@@ -1,17 +1,35 @@
 /*
  * @fidelity: likely
  * @fidelity-default: unreviewed
+ *
+ * tr_xanim.c -- CoD skeletal animation (XAnim / DObj) surface submission and
+ * rigid/weighted vertex skinning.  This has no RTCW analogue: CoD1 models are
+ * XModel-based and animated through a DObj (an instanced skeleton whose bone
+ * matrices live in evalStorage).  R_AddXModelSurfaces expands an animated
+ * entity into per-surface entity draw surfs; the RB_SurfaceXModel* backends
+ * then transform each surface's verts by the bone matrices (rigid, weighted,
+ * and the SSE / ARB / ATI / NV fast paths).
+ *
+ * The pointer-passed animation records (DObj, the XModel -> XModelInfo ->
+ * XModelLodInfo -> XModelSurfs -> XSurface chain, and the rigid/blend vertex
+ * streams) are typed file-locally below; every offset is proven against retail
+ * CoDMP.exe (IDA struct db) and cross-checked with CoDUO, and pinned with
+ * size/offset asserts.  shader_t / model_t / trRefEntity_t come from
+ * tr_local.h.  The XModel chain duplicates tr_model.c's file-local copy on
+ * purpose (separate translation units); tr_local.h is intentionally not
+ * touched.  Bone-matrix pointer arithmetic (evalStorage + partBase*64 + 0x30 +
+ * surfaceBoneOffset) is kept as an explicit expression because the +0x30 skew
+ * does not map cleanly onto a DObjSkelMat field.
  */
 
 #include <malloc.h>
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "tr_records.h"
 #include "tr_shaderregistry.h"
 #include "tr_gl_types.h"
 #include "tr_orientation.h"   /* backEnd.or 0x016D8DA8 -- one object, not 16 shards */
 #include "tr_tess.h"
+#include "tr_local.h"
 
 extern char xmodel_defaultCollision[];
 
@@ -27,124 +45,337 @@ extern void __cdecl RB_SetIteratorFog( void );
 extern int RB_SetupMultitexture();
 extern int R_AddDrawSurf();
 extern int R_AddScaledDebugString();
-extern int R_SetupEntityLighting();
-extern int XSurfaceGetTris();
+extern void R_SetupEntityLighting();
+extern char *__cdecl R_GetShaderByHandle(int hShader);
+extern void XSurfaceGetTris(unsigned int out, int surfacePtr, unsigned short indexOffset);
 extern int DObjBackfillParentPartBits();
 extern int DObjBuildPartCollisionTable();
 extern int DObjGetNumSurfaces();
-extern int DObjGetSurfaces();
+extern void DObjGetSurfaces();
+extern int DObjHasDefaultModel();
+extern const char *XModelGetName();
 extern int __cdecl XModelGetLodForDist( const void *model, float distance );
 
 extern double __cdecl R_GetLodDist( float *entityOrigin );
 
-#define backEnd_modelMatrix   ((GLfloat *)(void *)&flt_16D8DE4)
+#define backEnd_modelMatrix   ((GLfloat *)(void *)&backEnd_or_modelMatrix)
+
+/* ------------------------------------------------------------------------- *
+ *  CoD skeletal-animation data (file-local typed views).
+ *
+ *  XModel (0x0c) -> XModelInfo (0x68) -> XModelLodInfo[3] (0x14 each) ->
+ *  XModelSurfs (0x0c) -> XModelSurfsData (0x0c) -> XSurface* []; the DObj
+ *  (0x58) instances the skeleton and points every surface at its child XModel
+ *  and bone matrices; rigid/blend vertex streams feed the transforms.
+ * ------------------------------------------------------------------------- */
+typedef struct XModel_s XModel;
+
+typedef struct {
+	unsigned char  tileMode;          /* +0x00 */
+	unsigned char  pad01;             /* +0x01 */
+	short          vertexCount;       /* +0x02 */
+	short          triangleCount;     /* +0x04 */
+	short          boneMatrixOffset;  /* +0x06  0xFFFF => weighted (non-rigid) surface */
+	unsigned int   boneUsage[4];      /* +0x08 */
+	void          *weightedPoints;    /* +0x18  XSurfaceWeightedPoint[] */
+	void          *triangles;         /* +0x1c  unsigned short[3][] */
+	void          *vertexData;        /* +0x20  XSurfaceRigidVert[] or XSurfaceBlendVert[] */
+	void          *texCoords;         /* +0x24  float[2][] */
+	void          *optimizedDataARB;  /* +0x28 */
+	void          *optimizedDataATI;  /* +0x2c */
+	void          *optimizedDataNV;   /* +0x30 */
+} XSurface;
+COD1_ASSERT_SIZE(XSurface, 0x34);
+ASSERT_OFF(XSurface, vertexCount, 0x02);
+ASSERT_OFF(XSurface, triangleCount, 0x04);
+ASSERT_OFF(XSurface, boneMatrixOffset, 0x06);
+ASSERT_OFF(XSurface, weightedPoints, 0x18);
+ASSERT_OFF(XSurface, triangles, 0x1c);
+ASSERT_OFF(XSurface, vertexData, 0x20);
+ASSERT_OFF(XSurface, texCoords, 0x24);
+ASSERT_OFF(XSurface, optimizedDataARB, 0x28);
+ASSERT_OFF(XSurface, optimizedDataATI, 0x2c);
+ASSERT_OFF(XSurface, optimizedDataNV, 0x30);
+
+typedef struct XModelSurfsData {
+	struct XModelSurfsData *next;         /* +0x00 */
+	short                   surfaceCount; /* +0x04 */
+	short                   pad06;        /* +0x06 */
+	XSurface              **surfaces;     /* +0x08 */
+} XModelSurfsData;
+COD1_ASSERT_SIZE(XModelSurfsData, 0x0c);
+ASSERT_OFF(XModelSurfsData, surfaceCount, 0x04);
+ASSERT_OFF(XModelSurfsData, surfaces, 0x08);
+
+typedef struct {
+	const char      *name;                /* +0x00 */
+	XModelSurfsData *surfs;               /* +0x04 */
+	void           (*freeData)(void *);   /* +0x08 */
+} XModelSurfs;
+COD1_ASSERT_SIZE(XModelSurfs, 0x0c);
+ASSERT_OFF(XModelSurfs, surfs, 0x04);
+
+typedef struct {
+	float           distance;             /* +0x00 */
+	const char     *name;                 /* +0x04 */
+	short           surfaceCount;         /* +0x08 */
+	short           pad0a;                /* +0x0a */
+	unsigned short *surfaceNameTable;     /* +0x0c */
+	XModelSurfs    *surfs;                /* +0x10 */
+} XModelLodInfo;
+COD1_ASSERT_SIZE(XModelLodInfo, 0x14);
+ASSERT_OFF(XModelLodInfo, surfs, 0x10);
+
+typedef struct {
+	void          *parts;                 /* +0x00 */
+	XModelLodInfo  lodRecords[3];         /* +0x04  stride 0x14 */
+	void          *collisionSurfaces;     /* +0x40 */
+	int            collisionSurfaceCount; /* +0x44 */
+	int            contents;              /* +0x48 */
+	float          mins[3];               /* +0x4c */
+	float          maxs[3];               /* +0x58 */
+	short          lodCount;              /* +0x64 */
+	short          modelFileCount;        /* +0x66 */
+} XModelInfo;
+COD1_ASSERT_SIZE(XModelInfo, 0x68);
+ASSERT_OFF(XModelInfo, lodRecords, 0x04);
+ASSERT_OFF(XModelInfo, lodCount, 0x64);
+
+struct XModel_s {
+	const char  *name;                    /* +0x00 */
+	XModelInfo  *info;                    /* +0x04 */
+	void       (*freeData)(void *);       /* +0x08 */
+};
+COD1_ASSERT_SIZE(XModel, 0x0c);
+ASSERT_OFF(XModel, info, 0x04);
+
+/* DObj -- an instanced skeleton.  evalStorage holds the DObjSkelMat[] bone
+ * matrices; childModelIndices maps a child slot to a model handle (negative
+ * => -handle is a game model); childPartBaseIndices gives each child's bone
+ * base index into evalStorage. */
+typedef struct {
+	void          *tree;                       /* +0x00  XAnimTree* */
+	void          *evalStorage;                /* +0x04  DObjSkelMat[] bone matrices */
+	int            skelCacheKey;               /* +0x08 */
+	unsigned char *partRemapTable;             /* +0x0c */
+	unsigned short unknownState10;             /* +0x10 */
+	unsigned short scrNotifyId;                /* +0x12 */
+	unsigned short tracePartRemapHandle;       /* +0x14 */
+	unsigned char  childCount;                 /* +0x16 */
+	unsigned char  partCount;                  /* +0x17 */
+	XModel        *childRefs[8];               /* +0x18 */
+	short          childModelIndices[8];       /* +0x38  <0 => -index is a game model */
+	unsigned char  childParentPartIndices[8];  /* +0x48 */
+	unsigned char  childPartBaseIndices[8];    /* +0x50  bone-matrix base per child */
+} DObj;
+COD1_ASSERT_SIZE(DObj, 0x58);
+ASSERT_OFF(DObj, evalStorage, 0x04);
+ASSERT_OFF(DObj, childCount, 0x16);
+ASSERT_OFF(DObj, partCount, 0x17);
+ASSERT_OFF(DObj, childRefs, 0x18);
+ASSERT_OFF(DObj, childModelIndices, 0x38);
+ASSERT_OFF(DObj, childPartBaseIndices, 0x50);
+
+/* one bone influence: a local position plus the byte offset of its bone matrix
+ * within DObj.evalStorage */
+typedef struct {
+	float        position[3];        /* +0x00 */
+	unsigned int boneMatrixOffset;   /* +0x0c */
+} XSimpleBlendInfo;
+COD1_ASSERT_SIZE(XSimpleBlendInfo, 0x10);
+
+/* rigid vertex (0x18): one bone, normal + position */
+typedef struct {
+	float normal[3];                 /* +0x00 */
+	float position[3];               /* +0x0c */
+} XSurfaceRigidVert;
+COD1_ASSERT_SIZE(XSurfaceRigidVert, 0x18);
+
+/* blend vertex (variable stride): normal, primary bone influence, and (when
+ * additiveWeightCount != 0) a trailing primaryWeight -- the stream advances 32
+ * bytes without additive weights and 36 bytes with them */
+typedef struct {
+	float            normal[3];            /* +0x00 */
+	int              additiveWeightCount;  /* +0x0c */
+	XSimpleBlendInfo blend;                /* +0x10  primary bone influence */
+	float            primaryWeight;        /* +0x20  present only when additive */
+} XSurfaceBlendVert;
+COD1_ASSERT_SIZE(XSurfaceBlendVert, 0x24);
+ASSERT_OFF(XSurfaceBlendVert, additiveWeightCount, 0x0c);
+ASSERT_OFF(XSurfaceBlendVert, blend, 0x10);
+ASSERT_OFF(XSurfaceBlendVert, primaryWeight, 0x20);
+
+/* one additional weighted bone influence for a blend vertex (0x14) */
+typedef struct {
+	XSimpleBlendInfo blend;          /* +0x00 */
+	float            weight;         /* +0x10 */
+} XSurfaceWeightedPoint;
+COD1_ASSERT_SIZE(XSurfaceWeightedPoint, 0x14);
+ASSERT_OFF(XSurfaceWeightedPoint, weight, 0x10);
+
+/* entity surface draw record (0x10) built by R_AddEntityDrawSurf and consumed
+ * by the RB_SurfaceXModel* backends.  surfaceType selects the backend (4/5 =
+ * rigid + rigid SSE, 6/7/8 = rigid ARB/ATI/NV, 9/10 = weighted + weighted SSE). */
+typedef struct {
+	int        surfaceType;   /* +0x00 */
+	DObj      *dobj;          /* +0x04 */
+	XSurface  *surf;          /* +0x08 */
+	int        childIndex;    /* +0x0c  DObj child slot */
+} xmodelDrawSurf_t;
+COD1_ASSERT_SIZE(xmodelDrawSurf_t, 0x10);
+ASSERT_OFF(xmodelDrawSurf_t, dobj, 0x04);
+ASSERT_OFF(xmodelDrawSurf_t, surf, 0x08);
+ASSERT_OFF(xmodelDrawSurf_t, childIndex, 0x0c);
+
+/* one DObjGetSurfaces output entry: (child slot, surface index in that child's LOD) */
+typedef struct {
+	short childIndex;     /* +0x00 */
+	short surfaceIndex;   /* +0x02 */
+} DObjSurfaceRef;
+COD1_ASSERT_SIZE(DObjSurfaceRef, 0x04);
+
+/* one shader stage (0x688); interior layout is disputed across the shade TUs,
+ * so only the two fields this file touches are named. */
+typedef struct {
+	unsigned int  attributeBits;         /* +0x000 */
+	int           bundle;                /* +0x004  first textureBundle (image / anim) */
+	byte          bundleRest[0x644 - 0x008]; /* rest of textureBundle_t bundles[8] (tr_shade.c) */
+	int           atiFragmentShader;      /* +0x644 */
+	void         *registerCombiners;      /* +0x648 */
+	char         *vertexProgram;          /* +0x64c */
+	byte          rgbWave[0x14];          /* +0x650  waveForm_t */
+	int           rgbGen;                 /* +0x664 */
+	byte          alphaWave[0x14];        /* +0x668  waveForm_t */
+	int           alphaGen;               /* +0x67c */
+	byte          constantColor[4];       /* +0x680 */
+	unsigned int  stateBits;             /* +0x684  GL_State bits */
+} shaderStage_t;
+COD1_ASSERT_SIZE(shaderStage_t, 0x688);
+ASSERT_OFF(shaderStage_t, stateBits, 0x684);
+
+/* refEntity_t anim fields inside tr_local.h's unproven 0x84..0x9b range
+ * (proven here: R_AddXModelSurfaces / R_CullModel against retail). */
+#define R_EntDObj(ent)   ((DObj *)(ent)->e.dobj)
+#define R_EntPose(ent)   ((int)(ent)->e.owner)
+
+/* shader_t fields past tr_local.h's named prefix, reached on the shader the
+ * tess / globals macros hold; the disputed stage interior stays off. */
+#define R_ShaderCull(sh)       (((shader_t *)(sh))->cullType)
+#define R_ShaderNumStages(sh)  (((shader_t *)(sh))->numUnfoggedPasses)
+#define R_ShaderStages(sh)     ((shaderStage_t **)((shader_t *)(sh))->stages)
 
 /* ---- R_CullModel  0x0050DB00 ----  VERIFIED */
-int __cdecl R_CullModel(int a1, int a2)
+int __cdecl R_CullModel(int unused, trRefEntity_t *entity)
 {
-  if ( ((cvar_t *)r_drawXModels)->integer )
-    return *(_DWORD *)(a2 + 692);
-  else
-    return 2;
+  if ( !r_drawXModels->integer )
+    return CULL_OUT;
+  return entity->cullState;
 }
 
-/* ---- R_AddEntityDrawSurf  0x0050DB20 ----  VERIFIED */
-cvar_t *__cdecl R_AddEntityDrawSurf(int a1, _DWORD *a2, int a3, int a4)
+/* ---- R_AddEntityDrawSurf  0x0050DB20 ----  VERIFIED
+ * Build one entity draw surf for an XModel surface: pick the backend (rigid /
+ * weighted, plus SSE / ARB / ATI / NV variants), pack the sort key, and (for
+ * stencil-shadow shaders) also emit the shadow draw surf.  Returns cg_shadows
+ * as dead EAX. */
+cvar_t *__cdecl R_AddEntityDrawSurf(XSurface *surf, shader_t *shader, DObj *dobj, int childIndex)
 {
-  _DWORD *v4;
-  int v5;
-  int v6;
-  int *v7;
-  cvar_t *result;
+  xmodelDrawSurf_t *ds;
+  int               storage;
+  cvar_t           *result;
 
-  v4 = (_DWORD *)(tr_refdef_entitySurfaces + 16 * tr_refdef_entitySurfaceCount);
-  v5 = 0;
-  v6 = storageClass;
-  if ( *(_WORD *)(a1 + 6) == 0xFFFF )
+  storage = storageClass;
+  ds = (xmodelDrawSurf_t *)(tr_refdef_entitySurfaces + 16 * tr_refdef_entitySurfaceCount);
+  if ( surf->boneMatrixOffset == -1 )
   {
-    LOBYTE(v5) = sys_hasSSE != 0;
-    *v4 = v5 + 9;
-    goto LABEL_11;
+    ds->surfaceType = (sys_hasSSE != 0) + 9;   /* weighted (skinned) */
+    goto emit;
   }
-  LOBYTE(v5) = sys_hasSSE != 0;
-  *v4 = v5 + 4;
-  if ( (a2[20] & 0x3FF7FC00) == 0 )
+  ds->surfaceType = (sys_hasSSE != 0) + 4;      /* rigid */
+  if ( (shader->surfaceFlags & 0x3FF7FC00) == 0 )
   {
-    if ( *(_DWORD *)(a1 + 40) )
+    if ( surf->optimizedDataARB )
     {
-      *v4 = 6;
-      v6 = storageClass;
-      goto LABEL_11;
+      ds->surfaceType = 6;
+      storage = storageClass;
+      goto emit;
     }
-    if ( *(_DWORD *)(a1 + 48) )
+    if ( surf->optimizedDataNV )
     {
-      *v4 = 8;
-      v7 = *(int **)(a1 + 48);
+      ds->surfaceType = 8;
+      storage = *(int *)surf->optimizedDataNV;
     }
     else
     {
-      if ( !*(_DWORD *)(a1 + 44) )
-        goto LABEL_11;
-      *v4 = 7;
-      v7 = *(int **)(a1 + 44);
+      if ( !surf->optimizedDataATI )
+        goto emit;
+      ds->surfaceType = 7;
+      storage = *(int *)surf->optimizedDataATI;
     }
-    v6 = *v7;
   }
-LABEL_11:
-  v4[2] = a1;
-  v4[1] = a3;
-  v4[3] = a4;
+emit:
+  ds->dobj = dobj;
+  ds->surf = surf;
+  ds->childIndex = childIndex;
   if ( tr_refdef_numDrawSurfs < 0x10000 )
   {
-    *(_DWORD *)(tr_refdef_drawSurfs + 8 * tr_refdef_numDrawSurfs) = tr_shiftedEntityNumber | (((v6 << 12) | a2[18]) << 18) | 4;
-    *(_DWORD *)(tr_refdef_drawSurfs + 8 * tr_refdef_numDrawSurfs++ + 4) = v4;
+    /* indexed afresh per store: retail re-reads numDrawSurfs / drawSurfs */
+    ((drawSurf_t *)tr_refdef_drawSurfs)[tr_refdef_numDrawSurfs].sort =
+        tr_shiftedEntityNumber | (((storage << 12) | shader->sortedIndex) << 18) | 4;
+    ((drawSurf_t *)tr_refdef_drawSurfs)[tr_refdef_numDrawSurfs].surface = ds;
+    ++tr_refdef_numDrawSurfs;
   }
   result = cg_shadows;
   ++tr_refdef_entitySurfaceCount;
-  if ( cg_shadows->integer == 2 && a2[22] == 1084227584 )
+  if ( cg_shadows->integer == 2 && shader->sort == 5.0f )   /* stencil-shadow sort class */
   {
-    R_AddDrawSurf(v6, tr_stencilShadowShader, (int)v4, 0, 0, 0);
+    R_AddDrawSurf(storage, tr_stencilShadowShader, (int)ds, 0, 0, 0);
     return (cvar_t *)++tr_refdef_entitySurfaceCount;
   }
   return result;
 }
 
-/* ---- R_DObjGetSurfIndex  0x0050DC40 ----  VERIFIED */
-int __cdecl R_DObjGetSurfIndex(int a1, int a2)
+/* ---- R_DObjGetSurfIndex  0x0050DC40 ----  VERIFIED
+ * Map a DObj child slot to a model handle.  A negative table entry is the
+ * negated handle of a game-supplied model. */
+int __cdecl R_DObjGetSurfIndex(DObj *dobj, int childSlot)
 {
-  int result;
+  short handle = dobj->childModelIndices[childSlot];
+  int   index = handle;
 
-  LOWORD(a2) = *(_WORD *)(a2 + 2 * a1 + 56);
-  result = (__int16)a2;
-  if ( (__int16)a2 < 0 )
-    return (__int16)ri_CG_GetGameModel(-a2);
-  return result;
+  if ( index >= 0 )
+    return index;
+  return (short)ri.CG_GetGameModel(-handle);
 }
 
-/* ---- RB_TransformRigidVertex  0x0050DC60 ----  VERIFIED */
+/* ---- RB_TransformRigidVertex  0x0050DC60 ----  VERIFIED
+ * Transform a rigid vertex position + normal by one bone matrix.  The
+ * parameter order (not the operand order) fixes VC7's float-sum layout. */
 float *__cdecl RB_TransformRigidVertex(
-        float *result,
-        float *a2,
-        float *a3,
-        float *a4,
-        float *a5)
+        float *position,
+        float *normal,
+        float *matrix,
+        float *outPos,
+        float *outNormal)
 {
-  *a4 = a2[1] * result[4] + *a2 * *result + result[8] * a2[2] + result[12];
-  a4[1] = a2[1] * result[5] + result[9] * a2[2] + result[1] * *a2 + result[13];
-  a4[2] = a2[1] * result[6] + result[10] * a2[2] + result[2] * *a2 + result[14];
-  *a5 = a3[1] * result[4] + *a3 * *result + a3[2] * result[8];
-  a5[1] = result[1] * *a3 + result[9] * a3[2] + a3[1] * result[5];
-  a5[2] = result[2] * *a3 + result[10] * a3[2] + result[6] * a3[1];
-  return result;
+  outPos[0]    = position[1] * matrix[4] + position[0] * matrix[0]  + matrix[8]  * position[2] + matrix[12];
+  outPos[1]    = position[1] * matrix[5] + matrix[9]  * position[2] + matrix[1]  * position[0] + matrix[13];
+  outPos[2]    = position[1] * matrix[6] + matrix[10] * position[2] + matrix[2]  * position[0] + matrix[14];
+  outNormal[0] = normal[1]   * matrix[4] + normal[0]  * matrix[0]   + normal[2]  * matrix[8];
+  outNormal[1] = matrix[1]   * normal[0] + matrix[9]  * normal[2]   + normal[1]  * matrix[5];
+  outNormal[2] = matrix[2]   * normal[0] + matrix[10] * normal[2]   + matrix[6]  * normal[1];
+  return matrix;
 }
 
-/* ---- RB_AccumulateWeightedPoint  0x0050DD00 ----  VERIFIED */
-float *__cdecl RB_AccumulateWeightedPoint(float *result, float *a2, float *a3, float a4)
+/* ---- RB_AccumulateWeightedPoint  0x0050DD00 ----  VERIFIED
+ * Add one weighted bone influence to an already-transformed vertex position.
+ * Dead in retail (zero xrefs): RB_SurfaceXModelWeight runs its own inlined
+ * copy, whose y/z association differs from this one.  Kept for fidelity. */
+float *__cdecl RB_AccumulateWeightedPoint(float *point, float weight, float *matrix, float *outPos)
 {
-  *a2 = (result[4] * a3[1] + result[8] * a3[2] + *a3 * *result + result[12]) * a4 + *a2;
-  a2[1] = (result[5] * a3[1] + result[9] * a3[2] + result[1] * *a3 + result[13]) * a4 + a2[1];
-  a2[2] = (result[6] * a3[1] + result[10] * a3[2] + result[2] * *a3 + result[14]) * a4 + a2[2];
-  return result;
+  outPos[0] = (matrix[4] * point[1] + matrix[8]  * point[2] + point[0] * matrix[0] + matrix[12]) * weight + outPos[0];
+  outPos[1] = (matrix[5] * point[1] + matrix[9]  * point[2] + matrix[1] * point[0] + matrix[13]) * weight + outPos[1];
+  outPos[2] = (matrix[6] * point[1] + matrix[10] * point[2] + matrix[2] * point[0] + matrix[14]) * weight + outPos[2];
+  return matrix;
 }
 
 static const float colorWhite[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
@@ -165,1163 +396,1045 @@ static const int s_boneBoxEdges[12][6] =
 	{ 1,1,0,  1,1,1 }
 };
 
-/* ---- R_XModelDebugBoxes  0x0050DD70 ----  VERIFIED */
-float *__cdecl R_XModelDebugBoxes(int a1, int a2)
+/* ---- R_XModelDebugBoxes  0x0050DD70 ----  VERIFIED
+ * Draw the oriented bounding box of every DObj part whose bit is set in the
+ * part mask, transformed by that part's bone matrix then the entity frame.
+ * Built /Op-like (every pos / start / end component goes through its float
+ * slot).  Each sum is parenthesised in retail's grouping: VC7 keeps explicit
+ * float groupings but reassociates unparenthesised sums. */
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", on )
+#endif
+void __cdecl R_XModelDebugBoxes(trRefEntity_t *ent, const char *partMask)
 {
-  int v2;
-  int v3;
-  int v4;
-  int *parts; /* retail's alloca block -- ESP at 0x0050DD9B, var_C */
-  float *result;
-  int v7;
-  int v8;
-  _DWORD *v9;
-  int v10;
-  _DWORD *v11;
-  double v12;
-  double v13;
-  bool v14; // zf
-  bool v15; // cc
-  float color[4]; // [esp+Ch] [ebp-5Ch] BYREF
-  float start[3]; // [esp+1Ch] [ebp-4Ch] BYREF
-  float end[3];   // [esp+28h] [ebp-40h] BYREF
-  float v23;
-  float v24;
-  float v25;
-  float v26;
-  float v27;
-  float v28;
-  int v29;
-  _DWORD *v30;
-  int v31;
-  int v32;
-  int *v33;
-  float *v34;
-  int v35;
+  int          partCount;
+  float      **partTable;
+  float       *boneMat;
+  float       *mat;
+  const int  (*edge)[3];
+  float        color[4];
+  float        corner[3];
+  float        pos[3];
+  float        start[3];
+  float        end[3];
+  int          part;
+  int          e;
 
-  v2 = a1;
-  v3 = *(_DWORD *)(a1 + 144);
-  v4 = *(unsigned __int8 *)(v3 + 23);
-  v29 = v4;
-  parts = (int *)alloca(4 * v4);
-  v33 = parts;
-  DObjBuildPartCollisionTable(parts, v3);
-  result = (float *)((*(unsigned __int8 *)(*(_DWORD *)(v2 + 144) + 80) << 6)
-                   + *(_DWORD *)(*(_DWORD *)(v2 + 144) + 4)
-                   + 48);
-  v7 = 0;
-  color[0] = 1.0f;   /* 0x50DDC6 mov [ebp+color], 3F800000h */
+  /* retail re-reads ent's DObj for the bone matrices after the table call */
+  partCount = R_EntDObj(ent)->partCount;
+  partTable = (float **)alloca(4 * partCount);
+  DObjBuildPartCollisionTable(partTable, R_EntDObj(ent));
+  boneMat = (float *)((R_EntDObj(ent)->childPartBaseIndices[0] << 6) + (int)R_EntDObj(ent)->evalStorage + 48);
+  color[0] = 1.0f;
   color[1] = 1.0f;
   color[2] = 1.0f;
   color[3] = 0.0f;
-  v35 = 0;
-  if ( v4 > 0 )
+  for ( part = 0; part < partCount; ++part, ++partTable )
   {
-    result += 4;
-    v34 = result;
-    do
+    if ( (partMask[part >> 3] & (1 << (part & 7))) != 0 )
     {
-      if ( ((1 << (v7 & 7)) & *(char *)((v7 >> 3) + a2)) != 0 )
+      const float (*box)[3] = (const float (*)[3])*partTable;
+
+      mat = boneMat + 16 * part;
+      edge = (const int (*)[3])s_boneBoxEdges;
+      for ( e = 0; e < 12; ++e )
       {
-        v8 = *v33;
-        v31 = *v33;
-        v9 = (_DWORD *)s_boneBoxEdges;
-        v32 = 12;
-        while ( 1 )
-        {
-          v26 = *(float *)(v8 + 12 * *v9);
-          v27 = *(float *)(v8 + 12 * v9[1] + 4);
-          v28 = *(float *)(v8 + 12 * v9[2] + 8);
-          v10 = v9[3];
-          v11 = v9 + 3;
-          v23 = v28 * result[4] + v27 * *result + v26 * *(result - 4) + result[8];
-          v24 = v28 * result[5] + v27 * result[1] + v26 * *(result - 3) + result[9];
-          v25 = v28 * result[6] + v27 * result[2] + v26 * *(result - 2) + result[10];
-          start[0] = v25 * *(float *)(v2 + 52) + v24 * *(float *)(v2 + 40) + v23 * *(float *)(v2 + 28);
-          start[1] = v25 * *(float *)(v2 + 56) + v24 * *(float *)(v2 + 44) + v23 * *(float *)(v2 + 32);
-          start[2] = v25 * *(float *)(v2 + 60) + v24 * *(float *)(v2 + 48) + v23 * *(float *)(v2 + 36);
-          start[0] = start[0] + *(float *)(v2 + 68);
-          start[1] = start[1] + *(float *)(v2 + 72);
-          start[2] = start[2] + *(float *)(v2 + 76);
-          v26 = *(float *)(v8 + 12 * v10);
-          v12 = v26 * *(result - 4);
-          v27 = *(float *)(v8 + 12 * v11[1] + 4);
-          v28 = *(float *)(v8 + 12 * v11[2] + 8);
-          v13 = v28 * result[4];
-          v30 = v11 + 3;
-          v23 = v12 + v13 + v27 * *result + result[8];
-          v24 = v26 * *(result - 3) + v28 * result[5] + v27 * result[1] + result[9];
-          v25 = v26 * *(result - 2) + v28 * result[6] + v27 * result[2] + result[10];
-          end[0] = v23 * *(float *)(v2 + 28) + v25 * *(float *)(v2 + 52) + v24 * *(float *)(v2 + 40);
-          end[1] = v23 * *(float *)(v2 + 32) + v25 * *(float *)(v2 + 56) + v24 * *(float *)(v2 + 44);
-          end[2] = v23 * *(float *)(v2 + 36) + v25 * *(float *)(v2 + 60) + v24 * *(float *)(v2 + 48);
-          end[0] = end[0] + *(float *)(v2 + 68);
-          end[1] = end[1] + *(float *)(v2 + 72);
-          end[2] = end[2] + *(float *)(v2 + 76);
-          CL_AddDebugLine(start, end, color, 0, 0, 0);
-          v2 = a1;
-          v14 = v32-- == 1;
-          result = v34;
-          if ( v14 )
-            break;
-          v9 = v30;
-          v8 = v31;
-        }
-        v4 = v29;
+        /* each edge is two corner selectors: 0 = mins, 1 = maxs per axis */
+        corner[0] = box[(*edge)[0]][0];
+        corner[1] = box[(*edge)[1]][1];
+        corner[2] = box[(*edge)[2]][2];
+        pos[0] = (corner[1] * mat[4] + corner[2] * mat[8]) + corner[0] * mat[0] + mat[12];
+        pos[1] = (corner[1] * mat[5] + corner[2] * mat[9]) + corner[0] * mat[1] + mat[13];
+        pos[2] = (corner[1] * mat[6] + corner[2] * mat[10]) + corner[0] * mat[2] + mat[14];
+        start[0] = (pos[1] * ent->e.axis[1][0] + pos[2] * ent->e.axis[2][0]) + pos[0] * ent->e.axis[0][0];
+        start[1] = (pos[1] * ent->e.axis[1][1] + pos[2] * ent->e.axis[2][1]) + pos[0] * ent->e.axis[0][1];
+        start[2] = (pos[1] * ent->e.axis[1][2] + pos[2] * ent->e.axis[2][2]) + pos[0] * ent->e.axis[0][2];
+        start[0] = start[0] + ent->e.origin[0];
+        start[1] = start[1] + ent->e.origin[1];
+        start[2] = start[2] + ent->e.origin[2];
+        ++edge;
+        corner[0] = box[(*edge)[0]][0];
+        corner[1] = box[(*edge)[1]][1];
+        corner[2] = box[(*edge)[2]][2];
+        ++edge;
+        pos[0] = (corner[2] * mat[8] + corner[0] * mat[0]) + corner[1] * mat[4] + mat[12];
+        pos[1] = (corner[2] * mat[9] + corner[0] * mat[1]) + corner[1] * mat[5] + mat[13];
+        pos[2] = (corner[2] * mat[10] + corner[0] * mat[2]) + corner[1] * mat[6] + mat[14];
+        end[0] = (pos[2] * ent->e.axis[2][0] + pos[0] * ent->e.axis[0][0]) + pos[1] * ent->e.axis[1][0];
+        end[1] = (pos[2] * ent->e.axis[2][1] + pos[0] * ent->e.axis[0][1]) + pos[1] * ent->e.axis[1][1];
+        end[2] = (pos[2] * ent->e.axis[2][2] + pos[0] * ent->e.axis[0][2]) + pos[1] * ent->e.axis[1][2];
+        end[0] = end[0] + ent->e.origin[0];
+        end[1] = end[1] + ent->e.origin[1];
+        end[2] = end[2] + ent->e.origin[2];
+
+        CL_AddDebugLine(start, end, color, 0, 0, 0);
       }
-      v7 = v35 + 1;
-      result += 16;
-      v15 = ++v35 < v4;
-      v34 = result;
-      ++v33;
     }
-    while ( v15 );
   }
-  return result;
 }
 
-/* ---- R_XModelDebugAxes  0x0050E040 ----  VERIFIED */
-int __cdecl R_XModelDebugAxes(int a1, int a2)
+/* ---- R_XModelDebugAxes  0x0050E040 ----  VERIFIED
+ * Draw the X/Y/Z axes (red/green/blue, length 6) of every DObj part whose bit
+ * is set in the part mask, in the part's bone frame then the entity frame.
+ * Retail transforms the global vec3_origin through the bone matrix rather than
+ * copying the translation, so a -0.0 / non-finite matrix gives retail's
+ * result.  /Op-like with retail's sum groupings, as R_XModelDebugBoxes. */
+void __cdecl R_XModelDebugAxes(trRefEntity_t *ent, const char *partMask)
 {
-  float *ent;
-  float *result;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  float *v7;
-  float *v8;
-  double v9;
-  double v10;
-  int v11;
-  float *i;
-  int v13;
-  float v14;
-  float v15;
-  float v16;
-  float v17;
-  float v18;
-  float v19;
-  float start[3]; // [esp+28h] [ebp-4Ch] BYREF
-  float end[3];   // [esp+34h] [ebp-40h] BYREF
-  float color[5]; // [esp+40h] [ebp-34h] BYREF
-  float v27[8];   // [esp+54h] [ebp-20h] BYREF
+  DObj  *dobj;
+  int    partCount;
+  float *boneMat;
+  float *mat;
+  float  axes[3][3];
+  float  color[4];
+  float  pos[3];
+  float  start[3];
+  float  end[3];
+  int    part;
+  int    axis;
 
-  ent = (float *)a1;
-  color[4] = 6.0f;                      /* 0x50E049 */
-  v27[3] = 6.0f;                        /* 0x50E04D */
-  v27[7] = 6.0f;                        /* 0x50E051 */
-  result = ent;
-  v3 = *(_DWORD *)&ent[36];
-  v4 = *(unsigned __int8 *)(v3 + 23);
-  v5 = (*(unsigned __int8 *)(v3 + 80) << 6) + *(_DWORD *)(v3 + 4) + 48;
-  v6 = 0;
-  memset(v27, 0, 12);
-  memset(&v27[4], 0, 12);
-  v13 = 0;
-  if ( v4 )
+  axes[0][0] = 6.0f;
+  axes[0][1] = 0.0f;
+  axes[0][2] = 0.0f;
+  axes[1][0] = 0.0f;
+  axes[1][1] = 6.0f;
+  axes[1][2] = 0.0f;
+  axes[2][0] = 0.0f;
+  axes[2][1] = 0.0f;
+  axes[2][2] = 6.0f;
+  dobj = R_EntDObj(ent);
+  partCount = dobj->partCount;
+  boneMat = (float *)((dobj->childPartBaseIndices[0] << 6) + (int)dobj->evalStorage + 48);
+  for ( part = 0; part < partCount; ++part )
   {
-    v7 = (float *)(v5 + 16);            /* +0x10: axis[0] is v7[-4..-2] */
-    do
+    if ( (partMask[part >> 3] & (1 << (part & 7))) != 0 )
     {
-      if ( ((1 << (v6 & 7)) & *(char *)((v6 >> 3) + a2)) != 0 )
+      mat = boneMat + 16 * part;
+      for ( axis = 0; axis < 3; ++axis )
       {
-        v8 = v27;
-        v11 = 0;
-        for ( i = v27; ; v8 = i )
-        {
-          v9 = 0.0f * v7[0];
-          v10 = 0.0f * v7[4];
-          memset(color, 0, 16);
-          color[v11] = 1.0f;
-          v14 = v9 + v10 + 0.0f * *(v7 - 4) + v7[8];
-          v16 = 0.0f * v7[1] + 0.0f * v7[5] + 0.0f * *(v7 - 3) + v7[9];
-          v18 = 0.0f * v7[2] + 0.0f * v7[6] + 0.0f * *(v7 - 2) + v7[10];
-          start[0] = v18 * result[13] + v16 * result[10] + v14 * result[7];
-          start[1] = v18 * result[14] + v16 * result[11] + v14 * result[8];
-          start[2] = v18 * result[15] + v16 * result[12] + v14 * result[9];
-          start[0] = start[0] + result[17];
-          start[1] = start[1] + result[18];
-          start[2] = start[2] + result[19];
-          v15 = v7[0] * v8[0] + v8[1] * v7[4] + *(v8 - 1) * *(v7 - 4) + v7[8];
-          v17 = v7[1] * v8[0] + *(v8 - 1) * *(v7 - 3) + v8[1] * v7[5] + v7[9];
-          v19 = *(v8 - 1) * *(v7 - 2) + v7[2] * v8[0] + v8[1] * v7[6] + v7[10];
-          end[0] = v19 * result[13] + v17 * result[10] + v15 * result[7];
-          end[1] = v15 * result[8] + v19 * result[14] + v17 * result[11];
-          end[2] = v15 * result[9] + v19 * result[15] + v17 * result[12];
-          end[0] = end[0] + result[17];
-          end[1] = end[1] + result[18];
-          end[2] = end[2] + result[19];
-          CL_AddDebugLine(start, end, color, 0, 0, 0);
-          i += 3;
-          ++v11;
-          result = ent;
-          if ( v11 >= 3 )
-            break;
-        }
-        v6 = v13;
+        color[0] = color[1] = color[2] = 0.0f;
+        color[3] = 0.0f;
+        color[axis] = 1.0f;
+
+        pos[0] = (vec3_origin[2] * mat[8]  + vec3_origin[1] * mat[4]) + vec3_origin[0] * mat[0] + mat[12];
+        pos[1] = (vec3_origin[2] * mat[9]  + vec3_origin[1] * mat[5]) + vec3_origin[0] * mat[1] + mat[13];
+        pos[2] = (vec3_origin[2] * mat[10] + vec3_origin[1] * mat[6]) + vec3_origin[0] * mat[2] + mat[14];
+        start[0] = (pos[1] * ent->e.axis[1][0] + pos[2] * ent->e.axis[2][0]) + pos[0] * ent->e.axis[0][0];
+        start[1] = (pos[1] * ent->e.axis[1][1] + pos[2] * ent->e.axis[2][1]) + pos[0] * ent->e.axis[0][1];
+        start[2] = (pos[1] * ent->e.axis[1][2] + pos[2] * ent->e.axis[2][2]) + pos[0] * ent->e.axis[0][2];
+        start[0] = start[0] + ent->e.origin[0];
+        start[1] = start[1] + ent->e.origin[1];
+        start[2] = start[2] + ent->e.origin[2];
+
+        pos[0] = (mat[8] * axes[axis][2] + mat[4] * axes[axis][1]) + mat[0] * axes[axis][0] + mat[12];
+        pos[1] = (mat[1] * axes[axis][0] + mat[5] * axes[axis][1]) + mat[9] * axes[axis][2] + mat[13];
+        pos[2] = (mat[6] * axes[axis][1] + mat[2] * axes[axis][0]) + mat[10] * axes[axis][2] + mat[14];
+        end[0] = (pos[1] * ent->e.axis[1][0] + pos[2] * ent->e.axis[2][0]) + pos[0] * ent->e.axis[0][0];
+        end[1] = (pos[2] * ent->e.axis[2][1] + pos[0] * ent->e.axis[0][1]) + pos[1] * ent->e.axis[1][1];
+        end[2] = (pos[2] * ent->e.axis[2][2] + pos[0] * ent->e.axis[0][2]) + pos[1] * ent->e.axis[1][2];
+        end[0] = end[0] + ent->e.origin[0];
+        end[1] = end[1] + ent->e.origin[1];
+        end[2] = end[2] + ent->e.origin[2];
+
+        CL_AddDebugLine(start, end, color, 0, 0, 0);
       }
-      ++v6;
-      v7 += 16;
-      v13 = v6;
     }
-    while ( v6 < v4 );
   }
-  return (int)result;
 }
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", off )
+#endif
 
 /* ---- R_XModelDebug  0x0050E310 ----  VERIFIED */
-void __cdecl R_XModelDebug(int a1, int a2)
+void __cdecl R_XModelDebug(trRefEntity_t *ent, const unsigned char *partMask)
 {
-  int v2;
+  int drew = 0;
 
-  v2 = 0;
   if ( !_stricmp(r_xdebug->string, "boxes") || !_stricmp(r_xdebug->string, "both") )
   {
-    v2 = 1;
-    R_XModelDebugBoxes(a1, a2);
+    drew = 1;
+    R_XModelDebugBoxes(ent, (const char *)partMask);
   }
   if ( !_stricmp(r_xdebug->string, "axes") || !_stricmp(r_xdebug->string, "both") )
   {
-    R_XModelDebugAxes(a1, a2);
+    drew = 1;
+    R_XModelDebugAxes(ent, (const char *)partMask);
   }
-  else if ( !v2 )
+  if ( !drew )
   {
-    Cvar_Set2("r_xdebug", &empty_string, qtrue);
+    Cvar_Set2("r_xdebug", "", qtrue);
     Com_Printf("boxes - show bounding boxes\n");
     Com_Printf("axes - show axes\n");
     Com_Printf("both - show bounding boxes and axes\n");
   }
 }
 
-/* ---- R_AddXModelSurfaces  0x0050E3E0 ----  VERIFIED */
-void __cdecl R_AddXModelSurfaces(int a1)
+/* ---- R_AddXModelSurfaces  0x0050E3E0 ----  VERIFIED
+ * Add every visible surface of an animated XModel entity to the draw lists.
+ * Selects a LOD per child model, expands the DObj into a flat surface list,
+ * runs CalcPose skinning, then emits one entity draw surf per surface -- unless
+ * a child uses the default collision model, in which case it draws debug boxes
+ * / axes only.  Also feeds the r_showtricounts / r_showsurfcounts overlays and
+ * queues entity lighting. */
+void __cdecl R_AddXModelSurfaces(int entityPtr)
 {
-  int integer;
-  int v2;
-  int v3;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v10;
-  int *v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  bool v18; // zf
-  int v19;
-  int v20;
-  int v21;
-  int v22;
-  char *v23;
-  int v24;
-  int v25;
-  int v26;
-  int v27;
-  int v28;
-  int v29;
-  int v30;
-  int v31;
-  int v32;
-  bool v33; // zf
-  int v34;
-  int v35;
-  int v36;
-  int v37;
-  bool v38; // zf
-  int v39;
-  int v40;
-  int *v41;
-  char *v42;
-  char *v43;
-  int *v44;  /* surface list */
-  int v45[4]; // [esp+Ch] [ebp-40h] BYREF
-  int v46;
-  int v47;
-  float LodDist;
-  int *v49;
-  int v50;
-  int v51;
-  int v52;
-  int *v53;
-  int *v54;
-  int i;
-  int v56;
+  trRefEntity_t  *ent = (trRefEntity_t *)entityPtr;
+  DObj           *dobj;
+  int             skipDrawSurfs;
+  int             childCount;
+  int            *lods;
+  int             surfaceCount;
+  DObjSurfaceRef *surfList;
+  int             partBits[4];
+  float           lodDist;
+  int             triCount;
+  int             vertCount;
+  int             needsLighting;
+  int             childIndex;
+  int             model;
+  shader_t       *shader;
+  XSurface       *surf;
+  int             i;
 
-  if ( (*(_BYTE *)(a1 + 4) & 2) == 0 || (v50 = 1, tr_viewParms_isPortal) )
-    v50 = 0;
-  integer = r_drawXModels->integer;
-  v2 = *(_DWORD *)(a1 + 144);
-  v56 = v2;
-  if ( integer && *(_DWORD *)(a1 + 692) != 2 )
+  if ( (ent->e.renderfx & 2) != 0 && !tr_viewParms_isPortal )
+    skipDrawSurfs = 1;
+  else
+    skipDrawSurfs = 0;
+
+  dobj = R_EntDObj(ent);
+  if ( !r_drawXModels->integer || ent->cullState == CULL_OUT )
+    return;
+
+  childCount = dobj->childCount;
+  lods = (int *)alloca(4 * childCount);
+  lodDist = R_GetLodDist((float *)ent);
+  for ( i = 0; i < childCount; ++i )
+    lods[i] = XModelGetLodForDist(dobj->childRefs[i], lodDist);
+
+  surfaceCount = DObjGetNumSurfaces(dobj, (int)lods);
+  if ( surfaceCount + tr_refdef_entitySurfaceCount > 4096 )
   {
-    v3 = *(unsigned __int8 *)(v2 + 22);
-    v54 = (int *)alloca((4 * v3 + 7) & 0xFFFFFFF8);
-    v5 = 0;
-    LodDist = R_GetLodDist((float *)a1);
-    if ( v3 > 0 )
+    if ( com_developer->integer )
+      ri.Printf(0, "WARNING: MAX_ENTSURFS exceeded\n");
+    return;
+  }
+
+  surfList = (DObjSurfaceRef *)alloca(4 * surfaceCount);
+  DObjGetSurfaces(partBits, dobj, surfList, (int)lods);
+  if ( R_EntPose(ent) )
+  {
+    DObjBackfillParentPartBits(dobj, (int)partBits);
+    ri.CG_DObjCalcPose(R_EntPose(ent), dobj, partBits);
+  }
+
+  /* a child using the default ("bad") collision model draws debug geometry only */
+  if ( DObjHasDefaultModel(dobj) )
+  {
+    if ( com_developer->integer )
     {
-      v6 = v2 + 24;
-      do
-      {
-        v7 = XModelGetLodForDist(*(int *)v6, LodDist);
-        v54[v5++] = v7;
-        v6 += 4;
-      }
-      while ( v5 < v3 );
-      v2 = v56;
+      R_XModelDebugBoxes(ent, (const char *)partBits);
+      R_XModelDebugAxes(ent, (const char *)partBits);
     }
-    v8 = DObjGetNumSurfaces(v2, (int)v54);
-    v52 = v8;
-    if ( v8 + tr_refdef_entitySurfaceCount <= 4096 )
+    return;
+  }
+
+  /* emit one entity draw surf per surface */
+  needsLighting = 0;
+  triCount = 0;
+  vertCount = 0;
+  for ( i = 0; i < surfaceCount; ++i )
+  {
+    childIndex = surfList[i].childIndex;
+    model = R_DObjGetSurfIndex(dobj, childIndex);
+    if ( model )
     {
-      v44 = (int *)alloca((4 * v8 + 7) & 0xFFFFFFF8);
-      v10 = v56;
-      v11 = v44;
-      v49 = v44;
-      DObjGetSurfaces(v45, v56, v44, (int)v54);
-      if ( *(_DWORD *)(a1 + 148) )
+      shader = (shader_t *)R_GetShaderByHandle(
+                 ((unsigned short **)((model_t *)tr_models[model])->shaderHandles)[lods[childIndex]][surfList[i].surfaceIndex]);
+      if ( (shader->lightingFlags & 0x18) != 0 )
+        needsLighting = 1;
+      if ( !skipDrawSurfs )
       {
-        DObjBackfillParentPartBits(v10, (int)v45);
-        ri_CG_DObjCalcPose(*(_DWORD *)(a1 + 148), v10, v45);
+        surf = dobj->childRefs[surfList[i].childIndex]->info->lodRecords[lods[surfList[i].childIndex]].surfs->surfs->surfaces[surfList[i].surfaceIndex];
+        R_AddEntityDrawSurf(surf, shader, dobj, surfList[i].childIndex);
+        triCount  += surf->triangleCount;
+        vertCount += surf->vertexCount;
       }
-      v12 = *(unsigned __int8 *)(v10 + 22) - 1;
-      if ( v12 < 0 )
-      {
-LABEL_19:
-        HIWORD(v14) = HIWORD(v52);
-        v15 = 0;
-        LodDist = 0.0;
-        v51 = 0;
-        v53 = 0;
-        for ( i = 0; v15 < v52; i = v15 )
-        {
-          v16 = SLOWORD(v44[v15]);
-          LOWORD(v14) = *(_WORD *)(v56 + 2 * v16 + 56);
-          v17 = (__int16)v14;
-          v18 = (__int16)v14 == 0;
-          if ( (__int16)v14 < 0 )
-          {
-            v17 = (__int16)ri_CG_GetGameModel(-v14);
-            v18 = v17 == 0;
-          }
-          if ( !v18 )
-          {
-            v19 = *(_DWORD *)(tr_models[v17] + 80);
-            v20 = SHIWORD(v44[v15]);
-            v21 = *(_DWORD *)(v19 + 4 * v54[v16]);
-            v22 = *(unsigned __int16 *)(v21 + 2 * v20);
-            if ( v22 < tr_numShaders[0] )
-            {
-              v23 = (char *)tr_shaders[v22];
-            }
-            else
-            {
-              ri_Printf(2, "R_GetShaderByHandle: out of range hShader '%d'\n", *(unsigned __int16 *)(v21 + 2 * v20));
-              v23 = tr_defaultShader;
-            }
-            if ( (v23[84] & 0x18) != 0 )
-              LODWORD(LodDist) = 1;
-            if ( !v50 )
-            {
-              v24 = SLOWORD(v44[v15]);
-              v25 = *(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(v56 + 4 * v24 + 24) + 4)
-                                                                  + 20 * (v54[v24] + 1))
-                                                      + 4)
-                                          + 8)
-                              + 4 * SHIWORD(v44[v15]));
-              R_AddEntityDrawSurf(v25, v23, v56, v24);
-              v26 = *(__int16 *)(v25 + 4);
-              v27 = *(__int16 *)(v25 + 2);
-              v15 = i;
-              v51 += v26;
-              v53 = (int *)((char *)v53 + v27);
-            }
-          }
-          HIWORD(v14) = HIWORD(v52);
-          ++v15;
-        }
-        v28 = r_showtricounts->integer;
-        if ( !v28 || (*(_BYTE *)(a1 + 4) & 0x18) != 0 )
-        {
-          if ( r_showsurfcounts->integer )
-          {
-            if ( (*(_BYTE *)(a1 + 4) & 0x18) == 0 )
-            {
-              v29 = v52;
-              v30 = 1;
-              v51 = 1;
-              i = 1;
-              if ( v52 > 1 )
-              {
-                v53 = &v44[1];
-                do
-                {
-                  v31 = *(__int16 *)v53;
-                  v47 = v31;
-                  LOWORD(v31) = *(_WORD *)(v56 + 2 * v31 + 56);
-                  v32 = (__int16)v31;
-                  v33 = (__int16)v31 == 0;
-                  if ( (__int16)v31 < 0 )
-                  {
-                    v32 = (__int16)ri_CG_GetGameModel(-v31);
-                    v33 = v32 == 0;
-                  }
-                  if ( !v33 )
-                  {
-                    v34 = tr_models[v32];
-                    v35 = 0;
-                    v46 = *(_DWORD *)(v34 + 80);
-                    if ( v30 > 0 )
-                    {
-                      do
-                      {
-                        v36 = SLOWORD(v11[v35]);
-                        LOWORD(v34) = *(_WORD *)(v56 + 2 * v36 + 56);
-                        v37 = (__int16)v34;
-                        v38 = (__int16)v34 == 0;
-                        if ( (__int16)v34 < 0 )
-                        {
-                          v37 = (__int16)ri_CG_GetGameModel(-v34);
-                          v38 = v37 == 0;
-                        }
-                        if ( !v38 )
-                        {
-                          v39 = *(_DWORD *)(*(_DWORD *)(tr_models[v37] + 80) + 4 * v54[v36]);
-                          v40 = SHIWORD(v11[v35]);
-                          v11 = v49;
-                          if ( *(_WORD *)(*(_DWORD *)(v46 + 4 * v54[v47]) + 2 * *((__int16 *)v53 + 1)) == *(_WORD *)(v39 + 2 * v40) )
-                            break;
-                        }
-                        HIWORD(v34) = HIWORD(i);
-                        ++v35;
-                      }
-                      while ( v35 < i );
-                      v30 = i;
-                    }
-                    if ( v30 == v35 )
-                      ++v51;
-                  }
-                  v29 = v52;
-                  i = ++v30;
-                  ++v53;
-                }
-                while ( v30 < v52 );
-              }
-              v43 = va("%i/%i", v51, v29);
-              R_AddScaledDebugString(a1 + 68, (unsigned int *)colorWhite, v43);
-            }
-          }
-        }
-        else
-        {
-          if ( v28 == 2 )
-            v41 = v53;
-          else
-            v41 = (int *)v51;
-          v42 = va("%i", v41);
-          R_AddScaledDebugString(a1 + 68, (unsigned int *)colorWhite, v42);
-        }
-        if ( *r_xdebug->string )
-          R_XModelDebug(a1, (int)v45);
-        if ( (!v50 || cg_shadows->integer > 1) && LodDist != 0.0 )
-          R_SetupEntityLighting(a1, (int)&tr_refdef_x);
-      }
-      else
-      {
-        v13 = v10 + 4 * v12 + 24;
-        while ( (void *)*(_DWORD *)(*(_DWORD *)v13 + 4) != (void *)xmodel_defaultCollision )
-        {
-          --v12;
-          v13 -= 4;
-          if ( v12 < 0 )
-            goto LABEL_19;
-        }
-        if ( com_developer->integer )
-        {
-          R_XModelDebugBoxes(a1, (int)v45);
-          R_XModelDebugAxes(a1, (int)v45);
-        }
-      }
-    }
-    else if ( com_developer->integer )
-    {
-      ri_Printf(0, "WARNING: MAX_ENTSURFS exceeded\n");
     }
   }
+
+  if ( r_showtricounts->integer && (ent->e.renderfx & 0x18) == 0 )
+  {
+    if ( r_showtricounts->integer == 2 )
+      R_AddScaledDebugString(ent->e.origin, (unsigned int *)colorWhite, va("%i", vertCount));
+    else
+      R_AddScaledDebugString(ent->e.origin, (unsigned int *)colorWhite, va("%i", triCount));
+  }
+  else if ( r_showsurfcounts->integer && (ent->e.renderfx & 0x18) == 0 )
+  {
+    /* count surfaces whose shader handle no earlier surface already used */
+    int uniqueCount = 1;
+
+    for ( i = 1; i < surfaceCount; ++i )
+    {
+      int modelJ = surfList[i].childIndex;
+      int handleJ = R_DObjGetSurfIndex(dobj, modelJ);
+
+      if ( handleJ )
+      {
+        unsigned short **shJ = (unsigned short **)((model_t *)tr_models[handleJ])->shaderHandles;
+        int              k;
+
+        for ( k = 0; k < i; ++k )
+        {
+          int modelK = surfList[k].childIndex;
+          int handleK = R_DObjGetSurfIndex(dobj, modelK);
+
+          if ( handleK )
+          {
+            unsigned short **shK = (unsigned short **)((model_t *)tr_models[handleK])->shaderHandles;
+
+            if ( shJ[lods[modelJ]][surfList[i].surfaceIndex] == shK[lods[modelK]][surfList[k].surfaceIndex] )
+              break;
+          }
+        }
+        if ( i == k )
+          ++uniqueCount;
+      }
+    }
+    R_AddScaledDebugString(ent->e.origin, (unsigned int *)colorWhite, va("%i/%i", uniqueCount, surfaceCount));
+  }
+
+  if ( *r_xdebug->string )
+    R_XModelDebug(ent, (const unsigned char *)partBits);
+  if ( (!skipDrawSurfs || cg_shadows->integer > 1) && needsLighting )
+    R_SetupEntityLighting(ent, (int)&tr_refdef_x);
 }
 
-/* ---- RB_SetModelMatrixForRigidSurface  0x0050E830 ----  VERIFIED */
-void __cdecl RB_SetModelMatrixForRigidSurface(_DWORD *a1)
+/* ---- RB_SetModelMatrixForRigidSurface  0x0050E830 ----  VERIFIED
+ * Compose a rigid surface's bone matrix with backEnd.orientation.modelMatrix
+ * and load it, so the fixed-function pipeline draws the surface's VBO in place. */
+void __cdecl RB_SetModelMatrixForRigidSurface(xmodelDrawSurf_t *ds)
 {
-  float *v1;
-  double v2;
-  double v3;
-  double v4;
-  double v5;
-  double v6;
-  double v7;
-  double v8;
-  double v9;
+  XSurface      *surf = ds->surf;   /* the surf / dobj locals set VC7's term order in m[0..2] */
+  DObj          *dobj = ds->dobj;
+  const float   *bone;
   const GLfloat *mm;   /* backEnd.orientation.modelMatrix, 0x016D8DE4 */
-  GLfloat m[16]; // [esp+0h] [ebp-40h] BYREF
+  GLfloat        m[16];
 
-  v1 = (float *)(*(__int16 *)(a1[2] + 6) + (*(unsigned __int8 *)(a1[3] + a1[1] + 80) << 6) + *(_DWORD *)(a1[1] + 4) + 48);
+  bone = (const float *)(surf->boneMatrixOffset
+                         + (dobj->childPartBaseIndices[ds->childIndex] << 6)
+                         + (int)dobj->evalStorage + 48);
   mm = backEnd_modelMatrix;
-  m[0] = mm[0] * *v1 + mm[8] * v1[2] + mm[4] * v1[1];
-  m[1] = mm[1] * *v1 + mm[9] * v1[2] + mm[5] * v1[1];
-  v2 = mm[2] * *v1 + mm[10] * v1[2];
-  v3 = mm[6] * v1[1];
-  m[3] = 0.0;
-  m[2] = v2 + v3;
-  m[4] = mm[0] * v1[4] + mm[4] * v1[5] + mm[8] * v1[6];
-  m[5] = mm[1] * v1[4] + mm[5] * v1[5] + mm[9] * v1[6];
-  v4 = mm[2] * v1[4] + mm[6] * v1[5];
-  v5 = mm[10] * v1[6];
-  m[7] = 0.0;
-  m[6] = v4 + v5;
-  m[8] = mm[0] * v1[8] + mm[4] * v1[9] + mm[8] * v1[10];
-  m[9] = mm[1] * v1[8] + mm[5] * v1[9] + mm[9] * v1[10];
-  v6 = mm[2] * v1[8] + mm[6] * v1[9];
-  v7 = mm[10] * v1[10];
-  m[11] = 0.0;
-  m[10] = v6 + v7;
-  m[12] = mm[0] * v1[12] + mm[4] * v1[13] + mm[8] * v1[14] + mm[12];
-  m[13] = mm[1] * v1[12] + mm[5] * v1[13] + mm[9] * v1[14] + mm[13];
-  v8 = mm[2] * v1[12] + mm[6] * v1[13];
-  v9 = mm[10] * v1[14];
-  m[15] = 1.0;
-  m[14] = v8 + v9 + mm[14];
+  m[0]  = mm[0] * bone[0]  + mm[8]  * bone[2]  + mm[4]  * bone[1];
+  m[1]  = mm[1] * bone[0]  + mm[9]  * bone[2]  + mm[5]  * bone[1];
+  m[2]  = mm[2] * bone[0]  + mm[10] * bone[2]  + mm[6]  * bone[1];
+  m[3]  = 0.0f;
+  m[4]  = mm[0] * bone[4]  + mm[4]  * bone[5]  + mm[8]  * bone[6];
+  m[5]  = mm[1] * bone[4]  + mm[5]  * bone[5]  + mm[9]  * bone[6];
+  m[6]  = mm[2] * bone[4]  + mm[6]  * bone[5]  + mm[10] * bone[6];
+  m[7]  = 0.0f;
+  m[8]  = mm[0] * bone[8]  + mm[4]  * bone[9]  + mm[8]  * bone[10];
+  m[9]  = mm[1] * bone[8]  + mm[5]  * bone[9]  + mm[9]  * bone[10];
+  m[10] = mm[2] * bone[8]  + mm[6]  * bone[9]  + mm[10] * bone[10];
+  m[11] = 0.0f;
+  m[12] = mm[0] * bone[12] + mm[4]  * bone[13] + mm[8]  * bone[14] + mm[12];
+  m[13] = mm[1] * bone[12] + mm[5]  * bone[13] + mm[9]  * bone[14] + mm[13];
+  m[14] = mm[2] * bone[12] + mm[6]  * bone[13] + mm[10] * bone[14] + mm[14];
+  m[15] = 1.0f;
   glLoadMatrixf(m);
 }
 
-/* ---- RB_SurfaceXModelRigid  0x0050EA40 ----  VERIFIED */
-int __cdecl RB_SurfaceXModelRigid(_DWORD *a1)
+/* ---- RB_SurfaceXModelRigid  0x0050EA40 ----  VERIFIED
+ * Tessellate a rigid (single-bone) XModel surface: copy tex coords, then
+ * transform each vertex by the surface's bone matrix. */
+void __cdecl RB_SurfaceXModelRigid(xmodelDrawSurf_t *ds)
 {
-  int v1;
-  int v2;
-  int v3;
-  unsigned __int16 v4;
-  int v5;
-  int v6;
-  float *v7;
-  int result;
-  bool v9; // zf
-  float *v10;
-  float *v10n; /* retail's esi = v10 + 0x68000 == &tess.normal[3*i] */
-  int v11;
-  float *v12;
-  int v13;
+  DObj              *dobj = ds->dobj;
+  XSurface          *surf = ds->surf;
+  int                vertexCount = surf->vertexCount;
+  int                indexCount = 3 * surf->triangleCount;
+  unsigned short     baseVertex;
+  XSurfaceRigidVert *vert;
+  float             *xyz;
+  float             *nrm;
+  const float       *matrix;
+  int                remaining;
 
-  v1 = a1[2];
-  v2 = *(__int16 *)(v1 + 2);
-  v3 = 3 * *(__int16 *)(v1 + 4);
-  v11 = a1[1];
-  RB_CheckOverflow(v2, v3);
-  v4 = tess_numVertexes;
-  tess_numVertexes += v2;
-  XSurfaceGetTris(2 * tess_numIndexes + ((int)(char *)tess_indexes), v1, v4);
-  v5 = v3 + tess_numIndexes;
-  v6 = v4;
-  tess_numIndexes = v5;
-  v7 = *(float **)(v1 + 32);
-  v10 = (float *)(12 * v6 + ((int)(char *)tess_xyz));
-  v10n = (float *)(12 * v6 + ((int)(char *)tess_stageNormals));
-  Com_Memcpy(8 * v6 + ((int)(char *)tess_texCoords0), *(int **)(v1 + 36), 8 * v2);
-  result = *(_DWORD *)(v11 + 4);
-  v12 = (float *)(*(__int16 *)(v1 + 6) + (*(unsigned __int8 *)(a1[3] + v11 + 80) << 6) + result + 48);
-  if ( v2 )
+  RB_CheckOverflow(vertexCount, indexCount);
+  baseVertex = tess_numVertexes;
+  tess_numVertexes += vertexCount;
+  XSurfaceGetTris((int)((char *)tess_indexes + 2 * tess_numIndexes), (int)surf, baseVertex);
+  tess_numIndexes += indexCount;
+  xyz = tess_xyz + 3 * baseVertex;
+  nrm = tess_stageNormals + 3 * baseVertex;
+  vert = (XSurfaceRigidVert *)surf->vertexData;
+  Com_Memcpy((char *)tess_texCoords0 + 8 * baseVertex, surf->texCoords, 8 * vertexCount);
+  matrix = (const float *)(surf->boneMatrixOffset
+                           + (dobj->childPartBaseIndices[ds->childIndex] << 6)
+                           + (int)dobj->evalStorage + 48);
+  remaining = vertexCount;
+  while ( remaining )
   {
-    v13 = v2;
-    do
-    {
-      RB_TransformRigidVertex(v12, v7 + 3, v7, v10, v10n);
-      v7 += 6;
-      result = v13 - 1;
-      v9 = v13 == 1;
-      v10 += 3;
-      v10n += 3;
-      --v13;
-    }
-    while ( !v9 );
+    RB_TransformRigidVertex(vert->position, vert->normal, (float *)matrix, xyz, nrm);
+    ++vert;
+    xyz += 3;
+    nrm += 3;
+    --remaining;
   }
-  return result;
 }
 
 /* ---- RB_SurfaceXModelRigidSSE  0x0050EB40 ----  VERIFIED */
-void __cdecl RB_SurfaceXModelRigidSSE(_DWORD *a1)
+void __cdecl RB_SurfaceXModelRigidSSE(xmodelDrawSurf_t *ds)
 {
-  int v1;               /* esi -- the XSurface */
-  int v2;               /* edi -- vertexCount */
-  int v3;
-  unsigned __int16 v4;  /* the tess base vertex, MOVZX'd at 0x50EB9B */
-  const float *v5;
-  const float *m;
-  float *v10;
-  float *v10n;
-  int v13;
-  int c;
+  XSurface                *surf = ds->surf;
+  DObj                    *dobj = ds->dobj;
+  int                      vertexCount = surf->vertexCount;
+  int                      indexCount = 3 * surf->triangleCount;
+  unsigned short           baseVertex;
+  const XSurfaceRigidVert *vert;
+  const float             *m;
+  float                   *xyz;
+  float                   *nrm;
+#ifndef COD1_VC7
+  int                      remaining;
+  int                      c;
+#endif
 
-  v1 = a1[2];
-  v2 = *(__int16 *)(v1 + 2);
-  v3 = 3 * *(__int16 *)(v1 + 4);
-  RB_CheckOverflow(v2, v3);
-  v4 = tess_numVertexes;
-  tess_numVertexes += v2;
-  XSurfaceGetTris(2 * tess_numIndexes + ((int)(char *)tess_indexes), v1, v4);
-  tess_numIndexes += v3;
-  v10  = (float *)(12 * v4 + ((int)(char *)tess_xyz));
-  v10n = (float *)(12 * v4 + ((int)(char *)tess_stageNormals));
-  v5 = *(const float **)(v1 + 32);
-  Com_Memcpy((void *)(8 * v4 + ((int)(char *)tess_texCoords0)), *(int **)(v1 + 36), 8 * v2);
-  m = (const float *)(*(__int16 *)(v1 + 6)
-                      + (*(unsigned __int8 *)(a1[3] + a1[1] + 80) << 6)
-                      + *(_DWORD *)(a1[1] + 4)
-                      + 48);
-  v13 = v2;
+  RB_CheckOverflow(vertexCount, indexCount);
+  baseVertex = tess_numVertexes;
+  tess_numVertexes += vertexCount;
+  XSurfaceGetTris((int)((char *)tess_indexes + 2 * tess_numIndexes), (int)surf, baseVertex);
+  tess_numIndexes += indexCount;
+  xyz = tess_xyz + 3 * baseVertex;
+  nrm = tess_stageNormals + 3 * baseVertex;
+  vert = (const XSurfaceRigidVert *)surf->vertexData;
+  Com_Memcpy((char *)tess_texCoords0 + 8 * baseVertex, surf->texCoords, 8 * vertexCount);
+  m = (const float *)(surf->boneMatrixOffset
+                      + (dobj->childPartBaseIndices[ds->childIndex] << 6)
+                      + (int)dobj->evalStorage + 48);
+#ifdef COD1_VC7
+  /* retail's inline SSE, 0x50EBFC-0x50EC87 (the asm block gives it the ebp
+   * frame); movups stores 16 bytes at a 12-byte stride, so lane 3 lands on
+   * the next vertex's x (and past the last one) */
+  __asm
+  {
+    mov       eax, m
+    movaps    xmm4, [eax]
+    movaps    xmm5, [eax+10h]
+    movaps    xmm6, [eax+20h]
+    movaps    xmm7, [eax+30h]
+    mov       esi, xyz
+    mov       edi, nrm
+    mov       ecx, vertexCount
+    mov       edx, vert
+  rigidVertLoop:
+    prefetchnta [edx+80h]
+    movss     xmm0, [edx+0Ch]
+    movss     xmm1, [edx]
+    shufps    xmm0, xmm0, 0
+    shufps    xmm1, xmm1, 0
+    mulps     xmm0, xmm4
+    mulps     xmm1, xmm4
+    movss     xmm2, [edx+10h]
+    movss     xmm3, [edx+4]
+    shufps    xmm2, xmm2, 0
+    shufps    xmm3, xmm3, 0
+    mulps     xmm2, xmm5
+    mulps     xmm3, xmm5
+    addps     xmm0, xmm2
+    addps     xmm1, xmm3
+    movss     xmm2, [edx+14h]
+    movss     xmm3, [edx+8]
+    add       edx, 18h
+    shufps    xmm2, xmm2, 0
+    shufps    xmm3, xmm3, 0
+    mulps     xmm2, xmm6
+    mulps     xmm3, xmm6
+    addps     xmm0, xmm2
+    addps     xmm1, xmm3
+    movups    [edi], xmm1
+    add       edi, 0Ch
+    addps     xmm0, xmm7
+    movups    [esi], xmm0
+    add       esi, 0Ch
+    dec       ecx
+    jne       rigidVertLoop
+  }
+#else
+  remaining = vertexCount;
   do
   {
-    for ( c = 0; c < 3; ++c )
+    /* Retail 0x50EC21-0x50EC80 is packed SSE: every mulps/addps rounds to
+     * single precision, so each product and partial sum is cast / assigned
+     * to float here (the Release build is x87 /arch:IA32 /fp:precise, where
+     * a float*float product is exact and a float+float sum double-rounds
+     * harmlessly at 53 bits).  The stores are 16-byte movups at a 12-byte
+     * stride, so lane 3 (matrix column 3) spills into the next vertex's x;
+     * the next vertex overwrites it, except after the surface's last one. */
+    for ( c = 0; c < 4; ++c )
     {
-      v10n[c] = (v5[0] * m[c] + v5[1] * m[c + 4]) + v5[2] * m[c + 8];
-      v10[c]  = ((v5[3] * m[c] + v5[4] * m[c + 4]) + v5[5] * m[c + 8]) + m[c + 12];
+      float t;
+      float n;
+
+      t = (float)(vert->normal[0] * m[c]) + (float)(vert->normal[1] * m[c + 4]);
+      n = t + (float)(vert->normal[2] * m[c + 8]);
+      if ( nrm + c == tess_stageNormals + 24576 )   /* one past the array: retail 0x0183FF60 = tess_stageBitangents[0] */
+        tess_stageBitangents[0] = n;
+      else
+        nrm[c] = n;
+      t = (float)(vert->position[0] * m[c]) + (float)(vert->position[1] * m[c + 4]);
+      t = t + (float)(vert->position[2] * m[c + 8]);
+      xyz[c] = t + m[c + 12];   /* tess_xyz is 32768 floats: lane 3 of vertex 8191 stays in bounds */
     }
-    v5 += 6;
-    v10 += 3;
-    v10n += 3;
-    --v13;
+    ++vert;
+    xyz += 3;
+    nrm += 3;
+    --remaining;
   }
-  while ( v13 );
+  while ( remaining );
+#endif
 }
 
-/* ---- RB_SurfaceXModelRigidARB  0x0050EC90 ----  [HIGH] */
-int __cdecl RB_SurfaceXModelRigidARB(_DWORD *v)
+/* ---- RB_SurfaceXModelRigidARB  0x0050EC90 ----  [HIGH]
+ * Draw a rigid XModel surface from its ARB vertex buffer object. */
+int __cdecl RB_SurfaceXModelRigidARB(xmodelDrawSurf_t *ds)
 {
-  _DWORD *v1;
-  char *v2;
-  int v3;
-  _DWORD *v4;
-  void *v5;
-  int v6;
-  int v7;
-  _DWORD *v8;
-  int integer;
-  _DWORD *v10;
-  int result;
-  GLsizei v12;
-  GLsizei v13;
-  _DWORD v14[4]; // [esp+4Ch] [ebp-10h] BYREF
+  XSurface      *surf;
+  unsigned int  *arb;
+  int            stageCount;
+  int            i;
+  int            result;
+  int            texEnv[4];
+  shaderStage_t *stage;
+  GLsizei        count;
 
-  v1 = v;
   if ( r_logFile->integer )
   {
-    v2 = va(
-           "--- RB_SurfaceXModelRigidARB( %s ), model: %s ---\n",
-           (const char *)tess_shader,
-           **(const char ***)(v[1] + 4 * v[3] + 24));
+    char *msg = va(
+             "--- RB_SurfaceXModelRigidARB( %s ), model: %s ---\n",
+             ((shader_t *)tess_shader)->name,
+             XModelGetName(ds->dobj->childRefs[ds->childIndex]));
     if ( Stream )
-      fprintf(Stream, "%s", (int)v2);
+      fprintf(Stream, "%s", msg);
   }
-  RB_SetModelMatrixForRigidSurface(v1);
-  v3 = v1[2];
-  v4 = *(_DWORD **)(v3 + 40);
+  RB_SetModelMatrixForRigidSurface(ds);
+  surf = ds->surf;
+  arb = (unsigned int *)surf->optimizedDataARB;
   RB_SetIteratorFog();
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
+  GL_Cull(R_ShaderCull(tess_shader));
   GL_ClientState(1537);
-  qglBindBufferARB(34962, *v4);
-  qglBindBufferARB(34963, v4[1]);
+  qglBindBufferARB(34962, arb[0]);
+  qglBindBufferARB(34963, arb[1]);
   glNormalPointer(0x1406u, 32, (const GLvoid *)8);
   glVertexPointer(3, 0x1406u, 32, (const GLvoid *)0x14);
-  v6 = *(_DWORD *)(tess_shader + 336);
-  v7 = 0;
-  v14[0] = 0;
-  if ( v6 > 0 )
+  stageCount = R_ShaderNumStages(tess_shader);
+  texEnv[0] = 0;
+  i = 0;
+  if ( stageCount > 0 )
   {
     do
     {
-      v8 = *(_DWORD **)(tess_activeStages + 4 * v7);
-      GL_State(v8[417]);
-      RB_SetupMultitexture(v8, (int)v14, 32);
-      v12 = 3 * *(__int16 *)(v3 + 4);
-      backEnd_pc_drawnIndexCount += v12;
+      stage = *(shaderStage_t **)(tess_activeStages + 4 * i);
+      GL_State(stage->stateBits);
+      RB_SetupMultitexture(stage, texEnv, 32);
+      count = 3 * surf->triangleCount;
+      backEnd_pc_drawnIndexCount += count;
       ++backEnd_pc_drawCallCount;
-      glDrawElements(4u, v12, 0x1403u, 0);
-      ++v7;
+      glDrawElements(4u, count, 0x1403u, 0);
+      ++i;
     }
-    while ( v7 < *(_DWORD *)(tess_shader + 336) );
+    while ( i < R_ShaderNumStages(tess_shader) );
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  if ( r_showtris->integer )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    v10 = *(_DWORD **)(tr_showTrisShader + 340);
-    GL_State(v10[417]);
-    RB_SetupMultitexture(v10, (int)v14, 32);
-    if ( r_showtris->integer < 5 )
+    if ( (r_showtris->integer & 1) != 0 )
+      glDepthRange(0.0, 0.10000000149011612);   /* (double)0.1f = 0x3FB99999A0000000, retail 0x0050EDEA */
+    stage = R_ShaderStages(tr_showTrisShader)[0];
+    GL_State(stage->stateBits);
+    RB_SetupMultitexture(stage, texEnv, 32);
+    if ( r_showtris->integer >= 5 )
     {
-      qglColor3f(tr_identityLight, 0.0f, tr_identityLight);
+      unsigned int color;   /* packed RGBA: reuses the dead ds slot as in retail */
+
+      RB_ChooseSurfaceCountColor(3 * surf->triangleCount, &color);
+      glColor4ubv((const GLubyte *)&color);
     }
     else
     {
-      RB_ChooseSurfaceCountColor(3 * *(__int16 *)(v3 + 4), &v);
-      glColor4ubv((const GLubyte *)&v);
+      qglColor3f(tr_identityLight, 0.0f, tr_identityLight);
     }
-    v13 = 3 * *(__int16 *)(v3 + 4);
-    backEnd_pc_drawnIndexCount += v13;
+    count = 3 * surf->triangleCount;
+    backEnd_pc_drawnIndexCount += count;
     ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v13, 0x1403u, 0);
+    glDrawElements(4u, count, 0x1403u, 0);
     glDepthRange(0.0, 1.0);
   }
   qglBindBufferARB(34963, 0);
   qglBindBufferARB(34962, 0);
   glLoadMatrixf(backEnd_modelMatrix);   /* 0x016D8DE4 -- see the macro at the top */
   if ( Stream )
-    fprintf(Stream, "%s", (int)"----------\n");
-  backEnd_pc_indexCount += *(__int16 *)(v3 + 4) + 2 * *(__int16 *)(v3 + 4);
-  result = *(__int16 *)(v3 + 2);
+    fprintf(Stream, "%s", "----------\n");
+  backEnd_pc_indexCount += surf->triangleCount + 2 * surf->triangleCount;
+  result = surf->vertexCount;
   backEnd_pc_vertexCount += result;
   return result;
 }
 
-/* ---- RB_SurfaceXModelRigidATI  0x0050EF20 ----  [HIGH] */
-int __cdecl RB_SurfaceXModelRigidATI(_DWORD *v)
+/* ---- RB_SurfaceXModelRigidATI  0x0050EF20 ----  [HIGH]
+ * Draw a rigid XModel surface through the ATI vertex-array-object path. */
+void __cdecl RB_SurfaceXModelRigidATI(xmodelDrawSurf_t *ds)
 {
-  _DWORD *v1;
-  int v2;
-  char *v3;
-  int v4;
-  _DWORD *v5;
-  void *v6;
-  int v7;
-  bool v8; // cc
-  int v9;
-  GLenum *AnimatedImage;
-  int v11;
-  int integer;
-  int v13;
-  GLenum *v14;
-  int v15;
-  int v16;
-  GLenum *v17;
-  int v18;
-  GLenum *v19;
-  int result;
-  GLsizei v21;
-  GLsizei v22;
-  GLsizei v23;
-  int v24;
-  const GLvoid *v25;
-  const GLvoid *v26;
-  const GLvoid *v27;
+  XSurface      *surf;
+  unsigned int  *ati;
+  int            i;
+  GLsizei        count;
+  const GLvoid  *indices;
 
-  v1 = v;
-  v2 = 0;
   if ( r_logFile->integer )
   {
-    v3 = va(
-           "--- RB_SurfaceXModelRigidATI( %s ), model: %s ---\n",
-           (const char *)tess_shader,
-           **(const char ***)(v[1] + 4 * v[3] + 24));
+    char *msg = va(
+             "--- RB_SurfaceXModelRigidATI( %s ), model: %s ---\n",
+             ((shader_t *)tess_shader)->name,
+             XModelGetName(ds->dobj->childRefs[ds->childIndex]));
     if ( Stream )
-      fprintf(Stream, "%s", (int)v3);
+      fprintf(Stream, "%s", msg);
   }
   RB_EndMultitexture();
-  RB_SetModelMatrixForRigidSurface(v1);
-  v4 = v1[2];
-  v5 = *(_DWORD **)(v4 + 44);
+  RB_SetModelMatrixForRigidSurface(ds);
+  surf = ds->surf;
+  ati = (unsigned int *)surf->optimizedDataATI;
   RB_SetIteratorFog();
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
+  GL_Cull(R_ShaderCull(tess_shader));
   GL_ClientState(1537);
-  qglArrayObjectATI(32888, 2, 5126, 32, v5[1], v5[2]);
-  qglArrayObjectATI(32885, 3, 5126, 32, v5[1], v5[2] + 8);
-  qglArrayObjectATI(32884, 3, 5126, 32, v5[1], v5[2] + 20);
+  qglArrayObjectATI(32888, 2, 5126, 32, ati[1], ati[2]);
+  qglArrayObjectATI(32885, 3, 5126, 32, ati[1], ati[2] + 8);
+  qglArrayObjectATI(32884, 3, 5126, 32, ati[1], ati[2] + 20);
   if ( glConfig_ATIElementArray )
   {
     glEnableClientState(0x8768u);
-    v7 = tess_shader;
-    v8 = *(int *)(tess_shader + 336) <= 0;
-    v = 0;
-    if ( !v8 )
+    for ( i = 0; i < R_ShaderNumStages(tess_shader); ++i )
     {
-      v9 = 340;
-      do
-      {
-        GL_State(*(_DWORD *)(*(_DWORD *)(v7 + v9) + 1668));
-        AnimatedImage = (GLenum *)RB_GetAnimatedImage(tess_shader, *(_DWORD *)(tess_shader + v9) + 4, glState_currentTmu);
-        GL_Bind(AnimatedImage);
-        qglArrayObjectATI(34664, 1, 5123, 0, v5[1], v5[3]);
-        v24 = 3 * *(__int16 *)(v4 + 4);
-        backEnd_pc_drawnIndexCount += v24;
-        ++backEnd_pc_drawCallCount;
-        glDrawElementArrayATI(4, v24);
-        v7 = tess_shader;
-        v11 = *(_DWORD *)(tess_shader + 336);
-        v9 += 4;
-        v = (_DWORD *)((char *)v + 1);
-      }
-      while ( (int)v < v11 );
+      GL_State(R_ShaderStages(tess_shader)[i]->stateBits);
+      GL_Bind((GLenum *)RB_GetAnimatedImage( glState_currentTmu, (int)&R_ShaderStages(tess_shader)[i]->bundle ));
+      qglArrayObjectATI(34664, 1, 5123, 0, ati[1], ati[3]);
+      count = 3 * surf->triangleCount;
+      backEnd_pc_drawnIndexCount += count;
+      ++backEnd_pc_drawCallCount;
+      glDrawElementArrayATI(4, count);
     }
-    integer = r_showtris->integer;
-    if ( integer )
+    if ( r_showtris->integer )
     {
-      if ( (integer & 1) != 0 )
-        glDepthRange(0.0, 0.1000000014901161);
-      GL_State(*(_DWORD *)(*(_DWORD *)(tr_showTrisShader + 340) + 1668));
-      v14 = (GLenum *)RB_GetAnimatedImage(0, *(_DWORD *)(tr_showTrisShader + 340) + 4, glState_currentTmu);
-      GL_Bind(v14);
-      if ( r_showtris->integer < 5 )
+      if ( (r_showtris->integer & 1) != 0 )
+        glDepthRange(0.0, 0.10000000149011612);   /* (double)0.1f = 0x3FB99999A0000000, retail 0x0050F0DB */
+      GL_State(R_ShaderStages(tr_showTrisShader)[0]->stateBits);
+      GL_Bind((GLenum *)RB_GetAnimatedImage( glState_currentTmu, (int)&R_ShaderStages(tr_showTrisShader)[0]->bundle ));
+      if ( r_showtris->integer >= 5 )
       {
-        qglColor3f(tr_identityLight, 0.0f, tr_identityLight);
+        unsigned int color;   /* packed RGBA: reuses the dead ds slot as in retail */
+
+        RB_ChooseSurfaceCountColor(3 * surf->triangleCount, &color);
+        glColor4ubv((const GLubyte *)&color);
       }
       else
       {
-        RB_ChooseSurfaceCountColor(3 * *(__int16 *)(v4 + 4), &v);
-        glColor4ubv((const GLubyte *)&v);
+        qglColor3f(tr_identityLight, 0.0f, tr_identityLight);
       }
-      v25 = *(const GLvoid **)(v4 + 28);
-      v21 = 3 * *(__int16 *)(v4 + 4);
-      backEnd_pc_drawnIndexCount += v21;
+      indices = (const GLvoid *)surf->triangles;
+      count = 3 * surf->triangleCount;
+      backEnd_pc_drawnIndexCount += count;
       ++backEnd_pc_drawCallCount;
-      glDrawElements(4u, v21, 0x1403u, v25);
+      glDrawElements(4u, count, 0x1403u, indices);
       glDepthRange(0.0, 1.0);
     }
     glDisableClientState(0x8768u);
   }
   else
   {
-    v15 = tess_shader;
-    if ( *(int *)(tess_shader + 336) > 0 )
+    for ( i = 0; i < R_ShaderNumStages(tess_shader); ++i )
     {
-      v16 = 340;
-      do
-      {
-        GL_State(*(_DWORD *)(*(_DWORD *)(v16 + v15) + 1668));
-        v17 = (GLenum *)RB_GetAnimatedImage(tess_shader, *(_DWORD *)(v16 + tess_shader) + 4, glState_currentTmu);
-        GL_Bind(v17);
-        v26 = *(const GLvoid **)(v4 + 28);
-        v22 = 3 * *(__int16 *)(v4 + 4);
-        backEnd_pc_drawnIndexCount += v22;
-        ++backEnd_pc_drawCallCount;
-        glDrawElements(4u, v22, 0x1403u, v26);
-        v15 = tess_shader;
-        ++v2;
-        v16 += 4;
-      }
-      while ( v2 < *(_DWORD *)(tess_shader + 336) );
+      GL_State(R_ShaderStages(tess_shader)[i]->stateBits);
+      GL_Bind((GLenum *)RB_GetAnimatedImage( glState_currentTmu, (int)&R_ShaderStages(tess_shader)[i]->bundle ));
+      indices = (const GLvoid *)surf->triangles;
+      count = 3 * surf->triangleCount;
+      backEnd_pc_drawnIndexCount += count;
+      ++backEnd_pc_drawCallCount;
+      glDrawElements(4u, count, 0x1403u, indices);
     }
-    v18 = r_showtris->integer;
-    if ( v18 )
+    if ( r_showtris->integer )
     {
-      if ( (v18 & 1) != 0 )
-        glDepthRange(0.0, 0.1000000014901161);
-      GL_State(*(_DWORD *)(*(_DWORD *)(tr_showTrisShader + 340) + 1668));
-      v19 = (GLenum *)RB_GetAnimatedImage(glState_currentTmu, *(_DWORD *)(tr_showTrisShader + 340) + 4, glState_currentTmu);
-      GL_Bind(v19);
-      if ( r_showtris->integer < 5 )
+      if ( (r_showtris->integer & 1) != 0 )
+        glDepthRange(0.0, 0.10000000149011612);   /* (double)0.1f = 0x3FB99999A0000000, retail 0x0050F25B */
+      GL_State(R_ShaderStages(tr_showTrisShader)[0]->stateBits);
+      GL_Bind((GLenum *)RB_GetAnimatedImage( glState_currentTmu, (int)&R_ShaderStages(tr_showTrisShader)[0]->bundle ));
+      if ( r_showtris->integer >= 5 )
       {
-        qglColor3f(tr_identityLight, 0.0f, tr_identityLight);
+        unsigned int color;   /* packed RGBA: reuses the dead ds slot as in retail */
+
+        RB_ChooseSurfaceCountColor(3 * surf->triangleCount, &color);
+        glColor4ubv((const GLubyte *)&color);
       }
       else
       {
-        RB_ChooseSurfaceCountColor(3 * *(__int16 *)(v4 + 4), &v);
-        glColor4ubv((const GLubyte *)&v);
+        qglColor3f(tr_identityLight, 0.0f, tr_identityLight);
       }
-      v27 = *(const GLvoid **)(v4 + 28);
-      v23 = 3 * *(__int16 *)(v4 + 4);
-      backEnd_pc_drawnIndexCount += v23;
+      indices = (const GLvoid *)surf->triangles;
+      count = 3 * surf->triangleCount;
+      backEnd_pc_drawnIndexCount += count;
       ++backEnd_pc_drawCallCount;
-      glDrawElements(4u, v23, 0x1403u, v27);
+      glDrawElements(4u, count, 0x1403u, indices);
       glDepthRange(0.0, 1.0);
     }
   }
   glLoadMatrixf(backEnd_modelMatrix);   /* 0x016D8DE4 -- see the macro at the top */
   if ( Stream )
-    fprintf(Stream, "%s", (int)"----------\n");
-  backEnd_pc_indexCount += *(__int16 *)(v4 + 4) + 2 * *(__int16 *)(v4 + 4);
-  result = *(__int16 *)(v4 + 2) + backEnd_pc_vertexCount;
-  backEnd_pc_vertexCount = result;
-  return result;
+    fprintf(Stream, "%s", "----------\n");
+  backEnd_pc_indexCount += surf->triangleCount + 2 * surf->triangleCount;
+  backEnd_pc_vertexCount += surf->vertexCount;
 }
 
-/* ---- RB_SurfaceXModelRigidNV  0x0050F380 ----  [HIGH] */
-int __cdecl RB_SurfaceXModelRigidNV(_DWORD *v)
+/* ---- RB_SurfaceXModelRigidNV  0x0050F380 ----  [HIGH]
+ * Draw a rigid XModel surface through the NV vertex-array-range path. */
+void __cdecl RB_SurfaceXModelRigidNV(xmodelDrawSurf_t *ds)
 {
-  _DWORD *v1;
-  char *v2;
-  int v3;
-  int v4;
-  void *v5;
-  int v6;
-  int v7;
-  _DWORD *v8;
-  int integer;
-  _DWORD *v10;
-  int result;
-  GLsizei v12;
-  GLsizei v13;
-  const GLvoid *v14;
-  const GLvoid *v15;
-  _DWORD v16[4]; // [esp+3Ch] [ebp-10h] BYREF
+  XSurface      *surf;
+  unsigned int  *nv;
+  int            i;
+  int            texEnv[4];
+  shaderStage_t *stage;
+  GLsizei        count;
+  const GLvoid  *indices;
 
-  v1 = v;
   if ( r_logFile->integer )
   {
-    v2 = va(
-           "--- RB_SurfaceXModelRigidNV( %s ), model: %s ---\n",
-           (const char *)tess_shader,
-           **(const char ***)(v[1] + 4 * v[3] + 24));
+    char *msg = va(
+             "--- RB_SurfaceXModelRigidNV( %s ), model: %s ---\n",
+             ((shader_t *)tess_shader)->name,
+             XModelGetName(ds->dobj->childRefs[ds->childIndex]));
     if ( Stream )
-      fprintf(Stream, "%s", (int)v2);
+      fprintf(Stream, "%s", msg);
   }
-  RB_SetModelMatrixForRigidSurface(v1);
-  v3 = v1[2];
-  v4 = *(_DWORD *)(v3 + 48);
+  RB_SetModelMatrixForRigidSurface(ds);
+  surf = ds->surf;
+  nv = (unsigned int *)surf->optimizedDataNV;
   RB_SetIteratorFog();
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
+  GL_Cull(R_ShaderCull(tess_shader));
   GL_ClientState(1537);
-  glNormalPointer(0x1406u, 32, (const GLvoid *)(*(_DWORD *)(v4 + 4) + 8));
-  glVertexPointer(3, 0x1406u, 32, (const GLvoid *)(*(_DWORD *)(v4 + 4) + 20));
-  v6 = *(_DWORD *)(tess_shader + 336);
-  v7 = 0;
-  v16[0] = *(_DWORD *)(v4 + 4);
-  if ( v6 > 0 )
+  glNormalPointer(0x1406u, 32, (const GLvoid *)(nv[1] + 8));
+  glVertexPointer(3, 0x1406u, 32, (const GLvoid *)(nv[1] + 20));
+  texEnv[0] = nv[1];
+  for ( i = 0; i < R_ShaderNumStages(tess_shader); ++i )
   {
-    do
-    {
-      v8 = *(_DWORD **)(tess_activeStages + 4 * v7);
-      GL_State(v8[417]);
-      RB_SetupMultitexture(v8, (int)v16, 32);
-      v14 = *(const GLvoid **)(v3 + 28);
-      v12 = 3 * *(__int16 *)(v3 + 4);
-      backEnd_pc_drawnIndexCount += v12;
-      ++backEnd_pc_drawCallCount;
-      glDrawElements(4u, v12, 0x1403u, v14);
-      ++v7;
-    }
-    while ( v7 < *(_DWORD *)(tess_shader + 336) );
+    stage = *(shaderStage_t **)(tess_activeStages + 4 * i);
+    GL_State(stage->stateBits);
+    RB_SetupMultitexture(stage, texEnv, 32);
+    indices = (const GLvoid *)surf->triangles;
+    count = 3 * surf->triangleCount;
+    backEnd_pc_drawnIndexCount += count;
+    ++backEnd_pc_drawCallCount;
+    glDrawElements(4u, count, 0x1403u, indices);
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  if ( r_showtris->integer )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    v10 = *(_DWORD **)(tr_showTrisShader + 340);
-    GL_State(v10[417]);
-    RB_SetupMultitexture(v10, (int)v16, 32);
-    if ( r_showtris->integer < 5 )
+    if ( (r_showtris->integer & 1) != 0 )
+      glDepthRange(0.0, 0.10000000149011612);   /* (double)0.1f = 0x3FB99999A0000000, retail 0x0050F4CD */
+    stage = R_ShaderStages(tr_showTrisShader)[0];
+    GL_State(stage->stateBits);
+    RB_SetupMultitexture(stage, texEnv, 32);
+    if ( r_showtris->integer >= 5 )
     {
-      qglColor3f(tr_identityLight, 0.0f, tr_identityLight);
+      unsigned int color;   /* packed RGBA: reuses the dead ds slot as in retail */
+
+      RB_ChooseSurfaceCountColor(3 * surf->triangleCount, &color);
+      glColor4ubv((const GLubyte *)&color);
     }
     else
     {
-      RB_ChooseSurfaceCountColor(3 * *(__int16 *)(v3 + 4), &v);
-      glColor4ubv((const GLubyte *)&v);
+      qglColor3f(tr_identityLight, 0.0f, tr_identityLight);
     }
-    v15 = *(const GLvoid **)(v3 + 28);
-    v13 = 3 * *(__int16 *)(v3 + 4);
-    backEnd_pc_drawnIndexCount += v13;
+    indices = (const GLvoid *)surf->triangles;
+    count = 3 * surf->triangleCount;
+    backEnd_pc_drawnIndexCount += count;
     ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v13, 0x1403u, v15);
+    glDrawElements(4u, count, 0x1403u, indices);
     glDepthRange(0.0, 1.0);
   }
   glLoadMatrixf(backEnd_modelMatrix);   /* 0x016D8DE4 -- see the macro at the top */
   if ( Stream )
-    fprintf(Stream, "%s", (int)"----------\n");
-  backEnd_pc_indexCount += *(__int16 *)(v3 + 4) + 2 * *(__int16 *)(v3 + 4);
-  result = *(__int16 *)(v3 + 2) + backEnd_pc_vertexCount;
-  backEnd_pc_vertexCount = result;
-  return result;
+    fprintf(Stream, "%s", "----------\n");
+  backEnd_pc_indexCount += surf->triangleCount + 2 * surf->triangleCount;
+  backEnd_pc_vertexCount += surf->vertexCount;
 }
 
-/* ---- RB_SurfaceXModelWeight  0x0050F5E0 ----  VERIFIED */
-int __cdecl RB_SurfaceXModelWeight(_DWORD *a1)
+/* ---- RB_SurfaceXModelWeight  0x0050F5E0 ----  VERIFIED
+ * Tessellate a weighted (skinned) XModel surface: transform each vertex by its
+ * primary bone, then add every additive bone influence.  The blend-vertex
+ * stream is variable-stride (32 bytes without additive weights, 36 with). */
+void __cdecl RB_SurfaceXModelWeight(xmodelDrawSurf_t *ds)
 {
-  int v2;
-  int v3;
-  int v4;
-  unsigned __int16 v5;
-  int v6;
-  float *v7;
-  int v8;
-  int result;
-  int v10;
-  int v11;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  double v17;
-  double v18;
-  float *v19;
-  double v20;
-  bool v21; // zf
-  float *v7n; /* retail's esi = v7 + 0x68000 == &tess.normal[3*i] */
-  int v22;
-  int v23;
-  int v24;
-  unsigned __int16 v25;
-  int v26;
+  DObj          *dobj = ds->dobj;
+  XSurface      *surf = ds->surf;
+  int            vertexCount = surf->vertexCount;
+  int            indexCount = 3 * surf->triangleCount;
+  unsigned short baseVertex;
+  char          *vert;
+  char          *wpt;
+  float         *xyz;
+  float         *nrm;
+  int            mbase;
+  int            remaining;
 
-  v2 = a1[2];
-  v3 = *(__int16 *)(v2 + 2);
-  v23 = a1[1];
-  v4 = 3 * *(__int16 *)(v2 + 4);
-  RB_CheckOverflow(v3, v4);
-  v5 = tess_numVertexes;
-  tess_numVertexes += v3;
-  v25 = v5;
-  XSurfaceGetTris(2 * tess_numIndexes + ((int)(char *)tess_indexes), v2, v5);
-  v6 = v25;
-  tess_numIndexes += v4;
-  v26 = *(_DWORD *)(v2 + 32);
-  v7 = (float *)(12 * v6 + ((int)(char *)tess_xyz));
-  v7n = (float *)(12 * v6 + ((int)(char *)tess_stageNormals));
-  Com_Memcpy(8 * v6 + ((int)(char *)tess_texCoords0), *(int **)(v2 + 36), 8 * v3);
-  v8 = a1[3];
-  result = *(_DWORD *)(v23 + 4);
-  v10 = *(_DWORD *)(v2 + 24);
-  v11 = (*(unsigned __int8 *)(v8 + v23 + 80) << 6) + result + 48;
-  v22 = v11;
-  if ( v3 )
+  RB_CheckOverflow(vertexCount, indexCount);
+  baseVertex = tess_numVertexes;
+  tess_numVertexes += vertexCount;
+  XSurfaceGetTris((int)((char *)tess_indexes + 2 * tess_numIndexes), (int)surf, baseVertex);
+  tess_numIndexes += indexCount;
+  nrm = tess_stageNormals + 3 * baseVertex;
+  xyz = tess_xyz + 3 * baseVertex;
+  vert = (char *)surf->vertexData;
+  Com_Memcpy((char *)tess_texCoords0 + 8 * baseVertex, surf->texCoords, 8 * vertexCount);
+  mbase = (dobj->childPartBaseIndices[ds->childIndex] << 6) + (int)dobj->evalStorage + 48;
+  wpt = (char *)surf->weightedPoints;
+  if ( vertexCount )
   {
-    v24 = v3;
+    remaining = vertexCount;
     do
     {
-      RB_TransformRigidVertex((float *)(v11 + *(_DWORD *)(v26 + 28)), (float *)(v26 + 16), (float *)v26, v7, v7n);
-      v11 = v22;
-      v13 = v26;
-      v14 = *(_DWORD *)(v26 + 12);
-      if ( v14 )
+      XSurfaceBlendVert *bv = (XSurfaceBlendVert *)vert;
+
+      RB_TransformRigidVertex(bv->blend.position, bv->normal, (float *)(mbase + bv->blend.boneMatrixOffset), xyz, nrm);
+      if ( !bv->additiveWeightCount )
       {
-        *v7 = *(float *)(v13 + 32) * *v7;
-        v7[1] = *(float *)(v13 + 32) * v7[1];
-        v7[2] = *(float *)(v13 + 32) * v7[2];
-        do
-        {
-          v16 = *(_DWORD *)(v10 + 12);
-          v17 = *(float *)(v10 + 16);
-          v18 = *(float *)(v16 + v22 + 32);
-          v19 = (float *)(v22 + v16);
-          v20 = v18 * *(float *)(v10 + 8);
-          --v14;
-          v10 += 20;
-          *v7 = (v20 + v19[4] * *(float *)(v10 - 16) + *(float *)(v10 - 20) * *v19 + v19[12]) * v17 + *v7;
-          v7[1] = (v19[1] * *(float *)(v10 - 20)
-                 + v19[9] * *(float *)(v10 - 12)
-                 + v19[5] * *(float *)(v10 - 16)
-                 + v19[13])
-                * v17
-                + v7[1];
-          v7[2] = (v19[2] * *(float *)(v10 - 20)
-                 + v19[10] * *(float *)(v10 - 12)
-                 + v19[6] * *(float *)(v10 - 16)
-                 + v19[14])
-                * v17
-                + v7[2];
-        }
-        while ( v14 );
-        v15 = v13 + 36;
+        vert += 32;
       }
       else
       {
-        v15 = v13 + 32;
+        int w = bv->additiveWeightCount;
+
+        xyz[0] = bv->primaryWeight * xyz[0];
+        xyz[1] = bv->primaryWeight * xyz[1];
+        xyz[2] = bv->primaryWeight * xyz[2];
+        do
+        {
+          XSurfaceWeightedPoint *wp = (XSurfaceWeightedPoint *)wpt;
+          const float           *am = (const float *)(mbase + wp->blend.boneMatrixOffset);
+          const float           *q  = wp->blend.position;
+          float                  aw = wp->weight;
+
+          /* Retail runs an INLINED copy here (0x50F6E0-0x50F74C) and never
+           * calls the out-of-line RB_AccumulateWeightedPoint 0x50DD00 (zero
+           * xrefs).  The inlined y/z sums associate differently from that
+           * dead copy: (m1*p0 + m9*p2) + m5*p1, not (m5*p1 + m9*p2) + m1*p0.
+           * x is the same in both. */
+          xyz[0] = ((am[8] * q[2] + am[4] * q[1]) + q[0] * am[0] + am[12]) * aw + xyz[0];
+          xyz[1] = ((am[1] * q[0] + am[9] * q[2]) + am[5] * q[1] + am[13]) * aw + xyz[1];
+          xyz[2] = ((am[2] * q[0] + am[10] * q[2]) + am[6] * q[1] + am[14]) * aw + xyz[2];
+          --w;
+          wpt += 20;
+        }
+        while ( w );
+        vert += 36;
       }
-      v7 += 3;
-      v7n += 3;
-      result = v24 - 1;
-      v21 = v24 == 1;
-      v26 = v15;
-      --v24;
+      xyz += 3;
+      nrm += 3;
     }
-    while ( !v21 );
+    while ( --remaining );
   }
-  return result;
 }
 
 /* ---- RB_SurfaceXModelWeightSSE  0x0050F780 ----  VERIFIED */
-void __cdecl RB_SurfaceXModelWeightSSE(_DWORD *a1)
+void __cdecl RB_SurfaceXModelWeightSSE(xmodelDrawSurf_t *ds)
 {
-  int v1;               /* esi -- the XSurface */
-  int v2;               /* edi -- vertexCount */
-  int v3;
-  unsigned __int16 v4;  /* the tess base vertex, MOVZX'd at 0x50F7DB */
-  const char *vert;     /* edi -- the blend vertex stream, surf[+20] */
-  const char *wpt;
-  int mbase;            /* var_10 -- dobj->skelMats + (part << 6) + 0x30 */
-  const float *m;
-  const float *am;
-  const float *p;
-  const float *q;
-  float *v10;
-  float *v10n;
-  float pos[3];
-  float w;
-  float aw;
-  int n;
-  int v13;
-  int c;
+  XSurface      *surf = ds->surf;
+  DObj          *dobj = ds->dobj;
+  int            vertexCount = surf->vertexCount;
+  int            indexCount = 3 * surf->triangleCount;
+  unsigned short baseVertex;
+  char          *vert;
+  char          *wpt;
+  int            mbase;
+  float         *xyz;
+  float         *nrm;
+#ifndef COD1_VC7
+  float          pos[4];   /* xmm0: lane 3 is stored too (see the movups below) */
+  int            remaining;
+  int            c;
+#endif
 
-  v1 = a1[2];
-  v2 = *(__int16 *)(v1 + 2);
-  v3 = 3 * *(__int16 *)(v1 + 4);
-  RB_CheckOverflow(v2, v3);
-  v4 = tess_numVertexes;
-  tess_numVertexes += v2;
-  XSurfaceGetTris(2 * tess_numIndexes + ((int)(char *)tess_indexes), v1, v4);
-  tess_numIndexes += v3;
-  v10  = (float *)(12 * v4 + ((int)(char *)tess_xyz));
-  v10n = (float *)(12 * v4 + ((int)(char *)tess_stageNormals));
-  vert = *(const char **)(v1 + 32);
-  Com_Memcpy((void *)(8 * v4 + ((int)(char *)tess_texCoords0)), *(int **)(v1 + 36), 8 * v2);
-  mbase = (*(unsigned __int8 *)(a1[3] + a1[1] + 80) << 6) + *(_DWORD *)(a1[1] + 4) + 48;
-  wpt = *(const char **)(v1 + 24);
-  v13 = v2;
+  RB_CheckOverflow(vertexCount, indexCount);
+  baseVertex = tess_numVertexes;
+  tess_numVertexes += vertexCount;
+  XSurfaceGetTris((int)((char *)tess_indexes + 2 * tess_numIndexes), (int)surf, baseVertex);
+  tess_numIndexes += indexCount;
+  xyz = tess_xyz + 3 * baseVertex;
+  nrm = tess_stageNormals + 3 * baseVertex;
+  vert = (char *)surf->vertexData;
+  Com_Memcpy((char *)tess_texCoords0 + 8 * baseVertex, surf->texCoords, 8 * vertexCount);
+  mbase = (dobj->childPartBaseIndices[ds->childIndex] << 6) + (int)dobj->evalStorage + 48;
+  wpt = (char *)surf->weightedPoints;
+#ifdef COD1_VC7
+  /* retail's inline SSE, 0x50F83C-0x50F94B (the asm block gives it the ebp
+   * frame); movups stores 16 bytes at a 12-byte stride, so lane 3 lands on
+   * the next vertex's x (and past the last one) */
+  __asm
+  {
+    mov       edi, vert
+  weightVertLoop:
+    prefetchnta [edi+80h]
+    mov       eax, [edi+1Ch]
+    mov       edx, mbase
+    lea       esi, [edi+10h]
+    add       edx, eax
+    movss     xmm0, [esi]
+    movaps    xmm6, [edx]
+    movss     xmm3, [edi]
+    shufps    xmm0, xmm0, 0
+    shufps    xmm3, xmm3, 0
+    mulps     xmm0, xmm6
+    movss     xmm1, [esi+4]
+    mulps     xmm3, xmm6
+    movss     xmm4, [edi+4]
+    movaps    xmm7, [edx+10h]
+    shufps    xmm1, xmm1, 0
+    shufps    xmm4, xmm4, 0
+    mulps     xmm1, xmm7
+    movss     xmm2, [esi+8]
+    mulps     xmm4, xmm7
+    movss     xmm5, [edi+8]
+    addps     xmm0, xmm1
+    addps     xmm3, xmm4
+    movaps    xmm6, [edx+20h]
+    shufps    xmm2, xmm2, 0
+    movaps    xmm7, [edx+30h]
+    shufps    xmm5, xmm5, 0
+    mulps     xmm2, xmm6
+    addps     xmm0, xmm7
+    mulps     xmm5, xmm6
+    addps     xmm0, xmm2
+    addps     xmm3, xmm5
+    mov       esi, nrm
+    movups    [esi], xmm3
+    add       esi, 0Ch
+    mov       ecx, [edi+0Ch]
+    mov       nrm, esi
+    test      ecx, ecx
+    je        weightNoBlend
+    movss     xmm1, [edi+20h]
+    mov       esi, wpt
+    shufps    xmm1, xmm1, 0
+    mulps     xmm0, xmm1
+  weightBlendLoop:
+    movss     xmm3, [esi]
+    mov       eax, [esi+0Ch]
+    mov       edx, mbase
+    movss     xmm4, [esi+4]
+    add       edx, eax
+    movaps    xmm6, [edx]
+    shufps    xmm3, xmm3, 0
+    movaps    xmm7, [edx+10h]
+    shufps    xmm4, xmm4, 0
+    mulps     xmm3, xmm6
+    movss     xmm5, [esi+8]
+    movaps    xmm6, [edx+20h]
+    mulps     xmm4, xmm7
+    shufps    xmm5, xmm5, 0
+    movaps    xmm7, [edx+30h]
+    mulps     xmm5, xmm6
+    addps     xmm3, xmm4
+    movss     xmm1, [esi+10h]
+    addps     xmm3, xmm5
+    addps     xmm3, xmm7
+    shufps    xmm1, xmm1, 0
+    mulps     xmm3, xmm1
+    dec       ecx
+    lea       esi, [esi+14h]
+    addps     xmm0, xmm3
+    jne       weightBlendLoop
+    mov       wpt, esi
+    add       edi, 4
+  weightNoBlend:
+    mov       esi, xyz
+    mov       eax, vertexCount
+    add       edi, 20h
+    movups    [esi], xmm0
+    add       esi, 0Ch
+    dec       eax
+    mov       xyz, esi
+    mov       vertexCount, eax
+    jne       weightVertLoop
+  }
+#else
+  remaining = vertexCount;
   do
   {
-    m = (const float *)(mbase + *(_DWORD *)(vert + 28));
-    p = (const float *)(vert + 16);
-    q = (const float *)vert;
-    for ( c = 0; c < 3; ++c )
+    XSurfaceBlendVert *bv = (XSurfaceBlendVert *)vert;
+    const float       *m = (const float *)(mbase + bv->blend.boneMatrixOffset);
+    const float       *p = bv->blend.position;
+    const float       *q = bv->normal;
+    int                count;
+
+    /* Packed SSE in retail (0x50F851-0x50F8B2): every mulps/addps rounds to
+     * single precision, so each product and partial sum is cast / assigned
+     * to float here (x87 /arch:IA32 Release build).  All four lanes are
+     * computed because retail stores normal and position with 16-byte movups
+     * (0x50F8B8, 0x50F93E) at a 12-byte stride: lane 3 (matrix column 3)
+     * spills into the next vertex's x and survives after the last vertex. */
+    for ( c = 0; c < 4; ++c )
     {
-      /* origin BEFORE the z product -- 0x50F8A9 precedes 0x50F8AF */
-      pos[c]  = ((p[0] * m[c] + p[1] * m[c + 4]) + m[c + 12]) + p[2] * m[c + 8];
-      v10n[c] = (q[0] * m[c] + q[1] * m[c + 4]) + q[2] * m[c + 8];
+      float t;
+      float n;
+
+      /* origin term is added BEFORE the z product -- 0x50F8A9 precedes 0x50F8AF */
+      t      = (float)(p[0] * m[c]) + (float)(p[1] * m[c + 4]);
+      t      = t + m[c + 12];
+      pos[c] = t + (float)(p[2] * m[c + 8]);
+      t      = (float)(q[0] * m[c]) + (float)(q[1] * m[c + 4]);
+      n      = t + (float)(q[2] * m[c + 8]);
+      if ( nrm + c == tess_stageNormals + 24576 )   /* one past the array: retail 0x0183FF60 = tess_stageBitangents[0] */
+        tess_stageBitangents[0] = n;
+      else
+        nrm[c] = n;
     }
-    n = *(_DWORD *)(vert + 12);
-    if ( n )
+    count = bv->additiveWeightCount;
+    if ( count )
     {
-      w = *(float *)(vert + 32);
+      float w = bv->primaryWeight;
+
       pos[0] = pos[0] * w;
       pos[1] = pos[1] * w;
       pos[2] = pos[2] * w;
+      pos[3] = pos[3] * w;
       do
       {
-        am = (const float *)(mbase + *(_DWORD *)(wpt + 12));
-        q  = (const float *)wpt;
-        aw = *(float *)(wpt + 16);
-        for ( c = 0; c < 3; ++c )
-          pos[c] = ((( q[0] * am[c] + q[1] * am[c + 4]) + q[2] * am[c + 8])
-                    + am[c + 12]) * aw
-                   + pos[c];
+        XSurfaceWeightedPoint *wp = (XSurfaceWeightedPoint *)wpt;
+        const float           *am = (const float *)(mbase + wp->blend.boneMatrixOffset);
+        float                  aw = wp->weight;
+
+        q = wp->blend.position;
+        for ( c = 0; c < 4; ++c )   /* 0x50F8D7: ((q0*am0 + q1*am4) + q2*am8 + am12) * w, then pos += */
+        {
+          float t;
+
+          t      = (float)(q[0] * am[c]) + (float)(q[1] * am[c + 4]);
+          t      = t + (float)(q[2] * am[c + 8]);
+          t      = t + am[c + 12];
+          t      = t * aw;
+          pos[c] = t + pos[c];
+        }
         wpt += 20;
-        --n;
+        --count;
       }
-      while ( n );
+      while ( count );
       vert += 4;
     }
-    v10[0] = pos[0];
-    v10[1] = pos[1];
-    v10[2] = pos[2];
+    xyz[0] = pos[0];
+    xyz[1] = pos[1];
+    xyz[2] = pos[2];
+    xyz[3] = pos[3];   /* movups lane 3: the next vertex's x (tess_xyz is 32768 floats, so in bounds) */
     vert += 32;
-    v10 += 3;
-    v10n += 3;
-    --v13;
+    xyz += 3;
+    nrm += 3;
+    --remaining;
   }
-  while ( v13 );
+  while ( remaining );
+#endif
 }
-

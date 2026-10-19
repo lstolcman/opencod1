@@ -34,7 +34,7 @@ typedef enum {
 #define MAXSIZE             8       /* cmp esi, 8 in recurseQuad, 0x00406A80 */
 #define MINSIZE             4       /* cmp esi, 4 in recurseQuad, 0x00406AD1 */
 
-#define DEFAULT_CIN_WIDTH   512     /* mov dword_877828[eax], 512 in CIN_PlayCinematic, 0x00407A5B */
+#define DEFAULT_CIN_WIDTH   512     /* cinTable[h].CIN_WIDTH = 512 in CIN_PlayCinematic, 0x00407A5B */
 #define DEFAULT_CIN_HEIGHT  512
 
 #define LETTERBOX_OFFSET    105

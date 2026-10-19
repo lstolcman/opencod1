@@ -5,36 +5,111 @@
  * @fidelity-default: unreviewed
  *
  * Hand-written parts: the SPLIT-RECORD sites (see the note below);
- * PC_ExpandBuiltinDefine 0x0043E4B0; PC_EvaluateTokens 0x0043FC10 and its two
- * call sites; and the two calls in PC_ReadToken to PC_ReadDirective 0x00440FE0
- * and PC_ReadDollarDirective 0x00441350, which live in botlib/l_precomp_pc.c
- * along with the two .data tables they walk.
+ * PC_ExpandBuiltinDefine 0x0043E4B0; and the two calls in PC_ReadToken to
+ * PC_ReadDirective 0x00440FE0 and PC_ReadDollarDirective 0x00441350, which
+ * live in botlib/l_precomp_pc.c along with the two .data tables they walk.
+ * PC_EvaluateTokens 0x0043FC10 is RTCW's text (a standalone VC7 build of it
+ * reproduces retail's frame and code).
  *
- * PC_ExpectTokenType (0x00441740) is a stub, unreachable in retail (no xrefs):
- * CoD MP ships no BotLibSetup and no bots.
+ * PC_ExpectTokenType (0x00441740) is unreachable in retail (no xrefs):
+ * CoD MP ships no BotLibSetup and no bots.  Its body is reconstructed anyway
+ * for retail fidelity.
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "l_script.h"
+#include "l_memory.h"
+/* ---- module-owned globals ---- */
+int numtokens;
+void *globaldefines;
+char pc_baseFolder[64];   /* 0x01646560, PC_SetBaseFolder's base folder */
+
+/* ---- file-local records (RTCW l_precomp.h; not carried in l_script.h) ----
+ *
+ * token_t, source_t, script_t and punctuation_t all live in l_script.h with
+ * their offsets pinned there.  Only define_t and indent_t are private to this
+ * unit, so they are defined here.  source_t leaves defines/definehash/
+ * indentstack as void* (they predate these types), so those fields are cast at
+ * their use sites below. */
+
+/* define_t -- one preprocessor macro.  Offsets fixed by the retail field
+ * accesses: name +0, flags +4 (DEFINE_FIXED = 1), builtin +8, numparms +12,
+ * parms +16, tokens +20, next +24, hashnext +28.  Z_Malloc(sizeof(define_t) +
+ * strlen(name) + 1) reads in the decompile as malloc(strlen + 37) = 32 payload
+ * + a 4-byte heap magic + the trailing NUL, and memset clears 0x20 = 32 bytes.
+ * RTCW layout, no CoD divergence. */
+typedef struct define_s {
+	char *name;                     /* +0  */
+	int flags;                      /* +4  */
+	int builtin;                    /* +8  */
+	int numparms;                   /* +12 */
+	token_t *parms;                 /* +16 */
+	token_t *tokens;                /* +20 */
+	struct define_s *next;          /* +24 */
+	struct define_s *hashnext;      /* +28 */
+} define_t;                         /* 32 bytes */
+
+COD1_ASSERT_SIZE( define_t, 32 );
+COD1_STATIC_ASSERT( offsetof(define_t, tokens) == 20, "define_t.tokens must be +20" );
+COD1_STATIC_ASSERT( offsetof(define_t, hashnext) == 28, "define_t.hashnext must be +28" );
+
+/* define->flags */
+#define DEFINE_FIXED    1
+
+/* define->builtin values -- PC_ExpandBuiltinDefine's switch. */
+#define BUILTIN_LINE    1
+#define BUILTIN_FILE    2
+#define BUILTIN_DATE    3
+#define BUILTIN_TIME    4
+
+/* indent_t -- one #if/#ifdef/#else nesting level on source->indentstack.
+ * Z_Malloc(0x14) = a 4-byte heap magic + this 16-byte record: type +0,
+ * skip +4, script +8, next +12.  RTCW layout. */
+typedef struct indent_s {
+	int type;                       /* +0  */
+	int skip;                       /* +4  */
+	script_t *script;               /* +8  */
+	struct indent_s *next;          /* +12 */
+} indent_t;                         /* 16 bytes */
+
+COD1_ASSERT_SIZE( indent_t, 16 );
+
+/* indent types -- PC_PushIndent's `type` argument.  RTCW INDENT_*. */
+#define INDENT_IF       1
+#define INDENT_ELSE     2
+#define INDENT_ELIF     4
+#define INDENT_IFDEF    8
+#define INDENT_IFNDEF   16
+
+/* Two DEFINEHASHSIZE-driven bounds this unit walks the hash table with. */
+#define DEFINEHASHSIZE  1024
+
+/* The 0x12345678 heap magic Z_MallocInternal stamps ahead of every block and
+ * free() checks before releasing it. */
+#define ZONE_MAGIC      0x12345678
+
+/* Allocation goes through botlib's GetMemory / GetClearedMemory / FreeMemory
+ * (l_memory_mp.c 0x0043D6B0 / 0x0043D6D0 / 0x0043D770), which LTCG inlines at
+ * every site here, as in retail.  The former tree-only static copies
+ * (PC_MP_GetMemory & co.) were emitted as three dead out-of-line functions
+ * retail does not have; their LTCG symbols shifted VC7's scheduling ties in
+ * yylex and Netchan_Process (tools/vc7/tie_probe.py). */
 
 /*
  * ===========================================================================
- * THE SPLIT TOKEN RECORD -- read this before touching any local named
- * ArgList, Buffer or Source in this file.
+ * THE STACK TOKEN RECORD
  * ===========================================================================
  *
  * Retail builds a `token_t token;` on the stack in eleven functions here.  It
- * is 1072 bytes and it always sits at [ebp-434h], running down to the security
+ * is 1072 bytes and always sits at [ebp-434h], running down to the security
  * cookie at [ebp-4].  Callees read and write the full record: PC_ReadLine and
  * PC_ReadSourceToken fill 1072 bytes; PC_CopyToken memcpys 0x430 bytes out.
  *
- * Each such site declares the real `token_t tok;`, points the original char*
- * name at tok.string so the body text does not have to change, and roots each
- * loose scalar on its field (+1024 type, +1028 subtype, +1048 whitespace_p
- * and so on).  `tok.string` and `&tok` are the same address, so calls that
- * want the whole record are correct unchanged.  Sites are marked SPLIT-RECORD.
+ * The Hex-Rays decompile split each such record into a char* name (pointed at
+ * token.string) plus loose scalars rooted on the fields (+1024 type, +1028
+ * subtype, +1048 whitespace_p and so on).  This tidy folds every site back
+ * into a plain `token_t token;` and passes &token where the whole record is
+ * wanted -- `token.string` and `&token` are the same address.
  *
  * Layout is in l_script.h.
  */
@@ -42,7 +117,7 @@
 /* Functions this unit calls that live elsewhere.  Declared unprototyped and
  * int-returning: C89 makes that compatible with any definition.  Anything a
  * real header already declares is excluded -- StripDoubleQuotes
- * (__fastcall, string@<edx>), LoadScriptFile (one stack argument),
+ * (string@<edx>), LoadScriptFile (one stack argument),
  * LoadScriptMemory (retail lifts length into EAX; source order is
  * ( ptr, length, name )) and PS_ReadToken (retail ( token@<eax>,
  * script@<ecx> ); source order is ( script, token )) all come from
@@ -53,104 +128,84 @@
  * PC_PrintDefineHashTable is RTCW l_precomp.c:522 verbatim and uses Log_Write
  * for all three prints. */
 extern void QDECL Log_Write( char *fmt, ... );
-extern int SEH_GetLocalizedString_m();
-extern void Sys_OutOfMemoryPrep( void );
 
 /* PC_CheckTokenString (0x00441A20) is defined later in this file but called
  * earlier, from PC_ReadDefineParms.  The spelling matches the definition. */
-int __cdecl PC_CheckTokenString( _DWORD *source, const char *string );
+int __cdecl PC_CheckTokenString( source_t *source, const char *string );
 
-/* MessageBoxA is implicitly declared in this unit (four sites, all on the
- * Sys_OutOfMemoryPrep -> exit(-1) path).  It resolves to the cdecl shim in
- * win32/win_import_aliases.c, which forwards to the real __stdcall import.
- * Do not declare the __stdcall prototype here; that would bind to
- * __imp__MessageBoxA@16 and bypass the shim. */
+/* PC_ExpectTokenType (0x00441740) has no callers in retail or the tree.
+ * Retail passes subtype in EBX and type in ESI; this unit uses RTCW source
+ * order, so any future caller must pass ( source, type, subtype, token ). */
+int __cdecl PC_ExpectTokenType( source_t *source, int type, int subtype, token_t *token );
 
 /* ---- SourceError  0x0043D7B0 ---- */
 // SourceError | CONFIRMED | RTCW l_precomp.c SourceError.  DIVERGENCE: CoD prefixes the message with the "^1" red colour code; RTCW emits it plain via botimport.Print(PRT_ERROR,...)
-void SourceError(int a1, char *Format, ...)
+void SourceError(source_t *source, char *str, ...)
 {
-  char Buffer[1024]; // [esp+0h] [ebp-404h] BYREF
-  unsigned int v3;
-  unsigned int retaddr;
-  va_list ArgList; // [esp+410h] [ebp+Ch] BYREF
+  char text[1024];
+  va_list ap;
 
-  va_start(ArgList, Format);
-  v3 = retaddr ^ _security_cookie;
-  vsprintf(Buffer, Format, ArgList);
+  va_start(ap, str);
+  vsprintf(text, str, ap);
   Com_Printf(
     "^1Error: file %s, line %d: %s\n",
-    *(const char **)(a1 + 524),
-    *(_DWORD *)(*(_DWORD *)(a1 + 524) + 288),
-    Buffer);
+    source->scriptstack->filename,
+    source->scriptstack->line,
+    text);
 }
 
 /* ---- SourceWarning  0x0043D820 ---- */
 // SourceWarning | HIGH | RTCW SourceWarning (same format, no colour prefix).  Distinguished from SourceError purely by the absence of the ^1 colour prefix.
-void SourceWarning(int a1, char *Format, ...)
+void SourceWarning(source_t *source, char *str, ...)
 {
-  char Buffer[1024]; // [esp+0h] [ebp-404h] BYREF
-  unsigned int v3;
-  unsigned int retaddr;
-  va_list ArgList; // [esp+410h] [ebp+Ch] BYREF
+  char text[1024];
+  va_list ap;
 
-  va_start(ArgList, Format);
-  v3 = retaddr ^ _security_cookie;
-  vsprintf(Buffer, Format, ArgList);
-  Com_Printf("file %s, line %d: %s\n", *(const char **)(a1 + 524), *(_DWORD *)(*(_DWORD *)(a1 + 524) + 288), Buffer);
+  va_start(ap, str);
+  vsprintf(text, str, ap);
+  Com_Printf("file %s, line %d: %s\n", source->scriptstack->filename, source->scriptstack->line, text);
 }
 
 /* ---- PC_PushIndent  0x0043D890 ---- */
 // PC_PushIndent | CONFIRMED | RTCW l_precomp.c:189 -- mallocs 0x14 node w/ 0x12345678 heap magic, links onto source[135] indent stack, tracks skip in [136]
-int *__cdecl PC_PushIndent(_DWORD *a1, int a2, int a3)
+indent_t *__cdecl PC_PushIndent(source_t *source, int type, int skip)
 {
-  int *result;
-  BOOL v4;
-  int v5;
-  int v6;
+  int *magic;
+  indent_t *indent;
 
-  result = Z_MallocInternal(0x14u);
-  if ( result )
-    *result++ = 305419896;
-  *result = a2;
-  result[2] = a1[131];
-  v4 = a3 != 0;
-  result[1] = v4;
-  v5 = v4 + a1[136];
-  v6 = a1[135];
-  a1[136] = v5;
-  result[3] = v6;
-  a1[135] = result;
-  return result;
+  magic = Z_MallocInternal(4 + sizeof(indent_t));   /* 0x14 = heap magic + indent_t */
+  if ( magic )
+    *magic++ = ZONE_MAGIC;
+  indent = (indent_t *)magic;
+  indent->type = type;
+  indent->script = source->scriptstack;
+  indent->skip = (skip != 0);
+  source->skip += indent->skip;
+  indent->next = (indent_t *)source->indentstack;
+  source->indentstack = indent;
+  return indent;
 }
 
 /* ---- PC_PopIndent  0x0043D8F0 ---- */
 // PC_PopIndent | CONFIRMED | RTCW l_precomp.c:206 -- pops source[135], writes back type/skip, frees node if heap magic present
-void __cdecl PC_PopIndent(_DWORD *a1, _DWORD *a2, _DWORD *a3)
+void __cdecl PC_PopIndent(source_t *source, int *type, int *skip)
 {
-  _DWORD *v4;
-  int v5;
-  int v6;
-  _DWORD *v7;
+  indent_t *indent;
 
-  *a1 = 0;
-  *a2 = 0;
-  v4 = (_DWORD *)a3[135];
-  if ( v4 )
-  {
-    if ( v4[2] == a3[131] )
-    {
-      *a1 = *v4;
-      *a2 = v4[1];
-      v5 = a3[136];
-      a3[135] = *(_DWORD *)(a3[135] + 12);
-      v6 = v4[1];
-      v7 = v4 - 1;
-      a3[136] = v5 - v6;
-      if ( *v7 == 305419896 )
-        free(v7);
-    }
-  }
+  *type = 0;
+  *skip = 0;
+  indent = (indent_t *)source->indentstack;
+  if ( !indent )
+    return;
+  /* must be an indent from the current script */
+  if ( indent->script != source->scriptstack )
+    return;
+  *type = indent->type;
+  *skip = indent->skip;
+  source->indentstack = ((indent_t *)source->indentstack)->next;
+  source->skip -= indent->skip;
+  if ( ((int *)indent)[-1] == ZONE_MAGIC )
+    free((int *)indent - 1);
 }
 
 /* ---- PC_PushScript  0x0043D960 ---- */
@@ -166,29 +221,21 @@ void __cdecl PC_PopIndent(_DWORD *a1, _DWORD *a2, _DWORD *a3)
    Both scripts are script_t*, whose filename[] is at +0, so passing the struct
    pointers is passing the filenames.  99999 is retail's "compare it all"
    length; it is not a buffer bound and is reproduced as-is. */
-void __cdecl PC_PushScript(int a1, int a2)
+void __cdecl PC_PushScript(script_t *script, source_t *source)
 {
-  int v2;
-  int v3;
+  script_t *s;
 
-  v2 = *(_DWORD *)(a2 + 524);
-  v3 = v2;
-  if ( v2 )
+  for ( s = source->scriptstack; s; s = s->next )
   {
-    while ( !a1 || Q_stricmpn((const char *)v3, (const char *)a1, 99999) )
+    if ( script && !Q_stricmpn(s->filename, script->filename, 99999) )
     {
-      v3 = *(_DWORD *)(v3 + 1384);
-      if ( !v3 )
-        goto LABEL_5;
+      SourceError(source, "%s recursively included", script->filename);
+      return;
     }
-    SourceError(a2, "%s recursively included", (const char *)a1);
   }
-  else
-  {
-LABEL_5:
-    *(_DWORD *)(a1 + 1384) = v2;
-    *(_DWORD *)(a2 + 524) = a1;
-  }
+  /* push the script on the script stack */
+  script->next = source->scriptstack;
+  source->scriptstack = script;
 }
 
 /* ---- PC_InitTokenHeap  0x0043D9C0 ----   VERBATIM
@@ -207,574 +254,364 @@ void PC_InitTokenHeap( void )
 }
 
 /* ---- PC_CopyToken  0x0043D9D0 ---- */
-// PC_CopyToken | CONFIRMED | RTCW l_precomp.c PC_CopyToken -- token alloc 0x434 (magic 0x12345678 + 0x430 payload), qmemcpy 0x430, bumps numtokens.
-void *__cdecl PC_CopyToken(const void *token)
+// PC_CopyToken | CONFIRMED | RTCW l_precomp.c PC_CopyToken -- token alloc 0x434 (magic 0x12345678 + 0x430 payload), memcpy 0x430, bumps numtokens.
+token_t *__cdecl PC_CopyToken(const token_t *token)
 {
-  int *v1;
-  void *result;
-  int v3;
+  token_t *t;
 
-  v1 = Z_MallocInternal(0x434u);
-  if ( !v1 || (*v1 = 305419896, (result = v1 + 1) == 0) )
+  t = (token_t *)GetMemory(sizeof(token_t));   /* 0x434 = heap magic + token_t */
+  if ( !t )
+  {
     Com_Error(ERR_FATAL, "EXE_ERR_OUT_OF_MEMORY");
-  qmemcpy(result, token, 0x430u);
-  v3 = numtokens + 1;
-  *((_DWORD *)result + 266) = 0;
-  numtokens = v3;
-  return result;
+    return NULL;
+  }
+  memcpy(t, token, sizeof(token_t));   /* 0x430 */
+  t->next = NULL;
+  numtokens++;
+  return t;
 }
 
 /* ---- PC_FreeToken  0x0043DA30 ---- */
 // PC_FreeToken | CONFIRMED | FreeMemory(token) then --numtokens.
-void __cdecl PC_FreeToken(int a1)
+void __cdecl PC_FreeToken(token_t *token)
 {
-  int v1;
-  void *v2;
-
-  v1 = *(_DWORD *)(a1 - 4);
-  v2 = (void *)(a1 - 4);
-  if ( v1 == 305419896 )
-    free(v2);
-  --numtokens;
+  FreeMemory( token );
+  numtokens--;
 }
 
 /* ---- PC_ReadSourceToken  0x0043DA50 ---- */
 // PC_ReadSourceToken | CONFIRMED | RTCW l_precomp.c
-int __cdecl PC_ReadSourceToken(_DWORD *a1, int a2)
+int __cdecl PC_ReadSourceToken(source_t *source,token_t *token)
 {
-  _DWORD *v3;
-  int v4;
-  _DWORD *v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  void *v10;
-  int v11;
-  int v12;
-  _DWORD *v13;
+  token_t *t;
+  script_t *script;
+  int type, skip;
 
-  if ( *(_DWORD *)(a2 + 528) )
-  {
-LABEL_18:
-    qmemcpy(a1, *(const void **)(a2 + 528), 0x430u);
-    v11 = *(_DWORD *)(a2 + 528);
-    v12 = *(_DWORD *)(v11 + 1064);
-    v13 = (_DWORD *)(v11 - 4);
-    *(_DWORD *)(a2 + 528) = v12;
-    if ( *v13 == 305419896 )
-      free(v13);
-    --numtokens;
-  }
-  else
+  /* if there's no token already available */
+  while ( !source->tokens )
   {
     /* PS_ReadToken( script, token ) -- source order; retail's register order
        is ( token@<eax>, script@<ecx> ). */
-    while ( !PS_ReadToken( (script_t *)*(_DWORD *)(a2 + 524), (token_t *)a1 ) )
+    if ( PS_ReadToken( source->scriptstack, token ) )
+      return 1;
+    /* if at the end of the script, remove all indents of the script */
+    if ( source->scriptstack->script_p >= source->scriptstack->end_p )
     {
-      if ( *(_DWORD *)(*(_DWORD *)(a2 + 524) + 264) >= *(_DWORD *)(*(_DWORD *)(a2 + 524) + 268) )
+      while ( source->indentstack &&
+              ((indent_t *)source->indentstack)->script == source->scriptstack )
       {
-        while ( *(_DWORD *)(a2 + 540) )
-        {
-          if ( *(_DWORD *)(*(_DWORD *)(a2 + 540) + 8) != *(_DWORD *)(a2 + 524) )
-            break;
-          SourceWarning(a2, "missing #endif");
-          v3 = *(_DWORD **)(a2 + 540);
-          if ( v3 )
-          {
-            if ( v3[2] == *(_DWORD *)(a2 + 524) )
-            {
-              *(_DWORD *)(a2 + 540) = v3[3];
-              v4 = *(_DWORD *)(a2 + 544) - v3[1];
-              v5 = v3 - 1;
-              *(_DWORD *)(a2 + 544) = v4;
-              if ( *v5 == 305419896 )
-                free(v5);
-            }
-          }
-        }
+        SourceWarning( source, "missing #endif" );
+        PC_PopIndent( source, &type, &skip );
       }
-      v6 = *(_DWORD *)(a2 + 524);
-      v7 = *(_DWORD *)(v6 + 1384);
-      if ( !v7 )
-        return 0;
-      *(_DWORD *)(a2 + 524) = v7;
-      v8 = *(_DWORD *)(v6 + 308);
-      if ( v8 )
-      {
-        v9 = *(_DWORD *)(v8 - 4);
-        v10 = (void *)(v8 - 4);
-        if ( v9 == 305419896 )
-          free(v10);
-      }
-      if ( *(_DWORD *)(v6 - 4) == 305419896 )
-        free((void *)(v6 - 4));
-      if ( *(_DWORD *)(a2 + 528) )
-        goto LABEL_18;
     }
+    /* if this was the initial script, there are no more tokens */
+    if ( !source->scriptstack->next )
+      return 0;
+    /* remove the script and return to the previous one (inlined FreeScript) */
+    script = source->scriptstack;
+    source->scriptstack = source->scriptstack->next;
+    if ( script->punctuationtable && ((int *)script->punctuationtable)[-1] == ZONE_MAGIC )
+      free((int *)script->punctuationtable - 1);
+    if ( ((int *)script)[-1] == ZONE_MAGIC )
+      free((int *)script - 1);
   }
+  /* copy the already available token */
+  memcpy( token, source->tokens, sizeof(token_t) );
+  /* free the read token */
+  t = source->tokens;
+  source->tokens = source->tokens->next;
+  PC_FreeToken( t );
   return 1;
 }
 
 /* ---- PC_UnreadSourceToken  0x0043DBC0 ---- */
 // PC_UnreadSourceToken | CONFIRMED | RTCW l_precomp.c PC_UnreadSourceToken.  Wraps PC_CopyToken then prepends to source->tokens at +528.  Retail: source in ESI, token in EAX.
-int __cdecl PC_UnreadSourceToken(const void *a1, int a2)
+int __cdecl PC_UnreadSourceToken(source_t *source,const token_t *token)
 {
-  _DWORD *v2;
+  token_t *t;
 
-  v2 = PC_CopyToken(a1);
-  v2[266] = *(_DWORD *)(a2 + 528);
-  *(_DWORD *)(a2 + 528) = v2;
+  t = PC_CopyToken(token);
+  t->next = source->tokens;
+  source->tokens = t;
   return 1;
 }
 
 /* ---- PC_ReadDefineParms  0x0043DBF0 ---- */
 // PC_ReadDefineParms | CONFIRMED | RTCW l_precomp.c:377
-int __cdecl PC_ReadDefineParms(int a1, const char **a2, _DWORD *a3, int ArgList)
+int __cdecl PC_ReadDefineParms(source_t *source, define_t *define, token_t **parms, int maxparms)
 {
-  int v4;
-  const char **v6;
-  const char *v7;
-  int v8;
-  int v9;
-  _DWORD *v10;
-  int v11;
-  _DWORD *v12;
-  int *v13;
-  int *v14;
-  void *v15;
-  int v16;
-  char *v17;
-  char *LocalizedString_m;
-  int v19;
-  _DWORD *v20;
-  int v21;
-  int v22;
-  int v23;
-  _DWORD token[269]; // [esp+1Ch] [ebp-434h] BYREF
-  unsigned int retaddr;
+  token_t token;
+  token_t *t, *last;
+  int i, done, lastcomma, numparms, indent;
 
-  v4 = a1;
-  token[268] = retaddr ^ _security_cookie;
-  if ( PC_ReadSourceToken(token, a1) )
+  if ( !PC_ReadSourceToken(source,&token) )
   {
-    v6 = a2;
-    v7 = a2[3];
-    v8 = ArgList;
-    if ( (int)v7 <= ArgList )
-    {
-      v9 = 0;
-      if ( (int)v7 > 0 )
-      {
-        do
-          a3[v9++] = 0;
-        while ( v9 < (int)a2[3] );
-      }
-      if ( !strcmp((const char *)token, "(") )
-      {
-        v11 = 0;
-        v22 = 0;
-        v21 = 0;
-        v19 = 0;
-        v20 = a3;
-        while ( 2 )
-        {
-          if ( v11 >= v8 )
-          {
-            SourceError(v4, "define %s with too many parms", *v6);
-            return 0;
-          }
-          else if ( v11 >= (int)v6[3] )
-          {
-            SourceWarning(v4, "define %s has too many parms", *v6);
-            return 0;
-          }
-          else
-          {
-            v12 = 0;
-            *v20 = 0;
-            v23 = 1;
-            while ( 1 )
-            {
-              if ( !PC_ReadSourceToken(token, a1) )
-              {
-                SourceError(a1, "define %s incomplete", *a2);
-                return 0;
-              }
-              if ( !strcmp((const char *)token, ",") && v19 <= 0 )
-                break;
-              v23 = 0;
-              if ( !strcmp((const char *)token, "(") )
-              {
-                ++v19;
-              }
-              else
-              {
-                if ( !strcmp((const char *)token, ")") && --v19 <= 0 )
-                {
-                  if ( !a3[(_DWORD)a2[3] - 1] )
-                    SourceWarning(a1, "too few define parms");
-                  v22 = 1;
-                  goto LABEL_34;
-                }
-                if ( v21 < (int)a2[3] )
-                {
-                  v13 = (int *)malloc(0x434u);
-                  v14 = v13;
-                  if ( !v13 )
-                  {
-                    Sys_OutOfMemoryPrep();
-                    LocalizedString_m = SEH_GetLocalizedString_m("WIN_OUT_OF_MEM_TITLE");
-                    v17 = SEH_GetLocalizedString_m("WIN_OUT_OF_MEM_BODY");
-                    MessageBoxA(0, v17, LocalizedString_m, 0x10u);
-                    exit(-1);
-                  }
-                  Com_Memset(v13, 0, 0x434u);
-                  v15 = v14 + 1;
-                  *v14 = 305419896;
-                  if ( v14 == (int *)-4 )
-                    Com_Error(ERR_FATAL, "EXE_ERR_OUT_OF_MEMORY");
-                  qmemcpy(v15, token, 0x430u);
-                  v16 = numtokens + 1;
-                  v14[267] = 0;
-                  numtokens = v16;
-                  v14[267] = 0;
-                  if ( v12 )
-                    v12[266] = v15;
-                  else
-                    *v20 = v15;
-                  v12 = v14 + 1;
-                }
-              }
-            }
-            if ( v23 )
-              SourceWarning(a1, "too many comma's");
-LABEL_34:
-            v6 = a2;
-            v11 = ++v21;
-            ++v20;
-            if ( !v22 )
-            {
-              v4 = a1;
-              v8 = ArgList;
-              continue;
-            }
-            return 1;
-          }
-        }
-      }
-      else
-      {
-        v10 = PC_CopyToken(token);
-        v10[266] = *(_DWORD *)(a1 + 528);
-        *(_DWORD *)(a1 + 528) = v10;
-        SourceError(a1, "define %s missing parms", *a2);
-        return 0;
-      }
-    }
-    else
-    {
-      SourceError(a1, "define with more than %d parameters", ArgList);
-      return 0;
-    }
-  }
-  else
-  {
-    SourceError(a1, "define %s missing parms", *a2);
+    SourceError( source, "define %s missing parms", define->name );
     return 0;
   }
+  if ( define->numparms > maxparms )
+  {
+    SourceError( source, "define with more than %d parameters", maxparms );
+    return 0;
+  }
+  for ( i = 0; i < define->numparms; i++ )
+    parms[i] = NULL;
+  /* if no leading "(" */
+  if ( strcmp( token.string, "(" ) )
+  {
+    PC_UnreadSourceToken(source,&token);
+    SourceError( source, "define %s missing parms", define->name );
+    return 0;
+  }
+  /* read the define parameters */
+  for ( done = 0, numparms = 0, indent = 0; !done; )
+  {
+    if ( numparms >= maxparms )
+    {
+      SourceError( source, "define %s with too many parms", define->name );
+      return 0;
+    }
+    if ( numparms >= define->numparms )
+    {
+      SourceWarning( source, "define %s has too many parms", define->name );
+      return 0;
+    }
+    parms[numparms] = NULL;
+    lastcomma = 1;
+    last = NULL;
+    while ( !done )
+    {
+      if ( !PC_ReadSourceToken(source,&token) )
+      {
+        SourceError( source, "define %s incomplete", define->name );
+        return 0;
+      }
+      if ( !strcmp( token.string, "," ) )
+      {
+        if ( indent <= 0 )
+        {
+          if ( lastcomma )
+            SourceWarning( source, "too many comma's" );
+          lastcomma = 1;
+          break;
+        }
+      }
+      lastcomma = 0;
+      if ( !strcmp( token.string, "(" ) )
+      {
+        indent++;
+        continue;
+      }
+      else if ( !strcmp( token.string, ")" ) )
+      {
+        if ( --indent <= 0 )
+        {
+          if ( !parms[define->numparms - 1] )
+            SourceWarning( source, "too few define parms" );
+          done = 1;
+          break;
+        }
+      }
+      if ( numparms < define->numparms )
+      {
+        t = PC_CopyToken( &token );
+        t->next = NULL;
+        if ( last )
+          last->next = t;
+        else
+          parms[numparms] = t;
+        last = t;
+      }
+    }
+    numparms++;
+  }
+  return 1;
 }
 
 /* ---- PC_StringizeTokens  0x0043DF70 ---- */
 // PC_StringizeTokens | CONFIRMED | Builds a quoted string by walking the token list via +1064 (token->next) and strncat-ing each token->string, capped at 1024 (MAX_TOKEN).
-int __cdecl PC_StringizeTokens(int a1, char *Destination)
+int __cdecl PC_StringizeTokens(token_t *tokens, token_t *token)
 {
-  *((_DWORD *)Destination + 256) = 1;
-  *((_DWORD *)Destination + 262) = 0;
-  *((_DWORD *)Destination + 263) = 0;
-  *Destination = 0;
-  for ( *(_WORD *)&Destination[strlen(Destination)] = 34; a1; a1 = *(_DWORD *)(a1 + 1064) )
-    strncat(Destination, (const char *)a1, 1024 - strlen(Destination));
-  /* Closing quote: the two-byte literal at 0x005682F8, a double quote and a
-     NUL. */
-  strncat(Destination, "\"", 1024 - strlen(Destination));
+  token_t *t;
+
+  token->type = TT_STRING;
+  token->whitespace_p = NULL;
+  token->endwhitespace_p = NULL;
+  token->string[0] = '\0';
+  strcat( token->string, "\"" );
+  for ( t = tokens; t; t = t->next )
+    strncat( token->string, t->string, MAX_TOKEN - strlen(token->string) );
+  /* Closing quote: the two-byte literal at 0x005682F8, a double quote and a NUL. */
+  strncat( token->string, "\"", MAX_TOKEN - strlen(token->string) );
   return 1;
 }
 
 /* ---- PC_MergeTokens  0x0043E020 ---- */
 // PC_MergeTokens | CONFIRMED | Concatenates two tokens when the type pair permits (4 = TT_NAME / 3 = TT_NUMBER in this build).
-int __cdecl PC_MergeTokens(int a1, int a2)
+/* RTCW's ( t1, t2 ) order: t2 is appended onto t1, so t1 is the token that
+   grows.  LTCG passes t2 in EAX and t1 in ECX; the declared order also fixes
+   the order PC_ExpandDefine sets them up in. */
+int __cdecl PC_MergeTokens(token_t *t1, token_t *t2)
 {
-  int v3;
-  int v4;
-  unsigned int v5;
-  void *v6;
-
-  v3 = *(_DWORD *)(a2 + 1024);
-  if ( v3 == 4 )
+  /* merging of a name with a name or number */
+  if ( t1->type == TT_NAME && ( t2->type == TT_NAME || t2->type == TT_NUMBER ) )
   {
-    v4 = *(_DWORD *)(a1 + 1024);
-    if ( v4 == 4 || v4 == 3 )
-    {
-      v5 = strlen((const char *)a1) + 1;
-      v6 = (void *)(a2 + strlen((const char *)a2));
-LABEL_8:
-      qmemcpy(v6, (const void *)a1, v5);
-      return 1;
-    }
+    strcat( t1->string, t2->string );
+    return 1;
   }
-  if ( v3 == 1 && *(_DWORD *)(a1 + 1024) == 1 )
+  /* merging of two strings */
+  if ( t1->type == TT_STRING && t2->type == TT_STRING )
   {
-    *(_BYTE *)(strlen((const char *)a2) + a2 - 1) = 0;
-    v5 = strlen((const char *)++a1) + 1;
-    v6 = (void *)(a2 + strlen((const char *)a2));
-    goto LABEL_8;
+    /* remove trailing double quote, then concat without leading double quote */
+    t1->string[strlen(t1->string) - 1] = '\0';
+    strcat( t1->string, &t2->string[1] );
+    return 1;
   }
   return 0;
 }
 
 /* ---- PC_PrintDefineHashTable  0x0043E0C0 ---- */
 // PC_PrintDefineHashTable | CONFIRMED | Iterates 1024 buckets (DEFINEHASHSIZE) printing "%4d:" then each define name; hash chain link is define->hashnext at +28.
-void __cdecl PC_PrintDefineHashTable(int a1)
+void __cdecl PC_PrintDefineHashTable(define_t **definehash)
 {
   int i;
-  _DWORD *j;
+  define_t *d;
 
-  for ( i = 0; i < 1024; ++i )
+  for ( i = 0; i < DEFINEHASHSIZE; i++ )
   {
     Log_Write("%4d:", i);
-    for ( j = *(_DWORD **)(a1 + 4 * i); j; j = (_DWORD *)j[7] )
-      Log_Write((char *)off_56610C, *j);
+    for ( d = definehash[i]; d; d = d->hashnext )
+      Log_Write(" %s", d->name);
     Log_Write("\n");
   }
 }
 
 /* ---- PC_NameHash  0x0043E110 ---- */
 // PC_NameHash | HIGH | RTCW l_precomp.c define-name hash -- (h ^ ((h^(h>>10))>>10)) & 0x3FF, base 119 multiplier
-int __cdecl PC_NameHash(char *a1)
+int __cdecl PC_NameHash(char *name)
 {
-  char v1;
-  int v2;
-  int v3;
-  int v4;
+  int hash, i;
 
-  v1 = *a1;
-  v2 = 0;
-  if ( *a1 )
-  {
-    v3 = 119 - (_DWORD)a1;
-    do
-    {
-      v4 = v1 * (_DWORD)&a1[v3];
-      v1 = a1[1];
-      v2 += v4;
-      ++a1;
-    }
-    while ( v1 );
-  }
-  return ((unsigned __int16)v2 ^ (unsigned __int16)((v2 ^ (v2 >> 10)) >> 10)) & 0x3FF;
+  hash = 0;
+  for ( i = 0; name[i] != '\0'; i++ )
+    hash += name[i] * ( 119 + i );
+  hash = ( hash ^ ( hash >> 10 ) ^ ( hash >> 20 ) ) & ( DEFINEHASHSIZE - 1 );
+  return hash;
 }
 
 /* ---- PC_AddDefineToHash  0x0043E150 ---- */
 // PC_AddDefineToHash | CONFIRMED | define->hashnext (+28) = bucket; bucket = define.
-int __cdecl PC_AddDefineToHash(int a1, int a2)
+int __cdecl PC_AddDefineToHash(define_t **definehash, define_t *define)
 {
-  int result;
+  int hash;
 
-  result = PC_NameHash(*(char **)a2);
-  *(_DWORD *)(a2 + 28) = *(_DWORD *)(a1 + 4 * result);
-  *(_DWORD *)(a1 + 4 * result) = a2;
-  return result;
+  hash = PC_NameHash(define->name);
+  define->hashnext = definehash[hash];
+  definehash[hash] = define;
+  return hash;
 }
 
 /* ---- PC_FindHashedDefine  0x0043E170 ---- */
 // PC_FindHashedDefine | CONFIRMED | RTCW l_precomp.c:576 -- hashes name, walks bucket via define->hashnext(+28), strcmp on define->name
-int __cdecl PC_FindHashedDefine(int a1, char *a2)
+define_t *__cdecl PC_FindHashedDefine(define_t **definehash, char *name)
 {
-  int v2;
+  define_t *d;
 
-  v2 = *(_DWORD *)(a1 + 4 * PC_NameHash(a2));
-  if ( !v2 )
-    return 0;
-  while ( strcmp(*(const char **)v2, a2) )
+  for ( d = definehash[PC_NameHash(name)]; d; d = d->hashnext )
   {
-    v2 = *(_DWORD *)(v2 + 28);
-    if ( !v2 )
-      return 0;
+    if ( !strcmp(d->name, name) )
+      return d;
   }
-  return v2;
+  return NULL;
 }
 
 /* ---- PC_FindDefine  0x0043E1E0 ---- */
 // PC_FindDefine | CONFIRMED | Linear strcmp walk over the non-hashed define list, link at +24 (define->next).
-int __cdecl PC_FindDefine(int a1, const char *a2)
+define_t *__cdecl PC_FindDefine(define_t *defines, const char *name)
 {
-  int v2;
+  define_t *d;
 
-  v2 = a1;
-  if ( !a1 )
-    return 0;
-  while ( strcmp(*(const char **)v2, a2) )
+  for ( d = defines; d; d = d->next )
   {
-    v2 = *(_DWORD *)(v2 + 24);
-    if ( !v2 )
-      return 0;
+    if ( !strcmp(d->name, name) )
+      return d;
   }
-  return v2;
+  return NULL;
 }
 
 /* ---- PC_FindDefineParm  0x0043E240 ---- */
 // PC_FindDefineParm | CONFIRMED | RTCW l_precomp.c:614 -- walks define->parms(+16) via +1064 stride, returns ordinal or -1
-int __cdecl PC_FindDefineParm(const char *a1, int a2)
+int __cdecl PC_FindDefineParm(define_t *define, const char *name)
 {
-  int v2;
-  int v3;
+  token_t *p;
+  int i;
 
-  v2 = *(_DWORD *)(a2 + 16);
-  v3 = 0;
-  if ( !v2 )
-    return -1;
-  while ( strcmp((const char *)v2, a1) )
+  i = 0;
+  for ( p = define->parms; p; p = p->next )
   {
-    v2 = *(_DWORD *)(v2 + 1064);
-    ++v3;
-    if ( !v2 )
-      return -1;
+    if ( !strcmp(p->string, name) )
+      return i;
+    i++;
   }
-  return v3;
+  return -1;
 }
 
 /* ---- PC_FreeDefine  0x0043E2A0 ---- */
 // PC_FreeDefine | CONFIRMED | RTCW l_precomp.c:634 -- frees parm token chain (+1064 stride) then define, decrementing numtokens
-void __cdecl PC_FreeDefine(int a1)
+void __cdecl PC_FreeDefine(define_t *define)
 {
-  int v1;
-  int v2;
-  int v3;
-  void *v4;
-  int v5;
-  int v6;
-  int v7;
-  void *v8;
+  token_t *t, *next;
 
-  v1 = *(_DWORD *)(a1 + 16);
-  if ( v1 )
+  /* free the define parameters (inlined PC_FreeToken) */
+  for ( t = define->parms; t; t = next )
   {
-    do
-    {
-      v2 = *(_DWORD *)(v1 + 1064);
-      v3 = *(_DWORD *)(v1 - 4);
-      v4 = (void *)(v1 - 4);
-      if ( v3 == 305419896 )
-        free(v4);
-      --numtokens;
-      v1 = v2;
-    }
-    while ( v2 );
+    next = t->next;
+    if ( ((int *)t)[-1] == ZONE_MAGIC )
+      free((int *)t - 1);
+    numtokens--;
   }
-  v5 = *(_DWORD *)(a1 + 20);
-  if ( v5 )
+  /* free the define tokens */
+  for ( t = define->tokens; t; t = next )
   {
-    do
-    {
-      v6 = *(_DWORD *)(v5 + 1064);
-      v7 = *(_DWORD *)(v5 - 4);
-      v8 = (void *)(v5 - 4);
-      if ( v7 == 305419896 )
-        free(v8);
-      --numtokens;
-      v5 = v6;
-    }
-    while ( v6 );
+    next = t->next;
+    if ( ((int *)t)[-1] == ZONE_MAGIC )
+      free((int *)t - 1);
+    numtokens--;
   }
-  if ( *(_DWORD *)(a1 - 4) == 305419896 )
-    free((void *)(a1 - 4));
+  /* free the define itself */
+  if ( ((int *)define)[-1] == ZONE_MAGIC )
+    free((int *)define - 1);
 }
 
 /* ---- PC_AddBuiltinDefines  0x0043E340 ---- */
 // PC_AddBuiltinDefines | CONFIRMED | RTCW l_precomp.c:668
-int __cdecl PC_AddBuiltinDefines(int a1)
+void __cdecl PC_AddBuiltinDefines(source_t *source)
 {
-  const char *v1;
-  const char **v2;
-  unsigned int v3; // kr00_4
-  int *v4;
-  int *v5;
-  _DWORD *v6;
-  const char *v7;
-  char *v8;
-  int v9;
-  char v10;
-  int v11;
-  int v12;
-  int v13;
-  int result;
-  char *v15;
-  char *LocalizedString_m;
-  const char **v17;
-  _DWORD v18[10]; // [esp+14h] [ebp-28h] BYREF
-
-  v1 = "__LINE__";
-  v2 = (const char **)v18;
-  v18[0] = "__LINE__";
-  v18[1] = 1;
-  v18[2] = "__FILE__";
-  v18[3] = 2;
-  v18[4] = "__DATE__";
-  v18[5] = 3;
-  v18[6] = "__TIME__";
-  v18[7] = 4;
-  v18[8] = 0;
-  v18[9] = 0;
-  v17 = (const char **)v18;
-  do
+  int i;
+  define_t *define;
+  struct builtin
   {
-    v3 = strlen(v1);
-    v4 = (int *)malloc(v3 + 37);
-    v5 = v4;
-    if ( !v4 )
-    {
-      Sys_OutOfMemoryPrep();
-      LocalizedString_m = SEH_GetLocalizedString_m("WIN_OUT_OF_MEM_TITLE");
-      v15 = SEH_GetLocalizedString_m("WIN_OUT_OF_MEM_BODY");
-      MessageBoxA(0, v15, LocalizedString_m, 0x10u);
-      exit(-1);
-    }
-    Com_Memset(v4, 0, v3 + 37);
-    v6 = v5 + 1;
-    *v5 = 305419896;
-    memset(v5 + 1, 0, 0x20u);
-    v5[1] = (int)(v5 + 9);
-    strcpy((char *)v5 + 36, v1);
-    v7 = v2[1];
-    v8 = (char *)v5[1];
-    v6[1] |= 1u;
-    v6[2] = v7;
-    v9 = *(_DWORD *)(a1 + 536);
-    v10 = *v8;
-    v11 = 0;
-    if ( *v8 )
-    {
-      v12 = 119 - (_DWORD)v8;
-      do
-      {
-        v13 = v10 * (_DWORD)&v8[v12];
-        v10 = v8[1];
-        v11 += v13;
-        ++v8;
-      }
-      while ( v10 );
-      v2 = v17;
-    }
-    result = ((unsigned __int16)v11 ^ (unsigned __int16)((v11 ^ (v11 >> 10)) >> 10)) & 0x3FF;
-    v2 += 2;
-    v6[7] = *(_DWORD *)(v9 + 4 * result);
-    *(_DWORD *)(v9 + 4 * result) = v6;
-    v1 = *v2;
-    v17 = v2;
+    char *string;
+    int builtin;
+  } builtin[] = {
+    { "__LINE__", BUILTIN_LINE },
+    { "__FILE__", BUILTIN_FILE },
+    { "__DATE__", BUILTIN_DATE },
+    { "__TIME__", BUILTIN_TIME },
+    { NULL, 0 }
+  };
+
+  for ( i = 0; builtin[i].string; i++ )
+  {
+    define = (define_t *)GetMemory( sizeof(define_t) + strlen(builtin[i].string) + 1 );
+    memset( define, 0, sizeof(define_t) );
+    define->name = (char *)define + sizeof(define_t);
+    strcpy( define->name, builtin[i].string );
+    define->flags |= DEFINE_FIXED;
+    define->builtin = builtin[i].builtin;
+    /* add the define to the source */
+    PC_AddDefineToHash( (define_t **)source->definehash, define );
   }
-  while ( *v2 );
-  return result;
 }
 
 /* ---- PC_ExpandBuiltinDefine  0x0043E4B0 ---- */
@@ -814,35 +651,35 @@ int __cdecl PC_AddBuiltinDefines(int a1)
 extern long   time( long *timer );
 extern char * ctime( const long *timer );
 
-int __cdecl PC_ExpandBuiltinDefine(int source, token_t *deftoken, int define,
+int __cdecl PC_ExpandBuiltinDefine(source_t *source, token_t *deftoken, define_t *define,
                                    token_t **firsttoken, token_t **lasttoken)
 {
   token_t *token;
   char    *curtime;
   long     t;
 
-  token = (token_t *)PC_CopyToken(deftoken);
-  switch ( *(int *)(define + 8) )        /* define->builtin */
+  token = PC_CopyToken(deftoken);
+  switch ( define->builtin )
   {
-    case 1:                              /* BUILTIN_LINE */
+    case BUILTIN_LINE:
       sprintf(token->string, "%d", deftoken->line);
       token->intvalue   = deftoken->line;
-      token->type       = TT_NUMBER;
       token->floatvalue = (double)deftoken->line;
+      token->type       = TT_NUMBER;
       token->subtype    = TT_DECIMAL | TT_INTEGER;   /* 4104, as RTCW */
       *firsttoken = token;
       *lasttoken  = token;
       return 1;
 
-    case 2:                              /* BUILTIN_FILE */
-      strcpy(token->string, *(const char **)(source + 524));  /* scriptstack->filename */
+    case BUILTIN_FILE:
+      strcpy(token->string, source->scriptstack->filename);
       token->type    = TT_NAME;
       token->subtype = strlen(token->string);
       *firsttoken = token;
       *lasttoken  = token;
       return 1;
 
-    case 3:                              /* BUILTIN_DATE */
+    case BUILTIN_DATE:
       t = time(0);
       curtime = ctime(&t);
       strcpy(token->string, "\"");
@@ -856,7 +693,7 @@ int __cdecl PC_ExpandBuiltinDefine(int source, token_t *deftoken, int define,
       *lasttoken  = token;
       return 1;
 
-    case 4:                              /* BUILTIN_TIME */
+    case BUILTIN_TIME:
       t = time(0);
       curtime = ctime(&t);
       strcpy(token->string, "\"");
@@ -878,253 +715,168 @@ int __cdecl PC_ExpandBuiltinDefine(int source, token_t *deftoken, int define,
 
 /* ---- PC_ExpandDefine  0x0043E6A0 ---- */
 // PC_ExpandDefine | CONFIRMED | RTCW l_precomp.c:844
-int __cdecl PC_ExpandDefine(int a1, _DWORD *a2, int a3, char **a4, char **a5)
+int __cdecl PC_ExpandDefine(source_t *source, token_t *deftoken, define_t *define,
+                            token_t **firsttoken, token_t **lasttoken)
 {
-  int v5;
-  int result;
-  int v7;
-  int v8;
-  int v9;
-  _DWORD *i;
-  int *v11;
-  int *v12;
-  void *v13;
-  int v14;
-  int v15;
-  int DefineParm;
-  _DWORD *v17;
-  int v18;
-  int v19;
-  int v20;
-  int v21;
-  void *v22;
-  int v23;
-  char *v24;
-  int v25;
-  int v26;
-  int v27;
-  int v28;
-  void *v29;
-  char *LocalizedString_m;
-  char *v31;
-  char *v32;
-  _DWORD *v33;
-  _DWORD v34[128]; // [esp+Ch] [ebp-634h] BYREF
-  char v35[1072]; // [esp+20Ch] [ebp-434h] BYREF
-  unsigned int v36;
-  unsigned int retaddr;
+  token_t *parms[128], *dt, *pt, *t;   /* MAX_DEFINEPARMS */
+  token_t *t1, *t2, *first, *last, *nextpt, token;
+  int parmnum, i;
 
-  v5 = a3;
-  v36 = retaddr ^ _security_cookie;
-  if ( *(_DWORD *)(a3 + 8) )
-    /* Q3 source order (source, deftoken, define, firsttoken, lasttoken). */
-    return PC_ExpandBuiltinDefine(a1, (token_t *)a2, a3, (token_t **)a4, (token_t **)a5);
-  if ( *(_DWORD *)(a3 + 12) )
+  /* if it is a builtin define */
+  if ( define->builtin )
+    return PC_ExpandBuiltinDefine( source, deftoken, define, firsttoken, lasttoken );
+  /* if the define has parameters */
+  if ( define->numparms )
   {
-    result = PC_ReadDefineParms(a1, (const char **)a3, v34, 128);
-    if ( !result )
-      return result;
+    if ( !PC_ReadDefineParms( source, define, parms, 128 ) )
+      return 0;
   }
-  v7 = *(_DWORD *)(a3 + 20);
-  v8 = 0;
-  v33 = 0;
-  v32 = 0;
-  if ( !v7 )
-    goto LABEL_31;
-  do
+  /* empty list at first */
+  first = NULL;
+  last = NULL;
+  /* create a list with tokens of the expanded define */
+  for ( dt = define->tokens; dt; dt = dt->next )
   {
-    if ( *(_DWORD *)(v7 + 1024) == 4 && (v9 = PC_FindDefineParm((const char *)v7, v5), v9 >= 0) )
+    parmnum = -1;
+    /* if the token is a name, it could be a define parameter */
+    if ( dt->type == TT_NAME )
+      parmnum = PC_FindDefineParm( define, dt->string );
+    /* if it is a define parameter */
+    if ( parmnum >= 0 )
     {
-      for ( i = (_DWORD *)v34[v9]; i; v32 = (char *)(v12 + 1) )
+      for ( pt = parms[parmnum]; pt; pt = pt->next )
       {
-        v11 = (int *)malloc(0x434u);
-        v12 = v11;
-        if ( !v11 )
-        {
-          Sys_OutOfMemoryPrep();
-          LocalizedString_m = SEH_GetLocalizedString_m("WIN_OUT_OF_MEM_TITLE");
-          v24 = SEH_GetLocalizedString_m("WIN_OUT_OF_MEM_BODY");
-          MessageBoxA(0, v24, LocalizedString_m, 0x10u);
-          exit(-1);
-        }
-        Com_Memset(v11, 0, 0x434u);
-        v13 = v12 + 1;
-        *v12 = 305419896;
-        if ( v12 == (int *)-4 )
-          Com_Error((errorParm_t)v13, "EXE_ERR_OUT_OF_MEMORY");
-        qmemcpy(v13, i, 0x430u);
-        v14 = numtokens + 1;
-        v12[267] = 0;
-        numtokens = v14;
-        v12[267] = 0;
-        if ( v32 )
-          *((_DWORD *)v32 + 266) = v13;
+        t = PC_CopyToken( pt );
+        /* add the token to the list */
+        t->next = NULL;
+        if ( last )
+          last->next = t;
         else
-          v33 = v12 + 1;
-        i = (_DWORD *)i[266];
+          first = t;
+        last = t;
       }
     }
     else
     {
-      if ( *(_BYTE *)v7 != 35 || *(_BYTE *)(v7 + 1) )
+      /* if stringizing operator */
+      if ( dt->string[0] == '#' && dt->string[1] == '\0' )
       {
-        v31 = (char *)v7;
+        /* the stringizing operator must be followed by a define parameter */
+        if ( dt->next )
+          parmnum = PC_FindDefineParm( define, dt->next->string );
+        else
+          parmnum = -1;
+        if ( parmnum >= 0 )
+        {
+          /* step over the stringizing operator */
+          dt = dt->next;
+          /* stringize the define parameter tokens */
+          if ( !PC_StringizeTokens( parms[parmnum], &token ) )
+          {
+            SourceError( source, "can't stringize tokens" );
+            return 0;
+          }
+          t = PC_CopyToken( &token );
+        }
+        else
+        {
+          SourceWarning( source, "stringizing operator without define parameter" );
+          continue;
+        }
       }
       else
       {
-        v15 = *(_DWORD *)(v7 + 1064);
-        if ( !v15 || (DefineParm = PC_FindDefineParm(*(const char **)(v7 + 1064), a3), DefineParm < 0) )
-        {
-          SourceWarning(a1, "stringizing operator without define parameter");
-          goto LABEL_29;
-        }
-        v7 = v15;
-        if ( !PC_StringizeTokens(v34[DefineParm], v35) )
-        {
-          SourceError(a1, "can't stringize tokens");
-          return 0;
-        }
-        v31 = v35;
+        t = PC_CopyToken( dt );
       }
-      v17 = PC_CopyToken(v31);
-      v17[266] = 0;
-      if ( v32 )
-        *((_DWORD *)v32 + 266) = v17;
+      /* add the token to the list */
+      t->next = NULL;
+      if ( last )
+        last->next = t;
       else
-        v33 = v17;
-      v32 = (char *)v17;
-    }
-LABEL_29:
-    v7 = *(_DWORD *)(v7 + 1064);
-    v5 = a3;
-  }
-  while ( v7 );
-  v8 = (int)v33;
-LABEL_31:
-  if ( v8 )
-  {
-    while ( 1 )
-    {
-      v18 = *(_DWORD *)(v8 + 1064);
-      if ( v18 && *(_BYTE *)v18 == 35 && *(_BYTE *)(v18 + 1) == 35 && (v19 = *(_DWORD *)(v18 + 1064)) != 0 )
-      {
-        if ( !PC_MergeTokens(*(_DWORD *)(v18 + 1064), v8) )
-        {
-          SourceError(a1, "can't merge %s with %s", (const char *)v8, (const char *)v19);
-          return 0;
-        }
-        v20 = *(_DWORD *)(v8 + 1064);
-        v21 = *(_DWORD *)(v20 - 4);
-        v22 = (void *)(v20 - 4);
-        if ( v21 == 305419896 )
-          free(v22);
-        v23 = numtokens;
-        *(_DWORD *)(v8 + 1064) = *(_DWORD *)(v19 + 1064);
-        numtokens = v23 - 1;
-        if ( (char *)v19 == v32 )
-          v32 = (char *)v8;
-        if ( *(_DWORD *)(v19 - 4) == 305419896 )
-          free((void *)(v19 - 4));
-        --numtokens;
-      }
-      else
-      {
-        v8 = *(_DWORD *)(v8 + 1064);
-      }
-      if ( !v8 )
-      {
-        v5 = a3;
-        v8 = (int)v33;
-        break;
-      }
+        first = t;
+      last = t;
     }
   }
-  *a4 = (char *)v8;
-  *a5 = v32;
-  v25 = 0;
-  if ( *(int *)(v5 + 12) > 0 )
+  /* check for the merging operator */
+  for ( t = first; t; )
   {
-    do
+    if ( t->next )
     {
-      v26 = v34[v25];
-      if ( v26 )
+      /* if the merging operator */
+      if ( t->next->string[0] == '#' && t->next->string[1] == '#' )
       {
-        do
+        t1 = t;
+        t2 = t->next->next;
+        if ( t2 )
         {
-          v27 = *(_DWORD *)(v26 + 1064);
-          v28 = *(_DWORD *)(v26 - 4);
-          v29 = (void *)(v26 - 4);
-          if ( v28 == 305419896 )
-            free(v29);
-          --numtokens;
-          v26 = v27;
+          if ( !PC_MergeTokens( t1, t2 ) )
+          {
+            SourceError( source, "can't merge %s with %s", t1->string, t2->string );
+            return 0;
+          }
+          PC_FreeToken( t1->next );
+          t1->next = t2->next;
+          if ( t2 == last )
+            last = t1;
+          PC_FreeToken( t2 );
+          continue;
         }
-        while ( v27 );
       }
-      ++v25;
     }
-    while ( v25 < *(_DWORD *)(a3 + 12) );
+    t = t->next;
+  }
+  /* store the first and last token of the list */
+  *firsttoken = first;
+  *lasttoken = last;
+  /* free all the parameter tokens */
+  for ( i = 0; i < define->numparms; i++ )
+  {
+    for ( pt = parms[i]; pt; pt = nextpt )
+    {
+      nextpt = pt->next;
+      PC_FreeToken( pt );
+    }
   }
   return 1;
 }
 
 /* ---- PC_ExpandDefineIntoSource  0x0043EA90 ---- */
 // PC_ExpandDefineIntoSource | HIGH | RTCW l_precomp.c:906 -- calls PC_ExpandDefine then splices firsttoken/lasttoken onto source[528] token stack
-int __cdecl PC_ExpandDefineIntoSource(int a1, int a2, _DWORD *a3)
+/* RTCW parameter order: retail callers set define (EDX) before source (ESI). */
+int __cdecl PC_ExpandDefineIntoSource(source_t *source, token_t *deftoken, define_t *define)
 {
-  char *v3;
-  char *v5; // [esp+0h] [ebp-8h] BYREF
-  char *v6; // [esp+4h] [ebp-4h] BYREF
+  token_t *firsttoken, *lasttoken;
 
-  if ( !PC_ExpandDefine(a2, a3, a1, &v5, &v6) )
+  if ( !PC_ExpandDefine( source, deftoken, define, &firsttoken, &lasttoken ) )
     return 0;
-  v3 = v5;
-  if ( !v5 || !v6 )
+  if ( !firsttoken || !lasttoken )
     return 0;
-  *((_DWORD *)v6 + 266) = *(_DWORD *)(a2 + 528);
-  *(_DWORD *)(a2 + 528) = v3;
+  lasttoken->next = source->tokens;
+  source->tokens = firsttoken;
   return 1;
 }
 
 /* ---- PC_ConvertPath  0x0043EAF0 ---- */
 // PC_ConvertPath | CONFIRMED | Collapses doubled '\\' and '//' separators in place.  l_precomp.c verbatim.
-_BYTE *__cdecl PC_ConvertPath(_BYTE *a1)
+char *__cdecl PC_ConvertPath(char *path)
 {
-  _BYTE *v1;
-  char v2;
-  char *v3;
-  char v4;
-  _BYTE *result;
+  char *ptr;
 
-  v1 = a1;
-  while ( *v1 )
+  /* remove double path separators */
+  for ( ptr = path; *ptr; )
   {
-    if ( (*v1 == 92 || *v1 == 47) && ((v2 = v1[1], v3 = v1 + 1, v2 == 92) || v2 == 47) )
-    {
-      do
-      {
-        v4 = *v3;
-        *(v3 - 1) = *v3;
-        ++v3;
-      }
-      while ( v4 );
-    }
+    if ( ( *ptr == '\\' || *ptr == '/' ) && ( ptr[1] == '\\' || ptr[1] == '/' ) )
+      strcpy( ptr, ptr + 1 );
     else
-    {
-      ++v1;
-    }
+      ptr++;
   }
-  result = a1;
-  if ( *a1 )
+  /* set OS-dependent path separators */
+  for ( ptr = path; *ptr; ptr++ )
   {
-    do
-    {
-      if ( *result == 47 || *result == 92 )
-        *result = 92;
-    }
-    while ( *++result );
+    if ( *ptr == '/' || *ptr == '\\' )
+      *ptr = '\\';
   }
-  return result;
+  return ptr;
 }
 
 /* ---- PC_Directive_include  0x0043EB50 ----
@@ -1155,383 +907,281 @@ _BYTE *__cdecl PC_ConvertPath(_BYTE *a1)
  * the bound wants to be the remaining space in Destination.
  */
 // PC_Directive_include | CONFIRMED | RTCW l_precomp.c:969
-int __cdecl PC_Directive_include(int a1)
+int __cdecl PC_Directive_include(source_t *source)
 {
-  int v2;
-  _DWORD *ScriptFile;
-  char *v4;
-  char v5;
-  unsigned int v6;
-  char *v7;
-  char *v9;
-  unsigned int v10;
-  char *v11;
-  char *v12;
-  char v13;
-  unsigned int v14; // [esp+4h] [ebp-53Ch] BYREF
-  char Destination[260]; // [esp+8h] [ebp-538h] BYREF
-  /* SPLIT-RECORD: one token_t at [ebp-434h]; PC_ReadSourceToken fills all
-     1072 bytes of it.  type is +1024, linescrossed +1060. */
-  token_t tok;                          /* [esp+10Ch] [ebp-434h] BYREF */
-  char *Source = tok.string;
-  unsigned int v19;
-  unsigned int retaddr;
+  script_t *script;
+  token_t token;
+  char path[260];   /* _MAX_PATH */
 
-  v19 = retaddr ^ _security_cookie;
-  if ( *(int *)(a1 + 544) > 0 )
+  if ( source->skip > 0 )
     return 1;
-  if ( !PC_ReadSourceToken(Source, a1) || tok.linescrossed > 0 )
+  if ( !PC_ReadSourceToken(source,&token) )
   {
-    SourceError(a1, "#include without file name");
+    SourceError( source, "#include without file name" );
     return 0;
   }
-  if ( tok.type == TT_STRING )
+  if ( token.linescrossed > 0 )
   {
-    /* StripDoubleQuotes is __fastcall(unused@ecx, string@edx). */
-    StripDoubleQuotes(0, Source);
-    PC_ConvertPath(Source);
-    /* One argument, the filename; see botlib/l_precomp_pc.c. */
-    ScriptFile = LoadScriptFile(Source);
-    if ( ScriptFile )
-      goto LABEL_31;
-    v4 = (char *)(a1 + 260);
-    do
+    SourceError( source, "#include without file name" );
+    return 0;
+  }
+  if ( token.type == TT_STRING )
+  {
+    StripDoubleQuotes( token.string );
+    PC_ConvertPath( token.string );
+    script = LoadScriptFile( token.string );
+    if ( !script )
     {
-      v5 = *v4;
-      Destination[(_DWORD)v4 - 260 - a1] = *v4;
-      ++v4;
+      strcpy( path, source->includepath );
+      strcat( path, token.string );
+      script = LoadScriptFile( path );
     }
-    while ( v5 );
-    v6 = strlen(Source) + 1;
-    v7 = (char *)&v14 + 3;
-    while ( *++v7 )
-      ;
-    qmemcpy(v7, Source, 4 * (v6 >> 2));
-    v9 = &v7[4 * (v6 >> 2)];
-    v10 = v6 & 3;
-    qmemcpy(v9, &Source[4 * (v6 >> 2)], v10);
-    v11 = &v9[v10];
-LABEL_29:
-    /* One argument -- Destination. */
-    ScriptFile = LoadScriptFile(Destination);
-    if ( !ScriptFile )
+  }
+  else if ( token.type == TT_PUNCTUATION && token.string[0] == '<' )
+  {
+    strcpy( path, source->includepath );
+    while ( PC_ReadSourceToken(source,&token) )
     {
-      SourceError(a1, "file %s not found", Destination);
+      if ( token.linescrossed > 0 )
+      {
+        PC_UnreadSourceToken(source,&token);
+        break;
+      }
+      if ( token.type == TT_PUNCTUATION && token.string[0] == '>' )
+        break;
+      /* RETAIL OVERFLOW -- see the banner above this function.  path is
+         char[260]; the bound is the SOURCE length, not the remaining room,
+         so this loop appends without limit. */
+      strncat( path, token.string, 260 );
+    }
+    if ( token.string[0] != '>' )
+      SourceWarning( source, "#include missing trailing >" );
+    if ( !strlen( path ) )
+    {
+      SourceError( source, "#include without file name between < >" );
       return 0;
     }
-LABEL_31:
-    PC_PushScript((int)ScriptFile, a1);
-    return 1;
+    PC_ConvertPath( path );
+    script = LoadScriptFile( path );
   }
-  if ( tok.type != TT_PUNCTUATION || Source[0] != '<' )
+  else
   {
-    SourceError(a1, "#include without file name");
+    SourceError( source, "#include without file name" );
     return 0;
   }
-  v12 = (char *)(a1 + 260);
-  do
+  if ( !script )
   {
-    v13 = *v12;
-    Destination[(_DWORD)v12 - 260 - a1] = *v12;
-    ++v12;
+    SourceError( source, "file %s not found", path );
+    return 0;
   }
-  while ( v13 );
-  if ( PC_ReadSourceToken(Source, a1) )
-  {
-    while ( tok.linescrossed <= 0 )
-    {
-      if ( tok.type == TT_PUNCTUATION && Source[0] == '>' )
-        goto LABEL_26;
-      /* RETAIL OVERFLOW -- see the banner above this function.
-         Destination is char[260]; the bound is the SOURCE length, not the
-         remaining room, so this loop appends without limit. */
-      strncat(Destination, Source, 0x104u);
-      if ( !PC_ReadSourceToken(Source, a1) )
-        goto LABEL_24;
-    }
-    PC_UnreadSourceToken(Source, a1);
-  }
-LABEL_24:
-  if ( Source[0] != 62 )
-    SourceWarning(a1, "#include missing trailing >");
-LABEL_26:
-  v14 = strlen(Destination);
-  if ( v14 )
-  {
-    v11 = Destination;
-    PC_ConvertPath(Destination);
-    goto LABEL_29;
-  }
-  SourceError(a1, "#include without file name between < >");
-  return 0;
+  PC_PushScript( script, source );
+  return 1;
 }
 
 /* ---- PC_ReadLine  0x0043EDB0 ---- */
 // PC_ReadLine | HIGH | RTCW l_precomp.c:1043 -- reads tokens until line changes; backslash continues; unreads via PC_CopyToken onto source[528]
-int __cdecl PC_ReadLine(int a1, _DWORD *token)
+int __cdecl PC_ReadLine(source_t *source, token_t *token)
 {
-  int v3;
-  int result;
-  _DWORD *v5;
+  int crossline;
 
-  v3 = 0;
-  while ( PC_ReadSourceToken(token, a1) )
+  crossline = 0;
+  do
   {
-    if ( token[265] > v3 )
+    if ( !PC_ReadSourceToken(source,token) )
+      return 0;
+    if ( token->linescrossed > crossline )
     {
-      v5 = PC_CopyToken(token);
-      v5[266] = *(_DWORD *)(a1 + 528);
-      *(_DWORD *)(a1 + 528) = v5;
+      PC_UnreadSourceToken(source,token);
       return 0;
     }
-    result = 1;
-    if ( strcmp((const char *)token, "\\") )
-      return result;
-    v3 = 1;
+    crossline = 1;
   }
-  return 0;
+  while ( !strcmp( token->string, "\\" ) );
+  return 1;
 }
 
 /* ---- PC_WhiteSpaceBeforeToken  0x0043EE20 ---- */
 // PC_WhiteSpaceBeforeToken | CONFIRMED | token->endwhitespace_p (+1052) - token->whitespace_p (+1048) > 0.
-BOOL __cdecl PC_WhiteSpaceBeforeToken(int a1)
+int __cdecl PC_WhiteSpaceBeforeToken(token_t *token)
 {
-  return *(_DWORD *)(a1 + 1052) - *(_DWORD *)(a1 + 1048) > 0;
+  return token->endwhitespace_p - token->whitespace_p > 0;
 }
 
 /* ---- PC_ClearTokenWhiteSpace  0x0043EE40 ---- */
 // PC_ClearTokenWhiteSpace | CONFIRMED | Zeroes whitespace_p (+1048), endwhitespace_p (+1052) and linescrossed (+1060).  token_t: string[1024], type 1024, subtype 1028, intvalue 1032, floatvalue 1040 (8-aligned), whitespace_p 1048, endwhitespace_p 1052, line 1056, linescrossed 1060, next 1064 (see l_script.h).
-_DWORD *__cdecl PC_ClearTokenWhiteSpace(_DWORD *result)
+token_t *__cdecl PC_ClearTokenWhiteSpace(token_t *token)
 {
-  result[262] = 0;
-  result[263] = 0;
-  result[265] = 0;
-  return result;
+  token->whitespace_p = NULL;
+  token->endwhitespace_p = NULL;
+  token->linescrossed = 0;
+  return token;
 }
 
 /* ---- PC_Directive_undef  0x0043EE60 ---- */
 // PC_Directive_undef | CONFIRMED | RTCW
-int __cdecl PC_Directive_undef(_DWORD *a1)
+int __cdecl PC_Directive_undef(source_t *source)
 {
-  _DWORD *v2;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  _DWORD *v7;
-  /* SPLIT-RECORD: one token_t at [ebp-434h].  PC_ReadLine writes 1072 bytes
-     into it and PC_CopyToken reads 1072 back out. */
-  token_t tok;                          /* [esp+8h] [ebp-434h] BYREF */
-  char *ArgList = tok.string;
-  unsigned int v10;
-  unsigned int retaddr;
+  token_t token;
+  define_t *define, *lastdefine;
+  int hash;
 
-  v10 = retaddr ^ _security_cookie;
-  if ( (int)a1[136] <= 0 )
+  if ( source->skip > 0 )
+    return 1;
+  if ( !PC_ReadLine( source, &token ) )
   {
-    if ( !PC_ReadLine((int)a1, ArgList) )
+    SourceError( source, "undef without name" );
+    return 0;
+  }
+  if ( token.type != TT_NAME )
+  {
+    PC_UnreadSourceToken(source,&token);
+    SourceError( source, "expected name, found %s", token.string );
+    return 0;
+  }
+  hash = PC_NameHash( token.string );
+  for ( lastdefine = NULL, define = ((define_t **)source->definehash)[hash]; define; define = define->hashnext )
+  {
+    if ( !strcmp( define->name, token.string ) )
     {
-      SourceError((int)a1, "undef without name");
-      return 0;
-    }
-    if ( tok.type != TT_NAME )
-    {
-      v2 = PC_CopyToken(ArgList);
-      v2[266] = a1[132];
-      a1[132] = v2;
-      SourceError((int)a1, "expected name, found %s", ArgList);
-      return 0;
-    }
-    v3 = PC_NameHash(ArgList);
-    v4 = a1[134];
-    v5 = *(_DWORD *)(v4 + 4 * v3);
-    v6 = 0;
-    v7 = (_DWORD *)(v4 + 4 * v3);
-    if ( v5 )
-    {
-      while ( strcmp(*(const char **)v5, ArgList) )
+      if ( define->flags & DEFINE_FIXED )
       {
-        v6 = v5;
-        v5 = *(_DWORD *)(v5 + 28);
-        if ( !v5 )
-          return 1;
-      }
-      if ( (*(_BYTE *)(v5 + 4) & 1) != 0 )
-      {
-        SourceWarning((int)a1, "can't undef %s", ArgList);
+        SourceWarning( source, "can't undef %s", token.string );
       }
       else
       {
-        if ( v6 )
-          *(_DWORD *)(v6 + 28) = *(_DWORD *)(v5 + 28);
+        if ( lastdefine )
+          lastdefine->hashnext = define->hashnext;
         else
-          *v7 = *(_DWORD *)(v5 + 28);
-        PC_FreeDefine(v5);
+          ((define_t **)source->definehash)[hash] = define->hashnext;
+        PC_FreeDefine( define );
       }
+      break;
     }
+    lastdefine = define;
   }
   return 1;
 }
 
 /* ---- PC_Directive_define  0x0043EFE0 ---- */
 // PC_Directive_define | CONFIRMED | RTCW l_precomp.c:1161
-int __cdecl PC_Directive_define(_DWORD *a1)
+int __cdecl PC_Directive_define(source_t *source)
 {
-  _DWORD *v1;
-  _DWORD *v3;
-  int HashedDefine;
-  int *v5;
-  char *v6;
-  int v7;
-  int v8;
-  _DWORD *v9;
-  _DWORD *v10;
-  _DWORD *v11;
-  const char *v12;
-  const char *v13;
-  /* SPLIT-RECORD: one token_t at [ebp-434h]; type (+1024), whitespace_p
-     (+1048) and endwhitespace_p (+1052) are read off it. */
-  token_t tok;                          /* [esp+8h] [ebp-434h] BYREF */
-  char *ArgList = tok.string;
-  unsigned int v18;
-  unsigned int retaddr;
+  token_t token;
+  token_t *t, *last;
+  define_t *define;
 
-  v1 = a1;
-  v18 = retaddr ^ _security_cookie;
-  if ( (int)a1[136] > 0 )
+  if ( source->skip > 0 )
     return 1;
-  if ( !PC_ReadLine((int)a1, ArgList) )
+  if ( !PC_ReadLine( source, &token ) )
   {
-    SourceError((int)a1, "#define without name");
+    SourceError( source, "#define without name" );
     return 0;
   }
-  if ( tok.type != TT_NAME )
+  if ( token.type != TT_NAME )
   {
-    v3 = PC_CopyToken(ArgList);
-    v3[266] = a1[132];
-    a1[132] = v3;
-    SourceError((int)a1, "expected name after #define, found %s", ArgList);
+    PC_UnreadSourceToken(source,&token);
+    SourceError( source, "expected name after #define, found %s", token.string );
     return 0;
   }
-  HashedDefine = PC_FindHashedDefine(a1[134], ArgList);
-  if ( HashedDefine )
+  /* check if the define already exists */
+  define = PC_FindHashedDefine( (define_t **)source->definehash, token.string );
+  if ( define )
   {
-    if ( (*(_BYTE *)(HashedDefine + 4) & 1) != 0 )
+    if ( define->flags & DEFINE_FIXED )
     {
-      SourceError((int)a1, "can't redefine %s", ArgList);
+      SourceError( source, "can't redefine %s", token.string );
       return 0;
     }
-    SourceWarning((int)a1, "redefinition of %s", ArgList);
-    PC_UnreadSourceToken(ArgList, (int)a1);
-    if ( !PC_Directive_undef(a1) )
+    SourceWarning( source, "redefinition of %s", token.string );
+    /* unread the define name before executing the #undef directive */
+    PC_UnreadSourceToken(source,&token);
+    if ( !PC_Directive_undef( source ) )
       return 0;
   }
-  v5 = Z_MallocInternal(strlen(ArgList) + 37);
-  if ( v5 )
-  {
-    *v5 = 305419896;
-    v6 = (char *)(v5 + 1);
-  }
-  else
-  {
-    v6 = 0;
-  }
-  memset(v6, 0, 0x20u);
-  *(_DWORD *)v6 = v6 + 32;
-  strcpy(v6 + 32, ArgList);
-  v7 = a1[134];
-  v8 = PC_NameHash(*(char **)v6);
-  *((_DWORD *)v6 + 7) = *(_DWORD *)(v7 + 4 * v8);
-  *(_DWORD *)(v7 + 4 * v8) = v6;
-  if ( !PC_ReadLine((int)a1, ArgList) )
+  /* allocate define */
+  define = (define_t *)GetMemory( sizeof(define_t) + strlen(token.string) + 1 );
+  memset( define, 0, sizeof(define_t) );
+  define->name = (char *)define + sizeof(define_t);
+  strcpy( define->name, token.string );
+  /* add the define to the source */
+  PC_AddDefineToHash( (define_t **)source->definehash, define );
+  /* if nothing is defined, just return */
+  if ( !PC_ReadLine( source, &token ) )
     return 1;
-  /* no whitespace between the macro name and the '(' -- i.e. it takes
-     parameters.  Retail compares the two pointers by subtraction. */
-  if ( tok.endwhitespace_p - tok.whitespace_p <= 0 && !strcmp(ArgList, "(") )
+  /* if it is a define with parameters -- no whitespace between the name and '(' */
+  if ( !PC_WhiteSpaceBeforeToken( &token ) && !strcmp( token.string, "(" ) )
   {
-    v9 = a1;
-    v10 = 0;
-    if ( !PC_CheckTokenString(a1, ")") )
+    /* read the define parameters */
+    last = NULL;
+    if ( !PC_CheckTokenString( source, ")" ) )
     {
-      if ( !PC_ReadLine((int)a1, ArgList) )
-      {
-LABEL_29:
-        SourceError((int)v9, "expected define parameter");
-        return 0;
-      }
       while ( 1 )
       {
-        if ( tok.type != TT_NAME )
+        if ( !PC_ReadLine( source, &token ) )
         {
-          SourceError((int)v9, "invalid define parameter");
+          SourceError( source, "expected define parameter" );
           return 0;
         }
-        if ( PC_FindDefineParm(ArgList, (int)v6) >= 0 )
+        if ( token.type != TT_NAME )
         {
-          SourceError((int)v9, "two the same define parameters");
+          SourceError( source, "invalid define parameter" );
           return 0;
         }
-        v11 = PC_CopyToken(ArgList);
-        v11[262] = 0;
-        v11[263] = 0;
-        v11[265] = 0;
-        v11[266] = 0;
-        if ( v10 )
-          v10[266] = v11;
+        if ( PC_FindDefineParm( define, token.string ) >= 0 )
+        {
+          SourceError( source, "two the same define parameters" );
+          return 0;
+        }
+        t = PC_CopyToken( &token );
+        PC_ClearTokenWhiteSpace( t );
+        t->next = NULL;
+        if ( last )
+          last->next = t;
         else
-          *((_DWORD *)v6 + 4) = v11;
-        v10 = v11;
-        ++*((_DWORD *)v6 + 3);
-        if ( !PC_ReadLine((int)v9, ArgList) )
+          define->parms = t;
+        last = t;
+        define->numparms++;
+        if ( !PC_ReadLine( source, &token ) )
         {
-          SourceError((int)v9, "define parameters not terminated");
+          SourceError( source, "define parameters not terminated" );
           return 0;
         }
-        if ( !strcmp(ArgList, ")") )
+        if ( !strcmp( token.string, ")" ) )
           break;
-        if ( strcmp(ArgList, ",") )
+        /* then it must be a comma */
+        if ( strcmp( token.string, "," ) )
         {
-          SourceError((int)a1, "define not terminated");
+          SourceError( source, "define not terminated" );
           return 0;
         }
-        v9 = a1;
-        if ( !PC_ReadLine((int)a1, ArgList) )
-          goto LABEL_29;
       }
-      v9 = a1;
     }
-    if ( !PC_ReadLine((int)v9, ArgList) )
+    if ( !PC_ReadLine( source, &token ) )
       return 1;
-    v1 = a1;
   }
-  v13 = 0;
+  /* read the defined stuff */
+  last = NULL;
   do
   {
-    v12 = (const char *)PC_CopyToken(ArgList);
-    if ( *((_DWORD *)v12 + 256) == 4 )
+    t = PC_CopyToken( &token );
+    if ( t->type == TT_NAME && !strcmp( t->string, define->name ) )
     {
-      if ( !strcmp(v12, *(const char **)v6) )
-      {
-        SourceError((int)a1, "recursive define (removed recursion)");
-        v1 = a1;
-        continue;
-      }
-      v1 = a1;
+      SourceError( source, "recursive define (removed recursion)" );
+      continue;
     }
-    *((_DWORD *)v12 + 262) = 0;
-    *((_DWORD *)v12 + 263) = 0;
-    *((_DWORD *)v12 + 265) = 0;
-    *((_DWORD *)v12 + 266) = 0;
-    if ( v13 )
-      *((_DWORD *)v13 + 266) = v12;
+    PC_ClearTokenWhiteSpace( t );
+    t->next = NULL;
+    if ( last )
+      last->next = t;
     else
-      *((_DWORD *)v6 + 5) = v12;
-    v13 = v12;
+      define->tokens = t;
+    last = t;
   }
-  while ( PC_ReadLine((int)v1, ArgList) );
-  if ( v13 && (!strcmp(*((const char **)v6 + 5), "##") || !strcmp(v13, "##")) )
+  while ( PC_ReadLine( source, &token ) );
+  /* check for merge operators at the beginning or end */
+  if ( last && ( !strcmp( define->tokens->string, "##" ) || !strcmp( last->string, "##" ) ) )
   {
-    SourceError((int)v1, "define with misplaced ##");
+    SourceError( source, "define with misplaced ##" );
     return 0;
   }
   return 1;
@@ -1539,1028 +1189,808 @@ LABEL_29:
 
 /* ---- PC_DefineFromString  0x0043F480 ---- */
 // PC_DefineFromString | CONFIRMED | RTCW l_precomp.c PC_DefineFromString
-int __fastcall PC_DefineFromString(int a1, const char *a2)
+/* RTCW's one-parameter form; LTCG passes the string in EDX (no stack argument,
+   plain `ret`), so PC_AddGlobalDefine's EDX flows straight through. */
+define_t *__cdecl PC_DefineFromString(const char *string)
 {
-  _DWORD *ScriptMemory;
-  int *v3;
-  void *v4;
-  int v5;
-  int v6;
-  int i;
-  _DWORD *v8;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  void *v13;
-  char Destination[1628]; // [esp+10h] [ebp-660h] BYREF
-  unsigned int v16;
-  unsigned int retaddr;
+  script_t *script;
+  source_t src;
+  token_t *t;
+  int *magic;
+  define_t *def;
+  int res, i;
 
-  v16 = retaddr ^ _security_cookie;
   /* source order ( ptr, length, name ) -- retail lifts length into EAX */
-  ScriptMemory = (_DWORD *)LoadScriptMemory((char *)a2, strlen(a2), "*extern");
-  memset(Destination, 0, 0x658u);
-  strncpy(Destination, "*extern", 0x104u);
-  *(_DWORD *)&Destination[524] = ScriptMemory;
-  v3 = Z_MallocInternal(0x1004u);
-  if ( v3 )
+  script = LoadScriptMemory( (char *)string, strlen(string), "*extern" );
+  /* create a new source */
+  memset( &src, 0, sizeof(source_t) );
+  strncpy( src.filename, "*extern", 260 );   /* _MAX_PATH */
+  src.scriptstack = script;
+  src.definehash = GetClearedMemory( DEFINEHASHSIZE * sizeof(define_t *) );   /* 0x1000 */
+  /* create a define from the source */
+  res = PC_Directive_define( &src );
+  /* free any tokens if left */
+  for ( t = src.tokens; t; t = src.tokens )
   {
-    *v3 = 305419896;
-    v4 = v3 + 1;
+    src.tokens = src.tokens->next;
+    PC_FreeToken( t );
   }
-  else
+  /* the define is the first non-empty hash bucket */
+  def = NULL;
+  for ( i = 0; i < DEFINEHASHSIZE; i++ )
   {
-    v4 = 0;
-  }
-  memset(v4, 0, 0x1000u);
-  *(_DWORD *)&Destination[536] = v4;
-  v5 = PC_Directive_define(Destination);
-  v6 = *(_DWORD *)&Destination[528];
-  for ( i = *(_DWORD *)&Destination[528]; v6; i = v6 )
-  {
-    v6 = *(_DWORD *)(v6 + 1064);
-    v8 = (_DWORD *)(i - 4);
-    *(_DWORD *)&Destination[528] = v6;
-    if ( *v8 == 305419896 )
+    if ( src.definehash[i] )
     {
-      free(v8);
-      v6 = *(_DWORD *)&Destination[528];
+      def = (define_t *)src.definehash[i];
+      break;
     }
-    --numtokens;
   }
-  v9 = 0;
-  v10 = 0;
-  while ( !*(_DWORD *)(*(_DWORD *)&Destination[536] + 4 * v10) )
-  {
-    if ( ++v10 >= 1024 )
-      goto LABEL_13;
-  }
-  v9 = *(_DWORD *)(*(_DWORD *)&Destination[536] + 4 * v10);
-LABEL_13:
-  if ( *(_DWORD *)(*(_DWORD *)&Destination[536] - 4) == 305419896 )
-    free((void *)(*(_DWORD *)&Destination[536] - 4));
-  v11 = ScriptMemory[77];
-  if ( v11 )
-  {
-    v12 = *(_DWORD *)(v11 - 4);
-    v13 = (void *)(v11 - 4);
-    if ( v12 == 305419896 )
-      free(v13);
-  }
-  if ( *(ScriptMemory - 1) == 305419896 )
-    free(ScriptMemory - 1);
-  if ( v5 > 0 )
-    return v9;
-  if ( *(_DWORD *)&Destination[532] )
-    PC_FreeDefine(v9);
-  return 0;
+  /* free the hash table (inlined FreeMemory) */
+  magic = (int *)src.definehash - 1;
+  if ( *magic == ZONE_MAGIC )
+    free( magic );
+  /* free the script (inlined FreeScript) */
+  if ( script->punctuationtable && ((int *)script->punctuationtable)[-1] == ZONE_MAGIC )
+    free((int *)script->punctuationtable - 1);
+  if ( ((int *)script)[-1] == ZONE_MAGIC )
+    free((int *)script - 1);
+  /* if the define was created successfully */
+  if ( res > 0 )
+    return def;
+  /* free the define if created */
+  if ( src.defines )
+    PC_FreeDefine( def );
+  return NULL;
 }
 
 /* ---- PC_AddDefineToSourceFromString  0x0043F620 ---- */
 // PC_AddDefineToSourceFromString | CONFIRMED | PC_DefineFromString then inlined PC_AddDefineToHash against source->definehash at +536.
-int __fastcall PC_AddDefineToSourceFromString(int a1, const char *a2, int a3)
+int __cdecl PC_AddDefineToSourceFromString(source_t *source, const char *string)
 {
-  int result;
-  int v4;
-  int v5;
-  int v6;
+  define_t *define;
 
-  result = PC_DefineFromString(a1, a2);
-  v4 = result;
-  if ( result )
-  {
-    v5 = *(_DWORD *)(a3 + 536);
-    v6 = PC_NameHash(*(char **)result);
-    *(_DWORD *)(v4 + 28) = *(_DWORD *)(v5 + 4 * v6);
-    *(_DWORD *)(v5 + 4 * v6) = v4;
-    return 1;
-  }
-  return result;
+  define = PC_DefineFromString( string );
+  if ( !define )
+    return 0;
+  PC_AddDefineToHash( (define_t **)source->definehash, define );
+  return 1;
 }
 
 /* ---- PC_AddGlobalDefine  0x0043F660 ---- */
 // PC_AddGlobalDefine | CONFIRMED | Pushes onto the globaldefines list (link at +24).
-int __fastcall PC_AddGlobalDefine(int a1, const char *a2)
+int PC_AddGlobalDefine(const char *string)
 {
-  int result;
+  define_t *define;
 
-  result = PC_DefineFromString(a1, a2);
-  if ( result )
-  {
-    *(_DWORD *)(result + 24) = globaldefines;
-    globaldefines = (void *)result;
-    return 1;
-  }
-  return result;
+  define = PC_DefineFromString( string );
+  if ( !define )
+    return 0;
+  define->next = (define_t *)globaldefines;
+  globaldefines = define;
+  return 1;
 }
 
 /* ---- PC_RemoveGlobalDefine  0x0043F680 ---- */
 // PC_RemoveGlobalDefine | CONFIRMED | PC_FindDefine(globaldefines, name) then PC_FreeDefine.
-int __cdecl PC_RemoveGlobalDefine(const char *a1)
+int __cdecl PC_RemoveGlobalDefine(const char *name)
 {
-  int Define;
+  define_t *define;
 
-  Define = PC_FindDefine((int)globaldefines, a1);
-  if ( !Define )
-    return 0;
-  PC_FreeDefine(Define);
-  return 1;
+  define = PC_FindDefine( (define_t *)globaldefines, name );
+  if ( define )
+  {
+    PC_FreeDefine( define );
+    return 1;
+  }
+  return 0;
 }
 
 /* ---- PC_RemoveAllGlobalDefines  0x0043F6B0 ---- */
 // PC_RemoveAllGlobalDefines | CONFIRMED | Drains globaldefines through PC_FreeDefine.
 void PC_RemoveAllGlobalDefines()
 {
-  _DWORD *i;
+  define_t *define;
 
-  for ( i = globaldefines; globaldefines; i = globaldefines )
+  for ( define = (define_t *)globaldefines; globaldefines; define = (define_t *)globaldefines )
   {
-    globaldefines = (void *)i[6];
-    PC_FreeDefine((int)i);
+    globaldefines = define->next;
+    PC_FreeDefine( define );
   }
 }
 
 /* ---- PC_CopyDefine  0x0043F6E0 ---- */
 // PC_CopyDefine | HIGH | RTCW l_precomp.c PC_CopyDefine -- allocates via Z_Malloc(strlen(name)+37), copies flags/builtin/numparms/name, then walks parms and tokens lists into new define.  Divergence: CoD1 copies tokens list first (source[+20]) then parms list (source[+16]); RTCW does parms then tokens.  Field layout unchanged.
-void *__cdecl PC_CopyDefine(void *source, const void *define)
+define_t *__cdecl PC_CopyDefine(source_t *source, const define_t *define)
 {
-  _DWORD *v2;
-  int *v3;
-  char *v4;
-  _DWORD *v5;
-  int *v6;
-  int *v7;
-  void *v8;
-  int v9;
-  _DWORD *v10;
-  int *v11;
-  int *v12;
-  void *v13;
-  int v14;
-  char *v16;
-  char *LocalizedString_m;
-  _DWORD *v18;
-  _DWORD *v19;
+  define_t *newdefine;
+  token_t *token, *newtoken, *lasttoken;
 
-  v2 = define;
-  v3 = Z_MallocInternal(strlen(*(const char **)define) + 37);
-  if ( v3 )
+  newdefine = (define_t *)GetMemory( sizeof(define_t) + strlen(define->name) + 1 );
+  /* copy the define name */
+  newdefine->name = (char *)newdefine + sizeof(define_t);
+  strcpy( newdefine->name, define->name );
+  newdefine->flags = define->flags;
+  newdefine->builtin = define->builtin;
+  newdefine->numparms = define->numparms;
+  /* the define is not linked */
+  newdefine->next = NULL;
+  newdefine->hashnext = NULL;
+  /* copy the define tokens */
+  newdefine->tokens = NULL;
+  for ( lasttoken = NULL, token = define->tokens; token; token = token->next )
   {
-    *v3 = 305419896;
-    v4 = (char *)(v3 + 1);
+    newtoken = PC_CopyToken( token );
+    newtoken->next = NULL;
+    if ( lasttoken )
+      lasttoken->next = newtoken;
+    else
+      newdefine->tokens = newtoken;
+    lasttoken = newtoken;
   }
-  else
+  /* copy the define parameters */
+  newdefine->parms = NULL;
+  for ( lasttoken = NULL, token = define->parms; token; token = token->next )
   {
-    v4 = 0;
+    newtoken = PC_CopyToken( token );
+    newtoken->next = NULL;
+    if ( lasttoken )
+      lasttoken->next = newtoken;
+    else
+      newdefine->parms = newtoken;
+    lasttoken = newtoken;
   }
-  *(_DWORD *)v4 = v4 + 32;
-  strcpy(v4 + 32, *(const char **)define);
-  *((_DWORD *)v4 + 1) = *((_DWORD *)define + 1);
-  *((_DWORD *)v4 + 2) = *((_DWORD *)define + 2);
-  *((_DWORD *)v4 + 3) = *((_DWORD *)define + 3);
-  *((_DWORD *)v4 + 6) = 0;
-  *((_DWORD *)v4 + 7) = 0;
-  *((_DWORD *)v4 + 5) = 0;
-  v5 = (_DWORD *)*((_DWORD *)define + 5);
-  v18 = 0;
-  if ( v5 )
-  {
-    while ( 1 )
-    {
-      v6 = (int *)malloc(0x434u);
-      v7 = v6;
-      if ( !v6 )
-        break;
-      Com_Memset(v6, 0, 0x434u);
-      v8 = v7 + 1;
-      *v7 = 305419896;
-      if ( v7 == (int *)-4 )
-        Com_Error((errorParm_t)v8, "EXE_ERR_OUT_OF_MEMORY");
-      qmemcpy(v8, v5, 0x430u);
-      v2 = define;
-      v9 = numtokens + 1;
-      v7[267] = 0;
-      numtokens = v9;
-      v7[267] = 0;
-      if ( v18 )
-        v18[266] = v8;
-      else
-        *((_DWORD *)v4 + 5) = v8;
-      v5 = (_DWORD *)v5[266];
-      v18 = v7 + 1;
-      if ( !v5 )
-        goto LABEL_12;
-    }
-LABEL_21:
-    Sys_OutOfMemoryPrep();
-    LocalizedString_m = SEH_GetLocalizedString_m("WIN_OUT_OF_MEM_TITLE");
-    v16 = SEH_GetLocalizedString_m("WIN_OUT_OF_MEM_BODY");
-    MessageBoxA(0, v16, LocalizedString_m, 0x10u);
-    exit(-1);
-  }
-LABEL_12:
-  *((_DWORD *)v4 + 4) = 0;
-  v10 = (_DWORD *)v2[4];
-  v19 = 0;
-  if ( v10 )
-  {
-    while ( 1 )
-    {
-      v11 = (int *)malloc(0x434u);
-      v12 = v11;
-      if ( !v11 )
-        break;
-      Com_Memset(v11, 0, 0x434u);
-      v13 = v12 + 1;
-      *v12 = 305419896;
-      if ( v12 == (int *)-4 )
-        Com_Error((errorParm_t)v13, "EXE_ERR_OUT_OF_MEMORY");
-      qmemcpy(v13, v10, 0x430u);
-      v14 = numtokens + 1;
-      v12[267] = 0;
-      numtokens = v14;
-      v12[267] = 0;
-      if ( v19 )
-        v19[266] = v13;
-      else
-        *((_DWORD *)v4 + 4) = v13;
-      v10 = (_DWORD *)v10[266];
-      v19 = v12 + 1;
-      if ( !v10 )
-        return v4;
-    }
-    goto LABEL_21;
-  }
-  return v4;
+  return newdefine;
 }
 
 /* ---- PC_AddGlobalDefinesToSource  0x0043F8E0 ---- */
 // PC_AddGlobalDefinesToSource | CONFIRMED | RTCW l_precomp.c PC_AddGlobalDefinesToSource -- iterates globaldefines list (via ->next at +24), copies each via PC_CopyDefine, computes name hash (poly 119, mask 0x3FF), inserts into source->definehash at +536.
-void __cdecl PC_AddGlobalDefinesToSource(void *source)
+void __cdecl PC_AddGlobalDefinesToSource(source_t *source)
 {
-  _DWORD *v1;
-  char **v2;
-  char *v3;
-  char v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
+  define_t *define, *newdefine;
 
-  v1 = globaldefines;
-  if ( globaldefines )
+  for ( define = (define_t *)globaldefines; define; define = define->next )
   {
-    do
-    {
-      v2 = (char **)PC_CopyDefine(source, v1);
-      v3 = *v2;
-      v4 = **v2;
-      v5 = *((_DWORD *)source + 134);
-      v6 = 0;
-      if ( v4 )
-      {
-        v7 = 119 - (_DWORD)v3;
-        do
-        {
-          v8 = v4 * (_DWORD)&v3[v7];
-          v4 = v3[1];
-          v6 += v8;
-          ++v3;
-        }
-        while ( v4 );
-        v5 = *((_DWORD *)source + 134);
-      }
-      v9 = ((unsigned __int16)v6 ^ (unsigned __int16)((v6 ^ (v6 >> 10)) >> 10)) & 0x3FF;
-      v2[7] = *(char **)(v5 + 4 * v9);
-      *(_DWORD *)(v5 + 4 * v9) = v2;
-      v1 = (_DWORD *)v1[6];
-    }
-    while ( v1 );
+    newdefine = PC_CopyDefine( source, define );
+    /* inlined PC_AddDefineToHash */
+    PC_AddDefineToHash( (define_t **)source->definehash, newdefine );
   }
 }
 
 /* ---- PC_Directive_if_def  0x0043F960 ---- */
 // PC_Directive_if_def | CONFIRMED | RTCW
-int __cdecl PC_Directive_if_def(_DWORD *a1, int a2)
+int __cdecl PC_Directive_if_def(source_t *source, int type)
 {
-  _DWORD *v4;
-  int HashedDefine;
-  /* SPLIT-RECORD: one token_t at [ebp-434h] that PC_ReadLine fills. */
-  token_t tok;                          /* [esp+4h] [ebp-434h] BYREF */
-  char *ArgList = tok.string;
-  unsigned int v8;
-  unsigned int retaddr;
+  token_t token;
+  define_t *d;
+  int skip;
 
-  v8 = retaddr ^ _security_cookie;
-  if ( PC_ReadLine((int)a1, ArgList) )
+  if ( !PC_ReadLine( source, &token ) )
   {
-    if ( tok.type == TT_NAME )
-    {
-      HashedDefine = PC_FindHashedDefine(a1[134], ArgList);
-      PC_PushIndent(a1, a2, (HashedDefine == 0) == (a2 == 8));
-      return 1;
-    }
-    else
-    {
-      v4 = PC_CopyToken(ArgList);
-      v4[266] = a1[132];
-      a1[132] = v4;
-      SourceError((int)a1, "expected name after #ifdef, found %s", ArgList);
-      return 0;
-    }
-  }
-  else
-  {
-    SourceError((int)a1, "#ifdef without name");
+    SourceError( source, "#ifdef without name" );
     return 0;
   }
+  if ( token.type != TT_NAME )
+  {
+    PC_UnreadSourceToken(source,&token);
+    SourceError( source, "expected name after #ifdef, found %s", token.string );
+    return 0;
+  }
+  d = PC_FindHashedDefine( (define_t **)source->definehash, token.string );
+  skip = ( type == INDENT_IFDEF ) == ( d == NULL );
+  PC_PushIndent( source, type, skip );
+  return 1;
 }
 
 /* ---- PC_Directive_ifdef  0x0043FA60 ---- */
 // PC_Directive_ifdef | CONFIRMED | PC_Directive_if_def(source, 8).  8 = INDENT_IFDEF.
-int __cdecl PC_Directive_ifdef(_DWORD *a1)
+int __cdecl PC_Directive_ifdef(source_t *source)
 {
-  return PC_Directive_if_def(a1, 8);
+  return PC_Directive_if_def(source, INDENT_IFDEF);
 }
 
 /* ---- PC_Directive_ifndef  0x0043FA80 ---- */
 // PC_Directive_ifndef | CONFIRMED | PC_Directive_if_def(source, 16).  16 = INDENT_IFNDEF.
-int __cdecl PC_Directive_ifndef(_DWORD *a1)
+int __cdecl PC_Directive_ifndef(source_t *source)
 {
-  return PC_Directive_if_def(a1, 16);
+  return PC_Directive_if_def(source, INDENT_IFNDEF);
 }
 
 /* ---- PC_Directive_else  0x0043FAA0 ---- */
 // PC_Directive_else | CONFIRMED | RTCW
-int __cdecl PC_Directive_else(_DWORD *a1)
+int __cdecl PC_Directive_else(source_t *source)
 {
-  int v2; // [esp+4h] [ebp-8h] BYREF
-  int v3; // [esp+8h] [ebp-4h] BYREF
+  int type, skip;
 
-  PC_PopIndent(&v2, &v3, a1);
-  if ( v2 )
+  PC_PopIndent( source, &type, &skip );
+  if ( !type )
   {
-    if ( v2 == 2 )
-    {
-      SourceError((int)a1, "#else after #else");
-      return 0;
-    }
-    else
-    {
-      PC_PushIndent(a1, 2, v3 == 0);
-      return 1;
-    }
-  }
-  else
-  {
-    SourceError((int)a1, "misplaced #else");
+    SourceError( source, "misplaced #else" );
     return 0;
   }
+  if ( type == INDENT_ELSE )
+  {
+    SourceError( source, "#else after #else" );
+    return 0;
+  }
+  PC_PushIndent( source, INDENT_ELSE, skip == 0 );
+  return 1;
 }
 
 /* ---- PC_Directive_endif  0x0043FB10 ---- */
 // PC_Directive_endif | CONFIRMED | RTCW
-int __cdecl PC_Directive_endif(_DWORD *a1)
+int __cdecl PC_Directive_endif(source_t *source)
 {
-  int v2; // [esp+4h] [ebp-8h] BYREF
-  int v3; // [esp+8h] [ebp-4h] BYREF
+  int type, skip;
 
-  PC_PopIndent(&v2, &v3, a1);
-  if ( v2 )
-    return 1;
-  SourceError((int)a1, "misplaced #endif");
-  return 0;
+  PC_PopIndent( source, &type, &skip );
+  if ( !type )
+  {
+    SourceError( source, "misplaced #endif" );
+    return 0;
+  }
+  return 1;
 }
 
 /* ---- PC_OperatorPriority  0x0043FB50 ---- */
 // PC_OperatorPriority | CONFIRMED | Dense switch mapping punctuation subtype to C operator precedence; feeds PC_EvaluateTokens.
-int __cdecl PC_OperatorPriority(int a1)
+int __cdecl PC_OperatorPriority(int op)
 {
-  int result;
-
-  switch ( a1 )
+  /* RTCW case order: VC7 places each shared return at its last case */
+  switch ( op )
   {
-    case 5:
-      result = 7;
-      break;
-    case 6:
-      result = 6;
-      break;
-    case 7:
-    case 8:
-    case 37:
-    case 38:
-      result = 12;
-      break;
-    case 9:
-    case 10:
-      result = 11;
-      break;
-    case 21:
-    case 22:
-      result = 13;
-      break;
-    case 26:
-    case 27:
-    case 28:
-      result = 15;
-      break;
-    case 29:
-    case 30:
-      result = 14;
-      break;
-    case 32:
-      result = 10;
-      break;
-    case 33:
-      result = 8;
-      break;
-    case 34:
-      result = 9;
-      break;
-    case 35:
-    case 36:
-      result = 16;
-      break;
-    case 42:
-    case 43:
-      result = 5;
-      break;
-    default:
-      result = 0;
-      break;
+    case 26: return 15;   /* P_MUL */
+    case 27: return 15;   /* P_DIV */
+    case 28: return 15;   /* P_MOD */
+    case 29: return 14;   /* P_ADD */
+    case 30: return 14;   /* P_SUB */
+
+    case 5: return 7;     /* P_LOGIC_AND */
+    case 6: return 6;     /* P_LOGIC_OR */
+    case 7: return 12;    /* P_LOGIC_GEQ */
+    case 8: return 12;    /* P_LOGIC_LEQ */
+    case 9: return 11;    /* P_LOGIC_EQ */
+    case 10: return 11;   /* P_LOGIC_UNEQ */
+
+    case 36: return 16;   /* P_LOGIC_NOT */
+    case 37: return 12;   /* P_LOGIC_GREATER */
+    case 38: return 12;   /* P_LOGIC_LESS */
+
+    case 21: return 13;   /* P_RSHIFT */
+    case 22: return 13;   /* P_LSHIFT */
+
+    case 32: return 10;   /* P_BIN_AND */
+    case 33: return 8;    /* P_BIN_OR */
+    case 34: return 9;    /* P_BIN_XOR */
+    case 35: return 16;   /* P_BIN_NOT */
+
+    case 42: return 5;    /* P_COLON */
+    case 43: return 5;    /* P_QUESTIONMARK */
   }
-  return result;
+  return 0;
 }
 
 /* ---- PC_EvaluateTokens  0x0043FC10 ---- */
-// PC_EvaluateTokens | CONFIRMED | RTCW l_precomp.c:1784
-/* Retail is __usercall(tokens@ecx, source, intvalue, floatvalue, integer) --
- * `mov ebx, ecx` at 0x0043FC2A, then `mov ecx, [ebp+arg_0]` and
- * `mov eax, [ebp+arg_4]` for the two stack arguments the prologue touches.
- * tokens is Q3/RTCW's parameter, in Q3's own order; both callers
- * (PC_Evaluate, PC_DollarEvaluate) pass the firsttoken list head they free
- * immediately afterwards. */
-int __cdecl PC_EvaluateTokens(int a1, _DWORD *tokens, _DWORD *a2, _DWORD *a3, int a4)
-{
-  double *v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  char *v10;
-  int v11;
-  _DWORD *v12;
-  double *v13;
-  double *v14;
-  int v15;
-  _DWORD *v16;
-  int *v17;
-  double *v18;
-  int *v19;
-  int v20;
-  int v21;
-  int v22;
-  double v23;
-  double v24;
-  double v25;
-  BOOL v26;
-  double v27;
-  BOOL v28;
-  double v29;
-  double v30;
-  double v31;
-  double v32;
-  double v33;
-  double v34;
-  double v35;
-  int v36;
-  int v37;
-  int v38;
-  int v39;
-  int v40;
-  _DWORD *v41;
-  _DWORD *i;
-  double *j;
-  int v45;
-  char *v46;
-  _DWORD *v47;
-  int v48;
-  int v49;
-  int v50;
-  double *v51;
-  int v52;
-  _DWORD *v53;
-  int v54;
-  int v55;
-  int v56;
-  double *v57;
-  char *v58;
-  int v59;
-  double *v60;
-  int v61;
-  double v62;
-  int v63;
-  /* Retail's frame is `sub esp, 0D3Ch` at 0x0043FC16 and the two heaps tile
-   * it exactly: [ebp-D00h]..[ebp-800h] is 0x500 = 64 x 20, RTCW's
-   * `operator_t operator_heap[MAX_OPERATORS]`, and [ebp-800h]..[ebp-0] is
-   * 0x800 = 64 x 32, `value_t value_heap[MAX_VALUES]`.  Live: the engine's
-   * PC_* traps parse the UI .menu files, so any `#if` in one runs this. */
-  char v64[64 * 20]; // [esp+48h] [ebp-D00h] BYREF  -- operator_heap
-  char v65[64 * 32]; // [esp+548h] [ebp-800h] BYREF -- value_heap
+// PC_EvaluateTokens | CONFIRMED | RTCW l_precomp.c:1649
+/* RTCW l_precomp.c text.  Retail is __usercall(tokens@ecx, source, intvalue,
+ * floatvalue, integer): LTCG lifts tokens into ECX and leaves the other four
+ * on the stack.  Both callers (PC_Evaluate, PC_DollarEvaluate) pass the
+ * firsttoken list head they free immediately afterwards.
+ *
+ * Retail's frame is `sub esp, 0D3Ch` under `and esp, -8` (0x0043FC13): the
+ * two heaps tile it, operator_heap (64 x 20) at [esp+48h] and value_heap
+ * (64 x 32, 8-aligned for floatvalue) at [esp+548h].  Live: the engine's PC_*
+ * traps parse the UI .menu files, so any `#if` in one runs this. */
 
-  v5 = 0;
-  v6 = 0;
-  v7 = (int)tokens;
-  v8 = a1;
-  v61 = 0;
-  v54 = 0;
-  v50 = 0;
-  v55 = 0;
-  v63 = 0;
-  v56 = 0;
-  v47 = 0;
-  v53 = 0;
-  v51 = 0;
-  v57 = 0;
-  if ( a2 )
-    *a2 = 0;
-  if ( a3 )
+/* RTCW l_precomp.c operator_t / value_t, private to the evaluator there too. */
+typedef struct operator_s
+{
+  int op;                           /* +0  -- RTCW `operator` */
+  int priority;                     /* +4  */
+  int parentheses;                  /* +8  */
+  struct operator_s *prev, *next;   /* +12, +16 */
+} operator_t;                       /* 20 bytes */
+
+typedef struct value_s
+{
+  signed long int intvalue;         /* +0  */
+  long double floatvalue;                /* +8  */
+  int parentheses;                  /* +16 */
+  struct value_s *prev, *next;      /* +20, +24 */
+} value_t;                          /* 32 bytes */
+
+/* RTCW l_script.h punctuation subtypes the evaluator switches on. */
+#define P_LOGIC_AND         5
+#define P_LOGIC_OR          6
+#define P_LOGIC_GEQ         7
+#define P_LOGIC_LEQ         8
+#define P_LOGIC_EQ          9
+#define P_LOGIC_UNEQ        10
+#define P_INC               16
+#define P_DEC               17
+#define P_RSHIFT            21
+#define P_LSHIFT            22
+#define P_MUL               26
+#define P_DIV               27
+#define P_MOD               28
+#define P_ADD               29
+#define P_SUB               30
+#define P_BIN_AND           32
+#define P_BIN_OR            33
+#define P_BIN_XOR           34
+#define P_BIN_NOT           35
+#define P_LOGIC_NOT         36
+#define P_LOGIC_GREATER     37
+#define P_LOGIC_LESS        38
+#define P_COLON             42
+#define P_QUESTIONMARK      43
+#define P_PARENTHESESOPEN   44
+#define P_PARENTHESESCLOSE  45
+
+#define MAX_VALUES      64
+#define MAX_OPERATORS   64
+#define AllocValue( val )                                   \
+  if ( numvalues >= MAX_VALUES ) {                          \
+    SourceError( source, "out of value space\n" );          \
+    error = 1;                                              \
+    break;                                                  \
+  }                                                         \
+  else                                                      \
+    val = &value_heap[numvalues++];
+#define FreeValue( val )
+#define AllocOperator( op )                                 \
+  if ( numoperators >= MAX_OPERATORS ) {                    \
+    SourceError( source, "out of operator space\n" );       \
+    error = 1;                                              \
+    break;                                                  \
+  }                                                         \
+  else                                                      \
+    op = &operator_heap[numoperators++];
+#define FreeOperator( op )
+
+int __cdecl PC_EvaluateTokens(source_t *source, token_t *tokens, int *intvalue,
+                              long double *floatvalue, int integer)
+{
+  operator_t *o, *firstoperator, *lastoperator;
+  value_t *v, *firstvalue, *lastvalue, *v1, *v2;
+  token_t *t;
+  int brace = 0;
+  int parentheses = 0;
+  int error = 0;
+  int lastwasvalue = 0;
+  int negativevalue = 0;
+  int questmarkintvalue = 0;
+  double questmarkfloatvalue = 0;
+  int gotquestmarkvalue = 0;
+  int lastoperatortype = 0;
+  operator_t operator_heap[MAX_OPERATORS];
+  int numoperators = 0;
+  value_t value_heap[MAX_VALUES];
+  int numvalues = 0;
+
+  firstoperator = lastoperator = NULL;
+  firstvalue = lastvalue = NULL;
+  if ( intvalue )
+    *intvalue = 0;
+  if ( floatvalue )
+    *floatvalue = 0;
+  for ( t = tokens; t; t = t->next )
   {
-    *a3 = 0;
-    a3[1] = 0;
-  }
-  if ( !v7 )
-  {
-LABEL_80:
-    SourceError(a1, "trailing operator in #if/#elif");
-    goto LABEL_83;
-  }
-  v60 = (double *)v65;
-  v58 = v64;
-  while ( 1 )
-  {
-    if ( *(_DWORD *)(v7 + 1024) == 3 )
+    switch ( t->type )
     {
-      if ( v6 )
-        goto LABEL_77;
-      if ( v56 >= 64 )
+      case TT_NAME:
       {
-        SourceError(v8, "out of value space\n");
-        goto LABEL_83;
-      }
-      v14 = v60;
-      v60 += 4;
-      v15 = *(_DWORD *)(v7 + 1032);
-      ++v56;
-      if ( v55 )
-      {
-        *(_DWORD *)v14 = -v15;
-        v14[1] = -*(double *)(v7 + 1040);
-      }
-      else
-      {
-        *(_DWORD *)v14 = v15;
-        *((_DWORD *)v14 + 2) = *(_DWORD *)(v7 + 1040);
-        *((_DWORD *)v14 + 3) = *(_DWORD *)(v7 + 1044);
-      }
-      *((_DWORD *)v14 + 4) = v54;
-      *((_DWORD *)v14 + 6) = 0;
-      *((_DWORD *)v14 + 5) = v5;
-      if ( v5 )
-        *((_DWORD *)v5 + 6) = v14;
-      else
-        v57 = v14;
-      v51 = v14;
-      v55 = 0;
-      goto LABEL_64;
-    }
-    if ( *(_DWORD *)(v7 + 1024) == 4 )
-    {
-      if ( v6 || v55 )
-      {
-LABEL_77:
-        SourceError(v8, "syntax error in #if/#elif");
-        goto LABEL_83;
-      }
-      if ( strcmp((const char *)v7, "defined") )
-      {
-        SourceError(a1, "undefined name %s in #if/#elif", (const char *)v7);
-        goto LABEL_83;
-      }
-      v7 = *(_DWORD *)(v7 + 1064);
-      if ( !strcmp((const char *)v7, "(") )
-      {
-        v7 = *(_DWORD *)(v7 + 1064);
-        v61 = 1;
-      }
-      if ( !v7 || *(_DWORD *)(v7 + 1024) != 4 )
-      {
-        SourceError(a1, "defined without name in #if/#elif");
-        goto LABEL_83;
-      }
-      if ( v56 >= 64 )
-      {
-        SourceError(a1, "out of value space\n");
-        goto LABEL_83;
-      }
-      v13 = v60;
-      v60 += 4;
-      ++v56;
-      if ( PC_FindHashedDefine(*(_DWORD *)(a1 + 536), (char *)v7) )
-      {
-        *(_DWORD *)v13 = 1;
-        *((_DWORD *)v13 + 2) = 0;
-        *((_DWORD *)v13 + 3) = 1072693248;
-      }
-      else
-      {
-        *(_DWORD *)v13 = 0;
-        *((_DWORD *)v13 + 2) = 0;
-        *((_DWORD *)v13 + 3) = 0;
-      }
-      *((_DWORD *)v13 + 4) = v54;
-      *((_DWORD *)v13 + 6) = 0;
-      *((_DWORD *)v13 + 5) = v51;
-      if ( v51 )
-        *((_DWORD *)v51 + 6) = v13;
-      else
-        v57 = v13;
-      v51 = v13;
-      if ( v61 )
-      {
-        v7 = *(_DWORD *)(v7 + 1064);
-        if ( !v7 || strcmp((const char *)v7, ")") )
+        if ( lastwasvalue || negativevalue )
         {
-          SourceError(a1, "defined without ) in #if/#elif");
-          goto LABEL_83;
-        }
-      }
-      v61 = 0;
-LABEL_64:
-      v6 = 1;
-      goto LABEL_65;
-    }
-    if ( *(_DWORD *)(v7 + 1024) != 5 )
-    {
-      SourceError(v8, "unknown %s in #if/#elif", (const char *)v7);
-      goto LABEL_83;
-    }
-    if ( v55 )
-    {
-      SourceError(v8, "misplaced minus sign in #if/#elif");
-      goto LABEL_83;
-    }
-    v9 = *(_DWORD *)(v7 + 1028);
-    if ( v9 == 44 )
-    {
-      ++v54;
-    }
-    else if ( v9 == 45 )
-    {
-      if ( --v54 < 0 )
-      {
-        SourceError(v8, "too many ) in #if/#elsif");
-        goto LABEL_83;
-      }
-    }
-    else
-    {
-      if ( !a4 && (v9 == 35 || v9 == 28 || v9 == 21 || v9 == 22 || v9 == 32 || v9 == 33 || v9 == 34) )
-      {
-        SourceError(v8, "illigal operator %s on floating point operands\n", (const char *)v7);
-        goto LABEL_83;
-      }
-      switch ( v9 )
-      {
-        case 5:
-        case 6:
-        case 7:
-        case 8:
-        case 9:
-        case 10:
-        case 21:
-        case 22:
-        case 26:
-        case 27:
-        case 28:
-        case 29:
-        case 32:
-        case 33:
-        case 34:
-        case 37:
-        case 38:
-        case 42:
-        case 43:
-          if ( v6 )
-            goto LABEL_31;
-          SourceError(v8, "operator %s after operator in #if/#elif", (const char *)v7);
-          goto LABEL_83;
-        case 16:
-        case 17:
-          SourceError(v8, "++ or -- used in #if/#elif");
-          goto LABEL_31;
-        case 30:
-          if ( !v6 )
-            v55 = 1;
-          goto LABEL_31;
-        case 35:
-        case 36:
-          if ( v6 )
-          {
-            SourceError(v8, "! or ~ after value in #if/#elif");
-            goto LABEL_83;
-          }
-LABEL_31:
-          if ( v55 )
-            break;
-          if ( v63 >= 64 )
-          {
-            SourceError(a1, "out of operator space\n");
-            goto LABEL_83;
-          }
-          v10 = v58;
-          v58 += 20;
-          /* v10 and v12 are the same pointer -- the 20-byte operator_t just
-             carved off the 64-entry heap at [ebp-D00h]. */
-          v12 = (_DWORD *)v10;
-          *(_DWORD *)v10 = *(_DWORD *)(v7 + 1028);
-          ++v63;
-          v11 = PC_OperatorPriority(*(_DWORD *)(v7 + 1028));
-          v12[1] = v11;
-          v6 = 0;
-          v12[2] = v54;
-          v12[4] = 0;
-          v12[3] = v47;
-          if ( v47 )
-            v47[4] = v12;
-          else
-            v53 = v12;
-          v47 = v12;
+          SourceError( source, "syntax error in #if/#elif" );
+          error = 1;
           break;
-        default:
-          SourceError(v8, "invalid operator %s in #if/#elif", (const char *)v7);
-          goto LABEL_83;
-      }
-    }
-LABEL_65:
-    v7 = *(_DWORD *)(v7 + 1064);
-    if ( !v7 )
-      break;
-    v8 = a1;
-    v5 = v51;
-  }
-  if ( !v6 )
-    goto LABEL_80;
-  if ( v54 )
-  {
-    SourceError(a1, "too many ( in #if/#elif");
-LABEL_83:
-    v50 = 1;
-  }
-  v52 = 0;
-  v59 = 0;
-  v62 = 0.0;
-  if ( v50 )
-    goto LABEL_163;
-  while ( 2 )
-  {
-    v16 = v53;
-    if ( !v53 )
-      goto LABEL_164;
-    v17 = (int *)v53[4];
-    v18 = v57;
-    v19 = v53;
-    if ( v17 )
-    {
-      while ( 1 )
-      {
-        v20 = v19[2];
-        v21 = v17[2];
-        if ( v20 > v21 || v20 == v21 && v19[1] >= v17[1] )
-          goto LABEL_95;
-        if ( *v19 != 36 && *v19 != 35 )
-          v18 = (double *)*((_DWORD *)v18 + 6);
-        if ( !v18 )
+        }
+        if ( strcmp( t->string, "defined" ) )
+        {
+          SourceError( source, "undefined name %s in #if/#elif", t->string );
+          error = 1;
           break;
-        v19 = v17;
-        v17 = (int *)v17[4];
-        if ( !v17 )
-          goto LABEL_95;
-      }
-      SourceError(a1, "mising values in #if/#elif");
-      v50 = 1;
-      goto LABEL_164;
-    }
-LABEL_95:
-    v22 = *((_DWORD *)v18 + 6);
-    switch ( *v19 )
-    {
-      case 5:
-        v26 = *(_DWORD *)v18 && *(_DWORD *)v22;
-        v27 = v18[1];
-        *(_DWORD *)v18 = v26;
-        if ( (v27 == 0.0) | __UNORDERED__(v27, 0.0)
-          || (v48 = 1, (*(double *)(v22 + 8) == 0.0) | __UNORDERED__(*(double *)(v22 + 8), 0.0)) )
-        {
-          v48 = 0;
         }
-        v18[1] = (double)v48;
-        goto LABEL_142;
-      case 6:
-        v28 = *(_DWORD *)v18 || *(_DWORD *)v22;
-        v29 = v18[1];
-        *(_DWORD *)v18 = v28;
-        if ( !((v29 == 0.0) | __UNORDERED__(v29, 0.0))
-          || (v49 = 0, !((*(double *)(v22 + 8) == 0.0) | __UNORDERED__(*(double *)(v22 + 8), 0.0))) )
+        t = t->next;
+        if ( !strcmp( t->string, "(" ) )
         {
-          v49 = 1;
+          brace = 1;
+          t = t->next;
         }
-        v18[1] = (double)v49;
-        goto LABEL_142;
-      case 7:
-        v30 = v18[1];
-        *(_DWORD *)v18 = *(_DWORD *)v18 >= *(_DWORD *)v22;
-        v18[1] = (double)(v30 >= *(double *)(v22 + 8));
-        goto LABEL_142;
-      case 8:
-        v31 = v18[1];
-        *(_DWORD *)v18 = *(_DWORD *)v18 <= *(_DWORD *)v22;
-        v18[1] = (double)(v31 <= *(double *)(v22 + 8));
-        goto LABEL_142;
-      case 9:
-        v32 = v18[1];
-        *(_DWORD *)v18 = *(_DWORD *)v22 == *(_DWORD *)v18;
-        v18[1] = (double)(((v32 == *(double *)(v22 + 8)) | __UNORDERED__(v32, *(double *)(v22 + 8))) != 0);
-        goto LABEL_142;
-      case 10:
-        v33 = v18[1];
-        *(_DWORD *)v18 = *(_DWORD *)v18 != *(_DWORD *)v22;
-        v18[1] = (double)(((v33 == *(double *)(v22 + 8)) | __UNORDERED__(v33, *(double *)(v22 + 8))) == 0);
-        goto LABEL_142;
-      case 21:
-        *(int *)v18 >>= *(_DWORD *)v22;
-        goto LABEL_142;
-      case 22:
-        *(_DWORD *)v18 <<= *(_DWORD *)v22;
-        goto LABEL_142;
-      case 26:
-        *(_DWORD *)v18 *= *(_DWORD *)v22;
-        v18[1] = *(double *)(v22 + 8) * v18[1];
-        goto LABEL_142;
-      case 27:
-        if ( !*(_DWORD *)v22 || (*(double *)(v22 + 8) == 0.0) | __UNORDERED__(*(double *)(v22 + 8), 0.0) )
+        if ( !t || t->type != TT_NAME )
         {
-          v46 = "divide by zero in #if/#elif\n";
-          goto LABEL_161;
+          SourceError( source, "defined without name in #if/#elif" );
+          error = 1;
+          break;
         }
-        v24 = v18[1];
-        *(int *)v18 /= *(int *)v22;
-        v18[1] = v24 / *(double *)(v22 + 8);
-        goto LABEL_142;
-      case 28:
-        if ( !*(_DWORD *)v22 )
+        AllocValue( v );
+        if ( PC_FindHashedDefine( (define_t **)source->definehash, t->string ) )
         {
-          v46 = "divide by zero in #if/#elif\n";
-          v45 = a1;
-          goto LABEL_162;
-        }
-        *(int *)v18 %= *(_DWORD *)v22;
-        goto LABEL_142;
-      case 29:
-        *(_DWORD *)v18 += *(_DWORD *)v22;
-        v18[1] = *(double *)(v22 + 8) + v18[1];
-        goto LABEL_142;
-      case 30:
-        v25 = v18[1];
-        *(_DWORD *)v18 -= *(_DWORD *)v22;
-        v18[1] = v25 - *(double *)(v22 + 8);
-        goto LABEL_142;
-      case 32:
-        *(_DWORD *)v18 &= *(_DWORD *)v22;
-        goto LABEL_142;
-      case 33:
-        *(_DWORD *)v18 |= *(_DWORD *)v22;
-        goto LABEL_142;
-      case 34:
-        *(_DWORD *)v18 ^= *(_DWORD *)v22;
-        goto LABEL_142;
-      case 35:
-        *(_DWORD *)v18 = ~*(_DWORD *)v18;
-        goto LABEL_142;
-      case 36:
-        v23 = v18[1];
-        *(_DWORD *)v18 = *(_DWORD *)v18 == 0;
-        v18[1] = (double)(((v23 == 0.0) | __UNORDERED__(v23, 0.0)) != 0);
-        goto LABEL_142;
-      case 37:
-        v34 = v18[1];
-        *(_DWORD *)v18 = *(_DWORD *)v18 > *(_DWORD *)v22;
-        v18[1] = (double)(v34 > *(double *)(v22 + 8));
-        goto LABEL_142;
-      case 38:
-        v35 = v18[1];
-        *(_DWORD *)v18 = *(_DWORD *)v18 < *(_DWORD *)v22;
-        v18[1] = (double)(((v35 < *(double *)(v22 + 8)) | __UNORDERED__(v35, *(double *)(v22 + 8))) != 0);
-        goto LABEL_142;
-      case 42:
-        if ( !v52 )
-        {
-          v46 = ": without ? in #if/#elif";
-          v45 = a1;
-          goto LABEL_162;
-        }
-        if ( a4 )
-        {
-          if ( !v59 )
-          {
-            *(_DWORD *)v18 = *(_DWORD *)v22;
-            v52 = 0;
-            goto LABEL_142;
-          }
-        }
-        else if ( (v62 == 0.0) | __UNORDERED__(v62, 0.0) )
-        {
-          *((_DWORD *)v18 + 2) = *(_DWORD *)(v22 + 8);
-          *((_DWORD *)v18 + 3) = *(_DWORD *)(v22 + 12);
-        }
-        v52 = 0;
-        goto LABEL_142;
-      case 43:
-        if ( !v52 )
-        {
-          v59 = *(_DWORD *)v18;
-          v62 = v18[1];
-          v52 = 1;
-LABEL_142:
-          v36 = *v19;
-          if ( *v19 != 36 && v36 != 35 )
-          {
-            if ( v36 != 43 )
-              v18 = (double *)v22;
-            v37 = *((_DWORD *)v18 + 5);
-            if ( v37 )
-              *(_DWORD *)(v37 + 24) = *((_DWORD *)v18 + 6);
-            else
-              v57 = (double *)*((_DWORD *)v18 + 6);
-            v38 = *((_DWORD *)v18 + 6);
-            if ( v38 )
-              *(_DWORD *)(v38 + 20) = *((_DWORD *)v18 + 5);
-          }
-          v39 = v19[3];
-          if ( v39 )
-            *(_DWORD *)(v39 + 16) = v19[4];
-          else
-            v53 = (_DWORD *)v19[4];
-          v40 = v19[4];
-          if ( v40 )
-            *(_DWORD *)(v40 + 12) = v19[3];
-          continue;
-        }
-        v46 = "? after ? in #if/#elif";
-LABEL_161:
-        v45 = a1;
-LABEL_162:
-        SourceError(v45, v46);
-        v50 = 1;
-LABEL_163:
-        v16 = v53;
-LABEL_164:
-        if ( v57 )
-        {
-          if ( a2 )
-            *a2 = *(_DWORD *)v57;
-          v41 = a3;
-          if ( a3 )
-          {
-            *a3 = *((_DWORD *)v57 + 2);
-            a3[1] = *((_DWORD *)v57 + 3);
-          }
+          v->intvalue = 1;
+          v->floatvalue = 1;
         }
         else
         {
-          v41 = a3;
+          v->intvalue = 0;
+          v->floatvalue = 0;
         }
-        for ( i = v16; i; i = (_DWORD *)i[4] )
-          ;
-        for ( j = v57; j; j = (double *)*((_DWORD *)j + 6) )
-          ;
-        if ( !v50 )
-          return 1;
-        if ( a2 )
-          *a2 = 0;
-        if ( v41 )
+        v->parentheses = parentheses;
+        v->next = NULL;
+        v->prev = lastvalue;
+        if ( lastvalue )
+          lastvalue->next = v;
+        else
+          firstvalue = v;
+        lastvalue = v;
+        if ( brace )
         {
-          *v41 = 0;
-          v41[1] = 0;
+          t = t->next;
+          if ( !t || strcmp( t->string, ")" ) )
+          {
+            SourceError( source, "defined without ) in #if/#elif" );
+            error = 1;
+            break;
+          }
         }
-        return 0;
+        brace = 0;
+        /* defined() creates a value */
+        lastwasvalue = 1;
+        break;
+      }
+      case TT_NUMBER:
+      {
+        if ( lastwasvalue )
+        {
+          SourceError( source, "syntax error in #if/#elif" );
+          error = 1;
+          break;
+        }
+        AllocValue( v );
+        if ( negativevalue )
+        {
+          v->intvalue = -(signed int)t->intvalue;
+          v->floatvalue = -t->floatvalue;
+        }
+        else
+        {
+          v->intvalue = t->intvalue;
+          v->floatvalue = t->floatvalue;
+        }
+        v->parentheses = parentheses;
+        v->next = NULL;
+        v->prev = lastvalue;
+        if ( lastvalue )
+          lastvalue->next = v;
+        else
+          firstvalue = v;
+        lastvalue = v;
+        /* last token was a value */
+        lastwasvalue = 1;
+        negativevalue = 0;
+        break;
+      }
+      case TT_PUNCTUATION:
+      {
+        if ( negativevalue )
+        {
+          SourceError( source, "misplaced minus sign in #if/#elif" );
+          error = 1;
+          break;
+        }
+        if ( t->subtype == P_PARENTHESESOPEN )
+        {
+          parentheses++;
+          break;
+        }
+        else if ( t->subtype == P_PARENTHESESCLOSE )
+        {
+          parentheses--;
+          if ( parentheses < 0 )
+          {
+            SourceError( source, "too many ) in #if/#elsif" );
+            error = 1;
+          }
+          break;
+        }
+        /* check for invalid operators on floating point values */
+        if ( !integer )
+        {
+          if ( t->subtype == P_BIN_NOT || t->subtype == P_MOD ||
+               t->subtype == P_RSHIFT || t->subtype == P_LSHIFT ||
+               t->subtype == P_BIN_AND || t->subtype == P_BIN_OR ||
+               t->subtype == P_BIN_XOR )
+          {
+            SourceError( source, "illigal operator %s on floating point operands\n", t->string );
+            error = 1;
+            break;
+          }
+        }
+        switch ( t->subtype )
+        {
+          case P_LOGIC_NOT:
+          case P_BIN_NOT:
+          {
+            if ( lastwasvalue )
+            {
+              SourceError( source, "! or ~ after value in #if/#elif" );
+              error = 1;
+              break;
+            }
+            break;
+          }
+          case P_INC:
+          case P_DEC:
+          {
+            SourceError( source, "++ or -- used in #if/#elif" );
+            break;
+          }
+          case P_SUB:
+          {
+            if ( !lastwasvalue )
+            {
+              negativevalue = 1;
+              break;
+            }
+          }
+          /* fall through */
+          case P_MUL:
+          case P_DIV:
+          case P_MOD:
+          case P_ADD:
+
+          case P_LOGIC_AND:
+          case P_LOGIC_OR:
+          case P_LOGIC_GEQ:
+          case P_LOGIC_LEQ:
+          case P_LOGIC_EQ:
+          case P_LOGIC_UNEQ:
+
+          case P_LOGIC_GREATER:
+          case P_LOGIC_LESS:
+
+          case P_RSHIFT:
+          case P_LSHIFT:
+
+          case P_BIN_AND:
+          case P_BIN_OR:
+          case P_BIN_XOR:
+
+          case P_COLON:
+          case P_QUESTIONMARK:
+          {
+            if ( !lastwasvalue )
+            {
+              SourceError( source, "operator %s after operator in #if/#elif", t->string );
+              error = 1;
+              break;
+            }
+            break;
+          }
+          default:
+          {
+            SourceError( source, "invalid operator %s in #if/#elif", t->string );
+            error = 1;
+            break;
+          }
+        }
+        if ( !error && !negativevalue )
+        {
+          AllocOperator( o );
+          o->op = t->subtype;
+          o->priority = PC_OperatorPriority( t->subtype );
+          o->parentheses = parentheses;
+          o->next = NULL;
+          o->prev = lastoperator;
+          if ( lastoperator )
+            lastoperator->next = o;
+          else
+            firstoperator = o;
+          lastoperator = o;
+          lastwasvalue = 0;
+        }
+        break;
+      }
       default:
-        goto LABEL_142;
+      {
+        SourceError( source, "unknown %s in #if/#elif", t->string );
+        error = 1;
+        break;
+      }
+    }
+    if ( error )
+      break;
+  }
+  if ( !error )
+  {
+    if ( !lastwasvalue )
+    {
+      SourceError( source, "trailing operator in #if/#elif" );
+      error = 1;
+    }
+    else if ( parentheses )
+    {
+      SourceError( source, "too many ( in #if/#elif" );
+      error = 1;
     }
   }
+  gotquestmarkvalue = 0;
+  questmarkintvalue = 0;
+  questmarkfloatvalue = 0;
+  /* while there are operators */
+  while ( !error && firstoperator )
+  {
+    v = firstvalue;
+    for ( o = firstoperator; o->next; o = o->next )
+    {
+      /* if the current operator is nested deeper in parentheses than the
+         next operator */
+      if ( o->parentheses > o->next->parentheses )
+        break;
+      /* if the current and next operator are nested equally deep */
+      if ( o->parentheses == o->next->parentheses )
+      {
+        /* if the priority of the current operator is equal or higher than
+           the priority of the next operator */
+        if ( o->priority >= o->next->priority )
+          break;
+      }
+      /* if the arity of the operator isn't equal to 1 */
+      if ( o->op != P_LOGIC_NOT && o->op != P_BIN_NOT )
+        v = v->next;
+      /* if there's no value or no next value */
+      if ( !v )
+      {
+        SourceError( source, "mising values in #if/#elif" );
+        error = 1;
+        break;
+      }
+    }
+    if ( error )
+      break;
+    v1 = v;
+    v2 = v->next;
+    switch ( o->op )
+    {
+      case P_LOGIC_NOT:       v1->intvalue = !v1->intvalue;
+                              v1->floatvalue = !v1->floatvalue; break;
+      case P_BIN_NOT:         v1->intvalue = ~v1->intvalue;
+                              break;
+      case P_MUL:             v1->intvalue *= v2->intvalue;
+                              v1->floatvalue *= v2->floatvalue; break;
+      case P_DIV:             if ( !v2->intvalue || !v2->floatvalue )
+                              {
+                                SourceError( source, "divide by zero in #if/#elif\n" );
+                                error = 1;
+                                break;
+                              }
+                              v1->intvalue /= v2->intvalue;
+                              v1->floatvalue /= v2->floatvalue; break;
+      case P_MOD:             if ( !v2->intvalue )
+                              {
+                                SourceError( source, "divide by zero in #if/#elif\n" );
+                                error = 1;
+                                break;
+                              }
+                              v1->intvalue %= v2->intvalue; break;
+      case P_ADD:             v1->intvalue += v2->intvalue;
+                              v1->floatvalue += v2->floatvalue; break;
+      case P_SUB:             v1->intvalue -= v2->intvalue;
+                              v1->floatvalue -= v2->floatvalue; break;
+      case P_LOGIC_AND:       v1->intvalue = v1->intvalue && v2->intvalue;
+                              v1->floatvalue = v1->floatvalue && v2->floatvalue; break;
+      case P_LOGIC_OR:        v1->intvalue = v1->intvalue || v2->intvalue;
+                              v1->floatvalue = v1->floatvalue || v2->floatvalue; break;
+      case P_LOGIC_GEQ:       v1->intvalue = v1->intvalue >= v2->intvalue;
+                              v1->floatvalue = v1->floatvalue >= v2->floatvalue; break;
+      case P_LOGIC_LEQ:       v1->intvalue = v1->intvalue <= v2->intvalue;
+                              v1->floatvalue = v1->floatvalue <= v2->floatvalue; break;
+      case P_LOGIC_EQ:        v1->intvalue = v1->intvalue == v2->intvalue;
+                              v1->floatvalue = v1->floatvalue == v2->floatvalue; break;
+      case P_LOGIC_UNEQ:      v1->intvalue = v1->intvalue != v2->intvalue;
+                              v1->floatvalue = v1->floatvalue != v2->floatvalue; break;
+      case P_LOGIC_GREATER:   v1->intvalue = v1->intvalue > v2->intvalue;
+                              v1->floatvalue = v1->floatvalue > v2->floatvalue; break;
+      case P_LOGIC_LESS:      v1->intvalue = v1->intvalue < v2->intvalue;
+                              v1->floatvalue = v1->floatvalue < v2->floatvalue; break;
+      case P_RSHIFT:          v1->intvalue >>= v2->intvalue;
+                              break;
+      case P_LSHIFT:          v1->intvalue <<= v2->intvalue;
+                              break;
+      case P_BIN_AND:         v1->intvalue &= v2->intvalue;
+                              break;
+      case P_BIN_OR:          v1->intvalue |= v2->intvalue;
+                              break;
+      case P_BIN_XOR:         v1->intvalue ^= v2->intvalue;
+                              break;
+      case P_COLON:
+      {
+        if ( !gotquestmarkvalue )
+        {
+          SourceError( source, ": without ? in #if/#elif" );
+          error = 1;
+          break;
+        }
+        if ( integer )
+        {
+          if ( !questmarkintvalue )
+            v1->intvalue = v2->intvalue;
+        }
+        else
+        {
+          if ( !questmarkfloatvalue )
+            v1->floatvalue = v2->floatvalue;
+        }
+        gotquestmarkvalue = 0;
+        break;
+      }
+      case P_QUESTIONMARK:
+      {
+        if ( gotquestmarkvalue )
+        {
+          SourceError( source, "? after ? in #if/#elif" );
+          error = 1;
+          break;
+        }
+        questmarkintvalue = v1->intvalue;
+        questmarkfloatvalue = v1->floatvalue;
+        gotquestmarkvalue = 1;
+        break;
+      }
+    }
+    if ( error )
+      break;
+    lastoperatortype = o->op;
+    /* if not an operator with arity 1 */
+    if ( o->op != P_LOGIC_NOT && o->op != P_BIN_NOT )
+    {
+      /* remove the second value if not question mark operator */
+      if ( o->op != P_QUESTIONMARK )
+        v = v->next;
+      if ( v->prev )
+        v->prev->next = v->next;
+      else
+        firstvalue = v->next;
+      if ( v->next )
+        v->next->prev = v->prev;
+      else
+        lastvalue = v->prev;
+      FreeValue( v );
+    }
+    /* remove the operator */
+    if ( o->prev )
+      o->prev->next = o->next;
+    else
+      firstoperator = o->next;
+    if ( o->next )
+      o->next->prev = o->prev;
+    else
+      lastoperator = o->prev;
+    FreeOperator( o );
+  }
+  if ( firstvalue )
+  {
+    if ( intvalue )
+      *intvalue = firstvalue->intvalue;
+    if ( floatvalue )
+      *floatvalue = firstvalue->floatvalue;
+  }
+  for ( o = firstoperator; o; o = lastoperator )
+  {
+    lastoperator = o->next;
+    FreeOperator( o );
+  }
+  for ( v = firstvalue; v; v = lastvalue )
+  {
+    lastvalue = v->next;
+    FreeValue( v );
+  }
+  if ( !error )
+    return 1;
+  if ( intvalue )
+    *intvalue = 0;
+  if ( floatvalue )
+    *floatvalue = 0;
+  return 0;
 }
 
 /* 0x00440628-0x0044064F is NOT A FUNCTION: it is the JUMP TABLE for the
@@ -2570,122 +2000,92 @@ LABEL_164:
 
 /* ---- PC_Evaluate  0x00440650 ---- */
 // PC_Evaluate | CONFIRMED | RTCW l_precomp.c:2128
-int __cdecl PC_Evaluate(int a1, _DWORD *a2, _DWORD *a3, int a4)
+int __cdecl PC_Evaluate(source_t *source, int *intvalue, long double *floatvalue, int integer)
 {
-  int v4;
-  _DWORD *v6;
-  _DWORD *v7;
-  int HashedDefine;
-  int *v9;
-  int *v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  void *v15;
-  char *v16;
-  char *LocalizedString_m;
-  char v18[4];
-  int v19;
-  char ArgList[1072]; // [esp+10h] [ebp-434h] BYREF
-  unsigned int v21;
-  unsigned int retaddr;
+  token_t token;
+  token_t *firsttoken, *lasttoken;
+  token_t *t, *nexttoken;
+  define_t *define;
+  int defined = 0;
 
-  v21 = retaddr ^ _security_cookie;
-  v19 = 0;
-  if ( a2 )
-    *a2 = 0;
-  if ( a3 )
+  if ( intvalue )
+    *intvalue = 0;
+  if ( floatvalue )
+    *floatvalue = 0;
+  if ( !PC_ReadLine( source, &token ) )
   {
-    *a3 = 0;
-    a3[1] = 0;
-  }
-  v4 = a1;
-  if ( !PC_ReadLine(a1, ArgList) )
-  {
-    SourceError(a1, "no value after #if/#elif");
+    SourceError( source, "no value after #if/#elif" );
     return 0;
   }
-  *(_DWORD *)v18 = 0;
-  v6 = 0;
+  firsttoken = NULL;
+  lasttoken = NULL;
   do
   {
-    if ( *(_DWORD *)&ArgList[1024] != 4 )
+    /* if the token is a name */
+    if ( token.type == TT_NAME )
     {
-      if ( *(_DWORD *)&ArgList[1024] != 3 && *(_DWORD *)&ArgList[1024] != 5 )
+      if ( defined )
       {
-        SourceError(v4, "can't evaluate %s", ArgList);
-        return 0;
+        defined = 0;
+        t = PC_CopyToken( &token );
+        t->next = NULL;
+        if ( lasttoken )
+          lasttoken->next = t;
+        else
+          firsttoken = t;
+        lasttoken = t;
       }
-      v9 = (int *)malloc(0x434u);
-      v10 = v9;
-      if ( !v9 )
+      else if ( !strcmp( token.string, "defined" ) )
       {
-        Sys_OutOfMemoryPrep();
-        LocalizedString_m = SEH_GetLocalizedString_m("WIN_OUT_OF_MEM_TITLE");
-        v16 = SEH_GetLocalizedString_m("WIN_OUT_OF_MEM_BODY");
-        MessageBoxA(0, v16, LocalizedString_m, 0x10u);
-        exit(-1);
+        defined = 1;
+        t = PC_CopyToken( &token );
+        t->next = NULL;
+        if ( lasttoken )
+          lasttoken->next = t;
+        else
+          firsttoken = t;
+        lasttoken = t;
       }
-      Com_Memset(v9, 0, 0x434u);
-      v7 = v10 + 1;
-      *v10 = 305419896;
-      if ( v10 == (int *)-4 )
-        Com_Error(ERR_FATAL, "EXE_ERR_OUT_OF_MEMORY");
-      qmemcpy(v7, ArgList, 0x430u);
-      v11 = numtokens + 1;
-      v10[267] = 0;
-      numtokens = v11;
-      goto LABEL_13;
-    }
-    if ( v19 )
-    {
-      v19 = 0;
-      v7 = PC_CopyToken(ArgList);
-LABEL_13:
-      v7[266] = 0;
-      if ( v6 )
-        v6[266] = v7;
       else
-        *(_DWORD *)v18 = v7;
-      v6 = v7;
-      goto LABEL_26;
+      {
+        /* then it must be a define */
+        define = PC_FindHashedDefine( (define_t **)source->definehash, token.string );
+        if ( !define )
+        {
+          SourceError( source, "can't evaluate %s, not defined", token.string );
+          return 0;
+        }
+        if ( !PC_ExpandDefineIntoSource( source, &token, define ) )
+          return 0;
+      }
     }
-    if ( !strcmp(ArgList, "defined") )
+    /* if the token is a number or a punctuation */
+    else if ( token.type == TT_NUMBER || token.type == TT_PUNCTUATION )
     {
-      v19 = 1;
-      v7 = PC_CopyToken(ArgList);
-      goto LABEL_13;
+      t = PC_CopyToken( &token );
+      t->next = NULL;
+      if ( lasttoken )
+        lasttoken->next = t;
+      else
+        firsttoken = t;
+      lasttoken = t;
     }
-    HashedDefine = PC_FindHashedDefine(*(_DWORD *)(a1 + 536), ArgList);
-    if ( !HashedDefine )
+    else
     {
-      SourceError(a1, "can't evaluate %s, not defined", ArgList);
+      SourceError( source, "can't evaluate %s", token.string );
       return 0;
     }
-    if ( !PC_ExpandDefineIntoSource(HashedDefine, a1, ArgList) )
-      return 0;
-LABEL_26:
-    v4 = a1;
   }
-  while ( PC_ReadLine(a1, ArgList) );
+  while ( PC_ReadLine( source, &token ) );
   /* tokens is the ECX argument in retail; it is the list this function frees below. */
-  if ( !PC_EvaluateTokens(a1, *(_DWORD **)v18, a2, a3, a4) )
+  if ( !PC_EvaluateTokens( source, firsttoken, intvalue, floatvalue, integer ) )
     return 0;
-  v12 = *(_DWORD *)v18;
-  if ( *(_DWORD *)v18 )
+  for ( t = firsttoken; t; t = nexttoken )
   {
-    do
-    {
-      v13 = *(_DWORD *)(v12 + 1064);
-      v14 = *(_DWORD *)(v12 - 4);
-      v15 = (void *)(v12 - 4);
-      if ( v14 == 305419896 )
-        free(v15);
-      --numtokens;
-      v12 = v13;
-    }
-    while ( v13 );
+    nexttoken = t->next;
+    if ( ((int *)t)[-1] == ZONE_MAGIC )
+      free((int *)t - 1);
+    numtokens--;
   }
   return 1;
 }
@@ -2694,315 +2094,235 @@ LABEL_26:
 // PC_DollarEvaluate | CONFIRMED | RTCW l_precomp.c:2232
 /* Retail: source@<ecx> (`mov ebx, ecx` at 0x00440926) and the three stack
  * arguments at arg_0/arg_4/arg_8.  Spelled as an explicit leading parameter. */
-int __cdecl PC_DollarEvaluate(int source, _DWORD *a1, _DWORD *a2, int a3)
+int __cdecl PC_DollarEvaluate(source_t *source, int *intvalue, long double *floatvalue, int integer)
 {
-  int v3 = source;
-  int v4;
-  _DWORD *v6;
-  _DWORD *v7;
-  int HashedDefine;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  void *v13;
-  int v14;
-  char v15[4];
-  int v16;
-  /* SPLIT-RECORD: one token_t at [ebp-434h] that PC_ReadSourceToken and
-     PC_ExpandDefineIntoSource both fill completely. */
-  token_t tok;                          /* [esp+14h] [ebp-434h] BYREF */
-  char *ArgList = tok.string;
-  unsigned int v19;
-  unsigned int retaddr;
+  token_t token;
+  token_t *firsttoken, *lasttoken;
+  token_t *t, *nexttoken;
+  define_t *define;
+  int indent, defined = 0;
 
-  v19 = retaddr ^ _security_cookie;
-  v4 = v3;
-  v16 = 0;
-  if ( a1 )
-    *a1 = 0;
-  if ( a2 )
+  if ( intvalue )
+    *intvalue = 0;
+  if ( floatvalue )
+    *floatvalue = 0;
+  if ( !PC_ReadSourceToken(source,&token) )
   {
-    *a2 = 0;
-    a2[1] = 0;
-  }
-  if ( !PC_ReadSourceToken(ArgList, v3) )
-  {
-    SourceError(v4, "no leading ( after $evalint/$evalfloat");
+    SourceError( source, "no leading ( after $evalint/$evalfloat" );
     return 0;
   }
-  if ( !PC_ReadSourceToken(ArgList, v4) )
+  if ( !PC_ReadSourceToken(source,&token) )
   {
-    SourceError(v4, "nothing to evaluate");
+    SourceError( source, "nothing to evaluate" );
     return 0;
   }
-  v14 = 1;
-  *(_DWORD *)v15 = 0;
-  v6 = 0;
+  indent = 1;
+  firsttoken = NULL;
+  lasttoken = NULL;
   do
   {
-    if ( tok.type != TT_NAME )
+    /* if the token is a name */
+    if ( token.type == TT_NAME )
     {
-      if ( tok.type != TT_NUMBER && tok.type != TT_PUNCTUATION )
+      if ( defined )
       {
-        SourceError(v4, "can't evaluate %s", ArgList);
-        return 0;
+        defined = 0;
+        t = PC_CopyToken( &token );
+        t->next = NULL;
+        if ( lasttoken )
+          lasttoken->next = t;
+        else
+          firsttoken = t;
+        lasttoken = t;
       }
-      if ( ArgList[0] == '(' )
+      else if ( !strcmp( token.string, "defined" ) )
       {
-        v9 = v14 + 1;
+        defined = 1;
+        t = PC_CopyToken( &token );
+        t->next = NULL;
+        if ( lasttoken )
+          lasttoken->next = t;
+        else
+          firsttoken = t;
+        lasttoken = t;
       }
       else
       {
-        if ( ArgList[0] != ')' )
-          goto LABEL_29;
-        v9 = v14 - 1;
+        define = PC_FindHashedDefine( (define_t **)source->definehash, token.string );
+        if ( !define )
+        {
+          SourceError( source, "can't evaluate %s, not defined", token.string );
+          return 0;
+        }
+        if ( !PC_ExpandDefineIntoSource( source, &token, define ) )
+          return 0;
       }
-      v14 = v9;
-LABEL_29:
-      if ( v14 <= 0 )
+    }
+    /* if the token is a number or a punctuation */
+    else if ( token.type == TT_NUMBER || token.type == TT_PUNCTUATION )
+    {
+      if ( token.string[0] == '(' )
+        indent++;
+      else if ( token.string[0] == ')' )
+        indent--;
+      if ( indent <= 0 )
         break;
-      goto LABEL_13;
-    }
-    if ( v16 )
-    {
-      v16 = 0;
-LABEL_13:
-      v7 = PC_CopyToken(ArgList);
-      v7[266] = 0;
-      if ( v6 )
-        v6[266] = v7;
+      t = PC_CopyToken( &token );
+      t->next = NULL;
+      if ( lasttoken )
+        lasttoken->next = t;
       else
-        *(_DWORD *)v15 = v7;
-LABEL_32:
-      v6 = v7;
-      continue;
+        firsttoken = t;
+      lasttoken = t;
     }
-    if ( !strcmp(ArgList, "defined") )
+    else
     {
-      v16 = 1;
-      v7 = PC_CopyToken(ArgList);
-      v7[266] = 0;
-      if ( v6 )
-        v6[266] = v7;
-      else
-        *(_DWORD *)v15 = v7;
-      goto LABEL_32;
-    }
-    HashedDefine = PC_FindHashedDefine(*(_DWORD *)(v4 + 536), ArgList);
-    if ( !HashedDefine )
-    {
-      SourceError(v4, "can't evaluate %s, not defined", ArgList);
+      SourceError( source, "can't evaluate %s", token.string );
       return 0;
     }
-    if ( !PC_ExpandDefineIntoSource(HashedDefine, v4, ArgList) )
-      return 0;
   }
-  while ( PC_ReadSourceToken(ArgList, v4) );
+  while ( PC_ReadSourceToken(source,&token) );
   /* tokens is the ECX argument in retail; it is the list this function frees below. */
-  if ( !PC_EvaluateTokens(v4, *(_DWORD **)v15, a1, a2, a3) )
+  if ( !PC_EvaluateTokens( source, firsttoken, intvalue, floatvalue, integer ) )
     return 0;
-  v10 = *(_DWORD *)v15;
-  if ( *(_DWORD *)v15 )
+  for ( t = firsttoken; t; t = nexttoken )
   {
-    do
-    {
-      v11 = *(_DWORD *)(v10 + 1064);
-      v12 = *(_DWORD *)(v10 - 4);
-      v13 = (void *)(v10 - 4);
-      if ( v12 == 305419896 )
-        free(v13);
-      --numtokens;
-      v10 = v11;
-    }
-    while ( v11 );
+    nexttoken = t->next;
+    if ( ((int *)t)[-1] == ZONE_MAGIC )
+      free((int *)t - 1);
+    numtokens--;
   }
   return 1;
 }
 
 /* ---- PC_Directive_elif  0x00440B70 ---- */
 // PC_Directive_elif | CONFIRMED | RTCW
-int __cdecl PC_Directive_elif(_DWORD *a1)
+int __cdecl PC_Directive_elif(source_t *source)
 {
-  int v2; // [esp+4h] [ebp-8h] BYREF
-  int v3; // [esp+8h] [ebp-4h] BYREF
+  int value;
+  int type, skip;
 
-  PC_PopIndent(&v2, &v3, a1);
-  if ( !v2 || v2 == 2 )
+  PC_PopIndent( source, &type, &skip );
+  if ( !type || type == INDENT_ELSE )
   {
-    SourceError((int)a1, "misplaced #elif");
+    SourceError( source, "misplaced #elif" );
+    return 0;
   }
-  else if ( PC_Evaluate((int)a1, &v2, 0, 1) )
-  {
-    PC_PushIndent(a1, 4, v2 == 0);
-    return 1;
-  }
-  return 0;
+  if ( !PC_Evaluate( source, &value, NULL, 1 ) )
+    return 0;
+  skip = (value == 0);
+  PC_PushIndent( source, INDENT_ELIF, skip );
+  return 1;
 }
 
 /* ---- PC_Directive_if  0x00440BE0 ---- */
 // PC_Directive_if | CONFIRMED | PC_Evaluate(source, &value, NULL, qtrue) then PC_PushIndent(source, INDENT_IF=1, value == 0).
-int __cdecl PC_Directive_if(_DWORD *a1)
+int __cdecl PC_Directive_if(source_t *source)
 {
-  int result;
-  int v2; // [esp+4h] [ebp-4h] BYREF
+  int value;
 
-  result = PC_Evaluate((int)a1, &v2, 0, 1);
-  if ( result )
-  {
-    PC_PushIndent(a1, 1, v2 == 0);
-    return 1;
-  }
-  return result;
+  if ( !PC_Evaluate( source, &value, NULL, 1 ) )
+    return 0;
+  PC_PushIndent( source, INDENT_IF, value == 0 );
+  return 1;
 }
 
 /* ---- PC_Directive_line  0x00440C20 ---- */
 // PC_Directive_line | CONFIRMED | RTCW
-int __cdecl PC_Directive_line(int a1)
+int __cdecl PC_Directive_line(source_t *source)
 {
-  SourceError(a1, "#line directive not supported");
+  SourceError( source, "#line directive not supported" );
   return 0;
 }
 
 /* ---- PC_Directive_error  0x00440C40 ---- */
 // PC_Directive_error | CONFIRMED | RTCW
-int __cdecl PC_Directive_error(int a1)
+int __cdecl PC_Directive_error(source_t *source)
 {
-  char ArgList[1072]; // [esp+4h] [ebp-434h] BYREF
-  unsigned int v3;
-  unsigned int retaddr;
+  token_t token;
 
-  v3 = retaddr ^ _security_cookie;
-  ArgList[0] = 0;
-  PC_ReadSourceToken(ArgList, a1);
-  SourceError(a1, "#error directive: %s", ArgList);
+  token.string[0] = '\0';
+  PC_ReadSourceToken(source,&token);
+  SourceError( source, "#error directive: %s", token.string );
   return 0;
 }
 
 /* ---- PC_Directive_pragma  0x00440CA0 ---- */
 // PC_Directive_pragma | CONFIRMED | RTCW
-int __cdecl PC_Directive_pragma(int a1)
+int __cdecl PC_Directive_pragma(source_t *source)
 {
-  _DWORD v2[269]; // [esp+4h] [ebp-434h] BYREF
-  unsigned int retaddr;
+  token_t token;
 
-  v2[268] = retaddr ^ _security_cookie;
-  SourceWarning(a1, "#pragma directive not supported");
-  while ( PC_ReadLine(a1, v2) )
+  SourceWarning( source, "#pragma directive not supported" );
+  while ( PC_ReadLine( source, &token ) )
     ;
   return 1;
 }
 
 /* ---- PC_UnreadSignToken  0x00440D10 ---- */
 // PC_UnreadSignToken | CONFIRMED | Builds a '-' punctuation token on a stack token_t and unreads it.
-_DWORD *__cdecl PC_UnreadSignToken(int a1)
+token_t *__cdecl PC_UnreadSignToken(source_t *source)
 {
-  int v1;
-  int v2;
-  _DWORD *result;
-  __int16 token[512]; // [esp+0h] [ebp-434h] BYREF
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  unsigned int v11;
-  unsigned int retaddr;
+  token_t token;
+  token_t *t;
 
-  v11 = retaddr ^ _security_cookie;
-  v1 = *(_DWORD *)(a1 + 524);
-  v2 = *(_DWORD *)(v1 + 288);
-  v7 = *(_DWORD *)(v1 + 264);
-  v8 = v7;
-  v9 = v2;
-  v10 = 0;
-  token[0] = 45;
-  v5 = 5;
-  v6 = 30;
-  result = PC_CopyToken(token);
-  result[266] = *(_DWORD *)(a1 + 528);
-  *(_DWORD *)(a1 + 528) = result;
-  return result;
+  token.line = source->scriptstack->line;
+  token.whitespace_p = source->scriptstack->script_p;
+  token.endwhitespace_p = source->scriptstack->script_p;
+  token.linescrossed = 0;
+  strcpy( token.string, "-" );
+  token.type = TT_PUNCTUATION;
+  token.subtype = 30;                   /* P_SUB */
+  /* inlined PC_UnreadSourceToken */
+  t = PC_CopyToken( &token );
+  t->next = source->tokens;
+  source->tokens = t;
+  return t;
 }
 
 /* ---- PC_Directive_eval  0x00440DC0 ---- */
 // PC_Directive_eval | CONFIRMED | Evaluates and pushes the integer result back as a "%d" token.
-int __cdecl PC_Directive_eval(int a1)
+int __cdecl PC_Directive_eval(source_t *source)
 {
-  int result;
-  int v2;
-  int v3;
-  _DWORD *v4;
-  int v5; // [esp+4h] [ebp-438h] BYREF
-  /* SPLIT-RECORD: one token_t built at [ebp-434h] before handing it to
-     PC_CopyToken, which memcpys all 1072 bytes of it onto the heap. */
-  token_t tok;                          /* [esp+8h] [ebp-434h] BYREF */
-  char *Buffer = tok.string;
-  unsigned int v13;
-  unsigned int retaddr;
+  int value;
+  token_t token;
 
-  v13 = retaddr ^ _security_cookie;
-  result = PC_Evaluate(a1, &v5, 0, 1);
-  if ( result )
-  {
-    v2 = *(_DWORD *)(a1 + 524);
-    tok.line = *(_DWORD *)(v2 + 288);
-    tok.whitespace_p = *(char **)(v2 + 264);
-    v3 = v5;
-    tok.endwhitespace_p = *(char **)(v2 + 264);
-    tok.linescrossed = 0;
-    sprintf(Buffer, "%d", abs32(v5));
-    tok.type = TT_NUMBER;
-    tok.subtype = 12296;
-    v4 = PC_CopyToken(Buffer);
-    v4[266] = *(_DWORD *)(a1 + 528);
-    *(_DWORD *)(a1 + 528) = v4;
-    if ( v3 < 0 )
-      PC_UnreadSignToken(a1);
-    return 1;
-  }
-  return result;
+  if ( !PC_Evaluate( source, &value, NULL, 1 ) )
+    return 0;
+  token.line = source->scriptstack->line;
+  token.whitespace_p = source->scriptstack->script_p;
+  token.endwhitespace_p = source->scriptstack->script_p;
+  token.linescrossed = 0;
+  sprintf( token.string, "%d", abs(value) );
+  token.type = TT_NUMBER;
+  token.subtype = TT_INTEGER | TT_LONG | TT_DECIMAL;   /* 12296 */
+  PC_UnreadSourceToken(source,&token);
+  if ( value < 0 )
+    PC_UnreadSignToken( source );
+  return 1;
 }
 
 /* ---- PC_Directive_evalfloat  0x00440ED0 ---- */
 // PC_Directive_evalfloat | CONFIRMED | RTCW l_precomp.c:2466; reached from PC_ReadDirective 0x00440FE0
-int __cdecl PC_Directive_evalfloat(int a1)
+int __cdecl PC_Directive_evalfloat(source_t *source)
 {
-  int result;
-  int v2;
-  _DWORD *v3;
-  bool v4; // c0
-  bool v5; // c2
-  double v6; // [esp+Ch] [ebp-43Ch] BYREF
-  /* SPLIT-RECORD -- see PC_Directive_eval. */
-  token_t tok;                          /* [esp+14h] [ebp-434h] BYREF */
-  char *Buffer = tok.string;
-  unsigned int v14;
-  unsigned int retaddr;
+  double value;
+  token_t token;
 
-  v14 = retaddr ^ _security_cookie;
-  result = PC_Evaluate(a1, 0, &v6, 0);
-  if ( result )
-  {
-    v2 = *(_DWORD *)(a1 + 524);
-    tok.line = *(_DWORD *)(v2 + 288);
-    tok.whitespace_p = *(char **)(v2 + 264);
-    tok.endwhitespace_p = *(char **)(v2 + 264);
-    tok.linescrossed = 0;
-    sprintf(Buffer, "%1.2f", (double)fabs(v6));
-    tok.type = TT_NUMBER;
-    tok.subtype = 10248;
-    v3 = PC_CopyToken(Buffer);
-    v4 = v6 < 0.0;
-    v5 = __UNORDERED__(v6, 0.0);
-    v3[266] = *(_DWORD *)(a1 + 528);
-    *(_DWORD *)(a1 + 528) = v3;
-    if ( v4 || v5 )
-      PC_UnreadSignToken(a1);
-    return 1;
-  }
-  return result;
+  if ( !PC_Evaluate( source, NULL, &value, 0 ) )
+    return 0;
+  token.line = source->scriptstack->line;
+  token.whitespace_p = source->scriptstack->script_p;
+  token.endwhitespace_p = source->scriptstack->script_p;
+  token.linescrossed = 0;
+  sprintf( token.string, "%1.2f", (double)fabs(value) );
+  token.type = TT_NUMBER;
+  token.subtype = TT_FLOAT | TT_LONG | TT_DECIMAL;   /* 10248 */
+  PC_UnreadSourceToken(source,&token);
+  /* retail: fcomp, test ah,5, jp -- a NaN value skips the sign, as `<` does */
+  if ( value < 0.0 )
+    PC_UnreadSignToken( source );
+  return 1;
 }
 
 /* PC_ReadDirective (0x00440FE0) is in botlib/l_precomp_pc.c, together with
@@ -3010,86 +2330,51 @@ int __cdecl PC_Directive_evalfloat(int a1)
 
 /* ---- PC_DollarDirective_evalint  0x00441100 ---- */
 // PC_DollarDirective_evalint | CONFIRMED | $evalint twin of PC_Directive_eval; pairs with PC_DollarDirective_evalfloat at 0x441220.
-int __cdecl PC_DollarDirective_evalint(int a1)
+int __cdecl PC_DollarDirective_evalint(source_t *source)
 {
-  int result;
-  int v2;
-  int v3;
-  _DWORD *v4;
-  int v5; // [esp+4h] [ebp-438h] BYREF
-  /* SPLIT-RECORD -- see PC_Directive_eval.  Writes type, subtype, intvalue,
-     floatvalue (the 8-byte double at +1040), whitespace_p, endwhitespace_p,
-     line and linescrossed. */
-  token_t tok;                          /* [esp+8h] [ebp-434h] BYREF */
-  char *Buffer = tok.string;
-  unsigned int v15;
-  unsigned int retaddr;
+  int value;
+  token_t token;
 
-  v15 = retaddr ^ _security_cookie;
-  result = PC_DollarEvaluate(a1, &v5, 0, 1);   /* a1 = source, was passed in ECX */
-  if ( result )
-  {
-    v2 = *(_DWORD *)(a1 + 524);
-    tok.line = *(_DWORD *)(v2 + 288);
-    tok.whitespace_p = *(char **)(v2 + 264);
-    v3 = v5;
-    tok.endwhitespace_p = *(char **)(v2 + 264);
-    tok.linescrossed = 0;
-    sprintf(Buffer, "%d", abs32(v5));
-    tok.type = TT_NUMBER;
-    tok.floatvalue = (double)v5;
-    tok.subtype = 12296;
-    tok.intvalue = (unsigned long)v3;
-    v4 = PC_CopyToken(Buffer);
-    v4[266] = *(_DWORD *)(a1 + 528);
-    *(_DWORD *)(a1 + 528) = v4;
-    if ( v3 < 0 )
-      PC_UnreadSignToken(a1);
-    return 1;
-  }
-  return result;
+  if ( !PC_DollarEvaluate( source, &value, NULL, 1 ) )
+    return 0;
+  token.line = source->scriptstack->line;
+  token.whitespace_p = source->scriptstack->script_p;
+  token.endwhitespace_p = source->scriptstack->script_p;
+  token.linescrossed = 0;
+  sprintf( token.string, "%d", abs(value) );
+  token.type = TT_NUMBER;
+  token.floatvalue = (double)value;
+  token.subtype = TT_INTEGER | TT_LONG | TT_DECIMAL;   /* 12296 */
+  token.intvalue = (unsigned long)value;
+  PC_UnreadSourceToken(source,&token);
+  if ( value < 0 )
+    PC_UnreadSignToken( source );
+  return 1;
 }
 
 /* ---- PC_DollarDirective_evalfloat  0x00441220 ---- */
 // PC_DollarDirective_evalfloat | CONFIRMED | RTCW l_precomp.c:2576; reached from PC_ReadDollarDirective 0x00441350
-int __cdecl PC_DollarDirective_evalfloat(int a1)
+int __cdecl PC_DollarDirective_evalfloat(source_t *source)
 {
-  int result;
-  int v2;
-  _DWORD *v3;
-  bool v4; // c0
-  bool v5; // c2
-  int v6[2]; // [esp+Ch] [ebp-43Ch] BYREF
-  /* SPLIT-RECORD -- see PC_Directive_eval. */
-  token_t tok;                          /* [esp+14h] [ebp-434h] BYREF */
-  char *Buffer = tok.string;
-  unsigned int v16;
-  unsigned int retaddr;
+  double value;
+  token_t token;
 
-  v16 = retaddr ^ _security_cookie;
-  result = PC_DollarEvaluate(a1, 0, v6, 0);    /* a1 = source, was passed in ECX */
-  if ( result )
-  {
-    v2 = *(_DWORD *)(a1 + 524);
-    tok.line = *(_DWORD *)(v2 + 288);
-    tok.whitespace_p = *(char **)(v2 + 264);
-    tok.endwhitespace_p = *(char **)(v2 + 264);
-    tok.linescrossed = 0;
-    sprintf(Buffer, "%1.2f", (double)fabs(*(long double *)v6));
-    tok.type = TT_NUMBER;
-    tok.subtype = 10248;
-    tok.floatvalue = *(double *)v6;
-    tok.intvalue = (unsigned long)*(double *)v6;
-    v3 = PC_CopyToken(Buffer);
-    v4 = *(double *)v6 < 0.0;
-    v5 = __UNORDERED__(*(double *)v6, 0.0);
-    v3[266] = *(_DWORD *)(a1 + 528);
-    *(_DWORD *)(a1 + 528) = v3;
-    if ( v4 || v5 )
-      PC_UnreadSignToken(a1);
-    return 1;
-  }
-  return result;
+  if ( !PC_DollarEvaluate( source, NULL, &value, 0 ) )
+    return 0;
+  token.line = source->scriptstack->line;
+  token.whitespace_p = source->scriptstack->script_p;
+  token.endwhitespace_p = source->scriptstack->script_p;
+  token.linescrossed = 0;
+  sprintf( token.string, "%1.2f", (double)fabs(value) );
+  token.type = TT_NUMBER;
+  token.subtype = TT_FLOAT | TT_LONG | TT_DECIMAL;   /* 10248 */
+  token.intvalue = (unsigned long)value;
+  token.floatvalue = value;
+  PC_UnreadSourceToken(source,&token);
+  /* retail: fcomp, test ah,5, jp -- a NaN value skips the sign, as `<` does */
+  if ( value < 0.0 )
+    PC_UnreadSignToken( source );
+  return 1;
 }
 
 /* PC_ReadDollarDirective (0x00441350) is in botlib/l_precomp_pc.c, with the
@@ -3097,336 +2382,277 @@ int __cdecl PC_DollarDirective_evalfloat(int a1)
 
 /* ---- PC_ReadToken  0x00441490 ---- */
 // PC_ReadToken | CONFIRMED | RTCW
-int __cdecl PC_ReadToken(_DWORD *a1, _DWORD *a2)
+int __cdecl PC_ReadToken(source_t *source, token_t *token)
 {
-  int v2;
-  int Directive;
-  _DWORD *v4;
-  int HashedDefine;
-  _DWORD token[269]; // [esp+10h] [ebp-434h] BYREF
-  unsigned int retaddr;
+  define_t *define;
 
-  token[268] = retaddr ^ _security_cookie;
-  if ( !PC_ReadSourceToken(a2, (int)a1) )
-    return 0;
   while ( 1 )
   {
-    v2 = a2[256];
-    if ( v2 == 5 )
-    {
-      if ( *(_BYTE *)a2 == 35 )
-      {
-        Directive = PC_ReadDirective(a1);
-        goto LABEL_17;
-      }
-      if ( *(_BYTE *)a2 == 36 )
-      {
-        Directive = PC_ReadDollarDirective(a1);
-        goto LABEL_17;
-      }
-    }
-    if ( v2 == 1 && PC_ReadToken(a1, token) )
-    {
-      if ( token[256] == 1 )
-      {
-        *((_BYTE *)a2 + strlen((const char *)a2) - 1) = 0;
-        if ( strlen((const char *)token + 1) + strlen((const char *)a2) + 1 >= 0x400 )
-        {
-          SourceError((int)a1, "string longer than MAX_TOKEN %d\n", 1024);
-          return 0;
-        }
-        strcat((char *)a2, (const char *)token + 1);
-      }
-      else
-      {
-        v4 = PC_CopyToken(token);
-        v4[266] = a1[132];
-        a1[132] = v4;
-      }
-    }
-    if ( !a1[136] )
-      break;
-LABEL_18:
-    if ( !PC_ReadSourceToken(a2, (int)a1) )
+    if ( !PC_ReadSourceToken(source,token) )
       return 0;
-  }
-  if ( a2[256] == 4 )
-  {
-    HashedDefine = PC_FindHashedDefine(a1[134], (char *)a2);
-    if ( HashedDefine )
+    /* check for precompiler directives */
+    if ( token->type == TT_PUNCTUATION && token->string[0] == '#' )
     {
-      Directive = PC_ExpandDefineIntoSource(HashedDefine, (int)a1, a2);
-LABEL_17:
-      if ( !Directive )
+      if ( !PC_ReadDirective( source ) )
         return 0;
-      goto LABEL_18;
+      continue;
     }
+    if ( token->type == TT_PUNCTUATION && token->string[0] == '$' )
+    {
+      if ( !PC_ReadDollarDirective( source ) )
+        return 0;
+      continue;
+    }
+    /* recursively concatenate strings that are behind each other still
+       resolving defines */
+    if ( token->type == TT_STRING )
+    {
+      token_t newtoken;
+      if ( PC_ReadToken( source, &newtoken ) )
+      {
+        if ( newtoken.type == TT_STRING )
+        {
+          token->string[strlen(token->string) - 1] = '\0';
+          if ( strlen(token->string) + strlen(newtoken.string + 1) + 1 >= MAX_TOKEN )
+          {
+            SourceError( source, "string longer than MAX_TOKEN %d\n", MAX_TOKEN );
+            return 0;
+          }
+          strcat( token->string, newtoken.string + 1 );
+        }
+        else
+        {
+          PC_UnreadSourceToken(source,&newtoken);
+        }
+      }
+    }
+    /* if skipping source because of conditional compilation */
+    if ( source->skip )
+      continue;
+    /* if the token is a name, check if it is a define macro */
+    if ( token->type == TT_NAME )
+    {
+      define = PC_FindHashedDefine( (define_t **)source->definehash, token->string );
+      if ( define )
+      {
+        /* expand the defined macro */
+        if ( !PC_ExpandDefineIntoSource( source, token, define ) )
+          return 0;
+        continue;
+      }
+    }
+    /* copy the token for unreading, and return it */
+    memcpy( &source->token, token, sizeof(token_t) );
+    return 1;
   }
-  qmemcpy(a1 + 138, a2, 0x430u);
-  return 1;
 }
 
 /* ---- PC_ExpectTokenString  0x00441650 ---- */
 // PC_ExpectTokenString | CONFIRMED | RTCW
-int __cdecl PC_ExpectTokenString(const char *a1, _DWORD *a2)
+int __cdecl PC_ExpectTokenString(const char *string, source_t *source)
 {
-  _DWORD v3[269]; // [esp+4h] [ebp-434h] BYREF
-  unsigned int retaddr;
+  token_t token;
 
-  v3[268] = retaddr ^ _security_cookie;
-  if ( PC_ReadToken(a2, v3) )
+  if ( !PC_ReadToken( source, &token ) )
   {
-    if ( !strcmp((const char *)v3, a1) )
-    {
-      return 1;
-    }
-    else
-    {
-      SourceError((int)a2, "expected %s, found %s", a1, (const char *)v3);
-      return 0;
-    }
-  }
-  else
-  {
-    SourceError((int)a2, "couldn't find expected %s", a1);
+    SourceError( source, "couldn't find expected %s", string );
     return 0;
   }
+  if ( strcmp( token.string, string ) )
+  {
+    SourceError( source, "expected %s, found %s", string, token.string );
+    return 0;
+  }
+  return 1;
 }
 
-/* ---- PC_ExpectTokenType  AUTO-STUBBED ----
- * Unreachable in the RETAIL binary, not merely on a dedicated server: no
- * xrefs at all (0x00441740).  An unverified body is kept in the #if 0 block
- * below.
+/* ---- PC_ExpectTokenType  0x00441740 ----  IMPLEMENTED (retail) */
+/* Unreachable in the RETAIL binary, not merely on a dedicated server: no
+ * xrefs at all (0x00441740).  Kept for retail fidelity.
+ *
+ * RTCW l_precomp.c PC_ExpectTokenType, same control flow and strings (all
+ * confirmed in .rdata 0x00561274-0x00561318).
+ *
+ * RETAIL: __usercall( subtype@<ebx>, type@<esi>, source, token on stack ),
+ * cdecl cleanup.  Written here as __cdecl in RTCW source order
+ * ( source, type, subtype, token ), matching PS_ExpectTokenType in
+ * l_script_mp.c.  `str` is the MAX_TOKEN (0x400) buffer under the cookie.
  */
-int PC_ExpectTokenType() { return 0; }
-#if 0
-// PC_ExpectTokenType | CONFIRMED 95 | anchors: string:"couldn't read expected token"; tierC:RTCW l_precomp.c:2797 | module: botlib/l_precomp_mp.c
-int __cdecl PC_ExpectTokenType(int a1, int a2, _DWORD *a3, char *a4)
+int __cdecl PC_ExpectTokenType( source_t *source, int type, int subtype, token_t *token )
 {
-  int v5;
-  char *v6;
-  char *v8;
-  char *v10;
-  char *v12;
-  char v14; // [esp+7h] [ebp-405h] BYREF
-  char ArgList[8]; // [esp+8h] [ebp-404h] BYREF
-  void *v16;
-  unsigned int v17;
-  unsigned int retaddr;
+  char str[MAX_TOKEN];
 
-  v17 = retaddr ^ _security_cookie;
-  if ( !PC_ReadToken(a3, a4) )
+  if ( !PC_ReadToken( source, token ) )
   {
-    SourceError((int)a3, "couldn't read expected token");
+    SourceError( source, "couldn't read expected token" );
     return 0;
   }
-  v5 = *((_DWORD *)a4 + 256);
-  if ( v5 != a2 )
+
+  if ( token->type != type )
   {
-    ArgList[0] = 0;
-    switch ( a2 )
-    {
-      case 1:
-        strcpy(ArgList, "string");
-        break;
-      case 2:
-        *(_DWORD *)ArgList = 1702127980;
-        *(_DWORD *)&ArgList[4] = &unk_6C6172;
-        break;
-      case 3:
-        strcpy(ArgList, "number");
-        break;
-      case 4:
-        strcpy(ArgList, "name");
-        break;
-      case 5:
-        qmemcpy(ArgList, "punctuat", sizeof(ArgList));
-        v16 = &unk_6E6F69;
-        break;
-    }
-    SourceError((int)a3, "expected a %s, found %s", ArgList, a4);
+    /* retail stores str[0] = 0, then an if/else chain on `type`; an unknown
+       type leaves str empty. */
+    strcpy( str, "" );
+    if ( type == TT_STRING )
+      strcpy( str, "string" );
+    if ( type == TT_LITERAL )
+      strcpy( str, "literal" );
+    if ( type == TT_NUMBER )
+      strcpy( str, "number" );
+    if ( type == TT_NAME )
+      strcpy( str, "name" );
+    if ( type == TT_PUNCTUATION )
+      strcpy( str, "punctuation" );
+    SourceError( source, "expected a %s, found %s", str, token->string );
     return 0;
   }
-  if ( v5 != 3 )
+
+  if ( token->type == TT_NUMBER )
   {
-    if ( v5 == 5 && *((_DWORD *)a4 + 257) != a1 )
+    if ( ( token->subtype & subtype ) != subtype )
     {
-      SourceError((int)a3, "found %s", a4);
+      /* str is not cleared on this path: a subtype with none of the four
+         radix bits leaves it uninitialised before the strcats.  RTCW has
+         the same hole. */
+      if ( subtype & TT_DECIMAL )
+        strcpy( str, "decimal" );
+      if ( subtype & TT_HEX )
+        strcpy( str, "hex" );   /* retail: one dword store of 0x00786568 */
+      if ( subtype & TT_OCTAL )
+        strcpy( str, "octal" );
+      if ( subtype & TT_BINARY )
+        strcpy( str, "binary" );
+      if ( subtype & TT_LONG )
+        strcat( str, " long" );
+      if ( subtype & TT_UNSIGNED )
+        strcat( str, " unsigned" );
+      if ( subtype & TT_FLOAT )
+        strcat( str, " float" );
+      if ( subtype & TT_INTEGER )
+        strcat( str, " integer" );
+      SourceError( source, "expected %s, found %s", str, token->string );
       return 0;
     }
-    return 1;
   }
-  if ( (a1 & *((_DWORD *)a4 + 257)) == a1 )
-    return 1;
-  if ( (a1 & 8) != 0 )
+  else if ( token->type == TT_PUNCTUATION )
   {
-    *(_DWORD *)ArgList = 1768121700;
-    *(_DWORD *)&ArgList[4] = &unk_6C616D;
+    /* unlike PS_ExpectTokenType there is no "wrong punctuation subtype"
+       guard and no punctuation-table lookup; just the found string. */
+    if ( token->subtype != subtype )
+    {
+      SourceError( source, "found %s", token->string );
+      return 0;
+    }
   }
-  if ( (a1 & 0x100) != 0 )
-    *(_DWORD *)ArgList = &unk_786568;
-  if ( (a1 & 0x200) != 0 )
-    strcpy(ArgList, "octal");
-  if ( (a1 & 0x400) != 0 )
-    strcpy(ArgList, "binary");
-  if ( (a1 & 0x2000) != 0 )
-  {
-    v6 = &v14;
-    while ( *++v6 )
-      ;
-    strcpy(v6, " long");
-  }
-  if ( (a1 & 0x4000) != 0 )
-  {
-    v8 = &v14;
-    while ( *++v8 )
-      ;
-    strcpy(v8, " unsigned");
-  }
-  if ( (a1 & 0x800) != 0 )
-  {
-    v10 = &v14;
-    while ( *++v10 )
-      ;
-    strcpy(v10, " float");
-  }
-  if ( (a1 & 0x1000) != 0 )
-  {
-    v12 = &v14;
-    while ( *++v12 )
-      ;
-    strcpy(v12, " integer");
-  }
-  SourceError((int)a3, "expected %s, found %s", ArgList, a4);
-  return 0;
+  return 1;
 }
-#endif
 
 /* ---- PC_ExpectAnyToken  0x004419F0 ---- */
 // PC_ExpectAnyToken | HIGH | RTCW PC_ExpectAnyToken; 37-byte thin wrapper sharing its error string with PC_ExpectTokenType.
-int __cdecl PC_ExpectAnyToken(_DWORD *a1, _DWORD *a2)
+int __cdecl PC_ExpectAnyToken(token_t *token, source_t *source)
 {
-  if ( PC_ReadToken(a2, a1) )
-    return 1;
-  SourceError((int)a2, "couldn't read expected token");
-  return 0;
+  if ( !PC_ReadToken( source, token ) )
+  {
+    SourceError( source, "couldn't read expected token" );
+    return 0;
+  }
+  return 1;
 }
 
 /* ---- PC_CheckTokenString  0x00441A20 ---- */
 // PC_CheckTokenString | CONFIRMED | Reads a token, returns 1 on match, otherwise pushes a copy back onto source->tokens (+528).
-int __cdecl PC_CheckTokenString(_DWORD *a1, const char *a2)
+int __cdecl PC_CheckTokenString(source_t *source, const char *string)
 {
-  _DWORD *v3;
-  _DWORD token[269]; // [esp+0h] [ebp-434h] BYREF
-  unsigned int retaddr;
+  token_t token;
 
-  token[268] = retaddr ^ _security_cookie;
-  if ( PC_ReadToken(a1, token) )
-  {
-    if ( !strcmp((const char *)token, a2) )
-      return 1;
-    v3 = PC_CopyToken(token);
-    v3[266] = a1[132];
-    a1[132] = v3;
-  }
+  if ( !PC_ReadToken( source, &token ) )
+    return 0;
+  /* if the token is available */
+  if ( !strcmp( token.string, string ) )
+    return 1;
+  /* else push it back */
+  PC_UnreadSourceToken(source,&token);
   return 0;
 }
 
 /* ---- PC_CheckTokenType  0x00441AF0 ---- */
 // PC_CheckTokenType | CONFIRMED | Same shape as PC_CheckTokenString but matches token->type (+1024) and masks token->subtype (+1028); copies the whole 0x430-byte token out on success.
-int __fastcall PC_CheckTokenType(int a1, _DWORD *a2, int a3, void *a4)
+/* RTCW order; LTCG gives source EDX and subtype ECX, type and token stay on the stack. */
+int __cdecl PC_CheckTokenType(source_t *source, int type, int subtype, token_t *out_token)
 {
-  _DWORD *v7;
-  _DWORD token[269]; // [esp+8h] [ebp-434h] BYREF
-  unsigned int retaddr;
+  token_t token;
 
-  token[268] = retaddr ^ _security_cookie;
-  if ( PC_ReadToken(a2, token) )
+  if ( !PC_ReadToken( source, &token ) )
+    return 0;
+  /* if the type matches */
+  if ( token.type == type && (token.subtype & subtype) == subtype )
   {
-    if ( token[256] == a3 && (a1 & token[257]) == a1 )
-    {
-      qmemcpy(a4, token, 0x430u);
-      return 1;
-    }
-    v7 = PC_CopyToken(token);
-    v7[266] = a2[132];
-    a2[132] = v7;
+    memcpy( out_token, &token, sizeof(token_t) );
+    return 1;
   }
+  /* else push it back */
+  PC_UnreadSourceToken(source,&token);
   return 0;
 }
 
 /* ---- PC_SkipUntilString  0x00441BA0 ---- */
 // PC_SkipUntilString | CONFIRMED | Reads tokens until strcmp matches or the source runs dry.
-int __cdecl PC_SkipUntilString(const char *a1, _DWORD *a2)
+int __cdecl PC_SkipUntilString(const char *string, source_t *source)
 {
-  _DWORD v3[269]; // [esp+Ch] [ebp-434h] BYREF
-  unsigned int retaddr;
+  token_t token;
 
-  v3[268] = retaddr ^ _security_cookie;
-  if ( !PC_ReadToken(a2, v3) )
-    return 0;
-  while ( strcmp((const char *)v3, a1) )
+  while ( PC_ReadToken( source, &token ) )
   {
-    if ( !PC_ReadToken(a2, v3) )
-      return 0;
+    if ( !strcmp( token.string, string ) )
+      return 1;
   }
-  return 1;
+  return 0;
 }
 
 /* ---- PC_UnreadLastToken  0x00441C50 ---- */
 // PC_UnreadLastToken | CONFIRMED | PC_CopyToken(&source->token at +552) pushed onto source->tokens (+528).
-_DWORD *__cdecl PC_UnreadLastToken(int a1)
+token_t *__cdecl PC_UnreadLastToken(source_t *source)
 {
-  _DWORD *result;
+  token_t *t;
 
-  result = PC_CopyToken((const void *)(a1 + 552));
-  result[266] = *(_DWORD *)(a1 + 528);
-  *(_DWORD *)(a1 + 528) = result;
-  return result;
+  /* inlined PC_UnreadSourceToken( &source->token, source ) */
+  t = PC_CopyToken( &source->token );
+  t->next = source->tokens;
+  source->tokens = t;
+  return t;
 }
 
 /* ---- PC_UnreadToken  0x00441C80 ---- */
 // PC_UnreadToken | CONFIRMED | Same as above for an arbitrary token.
-_DWORD *__cdecl PC_UnreadToken(const void *a1, int a2)
+token_t *__cdecl PC_UnreadToken(const token_t *token, source_t *source)
 {
-  _DWORD *result;
+  token_t *t;
 
-  result = PC_CopyToken(a1);
-  result[266] = *(_DWORD *)(a2 + 528);
-  *(_DWORD *)(a2 + 528) = result;
-  return result;
+  t = PC_CopyToken( token );
+  t->next = source->tokens;
+  source->tokens = t;
+  return t;
 }
 
 /* ---- PC_SetIncludePath  0x00441CA0 ---- */
 // PC_SetIncludePath | CONFIRMED | strncpy into source->includepath (+260, MAX_PATH 0x104) and appends a separator when one is missing.
-char __cdecl PC_SetIncludePath(const char *a1, int a2)
+void __cdecl PC_SetIncludePath(const char *path, source_t *source)
 {
-  unsigned int v2;
-  char *v3;
-
-  strncpy((char *)(a2 + 260), a1, 0x104u);
-  v2 = strlen((const char *)(a2 + 260));
-  if ( *(_BYTE *)(v2 + a2 + 259) != 92 )
+  strncpy( source->includepath, path, 260 );   /* _MAX_PATH */
+  /* add trailing path separator */
+  if ( source->includepath[strlen(source->includepath) - 1] != '\\' &&
+       source->includepath[strlen(source->includepath) - 1] != '/' )
   {
-    v2 = strlen((const char *)(a2 + 260));
-    if ( *(_BYTE *)(v2 + a2 + 259) != 47 )
-    {
-      v3 = (char *)(a2 + 259);
-      do
-        LOBYTE(v2) = *++v3;
-      while ( (_BYTE)v2 );
-      strcpy(v3, "\\");
-    }
+    strcat( source->includepath, "\\" );       /* PATHSEPERATOR_STR */
   }
-  return v2;
 }
 
 /* ---- PC_SetPunctuations  0x00441D10 ---- */
 // PC_SetPunctuations | CONFIRMED | Single store into source->punctuations (+520).
-int __cdecl PC_SetPunctuations(int result, int a2)
+punctuation_t *__cdecl PC_SetPunctuations(punctuation_t *p, source_t *source)
 {
-  *(_DWORD *)(a2 + 520) = result;
-  return result;
+  source->punctuations = p;
+  return p;
 }
 
 /* LoadSourceFile (0x00441D20) is in botlib/l_precomp_pc.c.  One argument. */
@@ -3438,131 +2664,80 @@ int __cdecl PC_SetPunctuations(int result, int a2)
  * Retail is __usercall( ptr@<ecx>, length on stack arg_0, name on stack
  * arg_4 ) -- RTCW's ( ptr, length, name ) with only the first argument lifted
  * into a register.  Source order here. */
-_DWORD *__cdecl LoadSourceMemory(char *ptr, int length, char *Source)
+source_t *__cdecl LoadSourceMemory(char *ptr, int length, char *name)
 {
-  _DWORD *ScriptMemory;
-  _DWORD *v4;
-  void *v5;
-  int *v7;
-  _DWORD *v8;
-  int *v9;
+  script_t *script;
+  source_t *source;
 
-  ScriptMemory = (_DWORD *)LoadScriptMemory(ptr, length, Source);
-  v4 = ScriptMemory;
-  v5 = 0;
-  if ( !ScriptMemory )
-    return 0;
-  ScriptMemory[346] = 0;
-  v7 = Z_MallocInternal(0x65Cu);
-  if ( v7 )
-  {
-    *v7 = 305419896;
-    v8 = v7 + 1;
-  }
-  else
-  {
-    v8 = 0;
-  }
-  memset(v8, 0, 0x658u);
-  strncpy((char *)v8, Source, 0x104u);
-  v8[131] = v4;
-  v8[132] = 0;
-  v8[133] = 0;
-  v8[135] = 0;
-  v8[136] = 0;
-  v9 = Z_MallocInternal(0x1004u);
-  if ( v9 )
-  {
-    *v9 = 305419896;
-    v5 = v9 + 1;
-  }
-  memset(v5, 0, 0x1000u);
-  v8[134] = v5;
-  PC_AddGlobalDefinesToSource(v8);
-  return v8;
+  script = LoadScriptMemory( ptr, length, name );
+  if ( !script )
+    return NULL;
+  script->next = NULL;
+  source = (source_t *)GetMemory( sizeof(source_t) );   /* 0x65C with the magic */
+  memset( source, 0, sizeof(source_t) );
+  strncpy( source->filename, name, 260 );   /* _MAX_PATH */
+  source->scriptstack = script;
+  source->tokens = NULL;
+  source->defines = NULL;
+  source->indentstack = NULL;
+  source->skip = 0;
+  source->definehash = GetClearedMemory( DEFINEHASHSIZE * sizeof(define_t *) );
+  PC_AddGlobalDefinesToSource( source );
+  return source;
 }
 
 /* ---- FreeSource  0x00441EA0 ---- */
 // FreeSource | CONFIRMED | Frees scripts, tokens, defines and indents; called by PC_FreeSourceHandle.
-void __cdecl FreeSource(_DWORD *a1)
+void __cdecl FreeSource(source_t *source)
 {
-  int v1;
-  int v2;
-  int v3;
-  void *v4;
-  int v5;
-  int v6;
-  _DWORD *v7;
-  int v8;
+  script_t *script;
+  token_t *token;
+  define_t *define;
+  indent_t *indent;
   int i;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  _DWORD *v14;
-  int v15;
-  int v16;
-  void *v17;
 
-  while ( a1[131] )
+  /* free all the scripts (inlined FreeScript) */
+  while ( source->scriptstack )
   {
-    v1 = a1[131];
-    a1[131] = *(_DWORD *)(v1 + 1384);
-    v2 = *(_DWORD *)(v1 + 308);
-    if ( v2 )
-    {
-      v3 = *(_DWORD *)(v2 - 4);
-      v4 = (void *)(v2 - 4);
-      if ( v3 == 305419896 )
-        free(v4);
-    }
-    if ( *(_DWORD *)(v1 - 4) == 305419896 )
-      free((void *)(v1 - 4));
+    script = source->scriptstack;
+    source->scriptstack = script->next;
+    if ( script->punctuationtable && ((int *)script->punctuationtable)[-1] == ZONE_MAGIC )
+      free((int *)script->punctuationtable - 1);
+    if ( ((int *)script)[-1] == ZONE_MAGIC )
+      free((int *)script - 1);
   }
-  if ( a1[132] )
+  /* free all the tokens (inlined PC_FreeToken) */
+  while ( source->tokens )
   {
-    do
-    {
-      v5 = a1[132];
-      v6 = *(_DWORD *)(v5 + 1064);
-      v7 = (_DWORD *)(v5 - 4);
-      a1[132] = v6;
-      if ( *v7 == 305419896 )
-        free(v7);
-      v8 = a1[132];
-      --numtokens;
-    }
-    while ( v8 );
+    token = source->tokens;
+    source->tokens = token->next;
+    if ( ((int *)token)[-1] == ZONE_MAGIC )
+      free((int *)token - 1);
+    numtokens--;
   }
-  for ( i = 0; i < 4096; i += 4 )
+  /* free all the defines */
+  for ( i = 0; i < DEFINEHASHSIZE; i++ )
   {
-    while ( *(_DWORD *)(i + a1[134]) )
+    while ( ((define_t **)source->definehash)[i] )
     {
-      v10 = a1[134];
-      v11 = *(_DWORD *)(v10 + i);
-      *(_DWORD *)(i + v10) = *(_DWORD *)(v11 + 28);
-      PC_FreeDefine(v11);
+      define = ((define_t **)source->definehash)[i];
+      ((define_t **)source->definehash)[i] = ((define_t **)source->definehash)[i]->hashnext;
+      PC_FreeDefine( define );
     }
   }
-  while ( a1[135] )
+  /* free all the indents (inlined FreeMemory) */
+  while ( source->indentstack )
   {
-    v12 = a1[135];
-    v13 = *(_DWORD *)(v12 + 12);
-    v14 = (_DWORD *)(v12 - 4);
-    a1[135] = v13;
-    if ( *v14 == 305419896 )
-      free(v14);
+    indent = (indent_t *)source->indentstack;
+    source->indentstack = indent->next;
+    if ( ((int *)indent)[-1] == ZONE_MAGIC )
+      free((int *)indent - 1);
   }
-  v15 = a1[134];
-  if ( v15 )
-  {
-    v16 = *(_DWORD *)(v15 - 4);
-    v17 = (void *)(v15 - 4);
-    if ( v16 == 305419896 )
-      free(v17);
-  }
-  if ( *(a1 - 1) == 305419896 )
-    free(a1 - 1);
+  /* free the hash table and the source itself */
+  if ( source->definehash && ((int *)source->definehash)[-1] == ZONE_MAGIC )
+    free((int *)source->definehash - 1);
+  if ( ((int *)source)[-1] == ZONE_MAGIC )
+    free((int *)source - 1);
 }
 
 /* PC_LoadSourceHandle (0x00442010), PC_FreeSourceHandle (0x00442100),
@@ -3582,10 +2757,9 @@ void __cdecl FreeSource(_DWORD *a1)
 
    RtCW passes the path as the format string here too, which is sloppy but is
    what the binary does; a path containing a '%' would be misread by both. */
-int __cdecl PC_SetBaseFolder(char *a1)
+void __cdecl PC_SetBaseFolder(char *path)
 {
-  Com_sprintf((char *)pc_baseFolder, 64, a1);
-  return 1;
+  Com_sprintf((char *)pc_baseFolder, 64, path);
 }
 
 /* PC_CheckOpenSourceHandles (0x00442290) is in botlib/l_precomp_pc.c; it

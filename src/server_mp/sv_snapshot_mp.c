@@ -11,11 +11,11 @@ void MSG_WriteLong( msg_t *msg, int c );
 void MSG_WriteBits( msg_t *msg, int value, int bits );
 void MSG_WriteBit0( msg_t *msg );
 void MSG_WriteBit1( msg_t *msg );
-void MSG_WriteString( const char *s, msg_t *sb );
+void MSG_WriteString( msg_t *sb, const char *s );
 int MSG_WriteBitsCompress( const byte *datasrc, int bytecount, byte *buffdest );
 void MSG_WriteDeltaEntity( msg_t *msg, const byte *from, const byte *to, qboolean force );
 void MSG_WriteDeltaClient( msg_t *msg, const byte *from, const byte *to, qboolean force );
-void MSG_WriteDeltaPlayerstate( msg_t *msg, const byte *from, const byte *to, int number );
+void MSG_WriteDeltaPlayerstate( msg_t *msg, const byte *from, const byte *to );
 
 void MSG_WriteDeltaArchivedEntity( msg_t *msg, const byte *from, const byte *to,
 								   qboolean force );
@@ -26,7 +26,7 @@ int MSG_ReadBit( msg_t *msg );
 qboolean MSG_ReadDeltaClient( msg_t *msg, const byte *from, byte *to, int number );
 qboolean MSG_ReadDeltaArchivedEntity( msg_t *msg, const byte *from, byte *to,
 									  int number );
-void MSG_ReadDeltaPlayerstate( msg_t *msg, const byte *from, byte *to, int number );
+void MSG_ReadDeltaPlayerstate( msg_t *msg, const byte *from, byte *to );
 void MSG_BeginReading( msg_t *msg );
 
 /* qcommon/cm_test.c 0x00421E10. mins@ecx, maxs@eax in retail. */
@@ -36,7 +36,7 @@ int CM_BoxLeafnums( const vec3_t mins, const vec3_t maxs, int *list,
 void Netchan_Transmit( netchan_t *chan, int length, const byte *data );
 void Netchan_TransmitNextFragment( netchan_t *chan );
 
-void SV_Netchan_Encode( byte *data, client_t *client, int length );
+void SV_Netchan_Encode( client_t *client, byte *data, int length );
 
 void SV_CloseDownload( client_t *cl );
 void SV_WriteDownloadToClient( client_t *cl, msg_t *msg );
@@ -47,20 +47,34 @@ int CM_LeafArea( int leafnum );
 byte *CM_ClusterPVS( int cluster );
 qboolean CM_AreasConnected( int area1, int area2 );
 
-/* 0x01407444. cod1_globals.c types it `int`; four bytes either way. */
+/* 0x01407444, client_mp/cl_main_mp.c (null/null_client.c in the dedicated build) */
 extern cvar_t   *cl_shownet;
 
 void SV_AddEntToSnapshot( int *eNums, int gEntNum );
 void SV_AddArchivedEntToSnapshot( int *eNums, int gEntNum );
+/* server_mp/sv_game_mp.c 0x004558B0. Com_Errors "bad gEnt" on NULL or s.number outside [0,1024). */
+svEntity_t *SV_SvEntityForGentity( gentity_t *gent );
 cachedSnapshot_t *SV_GetCachedSnapshotInternal( int frameNum );
 cachedSnapshot_t *SV_GetCachedSnapshot( int *frameTime );
 void *SV_GetClientState( int clientNum );
+#ifndef COD1_VC7
 static void SV_UpdateAverageBPS( int numclients );
+#endif
+void SV_Netchan_TransmitNextFragment( netchan_t *chan );
 
+/*
+ * SV_ARCHIVE_SELFTEST (off by default) builds a tree-only archive diagnostic
+ * that retail does not have: the sv_archiveSelfTest / sv_archiveForceTime
+ * cvars, the round-trip check SV_ArchiveSelfTest run from SV_ArchiveSnapshot,
+ * the forced archive time in SV_GetClientArchiveTime and these counters.
+ * Default builds register no extra cvars and match retail exactly.
+ */
+#ifdef SV_ARCHIVE_SELFTEST
 int sv_archiveCachedBuilds;
 int sv_archiveCachedClientInfos;
 int sv_archiveCachedInfoChecks;
 extern cvar_t   *sv_archiveForceTime;
+#endif
 qboolean SV_GetArchivedClientInfo( int *frameTime, void *clientInfo, int clientNum );
 
 #define svc_nop                 1
@@ -85,6 +99,13 @@ qboolean SV_GetArchivedClientInfo( int *frameTime, void *clientInfo, int clientN
 
 #define SV_SNAPSHOT_CLIENT_BYTES 92
 
+/* One 92-byte record of svs.snapshotClients. Retail copies these by struct assignment (bare rep movsd). */
+typedef struct svSnapshotClient_s {
+	int words[SV_SNAPSHOT_CLIENT_BYTES / 4];
+} svSnapshotClient_t;
+
+#define SVS_SNAPSHOT_CLIENTS    ( (svSnapshotClient_t *)svs.snapshotClients )
+
 /* msg.maxsize the writer sets at 0x0045DEEF and the reader at 0x0045CBEB. Not MAX_MSGLEN -- eight times it. Both the archive writer and the archive reader put a buffer this size on the stack. */
 #define SV_ARCHIVE_MSG_BYTES    0x20000
 
@@ -96,64 +117,54 @@ qboolean SV_GetArchivedClientInfo( int *frameTime, void *clientInfo, int clientN
 
 #define PMF_ARCHIVE_HIDE_VIEWENTITY 0x00010000
 
-typedef struct svEntVis_s {
-	int numClusters;
-	int clusternums[MAX_ENT_CLUSTERS];
-	int lastCluster;
-	int areanum;
-	int areanum2;
-} svEntVis_t;
-
-#define SV_ENT_VIS( svEnt )     ( (const svEntVis_t *)( (const byte *)( svEnt ) + 0x118 ) )
-
 /* ---- SV_GentityNum  0x00455870 ---- */
 static gentity_t *SV_GentityNum( int num ) {
 	return (gentity_t *)( (byte *)sv.gentities + num * sv.gentitySize );
 }
 
-/* ---- SV_SvEntityNum  no-address ---- */
-static svEntity_t *SV_SvEntityNum( int num ) {
-	return &sv.svEntities[num];
-}
+/* ---- SV_SvEntityNum  no-address ----
+ * A macro: retail has no out-of-line copy of this helper (a called static
+ * would leave a tree-only dead copy under /GL). */
+#define SV_SvEntityNum( num )   ( &sv.svEntities[num] )
 
 /* ---- SV_EmitPacketEntities  0x0045BF80 ---- */
-void SV_EmitPacketEntities( int from_first_entity, msg_t *msg,
-							int from_num_entities, int to_num_entities,
-							int to_first_entity ) {
+void SV_EmitPacketEntities( int from_num_entities, int from_first_entity,
+							int to_num_entities, int to_first_entity,
+							msg_t *msg ) {
 	entityState_t   *oldent, *newent;
 	int oldindex, newindex;
 	int oldnum, newnum;
 
-	oldent = NULL;
 	newent = NULL;
-	oldindex = 0;
+	oldent = NULL;
 	newindex = 0;
+	oldindex = 0;
 
 	while ( 1 ) {
-		if ( newindex < to_num_entities ) {
-			newent = &svs.snapshotEntities[to_first_entity % svs.numSnapshotEntities];
-			newnum = newent->number;
-		} else {
+		if ( newindex >= to_num_entities ) {
 			if ( oldindex >= from_num_entities ) {
 				break;
 			}
 			newnum = 9999;
+		} else {
+			newent = &svs.snapshotEntities[( to_first_entity + newindex )
+										   % svs.numSnapshotEntities];
+			newnum = newent->number;
 		}
 
-		if ( oldindex < from_num_entities ) {
-			oldent = &svs.snapshotEntities[from_first_entity % svs.numSnapshotEntities];
-			oldnum = oldent->number;
-		} else {
+		if ( oldindex >= from_num_entities ) {
 			oldnum = 9999;
+		} else {
+			oldent = &svs.snapshotEntities[( from_first_entity + oldindex )
+										   % svs.numSnapshotEntities];
+			oldnum = oldent->number;
 		}
 
 		if ( newnum == oldnum ) {
 			MSG_WriteDeltaEntity( msg, (const byte *)oldent,
 								  (const byte *)newent, qfalse );
 			oldindex++;
-			from_first_entity++;
 			newindex++;
-			to_first_entity++;
 			continue;
 		}
 
@@ -162,116 +173,109 @@ void SV_EmitPacketEntities( int from_first_entity, msg_t *msg,
 								  (const byte *)&SV_SvEntityNum( newnum )->baseline,
 								  (const byte *)newent, qtrue );
 			newindex++;
-			to_first_entity++;
 			continue;
 		}
 
-		if ( cl_shownet && ( cl_shownet->integer >= 2 || cl_shownet->integer == -1 ) ) {
-			Com_Printf( "W|%3i: #%-3i remove\n", msg->cursize, oldent->number );
+		if ( newnum > oldnum ) {
+			MSG_WriteDeltaEntity( msg, (const byte *)oldent, NULL, qtrue );
+			oldindex++;
+			continue;
 		}
-		MSG_WriteBits( msg, oldent->number, 10 );
-		MSG_WriteBit1( msg );
-		oldindex++;
-		from_first_entity++;
 	}
 
 	MSG_WriteBits( msg, ENTITYNUM_NONE, 10 );
 }
 
 /* ---- SV_EmitPacketClients  0x0045C0F0 ---- */
-void SV_EmitPacketClients( int to_first_client, msg_t *msg,
-						   int from_num_clients, int from_first_client,
-						   int to_num_clients ) {
+void SV_EmitPacketClients( int from_num_clients, int from_first_client,
+						   int to_num_clients, int to_first_client,
+						   msg_t *msg ) {
 	const byte  *oldclient;
 	const byte  *newclient;
 	int oldindex, newindex;
 	int oldnum, newnum;
-	byte nullstate[SV_SNAPSHOT_CLIENT_BYTES];
 
-	oldclient = NULL;
 	newclient = NULL;
-	oldindex = 0;
+	oldclient = NULL;
 	newindex = 0;
+	oldindex = 0;
 
 	while ( 1 ) {
-		if ( newindex < to_num_clients ) {
-			newclient = (const byte *)svs.snapshotClients
-						+ SV_SNAPSHOT_CLIENT_BYTES
-						  * ( to_first_client % svs.numSnapshotClients );
-			newnum = *(const int *)newclient;
-		} else {
+		if ( newindex >= to_num_clients ) {
 			if ( oldindex >= from_num_clients ) {
 				break;
 			}
 			newnum = 9999;
+		} else {
+			newclient = (const byte *)svs.snapshotClients
+						+ SV_SNAPSHOT_CLIENT_BYTES
+						  * ( ( to_first_client + newindex ) % svs.numSnapshotClients );
+			newnum = *(const int *)newclient;
 		}
 
-		if ( oldindex < from_num_clients ) {
+		if ( oldindex >= from_num_clients ) {
+			oldnum = 9999;
+		} else {
 			oldclient = (const byte *)svs.snapshotClients
 						+ SV_SNAPSHOT_CLIENT_BYTES
-						  * ( from_first_client % svs.numSnapshotClients );
+						  * ( ( from_first_client + oldindex ) % svs.numSnapshotClients );
 			oldnum = *(const int *)oldclient;
-		} else {
-			oldnum = 9999;
 		}
 
 		if ( newnum == oldnum ) {
-			if ( !oldclient ) {
-				memset( nullstate, 0, sizeof( nullstate ) );
-				oldclient = nullstate;
-			}
 			MSG_WriteDeltaClient( msg, oldclient, newclient, qfalse );
 			oldindex++;
-			from_first_client++;
 			newindex++;
-			to_first_client++;
 			continue;
 		}
 
 		if ( newnum < oldnum ) {
-			memset( nullstate, 0, sizeof( nullstate ) );
-			MSG_WriteDeltaClient( msg, nullstate, newclient, qtrue );
+			MSG_WriteDeltaClient( msg, NULL, newclient, qtrue );
 			newindex++;
-			to_first_client++;
 			continue;
 		}
 
-		MSG_WriteDeltaClient( msg, oldclient, NULL, qtrue );
-		oldindex++;
-		from_first_client++;
+		if ( newnum > oldnum ) {
+			MSG_WriteDeltaClient( msg, oldclient, NULL, qtrue );
+			oldindex++;
+			continue;
+		}
 	}
 
 	MSG_WriteBit0( msg );
 }
 
 /* ---- SV_WriteSnapshotToClient  0x0045C2B0 ---- */
-void SV_WriteSnapshotToClient( msg_t *msg, client_t *client ) {
+void SV_WriteSnapshotToClient( client_t *client, msg_t *msg ) {
 	clientSnapshot_t    *frame;
 	clientSnapshot_t    *oldframe;
 	int lastframe;
 	int snapFlags;
+	int from_num_entities, from_first_entity;
+	int from_num_clients, from_first_client;
 	int i;
 
 	frame = &client->frames[client->netchan.outgoingSequence & PACKET_MASK];
 
-	oldframe = NULL;
-	lastframe = 0;
-
-	if ( client->deltaMessage > 0 && client->state == CS_ACTIVE ) {
+	if ( client->deltaMessage <= 0 || client->state != CS_ACTIVE ) {
+		oldframe = NULL;
+		lastframe = 0;
+	} else if ( client->netchan.outgoingSequence - client->deltaMessage
+				>= PACKET_BACKUP - 3 ) {
+		Com_DPrintf( "%s: Delta request from out of date packet.\n",
+					 client->name );
+		oldframe = NULL;
+		lastframe = 0;
+	} else {
+		oldframe = &client->frames[client->deltaMessage & PACKET_MASK];
 		lastframe = client->netchan.outgoingSequence - client->deltaMessage;
-		if ( lastframe >= PACKET_BACKUP - 3 ) {
-			Com_DPrintf( "%s: Delta request from out of date packet.\n",
+
+		if ( oldframe->first_entity
+			 < svs.nextSnapshotEntities - svs.numSnapshotEntities ) {
+			Com_DPrintf( "%s: Delta request from out of date entities.\n",
 						 client->name );
+			oldframe = NULL;
 			lastframe = 0;
-		} else {
-			oldframe = &client->frames[client->deltaMessage & PACKET_MASK];
-			if ( oldframe->first_entity
-				 < svs.nextSnapshotEntities - svs.numSnapshotEntities ) {
-				Com_DPrintf( "%s: Delta request from out of date entities.\n",
-							 client->name );
-				oldframe = NULL;
-				lastframe = 0;
-			}
 		}
 	}
 
@@ -297,41 +301,39 @@ void SV_WriteSnapshotToClient( msg_t *msg, client_t *client ) {
 
 	if ( oldframe ) {
 		MSG_WriteDeltaPlayerstate( msg, (const byte *)&oldframe->ps,
-								   (const byte *)&frame->ps, 0 );
-		SV_EmitPacketEntities( oldframe->first_entity, msg,
-							   oldframe->num_entities, frame->num_entities,
-							   frame->first_entity );
-		SV_EmitPacketClients( frame->first_client, msg,
-							  oldframe->num_clients, oldframe->first_client,
-							  frame->num_clients );
+								   (const byte *)&frame->ps );
+		from_num_entities = oldframe->num_entities;
+		from_first_entity = oldframe->first_entity;
+		from_num_clients = oldframe->num_clients;
+		from_first_client = oldframe->first_client;
 	} else {
-		MSG_WriteDeltaPlayerstate( msg, NULL, (const byte *)&frame->ps, 0 );
-		SV_EmitPacketEntities( 0, msg, 0, frame->num_entities,
-							   frame->first_entity );
-		SV_EmitPacketClients( frame->first_client, msg, 0, 0,
-							  frame->num_clients );
+		MSG_WriteDeltaPlayerstate( msg, NULL, (const byte *)&frame->ps );
+		from_num_entities = 0;
+		from_first_entity = 0;
+		from_num_clients = 0;
+		from_first_client = 0;
 	}
 
-	for ( i = 0 ; i < sv_padPackets->integer ; i++ ) {
-		MSG_WriteByte( msg, svc_nop );
+	SV_EmitPacketEntities( from_num_entities, from_first_entity,
+						   frame->num_entities, frame->first_entity, msg );
+	SV_EmitPacketClients( from_num_clients, from_first_client,
+						  frame->num_clients, frame->first_client, msg );
+
+	if ( sv_padPackets->integer ) {
+		for ( i = 0 ; i < sv_padPackets->integer ; i++ ) {
+			MSG_WriteByte( msg, svc_nop );
+		}
 	}
 }
 
 /* ---- SV_UpdateServerCommandsToClient  0x0045C4A0 ---- */
-void SV_UpdateServerCommandsToClient( msg_t *msg, client_t *client ) {
+void SV_UpdateServerCommandsToClient( client_t *client, msg_t *msg ) {
 	int i;
 
 	for ( i = client->reliableAcknowledge + 1 ; i <= client->reliableSequence ; i++ ) {
 		MSG_WriteByte( msg, svc_serverCommand );
 		MSG_WriteLong( msg, i );
-		MSG_WriteString(
-			client->reliableCommands[i & ( MAX_RELIABLE_COMMANDS - 1 )].command,
-			msg );
-		if ( sv_debugSpawn && sv_debugSpawn->integer ) {
-			Com_Printf( "SVCMD> cl%d seq%d cur%d [%.90s]\n",
-						(int)( client - svs.clients ), i, msg->cursize,
-						client->reliableCommands[i & ( MAX_RELIABLE_COMMANDS - 1 )].command );
-		}
+		MSG_WriteString( msg, client->reliableCommands[i & ( MAX_RELIABLE_COMMANDS - 1 )].command );
 	}
 	client->reliableSent = client->reliableSequence;
 }
@@ -351,11 +353,12 @@ void SV_UpdateServerCommandsToClient_PreventOverflow( msg_t *msg, client_t *clie
 
 		MSG_WriteByte( msg, svc_serverCommand );
 		MSG_WriteLong( msg, i );
-		MSG_WriteString( cmd, msg );
+		MSG_WriteString( msg, cmd );
 	}
 
-	if ( i - 1 > client->reliableSent ) {
-		client->reliableSent = i - 1;
+	i--;
+	if ( i > client->reliableSent ) {
+		client->reliableSent = i;
 	}
 }
 
@@ -398,7 +401,6 @@ void SV_AddEntitiesVisibleFromPoint( int leafnum, int clientNum, int *eNums ) {
 	int e, i;
 	gentity_t   *ent;
 	svEntity_t     *svEnt;
-	const svEntVis_t *vis;
 	int svFlags;
 	int area;
 	int cluster;
@@ -440,37 +442,37 @@ void SV_AddEntitiesVisibleFromPoint( int leafnum, int clientNum, int *eNums ) {
 			continue;
 		}
 
-		svEnt = SV_SvEntityNum( ent->s.number );
-		vis = SV_ENT_VIS( svEnt );
+		/* 0x0045C7A8: retail goes through the range-checked accessor, not a raw index. */
+		svEnt = SV_SvEntityForGentity( ent );
 
-		if ( vis->areanum < 0 || !CM_AreasConnected( area, vis->areanum ) ) {
-			if ( !CM_AreasConnected( area, vis->areanum2 ) ) {
+		if ( !CM_AreasConnected( area, svEnt->areanum ) ) {
+			if ( !CM_AreasConnected( area, svEnt->areanum2 ) ) {
 				continue;
 			}
 		}
 
-		if ( !vis->numClusters ) {
+		if ( !svEnt->numClusters ) {
 			continue;
 		}
 
 		l = 0;
-		for ( i = 0 ; i < vis->numClusters ; i++ ) {
-			l = vis->clusternums[i];
+		for ( i = 0 ; i < svEnt->numClusters ; i++ ) {
+			l = svEnt->clusternums[i];
 			if ( bitvector[l >> 3] & ( 1 << ( l & 7 ) ) ) {
 				break;
 			}
 		}
 
-		if ( i == vis->numClusters ) {
-			if ( !vis->lastCluster ) {
+		if ( i == svEnt->numClusters ) {
+			if ( !svEnt->lastCluster ) {
 				continue;
 			}
-			for ( ; l <= vis->lastCluster ; l++ ) {
+			for ( ; l <= svEnt->lastCluster ; l++ ) {
 				if ( bitvector[l >> 3] & ( 1 << ( l & 7 ) ) ) {
 					break;
 				}
 			}
-			if ( l == vis->lastCluster ) {
+			if ( l == svEnt->lastCluster ) {
 				continue;
 			}
 		}
@@ -481,13 +483,18 @@ void SV_AddEntitiesVisibleFromPoint( int leafnum, int clientNum, int *eNums ) {
 
 /* SV_GetClientArchiveTime 0x0045C8A0 */
 
+#ifdef SV_ARCHIVE_SELFTEST
 cvar_t  *sv_archiveForceTime;
+#endif
 
 /* ---- SV_GetClientArchiveTime  0x0045C8A0 ---- */
+/* Retail is just push clientNum; push 12h; call VM_Call. */
 int SV_GetClientArchiveTime( int clientNum ) {
+#ifdef SV_ARCHIVE_SELFTEST
 	if ( sv_archiveForceTime && sv_archiveForceTime->integer ) {
 		return sv_archiveForceTime->integer;
 	}
+#endif
 	return VM_Call( vm, GAME_GET_ARCHIVE_TIME, clientNum );
 }
 
@@ -502,7 +509,7 @@ void SV_AddCachedEntitiesVisibleFromPoint( int leafnum, int count, int firstEnt,
 	int area;
 	int i, j, num;
 	int svFlags;
-	int leafArea, leafCluster;
+	int leafCluster;
 
 	area = CM_LeafArea( leafnum );
 	if ( area < 0 ) {
@@ -539,11 +546,7 @@ void SV_AddCachedEntitiesVisibleFromPoint( int leafnum, int count, int firstEnt,
 		}
 
 		for ( j = 0 ; j < num ; j++ ) {
-			leafArea = CM_LeafArea( leafs[j] );
-			if ( leafArea < 0 ) {
-				continue;
-			}
-			if ( CM_AreasConnected( area, leafArea ) ) {
+			if ( CM_AreasConnected( area, CM_LeafArea( leafs[j] ) ) ) {
 				break;
 			}
 		}
@@ -578,21 +581,6 @@ void SV_SetClientArchiveTime( int clientNum, int time ) {
 	VM_Call( vm, GAME_SET_ARCHIVE_TIME, clientNum, time );
 }
 
-/* ---- SV_CachedClientAt  no-address ---- */
-static const cachedClient_t *SV_CachedClientAt( const cachedSnapshot_t *base,
-												int index, int *number ) {
-	const cachedClient_t *cc;
-
-	if ( index >= base->num_clients ) {
-		*number = SV_NO_MORE_CLIENTS;
-		return NULL;
-	}
-	cc = &SVS_CACHED_CLIENTS[ ( base->first_client + index )
-							  % SV_NUM_CACHED_SNAPSHOT_CLIENTS ];
-	*number = *(const int *)cc->cs;
-	return cc;
-}
-
 /* ---- SV_ArchivedFrameIsLive  no-address ---- */
 static qboolean SV_ArchivedFrameIsLive( int frameNum ) {
 	const archivedSnapshot_t *archived;
@@ -611,19 +599,18 @@ cachedSnapshot_t *SV_GetCachedSnapshotInternal( int frameNum ) {
 	cachedSnapshot_t    *base;
 	const cachedClient_t    *oldcc;
 	cachedClient_t      *cc;
-	archivedEntity_t    *ae;
 	int oldestFrame, frameIndex;
 	int baseFrame;
 	int number, cachedNum, cachedIndex;
-	qboolean matched;
-	int offset, room, len;
+	int offset, room;
 	byte buf[SV_ARCHIVE_MSG_BYTES];
 
-	if ( !SV_ArchivedFrameIsLive( frameNum ) ) {
-		return NULL;
-	}
 	archived = &svs.archivedSnapshotFrames[ frameNum
 											% SV_NUM_ARCHIVED_SNAPSHOT_FRAMES ];
+	if ( archived->start
+		 < svs.nextArchivedSnapshotBuffer - SV_ARCHIVED_SNAPSHOT_BUFFER_BYTES ) {
+		return NULL;
+	}
 
 	oldestFrame = svs.nextCachedSnapshotFrames - SV_NUM_CACHED_SNAPSHOT_FRAMES;
 	if ( oldestFrame < 0 ) {
@@ -646,16 +633,16 @@ cachedSnapshot_t *SV_GetCachedSnapshotInternal( int frameNum ) {
 	}
 
 	MSG_Init( &msg, buf, SV_ARCHIVE_MSG_BYTES );
-	len = archived->len;
-	msg.cursize = len;
+	msg.cursize = archived->len;
 
 	offset = archived->start % SV_ARCHIVED_SNAPSHOT_BUFFER_BYTES;
 	room = SV_ARCHIVED_SNAPSHOT_BUFFER_BYTES - offset;
-	if ( len > room ) {
-		memcpy( buf, svs.archivedSnapshotBuffer + offset, (size_t)room );
-		memcpy( buf + room, svs.archivedSnapshotBuffer, (size_t)( len - room ) );
+	if ( msg.cursize <= room ) {
+		memcpy( msg.data, svs.archivedSnapshotBuffer + offset, (size_t)msg.cursize );
 	} else {
-		memcpy( buf, svs.archivedSnapshotBuffer + offset, (size_t)len );
+		memcpy( msg.data, svs.archivedSnapshotBuffer + offset, (size_t)room );
+		memcpy( msg.data + room, svs.archivedSnapshotBuffer,
+				(size_t)( msg.cursize - room ) );
 	}
 
 	if ( !MSG_ReadBit( &msg ) ) {
@@ -683,7 +670,14 @@ cachedSnapshot_t *SV_GetCachedSnapshotInternal( int frameNum ) {
 		cache->time          = MSG_ReadLong( &msg );
 
 		cachedIndex = 0;
-		oldcc = SV_CachedClientAt( base, cachedIndex, &cachedNum );
+		oldcc = NULL;
+		if ( cachedIndex >= base->num_clients ) {
+			cachedNum = SV_NO_MORE_CLIENTS;
+		} else {
+			oldcc = &SVS_CACHED_CLIENTS[ ( base->first_client + cachedIndex )
+										 % SV_NUM_CACHED_SNAPSHOT_CLIENTS ];
+			cachedNum = *(const int *)oldcc->cs;
+		}
 
 		while ( MSG_ReadBit( &msg ) ) {
 			number = MSG_ReadBits( &msg, MSG_CLIENT_NUM_BITS );
@@ -693,38 +687,72 @@ cachedSnapshot_t *SV_GetCachedSnapshotInternal( int frameNum ) {
 
 			while ( cachedNum < number ) {
 				cachedIndex++;
-				oldcc = SV_CachedClientAt( base, cachedIndex, &cachedNum );
+				if ( cachedIndex >= base->num_clients ) {
+					cachedNum = SV_NO_MORE_CLIENTS;
+				} else {
+					oldcc = &SVS_CACHED_CLIENTS[ ( base->first_client + cachedIndex )
+												 % SV_NUM_CACHED_SNAPSHOT_CLIENTS ];
+					cachedNum = *(const int *)oldcc->cs;
+				}
 			}
 
-			cc = &SVS_CACHED_CLIENTS[ svs.nextCachedSnapshotClients
-									  % SV_NUM_CACHED_SNAPSHOT_CLIENTS ];
-			matched = (qboolean)( cachedNum == number );
-
-			if ( matched ) {
+			if ( cachedNum == number ) {
+				cc = &SVS_CACHED_CLIENTS[ svs.nextCachedSnapshotClients
+										  % SV_NUM_CACHED_SNAPSHOT_CLIENTS ];
 				MSG_ReadDeltaClient( &msg, oldcc->cs, cc->cs, number );
 				cc->havePlayerState = MSG_ReadBit( &msg );
 				if ( cc->havePlayerState ) {
 					MSG_ReadDeltaPlayerstate( &msg, (const byte *)&oldcc->ps,
-											  (byte *)&cc->ps, 0 );
+											  (byte *)&cc->ps );
+				}
+
+				svs.nextCachedSnapshotClients++;
+				if ( svs.nextCachedSnapshotClients >= SV_SNAPSHOT_COUNTER_LIMIT ) {
+					Com_Error( ERR_FATAL, "\x15svs.nextCachedSnapshotClients wrapped" );
+				}
+				cache->num_clients++;
+
+				cachedIndex++;
+				if ( cachedIndex >= base->num_clients ) {
+					cachedNum = SV_NO_MORE_CLIENTS;
+				} else {
+					oldcc = &SVS_CACHED_CLIENTS[ ( base->first_client + cachedIndex )
+												 % SV_NUM_CACHED_SNAPSHOT_CLIENTS ];
+					cachedNum = *(const int *)oldcc->cs;
 				}
 			} else {
+				cc = &SVS_CACHED_CLIENTS[ svs.nextCachedSnapshotClients
+										  % SV_NUM_CACHED_SNAPSHOT_CLIENTS ];
 				MSG_ReadDeltaClient( &msg, NULL, cc->cs, number );
 				cc->havePlayerState = MSG_ReadBit( &msg );
 				if ( cc->havePlayerState ) {
-					MSG_ReadDeltaPlayerstate( &msg, NULL, (byte *)&cc->ps, 0 );
+					MSG_ReadDeltaPlayerstate( &msg, NULL, (byte *)&cc->ps );
 				}
+
+				svs.nextCachedSnapshotClients++;
+				if ( svs.nextCachedSnapshotClients >= SV_SNAPSHOT_COUNTER_LIMIT ) {
+					Com_Error( ERR_FATAL, "\x15svs.nextCachedSnapshotClients wrapped" );
+				}
+				cache->num_clients++;
+			}
+		}
+
+		while ( ( number = MSG_ReadBits( &msg, 10 ) ) != ENTITYNUM_NONE ) {
+			if ( msg.readcount > msg.cursize ) {
+				Com_Error( ERR_DROP, "\x15SV_GetCachedSnapshot: end of message" );
 			}
 
-			svs.nextCachedSnapshotClients++;
-			if ( svs.nextCachedSnapshotClients >= SV_SNAPSHOT_COUNTER_LIMIT ) {
-				Com_Error( ERR_FATAL, "\x15svs.nextCachedSnapshotClients wrapped" );
-			}
-			cache->num_clients++;
+			MSG_ReadDeltaArchivedEntity( &msg,
+				(const byte *)&SV_SvEntityNum( number )->baseline,
+				(byte *)&SVS_CACHED_ENTITIES[ svs.nextCachedSnapshotEntities
+											  % SV_NUM_CACHED_SNAPSHOT_ENTITIES ],
+				number );
 
-			if ( matched ) {
-				cachedIndex++;
-				oldcc = SV_CachedClientAt( base, cachedIndex, &cachedNum );
+			svs.nextCachedSnapshotEntities++;
+			if ( svs.nextCachedSnapshotEntities >= SV_SNAPSHOT_COUNTER_LIMIT ) {
+				Com_Error( ERR_FATAL, "\x15svs.nextCachedSnapshotEntities wrapped" );
 			}
+			cache->num_entities++;
 		}
 	} else {
 		cache = &SVS_CACHED_FRAMES[ svs.nextCachedSnapshotFrames
@@ -748,7 +776,7 @@ cachedSnapshot_t *SV_GetCachedSnapshotInternal( int frameNum ) {
 			MSG_ReadDeltaClient( &msg, NULL, cc->cs, number );
 			cc->havePlayerState = MSG_ReadBit( &msg );
 			if ( cc->havePlayerState ) {
-				MSG_ReadDeltaPlayerstate( &msg, NULL, (byte *)&cc->ps, 0 );
+				MSG_ReadDeltaPlayerstate( &msg, NULL, (byte *)&cc->ps );
 			}
 
 			svs.nextCachedSnapshotClients++;
@@ -757,24 +785,24 @@ cachedSnapshot_t *SV_GetCachedSnapshotInternal( int frameNum ) {
 			}
 			cache->num_clients++;
 		}
-	}
 
-	while ( ( number = MSG_ReadBits( &msg, 10 ) ) != ENTITYNUM_NONE ) {
-		if ( msg.readcount > msg.cursize ) {
-			Com_Error( ERR_DROP, "\x15SV_GetCachedSnapshot: end of message" );
+		while ( ( number = MSG_ReadBits( &msg, 10 ) ) != ENTITYNUM_NONE ) {
+			if ( msg.readcount > msg.cursize ) {
+				Com_Error( ERR_DROP, "\x15SV_GetCachedSnapshot: end of message" );
+			}
+
+			MSG_ReadDeltaArchivedEntity( &msg,
+				(const byte *)&SV_SvEntityNum( number )->baseline,
+				(byte *)&SVS_CACHED_ENTITIES[ svs.nextCachedSnapshotEntities
+											  % SV_NUM_CACHED_SNAPSHOT_ENTITIES ],
+				number );
+
+			svs.nextCachedSnapshotEntities++;
+			if ( svs.nextCachedSnapshotEntities >= SV_SNAPSHOT_COUNTER_LIMIT ) {
+				Com_Error( ERR_FATAL, "\x15svs.nextCachedSnapshotEntities wrapped" );
+			}
+			cache->num_entities++;
 		}
-
-		ae = &SVS_CACHED_ENTITIES[ svs.nextCachedSnapshotEntities
-								   % SV_NUM_CACHED_SNAPSHOT_ENTITIES ];
-		MSG_ReadDeltaArchivedEntity( &msg,
-			(const byte *)&SV_SvEntityNum( number )->baseline,
-			(byte *)ae, number );
-
-		svs.nextCachedSnapshotEntities++;
-		if ( svs.nextCachedSnapshotEntities >= SV_SNAPSHOT_COUNTER_LIMIT ) {
-			Com_Error( ERR_FATAL, "\x15svs.nextCachedSnapshotEntities wrapped" );
-		}
-		cache->num_entities++;
 	}
 
 	svs.nextCachedSnapshotFrames++;
@@ -789,8 +817,6 @@ cachedSnapshot_t *SV_GetCachedSnapshotInternal( int frameNum ) {
 cachedSnapshot_t *SV_GetCachedSnapshot( int *frameTime ) {
 	cachedSnapshot_t    *cache;
 	int frameNum;
-	int oldestFrame;
-	int fps;
 
 	if ( !svs.archiveEnabled ) {
 		return NULL;
@@ -799,17 +825,15 @@ cachedSnapshot_t *SV_GetCachedSnapshot( int *frameTime ) {
 		return NULL;
 	}
 
-	fps = sv_fps->integer;
-	frameNum = svs.nextArchivedSnapshotFrames - ( *frameTime * fps ) / 1000;
+	frameNum = svs.nextArchivedSnapshotFrames - ( *frameTime * sv_fps->integer ) / 1000;
 
-	oldestFrame = svs.nextArchivedSnapshotFrames - SV_NUM_ARCHIVED_SNAPSHOT_FRAMES;
-	if ( frameNum < oldestFrame ) {
-		frameNum = oldestFrame;
-		*frameTime = ( svs.nextArchivedSnapshotFrames - frameNum ) * 1000 / fps;
+	if ( frameNum < svs.nextArchivedSnapshotFrames - SV_NUM_ARCHIVED_SNAPSHOT_FRAMES ) {
+		frameNum = svs.nextArchivedSnapshotFrames - SV_NUM_ARCHIVED_SNAPSHOT_FRAMES;
+		*frameTime = ( svs.nextArchivedSnapshotFrames - frameNum ) * 1000 / sv_fps->integer;
 	}
 	if ( frameNum < 0 ) {
 		frameNum = 0;
-		*frameTime = ( svs.nextArchivedSnapshotFrames - frameNum ) * 1000 / fps;
+		*frameTime = ( svs.nextArchivedSnapshotFrames - frameNum ) * 1000 / sv_fps->integer;
 	}
 
 	for ( ; frameNum < svs.nextArchivedSnapshotFrames ; frameNum++ ) {
@@ -836,82 +860,92 @@ void *SV_GetCurrentClientInfo( int clientNum, void *clientInfo ) {
 	return (void *)VM_Call( vm, GAME_GET_CLIENT_INFO, clientNum, clientInfo );
 }
 
-#define HUDELEM_FADE_START_TIME     0x24
-#define HUDELEM_SCALE_START_TIME    0x44
-#define HUDELEM_MOVE_START_TIME     0x54
-#define HUDELEM_TIMER_VALUE         0x5C
-
 #define SV_PS_HUD_ELEMS             31
 
-/* ---- SV_RebaseTime  no-address ---- */
-static void SV_RebaseTime( int *t, int timeDelta ) {
-	if ( *t ) {
-		*t += timeDelta;
-	}
-}
-
-/* ---- SV_RebaseArchivedPlayerState  no-address ---- */
-static void SV_RebaseArchivedPlayerState( playerState_t *ps, int timeDelta ) {
-	byte *he;
-	int i;
-
-	SV_RebaseTime( &ps->commandTime, timeDelta );           /* +0x000 */
-	SV_RebaseTime( &ps->pm_time, timeDelta );               /* +0x010 */
-	SV_RebaseTime( &ps->iFoliageSoundTime, timeDelta );     /* +0x038 */
-	SV_RebaseTime( &ps->jumpTime, timeDelta );              /* +0x064 */
-	SV_RebaseTime( &ps->viewHeightLerpTime, timeDelta );    /* +0x0D4 */
-	SV_RebaseTime( &ps->shellshockTime, timeDelta );        /* +0x3E0 */
-
-	/* Only the ARCHIVAL hud array is rebased, not the current one. Retail walks it from ps+0x135C, which is &hud.archival[0] + 0x24. */
-	for ( i = 0 ; i < SV_PS_HUD_ELEMS ; i++ ) {
-		he = (byte *)&ps->hud.archival[i];
-		SV_RebaseTime( (int *)( he + HUDELEM_TIMER_VALUE ), timeDelta );
-		SV_RebaseTime( (int *)( he + HUDELEM_FADE_START_TIME ), timeDelta );
-		SV_RebaseTime( (int *)( he + HUDELEM_SCALE_START_TIME ), timeDelta );
-		SV_RebaseTime( (int *)( he + HUDELEM_MOVE_START_TIME ), timeDelta );
-	}
-
-	/* +0x20CC, and this one is NOT guarded -- retail adds unconditionally. */
-	ps->deltaTime += timeDelta;
-}
+/* ---- SV_RebaseTime  no-address ----
+ * A macro for the same reason as SV_SvEntityNum (no retail dead copy). */
+#define SV_RebaseTime( t, timeDelta ) \
+	do { \
+		if ( *( t ) ) { \
+			*( t ) += ( timeDelta ); \
+		} \
+	} while ( 0 )
 
 /* ---- SV_GetArchivedClientInfo  0x0045D500 ---- */
 qboolean SV_GetArchivedClientInfo( int *frameTime, void *clientInfo, int clientNum ) {
 	const cachedSnapshot_t  *cache;
 	const cachedClient_t    *cc;
 	playerState_t   *ps;
+	hudelem_t       *he;
 	int timeDelta;
 	int i;
 
 	cache = SV_GetCachedSnapshot( frameTime );
-	if ( cache ) {
-		sv_archiveCachedClientInfos++;
-		timeDelta = svs.time - cache->time;
-
-		for ( i = 0 ; i < cache->num_clients ; i++ ) {
-			cc = &SVS_CACHED_CLIENTS[ ( cache->first_client + i )
-									  % SV_NUM_CACHED_SNAPSHOT_CLIENTS ];
-			if ( *(const int *)cc->cs != clientNum ) {
-				continue;
-			}
-			if ( !cc->havePlayerState ) {
-				return qfalse;
-			}
-			ps = (playerState_t *)clientInfo;
-			*ps = cc->ps;
-			SV_RebaseArchivedPlayerState( ps, timeDelta );
-			return qtrue;
+	if ( !cache ) {
+		if ( *frameTime <= 0 && svs.clients[clientNum].state == CS_ACTIVE ) {
+			return (qboolean)VM_Call( vm, GAME_GET_CLIENT_INFO, clientNum, clientInfo );
 		}
 		return qfalse;
 	}
 
-	if ( *frameTime > 0 ) {
-		return qfalse;
+#ifdef SV_ARCHIVE_SELFTEST
+	sv_archiveCachedClientInfos++;
+#endif
+	timeDelta = svs.time - cache->time;
+
+	for ( i = 0 ; i < cache->num_clients ; i++ ) {
+		cc = &SVS_CACHED_CLIENTS[ ( cache->first_client + i )
+								  % SV_NUM_CACHED_SNAPSHOT_CLIENTS ];
+		if ( *(const int *)cc->cs != clientNum ) {
+			continue;
+		}
+		if ( !cc->havePlayerState ) {
+			return qfalse;
+		}
+		ps = (playerState_t *)clientInfo;
+		*ps = cc->ps;
+
+		if ( ps->commandTime ) {
+			ps->commandTime += timeDelta;
+		}
+		if ( ps->pm_time ) {
+			ps->pm_time += timeDelta;
+		}
+		if ( ps->iFoliageSoundTime ) {
+			ps->iFoliageSoundTime += timeDelta;
+		}
+		if ( ps->jumpTime ) {
+			ps->jumpTime += timeDelta;
+		}
+		if ( ps->viewHeightLerpTime ) {
+			ps->viewHeightLerpTime += timeDelta;
+		}
+		if ( ps->shellshockTime ) {
+			ps->shellshockTime += timeDelta;
+		}
+
+		/* Only the ARCHIVAL hud array is rebased, not the current one. */
+		for ( i = 0 ; i < SV_PS_HUD_ELEMS ; i++ ) {
+			he = &ps->hud.archival[i];
+			if ( he->timerValue ) {
+				he->timerValue += timeDelta;
+			}
+			if ( he->fadeStartTime ) {
+				he->fadeStartTime += timeDelta;
+			}
+			if ( he->scaleStartTime ) {
+				he->scaleStartTime += timeDelta;
+			}
+			if ( he->moveStartTime ) {
+				he->moveStartTime += timeDelta;
+			}
+		}
+
+		/* Not guarded -- retail adds unconditionally. */
+		ps->deltaTime += timeDelta;
+		return qtrue;
 	}
-	if ( svs.clients[clientNum].state != CS_ACTIVE ) {
-		return qfalse;
-	}
-	return (qboolean)VM_Call( vm, GAME_GET_CLIENT_INFO, clientNum, clientInfo );
+	return qfalse;
 }
 
 /* ---- SV_BuildClientSnapshot  0x0045D650 ---- */
@@ -922,6 +956,7 @@ void SV_BuildClientSnapshot( client_t *cl ) {
 	const archivedEntity_t  *ae;
 	entityState_t       *es;
 	playerState_t       *ps;
+	svSnapshotClient_t  *snapClient;
 	int clientNum;
 	int viewEnt;
 	int frameTime;
@@ -956,9 +991,10 @@ void SV_BuildClientSnapshot( client_t *cl ) {
 	cache = SV_GetCachedSnapshot( &frameTime );
 	SV_SetClientArchiveTime( clientNum, frameTime );
 
-	timeDelta = 0;
 	if ( cache ) {
 		timeDelta = svs.time - cache->time;
+	} else {
+		timeDelta = 0;
 	}
 
 	ps = (playerState_t *)( (byte *)sv.gameClients + clientNum * sv.gameClientSize );
@@ -969,32 +1005,19 @@ void SV_BuildClientSnapshot( client_t *cl ) {
 		Com_Error( ERR_DROP, "\x15SV_BuildClientSnapshot: bad gEnt" );
 	}
 
-	org[0] = frame->ps.origin[0];
-	org[1] = frame->ps.origin[1];
-	org[2] = frame->ps.origin[2] + frame->ps.viewHeightCurrent;
+	VectorCopy( frame->ps.origin, org );
+	org[2] += frame->ps.viewHeightCurrent;
 	AddLeanToPosition( org, frame->ps.viewangles[1], frame->ps.leanf,
 					   16.0f, 20.0f );
 
 	leafnum = CM_PointLeafnum( org );
 
-	if ( cache ) {
-		sv_archiveCachedBuilds++;
-		SV_AddCachedEntitiesVisibleFromPoint( leafnum, cache->num_entities,
-											  cache->first_entity, viewEnt,
-											  eNums, &frame->ps );
+	if ( !cache ) {
+		SV_AddEntitiesVisibleFromPoint( leafnum, viewEnt, eNums );
 
 		for ( i = 0 ; i < eNums[0] ; i++ ) {
-			ae = &SVS_CACHED_ENTITIES[ ( eNums[i + 1] + cache->first_entity )
-									   % SV_NUM_CACHED_SNAPSHOT_ENTITIES ];
-
-			es = &svs.snapshotEntities[ svs.nextSnapshotEntities
-										% svs.numSnapshotEntities ];
-			*es = ae->s;
-
-			SV_RebaseTime( &es->pos.trTime, timeDelta );
-			SV_RebaseTime( &es->apos.trTime, timeDelta );
-			SV_RebaseTime( &es->time, timeDelta );
-			SV_RebaseTime( &es->time2, timeDelta );
+			svs.snapshotEntities[svs.nextSnapshotEntities % svs.numSnapshotEntities] =
+				*(const entityState_t *)SV_GentityNum( eNums[i + 1] );
 
 			svs.nextSnapshotEntities++;
 			if ( svs.nextSnapshotEntities >= SV_SNAPSHOT_COUNTER_LIMIT ) {
@@ -1003,14 +1026,14 @@ void SV_BuildClientSnapshot( client_t *cl ) {
 			frame->num_entities++;
 		}
 
-		for ( i = 0 ; i < cache->num_clients ; i++ ) {
-			cc = &SVS_CACHED_CLIENTS[ ( cache->first_client + i )
-									  % SV_NUM_CACHED_SNAPSHOT_CLIENTS ];
-			memcpy( (byte *)svs.snapshotClients
-					+ SV_SNAPSHOT_CLIENT_BYTES
-					  * ( svs.nextSnapshotClients % svs.numSnapshotClients ),
-					cc->cs,
-					SV_SNAPSHOT_CLIENT_BYTES );
+		/* cl is dead here; retail walks the clients in its incoming stack slot. */
+		for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
+			if ( cl->state < CS_CONNECTED ) {
+				continue;
+			}
+			snapClient = &SVS_SNAPSHOT_CLIENTS[svs.nextSnapshotClients
+											   % svs.numSnapshotClients];
+			*snapClient = *(const svSnapshotClient_t *)SV_GetClientState( i );
 
 			svs.nextSnapshotClients++;
 			if ( svs.nextSnapshotClients >= SV_SNAPSHOT_COUNTER_LIMIT ) {
@@ -1021,11 +1044,25 @@ void SV_BuildClientSnapshot( client_t *cl ) {
 		return;
 	}
 
-	SV_AddEntitiesVisibleFromPoint( leafnum, viewEnt, eNums );
+#ifdef SV_ARCHIVE_SELFTEST
+	sv_archiveCachedBuilds++;
+#endif
+	SV_AddCachedEntitiesVisibleFromPoint( leafnum, cache->num_entities,
+										  cache->first_entity, viewEnt,
+										  eNums, &frame->ps );
 
 	for ( i = 0 ; i < eNums[0] ; i++ ) {
-		svs.snapshotEntities[svs.nextSnapshotEntities % svs.numSnapshotEntities] =
-			*(const entityState_t *)SV_GentityNum( eNums[i + 1] );
+		ae = &SVS_CACHED_ENTITIES[ ( eNums[i + 1] + cache->first_entity )
+								   % SV_NUM_CACHED_SNAPSHOT_ENTITIES ];
+
+		es = &svs.snapshotEntities[ svs.nextSnapshotEntities
+									% svs.numSnapshotEntities ];
+		*es = ae->s;
+
+		SV_RebaseTime( &es->pos.trTime, timeDelta );
+		SV_RebaseTime( &es->apos.trTime, timeDelta );
+		SV_RebaseTime( &es->time, timeDelta );
+		SV_RebaseTime( &es->time2, timeDelta );
 
 		svs.nextSnapshotEntities++;
 		if ( svs.nextSnapshotEntities >= SV_SNAPSHOT_COUNTER_LIMIT ) {
@@ -1034,15 +1071,11 @@ void SV_BuildClientSnapshot( client_t *cl ) {
 		frame->num_entities++;
 	}
 
-	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		if ( svs.clients[i].state < CS_CONNECTED ) {
-			continue;
-		}
-		memcpy( (byte *)svs.snapshotClients
-				+ SV_SNAPSHOT_CLIENT_BYTES
-				  * ( svs.nextSnapshotClients % svs.numSnapshotClients ),
-				SV_GetClientState( i ),
-				SV_SNAPSHOT_CLIENT_BYTES );
+	for ( i = 0 ; i < cache->num_clients ; i++ ) {
+		cc = &SVS_CACHED_CLIENTS[ ( cache->first_client + i )
+								  % SV_NUM_CACHED_SNAPSHOT_CLIENTS ];
+		memcpy( &SVS_SNAPSHOT_CLIENTS[svs.nextSnapshotClients % svs.numSnapshotClients],
+				cc->cs, SV_SNAPSHOT_CLIENT_BYTES );
 
 		svs.nextSnapshotClients++;
 		if ( svs.nextSnapshotClients >= SV_SNAPSHOT_COUNTER_LIMIT ) {
@@ -1090,7 +1123,7 @@ void SV_SendMessageToClient( msg_t *msg, client_t *client ) {
 	client->frames[client->netchan.outgoingSequence & PACKET_MASK].messageSent = svs.time;
 	client->frames[client->netchan.outgoingSequence & PACKET_MASK].messageAcked = -1;
 
-	SV_Netchan_Encode( outBuf + 4, client, len - 4 );
+	SV_Netchan_Encode( client, outBuf + 4, len - 4 );
 	Netchan_Transmit( &client->netchan, len, outBuf );
 
 	if ( client->netchan.remoteAddress.type == NA_LOOPBACK
@@ -1131,12 +1164,10 @@ void SV_SendClientSnapshot( client_t *cl ) {
 	MSG_WriteLong( &msg, cl->lastClientCommand );
 
 	if ( cl->state == CS_ACTIVE || cl->state == CS_ZOMBIE ) {
-		SV_UpdateServerCommandsToClient( &msg, cl );
-		SV_WriteSnapshotToClient( &msg, cl );
-		if ( cl->state != CS_ZOMBIE ) {
-			SV_WriteDownloadToClient( cl, &msg );
-		}
-	} else {
+		SV_UpdateServerCommandsToClient( cl, &msg );
+		SV_WriteSnapshotToClient( cl, &msg );
+	}
+	if ( cl->state != CS_ZOMBIE ) {
 		SV_WriteDownloadToClient( cl, &msg );
 	}
 
@@ -1172,6 +1203,8 @@ void SV_SendClientSnapshot( client_t *cl ) {
 /* svFlags bits that force an entity into the archive regardless of whether it is in any PVS cluster. Retail tests `& 18h` (0x0045E5D9, 0x0045E20C). */
 #define SVF_ARCHIVE_ALWAYS      ( SVF_BROADCAST | SVF_PORTAL )
 
+#ifdef SV_ARCHIVE_SELFTEST
+/* Tree-only diagnostic, not in retail; see SV_ARCHIVE_SELFTEST at the top of the file. */
 /* ---- SV_FillArchivedEntity  no-address ---- */
 static void SV_FillArchivedEntity( archivedEntity_t *ae, const gentity_t *ent ) {
 	ae->s = ent->s;
@@ -1200,7 +1233,7 @@ static qboolean SV_ArchiveEntityVisible( const gentity_t *ent ) {
 	}
 	svEnt = SV_SvEntityNum( ent->s.number );
 	if ( ( ent->r.svFlags & SVF_ARCHIVE_ALWAYS ) == 0
-		 && !SV_ENT_VIS( svEnt )->numClusters ) {
+		 && !svEnt->numClusters ) {
 		return qfalse;
 	}
 	return qtrue;
@@ -1217,9 +1250,9 @@ static void SV_CanonicalPlayerState( const playerState_t *live ) {
 	msg_t m;
 
 	MSG_Init( &m, st_scratch, sizeof( st_scratch ) );
-	MSG_WriteDeltaPlayerstate( &m, NULL, (const byte *)live, 0 );
+	MSG_WriteDeltaPlayerstate( &m, NULL, (const byte *)live );
 	MSG_BeginReading( &m );
-	MSG_ReadDeltaPlayerstate( &m, NULL, (byte *)&st_canonPs, 0 );
+	MSG_ReadDeltaPlayerstate( &m, NULL, (byte *)&st_canonPs );
 }
 
 /* ---- SV_CanonicalArchivedEntity  no-address ---- */
@@ -1497,6 +1530,7 @@ static void SV_ArchiveSelfTest( int frameNum ) {
 					sv_archiveCachedInfoChecks );
 	}
 }
+#endif /* SV_ARCHIVE_SELFTEST */
 
 /* ---- SV_ArchiveSnapshot  0x0045DE80 ---- */
 void SV_ArchiveSnapshot( void ) {
@@ -1507,10 +1541,12 @@ void SV_ArchiveSnapshot( void ) {
 	cachedClient_t      *cc;
 	archivedEntity_t    *ae;
 	archivedEntity_t localEnt;
-	const gentity_t     *ent;
-	const byte          *liveClient;
+	gentity_t           *ent;
+	svEntity_t          *svEnt;
+	client_t            *cl;
 	playerState_t ps;
 	int clientIndex, cachedIndex, cachedNum;
+	int maxclients, numCached;
 	int frameIndex, oldestFrame, staleBefore;
 	int i, len, offset, room;
 	byte buf[SV_ARCHIVE_MSG_BYTES];
@@ -1543,84 +1579,111 @@ void SV_ArchiveSnapshot( void ) {
 	}
 
 	if ( cache
-		 && ( cache->first_entity
-			  < svs.nextCachedSnapshotEntities - SV_NUM_CACHED_SNAPSHOT_ENTITIES
-			  || cache->first_client
-				 < svs.nextCachedSnapshotClients - SV_NUM_CACHED_SNAPSHOT_CLIENTS ) ) {
-		cache = NULL;
-	}
-
-	if ( cache ) {
+		 && cache->first_entity
+			>= svs.nextCachedSnapshotEntities - SV_NUM_CACHED_SNAPSHOT_ENTITIES
+		 && cache->first_client
+			>= svs.nextCachedSnapshotClients - SV_NUM_CACHED_SNAPSHOT_CLIENTS ) {
+		/* Delta path: retail calls MSG_WriteBit0 and SV_SvEntityForGentity out of
+		   line here (the keyframe path inlines them); inline_depth(0) marks each site. */
+#pragma inline_depth(0)
 		MSG_WriteBit0( &msg );
-		MSG_WriteData( &msg, 4, &cache->archivedFrame );
-		MSG_WriteData( &msg, 4, &svs.time );
+#pragma inline_depth()
+		MSG_WriteLong( &msg, cache->archivedFrame );
+		MSG_WriteLong( &msg, svs.time );
 
+		maxclients = sv_maxclients->integer;
+		numCached = cache->num_clients;
+		cc = NULL;
 		clientIndex = 0;
 		cachedIndex = 0;
 
-		while ( 1 ) {
-			if ( clientIndex < sv_maxclients->integer ) {
-				if ( svs.clients[clientIndex].state < CS_CONNECTED ) {
-					clientIndex++;
-					continue;
-				}
-			} else if ( cachedIndex >= cache->num_clients ) {
-				break;
+		while ( clientIndex < maxclients || cachedIndex < numCached ) {
+			if ( clientIndex < maxclients
+				 && svs.clients[clientIndex].state < CS_CONNECTED ) {
+				clientIndex++;
+				continue;
 			}
 
-			if ( cachedIndex < cache->num_clients ) {
+			if ( cachedIndex >= numCached ) {
+				cachedNum = 9999;
+			} else {
 				cc = &SVS_CACHED_CLIENTS[ ( cache->first_client + cachedIndex )
 										  % SV_NUM_CACHED_SNAPSHOT_CLIENTS ];
 				cachedNum = *(const int *)cc->cs;
-			} else {
-				cc = NULL;
-				cachedNum = 9999;
+			}
+
+			if ( clientIndex == cachedNum ) {
+				MSG_WriteDeltaClient( &msg, cc->cs,
+									  (const byte *)SV_GetClientState( clientIndex ),
+									  qtrue );
+				if ( VM_Call( vm, GAME_GET_CLIENT_INFO, clientIndex, &ps ) ) {
+					MSG_WriteBit1( &msg );
+					MSG_WriteDeltaPlayerstate( &msg, (const byte *)&cc->ps,
+											   (const byte *)&ps );
+				} else {
+#pragma inline_depth(0)
+					MSG_WriteBit0( &msg );
+#pragma inline_depth()
+				}
+				cachedIndex++;
+				clientIndex++;
+				continue;
+			}
+
+			if ( clientIndex < cachedNum ) {
+				MSG_WriteDeltaClient( &msg, NULL,
+									  (const byte *)SV_GetClientState( clientIndex ),
+									  qtrue );
+				if ( VM_Call( vm, GAME_GET_CLIENT_INFO, clientIndex, &ps ) ) {
+					MSG_WriteBit1( &msg );
+					MSG_WriteDeltaPlayerstate( &msg, NULL, (const byte *)&ps );
+				} else {
+#pragma inline_depth(0)
+					MSG_WriteBit0( &msg );
+#pragma inline_depth()
+				}
+				clientIndex++;
+				continue;
 			}
 
 			if ( clientIndex > cachedNum ) {
 				cachedIndex++;
 				continue;
 			}
-
-			liveClient = (const byte *)SV_GetClientState( clientIndex );
-
-			if ( clientIndex == cachedNum ) {
-				MSG_WriteDeltaClient( &msg, cc->cs, liveClient, qtrue );
-				if ( VM_Call( vm, GAME_GET_CLIENT_INFO, clientIndex, &ps ) ) {
-					MSG_WriteBit1( &msg );
-					MSG_WriteDeltaPlayerstate( &msg, (const byte *)&cc->ps,
-											   (const byte *)&ps, 0 );
-				} else {
-					MSG_WriteBit0( &msg );
-				}
-				cachedIndex++;
-			} else {
-				MSG_WriteDeltaClient( &msg, NULL, liveClient, qtrue );
-				if ( VM_Call( vm, GAME_GET_CLIENT_INFO, clientIndex, &ps ) ) {
-					MSG_WriteBit1( &msg );
-					MSG_WriteDeltaPlayerstate( &msg, NULL, (const byte *)&ps, 0 );
-				} else {
-					MSG_WriteBit0( &msg );
-				}
-			}
-			clientIndex++;
 		}
 
+#pragma inline_depth(0)
 		MSG_WriteBit0( &msg );
+#pragma inline_depth()
 
 		for ( i = 0 ; i < sv.num_entities ; i++ ) {
 			ent = SV_GentityNum( i );
-			if ( !SV_ArchiveEntityVisible( ent ) ) {
+			if ( !ent->r.linked ) {
 				continue;
 			}
-			SV_FillArchivedEntity( &localEnt, ent );
+			if ( ent->r.svFlags & SVF_NOCLIENT ) {
+				continue;
+			}
+#pragma inline_depth(0)
+			svEnt = SV_SvEntityForGentity( ent );
+#pragma inline_depth()
+			if ( !( ent->r.svFlags & SVF_ARCHIVE_ALWAYS )
+				 && !svEnt->numClusters ) {
+				continue;
+			}
+
+			localEnt.s = ent->s;
+			localEnt.svFlags = ent->r.svFlags;
+			localEnt.singleClient = ent->r.singleClient;
+			VectorCopy( ent->r.absmin, localEnt.absmin );
+			VectorCopy( ent->r.absmax, localEnt.absmax );
 			MSG_WriteDeltaArchivedEntity( &msg,
 				(const byte *)&SV_SvEntityNum( ent->s.number )->baseline,
 				(const byte *)&localEnt, qtrue );
 		}
 	} else {
 		MSG_WriteBit1( &msg );
-		MSG_WriteData( &msg, 4, &svs.time );
+		MSG_WriteLong( &msg, svs.time );
 
 		cache = &SVS_CACHED_FRAMES[ svs.nextCachedSnapshotFrames
 									% SV_NUM_CACHED_SNAPSHOT_FRAMES ];
@@ -1632,8 +1695,8 @@ void SV_ArchiveSnapshot( void ) {
 		cache->usesDelta     = 0;
 		cache->time          = svs.time;
 
-		for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-			if ( svs.clients[i].state < CS_CONNECTED ) {
+		for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
+			if ( cl->state < CS_CONNECTED ) {
 				continue;
 			}
 
@@ -1645,7 +1708,7 @@ void SV_ArchiveSnapshot( void ) {
 			cc->havePlayerState = VM_Call( vm, GAME_GET_CLIENT_INFO, i, &cc->ps );
 			if ( cc->havePlayerState ) {
 				MSG_WriteBit1( &msg );
-				MSG_WriteDeltaPlayerstate( &msg, NULL, (const byte *)&cc->ps, 0 );
+				MSG_WriteDeltaPlayerstate( &msg, NULL, (const byte *)&cc->ps );
 			} else {
 				MSG_WriteBit0( &msg );
 			}
@@ -1661,13 +1724,25 @@ void SV_ArchiveSnapshot( void ) {
 
 		for ( i = 0 ; i < sv.num_entities ; i++ ) {
 			ent = SV_GentityNum( i );
-			if ( !SV_ArchiveEntityVisible( ent ) ) {
+			if ( !ent->r.linked ) {
+				continue;
+			}
+			if ( ent->r.svFlags & SVF_NOCLIENT ) {
+				continue;
+			}
+			svEnt = SV_SvEntityForGentity( ent );
+			if ( !( ent->r.svFlags & SVF_ARCHIVE_ALWAYS )
+				 && !svEnt->numClusters ) {
 				continue;
 			}
 
 			ae = &SVS_CACHED_ENTITIES[ svs.nextCachedSnapshotEntities
 									   % SV_NUM_CACHED_SNAPSHOT_ENTITIES ];
-			SV_FillArchivedEntity( ae, ent );
+			ae->s = ent->s;
+			ae->svFlags = ent->r.svFlags;
+			ae->singleClient = ent->r.singleClient;
+			VectorCopy( ent->r.absmin, ae->absmin );
+			VectorCopy( ent->r.absmax, ae->absmax );
 			MSG_WriteDeltaArchivedEntity( &msg,
 				(const byte *)&SV_SvEntityNum( ent->s.number )->baseline,
 				(const byte *)ae, qtrue );
@@ -1701,11 +1776,11 @@ void SV_ArchiveSnapshot( void ) {
 	}
 
 	room = SV_ARCHIVED_SNAPSHOT_BUFFER_BYTES - offset;
-	if ( len > room ) {
+	if ( len <= room ) {
+		memcpy( svs.archivedSnapshotBuffer + offset, msg.data, (size_t)len );
+	} else {
 		memcpy( svs.archivedSnapshotBuffer + offset, msg.data, (size_t)room );
 		memcpy( svs.archivedSnapshotBuffer, msg.data + room, (size_t)( len - room ) );
-	} else {
-		memcpy( svs.archivedSnapshotBuffer + offset, msg.data, (size_t)len );
 	}
 
 	svs.nextArchivedSnapshotFrames++;
@@ -1713,6 +1788,8 @@ void SV_ArchiveSnapshot( void ) {
 		Com_Error( ERR_FATAL, "\x15svs.nextArchivedSnapshotFrames wrapped" );
 	}
 
+	/* Retail ends here (0x0045E83D); the self test below is tree-only. */
+#ifdef SV_ARCHIVE_SELFTEST
 	if ( !sv_archiveSelfTest ) {
 		sv_archiveSelfTest = Cvar_Get( "sv_archiveSelfTest", "0", 0 );
 		sv_archiveForceTime = Cvar_Get( "sv_archiveForceTime", "0", 0 );
@@ -1720,71 +1797,130 @@ void SV_ArchiveSnapshot( void ) {
 	if ( sv_archiveSelfTest->integer ) {
 		SV_ArchiveSelfTest( svs.nextArchivedSnapshotFrames - 1 );
 	}
+#endif
 }
 
 /* ---- SV_SendClientMessages  0x0045E860 ---- */
 void SV_SendClientMessages( void ) {
 	int i;
-	client_t    *cl;
-	int numclients;
+	client_t    *c;
+	int numclients = 0;
 
 	sv.bpsTotalBytes = 0;
 	sv.ubpsTotalBytes = 0;
 
-	numclients = 0;
-
-	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		cl = &svs.clients[i];
-
-		if ( cl->state == CS_FREE ) {
+	for ( i = 0, c = svs.clients ; i < sv_maxclients->integer ; i++, c++ ) {
+		if ( !c->state ) {
 			continue;
 		}
-		if ( svs.time < cl->nextSnapshotTime ) {
+		if ( svs.time < c->nextSnapshotTime ) {
 			continue;
 		}
 
 		numclients++;
 
-		if ( cl->netchan.unsentFragments ) {
-			cl->nextSnapshotTime = svs.time
-								   + SV_RateMsec( cl,
-												  cl->netchan.unsentLength
-												  - cl->netchan.unsentFragmentStart );
-			Netchan_TransmitNextFragment( &cl->netchan );
+		if ( c->netchan.unsentFragments ) {
+			c->nextSnapshotTime = svs.time
+								  + SV_RateMsec( c,
+												 c->netchan.unsentLength
+												 - c->netchan.unsentFragmentStart );
+			SV_Netchan_TransmitNextFragment( &c->netchan );
 			continue;
 		}
 
-		SV_SendClientSnapshot( cl );
+		SV_SendClientSnapshot( c );
 	}
 
-	if ( !sv_showAverageBPS->integer || numclients <= 0 ) {
-		return;
-	}
+	if ( sv_showAverageBPS->integer && numclients > 0 ) {
+#ifdef COD1_VC7
+		float ave = 0, uave = 0;
 
-	SV_UpdateAverageBPS( numclients );
+		for ( i = 0 ; i < MAX_BPS_WINDOW - 1 ; i++ ) {
+			sv.bpsWindow[i] = sv.bpsWindow[i + 1];
+			ave += sv.bpsWindow[i];
+
+			sv.ubpsWindow[i] = sv.ubpsWindow[i + 1];
+			uave += sv.ubpsWindow[i];
+		}
+
+		sv.bpsWindow[MAX_BPS_WINDOW - 1] = sv.bpsTotalBytes;
+		ave += sv.bpsTotalBytes;
+
+		sv.ubpsWindow[MAX_BPS_WINDOW - 1] = sv.ubpsTotalBytes;
+		uave += sv.ubpsTotalBytes;
+
+		if ( sv.bpsTotalBytes >= sv.bpsMaxBytes ) {
+			sv.bpsMaxBytes = sv.bpsTotalBytes;
+		}
+		if ( sv.ubpsTotalBytes >= sv.ubpsMaxBytes ) {
+			sv.ubpsMaxBytes = sv.ubpsTotalBytes;
+		}
+
+		sv.bpsWindowSteps++;
+
+		if ( sv.bpsWindowSteps >= MAX_BPS_WINDOW ) {
+			float comp_ratio;
+
+			sv.bpsWindowSteps = 0;
+
+			ave = ( ave / (float)MAX_BPS_WINDOW );
+			uave = ( uave / (float)MAX_BPS_WINDOW );
+
+			comp_ratio = ( 1 - ave / uave ) * 100.f;
+			sv.ucompAve += comp_ratio;
+			sv.ucompNum++;
+
+			Com_DPrintf( "bpspc(%2.0f) bps(%2.0f) pk(%i) ubps(%2.0f) upk(%i) cr(%2.2f) acr(%2.2f)\n",
+						 ave / (float)numclients, ave, sv.bpsMaxBytes, uave, sv.ubpsMaxBytes,
+						 comp_ratio, sv.ucompAve / sv.ucompNum );
+		}
+#else
+		SV_UpdateAverageBPS( numclients );
+#endif
+	}
 }
 
+#ifndef COD1_VC7
 /* ---- SV_UpdateAverageBPS  no-address ---- */
+/*
+ * Modern build only: under VC7 SV_SendClientMessages carries the plain-float
+ * RTCW block, which compiles to retail. This emulates that block's x87
+ * rounding for modern MSVC.
+ *
+ * Tail of SV_SendClientMessages 0x0045E860 (0x0045E915..0x0045EBA9). Retail
+ * keeps `total` in an x87 register for the whole shuffle and never stores it;
+ * ave, uave and comp are also register values passed to Com_DPrintf as
+ * qwords. Under the CRT's _PC_53 those are C doubles. Only utotal is a float
+ * stack slot, and the eightfold unroll spills it after each group of eight
+ * (i = 0..7, 8..15), then after each of i = 16..18 and after the final add;
+ * usum is the register-held partial sum between spills.
+ */
 static void SV_UpdateAverageBPS( int numclients ) {
 	int i;
-	float total;
+	double total;
 	float utotal;
-	float ave, uave, comp;
+	double usum;
+	double ave, uave, comp;
 
-	total = 0.0f;
+	total = 0.0;
 	utotal = 0.0f;
+	usum = 0.0;
 
 	for ( i = 0 ; i < MAX_BPS_WINDOW - 1 ; i++ ) {
 		sv.bpsWindow[i] = sv.bpsWindow[i + 1];
-		total += (float)sv.bpsWindow[i];
+		total += sv.bpsWindow[i];
 		sv.ubpsWindow[i] = sv.ubpsWindow[i + 1];
-		utotal += (float)sv.ubpsWindow[i];
+		usum += sv.ubpsWindow[i];
+		if ( ( i & 7 ) == 7 || i >= 16 ) {
+			utotal = (float)usum;
+			usum = utotal;
+		}
 	}
 
 	sv.bpsWindow[MAX_BPS_WINDOW - 1] = sv.bpsTotalBytes;
-	total += (float)sv.bpsTotalBytes;
+	total += sv.bpsTotalBytes;
 	sv.ubpsWindow[MAX_BPS_WINDOW - 1] = sv.ubpsTotalBytes;
-	utotal += (float)sv.ubpsTotalBytes;
+	utotal = (float)( (double)utotal + sv.ubpsTotalBytes );
 
 	if ( sv.bpsTotalBytes >= sv.bpsMaxBytes ) {
 		sv.bpsMaxBytes = sv.bpsTotalBytes;
@@ -1799,15 +1935,18 @@ static void SV_UpdateAverageBPS( int numclients ) {
 	}
 	sv.bpsWindowSteps = 0;
 
+	/* flt_5690F0 is the float 0.05f; the products are formed in double. */
 	ave = total * ( 1.0f / MAX_BPS_WINDOW );
-	uave = utotal * ( 1.0f / MAX_BPS_WINDOW );
-	comp = (float)( ( 1.0 - (double)ave / (double)uave ) * 100.0 );
+	uave = (double)utotal * ( 1.0f / MAX_BPS_WINDOW );
+	comp = ( 1.0 - ave / uave ) * 100.0;
 
 	sv.ucompNum++;
-	sv.ucompAve += comp;
+	/* 0x0045EB69: only the sum is rounded to float, comp itself is not. */
+	sv.ucompAve = (float)( sv.ucompAve + comp );
 
 	Com_DPrintf( "bpspc(%2.0f) bps(%2.0f) pk(%i) ubps(%2.0f) upk(%i) cr(%2.2f) acr(%2.2f)\n",
-				 (double)ave / (double)numclients, (double)ave,
-				 sv.bpsMaxBytes, (double)uave, sv.ubpsMaxBytes,
-				 (double)comp, (double)sv.ucompAve / (double)sv.ucompNum );
+				 ave / numclients, ave,
+				 sv.bpsMaxBytes, uave, sv.ubpsMaxBytes,
+				 comp, (double)sv.ucompAve / sv.ucompNum );
 }
+#endif /* !COD1_VC7 */

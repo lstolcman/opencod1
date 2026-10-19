@@ -7,9 +7,10 @@ An open-source reconstruction of **Call of Duty** (2003) multiplayer.
 
 ## Status
 
-Reconstruction is **incomplete and ongoing.** The engine, dedicated server, and
-the game/cgame/ui modules build and link; some subsystems (the effects system
-especially) are still being reconstructed, so expect rough edges.
+The **vanilla** branch is a byte-matching reconstruction of the 1.1 binaries:
+
+- **game_mp, cgame_mp** and **ui_mp** rebuild **byte-identical** to the retail DLLs.
+- **CoDMP.exe** about 98% of its functions are identical.
 
 ## Recommended Branches
 Branch | Description

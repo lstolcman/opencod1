@@ -9,18 +9,29 @@
  * @fidelity: verified
  */
 
-#include "scr_local.h"
-#include "../qcommon/hexrays_shim.h"
+#ifdef __cplusplus
+/* retail built this unit as C++ with exceptions (/TP /GX); every name keeps C linkage */
+extern "C" {
+#endif
 
-#define FindNextSibling     cod1_globals_FindNextSibling_data
-#define FindObject          cod1_globals_FindObject_data
-#include "../qcommon/cod1_globals.h"
-#undef FindNextSibling
-#undef FindObject
+#include "scr_local.h"
+
 
 #include <malloc.h>
 
 typedef unsigned int sval_t;
+
+/* retail passes parse-tree cells by value as this union (symbols: 6sval_u),
+ * which LTCG never moves into registers */
+typedef union sval_u {
+	sval_t                  value;
+	int                     type;
+	unsigned int            stringValue;
+	int                     intValue;
+	unsigned int            sourcePosValue;
+} sval_u;
+
+#define SVAL_U( v )         ( *(sval_u *)&(v) )
 
 typedef struct sval_cell_s {
 	sval_t                  value;
@@ -220,7 +231,7 @@ enum {
 #define SCR_OPERAND_STACK_LIMIT 0x800
 
 #define SCR_CASE_TEST_BIAS      0x007E0000u
-#define SCR_CASE_TEST_LIMIT     0x00FE0000u
+#define SCR_CASE_TEST_MAX       0x00FDFFFFu
 #define SCR_CASE_ENCODE_BIAS    0x00800000u
 #define SCR_CASE_ENCODE_MASK    0x00FFFFFFu
 
@@ -248,11 +259,10 @@ enum {
 #define scrCompileGlob_caseAllowed      scrCompileGlob_caseAllowed    /* 0x014073AC */
 #define scrCompileGlob_caseAllowedDev   scrCompileGlob_caseAllowedDev    /* 0x014073AD */
 #define scrCompileGlob_caseList         scrCompileGlob_caseList   /* 0x014073B0 */
-#define scrAnimPub_currentAnimTree      dword_8E60B0    /* 0x008E60B0 (low word) */
+#define scrAnimPub_currentAnimTree      scrAnimPub_usingTreeNames    /* 0x008E60B0 (low word) */
 #define scrCompilePub_loadedScripts     scrCompilePub_loadedScripts    /* 0x008E60B4 (low word) */
 #define scrCompilePub_scriptCount       scrCompilePub_scriptCount    /* 0x008E60B8 */
 #define scrCompilePub_developerScript   scrVarPub_developerScript    /* 0x008E60C4 */
-#define scrCompilePub_scriptsPos        scrCompilePub_scriptsPos    /* 0x008E60CC (low word) */
 #define scrCompilePub_scriptsAvailable  scrVarPub_developer    /* 0x008E60D0 */
 
 #define SCR_HANDLE( g )     ( *(unsigned short *)&(g) )
@@ -263,6 +273,36 @@ enum {
 int     scrCompileGlob_cumulOffset;     /* retail 0x008E5EF0 */
 int     scrCompileGlob_maxOffset;       /* retail 0x008E5EF8 */
 int     scrCompileGlob_maxCallOffset;   /* retail 0x008E5EE0 */
+/* ---- module-owned globals ---- */
+int scrCompileGlob_devPatchMax;   /* 0x01407390 */
+void *scrCompileGlob_stringFixups;   /* 0x01407398 */
+unsigned char scrCompileGlob_breakAllowed;   /* 0x0140739C */
+unsigned char scrCompileGlob_breakAllowedDev;   /* 0x0140739D */
+int scrCompileGlob_breakList;   /* 0x014073A0 */
+unsigned char scrCompileGlob_contAllowed;   /* 0x014073A4 */
+unsigned char scrCompileGlob_contAllowedDev;   /* 0x014073A5 */
+int scrCompileGlob_contList;   /* 0x014073A8 */
+unsigned char scrCompileGlob_caseAllowed;   /* 0x014073AC */
+unsigned char scrCompileGlob_caseAllowedDev;   /* 0x014073AD */
+int scrCompileGlob_caseList;   /* 0x014073B0 */
+int scrCompileGlob_loadCursor;   /* 0x008E5EF4 */
+int scrCompileGlob_codePos;   /* 0x008E5EFC */
+int scrCompileGlob_codeRelocStart;   /* 0x008E5F00 */
+int scrCompileGlob_lastOpcodePos;   /* 0x00966430 */
+void *scrCompileGlob_devOpBuffer;   /* 0x0140738C */
+void *scrCompileGlob_devPatchTable;   /* 0x01407394 */
+int scrCompileGlob_animTreeValue;   /* 0x008E5ED8 */
+int developer_script_int;   /* 0x008E5EE8 */
+char *developerCodeStart;   /* 0x008E5EE4 */
+int scrCompilePub_checksum;   /* 0x01407364 */
+int scrCompilePub_programLen;   /* 0x01407388 */
+int scrCompilePub_scriptCount;   /* 0x008E60B8 */
+int scrCompilePub_scriptfilename;   /* 0x01407374 */
+int scrCompilePub_sourceBuf;   /* 0x01407370 */
+/* retail's 16-bit object handles (never address-taken) */
+unsigned short scrCompileGlob_currentFuncRoot;   /* 0x008E5EEC */
+unsigned short scrCompilePub_loadedScripts;   /* 0x008E60B4 */
+unsigned short scrCompilePub_scriptsPos;   /* 0x008E60CC, the loaded-scripts object */
 
 typedef struct scrCodeOffsetPatch_s {
 	char                           *codePos;
@@ -303,7 +343,11 @@ extern void QDECL    CompileError2( const char *codePos, const char *format, ...
 extern unsigned short SL_TransferToCanonicalString( unsigned short handle );
 extern qboolean      Scr_LoadScript( const char *filename );
 
+#ifdef COD1_VC7
+extern unsigned char Scr_IsIdentifier( const char *name );
+#else
 extern qboolean      Scr_IsIdentifier( const char *name );
+#endif
 
 extern void         *Scr_GetFunction( const char **name, int *developerOnly );
 extern void         *Scr_GetMethod( const char **name, int *developerOnly );
@@ -311,28 +355,29 @@ extern void         *Scr_GetMethod( const char **name, int *developerOnly );
 extern void          Scr_EmitAnimationInternal( char *animRef, unsigned short animName,
 												unsigned short tree, unsigned int sourcePos );
 extern unsigned short Scr_UsingTreeInternal( const char *name, int *animTreeValue );
+extern void           Scr_UsingTree( const char *name, unsigned int sourcePos );
 
 static void  EmitExpression( sval_t node );
 static void  EmitPrimitiveExpression( sval_t node );
 static void  EmitPrimitiveExpressionFieldObject( sval_t node, unsigned int sourcePos );
-static void  EmitExpressionFieldObject( sval_t node, unsigned int sourcePos );
+static void  EmitExpressionFieldObject( sval_u node, sval_u sourcePos );
 static void  EmitVariableExpression( sval_t node );
-static void  EmitVariableExpressionRef( sval_t node, qboolean bCreate );
-static void  EmitArrayExpressionRef( sval_t node, qboolean bCreate, unsigned int sourcePos );
-static void  EmitArrayPrimitiveExpressionRef( sval_t node, qboolean bCreate,
-											  unsigned int sourcePos );
+static void  EmitVariableExpressionRef( sval_t node, unsigned char bCreate );
+static void  EmitArrayPrimitiveExpressionRef( sval_u node, unsigned char bCreate,
+											  sval_u sourcePos );
+static void  EmitArrayExpressionRef( sval_u node, unsigned char bCreate, sval_u sourcePos );
 static void  EmitStatement( sval_t node );
-static void  EmitStatementList( sval_t block );
-static void  EmitCall( sval_t callNode, sval_list_t *args, qboolean bDropTop );
-static void  EmitMethod( sval_t objectNode, sval_t callNode, sval_list_t *args,
-						 unsigned int methodSourcePos, qboolean bDropTop );
-static void  EmitFunction( sval_t node, unsigned int sourcePos );
-static int   EmitExpressionList( sval_list_t *list );
+static void  EmitStatementList( sval_u block );
+static void  EmitCall( sval_u callNode, sval_u args, unsigned char bDropTop );
+static void  EmitMethod( sval_u objectNode, sval_u callNode, sval_u args,
+						 sval_u methodSourcePos, unsigned char bDropTop );
+static void  EmitFunction( sval_u func, sval_u sourcePos );
+static int   EmitExpressionList( sval_u list );
 static void  AddExpressionListOpcodePos( sval_list_t *list );
 static void  Scr_TransferToDeveloperBuffer( void );
 
 static void  Scr_TransferStatementListToDeveloperBuffer( void );
-static void  EmitDeveloperStatementList( sval_t block, unsigned int sourcePos );
+static void  EmitDeveloperStatementList( sval_u block, sval_u sourcePos );
 
 void         Scr_InitDeveloperOpcodes__Fv( void );
 void         Scr_InsertDeveloperOpcodes__Fv( void );
@@ -369,11 +414,11 @@ static void EmitCanonicalString( unsigned short string ) {
 
 	*out = string;
 	fixup = (scrStringFixup_t *)Z_MallocInternal( (int)sizeof( scrStringFixup_t ) );
-	fixup->codePos = (unsigned short *)( (char *)out
+	fixup->codePos = (unsigned short *)( (char *)scrCompileGlob_codePos
 					+ ( (int)scrCompilePub_developerBufPos - scrCompileGlob_codeRelocStart ) );
 	*fixup->codePos = 0;
 	fixup->next = (scrStringFixup_t *)scrCompileGlob_stringFixups;
-	scrCompileGlob_stringFixups = (int)fixup;
+	scrCompileGlob_stringFixups = (void *)fixup;
 }
 
 /* ---- CompileTransferRefToString  0x00468910 ---- */
@@ -391,8 +436,6 @@ static void CompileTransferRefToString( unsigned short string, unsigned char usa
 
 /* ---- EmitOpcode  0x00468950 ---- */
 static void EmitOpcode( unsigned char opcode, int stackDelta, int localDepthMode ) {
-	unsigned char  *out;
-
 	if ( scrCompileGlob_bDeferredCheck && scrCompileGlob_codegenMode == SCR_CODEGEN_INTERN ) {
 		scrCompileGlob_bDeferredCheck = 0;
 		Scr_TransferStatementListToDeveloperBuffer();
@@ -410,10 +453,9 @@ static void EmitOpcode( unsigned char opcode, int stackDelta, int localDepthMode
 		}
 	}
 
-	out = (unsigned char *)TempMalloc( 1 );
-	*out = opcode;
-	scrCompileGlob_codePos       = (int)out;
-	scrCompileGlob_lastOpcodePos = (int)out;
+	scrCompileGlob_codePos       = (int)TempMalloc( 1 );
+	scrCompileGlob_lastOpcodePos = scrCompileGlob_codePos;
+	*(unsigned char *)scrCompileGlob_codePos = opcode;
 	scrCompilePub_checksum = scrCompilePub_checksum * 31 + opcode;
 }
 
@@ -529,6 +571,7 @@ static void EmitEmptyArray( void ) {
 static void EmitAnimTree( unsigned int sourcePos ) {
 	if ( !scrCompileGlob_animTreeValue ) {
 		CompileError( sourcePos, "#using_animtree was not specified" );
+		return;
 	}
 	EmitOpcode( OP_GetInteger, 1, LOCALDEPTH_NONE );
 	EmitInteger( scrCompileGlob_animTreeValue );
@@ -541,18 +584,17 @@ static void EmitSetVariableField( unsigned int sourcePos ) {
 }
 
 /* ---- EmitSafeSetVariableField  0x00468D40 ---- */
-static void EmitSafeSetVariableField( unsigned short string, unsigned int sourcePos ) {
+static void EmitSafeSetVariableField( sval_u expr, sval_u sourcePos ) {
 	EmitOpcode( OP_SafeSetVariableField, 0, LOCALDEPTH_NONE );
-	AddOpcodePos( sourcePos );
-	EmitCanonicalString( string );
+	AddOpcodePos( sourcePos.sourcePosValue );
+	EmitCanonicalString( (unsigned short)expr.stringValue );
 }
 
 /* ---- EmitSafeSetWaittillVariableField  0x00468D70 ---- VERIFIED */
-static void EmitSafeSetWaittillVariableField( unsigned short string,
-											  unsigned int sourcePos ) {
+static void EmitSafeSetWaittillVariableField( sval_u expr, sval_u sourcePos ) {
 	EmitOpcode( OP_SafeSetWaittillField, 0, LOCALDEPTH_NONE );
-	AddOpcodePos( sourcePos );
-	EmitCanonicalString( string );
+	AddOpcodePos( sourcePos.sourcePosValue );
+	EmitCanonicalString( (unsigned short)expr.stringValue );
 }
 
 /* ---- EmitGetString  0x00468DA0 ---- */
@@ -606,10 +648,10 @@ static void EmitBoolComplement( unsigned int sourcePos ) {
 }
 
 /* ---- EmitSize  0x00468F60 ---- */
-static void EmitSize( sval_t node, unsigned int sourcePos ) {
-	EmitPrimitiveExpression( node );
+static void EmitSize( sval_u node, sval_u sourcePos ) {
+	EmitPrimitiveExpression( node.value );
 	EmitOpcode( OP_Size, 0, LOCALDEPTH_NONE );
-	AddOpcodePos( sourcePos );
+	AddOpcodePos( sourcePos.sourcePosValue );
 }
 
 /* ---- EmitSelfObject  0x00468FD0 ---- VERIFIED */
@@ -628,15 +670,15 @@ static void EmitAnimObject( void ) {
 }
 
 /* ---- EmitLocalVariable  0x00469000 ---- */
-static void EmitLocalVariable( unsigned short string ) {
+static void EmitLocalVariable( sval_u string ) {
 	EmitOpcode( OP_EvalLocalVariable, 1, LOCALDEPTH_NONE );
-	EmitCanonicalString( string );
+	EmitCanonicalString( (unsigned short)string.stringValue );
 }
 
 /* ---- EmitLocalVariableRef  0x00469020 ---- */
-static void EmitLocalVariableRef( unsigned short string ) {
+static void EmitLocalVariableRef( sval_u string ) {
 	EmitOpcode( OP_EvalLocalVariableRef, 0, LOCALDEPTH_NONE );
-	EmitCanonicalString( string );
+	EmitCanonicalString( (unsigned short)string.stringValue );
 }
 
 /* ---- EmitGameRef  0x00469040 ---- */
@@ -645,9 +687,9 @@ static void EmitGameRef( void ) {
 }
 
 /* ---- EmitClearLocalVariable  0x00469050 ---- */
-static void EmitClearLocalVariable( unsigned short string ) {
+static void EmitClearLocalVariable( sval_u string ) {
 	EmitOpcode( OP_ClearLocalVariable, 0, LOCALDEPTH_NONE );
-	EmitCanonicalString( string );
+	EmitCanonicalString( (unsigned short)string.stringValue );
 }
 
 /* ---- EmitEvalArray  0x00469070 ---- */
@@ -658,10 +700,13 @@ static void EmitEvalArray( unsigned int arraySourcePos, unsigned int indexSource
 }
 
 /* ---- EmitEvalArrayRef  0x004690A0 ---- VERIFIED */
-static void EmitEvalArrayRef( qboolean bCreate, unsigned int arraySourcePos,
+static void EmitEvalArrayRef( unsigned char bCreate, unsigned int arraySourcePos,
 							  unsigned int indexSourcePos ) {
-	EmitOpcode( (unsigned char)( bCreate ? OP_EvalArrayRef : OP_EvalArrayRefNoCreate ),
-				-1, LOCALDEPTH_NONE );
+	if ( bCreate ) {
+		EmitOpcode( OP_EvalArrayRef, -1, LOCALDEPTH_NONE );
+	} else {
+		EmitOpcode( OP_EvalArrayRefNoCreate, -1, LOCALDEPTH_NONE );
+	}
 	AddOpcodePos( indexSourcePos );
 	AddOpcodePos( arraySourcePos );
 }
@@ -674,58 +719,55 @@ static void EmitClearArray( unsigned int arraySourcePos, unsigned int indexSourc
 }
 
 /* ---- EmitAnimation  0x00469110 ---- */
-static void EmitAnimation( unsigned short string, unsigned int sourcePos ) {
-	char   *animRef;
-
+static void EmitAnimation( sval_u string, sval_u sourcePos ) {
 	EmitOpcode( OP_GetAnimation, 1, LOCALDEPTH_NONE );
 	EmitInteger( -1 );
-	animRef = (char *)scrCompileGlob_codePos;
-	AddOpcodePos( sourcePos );
+	AddOpcodePos( sourcePos.sourcePosValue );
 
-	if ( !SCR_HANDLE( scrAnimPub_currentAnimTree ) ) {
-		CompileError( sourcePos, "#using_animtree was not specified" );
+	if ( !scrAnimPub_currentAnimTree ) {
+		CompileError( sourcePos.sourcePosValue, "#using_animtree was not specified" );
+	} else {
+		Scr_EmitAnimationInternal( (char *)scrCompileGlob_codePos,
+								   (unsigned short)string.stringValue,
+								   scrAnimPub_currentAnimTree,
+								   sourcePos.sourcePosValue );
 	}
-	Scr_EmitAnimationInternal( animRef, string,
-							   SCR_HANDLE( scrAnimPub_currentAnimTree ), sourcePos );
-	CompileRemoveRefToString( string );
+	CompileRemoveRefToString( (unsigned short)string.stringValue );
 }
 
 /* ---- EmitFieldVariable  0x004691D0 ---- */
-static void EmitFieldVariable( sval_t objectNode, unsigned short string,
-							   unsigned int sourcePos ) {
-	EmitPrimitiveExpressionFieldObject( objectNode, sourcePos );
+static void EmitFieldVariable( sval_u objectNode, sval_u string, sval_u sourcePos ) {
+	EmitPrimitiveExpressionFieldObject( objectNode.value, sourcePos.sourcePosValue );
 	EmitOpcode( OP_EvalFieldVariable, 1, LOCALDEPTH_NONE );
-	AddOpcodePos( sourcePos );
-	EmitCanonicalString( string );
+	AddOpcodePos( sourcePos.sourcePosValue );
+	EmitCanonicalString( (unsigned short)string.stringValue );
 }
 
 /* ---- EmitFieldVariableRef  0x00469210 ---- */
-static void EmitFieldVariableRef( sval_t objectNode, unsigned short string,
-								  unsigned int sourcePos ) {
-	EmitPrimitiveExpressionFieldObject( objectNode, sourcePos );
+static void EmitFieldVariableRef( sval_u objectNode, sval_u string, sval_u sourcePos ) {
+	EmitPrimitiveExpressionFieldObject( objectNode.value, sourcePos.sourcePosValue );
 	EmitOpcode( OP_EvalFieldVariableRef, 0, LOCALDEPTH_NONE );
-	EmitCanonicalString( string );
+	EmitCanonicalString( (unsigned short)string.stringValue );
 }
 
 /* ---- EmitClearFieldVariable  0x00469240 ---- */
-static void EmitClearFieldVariable( sval_t objectNode, unsigned short string,
-									unsigned int objectSourcePos,
-									unsigned int opcodeSourcePos ) {
-	EmitPrimitiveExpressionFieldObject( objectNode, objectSourcePos );
+static void EmitClearFieldVariable( sval_u objectNode, sval_u string,
+									sval_u objectSourcePos, sval_u opcodeSourcePos ) {
+	EmitPrimitiveExpressionFieldObject( objectNode.value, objectSourcePos.sourcePosValue );
 	EmitOpcode( OP_ClearFieldVariable, 0, LOCALDEPTH_NONE );
-	AddOpcodePos( opcodeSourcePos );
-	EmitCanonicalString( string );
+	AddOpcodePos( opcodeSourcePos.sourcePosValue );
+	EmitCanonicalString( (unsigned short)string.stringValue );
 }
 
 /* ---- EmitCallRef  0x00469280 ---- */
-static void EmitCallRef( sval_t nameNode, sval_list_t *args ) {
+static void EmitCallRef( sval_u nameNode, sval_u args, sval_u sourcePos ) {
 	EmitCall( nameNode, args, qfalse );
 	EmitOpcode( OP_DiscardRef, -1, LOCALDEPTH_NONE );
 }
 
 /* ---- EmitMethodRef  0x004692C0 ---- */
-static void EmitMethodRef( sval_t objectNode, sval_t nameNode, sval_list_t *args,
-						   unsigned int methodSourcePos ) {
+static void EmitMethodRef( sval_u objectNode, sval_u nameNode, sval_u args,
+						   sval_u methodSourcePos ) {
 	EmitMethod( objectNode, nameNode, args, methodSourcePos, qfalse );
 	EmitOpcode( OP_DiscardRef, -1, LOCALDEPTH_NONE );
 }
@@ -742,30 +784,29 @@ static void EmitCastFieldObject( unsigned int sourcePos ) {
 }
 
 /* ---- EmitArrayVariable  0x00469320 ---- */
-static void EmitArrayVariable( sval_t objectNode, sval_t indexNode,
-							   unsigned int objectSourcePos,
-							   unsigned int indexSourcePos ) {
-	EmitExpression( indexNode );
-	EmitPrimitiveExpression( objectNode );
-	EmitEvalArray( objectSourcePos, indexSourcePos );
+static void EmitArrayVariable( sval_u objectNode, sval_u indexNode,
+							   sval_u objectSourcePos, sval_u indexSourcePos ) {
+	EmitExpression( indexNode.value );
+	EmitPrimitiveExpression( objectNode.value );
+	EmitEvalArray( objectSourcePos.sourcePosValue, indexSourcePos.sourcePosValue );
 }
 
 /* ---- EmitArrayVariableRef  0x00469360 ---- */
-static void EmitArrayVariableRef( sval_t arrayNode, sval_t indexNode,
-								  unsigned int arraySourcePos,
-								  unsigned int indexSourcePos, qboolean bCreate ) {
-	EmitExpression( indexNode );
-	EmitArrayExpressionRef( arrayNode, bCreate, arraySourcePos );
-	EmitEvalArrayRef( bCreate, arraySourcePos, indexSourcePos );
+static void EmitArrayVariableRef( sval_u arrayNode, sval_u indexNode,
+								  sval_u arraySourcePos, sval_u indexSourcePos,
+								  unsigned char bCreate ) {
+	EmitExpression( indexNode.value );
+	EmitArrayPrimitiveExpressionRef( arrayNode, bCreate, arraySourcePos );
+	EmitEvalArrayRef( bCreate, arraySourcePos.sourcePosValue,
+					  indexSourcePos.sourcePosValue );
 }
 
 /* ---- EmitClearArrayVariable  0x004693B0 ---- */
-static void EmitClearArrayVariable( sval_t arrayNode, sval_t indexNode,
-									unsigned int arraySourcePos,
-									unsigned int indexSourcePos ) {
-	EmitExpression( indexNode );
-	EmitArrayExpressionRef( arrayNode, qfalse, arraySourcePos );
-	EmitClearArray( arraySourcePos, indexSourcePos );
+static void EmitClearArrayVariable( sval_u arrayNode, sval_u indexNode,
+									sval_u arraySourcePos, sval_u indexSourcePos ) {
+	EmitExpression( indexNode.value );
+	EmitArrayPrimitiveExpressionRef( arrayNode, qfalse, arraySourcePos );
+	EmitClearArray( arraySourcePos.sourcePosValue, indexSourcePos.sourcePosValue );
 }
 
 /* ---- EmitVariableExpression  0x004693F0 ---- */
@@ -774,13 +815,13 @@ static void EmitVariableExpression( sval_t node ) {
 
 	switch ( n[0] ) {
 	case SVAL_STRING_REF:
-		EmitLocalVariable( (unsigned short)n[1] );
+		EmitLocalVariable( SVAL_U( n[1] ) );
 		break;
 	case SVAL_ARRAY_REF:
-		EmitArrayVariable( n[1], n[2], n[3], n[4] );
+		EmitArrayVariable( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	case SVAL_FIELD_REF:
-		EmitFieldVariable( n[1], (unsigned short)n[2], n[3] );
+		EmitFieldVariable( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ) );
 		break;
 	default:
 		break;
@@ -788,11 +829,11 @@ static void EmitVariableExpression( sval_t node ) {
 }
 
 /* ---- EmitExpressionList  0x00469490 ---- */
-static int EmitExpressionList( sval_list_t *list ) {
+static int EmitExpressionList( sval_u list ) {
 	sval_cell_t    *item;
 	int             count = 0;
 
-	for ( item = list->first; item; item = item->next ) {
+	for ( item = SVAL_LIST( list.value )->first; item; item = item->next ) {
 		EmitExpression( SVAL_ENTRY( item->value )->node );
 		count++;
 	}
@@ -800,13 +841,10 @@ static int EmitExpressionList( sval_list_t *list ) {
 }
 
 /* ---- GetSingleParameter  0x004694C0 ---- */
-static sval_cell_t *GetSingleParameter( sval_list_t *list ) {
-	sval_cell_t    *item = list->first;
-
-	if ( item && item->next ) {
-		return NULL;
-	}
-	return item;
+sval_cell_t *GetSingleParameter( sval_u list ) {
+	sval_cell_t *item = SVAL_LIST( list.value )->first;
+	if ( !item ) return NULL;
+	return item->next ? NULL : item;
 }
 
 /* ---- AddExpressionListOpcodePos  0x004694E0 ---- */
@@ -832,12 +870,12 @@ static unsigned short AddFilePrecache( unsigned short filename, unsigned int sou
 	cursor->sourcePos = sourcePos;
 	scrCompileGlob_loadCursor = (int)( cursor + 1 );
 
-	return GetObject( GetVariable( SCR_HANDLE( scrCompilePub_scriptsPos ), filename ) );
+	return GetObject( GetVariable( scrCompilePub_scriptsPos, filename ) );
 }
 
 /* ---- EmitFunction  0x00469560 ---- */
-static void EmitFunction( sval_t node, unsigned int sourcePos ) {
-	sval_t             *n = SVAL_NODE( node );
+static void EmitFunction( sval_u func, sval_u sourcePos ) {
+	sval_t             *n = SVAL_NODE( func.value );
 	unsigned short      functionObject;
 	unsigned short      functionName;
 	unsigned short      functionHandle;
@@ -863,37 +901,39 @@ static void EmitFunction( sval_t node, unsigned int sourcePos ) {
 
 	functionObject = 0;
 
-	if ( n[0] == SVAL_FUNCTION_REF ) {
+	switch ( n[0] ) {
+	case SVAL_FUNCTION_REF:
 		functionName   = (unsigned short)n[1];
-		functionHandle = FindVariable( SCR_HANDLE( scrCompileGlob_currentFuncRoot ),
+		functionHandle = FindVariable( scrCompileGlob_currentFuncRoot,
 									   functionName );
 		CompileTransferRefToString( functionName, SCR_STRING_USAGE_FUNCTION );
 		if ( !functionHandle ) {
-			CompileError( sourcePos, "unknown function" );
+			CompileError( sourcePos.sourcePosValue, "unknown function" );
 			return;
 		}
 		functionObject = FindObject( functionHandle );
-	} else if ( n[0] == SVAL_SCRIPT_FUNCTION_REF ) {
-		scriptFilename     = (unsigned short)n[1];
-		scriptFunctionName = (unsigned short)n[2];
+		break;
+	case SVAL_SCRIPT_FUNCTION_REF:
+		scriptFilename = (unsigned short)n[1];
 
 		canonical = Scr_CreateCanonicalFilename( SL_ConvertToString( scriptFilename ) );
-		CompileRemoveRefToString( scriptFilename );
+		CompileRemoveRefToString( (unsigned short)n[1] );
 
-		loadedScript = FindVariable( SCR_HANDLE( scrCompilePub_loadedScripts ), canonical );
-		scriptRoot   = AddFilePrecache( canonical, sourcePos );
+		loadedScript = FindVariable( scrCompilePub_loadedScripts, canonical );
+		scriptRoot   = AddFilePrecache( canonical, sourcePos.sourcePosValue );
 		CompileRemoveRefToString( canonical );
 
 		if ( loadedScript ) {
+			scriptFunctionName = (unsigned short)n[2];
 			functionHandle = FindVariable( scriptRoot, scriptFunctionName );
 			CompileTransferRefToString( scriptFunctionName, SCR_STRING_USAGE_FUNCTION );
 			if ( !functionHandle ) {
-				CompileError( sourcePos, "unknown function" );
+				CompileError( sourcePos.sourcePosValue, "unknown function" );
 				return;
 			}
 		} else {
-			functionHandle = GetVariable( scriptRoot, scriptFunctionName );
-			CompileTransferRefToString( scriptFunctionName, SCR_STRING_USAGE_FUNCTION );
+			functionHandle = GetVariable( scriptRoot, (unsigned short)n[2] );
+			CompileTransferRefToString( (unsigned short)n[2], SCR_STRING_USAGE_FUNCTION );
 		}
 
 		GetVariableValue( functionHandle, &functionValue );
@@ -903,13 +943,14 @@ static void EmitFunction( sval_t node, unsigned int sourcePos ) {
 		}
 		if ( functionValue.type == VAR_INTEGER ) {
 			if ( scrCompileGlob_codegenMode != SCR_CODEGEN_RELOCATE ) {
-				CompileError( sourcePos,
+				CompileError( sourcePos.sourcePosValue,
 							  "normal script cannot reference /# ... #/ comment" );
 			}
 			EmitCodepos( (const char *)functionValue.u.intValue );
 			return;
 		}
 		functionObject = GetObject( functionHandle );
+		break;
 	}
 
 	EmitBlankPos();
@@ -920,141 +961,151 @@ static void EmitFunction( sval_t node, unsigned int sourcePos ) {
 	countSlot = GetVariable( functionObject, SCR_FUNC_REFCOUNT );
 	GetVariableValue( countSlot, &countValue );
 	if ( countValue.type == VAR_UNDEFINED ) {
+		countValue.type = VAR_INTEGER;
 		countValue.u.intValue = 0;
-		countValue.type       = VAR_INTEGER;
 	}
 
 	referenceSlot = GetVariable( functionObject,
 								 (unsigned int)countValue.u.intValue + SCR_FUNC_FIRST_REF );
-	if ( scrCompileGlob_codegenMode == SCR_CODEGEN_RELOCATE ) {
-		referenceValue.u.intValue = scrCompileGlob_codePos
-			+ ( scrCompilePub_developerBufPos - scrCompileGlob_codeRelocStart );
-		referenceValue.type = VAR_INTEGER;
-	} else {
-		referenceValue.u.intValue = scrCompileGlob_codePos;
+	/* the code position is stored first and overwritten for /# #/ code (Mac 1.3 order) */
+	referenceValue.u.intValue = scrCompileGlob_codePos;
+	if ( scrCompileGlob_codegenMode != SCR_CODEGEN_RELOCATE ) {
 		referenceValue.type = VAR_CODEPOS;
+	} else {
+		referenceValue.type = VAR_INTEGER;
+		referenceValue.u.codePosValue = scrCompilePub_developerBufPos
+			+ ( scrCompileGlob_codePos - scrCompileGlob_codeRelocStart );
 	}
 	SetNewVariableValue( referenceSlot, &referenceValue );
 
 	countValue.u.intValue++;
 	SetVariableValue( countSlot, &countValue );
-	AddOpcodePos( sourcePos );
+	AddOpcodePos( sourcePos.sourcePosValue );
 }
 
 /* ---- EmitGetFunction  0x00469830 ---- */
-static void EmitGetFunction( sval_t nameNode, unsigned int sourcePos ) {
+static void EmitGetFunction( sval_u func, sval_u sourcePos ) {
 	EmitOpcode( OP_GetFunction, 1, LOCALDEPTH_NONE );
-	EmitFunction( nameNode, sourcePos );
+	EmitFunction( func, sourcePos );
 }
 
 /* ---- EmitPostScriptFunction  0x00469850 ---- */
-static void EmitPostScriptFunction( sval_t nameNode, int argCount,
-									qboolean hasMethodContext, unsigned int sourcePos ) {
-	if ( hasMethodContext ) {
-		EmitOpcode( OP_ScriptMethodCall, -2 - argCount, LOCALDEPTH_CALL );
-	} else {
+static void EmitPostScriptFunction( sval_u func, int argCount,
+									unsigned char bMethod, sval_u sourcePos ) {
+	if ( !bMethod ) {
 		EmitOpcode( OP_ScriptFunctionCall, -1 - argCount, LOCALDEPTH_CALL );
+	} else {
+		EmitOpcode( OP_ScriptMethodCall, -2 - argCount, LOCALDEPTH_CALL );
 	}
-	EmitFunction( nameNode, sourcePos );
+	EmitFunction( func, sourcePos );
 	EmitInteger( argCount );
 }
 
 /* ---- EmitPostScriptFunctionPointer  0x004698B0 ---- */
-static void EmitPostScriptFunctionPointer( sval_t objectNode, int argCount,
-										   qboolean hasMethodContext,
-										   unsigned int callSourcePos,
-										   unsigned int objectSourcePos ) {
-	EmitExpression( objectNode );
-	if ( hasMethodContext ) {
-		EmitOpcode( OP_ScriptMethodCallPtr, -3 - argCount, LOCALDEPTH_CALL );
-	} else {
+static void EmitPostScriptFunctionPointer( sval_u expr, int argCount,
+										   unsigned char bMethod,
+										   sval_u callSourcePos,
+										   sval_u objectSourcePos ) {
+	EmitExpression( expr.value );
+	if ( !bMethod ) {
 		EmitOpcode( OP_ScriptFunctionCallPtr, -2 - argCount, LOCALDEPTH_CALL );
+	} else {
+		EmitOpcode( OP_ScriptMethodCallPtr, -3 - argCount, LOCALDEPTH_CALL );
 	}
-	AddOpcodePos( objectSourcePos );
-	AddOpcodePos( callSourcePos );
+	AddOpcodePos( objectSourcePos.sourcePosValue );
+	AddOpcodePos( callSourcePos.sourcePosValue );
 	EmitInteger( argCount );
 }
 
 /* ---- EmitPostScriptThread  0x00469920 ---- */
-static void EmitPostScriptThread( sval_t nameNode, int argCount,
-								  qboolean hasMethodContext, unsigned int sourcePos ) {
-	if ( hasMethodContext ) {
-		EmitOpcode( OP_ScriptMethodThreadCall, -argCount, LOCALDEPTH_THREAD );
-	} else {
+static void EmitPostScriptThread( sval_u func, int argCount,
+								  unsigned char bMethod, sval_u sourcePos ) {
+	if ( !bMethod ) {
 		EmitOpcode( OP_ScriptThreadCall, 1 - argCount, LOCALDEPTH_THREAD );
+	} else {
+		EmitOpcode( OP_ScriptMethodThreadCall, -argCount, LOCALDEPTH_THREAD );
 	}
-	EmitFunction( nameNode, sourcePos );
+	EmitFunction( func, sourcePos );
 	EmitInteger( argCount );
 }
 
 /* ---- EmitPostScriptThreadPointer  0x00469980 ---- */
-static void EmitPostScriptThreadPointer( sval_t objectNode, int argCount,
-										 qboolean hasMethodContext,
-										 unsigned int sourcePos ) {
-	EmitExpression( objectNode );
-	if ( hasMethodContext ) {
-		EmitOpcode( OP_ScriptMethodThreadCallPtr, -1 - argCount, LOCALDEPTH_THREAD );
-	} else {
+static void EmitPostScriptThreadPointer( sval_u expr, int argCount,
+										 unsigned char bMethod,
+										 sval_u sourcePos ) {
+	EmitExpression( expr.value );
+	if ( !bMethod ) {
 		EmitOpcode( OP_ScriptThreadCallPtr, -argCount, LOCALDEPTH_THREAD );
+	} else {
+		EmitOpcode( OP_ScriptMethodThreadCallPtr, -1 - argCount, LOCALDEPTH_THREAD );
 	}
-	AddOpcodePos( sourcePos );
+	AddOpcodePos( sourcePos.sourcePosValue );
 	EmitInteger( argCount );
 }
 
 /* ---- EmitPostScriptFunctionCall  0x004699F0 ---- */
-static void EmitPostScriptFunctionCall( sval_t calleeNode, int argCount,
-										qboolean hasMethodContext,
-										unsigned int callSourcePos ) {
-	sval_t *callee = SVAL_NODE( calleeNode );
+static void EmitPostScriptFunctionCall( sval_u func, int argCount,
+										unsigned char bMethod,
+										sval_u callSourcePos ) {
+	sval_t *callee = SVAL_NODE( func.value );
 
-	if ( callee[0] == SVAL_SCRIPT_FUNCTION_NAME ) {
-		EmitPostScriptFunction( callee[1], argCount, hasMethodContext, callSourcePos );
-	} else if ( callee[0] == SVAL_FUNCTION_POINTER_CALL ) {
-		EmitPostScriptFunctionPointer( callee[1], argCount, hasMethodContext,
-									   callSourcePos, callee[2] );
+	switch ( callee[0] ) {
+	case SVAL_SCRIPT_FUNCTION_NAME:
+		EmitPostScriptFunction( SVAL_U( callee[1] ), argCount, bMethod, callSourcePos );
+		break;
+	case SVAL_FUNCTION_POINTER_CALL:
+		EmitPostScriptFunctionPointer( SVAL_U( callee[1] ), argCount, bMethod,
+									   callSourcePos, SVAL_U( callee[2] ) );
+		break;
 	}
 }
 
 /* ---- EmitPostScriptThreadCall  0x00469A30 ---- */
-static void EmitPostScriptThreadCall( sval_t calleeNode, int argCount,
-									  qboolean hasMethodContext,
-									  unsigned int callSourcePos,
-									  unsigned int methodSourcePos ) {
-	sval_t *callee = SVAL_NODE( calleeNode );
+static void EmitPostScriptThreadCall( sval_u func, int argCount,
+									  unsigned char bMethod,
+									  sval_u callSourcePos,
+									  sval_u methodSourcePos ) {
+	sval_t *callee = SVAL_NODE( func.value );
 
-	if ( callee[0] == SVAL_SCRIPT_FUNCTION_NAME ) {
-		EmitPostScriptThread( callee[1], argCount, hasMethodContext, methodSourcePos );
-	} else if ( callee[0] == SVAL_FUNCTION_POINTER_CALL ) {
-		EmitPostScriptThreadPointer( callee[1], argCount, hasMethodContext, callee[2] );
+	switch ( callee[0] ) {
+	case SVAL_SCRIPT_FUNCTION_NAME:
+		EmitPostScriptThread( SVAL_U( callee[1] ), argCount, bMethod, methodSourcePos );
+		break;
+	case SVAL_FUNCTION_POINTER_CALL:
+		EmitPostScriptThreadPointer( SVAL_U( callee[1] ), argCount, bMethod,
+									 SVAL_U( callee[2] ) );
+		break;
 	}
-	AddOpcodePos( callSourcePos );
+	AddOpcodePos( callSourcePos.sourcePosValue );
 }
 
 /* ---- EmitPreFunctionCall  0x00469A90 ---- */
-static void EmitPreFunctionCall( sval_t callNode ) {
-	if ( SVAL_NODE( callNode )[0] == SVAL_FUNCTION_CALL ) {
+static void EmitPreFunctionCall( sval_u callNode ) {
+	if ( SVAL_NODE( callNode.value )[0] == SVAL_FUNCTION_CALL ) {
 		EmitOpcode( OP_PreScriptCall, 2, LOCALDEPTH_NONE );
 	}
 }
 
 /* ---- EmitPostFunctionCall  0x00469AB0 ---- */
-static void EmitPostFunctionCall( sval_t callNode, int argCount,
-								  qboolean hasMethodContext ) {
-	sval_t *n = SVAL_NODE( callNode );
+static void EmitPostFunctionCall( sval_u func, int argCount, unsigned char bMethod ) {
+	sval_t *n = SVAL_NODE( func.value );
 
-	if ( n[0] == SVAL_FUNCTION_CALL ) {
-		EmitPostScriptFunctionCall( n[1], argCount, hasMethodContext, n[2] );
-	} else if ( n[0] == SVAL_METHOD_CALL ) {
-		EmitPostScriptThreadCall( n[1], argCount, hasMethodContext, n[2], n[3] );
+	switch ( n[0] ) {
+	case SVAL_FUNCTION_CALL:
+		EmitPostScriptFunctionCall( SVAL_U( n[1] ), argCount, bMethod, SVAL_U( n[2] ) );
+		break;
+	case SVAL_METHOD_CALL:
+		EmitPostScriptThreadCall( SVAL_U( n[1] ), argCount, bMethod,
+								  SVAL_U( n[2] ), SVAL_U( n[3] ) );
+		break;
 	}
 }
 
 /* ---- GetBuiltin  0x00469B20 ---- */
-static unsigned short GetBuiltin( sval_t callNode ) {
-	sval_t         *n = SVAL_NODE( callNode );
+static unsigned short GetBuiltin( sval_u callNode ) {
+	sval_t         *n = SVAL_NODE( callNode.value );
 	sval_t         *callee;
 	sval_t         *nameNode;
-	unsigned short  name;
 
 	if ( n[0] != SVAL_FUNCTION_CALL ) {
 		return 0;
@@ -1068,173 +1119,178 @@ static unsigned short GetBuiltin( sval_t callNode ) {
 		return 0;
 	}
 
-	name = (unsigned short)nameNode[1];
-	if ( FindVariable( SCR_HANDLE( scrCompileGlob_currentFuncRoot ), name ) ) {
+	/* the name is read twice, as Mac 1.3 GetBuiltin does: keeps it in a 16-bit register */
+	if ( FindVariable( scrCompileGlob_currentFuncRoot, (unsigned short)nameNode[1] ) ) {
 		return 0;
 	}
-	return name;
-}
-
-static qboolean Scr_BeginDeveloperCommand( unsigned int sourcePos, qboolean bDropTop ) {
-	if ( scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
-		return qfalse;
-	}
-
-	if ( !bDropTop ) {
-		CompileError( sourcePos, "developer command can only be used as a statement "
-								 "if not in a /# ... #/ comment" );
-	}
-
-	if ( scrCompilePub_developerScript ) {
-		if ( !scrCompileGlob_bDeferredCheck ) {
-			EmitOpcode( OP_DevBlockBegin, 0, LOCALDEPTH_NONE );
-			scrCompileGlob_codeRelocStart = scrCompileGlob_codePos;
-		}
-		scrCompileGlob_codegenMode = SCR_CODEGEN_RELOCATE;
-	} else {
-		scrCompileGlob_codegenMode = SCR_CODEGEN_DISCARD;
-	}
-	return qtrue;
-}
-
-static void Scr_EndDeveloperCommand( qboolean active, void *tempMark,
-									 int savedChecksum ) {
-	if ( !active ) {
-		return;
-	}
-
-	scrCompileGlob_codegenMode = SCR_CODEGEN_INTERN;
-	if ( scrCompilePub_developerScript ) {
-		scrCompileGlob_bDeferredCheck = 1;
-	} else {
-		TempMemorySetPos( tempMark );
-	}
-	scrCompilePub_checksum = savedChecksum;
+	return (unsigned short)nameNode[1];
 }
 
 /* ---- EmitCall  0x00469B70 ---- */
-static void EmitCall( sval_t callNode, sval_list_t *args, qboolean bDropTop ) {
+/* the developer-command bracket is written out in place (Mac 1.3 EmitCall): developerOnly
+   doubles as the "bracket opened" flag */
+static void EmitCall( sval_u callNode, sval_u args, unsigned char bDropTop ) {
 	unsigned short  builtinName;
 	const char     *builtinText;
 	void           *function;
 	int             developerOnly;
-	qboolean        developerActive;
 	int             savedChecksum;
 	unsigned int    callSourcePos;
 	void           *tempMark;
 	int             argCount;
 
 	builtinName = GetBuiltin( callNode );
-	if ( !builtinName ) {
-		EmitPreFunctionCall( callNode );
+	if ( builtinName ) {
+		builtinText   = SL_ConvertToString( builtinName );
+		developerOnly = 0;
+		function      = Scr_GetFunction( &builtinText, &developerOnly );
+
+		callSourcePos = SVAL_NODE( callNode.value )[2];
+		savedChecksum = scrCompilePub_checksum;
+		tempMark      = TempMalloc( 0 );
+		if ( developerOnly ) {
+			if ( scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
+				developerOnly = 0;
+			} else {
+				if ( !bDropTop ) {
+					CompileError( callSourcePos, "developer command can only be used as a statement "
+												 "if not in a /# ... #/ comment" );
+				}
+				if ( !scrCompilePub_developerScript ) {
+					scrCompileGlob_codegenMode = SCR_CODEGEN_DISCARD;
+				} else {
+					if ( !scrCompileGlob_bDeferredCheck ) {
+						EmitOpcode( OP_DevBlockBegin, 0, LOCALDEPTH_NONE );
+						scrCompileGlob_codeRelocStart = scrCompileGlob_codePos;
+					}
+					scrCompileGlob_codegenMode = SCR_CODEGEN_RELOCATE;
+				}
+			}
+		}
+
 		argCount = EmitExpressionList( args );
-		EmitPostFunctionCall( callNode, argCount, qfalse );
-		AddExpressionListOpcodePos( args );
+		if ( argCount >= SCR_BUILTIN_PARAM_LIMIT ) {
+			CompileRemoveRefToString( builtinName );
+			CompileError( callSourcePos, "parameter count exceeds 256" );
+		}
+		if ( !function ) {
+			CompileError( callSourcePos, "unknown (builtin) function '%s'", builtinText );
+			CompileRemoveRefToString( builtinName );
+		} else {
+			CompileRemoveRefToString( builtinName );
+			EmitOpcode( OP_CallBuiltin, 1 - argCount, LOCALDEPTH_BUILTIN );
+			EmitByte( (unsigned char)argCount );
+			EmitBuiltinFunction( function );
+			AddOpcodePos( callSourcePos );
+		}
+
+		AddExpressionListOpcodePos( SVAL_LIST( args.value ) );
 		if ( bDropTop ) {
 			EmitDecTop();
 		}
-		return;
+		if ( developerOnly ) {
+			scrCompileGlob_codegenMode = SCR_CODEGEN_INTERN;
+			if ( scrCompilePub_developerScript ) {
+				scrCompileGlob_bDeferredCheck = 1;
+			} else {
+				TempMemorySetPos( tempMark );
+			}
+			scrCompilePub_checksum = savedChecksum;
+		}
+	} else {
+		EmitPreFunctionCall( callNode );
+		argCount = EmitExpressionList( args );
+		EmitPostFunctionCall( callNode, argCount, 0 );
+		AddExpressionListOpcodePos( SVAL_LIST( args.value ) );
+		if ( bDropTop ) {
+			EmitDecTop();
+		}
 	}
-
-	builtinText   = SL_ConvertToString( builtinName );
-	developerOnly = 0;
-	function      = Scr_GetFunction( &builtinText, &developerOnly );
-
-	callSourcePos   = SVAL_NODE( callNode )[2];
-	savedChecksum   = scrCompilePub_checksum;
-	tempMark        = TempMalloc( 0 );
-	developerActive = qfalse;
-
-	if ( developerOnly ) {
-		developerActive = Scr_BeginDeveloperCommand( callSourcePos, bDropTop );
-	}
-
-	argCount = EmitExpressionList( args );
-	if ( argCount >= SCR_BUILTIN_PARAM_LIMIT ) {
-		CompileRemoveRefToString( builtinName );
-		CompileError( callSourcePos, "parameter count exceeds 256" );
-	}
-	if ( !function ) {
-		CompileError( callSourcePos, "unknown (builtin) function '%s'", builtinText );
-	}
-	CompileRemoveRefToString( builtinName );
-
-	EmitOpcode( OP_CallBuiltin, 1 - argCount, LOCALDEPTH_BUILTIN );
-	EmitByte( (unsigned char)argCount );
-	EmitBuiltinFunction( function );
-	AddOpcodePos( callSourcePos );
-
-	AddExpressionListOpcodePos( args );
-	if ( bDropTop ) {
-		EmitDecTop();
-	}
-
-	Scr_EndDeveloperCommand( developerActive, tempMark, savedChecksum );
 }
 
 /* ---- EmitMethod  0x00469E10 ---- */
-static void EmitMethod( sval_t objectNode, sval_t callNode, sval_list_t *args,
-						unsigned int methodSourcePos, qboolean bDropTop ) {
+static void EmitMethod( sval_u objectNode, sval_u callNode, sval_u args,
+						sval_u methodSourcePos, unsigned char bDropTop ) {
 	unsigned short  builtinName;
 	const char     *builtinText;
 	void           *method;
 	int             developerOnly;
-	qboolean        developerActive;
 	int             savedChecksum;
 	unsigned int    callSourcePos;
 	void           *tempMark;
 	int             argCount;
 
 	builtinName = GetBuiltin( callNode );
-	if ( !builtinName ) {
-		EmitPreFunctionCall( callNode );
+	if ( builtinName ) {
+		builtinText   = SL_ConvertToString( builtinName );
+		developerOnly = 0;
+		method        = Scr_GetMethod( &builtinText, &developerOnly );
+
+		callSourcePos = SVAL_NODE( callNode.value )[2];
+		savedChecksum = scrCompilePub_checksum;
+		tempMark      = TempMalloc( 0 );
+		if ( developerOnly ) {
+			if ( scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
+				developerOnly = 0;
+			} else {
+				if ( !bDropTop ) {
+					CompileError( callSourcePos, "developer command can only be used as a statement "
+												 "if not in a /# ... #/ comment" );
+				}
+				if ( !scrCompilePub_developerScript ) {
+					scrCompileGlob_codegenMode = SCR_CODEGEN_DISCARD;
+				} else {
+					if ( !scrCompileGlob_bDeferredCheck ) {
+						EmitOpcode( OP_DevBlockBegin, 0, LOCALDEPTH_NONE );
+						scrCompileGlob_codeRelocStart = scrCompileGlob_codePos;
+					}
+					scrCompileGlob_codegenMode = SCR_CODEGEN_RELOCATE;
+				}
+			}
+		}
+
 		argCount = EmitExpressionList( args );
-		EmitPrimitiveExpression( objectNode );
-		EmitPostFunctionCall( callNode, argCount, qtrue );
-		AddOpcodePos( methodSourcePos );
-		AddExpressionListOpcodePos( args );
+		EmitPrimitiveExpression( objectNode.value );
+		if ( argCount >= SCR_BUILTIN_PARAM_LIMIT ) {
+			CompileRemoveRefToString( builtinName );
+			CompileError( callSourcePos, "parameter count exceeds 256" );
+		}
+		if ( !method ) {
+			CompileError( callSourcePos, "unknown (builtin) method '%s'", builtinText );
+			CompileRemoveRefToString( builtinName );
+		} else {
+			CompileRemoveRefToString( builtinName );
+			EmitOpcode( OP_CallBuiltinMethod, -argCount, LOCALDEPTH_BUILTIN );
+			EmitByte( (unsigned char)argCount );
+			EmitBuiltinMethod( method );
+			AddOpcodePos( callSourcePos );
+		}
+
+		AddOpcodePos( methodSourcePos.sourcePosValue );
+		AddExpressionListOpcodePos( SVAL_LIST( args.value ) );
 		if ( bDropTop ) {
 			EmitDecTop();
 		}
-		return;
+		if ( developerOnly ) {
+			scrCompileGlob_codegenMode = SCR_CODEGEN_INTERN;
+			if ( scrCompilePub_developerScript ) {
+				scrCompileGlob_bDeferredCheck = 1;
+			} else {
+				TempMemorySetPos( tempMark );
+			}
+			scrCompilePub_checksum = savedChecksum;
+		}
+	} else {
+		EmitPreFunctionCall( callNode );
+		argCount = EmitExpressionList( args );
+		EmitPrimitiveExpression( objectNode.value );
+		EmitPostFunctionCall( callNode, argCount, 1 );
+		AddOpcodePos( methodSourcePos.sourcePosValue );
+		AddExpressionListOpcodePos( SVAL_LIST( args.value ) );
+		if ( bDropTop ) {
+			EmitDecTop();
+		}
 	}
-
-	builtinText   = SL_ConvertToString( builtinName );
-	developerOnly = 0;
-	method        = Scr_GetMethod( &builtinText, &developerOnly );
-
-	callSourcePos   = SVAL_NODE( callNode )[2];
-	savedChecksum   = scrCompilePub_checksum;
-	tempMark        = TempMalloc( 0 );
-	developerActive = qfalse;
-
-	if ( developerOnly ) {
-		developerActive = Scr_BeginDeveloperCommand( callSourcePos, bDropTop );
-	}
-
-	argCount = EmitExpressionList( args );
-	EmitPrimitiveExpression( objectNode );
-	if ( argCount >= SCR_BUILTIN_PARAM_LIMIT ) {
-		CompileRemoveRefToString( builtinName );
-		CompileError( callSourcePos, "parameter count exceeds 256" );
-	}
-	if ( !method ) {
-		CompileError( callSourcePos, "unknown (builtin) method '%s'", builtinText );
-	}
-	CompileRemoveRefToString( builtinName );
-
-	EmitOpcode( OP_CallBuiltinMethod, -argCount, LOCALDEPTH_BUILTIN );
-	EmitByte( (unsigned char)argCount );
-	EmitBuiltinMethod( method );
-	AddOpcodePos( callSourcePos );
-
-	AddOpcodePos( methodSourcePos );
-	AddExpressionListOpcodePos( args );
-	if ( bDropTop ) {
-		EmitDecTop();
-	}
-
-	Scr_EndDeveloperCommand( developerActive, tempMark, savedChecksum );
 }
 
 /* ---- AdjustFunctionAddresses  0x0046A0E0 ---- */
@@ -1249,14 +1305,18 @@ static void AdjustFunctionAddresses( void ) {
 	VariableValue      *referenceValue;
 	int                 index;
 
-	for ( functionSlot = FindNextSibling( SCR_HANDLE( scrCompileGlob_currentFuncRoot ) );
+	/* Retail (0x46A10B-0x46A116) clears definitionValue ONCE, before the loop.
+	   A function with no definition slot keeps the previous function's value/type,
+	   so the /# #/ reference test below can see a stale VAR_INTEGER. Do not move
+	   this back into the loop body. */
+	definitionValue.type = VAR_UNDEFINED;
+	definitionValue.u.intValue = 0;
+
+	for ( functionSlot = FindNextSibling( scrCompileGlob_currentFuncRoot );
 		  functionSlot;
 		  functionSlot = FindNextSibling( functionSlot ) ) {
 
 		functionObject = FindObject( functionSlot );
-
-		definitionValue.u.intValue = 0;
-		definitionValue.type       = VAR_UNDEFINED;
 
 		definitionSlot = FindVariable( functionObject, SCR_FUNC_DEFINITION );
 		if ( definitionSlot ) {
@@ -1276,11 +1336,11 @@ static void AdjustFunctionAddresses( void ) {
 				  && GetVarType( referenceSlot ) == VAR_CODEPOS ) {
 					CompileError2( referenceValue->u.codePosValue,
 								   "normal script cannot reference /# ... #/ comment" );
-				} else if ( !definitionSlot ) {
-					CompileError2( referenceValue->u.codePosValue, "unknown function" );
-				} else {
+				} else if ( definitionSlot ) {
 					*(unsigned int *)referenceValue->u.intValue =
 						(unsigned int)definitionValue.u.intValue;
+				} else {
+					CompileError2( referenceValue->u.codePosValue, "unknown function" );
 				}
 			}
 		}
@@ -1335,110 +1395,122 @@ static void SpecifyDeveloperThreadPosition( unsigned short functionObject,
 
 /* ---- SetThreadPosition  0x0046A360 ---- */
 static void SetThreadPosition( unsigned short functionObject ) {
-	unsigned short  definitionSlot;
-
+	void *position;
+	unsigned short definitionSlot;
+	position = TempMalloc( 0 );
 	definitionSlot = FindVariable( functionObject, SCR_FUNC_DEFINITION );
-	GetVariableValueAddress( definitionSlot )->u.pointerValue = TempMalloc( 0 );
+	GetVariableValueAddress( definitionSlot )->u.pointerValue = position;
 }
 
 /* ---- SetDeveloperThreadPosition  0x0046A3B0 ---- */
-static void SetDeveloperThreadPosition( unsigned short functionObject ) {
-	unsigned short  definitionSlot;
-
+static void SetDeveloperThreadPosition( unsigned short functionObject, sval_u sourcePos ) {
+	int position;
+	unsigned short definitionSlot;
+	position = (int)TempMalloc( 0 ) + ( (int)scrCompilePub_developerBufPos - scrCompileGlob_codeRelocStart );
 	definitionSlot = FindVariable( functionObject, SCR_FUNC_DEFINITION );
-	GetVariableValueAddress( definitionSlot )->u.intValue =
-		(int)TempMalloc( 0 )
-		+ ( scrCompilePub_developerBufPos - scrCompileGlob_codeRelocStart );
+	GetVariableValueAddress( definitionSlot )->u.intValue = position;
 }
 
 /* ---- EmitCallExpression  0x0046A410 ---- */
-static void EmitCallExpression( sval_t node, qboolean bDropTop ) {
-	sval_t *n = SVAL_NODE( node );
+static void EmitCallExpression( sval_u node, unsigned char bDropTop ) {
+	sval_t *n = SVAL_NODE( node.value );
 
-	if ( n[0] == SVAL_FUNCTION_CALL_VALUE ) {
-		EmitCall( n[1], SVAL_LIST( n[2] ), bDropTop );
-	} else if ( n[0] == SVAL_METHOD_CALL_VALUE ) {
-		EmitMethod( n[1], n[2], SVAL_LIST( n[3] ), n[4], bDropTop );
+	switch ( n[0] ) {
+	case SVAL_FUNCTION_CALL_VALUE:
+		EmitCall( SVAL_U( n[1] ), SVAL_U( n[2] ), bDropTop );
+		break;
+	case SVAL_METHOD_CALL_VALUE:
+		EmitMethod( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ), bDropTop );
+		break;
 	}
 }
 
 /* ---- EmitCallExpressionRef  0x0046A450 ---- */
-static void EmitCallExpressionRef( sval_t node ) {
-	sval_t *n = SVAL_NODE( node );
+static void EmitCallExpressionRef( sval_u node ) {
+	sval_t *n = SVAL_NODE( node.value );
 
-	if ( n[0] == SVAL_FUNCTION_CALL_VALUE ) {
-		EmitCallRef( n[1], SVAL_LIST( n[2] ) );
-	} else if ( n[0] == SVAL_METHOD_CALL_VALUE ) {
-		EmitMethodRef( n[1], n[2], SVAL_LIST( n[3] ), n[4] );
+	switch ( n[0] ) {
+	case SVAL_FUNCTION_CALL_VALUE:
+		EmitCallRef( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ) );
+		break;
+	case SVAL_METHOD_CALL_VALUE:
+		EmitMethodRef( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
+		break;
 	}
 }
 
 /* ---- EmitCallExpressionFieldObject  0x0046A4B0 ---- */
-static void EmitCallExpressionFieldObject( sval_t node ) {
-	sval_t *n = SVAL_NODE( node );
+static void EmitCallExpressionFieldObject( sval_u node ) {
+	sval_t *n = SVAL_NODE( node.value );
 
-	if ( n[0] == SVAL_FUNCTION_CALL_VALUE ) {
-		EmitCall( n[1], SVAL_LIST( n[2] ), qfalse );
+	switch ( n[0] ) {
+	case SVAL_FUNCTION_CALL_VALUE:
+		EmitCall( SVAL_U( n[1] ), SVAL_U( n[2] ), qfalse );
 		EmitCastFieldObject( n[3] );
-	} else if ( n[0] == SVAL_METHOD_CALL_VALUE ) {
-		EmitMethod( n[1], n[2], SVAL_LIST( n[3] ), n[4], qfalse );
+		break;
+	case SVAL_METHOD_CALL_VALUE:
+		EmitMethod( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ), qfalse );
 		EmitCastFieldObject( n[5] );
+		break;
 	}
 }
 
 /* ---- EmitPrimitiveExpressionList  0x0046A520 ---- */
-static void EmitPrimitiveExpressionList( sval_list_t *list, unsigned int sourcePos ) {
+static void EmitPrimitiveExpressionList( sval_u list, sval_u sourcePos ) {
 	int     count;
 
 	count = EmitExpressionList( list );
-	if ( count == 1 ) {
+	switch ( count ) {
+	case 1:
+		return;
+	case 3:
+		EmitOpcode( OP_Vector, -2, LOCALDEPTH_NONE );
+		AddExpressionListOpcodePos( SVAL_LIST( list.value ) );
+		return;
+	default:
+		CompileError( sourcePos.sourcePosValue,
+					  "expression list must have 1 or 3 parameters" );
 		return;
 	}
-	if ( count != 3 ) {
-		CompileError( sourcePos, "expression list must have 1 or 3 parameters" );
-	}
-	EmitOpcode( OP_Vector, -2, LOCALDEPTH_NONE );
-	AddExpressionListOpcodePos( list );
 }
 
 /* ---- EmitArrayExpressionListRef  0x0046A580 ---- */
-static void EmitArrayExpressionListRef( sval_list_t *list, qboolean bCreate,
+static void EmitArrayExpressionListRef( sval_list_t *list, unsigned char bCreate,
 										unsigned int sourcePos ) {
 	sval_cell_t    *item;
 	sval_entry_t   *entry;
 
-	item = GetSingleParameter( list );
+	item = list->first;
+	if ( item && item->next ) item = NULL;
 	if ( item ) {
 		entry = SVAL_ENTRY( item->value );
-		if ( SVAL_NODE( entry->node )[0] != SVAL_PRIMITIVE_EXPRESSION ) {
-			CompileError( entry->sourcePos, "not an array, string, or vector" );
-		}
-		EmitArrayExpressionRef( SVAL_NODE( entry->node )[1], bCreate,
-								SVAL_NODE( entry->node )[2] );
+		EmitArrayExpressionRef( SVAL_U( entry->node ), bCreate, SVAL_U( entry->sourcePos ) );
 		return;
 	}
 
-	if ( EmitExpressionList( list ) != 3 ) {
+	if ( EmitExpressionList( SVAL_U( list ) ) == 3 ) {
+		EmitOpcode( OP_Vector, -2, LOCALDEPTH_NONE );
+		AddExpressionListOpcodePos( list );
+		EmitOpcode( OP_DiscardRef, -1, LOCALDEPTH_NONE );
+	} else {
 		CompileError( sourcePos, "not an array, string, or vector" );
 	}
-	EmitOpcode( OP_Vector, -2, LOCALDEPTH_NONE );
-	AddExpressionListOpcodePos( list );
-	EmitOpcode( OP_DiscardRef, -1, LOCALDEPTH_NONE );
 }
 
 /* ---- EmitExpressionListFieldObject  0x0046A620 ---- */
-static void EmitExpressionListFieldObject( sval_list_t *list, unsigned int sourcePos ) {
+static void EmitExpressionListFieldObject( sval_u list, sval_u sourcePos ) {
 	sval_cell_t    *item;
 	sval_entry_t   *entry;
 
-	item = GetSingleParameter( list );
+	item = SVAL_LIST( list.value )->first;
+	if ( item && item->next ) item = NULL;
 	if ( item ) {
 		entry = SVAL_ENTRY( item->value );
-		EmitExpressionFieldObject( entry->node, entry->sourcePos );
+		EmitExpressionFieldObject( SVAL_U( entry->node ), SVAL_U( entry->sourcePos ) );
 		return;
 	}
 
-	CompileError( sourcePos, "not an object" );
+	CompileError( sourcePos.sourcePosValue, "not an object" );
 	EmitExpressionList( list );
 }
 
@@ -1448,6 +1520,9 @@ static void EmitPrimitiveExpression( sval_t node ) {
 	float   f;
 
 	switch ( n[0] ) {
+	case SVAL_EXPRESSION_LIST:
+		EmitPrimitiveExpressionList( SVAL_U( n[1] ), SVAL_U( n[2] ) );
+		break;
 	case SVAL_INTEGER_LITERAL:
 		EmitGetInteger( (int)n[1] );
 		break;
@@ -1467,14 +1542,11 @@ static void EmitPrimitiveExpression( sval_t node ) {
 	case SVAL_ISTRING:
 		EmitGetIString( (unsigned short)n[1] );
 		break;
+	case SVAL_CALL_VALUE:
+		EmitCallExpression( SVAL_U( n[1] ), qfalse );
+		break;
 	case SVAL_REFERENCE_EXPRESSION:
 		EmitVariableExpression( n[1] );
-		break;
-	case SVAL_SCRIPT_FUNCTION_NAME:
-		EmitGetFunction( n[1], n[2] );
-		break;
-	case SVAL_CALL_VALUE:
-		EmitCallExpression( n[1], qfalse );
 		break;
 	case SVAL_UNDEFINED:
 		EmitIncTop();
@@ -1491,17 +1563,17 @@ static void EmitPrimitiveExpression( sval_t node ) {
 	case SVAL_ANIM:
 		EmitAnim();
 		break;
-	case SVAL_EXPRESSION_LIST:
-		EmitPrimitiveExpressionList( SVAL_LIST( n[1] ), n[2] );
-		break;
 	case SVAL_SIZE:
-		EmitSize( n[1], n[2] );
+		EmitSize( SVAL_U( n[1] ), SVAL_U( n[2] ) );
+		break;
+	case SVAL_SCRIPT_FUNCTION_NAME:
+		EmitGetFunction( SVAL_U( n[1] ), SVAL_U( n[2] ) );
 		break;
 	case SVAL_EMPTY_ARRAY:
 		EmitEmptyArray();
 		break;
 	case SVAL_ANIM_STRING:
-		EmitAnimation( (unsigned short)n[1], n[2] );
+		EmitAnimation( SVAL_U( n[1] ), SVAL_U( n[2] ) );
 		break;
 	case SVAL_LITERAL_ZERO:
 		EmitFalse();
@@ -1518,67 +1590,65 @@ static void EmitPrimitiveExpression( sval_t node ) {
 }
 
 /* ---- EmitBoolOrExpression  0x0046A830 ---- VERIFIED */
-static void EmitBoolOrExpression( sval_t leftNode, unsigned int leftSourcePos,
-								  sval_t rightNode, unsigned int rightSourcePos ) {
+static void EmitBoolOrExpression( sval_u leftNode, sval_u leftSourcePos,
+								  sval_u rightNode, sval_u rightSourcePos ) {
 	char   *patch;
 	char   *end;
 
-	EmitExpression( leftNode );
+	EmitExpression( leftNode.value );
 	EmitOpcode( OP_JumpOnTrueExpr, -1, LOCALDEPTH_NONE );
-	AddOpcodePos( leftSourcePos );
+	AddOpcodePos( leftSourcePos.sourcePosValue );
 	EmitInteger( 0 );
 	patch = (char *)scrCompileGlob_codePos;
 
-	EmitExpression( rightNode );
-	EmitCastBool( rightSourcePos );
+	EmitExpression( rightNode.value );
+	EmitCastBool( rightSourcePos.sourcePosValue );
 
 	end = (char *)TempMalloc( 0 );
 	*(int *)patch = (int)( end - patch ) - 4;
 }
 
 /* ---- EmitBoolAndExpression  0x0046A8D0 ---- VERIFIED */
-static void EmitBoolAndExpression( sval_t leftNode, unsigned int leftSourcePos,
-								   sval_t rightNode, unsigned int rightSourcePos ) {
+static void EmitBoolAndExpression( sval_u leftNode, sval_u leftSourcePos,
+								   sval_u rightNode, sval_u rightSourcePos ) {
 	char   *patch;
 	char   *end;
 
-	EmitExpression( leftNode );
+	EmitExpression( leftNode.value );
 	EmitOpcode( OP_JumpOnFalseExpr, -1, LOCALDEPTH_NONE );
-	AddOpcodePos( leftSourcePos );
+	AddOpcodePos( leftSourcePos.sourcePosValue );
 	EmitInteger( 0 );
 	patch = (char *)scrCompileGlob_codePos;
 
-	EmitExpression( rightNode );
-	EmitCastBool( rightSourcePos );
+	EmitExpression( rightNode.value );
+	EmitCastBool( rightSourcePos.sourcePosValue );
 
 	end = (char *)TempMalloc( 0 );
 	*(int *)patch = (int)( end - patch ) - 4;
 }
 
 /* ---- EmitBinaryOperatorExpression  0x0046A970 ---- */
-static void EmitBinaryOperatorExpression( sval_t leftNode, sval_t rightNode,
-										  unsigned char opcode,
-										  unsigned int sourcePos ) {
-	EmitExpression( leftNode );
-	EmitExpression( rightNode );
-	EmitOpcode( opcode, -1, LOCALDEPTH_NONE );
-	AddOpcodePos( sourcePos );
+static void EmitBinaryOperatorExpression( sval_u leftNode, sval_u rightNode,
+										  sval_u opcode, sval_u sourcePos ) {
+	EmitExpression( leftNode.value );
+	EmitExpression( rightNode.value );
+	EmitOpcode( (unsigned char)opcode.type, -1, LOCALDEPTH_NONE );
+	AddOpcodePos( sourcePos.sourcePosValue );
 }
 
 /* ---- EmitBinaryEqualsOperatorExpression  0x0046A9A0 ---- */
-static void EmitBinaryEqualsOperatorExpression( sval_t refNode, sval_t valueNode,
-												unsigned char opcode,
-												unsigned int sourcePos ) {
+static void EmitBinaryEqualsOperatorExpression( sval_u refNode, sval_u valueNode,
+												sval_u opcode, sval_u sourcePos ) {
 	scrCompileGlob_bOwnsStrings = 1;
-	EmitVariableExpression( refNode );
+	EmitVariableExpression( refNode.value );
 	scrCompileGlob_bOwnsStrings = 0;
 
-	EmitExpression( valueNode );
-	EmitOpcode( opcode, -1, LOCALDEPTH_NONE );
-	AddOpcodePos( sourcePos );
+	EmitExpression( valueNode.value );
+	EmitOpcode( (unsigned char)opcode.type, -1, LOCALDEPTH_NONE );
+	AddOpcodePos( sourcePos.sourcePosValue );
 
-	EmitVariableExpressionRef( refNode, qtrue );
-	EmitSetVariableField( sourcePos );
+	EmitVariableExpressionRef( refNode.value, qtrue );
+	EmitSetVariableField( sourcePos.sourcePosValue );
 }
 
 /* ---- EmitExpression  0x0046AA00 ---- */
@@ -1590,13 +1660,13 @@ static void EmitExpression( sval_t node ) {
 		EmitPrimitiveExpression( n[1] );
 		break;
 	case SVAL_BOOL_OR:
-		EmitBoolOrExpression( n[1], n[2], n[3], n[4] );
+		EmitBoolOrExpression( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	case SVAL_BOOL_AND:
-		EmitBoolAndExpression( n[1], n[2], n[3], n[4] );
+		EmitBoolAndExpression( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	case SVAL_BINARY_OPERATOR:
-		EmitBinaryOperatorExpression( n[1], n[2], (unsigned char)n[3], n[4] );
+		EmitBinaryOperatorExpression( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	case SVAL_CAST_BOOL:
 		EmitExpression( n[1] );
@@ -1628,59 +1698,60 @@ static void EmitExpression( sval_t node ) {
 }
 
 /* ---- EmitVariableExpressionRef  0x0046ABB0 ---- */
-static void EmitVariableExpressionRef( sval_t node, qboolean bCreate ) {
+static void EmitVariableExpressionRef( sval_t node, unsigned char bCreate ) {
 	sval_t *n = SVAL_NODE( node );
 
 	switch ( n[0] ) {
 	case SVAL_STRING_REF:
-		EmitLocalVariableRef( (unsigned short)n[1] );
+		EmitLocalVariableRef( SVAL_U( n[1] ) );
 		break;
 	case SVAL_ARRAY_REF:
-		EmitArrayVariableRef( n[1], n[2], n[3], n[4], bCreate );
+		EmitArrayVariableRef( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ),
+							  bCreate );
 		break;
 	case SVAL_FIELD_REF:
-		EmitFieldVariableRef( n[1], (unsigned short)n[2], n[3] );
+		EmitFieldVariableRef( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ) );
 		break;
 	default:
 		break;
 	}
 }
 
-/* ---- EmitArrayExpressionRef  0x0046AC20 ---- */
-static void EmitArrayExpressionRef( sval_t node, qboolean bCreate,
-									unsigned int sourcePos ) {
-	sval_t *n = SVAL_NODE( node );
+/* ---- EmitArrayPrimitiveExpressionRef  0x0046AC20 ---- */
+static void EmitArrayPrimitiveExpressionRef( sval_u node, unsigned char bCreate,
+											 sval_u sourcePos ) {
+	sval_t *n = SVAL_NODE( node.value );
 
 	switch ( n[0] ) {
-	case SVAL_REFERENCE_EXPRESSION:
-		EmitVariableExpressionRef( n[1], bCreate );
+	case SVAL_EXPRESSION_LIST:
+		EmitArrayExpressionListRef( SVAL_LIST( n[1] ), bCreate, sourcePos.sourcePosValue );
 		break;
 	case SVAL_CALL_VALUE:
-		EmitCallExpressionRef( n[1] );
+		EmitCallExpressionRef( SVAL_U( n[1] ) );
+		break;
+	case SVAL_REFERENCE_EXPRESSION:
+		EmitVariableExpressionRef( n[1], bCreate );
 		break;
 	case SVAL_GAME:
 		EmitGameRef();
 		break;
-	case SVAL_EXPRESSION_LIST:
-		EmitArrayExpressionListRef( SVAL_LIST( n[1] ), bCreate, sourcePos );
-		break;
 	default:
-		CompileError( sourcePos, "not an array, string, or vector" );
+		CompileError( sourcePos.sourcePosValue, "not an array, string, or vector" );
+		EmitPrimitiveExpression( node.value );
 		break;
 	}
 }
 
-/* ---- EmitArrayPrimitiveExpressionRef  0x0046ACF0 ---- */
-static void EmitArrayPrimitiveExpressionRef( sval_t node, qboolean bCreate,
-											 unsigned int sourcePos ) {
-	sval_t *n = SVAL_NODE( node );
+/* ---- EmitArrayExpressionRef  0x0046ACF0 ---- */
+static void EmitArrayExpressionRef( sval_u node, unsigned char bCreate, sval_u sourcePos ) {
+	sval_t *n = SVAL_NODE( node.value );
 
 	if ( n[0] != SVAL_PRIMITIVE_EXPRESSION ) {
-		CompileError( sourcePos, "not an array, string, or vector" );
-		EmitExpression( node );
+		CompileError( sourcePos.sourcePosValue, "not an array, string, or vector" );
+		EmitExpression( node.value );
 		return;
 	}
-	EmitArrayExpressionRef( n[1], bCreate, n[2] );
+	EmitArrayPrimitiveExpressionRef( SVAL_U( n[1] ), bCreate, SVAL_U( n[2] ) );
 }
 
 /* ---- EmitPrimitiveExpressionFieldObject  0x0046AD30 ---- */
@@ -1688,12 +1759,15 @@ static void EmitPrimitiveExpressionFieldObject( sval_t node, unsigned int source
 	sval_t *n = SVAL_NODE( node );
 
 	switch ( n[0] ) {
+	case SVAL_EXPRESSION_LIST:
+		EmitExpressionListFieldObject( SVAL_U( n[1] ), SVAL_U( sourcePos ) );
+		return;
+	case SVAL_CALL_VALUE:
+		EmitCallExpressionFieldObject( SVAL_U( n[1] ) );
+		return;
 	case SVAL_REFERENCE_EXPRESSION:
 		EmitVariableExpression( n[1] );
 		EmitCastFieldObject( n[2] );
-		return;
-	case SVAL_CALL_VALUE:
-		EmitCallExpressionFieldObject( n[1] );
 		return;
 	case SVAL_SELF:
 		EmitSelfObject();
@@ -1704,9 +1778,6 @@ static void EmitPrimitiveExpressionFieldObject( sval_t node, unsigned int source
 	case SVAL_ANIM:
 		EmitAnimObject();
 		return;
-	case SVAL_EXPRESSION_LIST:
-		EmitExpressionListFieldObject( SVAL_LIST( n[1] ), sourcePos );
-		return;
 	default:
 		break;
 	}
@@ -1716,20 +1787,20 @@ static void EmitPrimitiveExpressionFieldObject( sval_t node, unsigned int source
 }
 
 /* ---- EmitExpressionFieldObject  0x0046AE20 ---- */
-static void EmitExpressionFieldObject( sval_t node, unsigned int sourcePos ) {
-	sval_t *n = SVAL_NODE( node );
+static void EmitExpressionFieldObject( sval_u node, sval_u sourcePos ) {
+	sval_t *n = SVAL_NODE( node.value );
 
-	if ( n[0] == SVAL_PRIMITIVE_EXPRESSION ) {
-		EmitPrimitiveExpressionFieldObject( n[1], n[2] );
+	if ( n[0] != SVAL_PRIMITIVE_EXPRESSION ) {
+		CompileError( sourcePos.sourcePosValue, "not an object" );
+		EmitExpression( node.value );
 		return;
 	}
 
-	CompileError( sourcePos, "not an object" );
-	EmitExpression( node );
+	EmitPrimitiveExpressionFieldObject( n[1], n[2] );
 }
 
 /* ---- ConnectBreakStatements  0x0046AE60 ---- */
-static void ConnectBreakStatements( void ) {
+__declspec(noinline) static void ConnectBreakStatements( void ) {
 	char                   *here;
 	scrCodeOffsetPatch_t   *patch;
 
@@ -1754,33 +1825,36 @@ static void ConnectContinueStatements( void ) {
 }
 
 /* ---- IsUndefinedPrimitiveExpression  0x0046AEF0 ---- */
-static qboolean IsUndefinedPrimitiveExpression( sval_t node ) {
-	return SVAL_NODE( node )[0] == SVAL_UNDEFINED ? qtrue : qfalse;
+static unsigned char IsUndefinedPrimitiveExpression( sval_u node ) {
+	return SVAL_NODE( node.value )[0] == SVAL_UNDEFINED ? qtrue : qfalse;
 }
 
 /* ---- IsUndefinedExpression  0x0046AF00 ---- */
-static qboolean IsUndefinedExpression( sval_t node ) {
-	sval_t *n = SVAL_NODE( node );
+static unsigned char IsUndefinedExpression( sval_u node ) {
+	sval_t         *n = SVAL_NODE( node.value );
+	unsigned char   result;
 
-	if ( n[0] != SVAL_PRIMITIVE_EXPRESSION ) {
-		return qfalse;
+	if ( n[0] == SVAL_PRIMITIVE_EXPRESSION ) {
+		/* a named result reproduces the original C++ bool return */
+		result = IsUndefinedPrimitiveExpression( SVAL_U( n[1] ) );
+		return result;
 	}
-	return IsUndefinedPrimitiveExpression( n[1] );
+	return 0;
 }
 
 /* ---- EmitClearVariableExpression  0x0046AF20 ---- */
-static void EmitClearVariableExpression( sval_t node ) {
-	sval_t *n = SVAL_NODE( node );
+static void EmitClearVariableExpression( sval_u node ) {
+	sval_t *n = SVAL_NODE( node.value );
 
 	switch ( n[0] ) {
 	case SVAL_STRING_REF:
-		EmitClearLocalVariable( (unsigned short)n[1] );
+		EmitClearLocalVariable( SVAL_U( n[1] ) );
 		break;
 	case SVAL_ARRAY_REF:
-		EmitClearArrayVariable( n[1], n[2], n[3], n[4] );
+		EmitClearArrayVariable( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	case SVAL_FIELD_REF:
-		EmitClearFieldVariable( n[1], (unsigned short)n[2], n[3], n[4] );
+		EmitClearFieldVariable( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	default:
 		break;
@@ -1788,26 +1862,26 @@ static void EmitClearVariableExpression( sval_t node ) {
 }
 
 /* ---- EmitAssignmentStatement  0x0046AFA0 ---- */
-static void EmitAssignmentStatement( sval_t refNode, sval_t valueNode,
-									 unsigned int sourcePos ) {
+static void EmitAssignmentStatement( sval_u refNode, sval_u valueNode,
+									 sval_u sourcePos ) {
 	if ( IsUndefinedExpression( valueNode ) ) {
 		EmitClearVariableExpression( refNode );
 		return;
 	}
 
-	EmitExpression( valueNode );
-	EmitVariableExpressionRef( refNode, qtrue );
-	EmitSetVariableField( sourcePos );
+	EmitExpression( valueNode.value );
+	EmitVariableExpressionRef( refNode.value, qtrue );
+	EmitSetVariableField( sourcePos.sourcePosValue );
 }
 
 /* ---- EmitExpressionStatement  0x0046AFF0 ---- */
-static void EmitExpressionStatement( sval_t node ) {
+static void EmitExpressionStatement( sval_u node ) {
 	EmitCallExpression( node, qtrue );
 }
 
 /* ---- EmitReturnStatement  0x0046B030 ---- */
-static void EmitReturnStatement( sval_t node ) {
-	EmitExpression( node );
+static void EmitReturnStatement( sval_u node ) {
+	EmitExpression( node.value );
 	EmitOpcode( OP_Return, -1, LOCALDEPTH_NONE );
 }
 
@@ -1817,16 +1891,17 @@ static void EmitEndStatement( void ) {
 }
 
 /* ---- EmitWaitStatement  0x0046B060 ---- */
-static void EmitWaitStatement( sval_t timeNode, unsigned int timeSourcePos,
-							   unsigned int opcodeSourcePos ) {
+static void EmitWaitStatement( sval_u timeNode, sval_u timeSourcePos,
+							   sval_u opcodeSourcePos ) {
 	if ( scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
-		CompileError( opcodeSourcePos, "wait not allowed in /# ... #/ comment" );
+		CompileError( opcodeSourcePos.sourcePosValue,
+					  "wait not allowed in /# ... #/ comment" );
 	}
 
-	EmitExpression( timeNode );
+	EmitExpression( timeNode.value );
 	EmitOpcode( OP_Wait, -1, LOCALDEPTH_NONE );
-	AddOpcodePos( opcodeSourcePos );
-	AddOpcodePos( timeSourcePos );
+	AddOpcodePos( opcodeSourcePos.sourcePosValue );
+	AddOpcodePos( timeSourcePos.sourcePosValue );
 }
 
 static char *EmitForwardJump( unsigned char opcode, int stackDelta,
@@ -1844,58 +1919,40 @@ static void PatchForwardJump( char *patch ) {
 }
 
 /* ---- EmitIfStatement  0x0046B0B0 ---- */
-static void EmitIfStatement( sval_t conditionNode, sval_t bodyNode,
-							 unsigned int sourcePos ) {
+static void EmitIfStatement( sval_u conditionNode, sval_u bodyNode,
+							 sval_u sourcePos ) {
 	char   *falsePatch;
 
-	EmitExpression( conditionNode );
-	falsePatch = EmitForwardJump( OP_JumpOnFalse, -1, sourcePos );
+	EmitExpression( conditionNode.value );
+	falsePatch = EmitForwardJump( OP_JumpOnFalse, -1, sourcePos.sourcePosValue );
 
-	EmitStatement( bodyNode );
+	EmitStatement( bodyNode.value );
 	EmitNOP();
 	PatchForwardJump( falsePatch );
 }
 
 /* ---- EmitIfElseStatement  0x0046B140 ---- */
-static void EmitIfElseStatement( sval_t conditionNode, sval_t thenNode,
-								 sval_t elseNode, unsigned int sourcePos ) {
+static void EmitIfElseStatement( sval_u conditionNode, sval_u thenNode,
+								 sval_u elseNode, sval_u sourcePos ) {
 	char   *falsePatch;
 	char   *endPatch;
 	char   *here;
 
-	EmitExpression( conditionNode );
-	falsePatch = EmitForwardJump( OP_JumpOnFalse, -1, sourcePos );
+	EmitExpression( conditionNode.value );
+	falsePatch = EmitForwardJump( OP_JumpOnFalse, -1, sourcePos.sourcePosValue );
 
-	EmitStatement( thenNode );
+	EmitStatement( thenNode.value );
 	EmitOpcode( OP_Jump, 0, LOCALDEPTH_NONE );
 	EmitInteger( 0 );
 	endPatch = (char *)scrCompileGlob_codePos;
 
 	PatchForwardJump( falsePatch );
 
-	EmitStatement( elseNode );
+	EmitStatement( elseNode.value );
 	EmitNOP();
 
 	here = (char *)TempMalloc( 0 );
 	*(int *)endPatch = (int)( here - endPatch );
-}
-
-typedef struct scrLoopState_s {
-	unsigned char           breakAllowed;
-	unsigned char           breakAllowedDev;
-	scrCodeOffsetPatch_t   *breakList;
-	unsigned char           contAllowed;
-	unsigned char           contAllowedDev;
-	scrCodeOffsetPatch_t   *contList;
-} scrLoopState_t;
-
-static void Scr_SaveLoopState( scrLoopState_t *state ) {
-	state->breakAllowed    = scrCompileGlob_breakAllowed;
-	state->breakAllowedDev = scrCompileGlob_breakAllowedDev;
-	state->breakList       = (scrCodeOffsetPatch_t *)scrCompileGlob_breakList;
-	state->contAllowed     = scrCompileGlob_contAllowed;
-	state->contAllowedDev  = scrCompileGlob_contAllowedDev;
-	state->contList        = (scrCodeOffsetPatch_t *)scrCompileGlob_contList;
 }
 
 static void Scr_ClearLoopState( void ) {
@@ -1906,84 +1963,105 @@ static void Scr_ClearLoopState( void ) {
 }
 
 static void Scr_EnableLoopState( void ) {
-	unsigned char   inDeveloper =
-		(unsigned char)( scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN );
-
 	scrCompileGlob_breakAllowed    = 1;
-	scrCompileGlob_breakAllowedDev = inDeveloper;
+	scrCompileGlob_breakAllowedDev = scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN;
 	scrCompileGlob_breakList       = 0;
 	scrCompileGlob_contAllowed     = 1;
-	scrCompileGlob_contAllowedDev  = inDeveloper;
+	scrCompileGlob_contAllowedDev  = scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN;
 	scrCompileGlob_contList        = 0;
 }
 
-static void Scr_RestoreLoopState( const scrLoopState_t *state ) {
-	scrCompileGlob_breakAllowed    = state->breakAllowed;
-	scrCompileGlob_breakAllowedDev = state->breakAllowedDev;
-	scrCompileGlob_breakList       = (int)state->breakList;
-	scrCompileGlob_contAllowed     = state->contAllowed;
-	scrCompileGlob_contAllowedDev  = state->contAllowedDev;
-	scrCompileGlob_contList        = (int)state->contList;
-}
-
 /* ---- EmitWhileStatement  0x0046B220 ---- */
-static void EmitWhileStatement( sval_t conditionNode, sval_t bodyNode,
-								unsigned int conditionSourcePos,
-								unsigned int loopSourcePos ) {
-	scrLoopState_t  state;
-	char           *loopStart;
-	char           *falsePatch;
-	char           *jumpPos;
+static void EmitWhileStatement( sval_u conditionNode, sval_u bodyNode,
+								sval_u conditionSourcePos,
+								sval_u loopSourcePos ) {
+	unsigned char           breakAllowed;
+	unsigned char           breakAllowedDev;
+	scrCodeOffsetPatch_t   *breakList;
+	unsigned char           contAllowed;
+	unsigned char           contAllowedDev;
+	scrCodeOffsetPatch_t   *contList;
+	char                   *loopStart;
+	char                   *falsePatch;
+	char                   *jumpPos;
 
 	EmitNOP();
-	Scr_SaveLoopState( &state );
-	Scr_ClearLoopState();
+	breakAllowed    = scrCompileGlob_breakAllowed;
+	breakAllowedDev = scrCompileGlob_breakAllowedDev;
+	breakList       = (scrCodeOffsetPatch_t *)scrCompileGlob_breakList;
+	scrCompileGlob_breakAllowed    = 0;
+	scrCompileGlob_breakAllowedDev = 0;
+	contAllowed     = scrCompileGlob_contAllowed;
+	contAllowedDev  = scrCompileGlob_contAllowedDev;
+	contList        = (scrCodeOffsetPatch_t *)scrCompileGlob_contList;
+	scrCompileGlob_contAllowed     = 0;
+	scrCompileGlob_contAllowedDev  = 0;
 
 	loopStart = (char *)TempMalloc( 0 );
-	EmitExpression( conditionNode );
-	falsePatch = EmitForwardJump( OP_JumpOnFalse, -1, conditionSourcePos );
+	EmitExpression( conditionNode.value );
+	falsePatch = EmitForwardJump( OP_JumpOnFalse, -1, conditionSourcePos.sourcePosValue );
 
 	Scr_EnableLoopState();
-	EmitStatement( bodyNode );
+	EmitStatement( bodyNode.value );
 	Scr_ClearLoopState();
 	ConnectContinueStatements();
 
 	EmitOpcode( OP_JumpBack, 0, LOCALDEPTH_NONE );
-	AddOpcodePos( loopSourcePos );
+	AddOpcodePos( loopSourcePos.sourcePosValue );
 	jumpPos = (char *)TempMalloc( 0 );
 	EmitInteger( (int)( loopStart - jumpPos ) );
 
 	PatchForwardJump( falsePatch );
 	ConnectBreakStatements();
-	Scr_RestoreLoopState( &state );
+	scrCompileGlob_breakAllowed    = breakAllowed;
+	scrCompileGlob_breakAllowedDev = breakAllowedDev;
+	scrCompileGlob_breakList       = (int)breakList;
+	scrCompileGlob_contAllowed     = contAllowed;
+	scrCompileGlob_contAllowedDev  = contAllowedDev;
+	scrCompileGlob_contList        = (int)contList;
 }
 
 /* ---- EmitDoWhileStatement  0x0046B3F0 ---- */
-static void EmitDoWhileStatement( sval_t bodyNode, sval_t conditionNode,
-								  unsigned int conditionSourcePos,
-								  unsigned int loopSourcePos ) {
-	scrLoopState_t  state;
-	char           *loopStart;
-	char           *jumpPos;
+static void EmitDoWhileStatement( sval_u bodyNode, sval_u conditionNode,
+								  sval_u conditionSourcePos,
+								  sval_u loopSourcePos ) {
+	unsigned char           breakAllowed;
+	unsigned char           breakAllowedDev;
+	scrCodeOffsetPatch_t   *breakList;
+	unsigned char           contAllowed;
+	unsigned char           contAllowedDev;
+	scrCodeOffsetPatch_t   *contList;
+	char                   *loopStart;
+	char                   *jumpPos;
 
 	EmitNOP();
-	Scr_SaveLoopState( &state );
+	breakAllowed    = scrCompileGlob_breakAllowed;
+	breakAllowedDev = scrCompileGlob_breakAllowedDev;
+	breakList       = (scrCodeOffsetPatch_t *)scrCompileGlob_breakList;
+	contAllowed     = scrCompileGlob_contAllowed;
+	contAllowedDev  = scrCompileGlob_contAllowedDev;
+	contList        = (scrCodeOffsetPatch_t *)scrCompileGlob_contList;
 	Scr_EnableLoopState();
 
 	loopStart = (char *)TempMalloc( 0 );
-	EmitStatement( bodyNode );
+	EmitStatement( bodyNode.value );
 	Scr_ClearLoopState();
 	ConnectContinueStatements();
 
-	EmitExpression( conditionNode );
+	EmitExpression( conditionNode.value );
 	EmitOpcode( OP_JumpOnTrueBack, -1, LOCALDEPTH_NONE );
-	AddOpcodePos( loopSourcePos );
-	AddOpcodePos( conditionSourcePos );
+	AddOpcodePos( loopSourcePos.sourcePosValue );
+	AddOpcodePos( conditionSourcePos.sourcePosValue );
 	jumpPos = (char *)TempMalloc( 0 );
 	EmitInteger( (int)( loopStart - jumpPos ) );
 
 	ConnectBreakStatements();
-	Scr_RestoreLoopState( &state );
+	scrCompileGlob_breakAllowed    = breakAllowed;
+	scrCompileGlob_breakAllowedDev = breakAllowedDev;
+	scrCompileGlob_breakList       = (int)breakList;
+	scrCompileGlob_contAllowed     = contAllowed;
+	scrCompileGlob_contAllowedDev  = contAllowedDev;
+	scrCompileGlob_contList        = (int)contList;
 }
 
 /* ---- EmitForStatement  0x0046B560 ---- */
@@ -1991,22 +2069,36 @@ static void EmitForStatement( sval_t initNode, sval_t conditionNode,
 							  sval_t incrementNode, sval_t bodyNode,
 							  unsigned int conditionSourcePos,
 							  unsigned int loopSourcePos ) {
-	scrLoopState_t  state;
-	char           *loopStart;
-	char           *falsePatch;
-	char           *jumpPos;
+	unsigned char           breakAllowed;
+	unsigned char           breakAllowedDev;
+	scrCodeOffsetPatch_t   *breakList;
+	unsigned char           contAllowed;
+	unsigned char           contAllowedDev;
+	scrCodeOffsetPatch_t   *contList;
+	char                   *loopStart;
+	char                   *falsePatch;
+	char                   *jumpPos;
 
-	Scr_SaveLoopState( &state );
-	Scr_ClearLoopState();
+	breakAllowed    = scrCompileGlob_breakAllowed;
+	breakAllowedDev = scrCompileGlob_breakAllowedDev;
+	breakList       = (scrCodeOffsetPatch_t *)scrCompileGlob_breakList;
+	scrCompileGlob_breakAllowed    = 0;
+	scrCompileGlob_breakAllowedDev = 0;
+	contAllowed     = scrCompileGlob_contAllowed;
+	contAllowedDev  = scrCompileGlob_contAllowedDev;
+	contList        = (scrCodeOffsetPatch_t *)scrCompileGlob_contList;
+	scrCompileGlob_contAllowed     = 0;
+	scrCompileGlob_contAllowedDev  = 0;
 
 	EmitStatement( initNode );
 	EmitNOP();
 	loopStart = (char *)TempMalloc( 0 );
 
-	falsePatch = NULL;
 	if ( SVAL_NODE( conditionNode )[0] == SVAL_FOR_CONDITION ) {
 		EmitExpression( SVAL_NODE( conditionNode )[1] );
 		falsePatch = EmitForwardJump( OP_JumpOnFalse, -1, conditionSourcePos );
+	} else {
+		falsePatch = NULL;
 	}
 
 	Scr_EnableLoopState();
@@ -2025,30 +2117,35 @@ static void EmitForStatement( sval_t initNode, sval_t conditionNode,
 	}
 
 	ConnectBreakStatements();
-	Scr_RestoreLoopState( &state );
+	scrCompileGlob_breakAllowed    = breakAllowed;
+	scrCompileGlob_breakAllowedDev = breakAllowedDev;
+	scrCompileGlob_breakList       = (int)breakList;
+	scrCompileGlob_contAllowed     = contAllowed;
+	scrCompileGlob_contAllowedDev  = contAllowedDev;
+	scrCompileGlob_contList        = (int)contList;
 }
 
 /* ---- EmitIncStatement  0x0046B760 ---- */
-static void EmitIncStatement( sval_t refNode, unsigned int sourcePos ) {
-	EmitVariableExpressionRef( refNode, qfalse );
+static void EmitIncStatement( sval_u refNode, sval_u sourcePos ) {
+	EmitVariableExpressionRef( refNode.value, qfalse );
 	EmitOpcode( OP_Inc, 1, LOCALDEPTH_NONE );
-	AddOpcodePos( sourcePos );
-	EmitSetVariableField( sourcePos );
+	AddOpcodePos( sourcePos.sourcePosValue );
+	EmitSetVariableField( sourcePos.sourcePosValue );
 }
 
 /* ---- EmitDecStatement  0x0046B7A0 ---- */
-static void EmitDecStatement( sval_t refNode, unsigned int sourcePos ) {
-	EmitVariableExpressionRef( refNode, qfalse );
+static void EmitDecStatement( sval_u refNode, sval_u sourcePos ) {
+	EmitVariableExpressionRef( refNode.value, qfalse );
 	EmitOpcode( OP_Dec, 1, LOCALDEPTH_NONE );
-	AddOpcodePos( sourcePos );
-	EmitSetVariableField( sourcePos );
+	AddOpcodePos( sourcePos.sourcePosValue );
+	EmitSetVariableField( sourcePos.sourcePosValue );
 }
 
 /* ---- EmitFormalParameterListRefInternal  0x0046B7E0 ---- */
 static void EmitFormalParameterListRefInternal( sval_cell_t *item ) {
 	for ( item = item->next; item; item = item->next ) {
-		EmitSafeSetVariableField( (unsigned short)SVAL_ENTRY( item->value )->node,
-								  SVAL_ENTRY( item->value )->sourcePos );
+		EmitSafeSetVariableField( SVAL_U( SVAL_ENTRY( item->value )->node ),
+								  SVAL_U( SVAL_ENTRY( item->value )->sourcePos ) );
 	}
 }
 
@@ -2056,60 +2153,71 @@ static void EmitFormalParameterListRefInternal( sval_cell_t *item ) {
 static void EmitFormalWaittillParameterListRefInternal( sval_cell_t *item ) {
 	for ( item = item->next; item; item = item->next ) {
 		EmitSafeSetWaittillVariableField(
-			(unsigned short)SVAL_ENTRY( item->value )->node,
-			SVAL_ENTRY( item->value )->sourcePos );
+			SVAL_U( SVAL_ENTRY( item->value )->node ),
+			SVAL_U( SVAL_ENTRY( item->value )->sourcePos ) );
 	}
 }
 
 /* ---- EmitWaittillStatement  0x0046B9A0 ---- VERIFIED */
-static void EmitWaittillStatement( sval_t objectNode, sval_t listNode,
-								   unsigned int objectSourcePos,
-								   unsigned int opcodeSourcePos ) {
+static void EmitWaittillStatement( sval_u objectNode, sval_u listNode,
+								   sval_u objectSourcePos,
+								   sval_u opcodeSourcePos ) {
 	sval_cell_t    *eventItem;
 
 	if ( scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
-		CompileError( opcodeSourcePos, "waittill not allowed in developer script" );
+		CompileError( opcodeSourcePos.sourcePosValue,
+					  "waittill not allowed in developer script" );
 	}
 
-	eventItem = SVAL_LIST( listNode )->first->next;
+	eventItem = SVAL_LIST( listNode.value )->first->next;
 	EmitExpression( SVAL_ENTRY( eventItem->value )->node );
-	EmitPrimitiveExpression( objectNode );
+	EmitPrimitiveExpression( objectNode.value );
 	EmitOpcode( OP_WaitTill, -2, LOCALDEPTH_NONE );
-	AddOpcodePos( opcodeSourcePos );
+	AddOpcodePos( opcodeSourcePos.sourcePosValue );
 	AddOpcodePos( SVAL_ENTRY( eventItem->value )->sourcePos );
-	AddOpcodePos( objectSourcePos );
+	AddOpcodePos( objectSourcePos.sourcePosValue );
 	EmitFormalWaittillParameterListRefInternal( eventItem );
 	EmitOpcode( OP_EndWaittill, 0, LOCALDEPTH_NONE );
 }
 
 /* ---- EmitWaittillmatchStatement  0x0046BA20 ---- */
-static void EmitWaittillmatchStatement( sval_t objectNode, sval_t listNode,
-										unsigned int objectSourcePos,
-										unsigned int opcodeSourcePos ) {
+static void EmitWaittillmatchStatement( sval_u objectNode, sval_u listNode,
+										sval_u objectSourcePos,
+										sval_u opcodeSourcePos ) {
 	sval_cell_t    *eventItem;
 	sval_cell_t    *item;
-	int             matchCount = 0;
+	int             matchCount;
 
 	if ( scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
-		CompileError( opcodeSourcePos, "waittillmatch not allowed in developer script" );
+		CompileError( opcodeSourcePos.sourcePosValue, "waittillmatch not allowed in developer script" );
 	}
 
-	eventItem = SVAL_LIST( listNode )->first->next;
-
-	for ( item = eventItem->next; item; item = item->next ) {
+	/* Mac 1.3 loop shapes: the cursors are re-read from the list and advanced before the test */
+	matchCount = 0;
+	item = SVAL_LIST( listNode.value )->first->next;
+	for ( ;; ) {
+		item = item->next;
+		if ( !item ) {
+			break;
+		}
 		EmitExpression( SVAL_ENTRY( item->value )->node );
 		matchCount++;
 	}
 
+	eventItem = SVAL_LIST( listNode.value )->first->next;
 	EmitExpression( SVAL_ENTRY( eventItem->value )->node );
-	EmitPrimitiveExpression( objectNode );
+	EmitPrimitiveExpression( objectNode.value );
 	EmitOpcode( OP_WaitTillMatch, -2 - matchCount, LOCALDEPTH_NONE );
-	AddOpcodePos( opcodeSourcePos );
+	AddOpcodePos( opcodeSourcePos.sourcePosValue );
 	AddOpcodePos( SVAL_ENTRY( eventItem->value )->sourcePos );
-	AddOpcodePos( objectSourcePos );
+	AddOpcodePos( objectSourcePos.sourcePosValue );
 
-	for ( item = eventItem->next; item; item = item->next ) {
-		AddOpcodePos( SVAL_ENTRY( item->value )->sourcePos );
+	for ( ;; ) {
+		eventItem = eventItem->next;
+		if ( !eventItem ) {
+			break;
+		}
+		AddOpcodePos( SVAL_ENTRY( eventItem->value )->sourcePos );
 	}
 
 	EmitByte( (unsigned char)matchCount );
@@ -2117,37 +2225,37 @@ static void EmitWaittillmatchStatement( sval_t objectNode, sval_t listNode,
 }
 
 /* ---- EmitNotifyStatement  0x0046BB00 ---- */
-static void EmitNotifyStatement( sval_t objectNode, sval_list_t *list,
-								 unsigned int objectSourcePos,
-								 unsigned int opcodeSourcePos ) {
+static void EmitNotifyStatement( sval_u objectNode, sval_u list,
+								 sval_u objectSourcePos, sval_u opcodeSourcePos ) {
 	sval_cell_t    *item;
-	sval_cell_t    *lastItem = NULL;
-	int             argCount = 0;
+	sval_cell_t    *lastItem;
+	int             argCount;
 
 	EmitOpcode( OP_VoidCodepos, 1, LOCALDEPTH_NONE );
 
-	for ( item = list->first; item; item = item->next ) {
+	argCount = 0;
+	lastItem = NULL;
+	for ( item = SVAL_LIST( list.value )->first; item; item = item->next ) {
 		lastItem = item;
 		EmitExpression( SVAL_ENTRY( item->value )->node );
 		argCount++;
 	}
 
-	EmitPrimitiveExpression( objectNode );
+	EmitPrimitiveExpression( objectNode.value );
 	EmitOpcode( OP_Notify, -2 - argCount, LOCALDEPTH_NONE );
-	AddOpcodePos( opcodeSourcePos );
+	AddOpcodePos( opcodeSourcePos.sourcePosValue );
 	AddOpcodePos( SVAL_ENTRY( lastItem->value )->sourcePos );
-	AddOpcodePos( objectSourcePos );
+	AddOpcodePos( objectSourcePos.sourcePosValue );
 }
 
 /* ---- EmitEndOnStatement  0x0046BC20 ---- */
-static void EmitEndOnStatement( sval_t objectNode, sval_t eventNode,
-								unsigned int objectSourcePos,
-								unsigned int opcodeSourcePos ) {
-	EmitExpression( eventNode );
-	EmitPrimitiveExpression( objectNode );
+static void EmitEndOnStatement( sval_u objectNode, sval_u eventNode,
+								sval_u objectSourcePos, sval_u opcodeSourcePos ) {
+	EmitExpression( eventNode.value );
+	EmitPrimitiveExpression( objectNode.value );
 	EmitOpcode( OP_EndOn, -2, LOCALDEPTH_NONE );
-	AddOpcodePos( opcodeSourcePos );
-	AddOpcodePos( objectSourcePos );
+	AddOpcodePos( opcodeSourcePos.sourcePosValue );
+	AddOpcodePos( objectSourcePos.sourcePosValue );
 }
 
 /* ---- CompareCaseInfo  0x0046BC60 ---- */
@@ -2155,7 +2263,7 @@ static int __cdecl CompareCaseInfo( const void *a, const void *b ) {
 	const scrCaseTableEntry_t  *left  = (const scrCaseTableEntry_t *)a;
 	const scrCaseTableEntry_t  *right = (const scrCaseTableEntry_t *)b;
 
-	if ( right->value < left->value ) {
+	if ( left->value > right->value ) {
 		return -1;
 	}
 	return left->value < right->value;
@@ -2182,78 +2290,89 @@ static void EmitCaseStatementInfo( unsigned int value, unsigned int sourcePos ) 
 }
 
 /* ---- EmitCaseStatement  0x0046BFD0 ---- */
-static void EmitCaseStatement( sval_t valueNode, unsigned int sourcePos ) {
-	sval_t         *n = SVAL_NODE( valueNode );
+static void EmitCaseStatement( sval_u valueNode, sval_u sourcePos ) {
+	sval_t         *n = SVAL_NODE( valueNode.value );
 	unsigned int    caseValue;
 	int             integerValue;
+	unsigned short stringValue;
 
-	if ( n[0] == SVAL_INTEGER_LITERAL ) {
-		integerValue = (int)n[1];
-		if ( (unsigned int)( integerValue + SCR_CASE_TEST_BIAS ) >= SCR_CASE_TEST_LIMIT ) {
-			CompileError( sourcePos, va( "case index %d out of range", integerValue ) );
+	switch ( n[0] ) {
+	case SVAL_INTEGER_LITERAL:
+		caseValue = (unsigned int)n[1];
+		integerValue = (int)caseValue;
+		if ( (unsigned int)( integerValue + SCR_CASE_TEST_BIAS ) > SCR_CASE_TEST_MAX ) {
+			CompileError( sourcePos.sourcePosValue,
+						  va( "case index %d out of range", integerValue ) );
 			return;
 		}
-		caseValue = ( (unsigned int)integerValue + SCR_CASE_ENCODE_BIAS )
+		caseValue = ( caseValue + SCR_CASE_ENCODE_BIAS )
 				  & SCR_CASE_ENCODE_MASK;
-	} else {
-		if ( n[0] != SVAL_STRING ) {
-			CompileError( sourcePos, "case expression must be an int or string" );
-			return;
-		}
-		caseValue = (unsigned short)n[1];
-		CompileTransferRefToString( (unsigned short)caseValue, SCR_STRING_USAGE_CASE );
+		break;
+	case SVAL_STRING:
+		stringValue = (unsigned short)n[1];
+		caseValue = stringValue;
+		CompileTransferRefToString( stringValue, SCR_STRING_USAGE_CASE );
+		break;
+	default:
+		CompileError( sourcePos.sourcePosValue, "case expression must be an int or string" );
+		EmitPrimitiveExpression( valueNode.value );   /* retail 0x0046BFF1 */
+		return;
 	}
 
+	/* retail 0x0046C062 / 0x0046C089: each error path returns without
+	 * recording the case */
 	if ( !scrCompileGlob_caseAllowed ) {
-		CompileError( sourcePos, "illegal case statement" );
-	} else if ( !scrCompileGlob_caseAllowedDev
-			 && scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
-		CompileError( sourcePos,
+		CompileError( sourcePos.sourcePosValue, "illegal case statement" );
+		return;
+	}
+	if ( !scrCompileGlob_caseAllowedDev
+		 && scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
+		CompileError( sourcePos.sourcePosValue,
 					  "cannot use /# ... #/ comments directly around a case statement" );
+		return;
 	}
 
-	EmitCaseStatementInfo( caseValue, sourcePos );
+	EmitCaseStatementInfo( caseValue, sourcePos.sourcePosValue );
 }
 
-static void EmitDefaultStatement( unsigned int sourcePos ) {
+/* ---- EmitDefaultStatement  0x0046C0A0 ---- */
+static void EmitDefaultStatement( sval_u sourcePos ) {
 	if ( !scrCompileGlob_caseAllowed ) {
-		CompileError( sourcePos, "illegal default statement" );
+		CompileError( sourcePos.sourcePosValue, "illegal default statement" );
+		return;     /* retail 0x0046C0BB */
 	}
-	EmitCaseStatementInfo( 0, sourcePos );
+	EmitCaseStatementInfo( 0, sourcePos.sourcePosValue );
 }
 
-typedef struct scrSwitchState_s {
+extern void         qsort_m( void *base, unsigned int count, unsigned int width,
+							 int ( __cdecl *compare )( const void *, const void * ) );
+
+/* ---- EmitSwitchStatement  0x0046BC80 ---- */
+static void EmitSwitchStatement( sval_u valueNode, sval_u bodyNode, sval_u sourcePos ) {
 	unsigned char           caseAllowed;
 	unsigned char           caseAllowedDev;
 	scrCaseRecord_t        *caseList;
 	unsigned char           breakAllowed;
 	unsigned char           breakAllowedDev;
 	scrCodeOffsetPatch_t   *breakList;
-} scrSwitchState_t;
-
-/* ---- EmitSwitchStatement  0x0046BC80 ---- */
-static void EmitSwitchStatement( sval_t valueNode, sval_t bodyNode,
-								 unsigned int sourcePos ) {
-	scrSwitchState_t        state;
 	char                   *tablePatch;
 	scrCaseTableEntry_t    *table;
 	scrCaseRecord_t        *record;
-	unsigned int            caseCount = 0;
-	unsigned int            index;
+	int                     caseCount;
+	int                     index;
 
-	state.caseAllowed     = scrCompileGlob_caseAllowed;
-	state.caseAllowedDev  = scrCompileGlob_caseAllowedDev;
-	state.caseList        = (scrCaseRecord_t *)scrCompileGlob_caseList;
-	state.breakAllowed    = scrCompileGlob_breakAllowed;
-	state.breakAllowedDev = scrCompileGlob_breakAllowedDev;
-	state.breakList       = (scrCodeOffsetPatch_t *)scrCompileGlob_breakList;
-
+	caseAllowed    = scrCompileGlob_caseAllowed;
+	caseAllowedDev = scrCompileGlob_caseAllowedDev;
+	caseList       = (scrCaseRecord_t *)scrCompileGlob_caseList;
 	scrCompileGlob_caseAllowed     = 0;
 	scrCompileGlob_caseAllowedDev  = 0;
+	breakAllowed    = scrCompileGlob_breakAllowed;
+	breakAllowedDev = scrCompileGlob_breakAllowedDev;
+	breakList       = (scrCodeOffsetPatch_t *)scrCompileGlob_breakList;
 	scrCompileGlob_breakAllowed    = 0;
 	scrCompileGlob_breakAllowedDev = 0;
 
-	EmitExpression( valueNode );
+	EmitExpression( valueNode.value );
 	EmitOpcode( OP_Switch, -1, LOCALDEPTH_NONE );
 	EmitInteger( 0 );
 	tablePatch = (char *)scrCompileGlob_codePos;
@@ -2266,7 +2385,7 @@ static void EmitSwitchStatement( sval_t valueNode, sval_t bodyNode,
 	scrCompileGlob_breakAllowedDev = scrCompileGlob_caseAllowedDev;
 	scrCompileGlob_breakList       = 0;
 
-	EmitStatement( bodyNode );
+	EmitStatement( bodyNode.value );
 
 	scrCompileGlob_caseAllowed     = 0;
 	scrCompileGlob_caseAllowedDev  = 0;
@@ -2274,12 +2393,13 @@ static void EmitSwitchStatement( sval_t valueNode, sval_t bodyNode,
 	scrCompileGlob_breakAllowedDev = 0;
 
 	EmitOpcode( OP_EndSwitch, 0, LOCALDEPTH_NONE );
-	AddOpcodePos( sourcePos );
+	AddOpcodePos( sourcePos.sourcePosValue );
 	EmitShort( 0 );
 
 	table = (scrCaseTableEntry_t *)TempMalloc( 0 );
 	*(int *)tablePatch = (int)( (char *)table - tablePatch );
 
+	caseCount = 0;
 	for ( record = (scrCaseRecord_t *)scrCompileGlob_caseList;
 		  record; record = record->next ) {
 		EmitInteger( (int)record->value );
@@ -2288,15 +2408,15 @@ static void EmitSwitchStatement( sval_t valueNode, sval_t bodyNode,
 	}
 
 	*(unsigned short *)( (char *)table - 2 ) = (unsigned short)caseCount;
-	qsort( table, caseCount, sizeof( scrCaseTableEntry_t ), CompareCaseInfo );
+	qsort_m( table, (unsigned int)caseCount, sizeof( scrCaseTableEntry_t ), CompareCaseInfo );
 
-	for ( index = 1; index < caseCount; index++ ) {
-		if ( table[index - 1].value != table[index].value ) {
+	for ( index = 1; index < caseCount; index++, table++ ) {
+		if ( table[0].value != table[1].value ) {
 			continue;
 		}
 		for ( record = (scrCaseRecord_t *)scrCompileGlob_caseList;
 			  record; record = record->next ) {
-			if ( record->value == table[index - 1].value ) {
+			if ( record->value == table[0].value ) {
 				CompileError( record->sourcePos, "duplicate case expression" );
 			}
 		}
@@ -2304,23 +2424,29 @@ static void EmitSwitchStatement( sval_t valueNode, sval_t bodyNode,
 
 	ConnectBreakStatements();
 
-	scrCompileGlob_caseAllowed     = state.caseAllowed;
-	scrCompileGlob_caseAllowedDev  = state.caseAllowedDev;
-	scrCompileGlob_caseList        = (int)state.caseList;
-	scrCompileGlob_breakAllowed    = state.breakAllowed;
-	scrCompileGlob_breakAllowedDev = state.breakAllowedDev;
-	scrCompileGlob_breakList       = (int)state.breakList;
+	scrCompileGlob_caseAllowed     = caseAllowed;
+	scrCompileGlob_caseAllowedDev  = caseAllowedDev;
+	scrCompileGlob_caseList        = (int)caseList;
+	scrCompileGlob_breakAllowed    = breakAllowed;
+	scrCompileGlob_breakAllowedDev = breakAllowedDev;
+	scrCompileGlob_breakList       = (int)breakList;
 }
 
-static void EmitBreakStatement( unsigned int sourcePos ) {
+/* ---- EmitBreakStatement  0x0046C0D0 ---- */
+static void EmitBreakStatement( sval_u sourcePos ) {
 	scrCodeOffsetPatch_t   *patch;
 
+	/* retail 0x0046C0EB / 0x0046C110: each error path returns without
+	 * emitting the jump */
 	if ( !scrCompileGlob_breakAllowed ) {
-		CompileError( sourcePos, "illegal break statement" );
-	} else if ( !scrCompileGlob_breakAllowedDev
-			 && scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
-		CompileError( sourcePos,
+		CompileError( sourcePos.sourcePosValue, "illegal break statement" );
+		return;
+	}
+	if ( !scrCompileGlob_breakAllowedDev
+		 && scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
+		CompileError( sourcePos.sourcePosValue,
 					  "cannot use /# ... #/ comments directly around a break statement" );
+		return;
 	}
 
 	EmitOpcode( OP_Jump, 0, LOCALDEPTH_NONE );
@@ -2333,15 +2459,21 @@ static void EmitBreakStatement( unsigned int sourcePos ) {
 	scrCompileGlob_breakList = (int)patch;
 }
 
-static void EmitContinueStatement( unsigned int sourcePos ) {
+/* ---- EmitContinueStatement  0x0046C170 ---- */
+static void EmitContinueStatement( sval_u sourcePos ) {
 	scrCodeOffsetPatch_t   *patch;
 
+	/* retail 0x0046C18B / 0x0046C1B0: each error path returns without
+	 * emitting the jump */
 	if ( !scrCompileGlob_contAllowed ) {
-		CompileError( sourcePos, "illegal continue statement" );
-	} else if ( !scrCompileGlob_contAllowedDev
-			 && scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
-		CompileError( sourcePos,
+		CompileError( sourcePos.sourcePosValue, "illegal continue statement" );
+		return;
+	}
+	if ( !scrCompileGlob_contAllowedDev
+		 && scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
+		CompileError( sourcePos.sourcePosValue,
 					  "cannot use /# ... #/ comments directly around a continue statement" );
+		return;
 	}
 
 	EmitOpcode( OP_Jump, 0, LOCALDEPTH_NONE );
@@ -2360,76 +2492,77 @@ static void EmitStatement( sval_t node ) {
 
 	switch ( n[0] ) {
 	case SVAL_ASSIGNMENT_STATEMENT:
-		EmitAssignmentStatement( n[1], n[2], n[3] );
+		EmitAssignmentStatement( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ) );
 		break;
 	case SVAL_CALL_STATEMENT:
-		EmitExpressionStatement( n[1] );
+		EmitExpressionStatement( SVAL_U( n[1] ) );
 		break;
 	case SVAL_RETURN_VALUE_STATEMENT:
-		EmitReturnStatement( n[1] );
+		EmitReturnStatement( SVAL_U( n[1] ) );
 		break;
 	case SVAL_RETURN_STATEMENT:
 		EmitEndStatement();
 		break;
 	case SVAL_WAIT_STATEMENT:
-		EmitWaitStatement( n[1], n[2], n[3] );
+		EmitWaitStatement( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ) );
 		break;
 	case SVAL_IF_STATEMENT:
-		EmitIfStatement( n[1], n[2], n[3] );
+		EmitIfStatement( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ) );
 		break;
 	case SVAL_IF_ELSE_STATEMENT:
-		EmitIfElseStatement( n[1], n[2], n[3], n[4] );
+		EmitIfElseStatement( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	case SVAL_WHILE_STATEMENT:
-		EmitWhileStatement( n[1], n[2], n[3], n[4] );
+		EmitWhileStatement( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	case SVAL_DO_WHILE_STATEMENT:
-		EmitDoWhileStatement( n[1], n[2], n[3], n[4] );
+		EmitDoWhileStatement( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	case SVAL_FOR_STATEMENT:
 		EmitForStatement( n[1], n[2], n[3], n[4], n[5], n[6] );
 		break;
 	case SVAL_INC_STATEMENT:
-		EmitIncStatement( n[1], n[2] );
+		EmitIncStatement( SVAL_U( n[1] ), SVAL_U( n[2] ) );
 		break;
 	case SVAL_DEC_STATEMENT:
-		EmitDecStatement( n[1], n[2] );
+		EmitDecStatement( SVAL_U( n[1] ), SVAL_U( n[2] ) );
 		break;
 	case SVAL_REF_ASSIGNMENT_STATEMENT:
-		EmitBinaryEqualsOperatorExpression( n[1], n[2], (unsigned char)n[3], n[4] );
+		EmitBinaryEqualsOperatorExpression( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ),
+												SVAL_U( n[4] ) );
 		break;
 	case SVAL_STATEMENT_BLOCK:
-		EmitStatementList( n[1] );
+		EmitStatementList( SVAL_U( n[1] ) );
 		break;
 	case SVAL_DEVELOPER_BLOCK:
-		EmitDeveloperStatementList( n[1], n[2] );
+		EmitDeveloperStatementList( SVAL_U( n[1] ), SVAL_U( n[2] ) );
 		break;
 	case SVAL_WAITTILL_STATEMENT:
-		EmitWaittillStatement( n[1], n[2], n[3], n[4] );
+		EmitWaittillStatement( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	case SVAL_WAITTILLMATCH_STATEMENT:
-		EmitWaittillmatchStatement( n[1], n[2], n[3], n[4] );
+		EmitWaittillmatchStatement( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	case SVAL_NOTIFY_STATEMENT:
-		EmitNotifyStatement( n[1], SVAL_LIST( n[2] ), n[3], n[4] );
+		EmitNotifyStatement( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	case SVAL_ENDON_STATEMENT:
-		EmitEndOnStatement( n[1], n[2], n[3], n[4] );
+		EmitEndOnStatement( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ), SVAL_U( n[4] ) );
 		break;
 	case SVAL_SWITCH_STATEMENT:
-		EmitSwitchStatement( n[1], n[2], n[3] );
+		EmitSwitchStatement( SVAL_U( n[1] ), SVAL_U( n[2] ), SVAL_U( n[3] ) );
 		break;
 	case SVAL_CASE_STATEMENT:
-		EmitCaseStatement( n[1], n[2] );
+		EmitCaseStatement( SVAL_U( n[1] ), SVAL_U( n[2] ) );
 		break;
 	case SVAL_DEFAULT_STATEMENT:
-		EmitDefaultStatement( n[1] );
+		EmitDefaultStatement( SVAL_U( n[1] ) );
 		break;
 	case SVAL_BREAK_STATEMENT:
-		EmitBreakStatement( n[1] );
+		EmitBreakStatement( SVAL_U( n[1] ) );
 		break;
 	case SVAL_CONTINUE_STATEMENT:
-		EmitContinueStatement( n[1] );
+		EmitContinueStatement( SVAL_U( n[1] ) );
 		break;
 	default:
 		break;
@@ -2437,10 +2570,10 @@ static void EmitStatement( sval_t node ) {
 }
 
 /* ---- EmitStatementList  0x0046C4E0 ---- */
-static void EmitStatementList( sval_t block ) {
+static void EmitStatementList( sval_u block ) {
 	sval_cell_t    *item;
 
-	for ( item = SVAL_BLOCKLIST( block )->head; item; item = item->next ) {
+	for ( item = SVAL_BLOCKLIST( block.value )->head; item; item = item->next ) {
 		EmitStatement( item->value );
 	}
 }
@@ -2479,21 +2612,21 @@ static void Scr_TransferStatementListToDeveloperBuffer( void ) {
 	scrCompilePub_checksum = savedChecksum;
 
 	if ( codeOffset >= scrCompileGlob_devPatchMax ) {
-		oldCapacity = scrCompileGlob_devPatchMax;
-		newCapacity = oldCapacity * 2;
+		newCapacity = scrCompileGlob_devPatchMax * 2;
 		if ( newCapacity <= codeOffset ) {
 			newCapacity = codeOffset * 2;
 		}
 
 		newTable = (char **)Z_MallocInternal( newCapacity * (int)sizeof( char * ) );
+		oldCapacity = scrCompileGlob_devPatchMax;
 		Com_Memcpy( newTable, (const void *)scrCompileGlob_devPatchTable,
 					(size_t)oldCapacity * sizeof( char * ) );
-		Com_Memset( &newTable[oldCapacity], 0,
-					(size_t)( newCapacity - oldCapacity ) * sizeof( char * ) );
+		Com_Memset( &newTable[scrCompileGlob_devPatchMax], 0,
+					(size_t)( newCapacity - scrCompileGlob_devPatchMax ) * sizeof( char * ) );
 
 		scrCompileGlob_devPatchMax = newCapacity;
 		free( (void *)scrCompileGlob_devPatchTable );
-		scrCompileGlob_devPatchTable = (int)newTable;
+		scrCompileGlob_devPatchTable = (void *)newTable;
 	}
 
 	( (char **)scrCompileGlob_devPatchTable )[codeOffset] =
@@ -2504,17 +2637,22 @@ static void Scr_TransferStatementListToDeveloperBuffer( void ) {
 }
 
 /* ---- EmitDeveloperStatementList  0x0046C660 ---- */
-static void EmitDeveloperStatementList( sval_t block, unsigned int sourcePos ) {
+static void EmitDeveloperStatementList( sval_u block, sval_u sourcePos ) {
 	int     savedChecksum;
 	void   *tempMark;
 
 	if ( scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
-		CompileError( sourcePos, "cannot recurse /#" );
+		CompileError( sourcePos.sourcePosValue, "cannot recurse /#" );
 	}
 
 	savedChecksum = scrCompilePub_checksum;
 
-	if ( scrCompilePub_developerScript ) {
+	if ( !scrCompilePub_developerScript ) {
+		tempMark = TempMalloc( 0 );
+		scrCompileGlob_codegenMode = SCR_CODEGEN_DISCARD;
+		EmitStatementList( block );
+		TempMemorySetPos( tempMark );
+	} else {
 		if ( !scrCompileGlob_bDeferredCheck ) {
 			EmitOpcode( OP_DevBlockBegin, 0, LOCALDEPTH_NONE );
 			scrCompileGlob_codeRelocStart = scrCompileGlob_codePos;
@@ -2522,11 +2660,6 @@ static void EmitDeveloperStatementList( sval_t block, unsigned int sourcePos ) {
 		scrCompileGlob_codegenMode = SCR_CODEGEN_RELOCATE;
 		EmitStatementList( block );
 		scrCompileGlob_bDeferredCheck = 1;
-	} else {
-		tempMark = TempMalloc( 0 );
-		scrCompileGlob_codegenMode = SCR_CODEGEN_DISCARD;
-		EmitStatementList( block );
-		TempMemorySetPos( tempMark );
 	}
 
 	scrCompileGlob_codegenMode = SCR_CODEGEN_INTERN;
@@ -2539,14 +2672,15 @@ void Scr_InitDeveloperOpcodes__Fv( void ) {
 		return;
 	}
 
-	scrCompileGlob_devOpBuffer   = (int)Z_MallocInternal( SCR_DEV_OP_BUF_SIZE );
+	scrCompileGlob_devOpBuffer   = Z_MallocInternal( SCR_DEV_OP_BUF_SIZE );
 	scrCompileGlob_devPatchMax   = SCR_DEV_PATCH_CAPACITY;
 	scrCompileGlob_devPatchTable =
-		(int)Z_MallocInternal( SCR_DEV_PATCH_CAPACITY * (int)sizeof( char * ) );
+		Z_MallocInternal( SCR_DEV_PATCH_CAPACITY * (int)sizeof( char * ) );
 	Com_Memset( (void *)scrCompileGlob_devPatchTable, 0,
 				SCR_DEV_PATCH_CAPACITY * sizeof( char * ) );
 
-	scrCompilePub_developerBufPos = scrCompileGlob_devOpBuffer;
+	scrCompilePub_developerBufPos = (char *)scrCompileGlob_devOpBuffer;
+	Com_Memset( scrVmGlob_devCallStack, 0, sizeof( scrVmGlob_devCallStack ) );   /* 0x00A7A488, 0x80 bytes */
 	scrCompileGlob_stringFixups   = 0;
 }
 
@@ -2555,6 +2689,7 @@ void Scr_InsertDeveloperOpcodes__Fv( void ) {
 	int                 codeOffset;
 	char               *patch;
 	scrStringFixup_t   *fixup;
+	scrStringFixup_t   *next;
 	unsigned short      string;
 
 	if ( !scrCompilePub_developerScript ) {
@@ -2570,13 +2705,13 @@ void Scr_InsertDeveloperOpcodes__Fv( void ) {
 	}
 
 	while ( scrCompileGlob_stringFixups ) {
-		fixup  = (scrStringFixup_t *)scrCompileGlob_stringFixups;
-		string = *fixup->codePos;
-		if ( string ) {
-			*fixup->codePos = SL_TransferToCanonicalString( string );
+		fixup = (scrStringFixup_t *)scrCompileGlob_stringFixups;
+		if ( *fixup->codePos ) {
+			*fixup->codePos = SL_TransferToCanonicalString( *fixup->codePos );
 		}
-		scrCompileGlob_stringFixups = (int)fixup->next;
+		next = fixup->next;
 		free( fixup );
+		scrCompileGlob_stringFixups = (void *)next;
 	}
 }
 
@@ -2597,48 +2732,45 @@ void Scr_ShutdownDeveloperOpcodes__Fv( void ) {
 }
 
 /* ---- EmitFormalParameterListRef  0x0046C910 ---- VERIFIED */
-static void EmitFormalParameterListRef( sval_list_t *parameters,
-										unsigned int sourcePos ) {
-	EmitFormalParameterListRefInternal( parameters->first );
+static void EmitFormalParameterListRef( sval_u exprlist, sval_u sourcePos ) {
+	EmitFormalParameterListRefInternal( SVAL_LIST( exprlist.value )->first );
 	EmitOpcode( OP_CheckClearParams, 0, LOCALDEPTH_NONE );
-	AddOpcodePos( sourcePos );
+	AddOpcodePos( sourcePos.sourcePosValue );
 }
 
 /* ---- SpecifyThread  0x0046C940 ---- */
-static void SpecifyThread( sval_t node ) {
-	sval_t         *n = SVAL_NODE( node );
-	unsigned short  functionObject;
+static void SpecifyThread( sval_u node ) {
+	sval_t         *n = SVAL_NODE( node.value );
 
-	if ( n[0] == SVAL_FUNCTION_DEFINITION ) {
-		functionObject = GetObject( GetVariable(
-			SCR_HANDLE( scrCompileGlob_currentFuncRoot ), (unsigned short)n[1] ) );
-		SpecifyThreadPosition( functionObject, n[4] );
-	} else if ( n[0] == SVAL_DEVELOPER_FUNCTION_DEF ) {
-		functionObject = GetObject( GetVariable(
-			SCR_HANDLE( scrCompileGlob_currentFuncRoot ), (unsigned short)n[1] ) );
-		SpecifyDeveloperThreadPosition( functionObject, n[4] );
+	switch ( n[0] ) {
+	case SVAL_FUNCTION_DEFINITION:
+		SpecifyThreadPosition( GetObject( GetVariable( scrCompileGlob_currentFuncRoot, (unsigned short)n[1] ) ), n[4] );
+		break;
+	case SVAL_DEVELOPER_FUNCTION_DEF:
+		SpecifyDeveloperThreadPosition( GetObject( GetVariable( scrCompileGlob_currentFuncRoot, (unsigned short)n[1] ) ), n[4] );
+		break;
 	}
 }
 
 /* ---- EmitThreadInternal  0x0046C9C0 ---- */
-static void EmitThreadInternal( sval_t node, unsigned int sourcePos ) {
-	sval_t *n = SVAL_NODE( node );
+static void EmitThreadInternal( sval_u node, sval_u sourcePos ) {
+	sval_t *n = SVAL_NODE( node.value );
 
-	AddOpcodePos( sourcePos );
+	AddOpcodePos( sourcePos.sourcePosValue );
 
 	scrCompileGlob_cumulOffset   = 0;
 	scrCompileGlob_maxOffset     = 0;
 	scrCompileGlob_maxCallOffset = 0;
 
 	CompileTransferRefToString( (unsigned short)n[1], SCR_STRING_USAGE_FUNCTION );
-	EmitFormalParameterListRef( SVAL_LIST( n[2] ), sourcePos );
-	EmitStatementList( n[3] );
+	EmitFormalParameterListRef( SVAL_U( n[2] ), sourcePos );
+	EmitStatementList( SVAL_U( n[3] ) );
 	EmitOpcode( OP_End, 0, LOCALDEPTH_NONE );
 
 	if ( scrCompileGlob_maxOffset
 	   + SCR_LOCAL_SLOT_WIDTH * scrCompileGlob_maxCallOffset
 	   >= SCR_OPERAND_STACK_LIMIT ) {
-		CompileError( sourcePos, "function exceeds operand stack size" );
+		CompileError( sourcePos.sourcePosValue, "function exceeds operand stack size" );
 	}
 }
 
@@ -2648,34 +2780,34 @@ static void EmitNormalThread( sval_t node, unsigned int sourcePos ) {
 	unsigned short  functionObject;
 
 	functionObject = FindObject( FindVariable(
-		SCR_HANDLE( scrCompileGlob_currentFuncRoot ), (unsigned short)n[1] ) );
+		scrCompileGlob_currentFuncRoot, (unsigned short)n[1] ) );
 	SetThreadPosition( functionObject );
-	EmitThreadInternal( node, sourcePos );
+	EmitThreadInternal( SVAL_U( node ), SVAL_U( sourcePos ) );
 }
 
 /* ---- EmitDeveloperThread  0x0046CB30 ---- */
-static void EmitDeveloperThread( sval_t node, unsigned int sourcePos ) {
-	sval_t         *n = SVAL_NODE( node );
+static void EmitDeveloperThread( sval_u node, sval_u sourcePos ) {
+	sval_t         *n = SVAL_NODE( node.value );
 	int             savedChecksum;
 	unsigned short  functionObject;
 
 	if ( scrCompileGlob_codegenMode != SCR_CODEGEN_INTERN ) {
-		CompileError( sourcePos, "cannot recurse /#" );
+		CompileError( sourcePos.sourcePosValue, "cannot recurse /#" );
 	}
 
 	scrCompileGlob_codeRelocStart = (int)TempMalloc( 0 );
 	savedChecksum = scrCompilePub_checksum;
 
-	if ( scrCompilePub_developerScript ) {
-		scrCompileGlob_codegenMode = SCR_CODEGEN_RELOCATE;
-		functionObject = FindObject( FindVariable(
-			SCR_HANDLE( scrCompileGlob_currentFuncRoot ), (unsigned short)n[1] ) );
-		SetDeveloperThreadPosition( functionObject );
-		EmitThreadInternal( node, sourcePos );
-		Scr_TransferToDeveloperBuffer();
-	} else {
+	if ( !scrCompilePub_developerScript ) {
 		scrCompileGlob_codegenMode = SCR_CODEGEN_DISCARD;
 		EmitThreadInternal( node, sourcePos );
+	} else {
+		scrCompileGlob_codegenMode = SCR_CODEGEN_RELOCATE;
+		functionObject = FindObject( FindVariable(
+			scrCompileGlob_currentFuncRoot, (unsigned short)n[1] ) );
+		SetDeveloperThreadPosition( functionObject, SVAL_U( n[4] ) );
+		EmitThreadInternal( node, sourcePos );
+		Scr_TransferToDeveloperBuffer();
 	}
 
 	scrCompileGlob_codegenMode = SCR_CODEGEN_INTERN;
@@ -2684,41 +2816,33 @@ static void EmitDeveloperThread( sval_t node, unsigned int sourcePos ) {
 }
 
 /* ---- EmitThread  0x0046CC30 ---- */
-static void EmitThread( sval_t node, unsigned int sourcePos ) {
-	sval_t         *n = SVAL_NODE( node );
-	unsigned short  treeNameHandle;
-	const char     *treeName;
+static void EmitThread( sval_u node, sval_u sourcePos ) {
+	sval_t         *n = SVAL_NODE( node.value );
 
-	if ( n[0] == SVAL_FUNCTION_DEFINITION ) {
-		EmitNormalThread( node, sourcePos );
-		return;
-	}
-	if ( n[0] == SVAL_DEVELOPER_FUNCTION_DEF ) {
+	switch ( n[0] ) {
+	case SVAL_FUNCTION_DEFINITION:
+		EmitNormalThread( node.value, sourcePos.sourcePosValue );
+		break;
+	case SVAL_DEVELOPER_FUNCTION_DEF:
 		EmitDeveloperThread( node, sourcePos );
-		return;
-	}
-	if ( n[0] == SVAL_USING_ANIMTREE ) {
-		treeNameHandle = (unsigned short)n[1];
-		treeName = SL_ConvertToString( treeNameHandle );
-		if ( !Scr_IsIdentifier( treeName ) ) {
-			CompileError( n[2], "bad anim tree name" );
-		}
-		SCR_HANDLE( scrAnimPub_currentAnimTree ) =
-			Scr_UsingTreeInternal( treeName, &scrCompileGlob_animTreeValue );
-		CompileRemoveRefToString( treeNameHandle );
+		break;
+	case SVAL_USING_ANIMTREE:
+		Scr_UsingTree( SL_ConvertToString( (unsigned short)n[1] ), n[2] );
+		CompileRemoveRefToString( (unsigned short)n[1] );
+		break;
 	}
 }
 
 /* ---- EmitThreadList  0x0046CCD0 ---- */
-static void EmitThreadList( sval_t block ) {
+static void EmitThreadList( sval_u block ) {
 	sval_cell_t    *item;
 
-	for ( item = SVAL_BLOCKLIST( block )->head; item; item = item->next ) {
-		SpecifyThread( SVAL_ENTRY( item->value )->node );
+	for ( item = SVAL_BLOCKLIST( block.value )->head; item; item = item->next ) {
+		SpecifyThread( SVAL_U( SVAL_ENTRY( item->value )->node ) );
 	}
-	for ( item = SVAL_BLOCKLIST( block )->head; item; item = item->next ) {
-		EmitThread( SVAL_ENTRY( item->value )->node,
-					SVAL_ENTRY( item->value )->sourcePos );
+	for ( item = SVAL_BLOCKLIST( block.value )->head; item; item = item->next ) {
+		EmitThread( SVAL_U( SVAL_ENTRY( item->value )->node ),
+					SVAL_U( SVAL_ENTRY( item->value )->sourcePos ) );
 	}
 }
 
@@ -2729,13 +2853,13 @@ void ScriptCompile( sval_t parseTree, unsigned short currentFunctionRoot ) {
 	int                 index;
 	const char         *filename;
 
-	SCR_HANDLE( scrCompileGlob_currentFuncRoot ) = currentFunctionRoot;
+	scrCompileGlob_currentFuncRoot = currentFunctionRoot;
 
 	scrCompileGlob_codePos        = (int)TempMalloc( 0 );
+	scrCompileGlob_bOwnsStrings   = 0;
 	scrCompileGlob_animTreeValue  = 0;
 	scrCompileGlob_codegenMode    = SCR_CODEGEN_INTERN;
 	scrCompileGlob_bDeferredCheck = 0;
-	scrCompileGlob_bOwnsStrings   = 0;
 
 	pendingCount = scrCompilePub_scriptCount;
 	pendingLoads = pendingCount
@@ -2744,7 +2868,7 @@ void ScriptCompile( sval_t parseTree, unsigned short currentFunctionRoot ) {
 	scrCompileGlob_loadCursor = (int)pendingLoads;
 
 	EmitOpcode( OP_End, 0, LOCALDEPTH_NONE );
-	EmitThreadList( SVAL_NODE( parseTree )[1] );
+	EmitThreadList( SVAL_U( SVAL_NODE( parseTree )[1] ) );
 
 	scrCompilePub_programLen =
 		(int)( (char *)TempMalloc( 0 ) - (char *)scrVarPub_programBuffer );
@@ -2765,3 +2889,7 @@ void ScriptCompile( sval_t parseTree, unsigned short currentFunctionRoot ) {
 		SL_RemoveRefToString( pendingLoads[index].filename );
 	}
 }
+
+#ifdef __cplusplus
+}
+#endif

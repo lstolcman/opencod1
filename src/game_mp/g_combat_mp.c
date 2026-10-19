@@ -1,19 +1,4 @@
-/*
- * g_combat_mp.c -- damage and death for the multiplayer game module.
- *
- * The skeleton is RTCW's game/g_combat.c: LookAtKiller, player_die, G_Damage,
- * CanDamage and G_RadiusDamage are all still recognisable.  What CoD replaced
- * is the top of the file and the client path -- the hit-location table
- * (G_HitLocStrcpy .. G_GetHitLocationIndexFromString, parsed out of
- * info/mp_lochit_dmgtable) and G_DamageClient, which scales by the hit
- * location and hands the whole event to the script's Callback_PlayerDamage
- * instead of touching armour or knockback.  RTCW's own scoring is gone:
- * AddScore is an empty stub and the score lives in the script.
- *
- * Function order is binary order (0x2001FF90 .. 0x20020FF0).
- *
- * @fidelity: likely
- */
+// g_combat_mp.c -- damage, death and the hit location tables
 
 #include "g_local.h"
 
@@ -21,53 +6,18 @@
 #include <stdlib.h>
 #include <math.h>
 
-/* Declarations that belong in a shared header. */
-
-#define ENTITYNUM_WORLD             ( MAX_GENTITIES - 2 )
-
-#define PITCH                       0
-#define YAW                         1
-#define ROLL                        2
-
-/* playerState_t.stats[].  Only the one LookAtKiller writes (0x2002025A). */
-#define STAT_DEAD_YAW               1
-
-/* entityState_t.eType.  4 is the missile type (fire_grenade / fire_rocket,
- * G_RunMissile's post-impact check); 5 is the mover branch of G_Damage below
- * (0x2002068A), which fires the entity's use function; 11 is g_utils_mp.c's
- * ET_TURRET, re-tested by player_die (0x20020324). */
-#define ET_MOVER                    5
-#define ET_TURRET                   11
-
-/* The two mounted-turret bits of playerState_t.eFlags; the game only ever
- * tests them together (player_die 0x20020310, FireWeapon 0x2003D164). */
-#define EF_TURRET_ACTIVE            0x0000C000
-
-/* The event player_die raises on the corpse (0x20020456).  Not inferred:
-   bg_misc.c's eventnames[] (0x2006C8B8) spells index 189 "EV_DEATH". */
-#define EV_DEATH                    189
-
-#define CONTENTS_CORPSE             0x04000000      /* player_die 0x200204FB */
 #define MASK_ALL                    ( -1 )
-#define MASK_GRENADE_TRACE          0x00000011      /* G_RadiusDamage 0x20020E25 */
-#define MASK_CANDAMAGE              0x02802091      /* CanDamage 0x20020A2B */
+#define MASK_CANDAMAGE              0x02802091
 
-/* The floor G_Damage clamps a dead entity's health to (0x2002077C). */
+// the floor G_Damage clamps a dead entity's health to
 #define GIB_HEALTH                  -999
 
-/*
- * q_shared.h carries these in the original tree.  CoD divides by 32768, not
- * Q3's 32767 (the multiplier at 0x2005FB04 is exactly 1/32768; player_die
- * 0x20020354).  crandom() is spelled as the machine spells it -- 2*r - 1, one
- * add and one subtract.
- */
+// these divide by 32768, not 32767
+// keep: crandom's form matches original codegen
 #define random()                    ( rand() * ( 1.0f / 32768.0f ) )
 #define crandom()                   ( 2.0f * random() - 1.0f )
 
-/*
- * One entry of the parse table ParseConfigStringToStruct walks.  The hitloc
- * table only ever uses the float type.
- */
+// a field of the table ParseConfigStringToStruct walks
 typedef struct parseField_s {
 	const char      *key;
 	int ofs;
@@ -78,68 +28,37 @@ typedef struct parseField_s {
 
 /* forward: q_shared.c / q_math.c */
 float           VectorNormalize2( const vec3_t v, vec3_t out );
+qboolean        Info_Validate( const char *s );
 float           vectoyaw( const vec3_t vec );
 void            AddLeanToPosition( vec3_t pos, float yaw, float leanFrac,
 								   float rightScale, float upScale );
-int             ParseConfigStringToStruct( const parseField_t *fields, void *base, int count,
-										   const char *buffer, int unused1, void *unused2,
+int             ParseConfigStringToStruct( const parseField_t *fields, void *base, int numFields,
+										   const char *buffer, int numGenericTypes, void *parseSpecific,
 										   void ( *copyString )( char *dest, const char *src ) );
 
 /* forward: g_main_mp.c */
 void            Com_Printf( const char *fmt, ... );
-extern vmCvar_t g_debugDamage;                  /* 0x202375E0 */
+extern vmCvar_t g_debugDamage;
 
 /* forward: g_cmds_mp.c */
 void            DeathmatchScoreboardMessage( gentity_t *ent );
 
-/*
- * forward: g_scr_main_mp.c.  Scr_PlayerDamage / Scr_PlayerKilled are the two
- * script callbacks this unit raises.  Scr_PlayerDamage takes its first four
- * arguments in registers.
- */
-qboolean        Scr_PlayerDamage( int hitLoc, const vec3_t point, int mod, const vec3_t dir,
-								  gentity_t *self, gentity_t *inflictor, gentity_t *attacker,
-								  int damage, int dflags, int weapon );
+/* forward: g_scr_main_mp.c -- the script callbacks this unit raises */
+void            Scr_PlayerDamage( gentity_t *self, gentity_t *inflictor, gentity_t *attacker,
+								  int damage, int dflags, int mod, int weapon, const vec3_t point,
+								  const vec3_t dir, int hitLoc );
 void            Scr_PlayerKilled( gentity_t *self, gentity_t *inflictor, gentity_t *attacker,
 								  int damage, int mod, int weapon, const float *dir, int hitLoc );
 
 /*
- * ---------------------------------------------------------------------------
- * Hit-location and means-of-death tables.
- * ---------------------------------------------------------------------------
- */
+============================================================================
 
-/* 0x2006A510.  G_IndexForMeansOfDeath walks all MOD_NUM_MODS of them and
- * Scr_PlayerDamage indexes it to build the sMeansOfDeath script string. */
-const char *modNames[MOD_NUM_MODS] = {
-	"MOD_UNKNOWN",
-	"MOD_PISTOL_BULLET",
-	"MOD_RIFLE_BULLET",
-	"MOD_GRENADE",
-	"MOD_GRENADE_SPLASH",
-	"MOD_PROJECTILE",
-	"MOD_PROJECTILE_SPLASH",
-	"MOD_MELEE",
-	"MOD_HEAD_SHOT",
-	"MOD_MORTAR",
-	"MOD_MORTAR_SPLASH",
-	"MOD_KICKED",
-	"MOD_GRABBER",
-	"MOD_DYNAMITE",
-	"MOD_DYNAMITE_SPLASH",
-	"MOD_AIRSTRIKE",
-	"MOD_WATER",
-	"MOD_SLIME",
-	"MOD_LAVA",
-	"MOD_CRUSH",
-	"MOD_TELEFRAG",
-	"MOD_FALLING",
-	"MOD_SUICIDE",
-	"MOD_TRIGGER_HURT",
-	"MOD_EXPLOSIVE"
-};
+HIT LOCATIONS AND MEANS OF DEATH
 
-/* 0x2006A498 -- also the key each hitloc damage multiplier is parsed from. */
+============================================================================
+*/
+
+// also the keys the hitloc damage multipliers are parsed from
 static const char *hitLocationNames[HITLOC_NUM] = {
 	"none",
 	"helmet",
@@ -162,8 +81,8 @@ static const char *hitLocationNames[HITLOC_NUM] = {
 	"gun"
 };
 
-float g_fHitLocDamageMult[HITLOC_NUM];                  /* 0x2014F940 */
-unsigned short hitLocationConstStrings[HITLOC_NUM];     /* 0x20089708 */
+float g_fHitLocDamageMult[HITLOC_NUM];
+unsigned short hitLocationConstStrings[HITLOC_NUM];
 
 /*
 ==================
@@ -210,8 +129,7 @@ void G_ParseHitLocDmgTable( void ) {
 		return;
 	}
 
-	/* Only a positive length was required above: a file shorter than the magic
-	   reads uninitialised stack here and makes the remainder below negative. */
+	// note: a file shorter than the magic is not caught here
 	trap_FS_Read( buffer, magicLen, f );
 	buffer[magicLen] = 0;
 	if ( strncmp( buffer, magic, magicLen ) ) {
@@ -226,11 +144,11 @@ void G_ParseHitLocDmgTable( void ) {
 	}
 
 	trap_FS_Read( buffer, len, f );
-	buffer[len] = 0;
+	// keep: matches original codegen
+	*( buffer + len ) = 0;
 	trap_FS_FCloseFile( f );
 
-	/* Info_Validate, inlined. */
-	if ( strchr( buffer, '"' ) || strchr( buffer, ';' ) ) {
+	if ( !Info_Validate( buffer ) ) {
 		Com_Error( ERR_DROP, "\x15" "\"%s\" is not a valid hitloc damage table\n", path );
 		return;
 	}
@@ -241,13 +159,57 @@ void G_ParseHitLocDmgTable( void ) {
 	}
 }
 
+// hit location priorities trap_LocationalTrace picks the winning part with;
+// the rifle map weights the head and torso far above the limbs
+// keep: original data layout
+byte bulletPriorityMap[HITLOC_NUM] = {
+	1,
+	3, 3, 3, 3, 3, 3, 3, 3, 3,
+	3, 3, 3, 3, 3, 3, 3, 3,
+	0
+};
+
+byte riflePriorityMap[HITLOC_NUM] = {
+	1,
+	9, 9, 9, 8, 7, 6, 6, 6, 6,
+	5, 5, 4, 4, 4, 4, 3, 3,
+	0
+};
+
+// means of death names, as the script sees them
+const char *modNames[MOD_NUM_MODS] = {
+	"MOD_UNKNOWN",
+	"MOD_PISTOL_BULLET",
+	"MOD_RIFLE_BULLET",
+	"MOD_GRENADE",
+	"MOD_GRENADE_SPLASH",
+	"MOD_PROJECTILE",
+	"MOD_PROJECTILE_SPLASH",
+	"MOD_MELEE",
+	"MOD_HEAD_SHOT",
+	"MOD_MORTAR",
+	"MOD_MORTAR_SPLASH",
+	"MOD_KICKED",
+	"MOD_GRABBER",
+	"MOD_DYNAMITE",
+	"MOD_DYNAMITE_SPLASH",
+	"MOD_AIRSTRIKE",
+	"MOD_WATER",
+	"MOD_SLIME",
+	"MOD_LAVA",
+	"MOD_CRUSH",
+	"MOD_TELEFRAG",
+	"MOD_FALLING",
+	"MOD_SUICIDE",
+	"MOD_TRIGGER_HURT",
+	"MOD_EXPLOSIVE"
+};
+
 /*
 =================
 AddScore
 
-Empty in 1.1 -- multiplayer scoring lives in the script.  The binary is a
-single ret, ICF-folded with every other empty function, so the parameters are
-RTCW's.
+Multiplayer scoring is done by the script.
 =================
 */
 void AddScore( gentity_t *ent, int score ) {
@@ -282,13 +244,13 @@ int G_IndexForMeansOfDeath( const char *name ) {
 	int i;
 
 	for ( i = 0 ; i < MOD_NUM_MODS ; i++ ) {
-		if ( !Q_stricmp( modNames[i], name ) ) {
+		if ( !Q_stricmp( name, modNames[i] ) ) {
 			return i;
 		}
 	}
 
 	Com_Printf( "Unknown means of death string '%s'\n", name );
-	return 0;
+	return MOD_UNKNOWN;
 }
 
 /*
@@ -324,13 +286,13 @@ void player_die( gentity_t *self, gentity_t *inflictor, gentity_t *attacker, int
 
 	// a cooking grenade goes off where the player fell
 	if ( self->client->ps.grenadeTimeLeft ) {
-		throwDir[0] = crandom() * 160;
-		throwDir[1] = crandom() * 160;
-		throwDir[2] = random() * 160;
+		throwDir[0] = crandom();
+		throwDir[1] = crandom();
+		throwDir[2] = random();
+		VectorScale( throwDir, 160, throwDir );
 
-		start[0] = self->r.currentOrigin[0];
-		start[1] = self->r.currentOrigin[1];
-		start[2] = self->r.currentOrigin[2] + 40;
+		VectorCopy( self->r.currentOrigin, start );
+		start[2] += 40;
 
 		fire_grenade( self, start, throwDir, self->s.weapon );
 	}
@@ -398,6 +360,8 @@ void G_DamageClient( gentity_t *targ, gentity_t *inflictor, gentity_t *attacker,
 		return;
 	}
 
+	damage = (int)( damage * g_fHitLocDamageMult[hitLoc] );
+
 	if ( inflictor ) {
 		weapon = inflictor->s.weapon;
 	} else if ( attacker ) {
@@ -406,27 +370,26 @@ void G_DamageClient( gentity_t *targ, gentity_t *inflictor, gentity_t *attacker,
 		weapon = 0;
 	}
 
-	Scr_PlayerDamage( hitLoc, point, mod, dir, targ, inflictor, attacker,
-					  (int)( damage * g_fHitLocDamageMult[hitLoc] ), dflags, weapon );
+	Scr_PlayerDamage( targ, inflictor, attacker, damage, dflags, mod, weapon, point, dir, hitLoc );
 }
 
 /*
 ============
 G_Damage
 
-targ        entity that is being damaged
-inflictor   entity that is causing the damage
-attacker    entity that caused the inflictor to damage targ
-dir         direction of the attack
-point       point at which the damage is being inflicted
-damage      amount of damage being inflicted
-dflags      passed straight on to the script as iDFlags; 1.1 never tests it
-mod         means-of-death index
-hitLoc      hit location index, indexes the hitloc damage multiplier table
+targ		entity that is being damaged
+inflictor	entity that is causing the damage
+attacker	entity that caused the inflictor to damage targ
+	example: targ=monster, inflictor=rocket, attacker=player
 
-`attacker` and `dflags` are the two arguments LTCG register-allocated (eax and
-ecx); call sites: pain and die (0x20020875, 0x200207DB), G_DamageClient's
-forwarding (0x20020655).
+dir			direction of the attack
+point		point at which the damage is being inflicted
+damage		amount of damage being inflicted
+dflags		passed on to the script as iDFlags
+mod			means of death
+hitLoc		hit location, scales the damage taken by clients
+
+inflictor, attacker, dir, and point can be NULL for environmental effects
 ============
 */
 void G_Damage( gentity_t *targ, gentity_t *inflictor, gentity_t *attacker, const vec3_t dir,
@@ -460,17 +423,18 @@ void G_Damage( gentity_t *targ, gentity_t *inflictor, gentity_t *attacker, const
 		return;
 	}
 
-	// unconditional, and ahead of the godmode test -- a NULL dir reaches this
+	// note: done ahead of the godmode test, even for a NULL dir
 	VectorNormalize2( dir, normalizedDir );
 
+	// check for godmode
 	if ( targ->flags & FL_GODMODE ) {
 		return;
 	}
 
-	take = damage;
-	if ( take < 1 ) {
-		take = 1;
+	if ( damage < 1 ) {
+		damage = 1;
 	}
+	take = damage;
 
 	if ( g_debugDamage.integer ) {
 		G_Printf( "target:%i health:%i damage:%i\n", targ->s.number, targ->health, take );
@@ -512,26 +476,25 @@ void G_Damage( gentity_t *targ, gentity_t *inflictor, gentity_t *attacker, const
 ============
 CanDamage
 
-Returns the fraction of the target an explosion at `origin` can see.  A client
+Returns the fraction of the target an explosion at origin can see.  A client
 is sampled at five points spread across its body, so it can be partly covered;
-anything else keeps Q3's all-or-nothing answer.
+anything else is all or nothing.
 ============
 */
 float CanDamage( gentity_t *targ, const vec3_t origin ) {
 	vec3_t dest[5];
-	vec3_t midpoint;
-	vec3_t eyePos;
 	vec3_t dir, perp;
+	vec3_t eyePos;
 	trace_t tr;
 	float halfHeight;
+	float side;
 	int hits;
 	int i;
 
 	if ( targ->client ) {
 		VectorCopy( targ->r.currentOrigin, eyePos );
 		eyePos[2] += targ->client->ps.viewHeightCurrent;
-		AddLeanToPosition( eyePos, targ->client->ps.viewangles[YAW], targ->client->ps.leanf,
-						   16.0, 20.0 );
+		G_AddLean( targ, eyePos );
 
 		halfHeight = ( eyePos[2] - targ->r.currentOrigin[2] ) * 0.5f;
 
@@ -544,19 +507,19 @@ float CanDamage( gentity_t *targ, const vec3_t origin ) {
 		perp[1] = dir[0];
 		perp[2] = dir[2];
 
-		midpoint[0] = ( eyePos[0] + targ->r.currentOrigin[0] ) * 0.5f;
-		midpoint[1] = ( eyePos[1] + targ->r.currentOrigin[1] ) * 0.5f;
-		midpoint[2] = ( eyePos[2] + targ->r.currentOrigin[2] ) * 0.5f;
+		VectorAdd( eyePos, targ->r.currentOrigin, dest[0] );
+		VectorScale( dest[0], 0.5f, dest[0] );
 
-		VectorCopy( midpoint, dest[0] );
-
-		VectorMA( midpoint, 15.0f, perp, dest[1] );
+		// keep: matches original codegen
+		side = 15;
+		VectorMA( dest[0], side, perp, dest[1] );
 		dest[1][2] += halfHeight;
-		VectorMA( midpoint, 15.0f, perp, dest[2] );
+		VectorMA( dest[0], side, perp, dest[2] );
 		dest[2][2] -= halfHeight;
-		VectorMA( midpoint, -15.0f, perp, dest[3] );
+		side = -15;
+		VectorMA( dest[0], side, perp, dest[3] );
 		dest[3][2] += halfHeight;
-		VectorMA( midpoint, -15.0f, perp, dest[4] );
+		VectorMA( dest[0], side, perp, dest[4] );
 		dest[4][2] -= halfHeight;
 
 		hits = 0;
@@ -577,15 +540,25 @@ float CanDamage( gentity_t *targ, const vec3_t origin ) {
 		return 1.0;
 	}
 
-	midpoint[0] = ( targ->r.absmin[0] + targ->r.absmax[0] ) * 0.5f;
-	midpoint[1] = ( targ->r.absmin[1] + targ->r.absmax[1] ) * 0.5f;
-	midpoint[2] = ( targ->r.absmin[2] + targ->r.absmax[2] ) * 0.5f;
+	// use the midpoint of the bounds instead of the origin, because
+	// bmodels may have their origin is 0,0,0
+	VectorAdd( targ->r.absmin, targ->r.absmax, dest[0] );
+	VectorScale( dest[0], 0.5f, dest[0] );
 
-	VectorCopy( midpoint, dest[0] );
-	VectorSet( dest[1], midpoint[0] + 15.0f, midpoint[1] + 15.0f, midpoint[2] );
-	VectorSet( dest[2], midpoint[0] + 15.0f, midpoint[1] - 15.0f, midpoint[2] );
-	VectorSet( dest[3], midpoint[0] - 15.0f, midpoint[1] + 15.0f, midpoint[2] );
-	VectorSet( dest[4], midpoint[0] - 15.0f, midpoint[1] - 15.0f, midpoint[2] );
+	// this should probably check in the plane of projection,
+	// rather than in world coordinate, and also include Z
+	VectorCopy( dest[0], dest[1] );
+	dest[1][0] += 15;
+	dest[1][1] += 15;
+	VectorCopy( dest[0], dest[2] );
+	dest[2][0] += 15;
+	dest[2][1] -= 15;
+	VectorCopy( dest[0], dest[3] );
+	dest[3][0] -= 15;
+	dest[3][1] += 15;
+	VectorCopy( dest[0], dest[4] );
+	dest[4][0] -= 15;
+	dest[4][1] -= 15;
 
 	for ( i = 0 ; i < 5 ; i++ ) {
 		trap_LocationalTrace( &tr, dest[i], origin, targ->s.number, MASK_CANDAMAGE,
@@ -614,9 +587,11 @@ qboolean G_RadiusDamage( const vec3_t origin, gentity_t *inflictor, gentity_t *a
 	vec3_t v;
 	vec3_t dir;
 	vec3_t midpoint;
+	vec3_t dest;
 	trace_t tr;
 	qboolean hitClient;
 	float visible;
+	rfloat boxRadius;
 	int i, e;
 
 	hitClient = qfalse;
@@ -629,9 +604,12 @@ qboolean G_RadiusDamage( const vec3_t origin, gentity_t *inflictor, gentity_t *a
 		radius = 1;
 	}
 
+	// radius * sqrt(2) for bounding box enlargement --
+	// bounding box was checking against radius / sqrt(2) if collision is along box plane
+	boxRadius = radius * 1.4142135f;
 	for ( i = 0 ; i < 3 ; i++ ) {
-		mins[i] = origin[i] - radius * 1.4142135f;
-		maxs[i] = origin[i] + radius * 1.4142135f;
+		mins[i] = origin[i] - boxRadius;
+		maxs[i] = origin[i] + boxRadius;
 	}
 
 	numListedEntities = trap_EntitiesInBox( mins, maxs, entityList, MAX_GENTITIES, MASK_ALL );
@@ -661,7 +639,8 @@ qboolean G_RadiusDamage( const vec3_t origin, gentity_t *inflictor, gentity_t *a
 			}
 		}
 
-		dist = VectorLength( v );
+		// keep: matches original codegen
+		dist = sqrt( v[2] * v[2] + v[1] * v[1] + v[0] * v[0] );
 		if ( dist >= radius ) {
 			continue;
 		}
@@ -681,34 +660,34 @@ qboolean G_RadiusDamage( const vec3_t origin, gentity_t *inflictor, gentity_t *a
 			// get knocked into the air more
 			dir[2] += 24;
 			G_Damage( ent, inflictor, attacker, dir, origin, (int)( points * visible ),
-					  DAMAGE_RADIUS, mod, 0 );
-			continue;
-		}
+					  DAMAGE_RADIUS, mod, HITLOC_NONE );
+		} else {
+			// no line of sight to the body: let a tenth of the damage through thin
+			// geometry if the box centre is close enough
+			VectorAdd( ent->r.absmin, ent->r.absmax, midpoint );
+			VectorScale( midpoint, 0.5, midpoint );
+			VectorCopy( midpoint, dest );
 
-		// no line of sight to the body: let a tenth of the damage through thin
-		// geometry if the box centre is close enough
-		midpoint[0] = ( ent->r.absmin[0] + ent->r.absmax[0] ) * 0.5;
-		midpoint[1] = ( ent->r.absmin[1] + ent->r.absmax[1] ) * 0.5;
-		midpoint[2] = ( ent->r.absmin[2] + ent->r.absmax[2] ) * 0.5;
+			trap_Trace( &tr, origin, vec3_origin, vec3_origin, dest, ENTITYNUM_NONE,
+						MASK_SOLID );
+			// keep: negated tests, so a NaN skips the entity
+			if ( !( tr.fraction < 1.0 ) ) {
+				continue;
+			}
 
-		trap_Trace( &tr, origin, vec3_origin, vec3_origin, midpoint, ENTITYNUM_NONE,
-					MASK_GRENADE_TRACE );
-		if ( tr.fraction >= 1.0 ) {
-			continue;
-		}
+			VectorSubtract( dest, origin, dest );
+			if ( !( sqrt( dest[2] * dest[2] + dest[1] * dest[1] + dest[0] * dest[0] ) < radius * 0.2f ) ) {
+				continue;
+			}
 
-		VectorSubtract( midpoint, origin, v );
-		if ( VectorLength( v ) >= radius * 0.2f ) {
-			continue;
+			if ( LogAccuracyHit( ent, attacker ) ) {
+				hitClient = qtrue;
+			}
+			VectorSubtract( ent->r.currentOrigin, origin, dir );
+			dir[2] += 24;
+			G_Damage( ent, inflictor, attacker, dir, origin, (int)( points * 0.1f ),
+					  DAMAGE_RADIUS, mod, HITLOC_NONE );
 		}
-
-		if ( LogAccuracyHit( ent, attacker ) ) {
-			hitClient = qtrue;
-		}
-		VectorSubtract( ent->r.currentOrigin, origin, dir );
-		dir[2] += 24;
-		G_Damage( ent, inflictor, attacker, dir, origin, (int)( points * 0.1f ),
-				  DAMAGE_RADIUS, mod, 0 );
 	}
 
 	return hitClient;
@@ -737,5 +716,5 @@ int G_GetHitLocationIndexFromString( unsigned short name ) {
 		}
 	}
 
-	return 0;
+	return HITLOC_NONE;
 }

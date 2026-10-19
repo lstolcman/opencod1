@@ -4,58 +4,114 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "tr_records.h"
 #include "tr_gl_types.h"
 #include "tr_tess.h"
+#include "tr_local.h"
 
-extern int GL_Cull();
-extern int GL_State();
-int __fastcall RB_BuildDlightArrays( unsigned char *a1, float *a2, float *a3, int a4 );
-void __cdecl RB_ComputeColors( int stage );
-extern int RB_ComputeTexCoords();
-extern int RB_DeformTessGeometry();
-void __cdecl RB_SetIteratorFog( void );
-extern int RB_SetupMultitexture();
 
-#define tess_numVertexes            tess_numVertexes   /* 0x0197FFA8 */
-#define tess_numIndexes             tess_numIndexes   /* 0x0197FFA4 */
-#define tess_vertexComponentCount   tess_vertexComponentCount   /* 0x0197FF80 */
-#define tess_shader                 tess_shader   /* 0x0197FF90 */
-#define tess_dlightBits             tess_dlightBits   /* 0x0197FFA0 */
-#define tess_activeStageCount       tess_activeStageCount   /* 0x019BFFBC */
-#define tess_activeStages           tess_activeStages   /* 0x019BFFC4 */
+
+/* ---- storage-of-record aliases -------------------------------------------
+ * Global renderer state stays on the existing tr_records.h / tr_local.h
+ * symbols; these #defines only give the ones this file uses their readable
+ * (RTCW/CoD-family) names.  Retyping happens on POINTER-passed data only. */
+
 #define tess_indexes_base           tess_indexes    /* 0x017A7F60 = tess base */
 
-#define rb_clientStateBits          glState_clientStateBits   /* 0x016C3954 */
-#define tr_dlightShader             tr_dlightShader   /* 0x016C4E14 */
 
+/* NV_vertex_array_range dynamic buffer: a mapped ring carved into fixed-size
+ * fenced allocations.  The ring entries live as struct { int offset; int size; }
+ * [512]; rb_nvFenceRingOffset/Size index the two interleaved words at stride 8. */
 #define rb_nvBufferBase             backEnd_dynamicBuffer_storage   /* 0x016D93EC */
 #define rb_nvBufferSize             backEnd_dynamicBuffer_capacity   /* 0x016D93F0 */
 #define rb_nvBufferCursor           backEnd_dynamicBuffer_currentOffset   /* 0x016D93F4 */
 #define rb_nvFenceHead              backEnd_dynamicBuffer_allocationSequence   /* 0x016D9400 */
 #define rb_nvFenceTail              backEnd_dynamicBuffer_reclaimSequence   /* 0x016D9404 */
 #define rb_nvBytesFree              backEnd_dynamicBuffer_freeBytes   /* 0x016D9408 */
-#define rb_nvFenceRingOffset        backEnd_dynamicBuffer_allocations   /* 0x016D940C, stride 8 */
-#define rb_nvFenceRingSize          dword_16D9410   /* 0x016D9410, stride 8 */
+#define rb_nvFenceRingOffset        backEnd_dynamicBuffer_allocations   /* 0x016D940C, ring[i].offset at [2*i] */
+#define rb_nvFenceRingSize          ( backEnd_dynamicBuffer_allocations + 1 )   /* 0x016D9410, ring[i].size at [2*i] */
 
-#define backEnd_currentEntity       backEnd_currentEntity   /* 0x016D8E5C */
-#define backEnd_currentLight        backEnd_currentDlight   /* 0x016D8E60 */
-#define backEnd_currentLightScale   backEnd_currentLightScale     /* 0x016D8E64 */
+#define backEnd_currentLight        backEnd_currentDlight   /* 0x016D8E60, dlight_t* */
 #define backEnd_num_dlights         backEnd_refdef_num_dlights   /* 0x016D8B1C */
-#define backEnd_dlights             backEnd_refdef_dlights   /* 0x016D8B24 */
+#define backEnd_dlights             backEnd_refdef_dlights   /* 0x016D8B24, dlight_t* base */
 
 
 #define R_MAX_SHADER_STAGES         8
-#define R_DLIGHT_STRIDE             0x88
-#define SHADER_STAGE_PER_LIGHT      0x80
-#define SHADER_LIGHTING_PER_ENTITY  0x80
+#define R_MAX_TEXTURE_UNITS         8
+#define R_DLIGHT_STRIDE             0x88          /* sizeof(dlight_t) */
+#define SHADER_STAGE_PER_LIGHT      0x80          /* stage->attributeBits bit: draw per dynamic light */
+#define SHADER_LIGHTING_PER_ENTITY  0x80          /* shader->lightingFlags bit: per-entity light pass */
 
-void RB_FinishFenceNV( void );
 
-/* ---- RB_FinishFenceNV  0x0050BB20 ----  VERIFIED */
-void RB_FinishFenceNV( void )
+
+/* -------------------------------------------------------------------------
+ *  Shader stage as seen by the NV interleaver (file-local; not in tr_local.h).
+ *
+ *  A stage's texture bundles begin at +0x04 with a 0xC8 stride (layout as
+ *  documented in tr_shade.c); only texCoordComponentCount (+0x8c) is read here.  attributeBits (+0x00) records
+ *  which per-vertex arrays the stage streams -- bit (8+tmu) selects texcoord
+ *  unit tmu, 0x10000 the color array, 0x20000 the normal array -- and the low
+ *  byte's sign bit (0x80) marks a per-light stage.  The bundles are reached
+ *  through STAGE_BUNDLES_OFFSET rather than the bundles[] member, as before.  Offsets proven against retail
+ *  RB_SingleStageGenericNV (0x0050BD60) and RB_ComputeColors (0x004FFA60).
+ * ------------------------------------------------------------------------- */
+typedef struct {
+	void  *image[32];               /* +0x00 */
+	int   numImageAnimations;       /* +0x80 */
+	float imageAnimationSpeed;      /* +0x84 */
+	void  *waterMap;                /* +0x88  waterMap_t (tr_shader.c) */
+	int   texCoordComponentCount;   /* +0x8c  texcoord components uploaded for this unit */
+	int   textureEnvMode;           /* +0x90 */
+	void  *texEnvCombine;           /* +0x94  ShaderTexEnvCombine (tr_shader.c) */
+	void  *nvTextureShader;         /* +0x98  ShaderNVTextureOperation (tr_shader.c) */
+	int   tcGen;                    /* +0x9c */
+	float tcGenVectors[2][3];       /* +0xa0  TCGEN_VECTOR (RB_ComputeTexCoords) */
+	int   numTexMods;               /* +0xb8 */
+	void  *texMods;                 /* +0xbc  texModInfo_t[numTexMods] */
+	int   videoMapHandle;           /* +0xc0 */
+	byte  isLightmap;               /* +0xc4  r_lightmap forces this unit to REPLACE */
+	byte  isVideoMap;               /* +0xc5 */
+	byte  clampAnimation;           /* +0xc6 */
+	byte  reserved_0xc7;            /* +0xc7  alignment */
+} textureBundle_t;
+COD1_ASSERT_SIZE(textureBundle_t, 0xC8);
+
+#define STAGE_BUNDLES_OFFSET   0x04    /* textureBundle_t bundle[] base within a stage */
+
+typedef struct {
+	unsigned attributeBits;        /* +0x000  streamed arrays: bit (8+tmu)=texcoord,
+	                                *          0x10000=color, 0x20000=normal, sign=per-light */
+	textureBundle_t bundles[8];      /* +0x004  (STAGE_BUNDLES_OFFSET) */
+	int      atiFragmentShader;     /* +0x644 */
+	void    *registerCombiners;     /* +0x648 */
+	char    *vertexProgram;         /* +0x64c */
+	byte     rgbWave[0x14];         /* +0x650  waveForm_t */
+	int      rgbGen;               /* +0x664  color source (11 => entity shaderRGBA) */
+	byte     alphaWave[0x14];       /* +0x668  waveForm_t */
+	int      alphaGen;              /* +0x67c */
+	byte     constantColor[4];     /* +0x680  CGEN_CONST RGBA8 */
+	unsigned stateBits;            /* +0x684  GL_State bits for this stage */
+} shaderStage_t;
+ASSERT_OFF(shaderStage_t, rgbGen, 0x664);
+ASSERT_OFF(shaderStage_t, constantColor, 0x680);
+ASSERT_OFF(shaderStage_t, stateBits, 0x684);
+
+
+extern int  GL_Cull();
+extern int  GL_State();
+int  __cdecl RB_BuildDlightArrays( float *texCoords, unsigned char *colors, float *dlight, int hitIndexes );
+void __cdecl    RB_ComputeColors( shaderStage_t *stage );
+extern int  RB_ComputeTexCoords();
+extern int  RB_DeformTessGeometry();
+void __cdecl    RB_SetIteratorFog( void );
+extern int  RB_SetupMultitexture();
+
+void RB_FinishFenceNV();
+
+/* ---- RB_FinishFenceNV  0x0050BB20 ----  VERIFIED
+ * Wait on the oldest outstanding fence (skipping wrap markers, whose offset is
+ * -1) and reclaim its bytes back to the free pool. */
+void RB_FinishFenceNV()
 {
   int slot;
 
@@ -66,645 +122,408 @@ void RB_FinishFenceNV( void )
   ++rb_nvFenceTail;
 }
 
-/* ---- RB_SelectStorageNV  0x0050BB80 ----  VERIFIED */
-void __cdecl RB_SelectStorageNV(int a1)
+/* ---- RB_SelectStorageNV  0x0050BB80 ----  VERIFIED
+ * Point the client arrays at the requested vertex storage: the primary or
+ * secondary static NV_vertex_array_range block (storage 1 / 2), or the
+ * system-memory tess arrays (storage 3 / other). */
+void __cdecl RB_SelectStorageNV( int storage )
 {
   if ( glState_currentStorageMode == 3 )
   {
-    glEnableClientState(0x851Du);
+    glEnableClientState( 0x851Du );      /* GL_VERTEX_ARRAY_RANGE_NV */
   }
-  else if ( a1 == 3 )
+  else if ( storage == 3 )
   {
+    /* entering system-memory mode: drop the VAR client state, then bind tess */
     if ( glConfig_NVVertexArrayRange == 1 )
-      glDisableClientState(0x851Du);
+      glDisableClientState( 0x851Du );   /* GL_VERTEX_ARRAY_RANGE_NV */
     else
-      glDisableClientState(0x8533u);
-LABEL_8:
-    glVertexPointer(tess_vertexComponentCount, 0x1406u, 0, tess_xyz);
-    glNormalPointer(0x1406u, 0, tess_stageNormals);
-    glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords);
-    glColorPointer(4, 0x1401u, 0, tess_stageVertexColors);
-    return;
+      glDisableClientState( 0x8533u );   /* GL_VERTEX_ARRAY_RANGE_WITHOUT_FLUSH_NV */
   }
-  if ( a1 == 1 )
+
+  if ( storage == 1 )
   {
-    qglVertexArrayRangeNV(tr_staticVertexMemoryPrimaryLimit, (const GLvoid *)tr_staticVertexMemoryPrimary);
-    return;
+    qglVertexArrayRangeNV( tr_staticVertexMemoryPrimaryLimit,
+                           (const GLvoid *)tr_staticVertexMemoryPrimary );
   }
-  if ( a1 != 2 )
-    goto LABEL_8;
-  qglVertexArrayRangeNV(tr_staticVertexMemorySecondaryLimit, (const GLvoid *)tr_staticVertexMemorySecondary);
+  else if ( storage == 2 )
+  {
+    qglVertexArrayRangeNV( tr_staticVertexMemorySecondaryLimit,
+                           (const GLvoid *)tr_staticVertexMemorySecondary );
+  }
+  else
+  {
+    glVertexPointer( tess_vertexComponentCount, 0x1406u, 0, tess_xyz );
+    glNormalPointer( 0x1406u, 0, tess_stageNormals );
+    glTexCoordPointer( 2, 0x1406u, 0, tess_activeTexCoords[0] );   /* retail 0x0050BBF5: loads the pointer in slot 0 */
+    glColorPointer( 4, 0x1401u, 0, tess_stageVertexColors );
+  }
 }
 
-/* ---- RB_GetBuffersNV  0x0050BC40 ----  VERIFIED */
-int __cdecl RB_GetBuffersNV(int a1)
+/* ---- RB_GetBuffersNV  0x0050BC40 ----  VERIFIED
+ * Reserve `size` bytes (rounded up to 32) from the fenced NV ring, wrapping the
+ * cursor and finishing fences as needed, and return the mapped address.  The
+ * (_WORD) casts Hex-Rays emits on the ring index are noise -- the sequence is a
+ * full 32-bit counter masked with 0x1FF -- so they are dropped. */
+int __cdecl RB_GetBuffersNV( int size )
 {
-  signed int v1;
-  int v2;
-  int v3;
-  int v4;
-  int v5;
-  bool v6; // zf
+  int allocSize;
+  int slot;
+  int tailSpace;
 
-  v1 = (a1 + 31) & 0xFFFFFFE0;
-  v2 = ((_WORD)backEnd_dynamicBuffer_allocationSequence++ + 1) & 0x1FF;
-  if ( backEnd_dynamicBuffer_allocationSequence == backEnd_dynamicBuffer_reclaimSequence + 512 )
+  allocSize = ( size + 31 ) & ~31;
+  slot = ++backEnd_dynamicBuffer.allocationSequence & 0x1FF;
+  if ( backEnd_dynamicBuffer.allocationSequence == backEnd_dynamicBuffer.reclaimSequence + 512 )
     RB_FinishFenceNV();
-  v3 = backEnd_dynamicBuffer_currentOffset;
-  if ( backEnd_dynamicBuffer_currentOffset + v1 > backEnd_dynamicBuffer_capacity )
+
+  if ( backEnd_dynamicBuffer.currentOffset + allocSize > backEnd_dynamicBuffer.capacity )
   {
-    v4 = backEnd_dynamicBuffer_capacity - backEnd_dynamicBuffer_currentOffset;
-    if ( backEnd_dynamicBuffer_capacity != backEnd_dynamicBuffer_currentOffset )
+    
+
+    tailSpace = backEnd_dynamicBuffer.capacity - backEnd_dynamicBuffer.currentOffset;
+    if ( tailSpace )
     {
-      dword_16D9410[2 * v2] = v4;
-      backEnd_dynamicBuffer_allocations[2 * v2] = -1;
-      backEnd_dynamicBuffer_freeBytes -= v4;
-      v5 = ((_WORD)backEnd_dynamicBuffer_allocationSequence + 1) & 0x1FF;
-      v6 = ++backEnd_dynamicBuffer_allocationSequence == backEnd_dynamicBuffer_reclaimSequence + 512;
-      v2 = v5;
-      if ( v6 )
+      backEnd_dynamicBuffer.allocations[slot].size   = tailSpace;
+      backEnd_dynamicBuffer.allocations[slot].offset = -1;
+      backEnd_dynamicBuffer.freeBytes -= tailSpace;
+      slot = ++backEnd_dynamicBuffer.allocationSequence & 0x1FF;
+      if ( backEnd_dynamicBuffer.allocationSequence == backEnd_dynamicBuffer.reclaimSequence + 512 )
         RB_FinishFenceNV();
     }
-    v3 = 0;
-    backEnd_dynamicBuffer_currentOffset = 0;
+    backEnd_dynamicBuffer.currentOffset = 0;
   }
-  if ( v1 > backEnd_dynamicBuffer_freeBytes )
-  {
-    do
-      RB_FinishFenceNV();
-    while ( v1 > backEnd_dynamicBuffer_freeBytes );
-    v3 = backEnd_dynamicBuffer_currentOffset;
-  }
-  dword_16D9410[2 * v2] = v1;
-  backEnd_dynamicBuffer_allocations[2 * v2] = v3;
-  backEnd_dynamicBuffer_freeBytes -= v1;
-  backEnd_dynamicBuffer_currentOffset += v1;
-  return backEnd_dynamicBuffer_storage + backEnd_dynamicBuffer_allocations[2 * v2];
+
+  
+  while ( allocSize > backEnd_dynamicBuffer.freeBytes )
+    RB_FinishFenceNV( backEnd_dynamicBuffer.reclaimSequence );
+
+  backEnd_dynamicBuffer.allocations[slot].offset = backEnd_dynamicBuffer.currentOffset;
+  backEnd_dynamicBuffer.allocations[slot].size   = allocSize;
+  backEnd_dynamicBuffer.freeBytes     -= allocSize;
+  backEnd_dynamicBuffer.currentOffset += allocSize;
+  return backEnd_dynamicBuffer.storage + backEnd_dynamicBuffer.allocations[slot].offset;
 }
 
-/* ---- RB_SetFenceNV  0x0050BD40 ----  VERIFIED */
+/* ---- RB_SetFenceNV  0x0050BD40 ----  VERIFIED
+ * Outlined fragment with zero callers; the live copy is the inlined tail of
+ * RB_SingleStageGenericNV.  Preserved for completeness. */
 void RB_SetFenceNV( void )
 {
-  qglSetFenceNV( rb_nvFenceHead, 0x84F2  );
+  qglSetFenceNV( rb_nvFenceHead, 0x84F2 );   /* GL_ALL_COMPLETED_NV */
 }
 
-/* ---- RB_SingleStageGenericNV  0x0050BD60 ----  VERIFIED */
-void __cdecl RB_SingleStageGenericNV(GLubyte *a3, GLsizei count, GLvoid *indices)
-{
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int *v10;
-  int v11;
-  GLsizei v12;
-  int *v13;
-  int BuffersNV;
-  int v15;
-  int v16;
-  int i;
-  int v18;
-  int v19;
-  _DWORD *v20;
-  float *v21;
-  int *v22;
-  int v23;
-  int *v24;
-  int v25;
-  _DWORD *v26;
-  int *v27;
-  int v28;
-  int *v29;
-  int v30;
-  _DWORD *v31;
-  int *v32;
-  int v33;
-  int *v34;
-  int v35;
-  int *v36;
-  _DWORD *v37;
-  int *v38;
-  int v39;
-  int *v40;
-  int v41;
-  _DWORD *v42;
-  _DWORD *v43;
-  int *v44;
-  int v45;
-  int v46;
-  int v47;
-  _DWORD *v48;
-  int *v49;
-  int *v50;
-  int v51;
-  int v52;
-  int v53;
-  int v54;
-  int v55;
-  int v56;
-  int v57;
-  int v58;
-  int v59;
-  int v60;
-  int v61;
-  int v62;
-  int v63;
-  int *v64;
-  int v65;
-  int v66;
-  int v67;
-  float *v77;
-  int v78;
-  int v79;
-  int v80;
-  int v97;
-  int v98;
-  int v99;
-  GLsizei v100;
-  int v101;
-  int v102;
-  int v103;
-  int v104;
-  int v105;
-  int v106;
-  int v107;
-  _DWORD *texCoordSrc[8];   /* [esp+20h] [ebp-BCh] */
-  int     texCoordComps[8]; /* [esp+50h] [ebp-8Ch] */
-  int     texCoordOfs[8];   /* [esp+70h] [ebp-6Ch] */
-  _DWORD v108[8]; // [esp+BCh] [ebp-20h] BYREF
+/* one texcoord unit of the general interleaver; retail repeats it for units 0..7 */
+#define NV_INTERLEAVE_TEXCOORD( unit )                                                    \
+  if ( stage->attributeBits & ( 0x100 << ( unit ) ) )                                     \
+  {                                                                                       \
+    *(int *)( (char *)dst + texCoordOfs[unit] + 0 ) = *texCoordSrc[unit]++;               \
+    *(int *)( (char *)dst + texCoordOfs[unit] + 4 ) = *texCoordSrc[unit]++;               \
+    if ( texCoordComps[unit] >= 3 )                                                       \
+    {                                                                                     \
+      *(int *)( (char *)dst + texCoordOfs[unit] + 8 ) = *texCoordSrc[unit]++;             \
+      if ( texCoordComps[unit] == 4 )                                                     \
+        *(int *)( (char *)dst + texCoordOfs[unit] + 12 ) = *texCoordSrc[unit]++;          \
+    }                                                                                     \
+  }
 
-  v5 = 0;
-  v6 = 0;
-  v78 = 0;
-  RB_ComputeTexCoords((int)a3);   /* takes ONE argument, shader@EAX -- 0x00500400 */
-  v7 = Value;
-  v8 = 0;
-  if ( Value > 0 )
+/* ---- RB_SingleStageGenericNV  0x0050BD60 ----  VERIFIED
+ * Interleave one shader stage's active per-vertex arrays (texcoords, optional
+ * color and normal, position) into a freshly fenced NV buffer, set the client
+ * pointers, and draw.  Four common attribute combos take a hand-specialised
+ * fast path; anything else uses the general interleaver.  The per-vertex byte
+ * stride is computed at run time, so the general interleaver writes each array
+ * at its byte offset into the mapped buffer (texcoord units unrolled 0..7, as
+ * retail has them). */
+void __cdecl RB_SingleStageGenericNV( shaderStage_t *stage, GLsizei numIndexes, GLvoid *indices )
+{
+  int      colorOffset;
+  int      normalOffset;
+  int      positionOffset;
+  int      vertexStride;
+  int      i;
+  int      v;
+  int     *dst;
+  int     *xyz;
+
+  int     *texCoordSrc[R_MAX_TEXTURE_UNITS];    /* per-unit source texcoord streams */
+  int      texCoordComps[R_MAX_TEXTURE_UNITS];  /* per-unit component counts (1..4) */
+  int      texCoordOfs[R_MAX_TEXTURE_UNITS];    /* per-unit byte offset within a vertex */
+  int      baseTexCoords[R_MAX_TEXTURE_UNITS];  /* per-unit mapped-buffer pointer for RB_SetupMultitexture */
+
+  colorOffset  = 0;
+  vertexStride = 0;   /* running attribute offset until the position is appended */
+  normalOffset = 0;
+  RB_ComputeTexCoords( stage );
+
+  /* lay out the active texcoord arrays back to back */
+  for ( i = 0; i < glConfig_maxActiveTextures; ++i )
   {
-    v9 = *(_DWORD *)a3;
-    v10 = (int *)(a3 + 144);
-    do
+    if ( stage->attributeBits & ( 0x100 << i ) )
     {
-      if ( ((256 << v8) & v9) != 0 )
-      {
-        v11 = *v10;
-        texCoordOfs[v8] = v5;
-        texCoordComps[v8] = v11;
-        v5 += 4 * v11;
-        texCoordSrc[v8] = (_DWORD *)(&tess_activeTexCoords)[v8];
-      }
-      ++v8;
-      v10 += 50;
+      int comps = ( (textureBundle_t *)( (char *)stage + STAGE_BUNDLES_OFFSET ) )[i].texCoordComponentCount;
+      texCoordOfs[i]   = vertexStride;
+      texCoordComps[i] = comps;
+      vertexStride    += 4 * comps;
+      texCoordSrc[i]   = (int *)tess_activeTexCoords[i];   /* retail 0x0050BDB8: loads the pointer in slot i */
     }
-    while ( v8 < v7 );
   }
-  if ( (*(_DWORD *)a3 & 0x10000) != 0 )
+
+  /* then the color and normal arrays, then the position at the end */
+  if ( stage->attributeBits & 0x10000 )
   {
-    v6 = v5;
-    v5 += 4;
-    RB_ComputeColors((int)a3);   /* ONE argument, the stage -- 0x0050BDE1 */
+    colorOffset   = vertexStride;
+    vertexStride += 4;
+    RB_ComputeColors( stage );
   }
-  if ( (*(_DWORD *)a3 & 0x20000) != 0 )
+  if ( stage->attributeBits & 0x20000 )
   {
-    v78 = v5;
-    v5 += 12;
+    normalOffset  = vertexStride;
+    vertexStride += 12;
   }
-  v12 = v5 + 4 * tess_vertexComponentCount;
-  v80 = v5;
-  v100 = v12;
-  v13 = tess_xyz;
-  BuffersNV = RB_GetBuffersNV(v12 * tess_numVertexes);
-  v15 = Value;
-  v16 = BuffersNV;
-  for ( i = 0; i < v15; ++i )
-    v108[i] = v16 + texCoordOfs[i];
-  RB_SetupMultitexture(a3, (int)v108, v12);
-  if ( (*(_DWORD *)a3 & 0x10000) != 0 )
+  positionOffset = vertexStride;
+  vertexStride  += 4 * tess_vertexComponentCount;
+  xyz            = (int *)tess_xyz;
+
+  dst = (int *)RB_GetBuffersNV( vertexStride * tess_numVertexes );
+  for ( i = 0; i < glConfig_maxActiveTextures; ++i )
+    baseTexCoords[i] = (int)dst + texCoordOfs[i];
+  RB_SetupMultitexture( stage, baseTexCoords, vertexStride );
+
+  /* ---- point the client color / normal / vertex arrays at the buffer ---- */
+  if ( stage->attributeBits & 0x10000 )
   {
-    if ( (glState_clientStateBits & 0x100) == 0 )
+    if ( ( glState_clientStateBits & 0x100 ) == 0 )
     {
-      glEnableClientState(0x8076u);
+      glEnableClientState( 0x8076u );          /* GL_COLOR_ARRAY */
       glState_clientStateBits |= 0x100u;
     }
-    glColorPointer(4, 0x1401u, v12, (const GLvoid *)(v16 + v6));
+    glColorPointer( 4, 0x1401u, vertexStride, (const GLvoid *)( (char *)dst + colorOffset ) );
   }
   else
   {
-    if ( (glState_clientStateBits & 0x100) != 0 )
+    if ( ( glState_clientStateBits & 0x100 ) != 0 )
     {
-      glDisableClientState(0x8076u);
+      glDisableClientState( 0x8076u );
       glState_clientStateBits &= ~0x100u;
     }
-    if ( *((_DWORD *)a3 + 409) == 11 )
-      glColor4ubv((const GLubyte *)(backEnd_currentEntity + 108));
+    if ( stage->rgbGen == 11 )
+      glColor4ubv( (const GLubyte *)( backEnd_currentEntity + 108 ) );   /* entity->e.shaderRGBA */
     else
-      glColor4ubv(a3 + 1664);
+      glColor4ubv( (const GLubyte *)stage->constantColor );
   }
-  if ( (*(_DWORD *)a3 & 0x20000) != 0 )
+
+  if ( stage->attributeBits & 0x20000 )
   {
-    if ( (glState_clientStateBits & 0x200) == 0 )
+    if ( ( glState_clientStateBits & 0x200 ) == 0 )
     {
-      glEnableClientState(0x8075u);
+      glEnableClientState( 0x8075u );          /* GL_NORMAL_ARRAY */
       glState_clientStateBits |= 0x200u;
     }
-    glNormalPointer(0x1406u, v12, (const GLvoid *)(v16 + v78));
+    glNormalPointer( 0x1406u, vertexStride, (const GLvoid *)( (char *)dst + normalOffset ) );
   }
-  else if ( (glState_clientStateBits & 0x200) != 0 )
+  else if ( ( glState_clientStateBits & 0x200 ) != 0 )
   {
-    glDisableClientState(0x8075u);
+    glDisableClientState( 0x8075u );
     glState_clientStateBits &= ~0x200u;
   }
-  if ( (glState_clientStateBits & 0x400) == 0 )
+
+  if ( ( glState_clientStateBits & 0x400 ) == 0 )
   {
-    glEnableClientState(0x8074u);
+    glEnableClientState( 0x8074u );            /* GL_VERTEX_ARRAY */
     glState_clientStateBits |= 0x400u;
   }
-  glVertexPointer(tess_vertexComponentCount, 0x1406u, v12, (const GLvoid *)(v16 + v80));
-  v18 = *(_DWORD *)a3 & 0x3FF00;
-  if ( v18 == 131328 && texCoordComps[0] == 2 && tess_vertexComponentCount == 3 )
+  glVertexPointer( tess_vertexComponentCount, 0x1406u, vertexStride,
+                   (const GLvoid *)( (char *)dst + positionOffset ) );
+
+  /* ---- interleave the vertices ---- */
+  if ( ( stage->attributeBits & 0x3FF00 ) == 0x20100 && texCoordComps[0] == 2 && tess_vertexComponentCount == 3 )
   {
-    v19 = 0;
-    if ( tess_numVertexes > 0 )
+    /* texcoord0 + normal + position (stride 32) */
+    for ( v = 0; v < tess_numVertexes; ++v )
     {
-      v20 = texCoordSrc[0];
-      v21 = flt_1827F64;
-      do
-      {
-        *(_DWORD *)v16 = *v20;
-        *(_DWORD *)(v16 + 4) = v20[1];
-        v22 = (int *)(v16 + 4);
-        v22[1] = *((_DWORD *)v21 - 1);
-        ++v22;
-        v22[1] = *(_DWORD *)v21;
-        ++v22;
-        v22[1] = *((_DWORD *)v21 + 1);
-        v22 += 2;
-        *v22 = *v13;
-        v23 = v13[1];
-        v24 = v13 + 1;
-        *++v22 = v23;
-        *++v22 = v24[1];
-        v20 += 2;
-        v16 = (int)(v22 + 1);
-        v13 = v24 + 2;
-        ++v19;
-        v21 += 3;
-      }
-      while ( v19 < tess_numVertexes );
+      *dst++ = *texCoordSrc[0]++;
+      *dst++ = *texCoordSrc[0]++;
+      *dst++ = ( (int *)tess_stageNormals )[3 * v + 0];
+      *dst++ = ( (int *)tess_stageNormals )[3 * v + 1];
+      *dst++ = ( (int *)tess_stageNormals )[3 * v + 2];
+      *dst++ = *xyz++;
+      *dst++ = *xyz++;
+      *dst++ = *xyz++;
     }
   }
-  else if ( v18 == 65792 && texCoordComps[0] == 2 && tess_vertexComponentCount == 3 )
+  else if ( ( stage->attributeBits & 0x3FF00 ) == 0x10100 && texCoordComps[0] == 2 && tess_vertexComponentCount == 3 )
   {
-    v25 = 0;
-    if ( tess_numVertexes > 0 )
+    /* texcoord0 + color + position (stride 24) */
+    for ( v = 0; v < tess_numVertexes; ++v )
     {
-      v26 = texCoordSrc[0];
-      do
-      {
-        *(_DWORD *)v16 = *v26;
-        *(_DWORD *)(v16 + 4) = v26[1];
-        v27 = (int *)(v16 + 4);
-        v27[1] = dword_186FF60[v25];   /* +0 shard: retail 0x0050C06A is `mov edx, tess_stageVertexColors[ecx*4]`, a DWORD load */
-        v27 += 2;
-        *v27 = *v13;
-        v28 = v13[1];
-        v29 = v13 + 1;
-        *++v27 = v28;
-        *++v27 = v29[1];
-        v26 += 2;
-        v16 = (int)(v27 + 1);
-        v13 = v29 + 2;
-        ++v25;
-      }
-      while ( v25 < tess_numVertexes );
+      *dst++ = *texCoordSrc[0]++;
+      *dst++ = *texCoordSrc[0]++;
+      *dst++ = tess_stageVertexColorsPacked[v];               /* packed RGBA8 vertex color */
+      *dst++ = *xyz++;
+      *dst++ = *xyz++;
+      *dst++ = *xyz++;
     }
   }
-  else if ( v18 == 256 && texCoordComps[0] == 2 && tess_vertexComponentCount == 3 )
+  else if ( ( stage->attributeBits & 0x3FF00 ) == 0x100 && texCoordComps[0] == 2 && tess_vertexComponentCount == 3 )
   {
-    v30 = 0;
-    if ( tess_numVertexes > 0 )
+    /* texcoord0 + position (stride 20) */
+    for ( v = 0; v < tess_numVertexes; ++v )
     {
-      v31 = texCoordSrc[0];
-      do
-      {
-        *(_DWORD *)v16 = *v31;
-        *(_DWORD *)(v16 + 4) = v31[1];
-        v32 = (int *)(v16 + 8);
-        *v32 = *v13;
-        v33 = v13[1];
-        v34 = v13 + 1;
-        *++v32 = v33;
-        *++v32 = v34[1];
-        v31 += 2;
-        v16 = (int)(v32 + 1);
-        v13 = v34 + 2;
-        ++v30;
-      }
-      while ( v30 < tess_numVertexes );
+      *dst++ = *texCoordSrc[0]++;
+      *dst++ = *texCoordSrc[0]++;
+      *dst++ = *xyz++;
+      *dst++ = *xyz++;
+      *dst++ = *xyz++;
     }
   }
-  else if ( v18 == 66304 && texCoordComps[0] == 2 && texCoordComps[1] == 2 && tess_vertexComponentCount == 3 )
+  else if ( ( stage->attributeBits & 0x3FF00 ) == 0x10300 && texCoordComps[0] == 2 && texCoordComps[1] == 2
+            && tess_vertexComponentCount == 3 )
   {
-    v35 = 0;
-    if ( tess_numVertexes > 0 )
+    /* texcoord0 + texcoord1 + color + position (stride 32) */
+    for ( v = 0; v < tess_numVertexes; ++v )
     {
-      v36 = texCoordSrc[1];
-      v37 = texCoordSrc[0];
-      do
-      {
-        *(_DWORD *)v16 = *v37;
-        *(_DWORD *)(v16 + 4) = v37[1];
-        v38 = (int *)(v16 + 4);
-        v38[1] = *v36;
-        ++v38;
-        v38[1] = v36[1];
-        ++v38;
-        v38[1] = dword_186FF60[v35];   /* +0 shard; retail 0x0050C17E */
-        v38 += 2;
-        *v38 = *v13;
-        v39 = v13[1];
-        v40 = v13 + 1;
-        *++v38 = v39;
-        *++v38 = v40[1];
-        v37 += 2;
-        v36 += 2;
-        v16 = (int)(v38 + 1);
-        v13 = v40 + 2;
-        ++v35;
-      }
-      while ( v35 < tess_numVertexes );
+      *dst++ = *texCoordSrc[0]++;
+      *dst++ = *texCoordSrc[0]++;
+      *dst++ = *texCoordSrc[1]++;
+      *dst++ = *texCoordSrc[1]++;
+      *dst++ = tess_stageVertexColorsPacked[v];               /* packed RGBA8 vertex color */
+      *dst++ = *xyz++;
+      *dst++ = *xyz++;
+      *dst++ = *xyz++;
     }
   }
   else
   {
-    v79 = 0;
-    if ( tess_numVertexes > 0 )
+    /* general interleaver: honor each array's own byte offset */
+    for ( v = 0; v < tess_numVertexes; ++v )
     {
-      v41 = texCoordOfs[1];
-      v107 = texCoordOfs[0] - texCoordOfs[1];
-      v102 = texCoordOfs[2] - texCoordOfs[1];
-      v104 = texCoordOfs[3] - texCoordOfs[1];
-      v106 = texCoordOfs[4] - texCoordOfs[1];
-      v99 = texCoordOfs[5] - texCoordOfs[1];
-      v97 = texCoordOfs[6] - texCoordOfs[1];
-      v101 = texCoordOfs[7] - texCoordOfs[1];
-      v103 = v78 - texCoordOfs[1];
-      v98 = v80 - texCoordOfs[1];
-      v42 = texCoordSrc[7];
-      v43 = (_DWORD *)(texCoordOfs[1] + v16);
-      v77 = flt_1827F64;
-      v105 = v6 - texCoordOfs[1];
-      do
+      NV_INTERLEAVE_TEXCOORD( 0 )
+      NV_INTERLEAVE_TEXCOORD( 1 )
+      NV_INTERLEAVE_TEXCOORD( 2 )
+      NV_INTERLEAVE_TEXCOORD( 3 )
+      NV_INTERLEAVE_TEXCOORD( 4 )
+      NV_INTERLEAVE_TEXCOORD( 5 )
+      NV_INTERLEAVE_TEXCOORD( 6 )
+      NV_INTERLEAVE_TEXCOORD( 7 )
+      if ( stage->attributeBits & 0x10000 )
+        *(int *)( (char *)dst + colorOffset ) = tess_stageVertexColorsPacked[v];
+      if ( stage->attributeBits & 0x20000 )
       {
-        v44 = texCoordSrc[1];
-        if ( (a3[1] & 1) != 0 )
-        {
-          *(_DWORD *)((char *)v43 + v107) = *texCoordSrc[0];
-          v45 = texCoordSrc[0][1];
-          ++texCoordSrc[0];
-          v46 = texCoordOfs[0];
-          *(_DWORD *)(texCoordOfs[0] + v16 + 4) = v45;
-          ++texCoordSrc[0];
-          if ( texCoordComps[0] >= 3 )
-          {
-            *(_DWORD *)(v46 + v16 + 8) = *texCoordSrc[0]++;
-            if ( texCoordComps[0] == 4 )
-              *(_DWORD *)(v46 + v16 + 12) = *texCoordSrc[0]++;
-          }
-          v44 = texCoordSrc[1];
-        }
-        if ( (a3[1] & 2) != 0 )
-        {
-          v47 = *v44;
-          v48 = v44 + 1;
-          *v43 = v47;
-          *(_DWORD *)(v41 + v16 + 4) = *v48;
-          v49 = v48 + 1;
-          texCoordSrc[1] = v49;
-          if ( texCoordComps[1] >= 3 )
-          {
-            *(_DWORD *)(v41 + v16 + 8) = *v49;
-            v50 = v49 + 1;
-            texCoordSrc[1] = v50;
-            if ( texCoordComps[1] == 4 )
-            {
-              *(_DWORD *)(v41 + v16 + 12) = *v50;
-              texCoordSrc[1] = v50 + 1;
-            }
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x400) != 0 )
-        {
-          *(_DWORD *)((char *)v43 + v102) = *texCoordSrc[2];
-          v51 = texCoordSrc[2][1];
-          ++texCoordSrc[2];
-          v52 = texCoordOfs[2];
-          *(_DWORD *)(texCoordOfs[2] + v16 + 4) = v51;
-          ++texCoordSrc[2];
-          if ( texCoordComps[2] >= 3 )
-          {
-            *(_DWORD *)(v52 + v16 + 8) = *texCoordSrc[2]++;
-            if ( texCoordComps[2] == 4 )
-              *(_DWORD *)(v52 + v16 + 12) = *texCoordSrc[2]++;
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x800) != 0 )
-        {
-          *(_DWORD *)((char *)v43 + v104) = *texCoordSrc[3];
-          v53 = texCoordSrc[3][1];
-          ++texCoordSrc[3];
-          v54 = texCoordOfs[3];
-          *(_DWORD *)(texCoordOfs[3] + v16 + 4) = v53;
-          ++texCoordSrc[3];
-          if ( texCoordComps[3] >= 3 )
-          {
-            *(_DWORD *)(v54 + v16 + 8) = *texCoordSrc[3]++;
-            if ( texCoordComps[3] == 4 )
-              *(_DWORD *)(v54 + v16 + 12) = *texCoordSrc[3]++;
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x1000) != 0 )
-        {
-          *(_DWORD *)((char *)v43 + v106) = *texCoordSrc[4];
-          v55 = texCoordSrc[4][1];
-          ++texCoordSrc[4];
-          v56 = texCoordOfs[4];
-          *(_DWORD *)(texCoordOfs[4] + v16 + 4) = v55;
-          ++texCoordSrc[4];
-          if ( texCoordComps[4] >= 3 )
-          {
-            *(_DWORD *)(v56 + v16 + 8) = *texCoordSrc[4]++;
-            if ( texCoordComps[4] == 4 )
-              *(_DWORD *)(v56 + v16 + 12) = *texCoordSrc[4]++;
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x2000) != 0 )
-        {
-          *(_DWORD *)((char *)v43 + v99) = *texCoordSrc[5];
-          v57 = texCoordSrc[5][1];
-          ++texCoordSrc[5];
-          v58 = texCoordOfs[5];
-          *(_DWORD *)(texCoordOfs[5] + v16 + 4) = v57;
-          ++texCoordSrc[5];
-          if ( texCoordComps[5] >= 3 )
-          {
-            *(_DWORD *)(v58 + v16 + 8) = *texCoordSrc[5]++;
-            if ( texCoordComps[5] == 4 )
-              *(_DWORD *)(v58 + v16 + 12) = *texCoordSrc[5]++;
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x4000) != 0 )
-        {
-          *(_DWORD *)((char *)v43 + v97) = *texCoordSrc[6];
-          v59 = texCoordSrc[6][1];
-          ++texCoordSrc[6];
-          v60 = texCoordOfs[6];
-          *(_DWORD *)(texCoordOfs[6] + v16 + 4) = v59;
-          ++texCoordSrc[6];
-          if ( texCoordComps[6] >= 3 )
-          {
-            *(_DWORD *)(v60 + v16 + 8) = *texCoordSrc[6]++;
-            if ( texCoordComps[6] == 4 )
-              *(_DWORD *)(v60 + v16 + 12) = *texCoordSrc[6]++;
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x8000) != 0 )
-        {
-          *(_DWORD *)((char *)v43 + v101) = *v42;
-          v61 = texCoordOfs[7];
-          *(_DWORD *)(texCoordOfs[7] + v16 + 4) = v42[1];
-          v42 += 2;
-          if ( texCoordComps[7] >= 3 )
-          {
-            *(_DWORD *)(v61 + v16 + 8) = *v42++;
-            if ( texCoordComps[7] == 4 )
-              *(_DWORD *)(v61 + v16 + 12) = *v42++;
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x10000) != 0 )
-          *(_DWORD *)((char *)v43 + v105) = dword_186FF60[v79];   /* +0 shard; retail 0x0050C5A0 */
-        if ( (*(_DWORD *)a3 & 0x20000) != 0 )
-        {
-          *(_DWORD *)((char *)v43 + v103) = *((_DWORD *)v77 - 1);
-          v62 = v78;
-          *(float *)(v16 + v78 + 4) = *v77;
-          *(float *)(v16 + v62 + 8) = v77[1];
-        }
-        v63 = *v13;
-        v64 = v13 + 1;
-        *(_DWORD *)((char *)v43 + v98) = v63;
-        v65 = *v64;
-        v66 = v80;
-        ++v64;
-        *(_DWORD *)(v80 + v16 + 4) = v65;
-        *(_DWORD *)(v66 + v16 + 8) = *v64;
-        v13 = v64 + 1;
-        if ( tess_vertexComponentCount == 4 )
-          *(_DWORD *)(v16 + v66 + 12) = *v13++;
-        v16 += v100;
-        v43 = (_DWORD *)((char *)v43 + v100);
-        v77 += 3;
-        ++v79;
+        *(int *)( (char *)dst + normalOffset + 0 ) = ( (int *)tess_stageNormals )[3 * v + 0];
+        *(int *)( (char *)dst + normalOffset + 4 ) = ( (int *)tess_stageNormals )[3 * v + 1];
+        *(int *)( (char *)dst + normalOffset + 8 ) = ( (int *)tess_stageNormals )[3 * v + 2];
       }
-      while ( v79 < tess_numVertexes );
+      *(int *)( (char *)dst + positionOffset + 0 ) = *xyz++;
+      *(int *)( (char *)dst + positionOffset + 4 ) = *xyz++;
+      *(int *)( (char *)dst + positionOffset + 8 ) = *xyz++;
+      if ( tess_vertexComponentCount == 4 )
+        *(int *)( (char *)dst + positionOffset + 12 ) = *xyz++;
+      dst = (int *)( (char *)dst + vertexStride );
     }
   }
-  if ( (v16 & 0x1F) != 0 )
+
+  /* pad the tail up to the next 32-byte boundary the ring allocator rounded to */
+  if ( ( (int)dst & 0x1F ) != 0 )
   {
-    v67 = (32 - (v16 & 0x1F)) >> 2;
+    int pad = ( 32 - ( (int)dst & 0x1F ) ) >> 2;
     do
-    {
-      *(_DWORD *)v16 = 0;
-      v16 += 4;
-      --v67;
-    }
-    while ( v67 );
+      *dst++ = 0;
+    while ( --pad );
   }
-  GL_State(*((_DWORD *)a3 + 417));
-  backEnd_pc_drawnIndexCount += count;
+
+  GL_State( stage->stateBits );
+  backEnd_pc_drawnIndexCount += numIndexes;
   ++backEnd_pc_drawCallCount;
-  glDrawElements(4u, count, 0x1403u, indices);
-  qglSetFenceNV( rb_nvFenceHead, 0x84F2  );
+  glDrawElements( 4u, numIndexes, 0x1403u, indices );   /* GL_TRIANGLES, GL_UNSIGNED_SHORT */
+  qglSetFenceNV( rb_nvFenceHead, 0x84F2 );               /* GL_ALL_COMPLETED_NV */
 }
 
-/* ---- RB_IterateStagesGenericNV  0x0050C6E0 ----  VERIFIED */
-void __cdecl RB_IterateStagesGenericNV( void )
-{
-  int      i;
-  GLubyte *stage;
+#undef NV_INTERLEAVE_TEXCOORD
 
-  for ( i = 0; i < 4 * R_MAX_SHADER_STAGES; i += 4 )
+/* ---- RB_IterateStagesGenericNV  0x0050C6E0 ----  VERIFIED
+ * Draw each ordinary stage (attributeBits sign bit clear) of the current tess
+ * shader.  Under r_lightmap, stop after the first stage whose bundle[0] or
+ * bundle[1] lightmap flag is set. */
+void __cdecl RB_IterateStagesGenericNV( shaderCommands_t *input )   /* input = &tess */
+{
+  int            stageIndex;
+  shaderStage_t *stage;
+
+  for ( stageIndex = 0; stageIndex < R_MAX_SHADER_STAGES; stageIndex++ )
   {
-    stage = *(GLubyte **)( i + tess_activeStages );
+    stage = ( (shaderStage_t **)tess_activeStages )[stageIndex];
     if ( !stage )
       break;
 
-    if ( (char)*stage >= 0 )
+    if ( !( stage->attributeBits & SHADER_STAGE_PER_LIGHT ) )
     {
-      RB_SingleStageGenericNV( stage, tess_numIndexes, (GLvoid *)tess_indexes_base );
+      RB_SingleStageGenericNV( stage, input->numIndexes, input->indexes );
       if ( r_lightmap->integer )
       {
-        if ( stage[200] )
+        if ( ( (byte *)stage )[200] )          /* bundle[0] lightmap gate */
           break;
-        if ( stage[400] )
+        if ( ( (byte *)stage )[400] )          /* bundle[1] lightmap gate */
           break;
       }
     }
   }
 }
 
-/* ---- ProjectDlightTextureNV  0x0050C740 ----  VERIFIED */
+/* ---- ProjectDlightTextureNV  0x0050C740 ----  VERIFIED
+ * For every dynamic light touching this surface, build the clipped index set
+ * and redraw the lit triangles: either the shared dlight shader's first stage
+ * (non per-entity-lit shaders) or each per-light stage of the tess shader. */
 void __cdecl ProjectDlightTextureNV( void )
 {
   int      i;
-  int      dlightOffset;
   int      stageIndex;
-  GLsizei  hitIndexCount;
-  GLubyte *stage;
-  GLubyte *dlightStage;
-  unsigned short hitIndexes[49152];   /* 0x18004 bytes incl. 4 pad */
+  GLsizei  hitCount;
+  shaderStage_t *stage;
+  shaderStage_t *dlightStage;
+  unsigned short hitIndexes[49152];   /* clipped-index scratch (retail adds a 4-byte canary) */
 
   if ( !backEnd_num_dlights )
     return;
   if ( !rb_nvBufferSize )
     return;
 
-  dlightOffset = 0;
-  for ( i = 0; i < backEnd_num_dlights; i++, dlightOffset += R_DLIGHT_STRIDE )
+  for ( i = 0; i < backEnd_num_dlights; ++i )
   {
     if ( ( ( 1 << i ) & tess_dlightBits ) == 0 )
       continue;
 
-    hitIndexCount = RB_BuildDlightArrays( (unsigned char *)tess_vertexColors,
-                                          (float *)tess_texCoords1,
-                                          (float *)( backEnd_dlights + dlightOffset ),
-                                          (int)hitIndexes );
-    if ( !hitIndexCount )
+    hitCount = RB_BuildDlightArrays( (float *)tess_texCoords1,
+                                     (unsigned char *)tess_vertexColors,
+                                     (float *)( backEnd_dlights + i * R_DLIGHT_STRIDE ),
+                                     (int)hitIndexes );
+    if ( !hitCount )
       continue;
 
-    if ( *(char *)( tess_shader + 84 ) >= 0 )
+    if ( *(byte *)( tess_shader + 84 ) & SHADER_LIGHTING_PER_ENTITY )   /* shader->lightingFlags */
     {
-      dlightStage = *(GLubyte **)( tr_dlightShader + 340  );
-      if ( dlightStage )
-        RB_SingleStageGenericNV( dlightStage, hitIndexCount, hitIndexes );
+      backEnd_currentLight = backEnd_dlights + i * R_DLIGHT_STRIDE;
+      for ( stageIndex = 0; stageIndex < R_MAX_SHADER_STAGES; stageIndex++ )
+      {
+        stage = ( (shaderStage_t **)tess_activeStages )[stageIndex];
+        if ( !stage )
+          break;
+        if ( stage->attributeBits & SHADER_STAGE_PER_LIGHT )
+          RB_SingleStageGenericNV( stage, hitCount, hitIndexes );
+      }
     }
     else
     {
-      backEnd_currentLight = backEnd_dlights + dlightOffset;
-      for ( stageIndex = 0; stageIndex < 4 * R_MAX_SHADER_STAGES; stageIndex += 4 )
-      {
-        stage = *(GLubyte **)( stageIndex + tess_activeStages );
-        if ( !stage )
-          break;
-        if ( (char)*stage < 0 )
-          RB_SingleStageGenericNV( stage, hitIndexCount, hitIndexes );
-      }
+      dlightStage = *(shaderStage_t **)( tr_dlightShader + 340 );   /* dlightShader->stages[0] */
+      if ( dlightStage )
+        RB_SingleStageGenericNV( dlightStage, hitCount, hitIndexes );
     }
   }
 }
 
-/* ---- RB_StageIteratorGenericNV  0x0050C870 ----  VERIFIED */
+/* ---- RB_StageIteratorGenericNV  0x0050C870 ----  VERIFIED
+ * Top-level generic-stage iterator for the NV path: deform, fog, cull, draw the
+ * base stages (unless portal-only), then apply dynamic-light and per-entity
+ * light passes. */
 void __cdecl RB_StageIteratorGenericNV( int portalPass )
 {
   char    *logText;
@@ -712,7 +531,7 @@ void __cdecl RB_StageIteratorGenericNV( int portalPass )
   int      lightCount;
   int      lightIndex;
   int      stageIndex;
-  GLubyte *stage;
+  shaderStage_t *stage;
 
   if ( tess_activeStageCount <= 0 )
     return;
@@ -721,62 +540,57 @@ void __cdecl RB_StageIteratorGenericNV( int portalPass )
 
   if ( r_logFile->integer )
   {
-    logText = va( "--- RB_StageIteratorGenericNV( %s ) ---\n",
-                  (const char *)tess_shader );
+    logText = va( "--- RB_StageIteratorGenericNV( %s ) ---\n", (const char *)tess_shader );
     if ( Stream )
-      fprintf( Stream, "%s", (int)logText );
+      fprintf( Stream, "%s", logText );
   }
 
   RB_DeformTessGeometry();
   RB_SetIteratorFog();
-  GL_Cull( *(_DWORD *)( tess_shader + 168  ) );
+  GL_Cull( ((shader_t *)tess_shader)->cullType );          /* shader->cullType */
 
   if ( !portalPass )
-    RB_IterateStagesGenericNV();
+    RB_IterateStagesGenericNV( &tess );
 
-  if ( tess_dlightBits )
+  if ( tess_dlightBits
+    && ( ((shader_t *)tess_shader)->sort <= 5.0f                              /* shader->sort */
+      || ( *(unsigned *)( tess_shader + 84 ) & SHADER_LIGHTING_PER_ENTITY ) )
+    && !( ((shader_t *)tess_shader)->surfaceParmFlags & 0x20004 ) )                        /* shader->surfaceParmFlags */
   {
-    if ( *(float *)( tess_shader + 88  ) <= 5.0
-      || ( *(_BYTE *)( tess_shader + 84 ) & SHADER_LIGHTING_PER_ENTITY ) != 0 )
-    {
-      if ( ( *(_DWORD *)( tess_shader + 92  ) & 0x20004 ) == 0 )
-      {
-        ProjectDlightTextureNV();
-        return;
-      }
-    }
+    ProjectDlightTextureNV();
+    return;
   }
 
-  if ( ( *(_BYTE *)( tess_shader + 84 ) & SHADER_LIGHTING_PER_ENTITY ) == 0 )
+  if ( !( *(unsigned *)( tess_shader + 84 ) & SHADER_LIGHTING_PER_ENTITY ) )
     return;
 
   entity = backEnd_currentEntity;
   if ( !entity )
     return;
-  lightCount = *(_DWORD *)( entity + 204  );
+  lightCount = ((trRefEntity_t *)entity)->lightCount;
   if ( !lightCount )
     return;
 
-  for ( lightIndex = 0; lightIndex < lightCount; lightIndex++ )
+  for ( lightIndex = 0; lightIndex < lightCount; ++lightIndex )
   {
-    backEnd_currentLight = *(_DWORD *)( entity + 8 * lightIndex + 208  );
-    if ( *(_DWORD *)backEnd_currentLight != 8  )
+    backEnd_currentLight = (int)((trRefEntity_t *)entity)->lights[lightIndex].light;
+    if ( *(int *)backEnd_currentLight != 8 )         /* skip light type 8 */
     {
-      backEnd_currentLightScale = *(float *)( entity + 8 * lightIndex + 212  );
+      backEnd_currentLightScale = ((trRefEntity_t *)entity)->lights[lightIndex].scale;
 
-      for ( stageIndex = 0; stageIndex < 4 * R_MAX_SHADER_STAGES; stageIndex += 4 )
+      for ( stageIndex = 0; stageIndex < R_MAX_SHADER_STAGES; stageIndex++ )
       {
-        stage = *(GLubyte **)( stageIndex + tess_activeStages );
+        stage = ( (shaderStage_t **)tess_activeStages )[stageIndex];
         if ( !stage )
           break;
-        if ( ( *stage & SHADER_STAGE_PER_LIGHT ) != 0 )
+        if ( stage->attributeBits & SHADER_STAGE_PER_LIGHT )
         {
           RB_SingleStageGenericNV( stage, tess_numIndexes, (GLvoid *)tess_indexes_base );
           entity = backEnd_currentEntity;
         }
       }
     }
-    lightCount = *(_DWORD *)( entity + 204 );
+    lightCount = ((trRefEntity_t *)entity)->lightCount;
   }
 
   backEnd_currentLight = 0;

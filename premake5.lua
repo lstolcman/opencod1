@@ -30,10 +30,13 @@ local UNIVERSAL = {
 -- The bg_ units the cgame DLL statically links, built with /D CGAMEDLL (two
 -- functions in bg_animation.c differ between the game and cgame images).
 local CGAME_BG = {
-    SRC.."/game_mp/bg_animation.c", SRC.."/game_mp/bg_misc.c",
+    SRC.."/game_mp/bg_animation.c", SRC.."/game_mp/bg_misc.c", SRC.."/game_mp/bg_misc_items.c",
     SRC.."/game_mp/bg_pmove.c",     SRC.."/game_mp/bg_slidemove.c",
     SRC.."/game_mp/bg_weapon.c",    SRC.."/game_mp/bg_public.h",
     SRC.."/game_mp/bg_local.h",
+    -- retail script/scr_import.c: the 98 import forwarders and Scr_FarHook,
+    -- linked after q_shared in both DLLs.
+    SRC.."/game_mp/g_scr_import_mp.c",
 }
 
 local function moduleGlobs()
@@ -81,7 +84,12 @@ workspace "opencod1"
         optimize "Speed"                 -- /O2
         inlining "Explicit"              -- /Ob1: keep single-caller statics
         vectorextensions "IA32"          -- /arch:IA32: x87, not SSE
-        linkoptions { "/OPT:REF", "/OPT:ICF" }   -- /DEBUG turns these off; re-arm
+        -- /DEBUG turns /OPT:REF off; re-arm it.  NO identical-COMDAT folding:
+        -- retail keeps byte-identical functions at distinct addresses (game's
+        -- AddScore, nullsub_2, nullsub_3 and SP_misc_teleporter_dest are four
+        -- separate `ret`s; every module has VectorCopy and Vector3Copy apart),
+        -- and folding would make distinct function pointers compare equal.
+        linkoptions { "/OPT:REF", "/OPT:NOICF" }
     filter {}
 
 -- Load-bearing exe link flags.  Retail CoDMP.exe links /STACK:0x800000 and
@@ -92,6 +100,15 @@ workspace "opencod1"
 -- it.  See tools/gen_sln.py for the full trace.
 local function exeLinkFlags()
     linkoptions { "/STACK:8388608", "/DYNAMICBASE:NO", "/NXCOMPAT:NO" }
+end
+
+-- Retail module image settings.  Each retail DLL is linked at its own fixed
+-- preferred base (game 0x20000000, cgame 0x30000000, ui 0x40000000) with
+-- DllCharacteristics 0 (no ASLR, no NX).  Like the exe, the DLLs were built
+-- with /GS (VC7 cookie XOR return address; e.g. game 0x200451DE is the check),
+-- so the /GS default stays on.
+local function dllImageFlags(base)
+    linkoptions { "/BASE:"..base, "/DYNAMICBASE:NO", "/NXCOMPAT:NO" }
 end
 
 local WIN_LIBS = { "kernel32","user32","gdi32","advapi32","winmm",
@@ -135,12 +152,14 @@ project "CodMP-ded"
 -- ============================ game_mp_x86.dll ==========================
 project "game_mp"
     kind "SharedLib"
+    defines { "GAMEDLL" }
     targetname "game_mp_x86"
     targetprefix ""
     targetdir (BUILD.."/main")           -- fs_game=main loads the DLLs from here
     files { SRC.."/game_mp/**.c", SRC.."/game_mp/**.h" }
     files (UNIVERSAL)
     linkoptions { defOpt("game_mp/game_mp.def") }
+    dllImageFlags("0x20000000")
     links (DLL_LIBS)
 
 -- ========================== cgame_mp_x86.dll ==========================
@@ -158,6 +177,7 @@ project "cgame_mp"
     -- cgame links ui_shared only, exactly what the manifest puts in its image.
     files { SRC.."/ui_mp/ui_shared_mp.c", SRC.."/ui_mp/ui_shared.h" }
     linkoptions { defOpt("cgame_mp/cgame_mp.def") }
+    dllImageFlags("0x30000000")
     links (DLL_LIBS)
 
 -- =========================== ui_mp_x86.dll ============================
@@ -171,4 +191,5 @@ project "ui_mp"
     files { SRC.."/ui_mp/**.c", SRC.."/ui_mp/**.h" }
     files (UNIVERSAL)
     linkoptions { defOpt("ui_mp/ui_mp.def") }
+    dllImageFlags("0x40000000")
     links (DLL_LIBS)

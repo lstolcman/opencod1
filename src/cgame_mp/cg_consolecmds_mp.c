@@ -1,57 +1,25 @@
-/*
- * @fidelity: likely
- *
- * cg_consolecmds.c -- text commands typed in at the local console, or executed
- * by a key binding.
- *
- * cgame_mp_x86.dll, CoD 1.1, imagebase 0x30000000; functions in address
- * order, 0x30013BC0 .. 0x300142C0.  RTCW-MP's cg_consolecmds.c is the
- * ancestor; CoD dropped the test-model, inventory, zoom, weapon-bank, item and
- * limbo commands and added the fade, shellshock and fx ones.
- *
- * commands[] is NUL-terminated here rather than walked with sizeof, and its
- * last real entry ("mr") has no function: CG_ConsoleCommand still claims the
- * name, and the engine forwards it to the server.
- */
+// cg_consolecmds.c -- text commands typed in at the local console, or executed by a key binding
 
 #include "cg_local.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-/* Declarations no header carries. */
-
-/* ui/ui_shared.c. */
 void        String_Init( void );
-extern int  menuCount;                  /* 0x300EEEE8 */
-/*
- * 0x300EEF34.  CG_LoadHud_f's `mov dword_300EEF34, 0` is the ONLY access in the
- * whole DLL -- nothing reads it -- so the name is unrecovered.  Not
- * ui_shared's: ui_shared.c's globals stop at 0x300EEF00, 0x300EEF2C/0x300EEF30
- * just below are cg_drawtools.c's CG_UpdateCompassOrientation statics and
- * 0x300EEF38 just above is bg_weapon.c's bg_numWeapons.  Defined here, in the
- * only unit that touches it.
- */
-int         cg_unknown_300EEF34;
+extern int  menuCount;
+int         cg_unknown_300EEF34;        // cleared by loadhud, never read
 
-/* RTCW keeps PITCH/YAW/ROLL in q_shared.h; q_shared.h here is types-only, so
-   the cgame units define them locally. */
 #ifndef YAW
 #define YAW     1
 #endif
 
 
-/* pm_flags bit gating a client that is actually playing.  bg_local.h stops at
-   PMF_FOLLOW 0x10000 and this bit has no recovered name (0x300140E5). */
-#define PMF_INGAME              0x00040000
+#define PMF_INGAME              0x00040000  // name inferred
 
 
 /*
 =================
 CG_TargetCommand_f
-
-CG_CrosshairPlayer (cg_main.c 0x30021940) is inlined; its -1 return makes the
-`!targetNum` test dead on the stale-crosshair path.
 =================
 */
 static void CG_TargetCommand_f( void ) {
@@ -106,8 +74,7 @@ static void CG_Viewpos_f( void ) {
 =================
 CG_ScoresDown_f
 
-Bound to "-scores" here, not "+scores": CoD swapped the two bodies relative to
-RTCW and kept the names.
+Bound to "-scores": the names are swapped relative to the bodies
 =================
 */
 static void CG_ScoresDown_f( void ) {
@@ -121,12 +88,12 @@ static void CG_ScoresDown_f( void ) {
 =================
 CG_ScoresUp_f
 
-Bound to "+scores".
+Bound to "+scores"
 =================
 */
 static void CG_ScoresUp_f( void ) {
 	if ( cg.scoresRequestTime + 2000 < cg.time ) {
-		// the scores are more than two seconds out of date,
+		// the scores are more than two seconds out of data,
 		// so request new ones
 		cg.scoresRequestTime = cg.time;
 		trap_SendClientCommand( "score" );
@@ -148,6 +115,8 @@ CG_LoadHud_f
 =============
 */
 static void CG_LoadHud_f( void ) {
+	char buff[1024];	// keep: unused, as in RTCW; matches original codegen
+
 	String_Init();
 	menuCount = 0;
 	CG_LoadMenus( "ui_mp/hud.txt", 5 );
@@ -158,8 +127,7 @@ static void CG_LoadHud_f( void ) {
 =============
 CG_Fade_f
 
-"fade <r> <g> <b> <a> <seconds>".  CG_Fade (cg_draw.c 0x300174C0) is inlined
-here; it ignores r, g and b, which is why they are parsed and dropped.
+"fade <r> <g> <b> <a> <seconds>"
 =============
 */
 static void CG_Fade_f( void ) {
@@ -175,8 +143,6 @@ static void CG_Fade_f( void ) {
 	a = atoi( CG_Argv( 4 ) );
 	time = atoi( CG_Argv( 5 ) ) * 1000;
 
-	/* the inlined body stores cg.time into cgs.scriptFadeStartTime (0x30013E5A)
-	   and `time` into scriptFadeDuration -- CG_Fade takes both. */
 	CG_Fade( r, g, b, a, cg.time, time );
 }
 
@@ -207,8 +173,7 @@ static void CG_ShellShock_f( void ) {
 	}
 
 	trap_Argv( 1, name, sizeof( name ) );
-	duration = atof( name );
-	duration *= 1000;
+	duration = FCAST( atof( name ) ) * 1000.0f;
 	msec = Q_ftol( duration );
 
 	CG_SetShellShockParmsFromCvars( &cgs.shellshockParms[0] );
@@ -295,7 +260,7 @@ static void CG_VoiceChat_f( void ) {
 
 	if ( cg.snap && cg.snap->ps.pm_type != PM_INTERMISSION
 		 && !( cg.snap->ps.pm_flags & PMF_INGAME ) ) {
-		CG_Printf( "%s\n", CG_SafeTranslateString_Internal( "cgame", "CGAME_NOSPECTATORVOICECHAT" ) );
+		CG_Printf( "%s\n", CG_SafeTranslateString( "CGAME_NOSPECTATORVOICECHAT" ) );
 		return;
 	}
 
@@ -317,7 +282,7 @@ static void CG_TeamVoiceChat_f( void ) {
 
 	if ( cg.snap && cg.snap->ps.pm_type != PM_INTERMISSION
 		 && !( cg.snap->ps.pm_flags & PMF_INGAME ) ) {
-		CG_Printf( "%s\n", CG_SafeTranslateString_Internal( "cgame", "CGAME_NOSPECTATORVOICECHAT" ) );
+		CG_Printf( "%s\n", CG_SafeTranslateString( "CGAME_NOSPECTATORVOICECHAT" ) );
 		return;
 	}
 
@@ -330,7 +295,7 @@ typedef struct {
 	void ( *function )( void );
 } consoleCommand_t;
 
-static consoleCommand_t commands[] = {
+static const consoleCommand_t commands[] = {
 	{ "viewpos", CG_Viewpos_f },
 	{ "+scores", CG_ScoresUp_f },
 	{ "-scores", CG_ScoresDown_f },
@@ -389,8 +354,8 @@ qboolean CG_ConsoleCommand( void ) {
 =================
 CG_InitConsoleCommands
 
-Let the client system know about all of our commands so it can perform tab
-completion
+Let the client system know about all of our commands
+so it can perform tab completion
 =================
 */
 void CG_InitConsoleCommands( void ) {

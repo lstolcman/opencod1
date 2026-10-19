@@ -1,18 +1,4 @@
-/*
- * g_utils_mp.c -- misc utility functions for the multiplayer game module.
- *
- * Half of this unit is RTCW's game/g_utils.c, carried across unchanged in
- * shape: the configstring index helpers, G_Find/G_PickTarget, vtos,
- * G_SetMovedir, the gentity_t lifecycle (G_InitGentity / G_Spawn /
- * G_FreeEntity / G_TempEntity), G_KillBox, the event helpers, G_SetOrigin and
- * infront.  The other half is CoD's own: the DObj model/tag attachment system
- * (G_EntAttach .. G_DObjGetWorldTagMatrix) that replaced RTCW's single
- * s.modelindex, and the const-string helpers that go with the script VM.
- *
- * Function order is binary order (0x2003A800 .. 0x2003C7C0).
- *
- * @fidelity: likely
- */
+// g_utils_mp.c -- misc utility functions for game module
 
 #include "g_local.h"
 
@@ -20,45 +6,7 @@
 #include <stdlib.h>
 #include <math.h>
 
-/* Declarations that belong in a shared header. */
-
-/* Configstring layout.  Each base is the previous base plus its count. */
-#define CS_TAGS                     108
-#define CS_TAGS_COUNT               32
-#define CS_MODELS                   268
-#define CS_MODELS_COUNT             256
-#define CS_SOUNDS                   524
-#define CS_SOUNDS_COUNT             256
-#define CS_EFFECTS                  780
-#define CS_EFFECTS_COUNT            64
-#define CS_SHELLSHOCKS              1100
-#define CS_SHELLSHOCKS_COUNT        16
-#define CS_LOCALIZED_STRINGS        1244
-#define CS_LOCALIZED_STRINGS_COUNT  256
-#define CS_SHADERS                  1500
-#define CS_SHADERS_COUNT            128
-
-/* entityState_t.eType.  0..11 are UO's values unchanged; 1.1 has no vehicle
- * types, so its event base is 12 rather than 16 (G_TempEntity 0x2003C317). */
-#define ET_GENERAL                  0
-#define ET_SCRIPTMOVER              8
-#define ET_TURRET                   11
-#define ET_EVENTS                   12
-
-/* trajectory_t.trType. */
-#define TR_STATIONARY               0
-#define TR_INTERPOLATE              1
-
-/* The sound-alias event, 0xAC (G_PlaySoundAlias 0x2003C5CB). */
-#define EV_SOUND_ALIAS              172
-
-/* The only content bit this unit names (G_KillBox 0x2003C3FB). */
-#define CONTENTS_BODY               0x2000000
-
-/* G_PickTarget's fixed choice array. */
 #define MAXCHOICES                  32
-
-#define FOFS( x ) ( (int)&( ( (gentity_t *)0 )->x ) )
 
 /* universal/q_math.c.  The three-operand forms compose left-to-right:
  * out = in0 applied inside in1. */
@@ -68,17 +16,13 @@ float       vectoyaw( const vec3_t vec );
 void        MatrixMultiply( vec3_t in0[3], vec3_t in1[3], vec3_t out[3] );
 void        MatrixTranspose( vec3_t in[3], vec3_t out[3] );
 void        MatrixMultiply43( const void *in0, const void *in1, void *out );
-void        MatrixInverseOrthogonal34( void *out, const void *in );
-/* Argument order is ( matrix, out, in ) -- destination in the MIDDLE
-   (universal/com_math.c 0x0042F950, server_mp/sv_game_mp.c 0x00456470). */
-void        MatrixTransformVector43( const void *mat, vec3_t out, const vec3_t in );
-void        DObjSkelMatrixMultiply43( const void *in1, void *out, const void *skelMat );
-/* OUT IS THE SECOND PARAMETER, not the third: universal/com_math_raw.c:109
-   writes through a2 and reads a1 and a3.  Spelled exactly as cg_local.h
-   spells it. */
-void        DObjSkel2MatrixMultiply43( const float *mat43, float *out,
-                                       const float *boneMatrix );
-/* QuatMultiply is declared in g_local.h: destination is the MIDDLE argument. */
+void        MatrixInverseOrthogonal34( const void *in, void *out );
+void        MatrixTransformVector43( const vec3_t in, const void *mat, vec3_t out );
+void        DObjSkelMatrixMultiply43( const void *skelMat, const void *in1, void *out );
+void        DObjSkel2MatrixMultiply43( const float *boneMatrix, const float *mat43, float *out );
+void        QuatFromPitch_m( float q[4], float degrees );
+void        QuatFromYaw_m( float q[4], float degrees );
+void        QuatFromRoll_m( float degrees, float q[4] );
 
 /* universal/q_shared.c. */
 int         Q_stricmp( const char *s1, const char *s2 );
@@ -100,12 +44,21 @@ void G_ClientStopUsingTurret( gentity_t *ent );
 void Scr_FreeEntityConstStrings( gentity_t *ent );
 
 /* The XModel behind every model configstring index, filled in by G_ModelIndex
- * and read back by G_GetModel (0x2008BF40). */
-static void *s_modelIndexXModels[CS_MODELS_COUNT];
+ * and read back by G_GetModel. */
+static XModel *s_modelIndexXModels[CS_MODELS_COUNT];
+
+/*
+=========================================================================
+
+model / sound configstring indexes
+
+=========================================================================
+*/
 
 /*
 ================
 G_FindConfigstringIndex
+
 ================
 */
 int G_FindConfigstringIndex( const char *name, int start, int max, qboolean create,
@@ -143,9 +96,40 @@ int G_FindConfigstringIndex( const char *name, int start, int max, qboolean crea
 	return i;
 }
 
+// keep: open-coded rather than a G_FindConfigstringIndex call (original codegen)
 int G_LocalizedStringIndex( const char *name ) {
-	return G_FindConfigstringIndex( name, CS_LOCALIZED_STRINGS, CS_LOCALIZED_STRINGS_COUNT,
-									level.spawning, "localized string" );
+	int i;
+	const char  *s;
+	qboolean create;
+
+	if ( !name[0] ) {
+		return 0;
+	}
+
+	create = level.spawning;
+
+	for ( i = 1 ; i < CS_LOCALIZED_STRINGS_COUNT ; i++ ) {
+		s = trap_GetConfigstringConst( CS_LOCALIZED_STRINGS + i );
+		if ( !s[0] ) {
+			break;
+		}
+		if ( !_stricmp( s, name ) ) {
+			return i;
+		}
+	}
+
+	if ( !create ) {
+		Scr_Error( va( "%s \"%s\" not precached", "localized string", name ) );
+		return 0;
+	}
+
+	if ( i == CS_LOCALIZED_STRINGS_COUNT ) {
+		G_Error( "G_FindConfigstringIndex: overflow" );
+	}
+
+	trap_SetConfigstring( CS_LOCALIZED_STRINGS + i, name );
+
+	return i;
 }
 
 int G_ShaderIndex( const char *name ) {
@@ -194,7 +178,7 @@ int G_ModelIndex( const char *name ) {
 	return i;
 }
 
-static void *G_GetModel( int modelIndex ) {
+static XModel *G_GetModel( int modelIndex ) {
 	return s_modelIndexXModels[modelIndex];
 }
 
@@ -220,7 +204,10 @@ byte G_SoundAliasIndex( const char *name ) {
 }
 
 unsigned short G_GetGameId( gentity_t *ent ) {
-	return Scr_GetEntityId( ent->s.number, 0 );
+	int entnum;
+
+	entnum = ent->s.number;
+	return Scr_GetEntityId( entnum, SCR_CLASS_ENTITY );
 }
 
 /*
@@ -232,9 +219,10 @@ their DObj in sync from ClientEndFrame instead, so they are left alone.
 ================
 */
 void G_DObjUpdate( gentity_t *ent ) {
-	DObjModel models[MAX_ATTACHED_MODELS + 1];
+	DObjModel models[MAX_ATTACHED_MODELS + 2];
 	unsigned short gameId;
 	int modelCount;
+	int modelIndex;
 	int i;
 
 	if ( ent->client ) {
@@ -243,33 +231,35 @@ void G_DObjUpdate( gentity_t *ent ) {
 
 	G_SafeDObjFree( ent );
 
-	if ( !ent->model ) {
+	modelIndex = ent->model;
+	if ( !modelIndex ) {
 		G_UpdateTagInfoOfChildren( ent, qfalse );
 		return;
 	}
 
 	gameId = G_GetGameId( ent );
 
-	models[0].model = G_GetModel( ent->model );
+	models[0].model = G_GetModel( modelIndex );
 	models[0].tagName = NULL;
-	models[0].boneName = -(short)ent->model;
+	models[0].boneName = -modelIndex;
 	modelCount = 1;
 
 	switch ( ent->s.eType ) {
 	case ET_GENERAL:
 	case ET_SCRIPTMOVER:
 	case ET_TURRET:
-		ent->s.index = ent->model;
+		ent->s.index = modelIndex;
 		break;
 	}
 
 	for ( i = 0 ; i < MAX_ATTACHED_MODELS ; i++ ) {
-		if ( !ent->attachModelIndex[i] ) {
+		modelIndex = ent->attachModelIndex[i];
+		if ( !modelIndex ) {
 			continue;
 		}
-		models[modelCount].model = G_GetModel( ent->attachModelIndex[i] );
+		models[modelCount].model = G_GetModel( modelIndex );
 		models[modelCount].tagName = SL_ConvertToString( ent->attachTagName[i] );
-		models[modelCount].boneName = -(short)ent->attachModelIndex[i];
+		models[modelCount].boneName = -modelIndex;
 		modelCount++;
 	}
 
@@ -290,19 +280,16 @@ void G_SetModel( gentity_t *ent, const char *modelName ) {
 qboolean G_EntAttach( gentity_t *ent, const char *modelName, const char *tagName ) {
 	int i;
 
-	i = 0;
-	while ( ent->attachModelIndex[i] ) {
-		if ( ++i >= MAX_ATTACHED_MODELS ) {
-			return qfalse;
+	for ( i = 0 ; i < MAX_ATTACHED_MODELS ; i++ ) {
+		if ( !ent->attachModelIndex[i] ) {
+			ent->attachModelIndex[i] = (byte)G_ModelIndex( modelName );
+			ent->attachTagName[i] = SL_GetLowercaseString( tagName, 0 );
+			G_DObjUpdate( ent );
+			return qtrue;
 		}
 	}
 
-	ent->attachModelIndex[i] = (byte)G_ModelIndex( modelName );
-	ent->attachTagName[i] = SL_GetLowercaseString( tagName, 0 );
-
-	G_DObjUpdate( ent );
-
-	return qtrue;
+	return qfalse;
 }
 
 qboolean G_EntDetach( gentity_t *ent, const char *modelName, const char *tagName ) {
@@ -450,10 +437,10 @@ void G_EntUnlink( gentity_t *ent ) {
 		prev = child;
 	}
 
-	if ( !prev ) {
-		linkInfo->parent->firstChild = linkInfo->nextChild;
-	} else {
+	if ( prev ) {
 		prev->linkInfo->nextChild = linkInfo->nextChild;
+	} else {
+		linkInfo->parent->firstChild = linkInfo->nextChild;
 	}
 
 	ent->linkInfo = NULL;
@@ -482,20 +469,18 @@ void G_UpdateTagInfo( gentity_t *ent, qboolean updateBoneIndex ) {
 
 	linkInfo = ent->linkInfo;
 
-	if ( !linkInfo->tagName ) {
-		linkInfo->parentTagIndex = -1;
-		return;
-	}
-
-	if ( updateBoneIndex ) {
-		linkInfo->parentTagIndex = trap_DObjGetBoneIndex( linkInfo->parent,
-														  SL_ConvertToString( linkInfo->tagName ) );
-		if ( linkInfo->parentTagIndex >= 0 ) {
-			return;
+	if ( linkInfo->tagName ) {
+		if ( updateBoneIndex ) {
+			linkInfo->parentTagIndex = trap_DObjGetBoneIndex( linkInfo->parent,
+															  SL_ConvertToString( linkInfo->tagName ) );
+			if ( linkInfo->parentTagIndex >= 0 ) {
+				return;
+			}
 		}
+		G_EntUnlink( ent );
+	} else {
+		linkInfo->parentTagIndex = -1;
 	}
-
-	G_EntUnlink( ent );
 }
 
 void G_UpdateTagInfoOfChildren( gentity_t *parent, qboolean updateBoneIndex ) {
@@ -524,19 +509,18 @@ void G_CalcTagParentAxis( gentity_t *child, matrix43_t *outAxis ) {
 	linkInfo = child->linkInfo;
 	parent = linkInfo->parent;
 
-	if ( linkInfo->parentTagIndex < 0 ) {
+	if ( linkInfo->parentTagIndex >= 0 ) {
+		AnglesToAxis( parent->r.currentAngles, parentAxis.axis );
+		VectorCopy( parent->r.currentOrigin, parentAxis.origin );
+
+		G_DObjCalcBone( parent, linkInfo->parentTagIndex );
+		// keep: integer offset arithmetic matches original codegen
+		DObjSkelMatrixMultiply43( (float *)( linkInfo->parentTagIndex * 64
+								  + (int)trap_DObjGetMatrixArray( parent ) ), &parentAxis, outAxis );
+	} else {
 		AnglesToAxis( parent->r.currentAngles, outAxis->axis );
 		VectorCopy( parent->r.currentOrigin, outAxis->origin );
-		return;
 	}
-
-	AnglesToAxis( parent->r.currentAngles, parentAxis.axis );
-	VectorCopy( parent->r.currentOrigin, parentAxis.origin );
-
-	G_DObjCalcBone( parent, linkInfo->parentTagIndex );
-	DObjSkelMatrixMultiply43( &parentAxis, outAxis,
-							  (float *)trap_DObjGetMatrixArray( parent )
-							  + linkInfo->parentTagIndex * 16 );
 }
 
 void G_CalcTagParentRelAxis( gentity_t *child, matrix43_t *outAxis ) {
@@ -570,7 +554,7 @@ void G_CalcTagAxis( gentity_t *ent, int useLinkedAngles ) {
 		MatrixTranspose( parentAxis.axis, inverseParentAxis.axis );
 		MatrixMultiply( localAxis.axis, inverseParentAxis.axis, linkInfo->relAxis.axis );
 	} else {
-		MatrixInverseOrthogonal34( &inverseParentAxis, &parentAxis );
+		MatrixInverseOrthogonal34( &parentAxis, &inverseParentAxis );
 		VectorCopy( ent->r.currentOrigin, localAxis.origin );
 		MatrixMultiply43( &localAxis, &inverseParentAxis, &linkInfo->relAxis );
 	}
@@ -592,19 +576,21 @@ void G_SetFixedLink( gentity_t *ent, int mode ) {
 	G_CalcTagParentAxis( ent, &parentAxis );
 	linkInfo = ent->linkInfo;
 
-	if ( mode == 1 ) {
+	switch ( mode ) {
+	case 0:
+		MatrixMultiply43( &linkInfo->relAxis, &parentAxis, &linkedAxis );
+		VectorCopy( linkedAxis.origin, ent->r.currentOrigin );
+		AxisToAngles( linkedAxis.axis, ent->r.currentAngles );
+		break;
+	case 1:
 		MatrixMultiply43( &linkInfo->relAxis, &parentAxis, &linkedAxis );
 		VectorCopy( linkedAxis.origin, ent->r.currentOrigin );
 		ent->r.currentAngles[1] = vectoyaw( linkedAxis.axis[0] );
-	} else if ( mode < 2 ) {
-		if ( mode == 0 ) {
-			MatrixMultiply43( &linkInfo->relAxis, &parentAxis, &linkedAxis );
-			VectorCopy( linkedAxis.origin, ent->r.currentOrigin );
-			AxisToAngles( linkedAxis.axis, ent->r.currentAngles );
-		}
-	} else if ( mode == 2 ) {
-		MatrixTransformVector43( &parentAxis, linkedAxis.origin, linkInfo->relAxis.origin );
+		break;
+	case 2:
+		MatrixTransformVector43( linkInfo->relAxis.origin, &parentAxis, linkedAxis.origin );
 		VectorCopy( linkedAxis.origin, ent->r.currentOrigin );
+		break;
 	}
 }
 
@@ -617,14 +603,7 @@ out through the trajectories so the clients interpolate it.
 ================
 */
 void G_GeneralLink( gentity_t *ent ) {
-	matrix43_t parentAxis;
-	matrix43_t linkedAxis;
-
-	G_CalcTagParentAxis( ent, &parentAxis );
-	MatrixMultiply43( &ent->linkInfo->relAxis, &parentAxis, &linkedAxis );
-
-	VectorCopy( linkedAxis.origin, ent->r.currentOrigin );
-	AxisToAngles( linkedAxis.axis, ent->r.currentAngles );
+	G_SetFixedLink( ent, 0 );
 
 	G_SetOrigin( ent, ent->r.currentOrigin );
 	G_SetAngle( ent, ent->r.currentAngles );
@@ -655,44 +634,25 @@ int G_DObjUpdateServerTime( gentity_t *ent, int stopOnNotetrack ) {
 ================
 G_DObjSetLocalTagInternal
 
-Overwrite one bone of the pose with an explicit origin/angles.  The three
-angle-to-quaternion helpers are inlined here by the retail build.
+Overwrite one bone of the pose with an explicit origin/angles.
+Not static: g_misc_mp.c calls it.
 ================
 */
-/* Not static: turret_think (g_misc_mp.c) calls it.  0x2003B790. */
 void G_DObjSetLocalTagInternal( gentity_t *ent, const vec3_t origin, const vec3_t angles,
 								int boneIndex ) {
 	DObjAnimMat *rotTrans;
-	vec4_t yawQuat;
-	vec4_t pitchQuat;
-	vec4_t rollQuat;
-	vec4_t pitchYawQuat;
-	float halfAngle;
+	float roll;
+	struct { vec4_t yaw; vec4_t pitch; vec4_t roll; vec4_t pitchYaw; } quats;   // keep: original stack layout
 
-	rotTrans = &( (DObjAnimMat *)trap_DObjGetRotTransArray( ent ) )[boneIndex];
+	rotTrans = &trap_DObjGetRotTransArray( ent )[boneIndex];
 
-	halfAngle = angles[1] * ( (float)M_PI / 360.0f );
-	yawQuat[0] = 0.0f;
-	yawQuat[1] = 0.0f;
-	yawQuat[2] = (float)sin( halfAngle );
-	yawQuat[3] = (float)cos( halfAngle );
+	QuatFromYaw_m( quats.yaw, angles[1] );
+	QuatFromPitch_m( quats.pitch, angles[0] );
+	roll = angles[2];
+	QuatFromRoll_m( roll, quats.roll );
 
-	halfAngle = angles[0] * ( (float)M_PI / 360.0f );
-	pitchQuat[0] = 0.0f;
-	pitchQuat[1] = (float)sin( halfAngle );
-	pitchQuat[2] = 0.0f;
-	pitchQuat[3] = (float)cos( halfAngle );
-
-	halfAngle = angles[2] * ( (float)M_PI / 360.0f );
-	rollQuat[0] = (float)sin( halfAngle );
-	rollQuat[1] = 0.0f;
-	rollQuat[2] = 0.0f;
-	rollQuat[3] = (float)cos( halfAngle );
-
-	/* 0x2003B887: eax=yawQuat, edx=pitchYawQuat (out), ecx=pitchQuat.
-	   0x2003B896: eax=pitchYawQuat, edx=rotTrans (out), ecx=rollQuat. */
-	QuatMultiply( yawQuat, pitchYawQuat, pitchQuat );
-	QuatMultiply( pitchYawQuat, rotTrans->quat, rollQuat );
+	QuatMultiply( quats.pitch, quats.yaw, quats.pitchYaw );
+	QuatMultiply( quats.roll, quats.pitchYaw, rotTrans->quat );
 
 	rotTrans->accumulatedWeight = 0.0f;
 	VectorCopy( origin, rotTrans->translation );
@@ -775,7 +735,7 @@ float *G_DObjGetLocalTagMatrix( gentity_t *ent, const char *tagName ) {
 
 	G_DObjCalcBone( ent, boneIndex );
 
-	return (float *)trap_DObjGetMatrixArray( ent ) + boneIndex * 16;
+	return trap_DObjGetMatrixArray( ent ) + boneIndex * 16;
 }
 
 qboolean G_DObjGetWorldTagMatrix( gentity_t *ent, const char *tagName, void *outMatrix ) {
@@ -789,13 +749,7 @@ qboolean G_DObjGetWorldTagMatrix( gentity_t *ent, const char *tagName, void *out
 
 	AnglesToAxis( ent->r.currentAngles, entityAxis.axis );
 	VectorCopy( ent->r.currentOrigin, entityAxis.origin );
-	/* ( entityAxis, outMatrix, localMatrix ) -- all three slots, not just the
-	   out.  0x2003BB36 calls it with eax = &entityAxis, edx = the outMatrix
-	   argument and ecx = localMatrix, and the register mapping is eax = mat43,
-	   edx = out, ecx = boneMatrix (cg_weapons_mp.c:57, from CG_AddPlayerWeapon
-	   0x30037137). */
-	DObjSkel2MatrixMultiply43( (const float *)&entityAxis, (float *)outMatrix,
-							   localMatrix );
+	DObjSkel2MatrixMultiply43( localMatrix, (const float *)&entityAxis, (float *)outMatrix );
 
 	return qtrue;
 }
@@ -853,9 +807,6 @@ gentity_t *G_FindStr( gentity_t *from, int fieldofs, const char *match ) {
 		if ( !s ) {
 			continue;
 		}
-		if ( !match ) {
-			continue;
-		}
 		if ( !Q_stricmp( s, match ) ) {
 			return from;
 		}
@@ -899,6 +850,14 @@ gentity_t *G_PickTarget( unsigned short targetname ) {
 	return choice[rand() % num_choices];
 }
 
+/*
+=============
+VectorToString
+
+This is just a convenience function
+for printing vectors
+=============
+*/
 char *vtos( const vec3_t v ) {
 	static int index;
 	static char str[8][32];
@@ -927,14 +886,14 @@ char *vtosf( const vec3_t v ) {
 }
 
 /*
-================
+===============
 G_SetMovedir
 
 The editor only specifies a single value for angles (yaw),
 but we have special constants to generate an up or down direction.
 Angles will be cleared, because it is being used to represent a direction
 instead of an orientation.
-================
+===============
 */
 void G_SetMovedir( vec3_t angles, vec3_t movedir ) {
 	static vec3_t VEC_UP        = { 0, -1, 0 };
@@ -981,14 +940,7 @@ gentity_t *G_Spawn( void ) {
 	gentity_t   *e;
 	int i;
 
-	if ( level.freeListHead ) {
-		e = level.freeListHead;
-		level.freeListHead = e->nextFree;
-		if ( !level.freeListHead ) {
-			level.freeListTail = NULL;
-		}
-		e->nextFree = NULL;
-	} else {
+	if ( !level.freeListHead ) {
 		if ( level.num_entities == MAX_GENTITIES - 2 ) {
 			for ( i = 0 ; i < level.num_entities ; i++ ) {
 				G_Printf( "%4i: '%s', origin: %f %f %f\n", i,
@@ -1004,6 +956,13 @@ gentity_t *G_Spawn( void ) {
 		level.num_entities++;
 		trap_LocateGameData( level.gentities, level.num_entities, sizeof( gentity_t ),
 							 &level.clients[0].ps, sizeof( gclient_t ) );
+	} else {
+		e = level.freeListHead;
+		level.freeListHead = level.freeListHead->nextFree;
+		if ( !level.freeListHead ) {
+			level.freeListTail = NULL;
+		}
+		e->nextFree = NULL;
 	}
 
 	G_InitGentity( e );
@@ -1028,7 +987,7 @@ gentity_t *G_SpawnPlayerClone( void ) {
 	e = &level.gentities[MAX_CLIENTS + level.playerCloneCursor];
 	level.playerCloneCursor = ( level.playerCloneCursor + 1 ) % BODY_QUEUE_SIZE;
 
-	eFlags = ~e->s.eFlags & 8;
+	eFlags = ~e->s.eFlags & EF_TELEPORT_BIT;
 
 	if ( e->inuse ) {
 		G_FreeEntity( e );
@@ -1050,7 +1009,10 @@ nothing follows it into the free list.
 */
 void G_FreeEntityRefs( gentity_t *ent ) {
 	gentity_t   *e;
+	int entnum;
 	int i;
+
+	entnum = ent->s.number;
 
 	for ( i = 0 ; i < level.num_entities ; i++ ) {
 		e = &g_entities[i];
@@ -1060,13 +1022,13 @@ void G_FreeEntityRefs( gentity_t *ent ) {
 		if ( e->parent == ent ) {
 			e->parent = NULL;
 		}
-		if ( e->r.ownerNum == ent->s.number ) {
+		if ( e->r.ownerNum == entnum ) {
 			e->r.ownerNum = ENTITYNUM_NONE;
 			if ( e->s.eType == ET_TURRET ) {
 				e->active = qfalse;
 			}
 		}
-		if ( e->s.groundEntityNum == ent->s.number ) {
+		if ( e->s.groundEntityNum == entnum ) {
 			e->s.groundEntityNum = ENTITYNUM_NONE;
 		}
 	}
@@ -1099,20 +1061,15 @@ void G_FreeEntity( gentity_t *ent ) {
 	}
 
 	trap_UnlinkEntity( ent );       // unlink from world
-	G_SafeDObjFree( ent );
+	trap_SafeDObjFree( ent->s.number, qtrue );   // also release the anim tree
 	G_FreeEntityRefs( ent );
 
 	if ( ent->turret ) {
-		if ( g_entities[ent->r.ownerNum].client ) {
-			G_ClientStopUsingTurret( ent );
-		}
-		ent->active = qfalse;
-		*(int *)ent->turret = 0;
-		ent->turret = NULL;
+		G_FreeTurret( ent );
 	}
 
 	Scr_FreeEntityConstStrings( ent );
-	Scr_FreeEntityNum( ent->s.number, 0 );
+	Scr_FreeEntityNum( ent->s.number, SCR_CLASS_ENTITY );
 
 	spawnCount = ent->spawnCount;
 
@@ -1137,8 +1094,7 @@ G_TempEntity
 
 Spawns an event entity that will be auto-removed
 The origin will be snapped to save net bandwidth, so care
-must be taken if the origin is right on a surface (snap towards start vector
-first)
+must be taken if the origin is right on a surface (snap towards start vector first)
 =================
 */
 gentity_t *G_TempEntity( const vec3_t origin, int event ) {
@@ -1164,6 +1120,14 @@ gentity_t *G_TempEntity( const vec3_t origin, int event ) {
 
 	return e;
 }
+
+/*
+==============================================================================
+
+Kill box
+
+==============================================================================
+*/
 
 /*
 =================
@@ -1193,9 +1157,11 @@ void G_KillBox( gentity_t *ent ) {
 		}
 
 		// nail it
-		G_Damage( hit, ent, ent, NULL, NULL, 100000, DAMAGE_NO_TEAM_PROTECTION, MOD_TELEFRAG, 0 );
+		G_Damage( hit, ent, ent, NULL, NULL, 100000, DAMAGE_NO_TEAM_PROTECTION, MOD_TELEFRAG, HITLOC_NONE );
 	}
 }
+
+//==============================================================================
 
 /*
 ===============
@@ -1206,17 +1172,12 @@ client side: jumppads and item pickups
 Adds an event+parm and twiddles the event counter
 ===============
 */
-void G_AddPredictableEvent( gentity_t *ent, byte event, byte eventParm ) {
+void G_AddPredictableEvent( gentity_t *ent, int event, int eventParm ) {
 	if ( !ent->client ) {
 		return;
 	}
-	if ( !event ) {
-		return;
-	}
 
-	ent->client->ps.events[ent->client->ps.eventSequence & 3] = event;
-	ent->client->ps.eventParms[ent->client->ps.eventSequence & 3] = eventParm;
-	ent->client->ps.eventSequence++;
+	BG_AddPredictableEventToPlayerstate( event, eventParm, &ent->client->ps );
 }
 
 /*
@@ -1261,8 +1222,13 @@ void G_PlaySoundAlias( gentity_t *ent, byte alias ) {
 	G_AddEvent( ent, EV_SOUND_ALIAS, alias );
 }
 
-/* Installed as the animation script's sound callback by G_InitGame
- * (0x20025EEE). */
+/*
+=============
+G_AnimScriptSound
+
+The animation script's sound callback
+=============
+*/
 void G_AnimScriptSound( int client, const char *name ) {
 	byte alias;
 
@@ -1274,6 +1240,15 @@ void G_AnimScriptSound( int client, const char *name ) {
 	G_AddEvent( &g_entities[client], EV_SOUND_ALIAS, alias );
 }
 
+//==============================================================================
+
+/*
+================
+G_SetOrigin
+
+Sets the pos trajectory for a fixed position
+================
+*/
 void G_SetOrigin( gentity_t *ent, const vec3_t origin ) {
 	VectorCopy( origin, ent->s.pos.trBase );
 	ent->s.pos.trType = TR_STATIONARY;
@@ -1284,6 +1259,11 @@ void G_SetOrigin( gentity_t *ent, const vec3_t origin ) {
 	VectorCopy( origin, ent->r.currentOrigin );
 }
 
+/*
+==============
+G_SetAngle
+==============
+*/
 void G_SetAngle( gentity_t *ent, const vec3_t angles ) {
 	VectorCopy( angles, ent->s.apos.trBase );
 	ent->s.apos.trType = TR_STATIONARY;
@@ -1294,6 +1274,11 @@ void G_SetAngle( gentity_t *ent, const vec3_t angles ) {
 	VectorCopy( angles, ent->r.currentAngles );
 }
 
+/*
+====================
+infront
+====================
+*/
 qboolean infront( gentity_t *self, gentity_t *other ) {
 	vec3_t vec;
 	float dot;

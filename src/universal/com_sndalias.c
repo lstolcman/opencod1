@@ -17,22 +17,22 @@ extern char     **FS_ListFilteredFiles( const char *path, const char *extension,
 extern int      FS_FOpenFileRead_Internal( const char *qpath, fileHandle_t *file,
 										   qboolean uniqueFILE, int filter_flag );
 extern qboolean FS_FileExists( const char *file );
+extern qboolean FS_TouchFile( const char *qpath );
 extern void     FS_BuildOSPath3( const char *base, const char *game,
 								 const char *qpath, char *fs_path,
 								 int allowOverflow );
 
 extern char     *Com_Parse( char **data_p );
 extern char     *Com_ParseOnLine( char **data_p );
-extern void     Com_SkipRestOfLine( int unused, char **data_p );
+extern void     Com_SkipRestOfLine( char **data_p );
 extern void     Com_SetCSV( qboolean enabled );
 extern void     Com_UngetToken( void );
 
 extern void     Hunk_SetLowTempMark( void );
 extern void     Hunk_ClearToLowTempMark( void );
 
-extern void     Sys_OutOfMemoryPrep( void );
-
-extern void     *MSS_LoadSoundFile( const char *name );
+/* retail 0x00433CC1 pushes source too; the snd_miles.c definition ignores it */
+extern void     *MSS_LoadSoundFile( const char *name, int source );
 extern void     MSS_StopSounds( int flag );
 
 typedef enum {
@@ -152,11 +152,7 @@ static const char *snd_aliasChannelNames[SND_CHANNEL_COUNT] = {
 };
 
 const char          *snd_currentFile;                                   /* 0x008931D0 */
-byte                snd_aliasSetLoaded[SND_ALIAS_LOADED_SLOTS];         /* 0x008931D4 */
-snd_alias_t         *snd_aliasHashTable[SND_ALIAS_LOCALE_COUNT][SND_ALIAS_HASH_SIZE];
-																		/* 0x008931D8 */
-snd_alias_t         *snd_aliasTable[SND_ALIAS_LOCALE_COUNT];            /* 0x00893DD8 */
-int                 snd_aliasTableCount[SND_ALIAS_LOCALE_COUNT];        /* 0x00893DE4 */
+snd_aliasGlobals_t  snd_aliasGlobals;                                   /* 0x008931D4 */
 snd_aliasBuild_t    *snd_aliasBuildHead;                                /* 0x00893DF0 */
 char                snd_aliasLocalizedName[64];                         /* 0x00893DF4 */
 int                 snd_aliasTableChecksum[SND_ALIAS_LOCALE_COUNT];     /* 0x00893E34 */
@@ -164,7 +160,7 @@ char                snd_subtitleReference[1024];                        /* 0x008
 
 static void  Com_LoadedSoundList( int source );
 static void  Com_StreamedSoundList( int source );
-int   Com_LoadSoundAliasFile( const char *csvPath, const char *sourceName,
+int   Com_LoadSoundAliasFile( const char *sourceName, const char *csvPath,
 									 int count, int source );
 void  Com_MakeSoundAliasesPermanent( int count, int source );
 static snd_aliasBuild_t *Com_SortTempSoundAliases_r( snd_aliasBuild_t *head, int *count );
@@ -180,8 +176,8 @@ static void Com_LoadedSoundList( int source ) {
 		return;
 	}
 
-	table = snd_aliasTable[source];
 	total = 0;
+	table = snd_aliasTable[source];
 
 	for ( i = 0 ; i < snd_aliasTableCount[source] ; i++ ) {
 		if ( table[i].type != SND_TYPE_LOADED ) {
@@ -189,23 +185,22 @@ static void Com_LoadedSoundList( int source ) {
 		}
 		for ( j = 0 ; j < i ; j++ ) {
 			if ( table[j].type == SND_TYPE_LOADED && table[j].file == table[i].file ) {
-				break;
+				goto nextAlias;
 			}
-		}
-		if ( j < i ) {
-			continue;
 		}
 
 		if ( table[i].soundData ) {
 			size = *( (int *) table[i].soundData + 2 ) + 36;
 			total += size;
-			Com_Printf( "%-64s %7.1f KB\n", table[i].file, (double) size / 1024.0 );
+			Com_Printf( "%-64s %7.1f KB\n", table[i].file, (rfloat) size / 1024.0f );
 		} else {
 			Com_Printf( "%-64s FAILED TO LOAD\n", table[i].file );
 		}
+nextAlias:
+		;
 	}
 
-	Com_Printf( "\ntotal usage %7.3f MB\n", (double) total / ( 1024.0 * 1024.0 ) );
+	Com_Printf( "\ntotal usage %7.3f MB\n", (rfloat) total / ( 1024.0f * 1024.0f ) );
 }
 
 static void Com_StreamedSoundList( int source ) {
@@ -224,11 +219,8 @@ static void Com_StreamedSoundList( int source ) {
 		}
 		for ( j = 0 ; j < i ; j++ ) {
 			if ( table[j].type == SND_TYPE_STREAMED && table[j].file == table[i].file ) {
-				break;
+				goto nextAlias;
 			}
-		}
-		if ( j < i ) {
-			continue;
 		}
 
 		if ( table[i].streamExists ) {
@@ -236,6 +228,8 @@ static void Com_StreamedSoundList( int source ) {
 		} else {
 			Com_Printf( "%-64s FILE NOT FOUND\n", table[i].file );
 		}
+nextAlias:
+		;
 	}
 }
 
@@ -267,34 +261,29 @@ int Com_HashAliasName( const char *name ) {
 
 /* ---- Com_IsValidAliasName  0x00432A20 ---- VERIFIED */
 qboolean Com_IsValidAliasName( const char *name ) {
-	signed char c;
-
-	c = (signed char) *name;
-	if ( c <= 31 || ( !isalpha( c ) && c != '_' ) ) {
+	if ( *name < ' ' || ( !isalpha( *name ) && *name != '_' ) ) {
 		return qfalse;
 	}
 
-	for ( ;; ) {
-		name++;
-		c = (signed char) *name;
-		if ( !c ) {
-			return qtrue;
-		}
-		if ( c <= 31 || ( !isalnum( c ) && c != '_' ) ) {
+	for ( name++ ; *name ; name++ ) {
+		if ( *name < ' ' || ( !isalnum( *name ) && *name != '_' ) ) {
 			return qfalse;
 		}
 	}
+	return qtrue;
 }
 
 /* ---- Com_FindSoundAlias  0x00432A80 ---- VERIFIED */
 snd_alias_t *Com_FindSoundAlias( const char *name, int source ) {
 	snd_alias_t *alias;
+	int         hash;
 
 	if ( !name ) {
 		return NULL;
 	}
 
-	for ( alias = snd_aliasHashTable[source][Com_HashAliasName( name )] ;
+	hash = Com_HashAliasName( name );
+	for ( alias = snd_aliasHashTable[source][hash] ;
 		  alias ;
 		  alias = alias->hashNext ) {
 		if ( alias->name && !Q_stricmp( name, alias->name ) ) {
@@ -306,26 +295,30 @@ snd_alias_t *Com_FindSoundAlias( const char *name, int source ) {
 
 /* ---- Com_LoadSoundAliasDefaults  0x00432AD0 ---- VERIFIED */
 static void Com_LoadSoundAliasDefaults( snd_aliasBuild_t *node, qboolean defaultLoadspec ) {
-	strcpy( node->sourceFile, snd_currentFile );
-	node->name[0]      = '\0';
-	node->subtitle[0]  = '\0';
-	node->sequence     = 0;
-	node->file[0]      = '\0';
-	node->volMin       = 1.0f;
-	node->volMax       = 1.0f;
-	node->pitchMin     = 1.0f;
-	node->pitchMax     = 1.0f;
-	node->distMin      = 120.0f;
-	node->distMax      = 0.0f;
-	node->channel      = SND_CHANNEL_AUTO;
-	node->type         = SND_TYPE_LOADED;
-	node->loop         = 0;
-	node->isMaster     = 0;
-	node->isSlave      = 0;
+	const char *source = snd_currentFile;
+	char *destination = node->sourceFile;
+	char c;
+	do { c = *source; ++source; *destination = c; ++destination; } while (c);
+	/* field order of the Mac build's Com_LoadSoundAliasDefaults */
+	node->name[0] = '\0';
+	node->sequence = 0;
+	node->file[0] = '\0';
+	node->subtitle[0] = '\0';
+	node->volMin = 1.0f;
+	node->volMax = 1.0f;
+	node->pitchMin = 1.0f;
+	node->pitchMax = 1.0f;
+	node->distMin = 120.0f;
+	node->distMax = 0.0f;
+	node->channel = SND_CHANNEL_AUTO;
+	node->type = SND_TYPE_LOADED;
+	node->loop = 0;
+	node->probability = 1.0f;
+	node->loadspec = (defaultLoadspec != qfalse);
+	node->isMaster = 0;
+	node->isSlave = 0;
 	node->slavePercent = 1.0f;
-	node->probability  = 1.0f;
-	node->loadspec     = ( defaultLoadspec != qfalse );
-	node->next         = NULL;
+	node->next = NULL;
 }
 
 /* ---- Com_SoundAliasChannelForName  0x00432B80 ---- VERIFIED */
@@ -335,8 +328,7 @@ static int Com_SoundAliasChannelForName( const char *name ) {
 	int i;
 
 	for ( i = 0 ; i < SND_CHANNEL_COUNT ; i++ ) {
-		if ( name && snd_aliasChannelNames[i]
-			 && !Q_stricmp( name, snd_aliasChannelNames[i] ) ) {
+		if ( !Q_stricmp( name, snd_aliasChannelNames[i] ) ) {
 			return i;
 		}
 	}
@@ -374,7 +366,7 @@ static int Com_SoundAliasTypeForName( const char *name ) {
 	return SND_TYPE_UNKNOWN;
 }
 
-static qboolean Com_SoundAliasLoop( const char *value ) {
+static byte Com_SoundAliasLoop( const char *value ) {
 	if ( value ) {
 		if ( !Q_stricmp( value, "looping" ) ) {
 			return qtrue;
@@ -407,7 +399,7 @@ static int Com_SoundAliasLoadSpec( const char *sourceName, const char *value ) {
 				   snd_currentFile, SND_ALIAS_LOADSPEC_MAX );
 	}
 
-	Q_strlwr( spec );
+	_strlwr( spec );    /* retail 0x00432D9E calls the CRT _strlwr, not Q_strlwr */
 	cursor = spec;
 
 	if ( spec[0] == '!' ) {
@@ -425,20 +417,23 @@ static int Com_SoundAliasLoadSpec( const char *sourceName, const char *value ) {
 	}
 
 	match = strstr( spec, sourceName );
-	while ( match ) {
+	for ( ;; ) {
+		if ( !match ) {
+			return strcmp( cursor, "all_mp" ) == 0;
+		}
 		if ( ( match == spec || *( match - 1 ) <= ' ' ) && match[sourceLen] <= ' ' ) {
-			return 1;
+			break;
 		}
 		cursor = match + 1;
 		match = strstr( cursor, sourceName );
 	}
 
-	return strcmp( cursor, "all_mp" ) == 0;
+	return 1;
 }
 
 /* ---- Com_SoundAliasMasterSlave  0x00432E70 ---- VERIFIED */
 static void Com_SoundAliasMasterSlave( const char *value, snd_aliasBuild_t *node ) {
-	if ( !Q_stricmp( value, "master" ) ) {
+	if ( !_stricmp( value, "master" ) ) {   /* retail 0x00432E76: CRT _stricmp */
 		node->isMaster = 1;
 		node->isSlave  = 0;
 	} else {
@@ -449,10 +444,11 @@ static void Com_SoundAliasMasterSlave( const char *value, snd_aliasBuild_t *node
 }
 
 /* ---- Com_LoadSoundAliasField  0x00432EB0 ---- VERIFIED */
-static void Com_LoadSoundAliasField( byte *seen, const char *value, int column,
+/* parameter order gives retail's LTCG registers: value in edx, column in ecx, seen in eax */
+static void Com_LoadSoundAliasField( const char *value, int column, byte *seen,
 									 const char *sourceName, snd_aliasBuild_t *node ) {
 	float f;
-	const char *p;
+	int   i;
 
 	if ( column == SND_COL_UNKNOWN ) {
 		return;
@@ -499,13 +495,12 @@ static void Com_LoadSoundAliasField( byte *seen, const char *value, int column,
 					   "\x15Sound alias file %s: Subtitle '%s' is longer than %i characters\n",
 					   snd_currentFile, value, sizeof( node->subtitle ) - 1 );
 		}
-		for ( p = value ; *p ; p++ ) {
-			if ( *(const signed char *) p < 0 ) {
+		for ( i = 0 ; value[i] ; i++ ) {
+			if ( value[i] < 0 ) {
 				Com_Error( ERR_DROP,
 						   "\x15Sound alias file %s: Subtitle '%s' has invalid character "
 						   "'%c' ascii %i\n",
-						   snd_currentFile, value, *(const signed char *) p,
-						   *(const unsigned char *) p );
+						   snd_currentFile, value, value[i], (unsigned char) value[i] );
 			}
 		}
 		strcpy( node->subtitle, value );
@@ -577,9 +572,9 @@ static void Com_FinishBuildingSoundAlias( snd_aliasBuild_t *node ) {
 	float tmp;
 
 	if ( node->pitchMin > node->pitchMax ) {
-		tmp = node->pitchMin;
-		node->pitchMin = node->pitchMax;
-		node->pitchMax = tmp;
+		tmp = node->pitchMax;
+		node->pitchMax = node->pitchMin;
+		node->pitchMin = tmp;
 	}
 	if ( node->pitchMin <= 0.0f ) {
 		Com_Error( ERR_DROP, "\x15sound alias '%s' has pitch_min %g <= 0\n",
@@ -587,11 +582,11 @@ static void Com_FinishBuildingSoundAlias( snd_aliasBuild_t *node ) {
 	}
 
 	if ( node->volMin > node->volMax ) {
-		tmp = node->volMin;
-		node->volMin = node->volMax;
-		node->volMax = tmp;
+		tmp = node->volMax;
+		node->volMax = node->volMin;
+		node->volMin = tmp;
 	}
-	if ( !( node->volMin >= 0.0f ) ) {
+	if ( node->volMin < 0.0f ) {
 		Com_Error( ERR_DROP, "\x15sound alias '%s' has vol_min < 0\n",
 				   node->name, node->volMin );
 	}
@@ -599,7 +594,7 @@ static void Com_FinishBuildingSoundAlias( snd_aliasBuild_t *node ) {
 	if ( !( node->distMax != 0.0f ) ) {
 		node->distMax = node->distMin * 5.0f;
 	}
-	if ( !( node->distMax >= node->distMin ) ) {
+	if ( node->distMax < node->distMin ) {
 		Com_Error( ERR_DROP, "\x15sound alias '%s' has dist_min %g <= dist_max %g\n",
 				   node->name, node->distMin, node->distMax );
 	}
@@ -612,11 +607,15 @@ static void Com_FinishBuildingSoundAlias( snd_aliasBuild_t *node ) {
 /* ---- Com_AddBuildSoundAlias  0x004332F0 ---- */
 static snd_aliasBuild_t *Com_AddBuildSoundAlias( const snd_aliasBuild_t *node ) {
 	snd_aliasBuild_t *clone;
+	snd_aliasBuild_t **head;
 
+	/* through a pointer: with the global spelled directly VC7 schedules the
+	 * call's add esp before the copy (retail 0x00433313 has it after) */
+	head = &snd_aliasBuildHead;
 	clone = (snd_aliasBuild_t *) Hunk_AllocateTempMemoryInternal( sizeof( *clone ) );
 	memcpy( clone, node, sizeof( *clone ) );
-	clone->next = snd_aliasBuildHead;
-	snd_aliasBuildHead = clone;
+	clone->next = *head;
+	*head = clone;
 	return clone;
 }
 
@@ -651,7 +650,7 @@ static void Com_AddSoundAlias( const snd_aliasBuild_t *node, snd_alias_t *alias,
 }
 
 /* ---- Com_LoadSoundAliasFile  0x004333D0 ---- VERIFIED */
-int Com_LoadSoundAliasFile( const char *csvPath, const char *sourceName,
+int Com_LoadSoundAliasFile( const char *sourceName, const char *csvPath,
 								   int count, int source ) {
 	void                *buffer;
 	char                *data_p;
@@ -680,7 +679,7 @@ int Com_LoadSoundAliasFile( const char *csvPath, const char *sourceName,
 		}
 
 		if ( !token[0] || token[0] == '#' ) {
-			Com_SkipRestOfLine( 0, &data_p );
+			Com_SkipRestOfLine( &data_p );
 			continue;
 		}
 
@@ -691,8 +690,7 @@ int Com_LoadSoundAliasFile( const char *csvPath, const char *sourceName,
 			for ( ;; ) {
 				columnMap[columnCount] = SND_COL_UNKNOWN;
 				for ( column = SND_COL_NAME ; column < SND_COL_COUNT ; column++ ) {
-					if ( snd_aliasColumnNames[column] && token
-						 && !Q_stricmp( snd_aliasColumnNames[column], token ) ) {
+					if ( !Q_stricmp( snd_aliasColumnNames[column], token ) ) {
 						columnMap[columnCount] = column;
 						if ( column == SND_COL_NAME ) {
 							hasName = qtrue;
@@ -715,38 +713,35 @@ int Com_LoadSoundAliasFile( const char *csvPath, const char *sourceName,
 						   "\x15Sound alias file %s: missing 'name' and/or 'file' columns\n",
 						   snd_currentFile );
 			}
+		} else {
+			memset( seen, 0, sizeof( seen ) );
+			Com_LoadSoundAliasDefaults( &node, source );
 
-			Com_SkipRestOfLine( 0, &data_p );
-			continue;
-		}
-
-		memset( seen, 0, sizeof( seen ) );
-		Com_LoadSoundAliasDefaults( &node, source );
-
-		i = 0;
-		for ( ;; ) {
-			if ( token[0] ) {
-				Com_LoadSoundAliasField( seen, token, columnMap[i], sourceName, &node );
+			i = 0;
+			for ( ;; ) {
+				if ( token[0] ) {
+					Com_LoadSoundAliasField( token, columnMap[i], seen, sourceName, &node );
+				}
+				if ( ++i == columnCount ) {
+					break;
+				}
+				token = Com_ParseOnLine( &data_p );
 			}
-			if ( ++i == columnCount ) {
-				break;
+
+			if ( !seen[SND_COL_NAME] || !seen[SND_COL_FILE] ) {
+				Com_Error( ERR_DROP,
+						   "\x15Sound alias file %s: alias entry missing name and/or file\n",
+						   snd_currentFile );
 			}
-			token = Com_ParseOnLine( &data_p );
+
+			if ( node.loadspec ) {
+				Com_FinishBuildingSoundAlias( &node );
+				Com_AddBuildSoundAlias( &node );
+				count++;
+			}
 		}
 
-		if ( !seen[SND_COL_NAME] || !seen[SND_COL_FILE] ) {
-			Com_Error( ERR_DROP,
-					   "\x15Sound alias file %s: alias entry missing name and/or file\n",
-					   snd_currentFile );
-		}
-
-		if ( node.loadspec ) {
-			Com_FinishBuildingSoundAlias( &node );
-			Com_AddBuildSoundAlias( &node );
-			count++;
-		}
-
-		Com_SkipRestOfLine( 0, &data_p );
+		Com_SkipRestOfLine( &data_p );
 	}
 
 	Com_EndParseSession();
@@ -759,8 +754,8 @@ static snd_aliasBuild_t *Com_SortTempSoundAliases_r( snd_aliasBuild_t *head, int
 	int                 i;
 	snd_aliasBuild_t    *rightHead;
 	snd_aliasBuild_t    *left, *right;
-	snd_aliasBuild_t    *merged, *tail, *pick;
-	int                 cmp, fileCmp;
+	snd_aliasBuild_t    **tail;
+	int                 cmp;
 
 	if ( *count == 1 ) {
 		head->next = NULL;
@@ -778,69 +773,59 @@ static snd_aliasBuild_t *Com_SortTempSoundAliases_r( snd_aliasBuild_t *head, int
 	left  = Com_SortTempSoundAliases_r( head, &leftCount );
 	right = Com_SortTempSoundAliases_r( rightHead, &rightCount );
 
+	/* the merged list reuses head */
 	*count = 0;
-	merged = NULL;
-	tail   = NULL;
+	head = NULL;
+	tail = &head;
 
 	while ( leftCount && rightCount ) {
 		cmp = Q_stricmp( left->name, right->name );
-		if ( cmp == 0 ) {
+		if ( !cmp ) {
 			cmp = left->sequence - right->sequence;
-			if ( cmp == 0 ) {
-				fileCmp = Q_stricmp( left->sourceFile, right->sourceFile );
-				if ( fileCmp == 0 ) {
+			if ( !cmp ) {
+				cmp = Q_stricmp( left->sourceFile, right->sourceFile );
+				/* different files: drop one copy.  The duplicate test is spelled unsigned: a
+				 * plain `if ( !cmp )' lets VC7 thread the Com_Error path into the link-right
+				 * arm; retail keeps cmp live and retests it (only ja vs retail jne remains) */
+				if ( (unsigned) cmp <= 0 ) {
 					Com_Error( ERR_DROP,
-							   "\x15sound alias file %s: duplicate alias '%s'\n",
-							   left->sourceFile, left->name );
-					cmp = 0;
-				} else if ( fileCmp < 0 ) {
-					left = left->next;
-					leftCount--;
-					continue;
+						   "\x15sound alias file %s: duplicate alias '%s'\n",
+						   left->sourceFile, left->name );
 				} else {
-					right = right->next;
-					rightCount--;
+					if ( cmp < 0 ) {
+						left = left->next;
+						leftCount--;
+					} else {
+						right = right->next;
+						rightCount--;
+					}
 					continue;
 				}
 			}
 		}
 
 		if ( cmp < 0 ) {
-			pick = left;
+			*tail = left;
 			left = left->next;
 			leftCount--;
 		} else {
-			pick = right;
+			*tail = right;
 			right = right->next;
 			rightCount--;
 		}
-
-		if ( !merged ) {
-			merged = pick;
-		} else {
-			tail->next = pick;
-		}
-		tail = pick;
 		( *count )++;
+		tail = &( *tail )->next;
 	}
 
-	if ( leftCount == 0 ) {
-		if ( !merged ) {
-			merged = right;
-		} else {
-			tail->next = right;
-		}
-		*count += rightCount;
-	} else {
-		if ( !merged ) {
-			merged = left;
-		} else {
-			tail->next = left;
-		}
+	if ( leftCount ) {
+		*tail = left;
 		*count += leftCount;
+	} else {
+		*tail = right;
+		*count += rightCount;
 	}
 
-	return merged;
+	return head;
 }
 
 /* ---- Com_MakeSoundAliasesPermanent  0x00433900 ---- VERIFIED */
@@ -854,7 +839,6 @@ void Com_MakeSoundAliasesPermanent( int count, int source ) {
 	int                 stringBytes, sharedBytes;
 	int                 recordIndex;
 	int                 byteIndex;
-	unsigned int        checksum;
 	size_t              length;
 	size_t              blockSize;
 
@@ -878,29 +862,28 @@ void Com_MakeSoundAliasesPermanent( int count, int source ) {
 		}
 
 		length = strlen( node->file ) + 1;
-		node->dupFileNode = NULL;
 		for ( scan = snd_aliasBuildHead ; scan != node ; scan = scan->next ) {
 			if ( !Q_stricmp( scan->file, node->file ) ) {
 				sharedBytes += (int) length;
 				node->dupFileNode = scan;
-				break;
+				goto nextNode;
 			}
 		}
-		if ( !node->dupFileNode ) {
-			stringBytes += (int) length;
-		}
+		node->dupFileNode = NULL;
+		stringBytes += (int) length;
+nextNode:
+		;
 	}
 
 	Com_DPrintf( "Sound alias strings use %.1f KB; %.1f KB saved by string sharing\n",
-				 (double) stringBytes / 1024.0, (double) sharedBytes / 1024.0 );
+				 stringBytes / 1024.0f, sharedBytes / 1024.0f );
 
 	blockSize = (size_t) count * sizeof( snd_alias_t ) + (size_t) stringBytes;
 	table = (snd_alias_t *) malloc( blockSize );
 	if ( !table ) {
-		Sys_OutOfMemoryPrep();
-		Sys_Error( "Com_MakeSoundAliasesPermanent: failed to allocate %i bytes",
-				   (int) blockSize );
-		return;
+		/* retail 0x00433A5C inlines Sys_OutOfMemoryError (0x00462BA0):
+		 * prep, localized out-of-memory message box, exit(-1). */
+		Sys_OutOfMemoryError();
 	}
 	Com_Memset( table, 0, blockSize );
 
@@ -916,20 +899,20 @@ void Com_MakeSoundAliasesPermanent( int count, int source ) {
 			stringCursor += strlen( stringCursor ) + 1;
 		}
 
-		if ( !node->subtitle[0] ) {
-			subtitle = NULL;
-		} else {
+		if ( node->subtitle[0] ) {
 			subtitle = stringCursor;
 			strcpy( stringCursor, node->subtitle );
 			stringCursor += strlen( stringCursor ) + 1;
+		} else {
+			subtitle = NULL;
 		}
 
-		if ( !node->dupFileNode ) {
+		if ( node->dupFileNode ) {
+			file = node->dupFileNode->compactFile;
+		} else {
 			file = stringCursor;
 			strcpy( stringCursor, node->file );
 			stringCursor += strlen( stringCursor ) + 1;
-		} else {
-			file = node->dupFileNode->compactFile;
 		}
 		node->compactFile = file;
 
@@ -940,24 +923,25 @@ void Com_MakeSoundAliasesPermanent( int count, int source ) {
 	snd_aliasTable[source]      = table;
 	snd_aliasTableCount[source] = count;
 
-	checksum = (unsigned int) count * (unsigned int) stringBytes;
-	snd_aliasTableChecksum[source] = (int) checksum;
+	/* retail reloads stringBase from its stack slot on every pass of the checksum loop
+	 * (0x00433BF4); a volatile read of it does the same */
+	snd_aliasTableChecksum[source] = (int) ( (unsigned int) count * (unsigned int) stringBytes );
 	for ( byteIndex = 0 ; byteIndex < stringBytes ; byteIndex++ ) {
-		checksum  = (unsigned int) snd_aliasTableChecksum[source] * SND_ALIAS_HASH_MULTIPLIER;
-		checksum += (unsigned int) (signed char) stringBase[byteIndex];
-		snd_aliasTableChecksum[source] = (int) checksum;
+		snd_aliasTableChecksum[source] =
+			(int) ( (unsigned int) snd_aliasTableChecksum[source] * SND_ALIAS_HASH_MULTIPLIER );
+		snd_aliasTableChecksum[source] =
+			(int) ( (unsigned int) snd_aliasTableChecksum[source]
+					+ (unsigned int) (signed char) ( *(char * volatile *) &stringBase )[byteIndex] );
 	}
 }
 
 #ifndef DEDICATED
 /* ---- Com_LoadSoundAliasSounds  0x00433C20 ---- */
-int Com_LoadSoundAliasSounds( int source ) {
+void Com_LoadSoundAliasSounds( int source ) {
 	extern cvar_t *mss_errorOnMissing;
 
 	snd_alias_t     *table;
 	snd_alias_t     *alias;
-	fileHandle_t    f;
-	const char      *path;
 	int             i, j;
 	int             missing;
 	qboolean        warned;
@@ -978,7 +962,8 @@ int Com_LoadSoundAliasSounds( int source ) {
 					alias->soundData = table[j].soundData;
 					goto nextAlias;
 				}
-				if ( !warned && Q_stricmp( alias->file, "temp.wav" ) ) {
+				/* retail 0x00433C86 / 0x00433D17 compare with the CRT _stricmp */
+				if ( !warned && _stricmp( alias->file, "temp.wav" ) ) {
 					warned = qtrue;
 					Com_Printf( "WARNING: sound file '%s' used as streamed in alias '%s' "
 								"and loaded in alias '%s'\n",
@@ -986,7 +971,7 @@ int Com_LoadSoundAliasSounds( int source ) {
 				}
 			}
 
-			alias->soundData = MSS_LoadSoundFile( alias->file );
+			alias->soundData = MSS_LoadSoundFile( alias->file, source );
 			if ( alias->soundData ) {
 				goto nextAlias;
 			}
@@ -1002,7 +987,7 @@ int Com_LoadSoundAliasSounds( int source ) {
 					alias->streamExists = table[j].streamExists;
 					goto nextAlias;
 				}
-				if ( !warned && Q_stricmp( alias->file, "temp.wav" ) ) {
+				if ( !warned && _stricmp( alias->file, "temp.wav" ) ) {
 					warned = qtrue;
 					Com_Printf( "WARNING: sound file '%s' used as streamed in alias '%s' "
 								"and loaded in alias '%s'\n",
@@ -1010,17 +995,7 @@ int Com_LoadSoundAliasSounds( int source ) {
 				}
 			}
 
-			path = va( "sound/%s", alias->file );
-			fs_loadingMode = 1;
-			f = 0;
-			FS_FOpenFileRead_Internal( path, &f, qfalse, 0 );
-			if ( f ) {
-				FS_FCloseFile( f );
-				alias->streamExists = 1;
-			} else {
-				alias->streamExists = 0;
-			}
-
+			alias->streamExists = (byte) FS_TouchFile( va( "sound/%s", alias->file ) );
 			if ( alias->streamExists ) {
 				goto nextAlias;
 			}
@@ -1032,26 +1007,32 @@ nextAlias:
 		;
 	}
 
-	if ( missing && mss_errorOnMissing && mss_errorOnMissing->integer ) {
+	/* retail 0x00433DE7: no NULL test on mss_errorOnMissing (NULL only if AIL_startup failed in MSS_Init) */
+	if ( missing && mss_errorOnMissing->integer ) {
 		Com_Error( source != 0 ? ERR_DROP : ERR_FATAL,
 				   va( "\x15%i sound file(s) are missing or in a bad format\n", missing ) );
 	}
-
-	return missing;
 }
 
 /* ---- Com_UnloadSoundAliasSounds  0x00433E20 ---- VERIFIED */
 void Com_UnloadSoundAliasSounds( int source ) {
 	snd_alias_t *table;
-	int i;
+	int i, j;
 
 	MSS_StopSounds( 0 );
 
 	table = snd_aliasTable[source];
 	for ( i = 0 ; i < snd_aliasTableCount[source] ; i++ ) {
-		if ( table[i].type == SND_TYPE_LOADED ) {
-			table[i].soundData = NULL;
+		if ( table[i].type != SND_TYPE_LOADED ) {
+			continue;
 		}
+		/* retail keeps this search for an earlier owner of the same file; its result is unused */
+		for ( j = 0 ; j < i ; j++ ) {
+			if ( table[j].file == table[i].file && table[j].type == SND_TYPE_LOADED ) {
+				break;
+			}
+		}
+		table[i].soundData = NULL;
 	}
 }
 #endif
@@ -1060,7 +1041,6 @@ void Com_UnloadSoundAliasSounds( int source ) {
 void Com_LoadSoundAliases( const char *name, int source ) {
 	char    normalized[64];
 	char    **files;
-	char    **p;
 	int     numFiles;
 	int     i;
 	int     count;
@@ -1068,23 +1048,22 @@ void Com_LoadSoundAliases( const char *name, int source ) {
 
 	count = 0;
 
-	if ( source == SND_LOCALE_INGAME && !Q_stricmp( snd_aliasLocalizedName, name ) ) {
-		snd_aliasTable[SND_LOCALE_INGAME]      = snd_aliasTable[SND_LOCALE_LOCALIZED];
-		snd_aliasTableCount[SND_LOCALE_INGAME] = snd_aliasTableCount[SND_LOCALE_LOCALIZED];
-		Com_Memcpy( snd_aliasHashTable[SND_LOCALE_INGAME],
-					snd_aliasHashTable[SND_LOCALE_LOCALIZED],
-					SND_ALIAS_HASH_SLICE_BYTES );
-	} else {
-		if ( !Q_stricmpn( name, "maps/", 5 ) ) {
+	/* retail 0x00433EB9 / 0x00433EFF / 0x00433F38 / 0x00433F5F use the CRT
+	   _stricmp, _strnicmp and _strlwr here, not the Q_ helpers */
+	if ( source != SND_LOCALE_INGAME || _stricmp( snd_aliasLocalizedName, name ) ) {
+		if ( !_strnicmp( name, "maps/", 5 ) ) {
 			strcpy( normalized, name + 5 );
 			length = strlen( normalized );
-			if ( length >= 4 && !Q_stricmp( normalized + length - 4, ".bsp" ) ) {
-				normalized[length - 4] = '\0';
+			/* retail 0x00433F2E has no length >= 4 test (tree guard kept until this function can match) */
+			if ( !_stricmp( normalized + length - 4, ".bsp" ) ) {
+				/* retail 0x00433F44 stores with no bound check; written as a pointer store because
+				   normalized[length - 4] makes modern /GS add a range-check fast-fail */
+				*( normalized + length - 4 ) = '\0';
 			}
 		} else {
 			strcpy( normalized, name );
 		}
-		Q_strlwr( normalized );
+		_strlwr( normalized );
 
 		files = FS_ListFilteredFiles( "soundaliases", "csv", NULL, &numFiles );
 		if ( !numFiles ) {
@@ -1095,27 +1074,28 @@ void Com_LoadSoundAliases( const char *name, int source ) {
 		Hunk_SetLowTempMark();
 		for ( i = 0 ; i < numFiles ; i++ ) {
 			snd_currentFile = files[i];
-			count = Com_LoadSoundAliasFile( va( "soundaliases/%s", files[i] ),
-											normalized, count, source );
+			count = Com_LoadSoundAliasFile( normalized, va( "soundaliases/%s", files[i] ),
+											count, source );
 		}
 		if ( count ) {
 			Com_MakeSoundAliasesPermanent( count, source );
 		}
 		Hunk_ClearToLowTempMark();
 
-		if ( files ) {
-			for ( p = files ; *p ; p++ ) {
-				free( *p );
-			}
-			free( files );
-		}
+		FS_FreeFileList( files );
 
 		if ( source == SND_LOCALE_LOCALIZED ) {
 			strcpy( snd_aliasLocalizedName, name );
 		}
+	} else {
+		snd_aliasTable[SND_LOCALE_INGAME]      = snd_aliasTable[SND_LOCALE_LOCALIZED];
+		snd_aliasTableCount[SND_LOCALE_INGAME] = snd_aliasTableCount[SND_LOCALE_LOCALIZED];
+		Com_Memcpy( snd_aliasHashTable[SND_LOCALE_INGAME],
+					snd_aliasHashTable[SND_LOCALE_LOCALIZED],
+					SND_ALIAS_HASH_SLICE_BYTES );
 	}
 
-	if ( source == SND_LOCALE_MENU || source == SND_LOCALE_INGAME ) {
+	if ( source == SND_LOCALE_INGAME || source == SND_LOCALE_MENU ) {
 		if ( !snd_aliasSetLoaded[SND_LOCALE_INGAME] && !snd_aliasSetLoaded[SND_LOCALE_MENU] ) {
 			Cmd_AddCommand( "snd_list", Com_SoundList_f );
 		}
@@ -1154,9 +1134,10 @@ void Com_UnloadSoundAliases( int source ) {
 		memset( snd_aliasHashTable[source], 0, SND_ALIAS_HASH_SLICE_BYTES );
 	}
 
-	snd_aliasSetLoaded[source] = 0;
+	/* retail 0x0043411D stores with no bound check; pointer form keeps /GS range check out */
+	*( snd_aliasSetLoaded + source ) = 0;
 
-	if ( ( source == SND_LOCALE_MENU || source == SND_LOCALE_INGAME )
+	if ( ( source == SND_LOCALE_INGAME || source == SND_LOCALE_MENU )
 		 && !snd_aliasSetLoaded[SND_LOCALE_INGAME]
 		 && !snd_aliasSetLoaded[SND_LOCALE_MENU] ) {
 		Cmd_RemoveCommand( "snd_list" );
@@ -1176,56 +1157,51 @@ const char *Com_SoundAliasString( const char *name, int source ) {
 
 /* ---- Com_PickSoundAlias  0x00434160 ---- VERIFIED */
 snd_alias_t *Com_PickSoundAlias( const char *name, int source ) {
+	snd_alias_t *alias;
 	snd_alias_t *first;
 	snd_alias_t *selected;
-	snd_alias_t *cursor;
-	snd_alias_t *tableBase;
-	int         matches;
-	int         remaining;
+	int         count;
 	int         maxPickSequence;
 	float       totalWeight;
 
-	first = Com_FindSoundAlias( name, source );
-	if ( !first ) {
+	alias = Com_FindSoundAlias( name, source );
+	if ( !alias ) {
 		return NULL;
 	}
 
-	selected        = first;
-	totalWeight     = first->probability;
-	matches         = 1;
-	maxPickSequence = first->pickSequence;
-	tableBase       = snd_aliasTable[source];
+	first           = alias;
+	totalWeight     = alias->probability;
+	selected        = alias;
+	maxPickSequence = alias->pickSequence;
+	count           = 1;
 
-	if ( first != tableBase ) {
-		cursor = first;
-		do {
-			cursor--;
-			if ( cursor->name != first->name ) {
-				break;
-			}
+	while ( alias != snd_aliasTable[source] ) {
+		alias--;
+		if ( alias->name != selected->name ) {
+			break;
+		}
+		count++;
+		totalWeight += alias->probability;
+		if ( (float)rand() * totalWeight < alias->probability * 32768.0f ) {
+			selected = alias;
+		}
+		if ( maxPickSequence < alias->pickSequence ) {
+			maxPickSequence = alias->pickSequence;
+		}
+	}
 
-			matches++;
-			totalWeight += cursor->probability;
-			if ( cursor->probability * 32768.0 > (double) rand() * totalWeight ) {
-				selected = cursor;
-			}
-			if ( maxPickSequence < cursor->pickSequence ) {
-				maxPickSequence = cursor->pickSequence;
-			}
-		} while ( cursor != tableBase );
-
-		if ( matches > 2 && maxPickSequence == selected->pickSequence ) {
-			totalWeight = 0.0f;
-			cursor = first;
-			for ( remaining = matches ; remaining ; remaining-- ) {
-				if ( maxPickSequence != cursor->pickSequence ) {
-					totalWeight += cursor->probability;
-					if ( cursor->probability * 32768.0 > (double) rand() * totalWeight ) {
-						selected = cursor;
-					}
+	if ( count > 2 && maxPickSequence == selected->pickSequence ) {
+		totalWeight = 0.0f;
+		alias = first;
+		while ( count ) {
+			if ( maxPickSequence != alias->pickSequence ) {
+				totalWeight += alias->probability;
+				if ( (float)rand() * totalWeight < alias->probability * 32768.0f ) {
+					selected = alias;
 				}
-				cursor--;
 			}
+			alias--;
+			count--;
 		}
 	}
 
@@ -1245,7 +1221,7 @@ snd_alias_t *Com_GetSoundAlias( int source, int index ) {
 int Com_SoundAliasIndex( const snd_alias_t *alias, int source ) {
 	int index;
 
-	index = (int) ( alias - snd_aliasTable[source] ) + 1;
+	index = (int) ( alias + 1 - snd_aliasTable[source] );
 	if ( index <= 0 || index > snd_aliasTableCount[source] ) {
 		return 0;
 	}
@@ -1264,6 +1240,8 @@ qboolean Com_StringEdReferenceExists( const char *reference ) {
 	char        *token;
 	qboolean    found;
 
+	found = qfalse;
+
 	if ( Q_strncmp( reference, SUBTITLE_PREFIX, SUBTITLE_PREFIX_LEN ) ) {
 		return qfalse;
 	}
@@ -1276,7 +1254,6 @@ qboolean Com_StringEdReferenceExists( const char *reference ) {
 
 	Com_BeginParseSession( SUBTITLE_FILE );
 	data_p = (char *) buffer;
-	found  = qfalse;
 
 	for ( ;; ) {
 		token = Com_Parse( &data_p );
@@ -1285,12 +1262,12 @@ qboolean Com_StringEdReferenceExists( const char *reference ) {
 		}
 		if ( !strcmp( token, "REFERENCE" ) ) {
 			token = Com_ParseOnLine( &data_p );
-			if ( token && !Q_stricmp( reference + SUBTITLE_PREFIX_LEN, token ) ) {
+			if ( !Q_stricmp( reference + SUBTITLE_PREFIX_LEN, token ) ) {
 				found = qtrue;
 				break;
 			}
 		}
-		Com_SkipRestOfLine( 0, &data_p );
+		Com_SkipRestOfLine( &data_p );
 	}
 
 	Com_EndParseSession();
@@ -1313,7 +1290,7 @@ const char *Com_GetSubtitleStringEdReference( const char *englishText ) {
 	Com_BeginParseSession( SUBTITLE_FILE );
 	data_p = (char *) buffer;
 
-	while ( data_p ) {
+	for ( ;; ) {
 		token = Com_Parse( &data_p );
 		if ( !data_p ) {
 			break;
@@ -1322,7 +1299,7 @@ const char *Com_GetSubtitleStringEdReference( const char *englishText ) {
 		if ( !strcmp( token, "REFERENCE" ) ) {
 			token = Com_ParseOnLine( &data_p );
 			strcpy( snd_subtitleReference, token );
-			Com_SkipRestOfLine( 0, &data_p );
+			Com_SkipRestOfLine( &data_p );
 
 			do {
 				token = Com_Parse( &data_p );
@@ -1333,14 +1310,14 @@ const char *Com_GetSubtitleStringEdReference( const char *englishText ) {
 			} while ( strcmp( token, "LANG_ENGLISH" ) );
 
 			token = Com_ParseOnLine( &data_p );
-			if ( englishText && token && !Q_stricmp( englishText, token ) ) {
+			if ( !Q_stricmp( englishText, token ) ) {
 				Com_EndParseSession();
 				FS_FreeFile( buffer );
 				return snd_subtitleReference;
 			}
 		}
 
-		Com_SkipRestOfLine( 0, &data_p );
+		Com_SkipRestOfLine( &data_p );
 	}
 
 	Com_EndParseSession();
@@ -1352,11 +1329,17 @@ const char *Com_GetSubtitleStringEdReference( const char *englishText ) {
 static void Com_WriteStringEdReferenceToFile( const char *englishText,
 											  const char *reference,
 											  fileHandle_t f ) {
-	FS_Write( "REFERENCE           ", strlen( "REFERENCE           " ), f );
+	const char  *text;
+
+	/* retail measures even the literals at run time (strlen through a pointer) */
+	text = "REFERENCE           ";
+	FS_Write( text, strlen( text ), f );
 	FS_Write( reference, strlen( reference ), f );
-	FS_Write( "\r\nLANG_ENGLISH        \"", strlen( "\r\nLANG_ENGLISH        \"" ), f );
+	text = "\r\nLANG_ENGLISH        \"";
+	FS_Write( text, strlen( text ), f );
 	FS_Write( englishText, strlen( englishText ), f );
-	FS_Write( "\"\r\n\r\n", strlen( "\"\r\n\r\n" ), f );
+	text = "\"\r\n\r\n";
+	FS_Write( text, strlen( text ), f );
 }
 
 /* ---- Com_SetStringEdReference  0x00434790 ---- (0x00434760 was mid-instruction) */
@@ -1365,7 +1348,9 @@ void Com_SetStringEdReference( const char *referenceTag, const char *englishText
 	char            *data_p;
 	char            *copyFrom;
 	char            *token;
-	const char      *reference;
+	/* volatile: retail keeps reference in its stack slot (stored before the FS_FOpenFileWrite call)
+	 * and f in ebx; as a plain local VC7 turns ebx into a zero register */
+	const char      * volatile reference;
 	fileHandle_t    f;
 	qboolean        replaced;
 	char            tempPath[MAX_OSPATH];
@@ -1373,7 +1358,6 @@ void Com_SetStringEdReference( const char *referenceTag, const char *englishText
 
 	replaced  = qfalse;
 	reference = referenceTag + SUBTITLE_PREFIX_LEN;
-
 	f = FS_FOpenFileWrite( "soundaliases/temp.st" );
 	if ( !f ) {
 		Com_Printf( "WARNING: Could not open output file %s for writing\n",
@@ -1402,7 +1386,6 @@ void Com_SetStringEdReference( const char *referenceTag, const char *englishText
 			if ( copyFrom < data_p ) {
 				FS_Write( copyFrom, (int) ( data_p - copyFrom ) - 11, f );
 			}
-			copyFrom = NULL;
 			break;
 		}
 
@@ -1427,13 +1410,10 @@ void Com_SetStringEdReference( const char *referenceTag, const char *englishText
 						break;
 					}
 				}
-				if ( !copyFrom ) {
-					break;
-				}
 			}
 		}
 
-		Com_SkipRestOfLine( 0, &data_p );
+		Com_SkipRestOfLine( &data_p );
 	}
 
 	if ( !replaced ) {
@@ -1443,7 +1423,8 @@ void Com_SetStringEdReference( const char *referenceTag, const char *englishText
 	Com_EndParseSession();
 	FS_FreeFile( buffer );
 
-	FS_Write( "\r\nENDMARKER\r\n\r\n\r\n", strlen( "\r\nENDMARKER\r\n\r\n\r\n" ), f );
+	copyFrom = "\r\nENDMARKER\r\n\r\n\r\n";
+	FS_Write( copyFrom, strlen( copyFrom ), f );
 	FS_FCloseFile( f );
 
 	FS_BuildOSPath3( fs_basepath->string, fs_gamedir, "soundaliases/temp.st", tempPath, 0 );
@@ -1453,7 +1434,7 @@ void Com_SetStringEdReference( const char *referenceTag, const char *englishText
 }
 
 /* ---- Com_ProcessSoundAliasFileLocalization  0x00434B50 ---- */
-static void Com_ProcessSoundAliasFileLocalization( const char *filename ) {
+static void Com_ProcessSoundAliasFileLocalization( const char *filename, const char *stringEdPath ) {
 	void                *buffer;
 	FILE                *probe;
 	char                *data_p;
@@ -1467,7 +1448,6 @@ static void Com_ProcessSoundAliasFileLocalization( const char *filename ) {
 	char                tag[1024];
 	const char          *existing;
 	const char          *cell;
-	const char          *fmt;
 	char                *formatted;
 	char                osPath[MAX_OSPATH];
 	char                tempPath[MAX_OSPATH];
@@ -1477,6 +1457,9 @@ static void Com_ProcessSoundAliasFileLocalization( const char *filename ) {
 	int                 i;
 	int                 localized;
 	qboolean            hasName, hasFile;
+	qboolean            translate;
+	int                 len, k;
+	char                c;
 
 	FS_BuildOSPath3( fs_basepath->string, fs_gamedir, filename, osPath, 0 );
 	Com_Printf( "Processing sound alias file %s..\n", osPath );
@@ -1521,128 +1504,155 @@ static void Com_ProcessSoundAliasFileLocalization( const char *filename ) {
 			break;
 		}
 
-		if ( !token[0] || token[0] == '#' ) {
-			Com_SkipRestOfLine( 0, &data_p );
-			if ( *lineStart == '\n' ) {
-				FS_Write( "\r", 1, f );
-			}
-			FS_Write( lineStart, (int) ( data_p - lineStart ), f );
-			continue;
-		}
+		hasFile = qfalse;
+		if ( token[0] && token[0] != '#' ) {
+			if ( columnCount == 0 ) {
+				hasName = qfalse;
 
-		if ( columnCount == 0 ) {
-			hasName = qfalse;
-			hasFile = qfalse;
-
-			for ( ;; ) {
-				columnMap[columnCount] = SND_COL_UNKNOWN;
-				for ( column = SND_COL_NAME ; column < SND_COL_COUNT ; column++ ) {
-					if ( snd_aliasColumnNames[column] && token
-						 && !Q_stricmp( snd_aliasColumnNames[column], token ) ) {
-						columnMap[columnCount] = column;
-						if ( column == SND_COL_NAME ) {
-							hasName = qtrue;
-						} else if ( column == SND_COL_FILE ) {
-							hasFile = qtrue;
+				for ( ;; ) {
+					columnMap[columnCount] = SND_COL_UNKNOWN;
+					for ( column = SND_COL_NAME ; column < SND_COL_COUNT ; column++ ) {
+						if ( !Q_stricmp( snd_aliasColumnNames[column], token ) ) {
+							columnMap[columnCount] = column;
+							if ( column == SND_COL_NAME ) {
+								hasName = qtrue;
+							} else if ( column == SND_COL_FILE ) {
+								hasFile = qtrue;
+							}
+							break;
 						}
+					}
+
+					columnCount++;
+					if ( columnCount == SND_ALIAS_MAX_COLUMNS || !data_p || *data_p == '\n' ) {
 						break;
 					}
+					token = Com_ParseOnLine( &data_p );
 				}
 
-				columnCount++;
-				if ( columnCount == SND_ALIAS_MAX_COLUMNS || !data_p || *data_p == '\n' ) {
-					break;
+				if ( !hasName || !hasFile ) {
+					Com_Error( ERR_DROP,
+							   "\x15Sound alias file %s: missing 'name' and/or 'file' columns\n",
+							   snd_currentFile );
 				}
-				token = Com_ParseOnLine( &data_p );
-			}
 
-			if ( !hasName || !hasFile ) {
-				Com_Error( ERR_DROP,
-						   "\x15Sound alias file %s: missing 'name' and/or 'file' columns\n",
-						   snd_currentFile );
-			}
+				Com_SkipRestOfLine( &data_p );
+				if ( *lineStart == '\n' ) {
+					FS_Write( "\r", 1, f );
+				}
+				FS_Write( lineStart, (int) ( data_p - lineStart ), f );
+			} else {
+				/* retail 0x00434E2E clears only seen[]; cells[] is never cleared, every cell read
+				   below belongs to a column filled on this row */
+				memset( seen, 0, sizeof( seen ) );
+				Com_LoadSoundAliasDefaults( &node, qfalse );
 
-			Com_SkipRestOfLine( 0, &data_p );
+				i = 0;
+				for ( ;; ) {
+					column = columnMap[i];
+					strcpy( cells[column], token );
+					if ( token[0] ) {
+						Com_LoadSoundAliasField( token, column, seen, "", &node );
+					}
+					if ( ++i == columnCount ) {
+						break;
+					}
+					token = Com_ParseOnLine( &data_p );
+				}
+
+				if ( !seen[SND_COL_NAME] || !seen[SND_COL_FILE] ) {
+					Com_Error( ERR_DROP,
+							   "\x15Sound alias file %s: alias entry missing name and/or file\n",
+							   snd_currentFile );
+				}
+
+				/* retail 0x00434EEE-0x00434F7E, open-coded (no helper copy in retail): the
+				 * subtitle cell is a reference tag when every character is in [A-Z0-9_]
+				 * (signed char compares, i < len re-tested after the loop) and it starts
+				 * with "SUBTITLE_" (inline Q_strncmp, count 9).  The prefix test repeats the
+				 * one Com_StringEdReferenceExists does first; kept to mirror retail. */
+				/* translate unless the subtitle cell is already a StringEd reference that
+				 * exists: [A-Z0-9_]* starting with SUBTITLE_ (retail 0x00434EEE-0x00434F92) */
+				translate = qfalse;
+				if ( seen[SND_COL_SUBTITLE] ) {
+					len = (int) strlen( cells[SND_COL_SUBTITLE] );
+					for ( k = 0 ; k < len ; k++ ) {
+						c = cells[SND_COL_SUBTITLE][k];
+						if ( ( c < 'A' || c > 'Z' ) && ( c < '0' || c > '9' ) && c != '_' ) {
+							break;
+						}
+					}
+					if ( k < len || Q_strncmp( cells[SND_COL_SUBTITLE], SUBTITLE_PREFIX, SUBTITLE_PREFIX_LEN )
+						 || !Com_StringEdReferenceExists( cells[SND_COL_SUBTITLE] ) ) {
+						translate = qtrue;
+					}
+				}
+
+				if ( translate ) {
+					for ( i = 0 ; i < columnCount ; i++ ) {
+						column = columnMap[i];
+
+						if ( !column || !seen[column] ) {
+							if ( i != columnCount - 1 ) {
+								FS_Write( ",", 1, f );
+							}
+							continue;
+						}
+
+						if ( column == SND_COL_SUBTITLE ) {
+							existing = Com_GetSubtitleStringEdReference( cells[SND_COL_SUBTITLE] );
+							if ( existing ) {
+								Com_sprintf( tag, sizeof( tag ), "%s%s", SUBTITLE_PREFIX, existing );
+								formatted = Q_strupr( tag );
+							} else {
+								if ( seen[SND_COL_SEQUENCE] ) {
+									Com_sprintf( tag, sizeof( tag ), "%s%s_%s", SUBTITLE_PREFIX,
+												 cells[SND_COL_NAME], cells[SND_COL_SEQUENCE] );
+								} else {
+									Com_sprintf( tag, sizeof( tag ), "%s%s", SUBTITLE_PREFIX,
+												 cells[SND_COL_NAME] );
+								}
+								formatted = Q_strupr( tag );
+								Com_SetStringEdReference( tag, cells[SND_COL_SUBTITLE] );
+								localized++;
+							}
+							FS_Write( formatted, strlen( formatted ), f );
+							continue;
+						}
+
+						cell = cells[column];
+						if ( i == columnCount - 1 ) {
+							if ( !strchr( cell, ',' ) && !strchr( cell, ' ' )
+								 && !strchr( cell, '\n' ) && !strchr( cell, '\r' ) ) {
+								formatted = va( "%s", cell );
+							} else {
+								formatted = va( "\"%s\"", cell );
+							}
+						} else {
+							if ( !strchr( cell, ',' ) && !strchr( cell, ' ' )
+								 && !strchr( cell, '\n' ) && !strchr( cell, '\r' ) ) {
+								formatted = va( "%s,", cell );
+							} else {
+								formatted = va( "\"%s\",", cell );
+							}
+						}
+						FS_Write( formatted, strlen( formatted ), f );
+					}
+
+					FS_Write( "\r\n", 2, f );
+					Com_SkipRestOfLine( &data_p );
+				} else {
+					Com_SkipRestOfLine( &data_p );
+					FS_Write( lineStart, (int) ( data_p - lineStart ), f );
+				}
+			}
+		} else {
+			Com_SkipRestOfLine( &data_p );
 			if ( *lineStart == '\n' ) {
 				FS_Write( "\r", 1, f );
 			}
 			FS_Write( lineStart, (int) ( data_p - lineStart ), f );
-			continue;
 		}
-
-		memset( seen, 0, sizeof( seen ) );
-		memset( cells, 0, sizeof( cells ) );
-		Com_LoadSoundAliasDefaults( &node, qfalse );
-
-		for ( i = 0 ; i < columnCount ; i++ ) {
-			column = columnMap[i];
-			strcpy( cells[column], token );
-			if ( token[0] ) {
-				Com_LoadSoundAliasField( seen, token, column, "", &node );
-			}
-			if ( i + 1 == columnCount ) {
-				break;
-			}
-			token = Com_ParseOnLine( &data_p );
-		}
-
-		if ( !seen[SND_COL_NAME] || !seen[SND_COL_FILE] ) {
-			Com_Error( ERR_DROP,
-					   "\x15Sound alias file %s: alias entry missing name and/or file\n",
-					   snd_currentFile );
-		}
-
-		if ( !seen[SND_COL_SUBTITLE]
-			 || Com_StringEdReferenceExists( cells[SND_COL_SUBTITLE] ) ) {
-			Com_SkipRestOfLine( 0, &data_p );
-			FS_Write( lineStart, (int) ( data_p - lineStart ), f );
-			continue;
-		}
-
-		for ( i = 0 ; i < columnCount ; i++ ) {
-			column = columnMap[i];
-
-			if ( !column || !seen[column] ) {
-				if ( i != columnCount - 1 ) {
-					FS_Write( ",", 1, f );
-				}
-				continue;
-			}
-
-			if ( column == SND_COL_SUBTITLE ) {
-				existing = Com_GetSubtitleStringEdReference( cells[SND_COL_SUBTITLE] );
-				if ( existing ) {
-					Com_sprintf( tag, sizeof( tag ), "%s%s", SUBTITLE_PREFIX, existing );
-					Q_strupr( tag );
-				} else {
-					if ( seen[SND_COL_SEQUENCE] ) {
-						Com_sprintf( tag, sizeof( tag ), "%s%s_%s", SUBTITLE_PREFIX,
-									 cells[SND_COL_NAME], cells[SND_COL_SEQUENCE] );
-					} else {
-						Com_sprintf( tag, sizeof( tag ), "%s%s", SUBTITLE_PREFIX,
-									 cells[SND_COL_NAME] );
-					}
-					Q_strupr( tag );
-					Com_SetStringEdReference( tag, cells[SND_COL_SUBTITLE] );
-					localized++;
-				}
-				FS_Write( tag, strlen( tag ), f );
-				continue;
-			}
-
-			cell = cells[column];
-			if ( strchr( cell, ',' ) || strchr( cell, ' ' )
-				 || strchr( cell, '\n' ) || strchr( cell, '\r' ) ) {
-				fmt = ( i == columnCount - 1 ) ? "\"%s\"" : "\"%s\",";
-			} else {
-				fmt = ( i == columnCount - 1 ) ? "%s" : "%s,";
-			}
-			formatted = va( (char *) fmt, cell );
-			FS_Write( formatted, strlen( formatted ), f );
-		}
-
-		FS_Write( "\r\n", 2, f );
-		Com_SkipRestOfLine( 0, &data_p );
 	}
 
 	Com_EndParseSession();
@@ -1704,7 +1714,8 @@ void Com_WriteLocalizedSoundAliasFiles( void ) {
 	FS_BuildOSPath3( fs_homepath->string,
 					 "../source_data/string_resources/subtitle.st", "",
 					 masterPath, 0 );
-	masterPath[strlen( masterPath ) - 1] = '\0';
+	/* retail 0x00435407 stores with no bound check; pointer form keeps /GS range check out */
+	*( masterPath + strlen( masterPath ) - 1 ) = '\0';
 
 	probe = fopen( masterPath, "r+" );
 	if ( !probe ) {
@@ -1734,7 +1745,7 @@ void Com_WriteLocalizedSoundAliasFiles( void ) {
 	for ( i = 0 ; i < numFiles ; i++ ) {
 		Hunk_SetLowTempMark();
 		Com_sprintf( csvPath, sizeof( csvPath ), "soundaliases/%s", files[i] );
-		Com_ProcessSoundAliasFileLocalization( csvPath );
+		Com_ProcessSoundAliasFileLocalization( csvPath, localPath );
 		Hunk_ClearToLowTempMark();
 	}
 

@@ -17,11 +17,13 @@ scrStringHashSlot_t     scrStringHashSlots[SCR_STRING_HASH_SLOT_COUNT];
 scrStringHashSlot_t    *scrString_freedHashSlot;
 
 unsigned short         *scrString_canonicalMap;
-unsigned short          scrString_canonicalCount;
+/* initialised, so a real definition rather than a C common: VC7 then reloads it as a
+   dword after the canonical-map store (retail Scr_InsertDeveloperOpcodes 0x0046C878) */
+unsigned short          scrString_canonicalCount = 0;
 
 /* ---- GetRefString  0x0046F7C0 ---- VERIFIED */
 scrStringEntry_t *GetRefString( unsigned short handle ) {
-	return (scrStringEntry_t *)&scrMemTree_blocks[handle];
+	return (scrStringEntry_t *)( (scrMemBlock_t *)GetRefString_var + handle );
 }
 
 /* ---- GetRefString  0x0046F7D0 ---- VERIFIED */
@@ -31,41 +33,39 @@ static scrStringEntry_t *GetRefStringByText( const char *text ) {
 
 /* ---- SL_ConvertToString  0x0046F7E0 ---- VERIFIED */
 const char *SL_ConvertToString( unsigned short handle ) {
-	if ( handle == 0 ) {
-		return NULL;
+	if ( handle ) {
+		return GetRefString( handle )->text;
 	}
-	return GetRefString( handle )->text;
+	return NULL;
 }
 
 /* ---- SL_ConvertFromString  0x0046F800 ---- VERIFIED */
 unsigned short SL_ConvertFromString( const char *text ) {
 	scrStringEntry_t *entry = GetRefStringByText( text );
 
-	return (unsigned short)( ( (const char *)entry - (const char *)scrMemTree_blocks )
+	return (unsigned short)( ( (const char *)entry - (const char *)GetRefString_var )
 							 / SCR_MT_BLOCK_SIZE );
 }
 
 /* ---- GetHashCode  0x0046F820 ---- VERIFIED */
 static unsigned short GetHashCode( const char *text, unsigned int size ) {
 	unsigned int hash;
-	unsigned int i;
 
-	if ( size >= SCR_STRING_HASH_SHORT_LIMIT ) {
-		hash = size >> 2;
-	} else {
-		hash = 0;
-		for ( i = 0; i < size; i++ ) {
-			hash = hash * SCR_STRING_HASH_MULTIPLIER + (unsigned int)(int)(signed char)text[i];
+	if ( size < SCR_STRING_HASH_SHORT_LIMIT ) {
+		for ( hash = 0; size; size-- ) {
+			hash = hash * SCR_STRING_HASH_MULTIPLIER + (unsigned int)(int)(signed char)*text++;
 		}
+		return (unsigned short)( hash % SCR_STRING_HASH_LINK_MASK + SCR_STRING_HASH_FIRST_SLOT );
 	}
 
-	return (unsigned short)( hash % SCR_STRING_HASH_LINK_MASK + SCR_STRING_HASH_FIRST_SLOT );
+	return (unsigned short)( ( size >> 2 ) % SCR_STRING_HASH_LINK_MASK + SCR_STRING_HASH_FIRST_SLOT );
 }
 
 /* ---- SL_Init  0x0046F860 ---- VERIFIED */
 void SL_Init( void ) {
-	unsigned short previous;
-	unsigned short slot;
+	unsigned short          previous;
+	unsigned int            slot;
+	scrStringHashSlot_t    *entry;
 
 	MT_Init();
 
@@ -74,47 +74,14 @@ void SL_Init( void ) {
 	for ( slot = SCR_STRING_HASH_FIRST_SLOT;
 		  slot < SCR_STRING_HASH_SLOT_COUNT;
 		  slot++ ) {
-		scrStringHashSlots[slot].linkAndFlags = SCR_STRING_HASH_EMPTY;
+		entry = &scrStringHashSlots[slot];
+		entry->linkAndFlags = SCR_STRING_HASH_EMPTY;
 		scrStringHashSlots[previous].linkAndFlags =
 			(unsigned short)( scrStringHashSlots[previous].linkAndFlags | slot );
-		scrStringHashSlots[slot].stringHandle = previous;
-		previous = slot;
+		entry->stringHandle = previous;
+		previous = (unsigned short)slot;
 	}
 	scrStringHashSlots[0].stringHandle = previous;
-}
-
-static qboolean SL_EntryMatches( const scrStringHashSlot_t *slot,
-								 const char *text, unsigned int size ) {
-	scrStringEntry_t *entry = GetRefString( slot->stringHandle );
-
-	if ( entry->sizeByte == (unsigned char)size
-		 && memcmp( entry->text, text, size ) == 0 ) {
-		return qtrue;
-	}
-	return qfalse;
-}
-
-static void SL_MoveSlotToHashHead( unsigned short hash,
-								   unsigned short previousSlot,
-								   unsigned short matchSlot ) {
-	scrStringHashSlot_t *head     = &scrStringHashSlots[hash];
-	scrStringHashSlot_t *previous = &scrStringHashSlots[previousSlot];
-	scrStringHashSlot_t *match    = &scrStringHashSlots[matchSlot];
-	unsigned short       movedHandle;
-
-	previous->linkAndFlags =
-		(unsigned short)( ( match->linkAndFlags & SCR_STRING_HASH_LINK_MASK )
-						  | ( previous->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK ) );
-	match->linkAndFlags =
-		(unsigned short)( ( head->linkAndFlags & SCR_STRING_HASH_LINK_MASK )
-						  | ( match->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK ) );
-	head->linkAndFlags =
-		(unsigned short)( matchSlot
-						  | ( head->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK ) );
-
-	movedHandle = match->stringHandle;
-	match->stringHandle = head->stringHandle;
-	head->stringHandle = movedHandle;
 }
 
 /* ---- SL_FindStringOfLen  0x0046F8E0 ---- VERIFIED */
@@ -122,36 +89,52 @@ unsigned short SL_FindStringOfLen( const char *text, unsigned int size ) {
 	unsigned short          hash;
 	scrStringHashSlot_t    *head;
 	scrStringHashSlot_t    *current;
+	scrStringEntry_t       *entry;
 	unsigned short          previousSlot;
 	unsigned short          currentSlot;
+	unsigned short          movedHandle;
 
 	hash = GetHashCode( text, size );
 	head = &scrStringHashSlots[hash];
 
 	if ( ( head->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK )
-		 != SCR_STRING_HASH_OCCUPIED ) {
-		return 0;
-	}
-
-	if ( SL_EntryMatches( head, text, size ) ) {
-		return head->stringHandle;
-	}
-
-	previousSlot = hash;
-	currentSlot = head->linkAndFlags;
-	for ( ;; ) {
-		currentSlot &= SCR_STRING_HASH_LINK_MASK;
-		current = &scrStringHashSlots[currentSlot];
-		if ( current == head ) {
-			return 0;
-		}
-		if ( SL_EntryMatches( current, text, size ) ) {
-			SL_MoveSlotToHashHead( hash, previousSlot, currentSlot );
+		 == SCR_STRING_HASH_OCCUPIED ) {
+		entry = GetRefString( head->stringHandle );
+		if ( entry->sizeByte == (unsigned char)size
+			 && memcmp( entry->text, text, size ) == 0 ) {
 			return head->stringHandle;
 		}
-		previousSlot = currentSlot;
-		currentSlot = current->linkAndFlags;
+
+		previousSlot = hash;
+		currentSlot = (unsigned short)( head->linkAndFlags & SCR_STRING_HASH_LINK_MASK );
+		current = &scrStringHashSlots[currentSlot];
+		while ( current != head ) {
+			entry = GetRefString( current->stringHandle );
+			if ( entry->sizeByte == (unsigned char)size
+				 && memcmp( entry->text, text, size ) == 0 ) {
+				scrStringHashSlots[previousSlot].linkAndFlags =
+					(unsigned short)( ( current->linkAndFlags & SCR_STRING_HASH_LINK_MASK )
+									  | ( scrStringHashSlots[previousSlot].linkAndFlags
+										  & SCR_STRING_HASH_FLAGS_MASK ) );
+				current->linkAndFlags =
+					(unsigned short)( ( head->linkAndFlags & SCR_STRING_HASH_LINK_MASK )
+									  | ( current->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK ) );
+				head->linkAndFlags =
+					(unsigned short)( currentSlot
+									  | ( head->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK ) );
+
+				movedHandle = current->stringHandle;
+				current->stringHandle = head->stringHandle;
+				head->stringHandle = movedHandle;
+				return movedHandle;
+			}
+			previousSlot = currentSlot;
+			currentSlot = (unsigned short)( current->linkAndFlags & SCR_STRING_HASH_LINK_MASK );
+			current = &scrStringHashSlots[currentSlot];
+		}
 	}
+
+	return 0;
 }
 
 /* ---- SL_FindString  0x0046FA30 ---- VERIFIED */
@@ -169,88 +152,10 @@ unsigned short SL_FindLowercaseString( const char *text ) {
 	lowercase = (char *)_alloca( size );
 
 	for ( i = (int)size - 1; i >= 0; i-- ) {
-		lowercase[i] = (char)tolower( (unsigned char)text[i] );
+		lowercase[i] = (char)tolower( text[i] );
 	}
 
 	return SL_FindStringOfLen( lowercase, size );
-}
-
-static unsigned short SL_PopFreeHashSlot( void ) {
-	unsigned short freeSlot;
-
-	freeSlot = scrStringHashSlots[0].linkAndFlags;
-	if ( freeSlot == 0 ) {
-		Scr_DumpScriptThreads();
-		Com_Error( ERR_DROP, "\x15" "exceeded maximum number of script strings\n" );
-	}
-
-	scrStringHashSlots[0].linkAndFlags =
-		(unsigned short)( scrStringHashSlots[freeSlot].linkAndFlags
-						  & SCR_STRING_HASH_LINK_MASK );
-	scrStringHashSlots[scrStringHashSlots[0].linkAndFlags].stringHandle = 0;
-
-	return freeSlot;
-}
-
-static void SL_InsertIntoOccupiedHead( unsigned short hash, unsigned short freeSlot ) {
-	scrStringHashSlot_t *head = &scrStringHashSlots[hash];
-	scrStringHashSlot_t *slot = &scrStringHashSlots[freeSlot];
-
-	slot->linkAndFlags =
-		(unsigned short)( ( head->linkAndFlags & SCR_STRING_HASH_LINK_MASK )
-						  | SCR_STRING_HASH_CHAINED );
-	head->linkAndFlags =
-		(unsigned short)( ( head->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK )
-						  | freeSlot );
-	slot->stringHandle = head->stringHandle;
-}
-
-static void SL_UnlinkFreeSlot( unsigned short slot ) {
-	unsigned short next;
-	unsigned short previous;
-
-	next = (unsigned short)( scrStringHashSlots[slot].linkAndFlags
-							 & SCR_STRING_HASH_LINK_MASK );
-	previous = scrStringHashSlots[slot].stringHandle;
-
-	scrStringHashSlots[previous].linkAndFlags =
-		(unsigned short)( next
-						  | ( scrStringHashSlots[previous].linkAndFlags
-							  & SCR_STRING_HASH_FLAGS_MASK ) );
-	scrStringHashSlots[next].stringHandle = previous;
-}
-
-static void SL_InsertIntoLinkedHash( unsigned short hash, unsigned short freeSlot ) {
-	unsigned short previousSlot;
-	unsigned short evictedLink;
-
-	evictedLink = (unsigned short)( scrStringHashSlots[hash].linkAndFlags
-									& SCR_STRING_HASH_LINK_MASK );
-
-	previousSlot = evictedLink;
-	while ( ( scrStringHashSlots[previousSlot].linkAndFlags
-			  & SCR_STRING_HASH_LINK_MASK ) != hash ) {
-		previousSlot = (unsigned short)( scrStringHashSlots[previousSlot].linkAndFlags
-										 & SCR_STRING_HASH_LINK_MASK );
-	}
-
-	scrStringHashSlots[previousSlot].linkAndFlags =
-		(unsigned short)( ( scrStringHashSlots[previousSlot].linkAndFlags
-							& SCR_STRING_HASH_FLAGS_MASK )
-						  | freeSlot );
-	scrStringHashSlots[freeSlot].linkAndFlags =
-		(unsigned short)( evictedLink | SCR_STRING_HASH_CHAINED );
-	scrStringHashSlots[freeSlot].stringHandle = scrStringHashSlots[hash].stringHandle;
-}
-
-/* SL_AddUser  0x0046FD8B */
-static void SL_AddUser( scrStringHashSlot_t *head, unsigned char user ) {
-	scrStringEntry_t *entry = GetRefString( head->stringHandle );
-
-	if ( ( entry->flags & user ) == 0 ) {
-		entry->flags = (unsigned char)( entry->flags | user );
-		entry->refCount++;
-	}
 }
 
 /* ---- SL_GetStringOfLen  0x0046FAC0 ---- VERIFIED */
@@ -259,44 +164,114 @@ unsigned short SL_GetStringOfLen( const char *text, unsigned char user,
 	unsigned short          hash;
 	scrStringHashSlot_t    *head;
 	scrStringHashSlot_t    *current;
+	scrStringHashSlot_t    *freeEntry;
+	scrStringEntry_t       *entry;
 	unsigned short          previousSlot;
 	unsigned short          currentSlot;
-	scrStringEntry_t       *entry;
+	unsigned short          freeSlot;
+	unsigned short          nextFree;
+	unsigned short          movedHandle;
 
 	hash = GetHashCode( text, size );
 	head = &scrStringHashSlots[hash];
 
 	if ( ( head->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK )
 		 == SCR_STRING_HASH_OCCUPIED ) {
-		if ( SL_EntryMatches( head, text, size ) ) {
-			SL_AddUser( head, user );
+		entry = GetRefString( head->stringHandle );
+		if ( entry->sizeByte == (unsigned char)size
+			 && memcmp( entry->text, text, size ) == 0 ) {
+			if ( ( entry->flags & user ) == 0 ) {
+				entry->flags = (unsigned char)( entry->flags | user );
+				entry->refCount++;
+			}
 			return head->stringHandle;
 		}
 
+		currentSlot = (unsigned short)( head->linkAndFlags & SCR_STRING_HASH_LINK_MASK );
+		current = &scrStringHashSlots[currentSlot];
 		previousSlot = hash;
-		currentSlot = head->linkAndFlags;
-		for ( ;; ) {
-			currentSlot &= SCR_STRING_HASH_LINK_MASK;
-			current = &scrStringHashSlots[currentSlot];
-			if ( current == head ) {
-				break;
-			}
-			if ( SL_EntryMatches( current, text, size ) ) {
-				SL_MoveSlotToHashHead( hash, previousSlot, currentSlot );
-				SL_AddUser( head, user );
+		while ( current != head ) {
+			entry = GetRefString( current->stringHandle );
+			if ( entry->sizeByte == (unsigned char)size
+				 && memcmp( entry->text, text, size ) == 0 ) {
+				scrStringHashSlots[previousSlot].linkAndFlags =
+					(unsigned short)( ( current->linkAndFlags & SCR_STRING_HASH_LINK_MASK )
+									  | ( scrStringHashSlots[previousSlot].linkAndFlags
+										  & SCR_STRING_HASH_FLAGS_MASK ) );
+				current->linkAndFlags =
+					(unsigned short)( ( head->linkAndFlags & SCR_STRING_HASH_LINK_MASK )
+									  | ( current->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK ) );
+				head->linkAndFlags =
+					(unsigned short)( currentSlot
+									  | ( head->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK ) );
+
+				movedHandle = current->stringHandle;
+				current->stringHandle = head->stringHandle;
+				head->stringHandle = movedHandle;
+
+				if ( ( entry->flags & user ) == 0 ) {
+					entry->flags = (unsigned char)( entry->flags | user );
+					entry->refCount++;
+				}
 				return head->stringHandle;
 			}
 			previousSlot = currentSlot;
-			currentSlot = current->linkAndFlags;
+			currentSlot = (unsigned short)( current->linkAndFlags & SCR_STRING_HASH_LINK_MASK );
+			current = &scrStringHashSlots[currentSlot];
 		}
 
-		SL_InsertIntoOccupiedHead( hash, SL_PopFreeHashSlot() );
+		freeSlot = scrStringHashSlots[0].linkAndFlags;
+		if ( freeSlot == 0 ) {
+			Scr_DumpScriptThreads();
+			Com_Error( ERR_DROP, "\x15" "exceeded maximum number of script strings\n" );
+		}
+		/* pop the free list (retail inlines this at both allocation sites) */
+		freeEntry = &scrStringHashSlots[freeSlot];
+		nextFree = (unsigned short)( freeEntry->linkAndFlags & SCR_STRING_HASH_LINK_MASK );
+		scrStringHashSlots[0].linkAndFlags = nextFree;
+		scrStringHashSlots[nextFree].stringHandle = 0;
+
+		freeEntry->linkAndFlags =
+			(unsigned short)( ( head->linkAndFlags & SCR_STRING_HASH_LINK_MASK )
+							  | SCR_STRING_HASH_CHAINED );
+		head->linkAndFlags =
+			(unsigned short)( ( freeSlot & SCR_STRING_HASH_LINK_MASK )   /* no-op mask: retail's xor merge */
+							  | ( head->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK ) );
+		freeEntry->stringHandle = head->stringHandle;
 	} else {
-		if ( ( head->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK )
-			 == SCR_STRING_HASH_EMPTY ) {
-			SL_UnlinkFreeSlot( hash );
+		if ( ( head->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK ) == SCR_STRING_HASH_EMPTY ) {
+			previousSlot = head->stringHandle;
+			currentSlot = (unsigned short)( head->linkAndFlags & SCR_STRING_HASH_LINK_MASK );
+			scrStringHashSlots[previousSlot].linkAndFlags =
+				(unsigned short)( currentSlot
+								  | ( scrStringHashSlots[previousSlot].linkAndFlags
+									  & SCR_STRING_HASH_FLAGS_MASK ) );
+			scrStringHashSlots[currentSlot].stringHandle = previousSlot;
 		} else {
-			SL_InsertIntoLinkedHash( hash, SL_PopFreeHashSlot() );
+			currentSlot = (unsigned short)( head->linkAndFlags & SCR_STRING_HASH_LINK_MASK );
+			previousSlot = currentSlot;
+			while ( ( scrStringHashSlots[previousSlot].linkAndFlags
+					  & SCR_STRING_HASH_LINK_MASK ) != hash ) {
+				previousSlot = (unsigned short)( scrStringHashSlots[previousSlot].linkAndFlags
+												 & SCR_STRING_HASH_LINK_MASK );
+			}
+
+			freeSlot = scrStringHashSlots[0].linkAndFlags;
+			if ( freeSlot == 0 ) {
+				Scr_DumpScriptThreads();
+				Com_Error( ERR_DROP, "\x15" "exceeded maximum number of script strings\n" );
+			}
+			freeEntry = &scrStringHashSlots[freeSlot];
+			nextFree = (unsigned short)( freeEntry->linkAndFlags & SCR_STRING_HASH_LINK_MASK );
+			scrStringHashSlots[0].linkAndFlags = nextFree;
+			scrStringHashSlots[nextFree].stringHandle = 0;
+
+			scrStringHashSlots[previousSlot].linkAndFlags =
+				(unsigned short)( freeSlot
+								  | ( scrStringHashSlots[previousSlot].linkAndFlags
+									  & SCR_STRING_HASH_FLAGS_MASK ) );
+			freeEntry->linkAndFlags = (unsigned short)( currentSlot | SCR_STRING_HASH_CHAINED );
+			freeEntry->stringHandle = head->stringHandle;
 		}
 		head->linkAndFlags = (unsigned short)( hash | SCR_STRING_HASH_OCCUPIED );
 	}
@@ -304,7 +279,7 @@ unsigned short SL_GetStringOfLen( const char *text, unsigned char user,
 	head->stringHandle =
 		MT_AllocIndex( (int)( size + SCR_STRING_ENTRY_HEADER_SIZE ), type );
 	entry = GetRefString( head->stringHandle );
-	memcpy( entry->text, text, size );
+	Com_Memcpy( entry->text, text, size );
 	entry->flags = user;
 	entry->refCount = 0;
 	entry->sizeByte = (unsigned char)size;
@@ -330,7 +305,7 @@ unsigned short SL_GetLowercaseStringOfLen( const char *text, unsigned char user,
 
 	lowercase = (char *)_alloca( size );
 	for ( i = (int)size - 1; i >= 0; i-- ) {
-		lowercase[i] = (char)tolower( (unsigned char)text[i] );
+		lowercase[i] = (char)tolower( text[i] );
 	}
 
 	return SL_GetStringOfLen( lowercase, user, size, type );
@@ -351,11 +326,11 @@ unsigned short SL_GetLowercaseString( const char *text, unsigned char user ) {
 void SL_TransferRefToString( unsigned short handle, unsigned char usage ) {
 	scrStringEntry_t *entry = GetRefString( handle );
 
-	if ( ( entry->flags & usage ) == 0 ) {
-		entry->flags = (unsigned char)( entry->flags | usage );
+	if ( entry->flags & usage ) {
+		entry->refCount--;
 		return;
 	}
-	entry->refCount--;
+	entry->flags = (unsigned char)( entry->flags | usage );
 }
 
 /* ---- SL_AddRefToString  0x0046FF50 ---- VERIFIED */
@@ -367,17 +342,13 @@ void SL_AddRefToString( unsigned short handle ) {
 void SL_FreeString( unsigned short handle, const char *text, unsigned int size ) {
 	unsigned short          hash;
 	scrStringHashSlot_t    *head;
-	scrStringHashSlot_t    *freeSlot;
 	scrStringHashSlot_t    *replacement;
-	unsigned short          freeSlotIndex;
 	unsigned short          replacementSlot;
 	unsigned short          previousSlot;
 	unsigned short          oldFreeHead;
 
 	hash = GetHashCode( text, size );
 	head = &scrStringHashSlots[hash];
-	freeSlot = head;
-	freeSlotIndex = hash;
 
 	MT_FreeIndex( handle, size + SCR_STRING_ENTRY_HEADER_SIZE );
 
@@ -392,60 +363,52 @@ void SL_FreeString( unsigned short handle, const char *text, unsigned int size )
 								  | SCR_STRING_HASH_OCCUPIED );
 			head->stringHandle = replacement->stringHandle;
 			scrString_freedHashSlot = head;
-			freeSlot = replacement;
-			freeSlotIndex = replacementSlot;
+		} else {
+			/* already equal; retail still copies both (mov ecx,esi / mov eax,ebx) */
+			replacement = head;
+			replacementSlot = hash;
 		}
 	} else {
 		previousSlot = hash;
-		{ int guard = 0;
 		while ( replacement->stringHandle != handle ) {
-			if ( ++guard > SCR_STRING_HASH_SLOT_COUNT ) {
-				extern void Com_Printf( const char *fmt, ... );
-				Com_Printf( "[[SLF]] SL_FreeString runaway handle=%u size=%u hash=%u ra=0x%08X\n",
-							handle, size, hash, ( (unsigned int *)&handle )[-1] );
-				return;
-			}
 			previousSlot = replacementSlot;
 			replacementSlot = (unsigned short)( replacement->linkAndFlags
 												& SCR_STRING_HASH_LINK_MASK );
 			replacement = &scrStringHashSlots[replacementSlot];
 		}
-		}
 		scrStringHashSlots[previousSlot].linkAndFlags =
 			(unsigned short)( ( replacement->linkAndFlags & SCR_STRING_HASH_LINK_MASK )
 							  | ( scrStringHashSlots[previousSlot].linkAndFlags
 								  & SCR_STRING_HASH_FLAGS_MASK ) );
-		freeSlot = replacement;
-		freeSlotIndex = replacementSlot;
 	}
 
 	oldFreeHead = scrStringHashSlots[0].linkAndFlags;
-	freeSlot->linkAndFlags = oldFreeHead;
-	freeSlot->stringHandle = 0;
-	scrStringHashSlots[oldFreeHead].stringHandle = freeSlotIndex;
-	scrStringHashSlots[0].linkAndFlags = freeSlotIndex;
+	replacement->linkAndFlags = scrStringHashSlots[0].linkAndFlags;   /* re-read: retail's mov si,dx */
+	replacement->stringHandle = 0;
+	scrStringHashSlots[oldFreeHead].stringHandle = replacementSlot;
+	scrStringHashSlots[0].linkAndFlags = replacementSlot;
 }
 
 /* ---- SL_RemoveRefToString  0x00470050 ---- VERIFIED */
 void SL_RemoveRefToString( unsigned short handle ) {
 	scrStringEntry_t *entry = GetRefString( handle );
 
-	if ( entry->refCount == 0 ) {
-		SL_FreeString( handle, entry->text, (unsigned int)strlen( entry->text ) + 1 );
+	if ( entry->refCount ) {
+		entry->refCount--;
 		return;
 	}
-	entry->refCount--;
+	SL_FreeString( handle, entry->text, (unsigned int)strlen( entry->text ) + 1 );
 }
 
 /* ---- SL_RemoveRefToStringOfLen  0x00470090 ---- VERIFIED */
 void SL_RemoveRefToStringOfLen( unsigned short handle, unsigned int size ) {
 	scrStringEntry_t *entry = GetRefString( handle );
 
-	if ( entry->refCount == 0 ) {
-		SL_FreeString( handle, entry->text, size );
+	if ( entry->refCount ) {
+		entry->refCount--;
 		return;
 	}
-	entry->refCount--;
+	SL_FreeString( handle, entry->text, size );
 }
 
 /* ---- Scr_SetString  0x004700C0 ---- VERIFIED */
@@ -490,14 +453,14 @@ unsigned short SL_GetStringForVector( const float *v ) {
 
 /* ---- SL_ShutdownSystem  0x004702F0 ---- VERIFIED */
 void SL_ShutdownSystem( unsigned char usage ) {
-	unsigned short          slot;
+	unsigned int            slot;
 	scrStringHashSlot_t    *hashSlot;
 	scrStringEntry_t       *entry;
 
 	for ( slot = SCR_STRING_HASH_FIRST_SLOT;
 		  slot < SCR_STRING_HASH_SLOT_COUNT;
 		  slot++ ) {
-		for ( ;; ) {
+		do {
 			hashSlot = &scrStringHashSlots[slot];
 			if ( ( hashSlot->linkAndFlags & SCR_STRING_HASH_FLAGS_MASK )
 				 == SCR_STRING_HASH_EMPTY ) {
@@ -512,25 +475,22 @@ void SL_ShutdownSystem( unsigned char usage ) {
 
 			scrString_freedHashSlot = NULL;
 			SL_RemoveRefToString( hashSlot->stringHandle );
-			if ( scrString_freedHashSlot == NULL ) {
-				break;
-			}
-		}
+		} while ( scrString_freedHashSlot );
 	}
 }
 
 /* ---- CreateCanonicalFilename  0x00470390 ---- VERIFIED */
 void CreateCanonicalFilename( char *dest, const char *source, int maxLength ) {
-	unsigned char ch;
+	char ch;
 
 	for ( ;; ) {
 		do {
 			do {
-				ch = (unsigned char)*source++;
+				ch = *source++;
 			} while ( ch == '\\' );
 		} while ( ch == '/' );
 
-		while ( ch > 0x1F ) {
+		while ( (unsigned char)ch >= ' ' ) {
 			*dest++ = (char)tolower( ch );
 			maxLength--;
 			if ( maxLength == 0 ) {
@@ -542,7 +502,7 @@ void CreateCanonicalFilename( char *dest, const char *source, int maxLength ) {
 				break;
 			}
 
-			ch = (unsigned char)*source++;
+			ch = *source++;
 			if ( ch == '/' ) {
 				ch = '\\';
 			}
@@ -566,10 +526,6 @@ unsigned short Scr_CreateCanonicalFilename( const char *filename ) {
 void SL_FreeString__FUsPCcUi( unsigned short handle, const char *text,
 							  unsigned int size ) {
 	SL_FreeString( handle, text, size );
-}
-
-unsigned short GetHashCode_SL__FPCcUi( const char *text, unsigned int size ) {
-	return GetHashCode( text, size );
 }
 
 scrStringEntry_t *GetRefString__FUs( unsigned short handle ) {

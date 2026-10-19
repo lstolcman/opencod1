@@ -31,7 +31,7 @@
 #ifndef __FILES_LOCAL_H__
 #define __FILES_LOCAL_H__
 
-#include "../qcommon/cod1_types.h"
+#include "q_shared.h"
 
 #include <stdio.h>
 
@@ -120,7 +120,7 @@ typedef struct {
 	int checksum;                       /* +0x304 */
 	int pure_checksum;                  /* +0x308 */
 	int numfiles;                       /* +0x30C  number of files in pk3 */
-	int referenced;                     /* +0x310 */
+	byte referenced[4];                 /* +0x310  independent flags: [0] general, [1] ui, [2] cgame, [3] qagame */
 	int hashSize;                       /* +0x314  hash table size (power of 2) */
 	fileInPack_t            **hashTable; /* +0x318 */
 	fileInPack_t            *buildBuffer; /* +0x31C */
@@ -184,9 +184,6 @@ typedef struct fileData_s {
  * the published head at 0x0140742C.  It does `strncpy(list, dir, 255)` with
  * `list[255] = 0`, then stores the file count at +0x100 and the hash size at
  * +0x104.
- *
- * The builder is currently a no-op (see com_files.c), so only the first
- * lookup (the pak hash) can hit.
  */
 typedef struct fs_dirFile_s {
 	char    *name;                          /* +0x00 */
@@ -243,21 +240,21 @@ long FS_HashFileName( const char *fname, int hashSize );
 
 /* 0x00428DB0 -- the range selector is a parameter (EAX), not a global.
  * `streamed` nonzero draws from handles 51..63, zero from 1..50. */
-fileHandle_t FS_HandleForFileStreamed( int streamed );
-fileHandle_t FS_HandleForFile( void );          /* == FS_HandleForFileStreamed(0) */
+fileHandle_t FS_HandleForFile( int streamed );
 
 FILE *FS_FileForHandle( fileHandle_t f );
 qboolean FS_PakIsPure( pack_t *pack );
 qboolean FS_FilenameCompare( const char *s1, const char *s2 );
 
-/* The retail join, 0x00428EE0: base '/' game '/' qpath.  See com_files.c for
- * the register mapping.  FS_BuildOSPath_Internal below is the two-component
- * form the other callers use; it is a deliberate divergence. */
+/* The retail join, 0x00428EE0: base '/' game '/' qpath, with base in EAX and
+ * game, qpath, fs_path, allowOverflow on the stack.  An empty or NULL game
+ * defaults to fs_gamedir (0x01629660).  It is the only path join retail has;
+ * two-component paths are built as FS_BuildOSPath3( base, dir, "", out, 0 )
+ * followed by cutting the trailing separator. */
 void FS_BuildOSPath3( const char *base, const char *game, const char *qpath,
 					  char *fs_path, int allowOverflow );
-void FS_BuildOSPath_Internal( const char *base, const char *qpath, char *out, int flags );
 qboolean FS_CreatePath( char *OSPath );
-qboolean FS_CopyFile( char *fromOSPath, char *toOSPath );
+void FS_CopyFile( char *fromOSPath, char *toOSPath );
 int FS_filelength( fileHandle_t f );
 
 #endif  /* __FILES_LOCAL_H__ */

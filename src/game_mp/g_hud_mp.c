@@ -1,41 +1,19 @@
-/*
- * @fidelity: likely
- *
- * g_hud_mp.c -- the server-side hudelem system.
- *
- * g_hudelems[] (0x2014F9A0) is a flat pool of 1024 records.  A record is live
- * when its type is non-zero; HudElem_UpdateClient walks the whole pool once per
- * client per frame and packs the records that client may see into the two
- * 31-entry arrays of playerState_t.hud, which is how a hudelem reaches a
- * client at all -- there is no per-client ownership list.
- *
- * The script side sees a hudelem as an object of its own class: hudelemFields[]
- * (0x200558D0) is the field table Scr_Set/GetHudElemField dispatch through, and
- * hudelemMethods[] (0x200559C0) is the method table Scr_GetMethod falls through
- * to after the player and entity tables.
- *
- * Function order is binary order (0x20021410 .. 0x20022760).
- */
+// g_hud_mp.c -- server-side hud elements, created and driven by script and
+// sent to each client that can see them through playerState_t.hud
 
 #include <stdio.h>
 #include <string.h>
 
 #include "g_local.h"
 
-/* forward: bg_slidemove.c */
+// bg_slidemove.c
 int Q_ftol( float f );
 
-/* HudElem_Alloc's scan bound (0x200214B7) and HudElem_DestroyAll's memset
- * length 126976 = 1024 * 124 (0x20021694). */
 #define MAX_HUDELEMS            1024
 
-/* The per-client half: q_shared.h's hudElemState_t is current[31] +
- * archival[31], and HudElem_UpdateClient stops copying past 31 (0x20022802). */
-#define MAX_CLIENT_HUDELEMS     31
+#define MAX_CLIENT_HUDELEMS     31     // size of each hudElemState_t array
 
-/* hudelem_t.type.  Each value is set by one method:
- * HudElem_Alloc 1, HECmd_SetValue 2, HECmd_SetShader 3, and the six timer /
- * clock thunks 4..9. */
+// g_hudelem_t.type
 typedef enum {
 	HE_TYPE_FREE,
 	HE_TYPE_TEXT,
@@ -49,29 +27,6 @@ typedef enum {
 	HE_TYPE_CLOCK_UP
 } hudElemType_t;
 
-/*
- * The field types, duplicated from g_spawn_mp.c -- fields[], clientFields[] and
- * hudelemFields[] share them and no header carries the enum yet.
- */
-typedef enum {
-	F_INT,
-	F_FLOAT,
-	F_CSTRING,
-	F_STRING,               /* const string id; the only type this unit frees */
-	F_VECTOR,
-	F_ENTITY,
-	F_VECTOR_Y,
-	F_OBJECT,
-	F_MODEL,
-	F_IGNORE
-} fieldtype_t;
-
-/* Scr_AddEntityNum / Scr_FreeEntityNum class number of a hudelem; g_spawn_mp.c
- * carries the same constant. */
-#ifndef SCR_OBJECT_HUDELEM
-#define SCR_OBJECT_HUDELEM      1
-#endif
-
 typedef struct hudElemField_s hudElemField_t;
 typedef void ( *hudElemFieldFunc_t )( g_hudelem_t *elem, int fieldnum );
 
@@ -79,8 +34,8 @@ struct hudElemField_s {
 	const char          *name;
 	int                 ofs;
 	fieldtype_t         type;
-	hudElemFieldFunc_t  setter;     /* NULL falls through to Scr_SetGenericField */
-	hudElemFieldFunc_t  getter;     /* NULL falls through to Scr_GetGenericField */
+	hudElemFieldFunc_t  setter;     // NULL uses Scr_SetGenericField
+	hudElemFieldFunc_t  getter;     // NULL uses Scr_GetGenericField
 };
 
 typedef struct hudElemMethod_s {
@@ -89,6 +44,10 @@ typedef struct hudElemMethod_s {
 } hudElemMethod_t;
 
 #define HEOFS( x )      ( (int)&( ( (g_hudelem_t *)0 )->x ) )
+
+// keep: HudElem_SetColor's MAX-of-MIN clamp matches original codegen
+#define HE_MAX( a, b )  ( ( a ) > ( b ) ? ( a ) : ( b ) )
+#define HE_MIN( a, b )  ( ( a ) < ( b ) ? ( a ) : ( b ) )
 
 static void HudElem_SetLocalizedString( g_hudelem_t *elem, int fieldnum );
 static void HudElem_SetBoolean( g_hudelem_t *elem, int fieldnum );
@@ -137,25 +96,6 @@ static const hudElemField_t hudelemFields[] = {
 	{ NULL,         0,                  F_INT,      NULL,                       NULL }
 };
 
-static const hudElemMethod_t hudelemMethods[] = {
-	{ "settext",            HECmd_SetText },
-	{ "setshader",          HECmd_SetShader },
-	{ "settimer",           HECmd_SetTimer },
-	{ "settimerup",         HECmd_SetTimerUp },
-	{ "settenthstimer",     HECmd_SetTenthsTimer },
-	{ "settenthstimerup",   HECmd_SetTenthsTimerUp },
-	{ "setclock",           HECmd_SetClock },
-	{ "setclockup",         HECmd_SetClockUp },
-	{ "setvalue",           HECmd_SetValue },
-	{ "fadeovertime",       HECmd_FadeOverTime },
-	{ "scaleovertime",      HECmd_ScaleOverTime },
-	{ "moveovertime",       HECmd_MoveOverTime },
-	{ "reset",              HECmd_Reset },
-	{ "destroy",            HECmd_Destroy },
-
-	{ NULL,                 NULL }
-};
-
 static const char *hudelemFontNames[] = {
 	"default",
 	"bigfixed",
@@ -179,8 +119,8 @@ static const char *hudelemAlignYNames[] = {
 HudElem_SetDefaults
 
 Clears everything the element's type owns; every method that changes the type
-starts here.  Deliberately leaves x/y, the colour, the label, the sort key and
-the move block alone.
+starts here.  Leaves x/y, the color, the label, the sort key and the move
+state alone.
 ==================
 */
 static void HudElem_SetDefaults( g_hudelem_t *elem ) {
@@ -201,9 +141,7 @@ static void HudElem_SetDefaults( g_hudelem_t *elem ) {
 ==================
 HudElem_Reset
 
-Everything back to a plain white text element.  Name inferred: no retail
-symbol -- the body survives only at 0x20021440, reached by the tail call in
-HECmd_Reset and inlined into HudElem_Alloc.
+Everything back to a plain white text element.
 ==================
 */
 static void HudElem_Reset( g_hudelem_t *elem ) {
@@ -231,21 +169,18 @@ HudElem_Alloc
 ==================
 */
 static g_hudelem_t *HudElem_Alloc( int clientNum, int team ) {
-	g_hudelem_t *elem;
-	int         i;
+	unsigned int i;
 
-	for ( i = 0, elem = g_hudelems; elem->type; i++, elem++ ) {
-		if ( i + 1 >= MAX_HUDELEMS ) {
-			return NULL;
+	for ( i = 0; i < MAX_HUDELEMS; i++ ) {
+		if ( !g_hudelems[i].type ) {
+			HudElem_Reset( &g_hudelems[i] );
+			g_hudelems[i].clientNum = clientNum;
+			g_hudelems[i].team = team;
+			return &g_hudelems[i];
 		}
 	}
 
-	HudElem_Reset( elem );
-
-	elem->clientNum = clientNum;
-	elem->team = team;
-
-	return elem;
+	return NULL;
 }
 
 /*
@@ -254,7 +189,6 @@ HudElem_Free
 ==================
 */
 static void HudElem_Free( g_hudelem_t *elem ) {
-	Scr_FreeHudElemConstStrings( elem );
 	Scr_FreeHudElem( elem );
 	elem->type = HE_TYPE_FREE;
 }
@@ -265,15 +199,14 @@ HudElem_ClientDisconnect
 ==================
 */
 void HudElem_ClientDisconnect( gentity_t *ent ) {
-	g_hudelem_t *elem;
-	int         i;
+	unsigned int i;
 
-	for ( i = 0, elem = g_hudelems; i < MAX_HUDELEMS; i++, elem++ ) {
-		if ( !elem->type ) {
+	for ( i = 0; i < MAX_HUDELEMS; i++ ) {
+		if ( !g_hudelems[i].type ) {
 			continue;
 		}
-		if ( elem->clientNum == ent->s.number ) {
-			HudElem_Free( elem );
+		if ( g_hudelems[i].clientNum == ent->s.number ) {
+			HudElem_Free( &g_hudelems[i] );
 		}
 	}
 }
@@ -284,12 +217,11 @@ HudElem_DestroyAll
 ==================
 */
 void HudElem_DestroyAll( void ) {
-	g_hudelem_t *elem;
-	int         i;
+	unsigned int i;
 
-	for ( i = 0, elem = g_hudelems; i < MAX_HUDELEMS; i++, elem++ ) {
-		if ( elem->type ) {
-			HudElem_Free( elem );
+	for ( i = 0; i < MAX_HUDELEMS; i++ ) {
+		if ( g_hudelems[i].type ) {
+			HudElem_Free( &g_hudelems[i] );
 		}
 	}
 
@@ -310,7 +242,7 @@ static void HudElem_SetEnumString( g_hudelem_t *elem, const hudElemField_t *fiel
 	string = Scr_GetString( 0 );
 
 	for ( i = 0; i < count; i++ ) {
-		if ( !Q_stricmp( names[i], string ) ) {
+		if ( !Q_stricmp( string, names[i] ) ) {
 			*(int *)( (byte *)elem + field->ofs ) = i;
 			return;
 		}
@@ -318,9 +250,7 @@ static void HudElem_SetEnumString( g_hudelem_t *elem, const hudElemField_t *fiel
 
 	sprintf( buffer, "\"%s\" is not a valid value for hudelem field \"%s\"\nShould be one of:",
 			 string, field->name );
-	/* The length is the whole buffer, not what is left of it -- retail passes
-	   0x800 at 0x2002173C, so a long enough name list runs past the frame.
-	   Reproduced as-is; the truncation on the next line is retail's too. */
+	// keep: the length is the whole buffer, not what is left of it (original behavior)
 	for ( i = 0; i < count; i++ ) {
 		strncat( buffer, va( " %s", names[i] ), sizeof( buffer ) );
 		buffer[sizeof( buffer ) - 1] = 0;
@@ -331,10 +261,12 @@ static void HudElem_SetEnumString( g_hudelem_t *elem, const hudElemField_t *fiel
 /*
 ==================
 HudElem_GetEnumString
+
+count is unused; it mirrors HudElem_SetEnumString.
 ==================
 */
 static void HudElem_GetEnumString( g_hudelem_t *elem, const hudElemField_t *field,
-								   const char **names ) {
+								   const char **names, int count ) {
 	Scr_AddString( names[ *(int *)( (byte *)elem + field->ofs ) ] );
 }
 
@@ -361,50 +293,19 @@ static void HudElem_SetBoolean( g_hudelem_t *elem, int fieldnum ) {
 ==================
 HudElem_SetColor
 
-The alpha byte is left alone; setColor and setAlpha share the field offset but
-neither reads it -- both address the packed colour directly.
-
-Each component is clamped to 0..1 and scaled to a byte in place (retail
-0x20021830 .. 0x2002195D has the three copies back to back, no helper).  Each
-byte goes through Q_ftol; retail inlines its fld/fadd/fistp body at
-0x2002188B/0x200218F2/0x20021955.
+Each component is clamped to 0..1 and scaled to a byte.  The alpha byte is
+left alone; "color" and "alpha" share the field offset and both address the
+packed color directly.
 ==================
 */
 static void HudElem_SetColor( g_hudelem_t *elem, int fieldnum ) {
 	vec3_t  color;
-	byte    *rgba;
-	float   f;
 
 	Scr_GetVector( 0, color );
 
-	rgba = (byte *)&elem->color;
-
-	f = color[0];
-	if ( f > 1.0f ) {
-		f = 1.0f;
-	} else if ( f < 0.0f ) {
-		f = 0.0f;
-	}
-	f = f * 255.0f;
-	rgba[0] = Q_ftol( f );
-
-	f = color[1];
-	if ( f > 1.0f ) {
-		f = 1.0f;
-	} else if ( f < 0.0f ) {
-		f = 0.0f;
-	}
-	f = f * 255.0f;
-	rgba[1] = Q_ftol( f );
-
-	f = color[2];
-	if ( f > 1.0f ) {
-		f = 1.0f;
-	} else if ( f < 0.0f ) {
-		f = 0.0f;
-	}
-	f = f * 255.0f;
-	rgba[2] = Q_ftol( f );
+	( (byte *)&elem->color )[0] = Q_ftol( HE_MAX( 0.0f, HE_MIN( 1.0f, color[0] ) ) * 255.0f );
+	( (byte *)&elem->color )[1] = Q_ftol( HE_MAX( 0.0f, HE_MIN( 1.0f, color[1] ) ) * 255.0f );
+	( (byte *)&elem->color )[2] = Q_ftol( HE_MAX( 0.0f, HE_MIN( 1.0f, color[2] ) ) * 255.0f );
 }
 
 /*
@@ -434,10 +335,13 @@ static void HudElem_SetAlpha( g_hudelem_t *elem, int fieldnum ) {
 	float   alpha;
 
 	alpha = Scr_GetFloat( 0 );
-	if ( alpha > 1.0f ) {
+	// keep: inverted test matches original codegen
+	if ( !( 1.0f < alpha ) ) {
+		if ( 0.0f > alpha ) {
+			alpha = 0.0f;
+		}
+	} else {
 		alpha = 1.0f;
-	} else if ( alpha < 0.0f ) {
-		alpha = 0.0f;
 	}
 	alpha = alpha * 255.0f;
 
@@ -488,7 +392,7 @@ HudElem_GetFont
 ==================
 */
 static void HudElem_GetFont( g_hudelem_t *elem, int fieldnum ) {
-	HudElem_GetEnumString( elem, &hudelemFields[fieldnum], hudelemFontNames );
+	HudElem_GetEnumString( elem, &hudelemFields[fieldnum], hudelemFontNames, 3 );
 }
 
 /*
@@ -506,7 +410,7 @@ HudElem_GetAlignX
 ==================
 */
 static void HudElem_GetAlignX( g_hudelem_t *elem, int fieldnum ) {
-	HudElem_GetEnumString( elem, &hudelemFields[fieldnum], hudelemAlignXNames );
+	HudElem_GetEnumString( elem, &hudelemFields[fieldnum], hudelemAlignXNames, 3 );
 }
 
 /*
@@ -524,7 +428,7 @@ HudElem_GetAlignY
 ==================
 */
 static void HudElem_GetAlignY( g_hudelem_t *elem, int fieldnum ) {
-	HudElem_GetEnumString( elem, &hudelemFields[fieldnum], hudelemAlignYNames );
+	HudElem_GetEnumString( elem, &hudelemFields[fieldnum], hudelemAlignYNames, 3 );
 }
 
 /*
@@ -555,8 +459,8 @@ void Scr_SetHudElemField( int elemnum, int fieldnum ) {
 	g_hudelem_t             *elem;
 	const hudElemField_t    *field;
 
-	elem = &g_hudelems[elemnum];
 	field = &hudelemFields[fieldnum];
+	elem = &g_hudelems[elemnum];
 
 	if ( field->setter ) {
 		field->setter( elem, fieldnum );
@@ -569,8 +473,7 @@ void Scr_SetHudElemField( int elemnum, int fieldnum ) {
 ==================
 Scr_FreeHudElemConstStrings
 
-No hudelem field is F_STRING in 1.1, so the loop never fires; the table walk is
-the same one Scr_FreeEntityConstStrings does.
+No hudelem field is F_STRING, so this currently frees nothing.
 ==================
 */
 void Scr_FreeHudElemConstStrings( g_hudelem_t *elem ) {
@@ -658,7 +561,10 @@ GScr_AddFieldsForHudElems
 ==================
 */
 void GScr_AddFieldsForHudElems( void ) {
-	const hudElemField_t *field;
+	const hudElemField_t    *field;
+	unsigned short          classnum;
+
+	classnum = g_scr_data.classMap[SCR_CLASS_HUDELEM].classnum;
 
 	for ( field = hudelemFields; field->name; field++ ) {
 		switch ( field->type ) {
@@ -670,7 +576,7 @@ void GScr_AddFieldsForHudElems( void ) {
 		case F_ENTITY:
 		case F_OBJECT:
 		case F_MODEL:
-			Scr_AddClassField( g_scr_data.classMap[SCR_CLASS_HUDELEM].classnum, field->name,
+			Scr_AddClassField( classnum, field->name,
 							   (unsigned short)( field - hudelemFields ) );
 			break;
 		default:
@@ -685,15 +591,13 @@ HECmd_SetText
 ==================
 */
 static void HECmd_SetText( int elemnum ) {
-	g_hudelem_t *elem;
 	const char  *string;
 
-	elem = &g_hudelems[elemnum];
 	string = Scr_GetIString( 0 );
 
-	HudElem_SetDefaults( elem );
-	elem->type = HE_TYPE_TEXT;
-	elem->text = G_LocalizedStringIndex( string );
+	HudElem_SetDefaults( &g_hudelems[elemnum] );
+	g_hudelems[elemnum].type = HE_TYPE_TEXT;
+	g_hudelems[elemnum].text = G_LocalizedStringIndex( string );
 }
 
 /*
@@ -741,9 +645,8 @@ static void HECmd_SetShader( int elemnum ) {
 ==================
 HECmd_SetTimer_Internal
 
-Q_rint's 0.5 - 2^-30 bias under a round-to-nearest fistp is a ceil: any
-fraction at all pushes the millisecond count up (retail inlines the body at
-0x200220A8; SetClock's two sites are 0x2002218B/0x200221EE).
+Shared by the four timer methods.  Any fraction of a millisecond rounds the
+time up.
 ==================
 */
 static void HECmd_SetTimer_Internal( int elemnum, hudElemType_t type, const char *name ) {
@@ -776,7 +679,6 @@ HECmd_SetClock_Internal
 static void HECmd_SetClock_Internal( int elemnum, hudElemType_t type, const char *name ) {
 	g_hudelem_t *elem;
 	int         numParam;
-	float       seconds;
 	int         msec;
 	int         duration;
 	int         shader;
@@ -791,14 +693,12 @@ static void HECmd_SetClock_Internal( int elemnum, hudElemType_t type, const char
 
 	elem = &g_hudelems[elemnum];
 
-	seconds = Scr_GetFloat( 0 ) * 1000.0f;
-	msec = Q_rint( seconds );
+	msec = Q_rint( Scr_GetFloat( 0 ) * 1000.0f );
 	if ( msec <= 0 && type != HE_TYPE_CLOCK_UP ) {
 		Scr_ParamError( 0, va( "time %g should be > 0", msec * 0.001f ) );
 	}
 
-	seconds = Scr_GetFloat( 1 ) * 1000.0f;
-	duration = Q_rint( seconds );
+	duration = Q_rint( Scr_GetFloat( 1 ) * 1000.0f );
 	if ( duration <= 0 ) {
 		Scr_ParamError( 1, va( "duration %g should be > 0", duration * 0.001f ) );
 	}
@@ -824,8 +724,8 @@ static void HECmd_SetClock_Internal( int elemnum, hudElemType_t type, const char
 	elem->timerValue = level.time + msec;
 	elem->width = width;
 	elem->height = height;
-	elem->materialIndex = shader;
 	elem->rotationPeriodMs = duration;
+	elem->materialIndex = shader;
 }
 
 /*
@@ -888,15 +788,13 @@ HECmd_SetValue
 ==================
 */
 static void HECmd_SetValue( int elemnum ) {
-	g_hudelem_t *elem;
 	float       value;
 
-	elem = &g_hudelems[elemnum];
 	value = Scr_GetFloat( 0 );
 
-	HudElem_SetDefaults( elem );
-	elem->value = value;
-	elem->type = HE_TYPE_VALUE;
+	HudElem_SetDefaults( &g_hudelems[elemnum] );
+	g_hudelems[elemnum].value = value;
+	g_hudelems[elemnum].type = HE_TYPE_VALUE;
 }
 
 /*
@@ -999,18 +897,37 @@ static void HECmd_Destroy( int elemnum ) {
 	HudElem_Free( &g_hudelems[elemnum] );
 }
 
+// no terminator; HudElem_GetMethod uses the array size
+// keep: defined after the methods (original data layout)
+static const hudElemMethod_t hudelemMethods[] = {
+	{ "settext",            HECmd_SetText },
+	{ "setshader",          HECmd_SetShader },
+	{ "settimer",           HECmd_SetTimer },
+	{ "settimerup",         HECmd_SetTimerUp },
+	{ "settenthstimer",     HECmd_SetTenthsTimer },
+	{ "settenthstimerup",   HECmd_SetTenthsTimerUp },
+	{ "setclock",           HECmd_SetClock },
+	{ "setclockup",         HECmd_SetClockUp },
+	{ "setvalue",           HECmd_SetValue },
+	{ "fadeovertime",       HECmd_FadeOverTime },
+	{ "scaleovertime",      HECmd_ScaleOverTime },
+	{ "moveovertime",       HECmd_MoveOverTime },
+	{ "reset",              HECmd_Reset },
+	{ "destroy",            HECmd_Destroy }
+};
+
 /*
 ==================
 HudElem_GetMethod
 
-Scr_GetMethod's third and last try; it has already cleared *type, which is why
-nothing here writes it.
+Scr_GetMethod's HUD lookup.  The caller handles the developer flag; this
+lookup receives only the method name.
 ==================
 */
-void ( *HudElem_GetMethod( const char **pName, int *type ) )( int elemnum ) {
+void ( *HudElem_GetMethod( const char **pName ) )( int elemnum ) {
 	int i;
 
-	for ( i = 0; i < 14; i++ ) {
+	for ( i = 0; i < sizeof( hudelemMethods ) / sizeof( hudelemMethods[0] ); i++ ) {
 		if ( !strcmp( *pName, hudelemMethods[i].name ) ) {
 			*pName = hudelemMethods[i].name;
 			return hudelemMethods[i].call;

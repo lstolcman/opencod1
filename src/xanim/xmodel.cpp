@@ -5,20 +5,33 @@
  * @fidelity: likely
  */
 
+#ifdef __cplusplus
+/* retail built this unit as C++ with exceptions (/TP /GX); every name keeps C linkage */
+extern "C" {
+#endif
+
 #include <malloc.h>
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
+#include "../qcommon/vc7_compat.h"
 
-#define xanim_pool xmodel_generatedPoolDecl_unused
-#include "../qcommon/cod1_globals.h"
-#undef xanim_pool
+extern int currentPos;   /* script/scr_tempmemory.cpp: the script temp-memory cursor */
+extern char *scrSave_readPos;   /* script/scr_variable.cpp: the save-game read cursor */
+#include "xanim_local.h"
+
+/* retail .rdata error strings (a leading \x15 marks a localized-string reference); extern
+   keeps C++ const data externally linked, as a C definition would be */
+extern const char xmodel_errSyncLoopingAndSyncNonlooping[] = "\x15" "animation cannot be sync looping and sync nonlooping";   /* 0x0055A3E0 */
+extern const char xmodel_errDuplicateSyncSpec[] = "\x15" "duplicate specification of animation sync in '%s', %d nodes above '%s'";   /* 0x0055A418 */
+extern const char xmodel_errAnimSyncNonloopingAndLooping[] = "\x15" "animation '%s' in '%s' cannot be sync nonlooping and looping";   /* 0x0055A460 */
+extern const char xmodel_errAnimSyncLoopingAndNonlooping[] = "\x15" "animation '%s' in '%s' cannot be sync looping and nonlooping";   /* 0x0055A4A0 */
 
 extern void *FS_GetDataForFile( const char *dir, const char *name, const char *ext );
-extern int Hunk_ReallocateTempMemory();
+extern void *Hunk_ReallocateTempMemory( int size );
+float FloatNoSwap( float f );   /* universal/q_shared.c; LTCG inlines it */
 extern unsigned short SL_GetStringOfLen( const char *text, unsigned char user,
                                          unsigned int size, int type );
-extern int SL_FreeString__FUsPCcUi();
+extern void SL_FreeString__FUsPCcUi( unsigned short handle, const char *text, unsigned int size );
 extern void WriteString( unsigned short id );
 extern void  __cdecl XAnimCalcRelDeltaParts( float *result, int parts, float weight,
                                  float time0, float time1 );
@@ -26,11 +39,13 @@ extern float * __cdecl XAnimCalcAbsDeltaParts( float *result, unsigned short *pa
                                    float weight, float time );
 extern int  __cdecl XAnimFreeInfo( unsigned short handle );
 extern int  __cdecl XAnimGetNextNotifyTime( int entry, int node, float time );
-extern int XAnimClearServerNotify();
+struct XAnimInfo_s;
+struct XModelSurfsData_s;
+extern void __cdecl XAnimClearServerNotify( struct XAnimInfo_s *node );
 extern void __cdecl XAnimDisplay( void *tree, int nodeIndex, int depth );
 extern void __cdecl XAnimCalcTreeDelta_m( void *tree, int nodeIndex, float weight,
                                 float *delta, int isFirst, int isChild );
-extern int XModelOptimize();
+extern void __cdecl XModelOptimize( struct XModelSurfsData_s *modelSurfs, void *(*alloc)( int size ) );
 
 typedef struct XModelPartNameTable_s
 {
@@ -273,12 +288,12 @@ extern int __cdecl XAnimSetAnimInternal_m( int nodeIndex, float weight, float bl
                                unsigned __int16 notifyName,
                                __int16 notifyType );
 
-extern int  __cdecl XAnimUpdateNotifyIndex_m( int node );
+extern void __cdecl XAnimUpdateNotifyIndex_m( int node );
 extern void __cdecl XAnimReseedTiming_m( int nodeIndex, int forceClear );
-extern int  __cdecl cand_XAnimSeedParentChain( int node, int blendTimeBits );
-extern __int16 __cdecl XAnimSetAnimKnobInternal_m( unsigned __int16 notifyName,
-                                   XAnimTree *tree, int node, float weight,
-                                   int blendTimeBits, float rate,
+extern void __cdecl cand_XAnimSeedParentChain( int node, float blendTime );
+extern void __cdecl XAnimSetAnimKnobInternal_m( XAnimTree *tree, int node,
+                                   float weight, float blendTime, float rate,
+                                   unsigned __int16 notifyName,
                                    __int16 notifyType, int animFlags );
 
 typedef void *(*XModelAllocFn)(int size);
@@ -311,6 +326,8 @@ static unsigned short           xmodel_defaultSurfaceNames[1];  /* 0x00A9CE0E */
 
 float                           xmodel_testLodDist;             /* 0x00A9CE10 */
 unsigned char                   xmodel_testLodsEnabled;         /* 0x00A9CE14 */
+int                             xmodel_animCheck;               /* 0x01407330 */
+int                             xmodel_enforceExist;            /* 0x00572D68, the cl_xmodelcheck latch */
 XModelLodInfo                   xmodel_testLodDistances[XMODEL_LOD_COUNT]; /* 0x00A9CE18 */
 
 static XModelSurfsData         *xmodel_surfsCloneList;
@@ -332,186 +349,180 @@ static void XModelReleaseString(unsigned short handle)
 }
 
 /* ---- DObjDisplayAnim  0x00488150 ----  [CONFIRMED] */
-void __cdecl DObjDisplayAnim(int **a1)
+void __cdecl DObjDisplayAnim(int **treeSlot)
 {
-  int *v1;
+  int *tree = *treeSlot;
 
-  v1 = *a1;
-  if ( v1 )
-  {
-    XAnimDisplay(v1, 0, 0);
-    Com_Printf("\n");
-  }
-  else
+  if ( !tree )
   {
     Com_Printf("NO TREE\n");
+    return;
   }
+  XAnimDisplay(tree, 0, 0);
+  Com_Printf("\n");
 }
 
+/*
+ * delta[6] as filled by XAnimCalcTreeDelta_m / XAnimCalc*DeltaParts:
+ *   delta[0..1]  2D facing delta (cos, sin); reset to (0,1) when degenerate
+ *   delta[2]     unused
+ *   delta[3..5]  translation delta (copied out verbatim as raw bits)
+ * The `x == 0.0f` tests below are plain C compares (false on NaN), exactly
+ * retail's `test ah,44h / jnp` x87 sequences.
+ */
+
 /* ---- XAnimGetRelDelta_m  0x00488180 ----  VERIFIED */
-int __cdecl XAnimGetRelDelta_m(int a1, int a2, int *a3, float *a4, _DWORD *a5)
+int __cdecl XAnimGetRelDelta_m( void *tree, int node, float *dirDelta,
+                                int *posDelta, int deltaRootNode )
 {
   float delta[6];
-  float v5;
-  int result;
-  int v7;
-  int v8;
 
-  dword_A9C620 = a1;
-  byte_A9C63C = 0;
-  XAnimCalcTreeDelta_m(a5, a2, 1.0f, delta, 1, 0);
-  if ( (delta[0] == 0.0) | __UNORDERED__(delta[0], 0.0) || (delta[1] == 0.0) | __UNORDERED__(delta[1], 0.0) )
+  xanim_evalPoolWeightSelector = deltaRootNode;
+  xanim_evalLeafOutputMode = 0;
+  XAnimCalcTreeDelta_m( tree, node, 1.0f, delta, 1, 0 );
+  if ( delta[0] == 0.0f
+    || delta[1] == 0.0f )
   {
-    *a4 = 0.0;
-    a4[1] = 1.0;
+    dirDelta[0] = 0.0f;
+    dirDelta[1] = 1.0f;
   }
   else
   {
-    v5 = delta[1];
-    *a4 = delta[0];
-    a4[1] = v5;
+    dirDelta[0] = delta[0];
+    dirDelta[1] = delta[1];
   }
-  result = ((int *)delta)[3];
-  v7 = ((int *)delta)[4];
-  v8 = ((int *)delta)[5];
-  *a3 = result;
-  a3[1] = v7;
-  a3[2] = v8;
-  return result;
+  posDelta[0] = ((int *)delta)[3];
+  posDelta[1] = ((int *)delta)[4];
+  posDelta[2] = ((int *)delta)[5];
+  return ((int *)delta)[3];
 }
 
 /* ---- XAnimGetAbsDelta_m  0x00488210 ----  VERIFIED */
-int __cdecl XAnimGetAbsDelta_m(int a1, _DWORD *a2, _DWORD *a3, float *a4)
+int __cdecl XAnimGetAbsDelta_m( void *tree, int node, float *dirDelta, int *posDelta )
 {
   float delta[6];
-  float v4;
-  int result;
-  int v6;
 
-  byte_A9C63C = 1;
-  dword_A9C620 = 1;
-  XAnimCalcTreeDelta_m(a2, a1, 1.0f, delta, 1, 0);
-  if ( (delta[0] == 0.0) | __UNORDERED__(delta[0], 0.0) && (delta[1] == 0.0) | __UNORDERED__(delta[1], 0.0) )
+  xanim_evalLeafOutputMode = 1;
+  xanim_evalPoolWeightSelector = 1;
+  XAnimCalcTreeDelta_m( tree, node, 1.0f, delta, 1, 0 );
+  if ( delta[0] == 0.0f
+    && delta[1] == 0.0f )
   {
-    *a4 = 0.0;
-    a4[1] = 1.0;
+    dirDelta[0] = 0.0f;
+    dirDelta[1] = 1.0f;
   }
   else
   {
-    v4 = delta[1];
-    *a4 = delta[0];
-    a4[1] = v4;
+    dirDelta[0] = delta[0];
+    dirDelta[1] = delta[1];
   }
-  result = ((int *)delta)[4];
-  v6 = ((int *)delta)[5];
-  *a3 = ((int *)delta)[3];
-  a3[1] = result;
-  a3[2] = v6;
-  return result;
+  posDelta[0] = ((int *)delta)[3];
+  posDelta[1] = ((int *)delta)[4];
+  posDelta[2] = ((int *)delta)[5];
+  return ((int *)delta)[4];
 }
 
-/* ---- XAnimGetRelDeltaForTime_m  0x00488290 ----  VERIFIED */
-char __cdecl XAnimGetRelDeltaForTime_m(int a1, int a2, _DWORD *a3, float *a4, float a5, float a6)
-{
-  float delta[6];
-  int v6;
-  float v7;
-  int v8;
-  int v9;
+/*
+ * The ForTime variants take the *source* tree (XAnim) directly and evaluate one
+ * leaf node's delta at explicit sample times.  A non-leaf node, or a leaf whose
+ * anim-parts "has delta" flag (parts[+3]) is clear, yields the degenerate delta.
+ */
 
-  if ( *(_WORD *)(a2 + 8 * a1 + 8)
-    || (v6 = *(_DWORD *)(*(_DWORD *)(a2 + 8 * a1 + 12) + 4), LOBYTE(a1) = *(_BYTE *)(v6 + 3), !(_BYTE)a1) )
+/* ---- XAnimGetRelDeltaForTime_m  0x00488290 ----  VERIFIED */
+void __cdecl XAnimGetRelDeltaForTime_m( int sourceTree, int node, float *posDelta,
+                                        float *dirDelta, float time0, float time1 )
+{
+  const XAnim *source = (const XAnim *)sourceTree;
+  const char  *parts;
+  float        delta[6];
+
+  if ( !source->entries[node].childCount )
   {
-    *a4 = 0.0;
-    a4[1] = 1.0;
-    a3[1] = 0;
-    a3[2] = 0;
-    *a3 = 0;
-  }
-  else
-  {
-    delta[0] = 0.0;
-    delta[1] = 0.0;
-    ((int *)delta)[2] = 0;
-    ((int *)delta)[3] = 0;
-    ((int *)delta)[4] = 0;
-    ((int *)delta)[5] = 0;
-    XAnimCalcRelDeltaParts(delta, v6, 1.0f, a5, a6);
-    if ( (delta[0] == 0.0) | __UNORDERED__(delta[0], 0.0) && (delta[1] == 0.0) | __UNORDERED__(delta[1], 0.0) )
+    parts = ((const char **)source->entries[node].u.leafAsset)[1];
+    if ( parts[3] )   /* XAnimParts::hasDeltaMotion */
     {
-      *a4 = 0.0;
-      a4[1] = 1.0;
+      delta[0] = 0.0f;
+      delta[1] = 0.0f;
+      delta[2] = 0.0f;
+      delta[3] = 0.0f;
+      delta[4] = 0.0f;
+      delta[5] = 0.0f;
+      XAnimCalcRelDeltaParts( delta, (int)parts, 1.0f, time0, time1 );
+      if ( delta[0] == 0.0f && delta[1] == 0.0f )
+      {
+        dirDelta[0] = 0.0f;
+        dirDelta[1] = 1.0f;
+      }
+      else
+      {
+        dirDelta[0] = delta[0];
+        dirDelta[1] = delta[1];
+      }
+      posDelta[0] = delta[3];
+      posDelta[1] = delta[4];
+      posDelta[2] = delta[5];
+      return;
     }
-    else
-    {
-      v7 = delta[1];
-      *a4 = delta[0];
-      a4[1] = v7;
-    }
-    v8 = ((int *)delta)[3];
-    LOBYTE(a1) = ((int *)delta)[4];
-    v9 = ((int *)delta)[5];
-    a3[1] = ((int *)delta)[4];
-    a3[2] = v9;
-    *a3 = v8;
   }
-  return a1;
+
+  dirDelta[0] = 0.0f;
+  dirDelta[1] = 1.0f;
+  posDelta[0] = 0.0f;
+  posDelta[1] = 0.0f;
+  posDelta[2] = 0.0f;
 }
 
 /* ---- XAnimGetAbsDeltaForTime_m  0x00488360 ----  VERIFIED */
-int __cdecl XAnimGetAbsDeltaForTime_m(int result, int a2, float *a3, _DWORD *a4, float a5)
+void __cdecl XAnimGetAbsDeltaForTime_m( const XAnim *sourceTree, int node, float *posDelta, float *dirDelta, float time )
 {
-  float delta[6];
-  float v5;
-  int v6;
+  const char *parts;
+  float       delta[6];
 
-  if ( *(_WORD *)(a2 + 8 * result + 8)
-    || (result = *(_DWORD *)(*(_DWORD *)(a2 + 8 * result + 12) + 4), !*(_BYTE *)(result + 3)) )
+  if ( !sourceTree->entries[node].childCount )
   {
-    *a3 = 0.0;
-    a3[1] = 1.0;
-    *a4 = 0;
-    a4[1] = 0;
-    a4[2] = 0;
-  }
-  else
-  {
-    delta[0] = 0.0;
-    delta[1] = 0.0;
-    ((int *)delta)[2] = 0;
-    ((int *)delta)[3] = 0;
-    ((int *)delta)[4] = 0;
-    ((int *)delta)[5] = 0;
-    XAnimCalcAbsDeltaParts(delta, (unsigned short *)result, 1.0f, a5);
-    if ( (delta[0] == 0.0) | __UNORDERED__(delta[0], 0.0) && (delta[1] == 0.0) | __UNORDERED__(delta[1], 0.0) )
+    parts = ((const char **)sourceTree->entries[node].u.leafAsset)[1];
+    if ( parts[3] )   /* XAnimParts::hasDeltaMotion */
     {
-      *a3 = 0.0;
-      a3[1] = 1.0;
+      delta[0] = 0.0f;
+      delta[1] = 0.0f;
+      delta[2] = 0.0f;
+      delta[3] = 0.0f;
+      delta[4] = 0.0f;
+      delta[5] = 0.0f;
+      XAnimCalcAbsDeltaParts( delta, (unsigned short *)parts, 1.0f, time );
+      if ( delta[0] == 0.0f && delta[1] == 0.0f )
+      {
+        dirDelta[0] = 0.0f;
+        dirDelta[1] = 1.0f;
+      }
+      else
+      {
+        dirDelta[0] = delta[0];
+        dirDelta[1] = delta[1];
+      }
+      posDelta[0] = delta[3];
+      posDelta[1] = delta[4];
+      posDelta[2] = delta[5];
+      return;
     }
-    else
-    {
-      v5 = delta[1];
-      *a3 = delta[0];
-      a3[1] = v5;
-    }
-    v6 = ((int *)delta)[4];
-    result = ((int *)delta)[5];
-    *a4 = ((int *)delta)[3];
-    a4[1] = v6;
-    a4[2] = result;
   }
-  return result;
+
+  dirDelta[0] = 0.0f;
+  dirDelta[1] = 1.0f;
+  posDelta[0] = 0.0f;
+  posDelta[1] = 0.0f;
+  posDelta[2] = 0.0f;
 }
 
 /* ---- XAnimAllocInfo  0x00488450 ----  VERIFIED */
 XAnimInfo *__cdecl XAnimAllocInfo( XAnimTree *tree, int nodeIndex )
 {
     unsigned short handle;
-    unsigned short newHead;
 
     handle = xanim_pool[0].freeNext;
-    if ( !handle ) {
+    if ( !xanim_pool[0].freeNext ) {
         Com_Error( ERR_DROP, "\x15" "exceeded maximum number of anim info" );
+        return NULL;
     }
 
     ++xanim_poolUsedCount;
@@ -519,76 +530,24 @@ XAnimInfo *__cdecl XAnimAllocInfo( XAnimTree *tree, int nodeIndex )
         xanim_poolHighWaterCount = xanim_poolUsedCount;
     }
 
-    newHead = xanim_pool[handle].freeNext;
-    xanim_pool[0].freeNext        = newHead;
-    xanim_pool[newHead].freePrev  = 0;
+    xanim_pool[0].freeNext = xanim_pool[xanim_pool[0].freeNext].freeNext;
+    xanim_pool[xanim_pool[0].freeNext].freePrev = 0;
     tree->poolNodeHandles[nodeIndex] = handle;
-
     return &xanim_pool[handle];
 }
-#if 0
-// XAnimAllocInfo: allocates an XAnimInfo pool node (pops the free head at 0x00A7A62A, bumps the high-water counter, Com_Error when exhausted) and stores its handle in the runtime tree slot.
-char *__cdecl XAnimAllocInfo(int a1, int a2)
-{
-  __int16 v2;
-  int v3;
-  int v4;
-
-  v2 = word_A7A62A[0];
-  if ( !word_A7A62A[0] )
-    Com_Error(ERR_DROP, &byte_55A4E0);
-  v3 = ++xanim_poolUsedCount;
-  if ( xanim_poolUsedCount > xanim_poolHighWaterCount )
-    xanim_poolHighWaterCount = v3;
-  v4 = 34 * (unsigned __int16)word_A7A62A[0];
-  word_A7A62A[0] = word_A7A62A[v4];
-  word_A7A628[34 * (unsigned __int16)word_A7A62A[0]] = 0;
-  *(_WORD *)(a1 + 2 * a2 + 8) = v2;
-  return (char *)&xanim_pool + v4 * 2;
-}
-#endif
 
 /* ---- XAnimParentChainHasWeight_m  0x004884D0 ----  VERIFIED */
 char __cdecl XAnimParentChainHasWeight_m( int nodeIndex, XAnimTree *tree )
 {
-    XAnim *source;
-
-    if ( nodeIndex == 0 ) {
-        return 1;
-    }
-
-    source = tree->sourceTree;
-    for ( ;; ) {
-        nodeIndex = source->entries[nodeIndex].parentIndex;
+    while ( nodeIndex ) {
+        nodeIndex = tree->sourceTree->entries[nodeIndex].parentIndex;
 
         if ( XANIM_LANE( tree->poolNodeHandles[nodeIndex] ).currentWeight == 0.0f ) {
             return 0;
         }
-        if ( nodeIndex == 0 ) {
-            return 1;
-        }
     }
-}
-#if 0
-// XAnimParentChainHasWeight_m: true while every ancestor of the node still carries weight.
-char __cdecl XAnimParentChainHasWeight_m(int a1, _DWORD *a2)
-{
-  double v2;
-
-  if ( !a1 )
     return 1;
-  while ( 1 )
-  {
-    a1 = *(unsigned __int16 *)(*a2 + 8 * a1 + 10);
-    v2 = *((float *)&unk_A7A640 + 17 * *((unsigned __int16 *)a2 + a1 + 4) + 7 * xanim_activePoolSlot);
-    if ( (v2 == 0.0) | __UNORDERED__(v2, 0.0) )
-      break;
-    if ( !a1 )
-      return 1;
-  }
-  return 0;
 }
-#endif
 
 /* ---- XAnimSubtreeHasWeight_m  0x00488510 ----  VERIFIED */
 char __cdecl XAnimSubtreeHasWeight_m( XAnimTree *tree, int nodeIndex )
@@ -596,7 +555,6 @@ char __cdecl XAnimSubtreeHasWeight_m( XAnimTree *tree, int nodeIndex )
     unsigned short  handle;
     XAnimEntry     *entry;
     int             childCount;
-    int             firstChild;
     int             i;
 
     handle = tree->poolNodeHandles[nodeIndex];
@@ -613,143 +571,95 @@ char __cdecl XAnimSubtreeHasWeight_m( XAnimTree *tree, int nodeIndex )
         return 1;
     }
 
-    firstChild = entry->u.parent.firstChildIndex;
     for ( i = 0; i < childCount; ++i ) {
-        if ( XAnimSubtreeHasWeight_m( tree, firstChild + i ) ) {
+        if ( XAnimSubtreeHasWeight_m( tree, entry->u.parent.firstChildIndex + i ) ) {
             return 1;
         }
     }
     return 0;
 }
-#if 0
-// XAnimSubtreeHasWeight_m: true if the node has weight and (is a leaf or has a weighted descendant).
-char __cdecl XAnimSubtreeHasWeight_m(_DWORD *a1, int a2)
-{
-  unsigned __int16 v2;
-  double v3;
-  _WORD *v5;
-  int v6;
-  int v7;
-  int v8;
-
-  v2 = *((_WORD *)a1 + a2 + 4);
-  if ( !v2 )
-    return 0;
-  v3 = *((float *)&unk_A7A640 + 17 * v2 + 7 * xanim_activePoolSlot);
-  if ( (v3 == 0.0) | __UNORDERED__(v3, 0.0) )
-    return 0;
-  v5 = (_WORD *)(*a1 + 8 * a2 + 8);
-  v6 = (unsigned __int16)*v5;
-  if ( *v5 )
-  {
-    v7 = 0;
-    v8 = *(unsigned __int16 *)(*a1 + 8 * a2 + 14);
-    while ( !XAnimSubtreeHasWeight_m(a1, v7 + v8) )
-    {
-      if ( ++v7 >= v6 )
-        return 0;
-    }
-  }
-  return 1;
-}
-#endif
 
 /* ---- XAnimNodeIsActive_m  0x00488590 ----  VERIFIED */
-BOOL __cdecl XAnimNodeIsActive_m(_DWORD *a1, int a2)
+int __cdecl XAnimNodeIsActive_m( unsigned int *tree, int node )
 {
-  return XAnimParentChainHasWeight_m(a2, (XAnimTree *)a1) && XAnimSubtreeHasWeight_m((XAnimTree *)a1, a2);
+  return XAnimParentChainHasWeight_m( node, (XAnimTree *)tree )
+      && XAnimSubtreeHasWeight_m( (XAnimTree *)tree, node );
 }
 
 /* ---- XAnimClearAnimNode_m  0x004885C0 ----  VERIFIED */
-void __cdecl XAnimClearAnimNode_m(_DWORD *a1, int a2, float a3)
+void __cdecl XAnimClearAnimNode_m( unsigned int *treePtr, int node, float blendTime )
 {
-  unsigned __int16 v4;
-  char *v5;
-  int v6;
+  XAnimTree     *tree   = (XAnimTree *)treePtr;
+  unsigned short handle = tree->poolNodeHandles[node];
 
-  v4 = *((_WORD *)a1 + a2 + 4);
-  if ( v4 )
+  if ( handle )
   {
-    v5 = (char *)&xanim_pool + 68 * v4;
-    v6 = (int)&v5[28 * xanim_activePoolSlot + 12];
-    if ( XAnimParentChainHasWeight_m(a2, (XAnimTree *)a1) && XAnimSubtreeHasWeight_m((XAnimTree *)a1, a2) )
+    XAnimInfo  *info = &xanim_pool[handle];
+    XAnimState *lane = &info->states[xanim_activePoolSlot];
+
+    if ( !XAnimNodeIsActive_m( treePtr, node ) )
     {
-      if ( (*(float *)(v6 + 16) == 0.0) | __UNORDERED__(*(float *)(v6 + 16), 0.0) )
-      {
-        if ( *(float *)(v6 + 12) > (double)a3 )
-          *(float *)(v6 + 12) = a3;
-      }
-      else
-      {
-        *(_DWORD *)(v6 + 16) = 0;
-        *(float *)(v6 + 12) = a3;
-      }
+      lane->currentWeight = 0.0f;
+      lane->weightBlendTimeRemaining = 0.0f;
+      lane->targetWeight = 0.0f;
     }
-    else
+    else if ( lane->targetWeight != 0.0f )
     {
-      *(_DWORD *)(v6 + 20) = 0;
-      *(_DWORD *)(v6 + 12) = 0;
-      *(_DWORD *)(v6 + 16) = 0;
+      lane->targetWeight = 0.0f;
+      lane->weightBlendTimeRemaining = blendTime;
+    }
+    else if ( lane->weightBlendTimeRemaining > blendTime )
+    {
+      lane->weightBlendTimeRemaining = blendTime;
     }
     if ( xanim_activePoolSlot )
-      XAnimClearServerNotify((int)v5);
+      XAnimClearServerNotify( info );
   }
 }
 
 /* ---- XAnimClearAnimSubtree_m  0x00488660 ----  VERIFIED */
-void __cdecl XAnimClearAnimSubtree_m(_DWORD *a1, int a2, float a3)
+void __cdecl XAnimClearAnimSubtree_m( unsigned int *treePtr, int node, float blendTime )
 {
-  int v3;
-  _WORD *v4;
-  int v5;
+  XAnimTree *tree = (XAnimTree *)treePtr;
 
-  if ( *((_WORD *)a1 + a2 + 4) )
+  if ( tree->poolNodeHandles[node] )
   {
-    XAnimClearAnimNode_m(a1, a2, a3);
-    v3 = *(unsigned __int16 *)(*a1 + 8 * a2 + 8);
-    v4 = (_WORD *)(*a1 + 8 * a2 + 8);
-    v5 = 0;
-    if ( *v4 )
-    {
-      do
-      {
-        XAnimClearAnimSubtree_m(a1, v5 + (unsigned __int16)v4[3], a3);
-        ++v5;
-      }
-      while ( v5 < v3 );
-    }
+    XAnimEntry *entry;
+    int         childCount;
+    int         i;
+
+    XAnimClearAnimNode_m( treePtr, node, blendTime );
+
+    entry      = &tree->sourceTree->entries[node];
+    childCount = entry->childCount;
+    for ( i = 0; i < childCount; ++i )
+      XAnimClearAnimSubtree_m( treePtr, entry->u.parent.firstChildIndex + i, blendTime );
   }
 }
 
 /* ---- XAnimClearAnim_m  0x004886C0 ----  VERIFIED */
-void __cdecl XAnimClearAnim_m(int a1, _DWORD *a2, float a3)
+void __cdecl XAnimClearAnim_m( int node, unsigned int *treePtr, float blendTime )
 {
-  if ( (a3 < 0.001) | __UNORDERED__(a3, 0.001) )
-    a3 = 0.0;
-  XAnimClearAnimSubtree_m(a2, a1, a3);
+  if ( blendTime < 0.001f )
+    blendTime = 0.0f;
+  XAnimClearAnimSubtree_m( treePtr, node, blendTime );
 }
 
 /* ---- XAnimClearAnimChildSubtrees_m  0x004886F0 ----  VERIFIED */
-void __cdecl XAnimClearAnimChildSubtrees_m(_DWORD *a1, int v2, float a2)
+void __cdecl XAnimClearAnimChildSubtrees_m( unsigned int *treePtr, int node, float blendTime )
 {
-  int v3;
-  _WORD *v4;
-  int v5;
+  XAnimTree  *tree = (XAnimTree *)treePtr;
+  XAnimEntry *entry;
+  int         childCount;
+  int         i;
 
-  if ( (a2 < 0.001) | __UNORDERED__(a2, 0.001) )
-    a2 = 0.0;
-  v3 = *(unsigned __int16 *)(*a1 + 8 * v2 + 8);
-  v4 = (_WORD *)(*a1 + 8 * v2 + 8);
-  v5 = 0;
-  if ( *v4 )
-  {
-    do
-    {
-      XAnimClearAnimSubtree_m(a1, v5 + (unsigned __int16)v4[3], a2);
-      ++v5;
-    }
-    while ( v5 < v3 );
-  }
+  if ( blendTime < 0.001f )
+    blendTime = 0.0f;
+
+  entry      = &tree->sourceTree->entries[node];
+  childCount = entry->childCount;
+  for ( i = 0; i < childCount; ++i )
+    XAnimClearAnimSubtree_m( treePtr, entry->u.parent.firstChildIndex + i, blendTime );
 }
 
 /* ---- XAnimSetGoalWeight_m  0x00488750 ----  VERIFIED */
@@ -758,23 +668,24 @@ void __cdecl XAnimSetGoalWeight_m( XAnimTree *tree, int nodeIndex, float goalWei
 {
     XAnimEntry *parentEntry;
     int         siblingCount;
-    int         firstSibling;
     int         i;
-    float       maxWeight = 0.0f;
+    float       maxWeight;
     float       blendTime;
+    rfloat      blendProduct;   /* x87 stack in retail (_PC_53); never stored */
 
     if ( nodeIndex == 0 ) {
         return;
     }
 
+    maxWeight=0.0f;
     parentEntry  = &tree->sourceTree->entries[
                        tree->sourceTree->entries[nodeIndex].parentIndex];
     siblingCount = parentEntry->childCount;
-    firstSibling = parentEntry->u.parent.firstChildIndex;
+
 
     for ( i = 0; i < siblingCount; ++i ) {
-        int            sibling = firstSibling + i;
-        unsigned short handle  = tree->poolNodeHandles[sibling];
+        int            sibling = parentEntry->u.parent.firstChildIndex + i;
+        unsigned short handle  = tree->poolNodeHandles[parentEntry->u.parent.firstChildIndex + i];
         float          weight  = handle ? XANIM_LANE( handle ).currentWeight
                                         : 0.0f;
         float          candidate;
@@ -794,332 +705,123 @@ void __cdecl XAnimSetGoalWeight_m( XAnimTree *tree, int nodeIndex, float goalWei
         }
     }
 
-    blendTime = maxWeight * blendFactor;
-    if ( blendTime < 0.001f ) {
+    /* 0x004889BA fmul / fst / fcomp: the float is stored, but the
+     * UNROUNDED product is what is tested against 0.001f. */
+    blendProduct = (rfloat)maxWeight * blendFactor;
+    blendTime    = (float)blendProduct;
+    if ( blendProduct < 0.001f ) {
         blendTime = 0.0f;
     }
 
     for ( i = 0; i < siblingCount; ++i ) {
-        int sibling = parentEntry->u.parent.firstChildIndex + i;
-
-        if ( sibling != nodeIndex ) {
-            XAnimClearAnimNode_m( (_DWORD *)tree, sibling, blendTime );
+        if ( parentEntry->u.parent.firstChildIndex + i != nodeIndex ) {
+            XAnimClearAnimNode_m( (unsigned int *)tree, parentEntry->u.parent.firstChildIndex + i, blendTime );
         }
     }
 }
-#if 0
-// XAnimSetGoalWeight_m: redistributes goal weights across a node's siblings before a new animation is set.  Called first by all four XAnimSetAnim* entry points.
-void __cdecl XAnimSetGoalWeight_m(_DWORD *a1, int a2, float a3, float a4)
-{
-  double v4;
-  int v5;
-  signed int v6;
-  int v7;
-  signed int v8;
-  int v9;
-  int v10;
-  int v11;
-  unsigned __int16 *v12;
-  unsigned __int16 v13;
-  double v14;
-  double v15;
-  unsigned __int16 v16;
-  double v17;
-  unsigned __int16 v18;
-  double v19;
-  int v20;
-  _WORD *v21;
-  int v22;
-  double v23;
-  double v24;
-  signed int i;
-  int v26;
-  int v27;
-  int v28;
-  int v29;
-  int v30;
-  int v31;
-  float v32;
-  float v33;
-  float v34;
-  float v35;
-  float v36;
-  float v37;
-
-  if ( a2 )
-  {
-    v4 = 0.0;
-    v5 = *(unsigned __int16 *)(*a1 + 8 * a2 + 10);
-    v6 = *(unsigned __int16 *)(*a1 + 8 * v5 + 8);
-    v7 = *a1 + 8 * v5 + 8;
-    v8 = 0;
-    if ( (unsigned int)v6 >= 4 )
-    {
-      v9 = *(unsigned __int16 *)(*a1 + 8 * v5 + 14);
-      v10 = 3;
-      v11 = v9 + 2;
-      v12 = (unsigned __int16 *)a1 + v9 + 5;
-      do
-      {
-        v13 = *(v12 - 1);
-        if ( v13 )
-          v14 = *((float *)&unk_A7A640 + 17 * v13 + 7 * xanim_activePoolSlot);
-        else
-          v14 = 0.0;
-        if ( v11 - 2 == a2 )
-        {
-          v32 = a3 - v14;
-          v27 = LODWORD(v32) & 0x7FFFFFFF;
-        }
-        else
-        {
-          *(float *)&v27 = v14;
-        }
-        if ( *(float *)&v27 > v4 )
-          v4 = *(float *)&v27;
-        if ( *v12 )
-          v15 = *((float *)&unk_A7A640 + 17 * *v12 + 7 * xanim_activePoolSlot);
-        else
-          v15 = 0.0;
-        if ( v11 - 1 == a2 )
-        {
-          v33 = a3 - v15;
-          v28 = LODWORD(v33) & 0x7FFFFFFF;
-        }
-        else
-        {
-          *(float *)&v28 = v15;
-        }
-        if ( *(float *)&v28 > v4 )
-          v4 = *(float *)&v28;
-        v16 = v12[1];
-        if ( v16 )
-          v17 = *((float *)&unk_A7A640 + 17 * v16 + 7 * xanim_activePoolSlot);
-        else
-          v17 = 0.0;
-        if ( v11 == a2 )
-        {
-          v34 = a3 - v17;
-          v29 = LODWORD(v34) & 0x7FFFFFFF;
-        }
-        else
-        {
-          *(float *)&v29 = v17;
-        }
-        if ( *(float *)&v29 > v4 )
-          v4 = *(float *)&v29;
-        v18 = v12[2];
-        if ( v18 )
-          v19 = *((float *)&unk_A7A640 + 17 * v18 + 7 * xanim_activePoolSlot);
-        else
-          v19 = 0.0;
-        if ( v11 + 1 == a2 )
-        {
-          v35 = a3 - v19;
-          v30 = LODWORD(v35) & 0x7FFFFFFF;
-        }
-        else
-        {
-          *(float *)&v30 = v19;
-        }
-        if ( *(float *)&v30 > v4 )
-          v4 = *(float *)&v30;
-        v10 += 4;
-        v8 += 4;
-        v12 += 4;
-        v11 += 4;
-      }
-      while ( v10 < v6 );
-    }
-    if ( v8 < v6 )
-    {
-      v20 = *(unsigned __int16 *)(v7 + 6) + v8;
-      v21 = (_WORD *)a1 + v20 + 4;
-      v22 = v6 - v8;
-      do
-      {
-        if ( *v21 )
-          v23 = *((float *)&unk_A7A640 + 17 * (unsigned __int16)*v21 + 7 * xanim_activePoolSlot);
-        else
-          v23 = 0.0;
-        if ( v20 == a2 )
-        {
-          v36 = a3 - v23;
-          v31 = LODWORD(v36) & 0x7FFFFFFF;
-        }
-        else
-        {
-          *(float *)&v31 = v23;
-        }
-        if ( *(float *)&v31 > v4 )
-          v4 = *(float *)&v31;
-        ++v21;
-        ++v20;
-        --v22;
-      }
-      while ( v22 );
-    }
-    v24 = v4 * a4;
-    v37 = v24;
-    if ( (v24 < 0.001) | __UNORDERED__(v24, 0.001) )
-      v37 = 0.0;
-    for ( i = 0; i < v6; ++i )
-    {
-      v26 = *(unsigned __int16 *)(v7 + 6);
-      if ( v26 + i != a2 )
-        XAnimClearAnimNode_m(a1, v26 + i, v37);
-    }
-  }
-}
-#endif
 
 /* ---- XAnimSetAnimKnob_m  0x00488A10 ----  VERIFIED */
-__int16 __cdecl XAnimSetAnimKnob_m(
-        _DWORD *a1,
-        int a2,
-        float a3,
-        int a4,
-        float a5,
-        __int16 a6,
-        __int16 a7,
-        int a8)
+void __cdecl XAnimSetAnimKnob_m( unsigned int *tree, int node, float weight,
+                                    float blendTime, float rate,
+                                    __int16 notifyName, __int16 notifyType,
+                                    int animFlags )
 {
-  if ( (a3 < 0.001) | __UNORDERED__(a3, 0.001) )
-    a3 = 0.0;
-  XAnimSetGoalWeight_m((XAnimTree *)a1, a2, a3, *(float *)&a4);
-  return XAnimSetAnimKnobInternal_m(a6, (XAnimTree *)a1, a2, a3, a4, a5, a7, a8);
+  if ( weight < 0.001f )
+    weight = 0.0f;
+  XAnimSetGoalWeight_m( (XAnimTree *)tree, node, weight, blendTime );
+  XAnimSetAnimKnobInternal_m( (XAnimTree *)tree, node, weight, blendTime, rate,
+                              notifyName, notifyType, animFlags );
 }
 
 /* ---- XAnimSetAnimKnobAll_m  0x00488A70 ----  VERIFIED */
-int __cdecl XAnimSetAnimKnobAll_m(
-        int a1,
-        _DWORD *a2,
-        int a3,
-        float a4,
-        int a5,
-        float a6,
-        __int16 a7,
-        __int16 a8,
-        int a9)
+int __cdecl XAnimSetAnimKnobAll_m( int node, unsigned int *treePtr, int stopNode,
+                                   float weight, float blendTime, float rate,
+                                   __int16 notifyName, __int16 notifyType,
+                                   int animFlags )
 {
-  int v9;
-  float *v10;
-  _WORD *v11;
-  int v13;
+  XAnimTree *tree = (XAnimTree *)treePtr;
+  int        result;
+  int        cur;
 
-  v9 = a1;
-  xanim_currentTree = (int)a2;
-  if ( (a4 < 0.001) | __UNORDERED__(a4, 0.001) )
-    a4 = 0.0;
-  XAnimSetGoalWeight_m((XAnimTree *)a2, a1, a4, *(float *)&a5);
-  v13 = XAnimSetAnimInternal_m(v9, a4, *(float *)&a5, a6, 0, a7, a8);
-  cand_XAnimSeedParentChain(v9, a5);
-  XAnimReseedTiming_m(v9, a9);
+  xanim_currentTree = (int)treePtr;
+  if ( weight < 0.001f )
+    weight = 0.0f;
+
+  XAnimSetGoalWeight_m( tree, node, weight, blendTime );
+  result = XAnimSetAnimInternal_m( node, weight, blendTime, rate, 0,
+                                   notifyName, notifyType );
+  cand_XAnimSeedParentChain( node, blendTime );
+  XAnimReseedTiming_m( node, animFlags );
   if ( xanim_activePoolSlot )
-    XAnimUpdateNotifyIndex_m(v9);
-  if ( !v9 )
-    return 1;
-  while ( 1 )
+    XAnimUpdateNotifyIndex_m( node );
+  cur = node;
+  while ( cur )
   {
-    v9 = *(unsigned __int16 *)(*a2 + 8 * v9 + 10);
-    if ( v9 == a3 )
-      return v13;
-    XAnimSetGoalWeight_m((XAnimTree *)a2, v9, 1.0f, *(float *)&a5);
-    XAnimSetAnimInternal_m(v9, 1.0f, *(float *)&a5, 1.0f, 0, 0, 0);
-    XAnimReseedTiming_m(v9, a9);
-    if ( !xanim_activePoolSlot )
-      goto LABEL_15;
-    v10 = (float *)((char *)&xanim_pool + 68 * *(unsigned __int16 *)(xanim_currentTree + 2 * v9 + 8));
-    if ( !*((_WORD *)v10 + 2) )
-      goto LABEL_15;
-    if ( *((_DWORD *)v10 + 10) == 1065353216 )
-    {
-      *((_WORD *)v10 + 1) = -1;
-    }
-    else
-    {
-      v11 = (_WORD *)(*(_DWORD *)xanim_currentTree + 8 * v9 + 8);
-      if ( !*v11 )
-        goto LABEL_14;
-      if ( *(_WORD *)v10 )
-      {
-        v11 = (_WORD *)(*(_DWORD *)xanim_currentTree + 8 * *(unsigned __int16 *)v10 + 8);
-LABEL_14:
-        *((_WORD *)v10 + 1) = XAnimGetNextNotifyTime((int)v11, (int)v10, v10[10]);
-      }
-    }
-LABEL_15:
-    if ( !v9 )
-      return 1;
+    cur = tree->sourceTree->entries[cur].parentIndex;
+    if ( cur == stopNode )
+      return result;
+
+    XAnimSetGoalWeight_m( tree, cur, 1.0f, blendTime );
+    XAnimSetAnimInternal_m( cur, 1.0f, blendTime, 1.0f, 0, 0, 0 );
+    XAnimReseedTiming_m( cur, animFlags );
+    if ( xanim_activePoolSlot )
+      XAnimUpdateNotifyIndex_m( cur );
   }
+  return 1;
 }
 
 /* ---- XAnimSetAnimLimited_m  0x00488BC0 ---- */
 extern int __cdecl XAnimSetAnimInternalLimited_m( __int16 a1, unsigned __int16 a2, int a3, int a4,
-                               float a5, int a6, float a7, int a8 );
+                               float a5, float a6, float a7, int a8 );
 
 /* ---- XAnimSetAnimLimited_m  0x00488BC0 ----  VERIFIED */
-int __cdecl XAnimSetAnimLimited_m(int a1, _DWORD *a2, float a3, int a4, float a5, __int16 a6, __int16 a7, int a8)
+int __cdecl XAnimSetAnimLimited_m( unsigned int *tree, int node, float weight,
+                                   float blendTime, float rate,
+                                   __int16 notifyName, __int16 notifyType,
+                                   int animFlags )
 {
-  if ( (a3 < 0.001) | __UNORDERED__(a3, 0.001) )
-    a3 = 0.0;
-  XAnimSetGoalWeight_m((XAnimTree *)a2, a1, a3, *(float *)&a4);
-  return XAnimSetAnimInternalLimited_m(a7, a6, (int)a2, a1, a3, a4, a5, a8);
+  if ( weight < 0.001f )
+    weight = 0.0f;
+  XAnimSetGoalWeight_m( (XAnimTree *)tree, node, weight, blendTime );
+  return XAnimSetAnimInternalLimited_m( notifyType, notifyName, (int)tree, node,
+                                        weight, blendTime, rate, animFlags );
 }
 
 /* ---- XAnimClearAnimChildren_m  0x00488C20 ----  VERIFIED */
-void __cdecl XAnimClearAnimChildren_m(_DWORD *a1, int v2, float a2)
+void __cdecl XAnimClearAnimChildren_m( unsigned int *treePtr, int node, float blendTime )
 {
-  int v3;
-  _WORD *v4;
-  int v5;
+  XAnimTree  *tree = (XAnimTree *)treePtr;
+  XAnimEntry *entry;
+  int         childCount;
+  int         i;
 
-  if ( (a2 < 0.001) | __UNORDERED__(a2, 0.001) )
-    a2 = 0.0;
-  v3 = *(unsigned __int16 *)(*a1 + 8 * v2 + 8);
-  v4 = (_WORD *)(*a1 + 8 * v2 + 8);
-  v5 = 0;
-  if ( *v4 )
-  {
-    do
-    {
-      XAnimClearAnimNode_m(a1, v5 + (unsigned __int16)v4[3], a2);
-      ++v5;
-    }
-    while ( v5 < v3 );
-  }
+  if ( blendTime < 0.001f )
+    blendTime = 0.0f;
+
+  entry      = &tree->sourceTree->entries[node];
+  childCount = entry->childCount;
+  for ( i = 0; i < childCount; ++i )
+    XAnimClearAnimNode_m( treePtr, entry->u.parent.firstChildIndex + i, blendTime );
 }
 
 /* ---- XAnimClearTree_r  0x00488C80 ----  VERIFIED */
-int __cdecl XAnimClearTree_r(_DWORD *a1, int a2)
+int __cdecl XAnimClearTree_r( unsigned int *treePtr, int node )
 {
-  int result;
-  unsigned __int16 v4;
-  int v5;
-  _WORD *v6;
-  int v7;
-  unsigned __int16 v8;
+  XAnimTree     *tree   = (XAnimTree *)treePtr;
+  unsigned short handle = tree->poolNodeHandles[node];
+  int            result = node;
 
-  result = a2;
-  v4 = *((_WORD *)a1 + a2 + 4);
-  v8 = v4;
-  if ( v4 )
+  if ( handle )
   {
-    v5 = *(unsigned __int16 *)(*a1 + 8 * a2 + 8);
-    v6 = (_WORD *)(*a1 + 8 * a2 + 8);
-    v7 = 0;
-    if ( *v6 )
-    {
-      do
-      {
-        XAnimClearTree_r(a1, v7 + (unsigned __int16)v6[3]);
-        ++v7;
-      }
-      while ( v7 < v5 );
-      v4 = v8;
-    }
-    result = XAnimFreeInfo(v4);
-    *((_WORD *)a1 + a2 + 4) = 0;
+    XAnimEntry *entry      = &tree->sourceTree->entries[node];
+    int         childCount = entry->childCount;
+    int         i;
+
+    for ( i = 0; i < childCount; ++i )
+      XAnimClearTree_r( treePtr, entry->u.parent.firstChildIndex + i );
+
+    result = XAnimFreeInfo( handle );
+    tree->poolNodeHandles[node] = 0;
   }
   return result;
 }
@@ -1130,15 +832,17 @@ void __cdecl XAnimClearTree( XAnimTree *tree )
     unsigned short *table;
     int             nodeCount;
     int             tableIndex;
+    int             size;
     int             i;
 
-    XAnimClearTree_r( (_DWORD *)tree, 0 );
+    XAnimClearTree_r( (unsigned int *)tree, 0 );
 
     nodeCount = tree->sourceTree->nodeCount;
     table     = (unsigned short *)( (char *)tree + 8 + 2 * nodeCount );
+    size      = 3 * nodeCount + 1;
 
     for ( tableIndex = 0; tableIndex < 2; ++tableIndex ) {
-        for ( i = nodeCount - 1; i >= 0; --i ) {
+        for ( i = tree->sourceTree->nodeCount - 1; i >= 0; --i ) {
             unsigned short handle = table[i];
 
             if ( handle ) {
@@ -1153,115 +857,77 @@ void __cdecl XAnimClearTree( XAnimTree *tree )
                 table[i] = 0;
             }
         }
-        table = (unsigned short *)( (char *)table + 3 * nodeCount + 1 );
+        /* loop-invariant: retail hoists (3n+1)+(2n+8)+tree to a stack slot */
+        table = (unsigned short *)( (char *)&tree->poolNodeHandles[nodeCount] + size );
     }
 }
-#if 0
-// XAnimClearTree: tears a runtime tree down completely: pool nodes (XAnimClearTree_r) plus the two interned part-remap tables (second table at tree+8+2n+(3n+1)).
-int __cdecl XAnimClearTree(_DWORD *a1)
-{
-  int v1;
-  char *v2;
-  int i;
-  unsigned __int16 v4;
-  int v5;
-  int result;
-  int v7;
-  char *v8;
-
-  XAnimClearTree_r(a1, 0);
-  v1 = *(_DWORD *)(*a1 + 4);
-  v2 = (char *)a1 + 2 * v1 + 8;
-  v8 = (char *)a1 + 3 * v1 + 2 * v1 + 9;
-  v7 = 2;
-  do
-  {
-    for ( i = *(_DWORD *)(*a1 + 4) - 1; i >= 0; --i )
-    {
-      v4 = *(_WORD *)&v2[2 * i];
-      if ( v4 )
-      {
-        v5 = GetRefString_var + 8 * v4;
-        if ( *(_WORD *)v5 )
-          --*(_WORD *)v5;
-        else
-          SL_FreeString(v4, (char *)(v5 + 4), **(__int16 **)(*(_DWORD *)(*(_DWORD *)(*a1 + 8 * i + 12) + 4) + 12) + 16);
-        *(_WORD *)&v2[2 * i] = 0;
-      }
-    }
-    v2 = v8;
-    result = --v7;
-  }
-  while ( v7 );
-  return result;
-}
-#endif
 
 /* ---- cand_XAnimClearSecondaryTiming  0x00488DA0 ----  [HIGH] */
-int __cdecl cand_XAnimClearSecondaryTiming(int result)
+int __cdecl cand_XAnimClearSecondaryTiming( int info )
 {
-  *(_DWORD *)(result + 40) = 0;
-  *(_WORD *)(result + 48) = 0;
-  *(_DWORD *)(result + 44) = 0;
-  *(_WORD *)(result + 50) = 0;
-  return result;
+  XAnimState *state = &( (XAnimInfo *)info )->states[1];
+
+  state->time          = 0.0f;
+  state->cycleCount    = 0;
+  state->oldTime       = 0.0f;
+  state->oldCycleCount = 0;
+  return info;
 }
 
 /* ---- cand_XAnimClearPrimaryTiming  0x00488DC0 ----  VERIFIED */
-int __cdecl cand_XAnimClearPrimaryTiming(int result)
+int __cdecl cand_XAnimClearPrimaryTiming( int info )
 {
-  *(_DWORD *)(result + 12) = 0;
-  *(_WORD *)(result + 20) = 0;
-  *(_DWORD *)(result + 16) = 0;
-  *(_WORD *)(result + 22) = 0;
-  return result;
+  XAnimState *state = &( (XAnimInfo *)info )->states[0];
+
+  state->time          = 0.0f;
+  state->cycleCount    = 0;
+  state->oldTime       = 0.0f;
+  state->oldCycleCount = 0;
+  return info;
 }
 
 /* ---- cand_XAnimFindHeaviestLeaf  0x00488DE0 ----  VERIFIED */
-int __cdecl cand_XAnimFindHeaviestLeaf(int a1)
+int __cdecl cand_XAnimFindHeaviestLeaf( int node )
 {
-  int result;
-  unsigned __int16 *v2;
-  int v3;
-  int v4;
-  int v5;
-  unsigned __int16 *v6;
-  int v7;
-  int v8;
-  float v9;
-  int v10;
-  float v11;
+  XAnimEntry *entry;
+  int         childCount;
+  int         best;
+  int         leaf;
+  int         i;
+  float       bestWeight;
+  float       weight;
 
-  result = a1;
-  v2 = (unsigned __int16 *)(*(_DWORD *)xanim_currentTree + 8 * a1 + 8);
-  v3 = 0;
-  if ( *v2 )
+  entry      = &((XAnimTree *)xanim_currentTree)->sourceTree->entries[node];
+  if ( !entry->childCount )
+    return node;
+
+  bestWeight = 0.0f;
+  best       = 0;
+  childCount = entry->childCount;
+  for ( i = 0; i < childCount; ++i )
   {
-    v11 = 0.0;
-    v8 = 0;
-    v10 = *v2;
-    v4 = v2[3];
-    v5 = 28 * xanim_activePoolSlot;
-    v6 = (unsigned __int16 *)(xanim_currentTree + 2 * v4 + 8);
-    do
+    weight = XANIM_LANE( ((XAnimTree *)xanim_currentTree)->poolNodeHandles[entry->u.parent.firstChildIndex + i] ).targetWeight;
+    /* 0x488E41 test ah,41h / jnp: a NaN weight also recurses */
+    if ( !( weight <= bestWeight ) )
     {
-      v9 = *(float *)(68 * *v6 + v5 + 10987068);
-      if ( v9 > (double)v11 )
+      leaf = cand_XAnimFindHeaviestLeaf( entry->u.parent.firstChildIndex + i );
+      if ( leaf )
       {
-        v7 = cand_XAnimFindHeaviestLeaf(v4 + v3);
-        if ( v7 )
-        {
-          v11 = v9;
-          v8 = v7;
-        }
+        bestWeight = weight;
+        best       = leaf;
       }
-      ++v3;
-      ++v6;
     }
-    while ( v3 < v10 );
-    return v8;
   }
-  return result;
+  return best;
+}
+
+/* sign mask through an int temp: retail's fstp / mov eax / and / mov on one slot */
+static __inline float XAnimFabs( float f )
+{
+    int tmp = *(int *)&f;
+
+    tmp &= 0x7FFFFFFF;
+    return *(float *)&tmp;
 }
 
 /* ---- XAnimSetAnimInternal_m  0x00488E80 ----  VERIFIED */
@@ -1269,30 +935,28 @@ int __cdecl XAnimSetAnimInternal_m( int nodeIndex, float weight, float blendTime
                         float rate, char force, unsigned __int16 notifyName,
                         __int16 notifyType )
 {
-    XAnimTree      *tree = (XAnimTree *)xanim_currentTree;
     XAnimInfo      *node;
-    XAnimState     *lane;
     unsigned short  handle;
     float           weightDelta;
-    float           blendRemaining;
+    rfloat          blendRemaining; /* x87 stack in retail (_PC_53) */
     int             slot;
 
-    handle = tree->poolNodeHandles[nodeIndex];
-    if ( handle ) {
-        node = &xanim_pool[handle];
-        if ( xanim_activePoolSlot && node->notifyName ) {
-            SL_RemoveRefToString( node->notifyName );
-        }
-    } else {
+    handle = ((XAnimTree *)xanim_currentTree)->poolNodeHandles[nodeIndex];
+    if ( !handle ) {
         if ( weight == 0.0f && !force ) {
             return 0;
         }
-        node = XAnimAllocInfo( tree, nodeIndex );
+        node = XAnimAllocInfo( (XAnimTree *)xanim_currentTree, nodeIndex );
         Com_Memset( node->states, 0, 2 * sizeof( XAnimState ) );
         node->notifyName       = 0;
         node->notifyIndex      = -1;
         node->notifyChildIndex = 0;
         node->notifyType       = 0;
+    } else {
+        node = &xanim_pool[handle];
+        if ( xanim_activePoolSlot && node->notifyName ) {
+            SL_RemoveRefToString( node->notifyName );
+        }
     }
 
     if ( nodeIndex == 0 ) {
@@ -1302,31 +966,33 @@ int __cdecl XAnimSetAnimInternal_m( int nodeIndex, float weight, float blendTime
     }
 
     slot = xanim_activePoolSlot;
-    lane = &node->states[slot];
 
-    weightDelta = weight - lane->currentWeight;
-    *(int *)&weightDelta &= 0x7FFFFFFF;
+    node->states[slot].targetWeight             = weight;
+    weightDelta = weight - node->states[slot].currentWeight;
+    weightDelta = XAnimFabs( weightDelta );
 
-    lane->targetWeight             = weight;
-    blendRemaining                 = weightDelta * blendTime;
-    lane->weightBlendTimeRemaining = blendRemaining;
+    /* 0x00488F59 fmul / fst / fcomp: the field gets the float, the test
+     * against 0.001f sees the unrounded product. */
+    blendRemaining                              = (rfloat)weightDelta * blendTime;
+    node->states[slot].weightBlendTimeRemaining = (float)blendRemaining;
 
     if ( blendRemaining < 0.001f ) {
-        lane->weightBlendTimeRemaining = 0.0f;
-        lane->currentWeight            = weight;
-    } else if ( lane->currentWeight == 0.0f ) {
-        lane->currentWeight = weight * 0.001f;
+        node->states[slot].weightBlendTimeRemaining = 0.0f;
+        node->states[slot].currentWeight            = weight;
+    } else if ( node->states[slot].currentWeight == 0.0f ) {
+        node->states[slot].currentWeight = weight * 0.001f;
     }
-    lane->rateScale = rate;
+    node->states[slot].rateScale = rate;
 
     if ( slot ) {
-        XAnimEntry *entry = &tree->sourceTree->entries[nodeIndex];
+        XAnimEntry *entry;
 
         node->notifyName = notifyName;
         if ( notifyName ) {
             SL_AddRefToString( notifyName );
         }
         node->notifyIndex = -1;
+        entry = &((XAnimTree *)xanim_currentTree)->sourceTree->entries[nodeIndex];
 
         if ( !notifyName || entry->childCount == 0
           || ( entry->u.parent.flags & 3 ) == 0 ) {
@@ -1343,686 +1009,329 @@ int __cdecl XAnimSetAnimInternal_m( int nodeIndex, float weight, float blendTime
     }
     return 0;
 }
-#if 0
-// XAnimSetAnimInternal_m: installs weight, blend time, rate and notify name on one node, allocating its pool node on demand.  Common worker of every XAnimSetAnim* path.
-int __cdecl XAnimSetAnimInternal_m(int a1, float a2, float a3, float a4, char a5, unsigned __int16 a6, __int16 a7)
-{
-  unsigned __int16 v7;
-  char *v8;
-  unsigned __int16 v9;
-  double v10;
-  int v11;
-  float *v12;
-  double v13;
-  _DWORD *v14;
-  int v15;
-  __int16 v16;
-  float v18;
-
-  v7 = *(_WORD *)(xanim_currentTree + 2 * a1 + 8);
-  if ( v7 )
-  {
-    v8 = (char *)&xanim_pool + 68 * v7;
-    if ( xanim_activePoolSlot )
-    {
-      v9 = *((_WORD *)v8 + 2);
-      if ( v9 )
-        SL_RemoveRefToString(v9);
-    }
-  }
-  else
-  {
-    if ( (a2 == 0.0) | __UNORDERED__(a2, 0.0) && !a5 )
-      return 0;
-    v8 = XAnimAllocInfo(xanim_currentTree, a1);
-    Com_Memset((int *)v8 + 3, 0, 56);
-    *((_WORD *)v8 + 2) = 0;
-    *((_WORD *)v8 + 1) = -1;
-    *(_WORD *)v8 = 0;
-    *((_WORD *)v8 + 3) = 0;
-  }
-  if ( a1 )
-  {
-    v10 = a4;
-  }
-  else
-  {
-    v10 = 1.0;
-    a2 = 1.0;
-    a3 = 0.0;
-  }
-  v11 = xanim_activePoolSlot;
-  v18 = a2 - *(float *)&v8[28 * xanim_activePoolSlot + 32];
-  v12 = (float *)&v8[28 * xanim_activePoolSlot];
-  v12[7] = a2;
-  v13 = COERCE_FLOAT(LODWORD(v18) & 0x7FFFFFFF) * a3;
-  v12[6] = v13;
-  if ( (v13 < 0.001) | __UNORDERED__(v13, 0.001) )
-  {
-    v12[6] = 0.0;
-    v12[8] = a2;
-  }
-  else if ( (v12[8] == 0.0) | __UNORDERED__(v12[8], 0.0) )
-  {
-    v12[8] = a2 * 0.001;
-  }
-  v12[9] = v10;
-  if ( v11 )
-  {
-    *((_WORD *)v8 + 2) = a6;
-    if ( a6 )
-      ++*(_WORD *)(GetRefString_var + 8 * a6);
-    v14 = (_DWORD *)xanim_currentTree;
-    *((_WORD *)v8 + 1) = -1;
-    v15 = *v14 + 8 * a1 + 8;
-    if ( !a6 || !*(_WORD *)v15 || (*(_BYTE *)(v15 + 4) & 3) == 0 )
-    {
-      *(_WORD *)v8 = 0;
-      return 0;
-    }
-    v16 = cand_XAnimFindHeaviestLeaf(a1);
-    *(_WORD *)v8 = v16;
-    if ( !v16 )
-      return 2;
-  }
-  else
-  {
-    *((_WORD *)v8 + 3) = a7;
-  }
-  return 0;
-}
-#endif
 
 /* ---- XAnimSetRate_m  0x00489010 ----  VERIFIED */
-int __cdecl XAnimSetRate_m(int nodeIndex, float rate)
+void __cdecl XAnimSetRate_m(int nodeIndex, float rate)
 {
     XAnimTree     *tree = (XAnimTree *)xanim_currentTree;
     unsigned short handle = tree->poolNodeHandles[nodeIndex];
 
     XANIM_LANE( handle ).rateScale = rate;
-    return 28 * xanim_activePoolSlot;
 }
-#if 0
-// XAnimSetRate_m: sets a node's playback rate scale (XAnimState.rateScale at +0x18 of the active lane).
-int __cdecl XAnimSetRate_m(int nodeIndex, float rate)
-{
-  int result;
 
-  result = 28 * xanim_activePoolSlot;
-  *((float *)&unk_A7A644 + 17 * *(unsigned __int16 *)(xanim_currentTree + 2 * nodeIndex + 8) + 7 * xanim_activePoolSlot) = rate;
-  return result;
-}
-#endif
+/*
+ * Sync-node validation walks the source tree.  parent.flags bits 0/1 mark a
+ * subtree that must play in sync (bit set for "first child" vs the rest); bit 2
+ * marks it already checked.  The isFirst argument is a 0/1 flag -- the retail
+ * decompile smuggles it in a register's low byte, but only that byte is used.
+ */
 
 /* ---- XAnimSetupSyncNodes_r  0x00489040 ----  VERIFIED */
-char __cdecl XAnimSetupSyncNodes_r(_DWORD *a1, int a2, int a3)
+void __cdecl XAnimSetupSyncNodes_r( unsigned int *treePtr, int node, unsigned char isFirst )
 {
-  int v3;
-  _DWORD *v4;
-  _DWORD *v5;
-  __int16 v6;
-  int v7;
-  int v8;
+  XAnim *source=(XAnim *)treePtr;
+  XAnimEntry *entry=&source->entries[node];
+  int childCount=entry->childCount;
+  int syncFlag;
+  int i;
+  char result;
+  if ( !childCount ) {
+    const int *leafAsset=(const int *)entry->u.leafAsset;
+    if ( *(const unsigned char *)(leafAsset[1]+2) != (unsigned char)isFirst ) {
+      if ( (unsigned char)isFirst ) {
+        Com_Error(ERR_DROP,xmodel_errAnimSyncLoopingAndNonlooping,leafAsset[0],source->name);
+        return;
+      }
+      Com_Error(ERR_DROP,xmodel_errAnimSyncNonloopingAndLooping,leafAsset[0],source->name);
+    }
+    return;
+  }
+  if ( entry->u.parent.flags & 3 ) {
 
-  v3 = LOWORD(a1[2 * a2 + 2]);
-  v4 = &a1[2 * a2 + 2];
-  if ( *(_WORD *)v4 )
-  {
-    if ( (a1[2 * a2 + 3] & 3) != 0 )
-    {
-      v7 = 0;
-      do
-      {
-        v4 = &a1[2 * *((unsigned __int16 *)v4 + 3) + 2];
-        ++v7;
-      }
-      while ( *(_WORD *)v4 );
-      Com_Error(ERR_DROP, &byte_55A418, *a1, v7, *(_DWORD *)v4[1]);
-    }
-    v8 = 0;
-    v6 = ((_BYTE)a3 == 0) + 1;
-    LOWORD(a1[2 * a2 + 3]) |= v6;
-    if ( v3 > 0 )
-    {
-      do
-      {
-        LOBYTE(v6) = XAnimSetupSyncNodes_r(a1, v8 + HIWORD(a1[2 * a2 + 3]), a3);
-        ++v8;
-      }
-      while ( v8 < v3 );
-    }
+    int depth=0;
+    do {
+      entry=&source->entries[entry->u.parent.firstChildIndex];
+      ++depth;
+    } while ( entry->childCount );
+    Com_Error(ERR_DROP,xmodel_errDuplicateSyncSpec,source->name,depth,*(const int *)entry->u.leafAsset);
   }
-  else
-  {
-    v5 = (_DWORD *)a1[2 * a2 + 3];
-    LOBYTE(v6) = a3;
-    if ( *(_BYTE *)(v5[1] + 2) != (_BYTE)a3 )
-    {
-      if ( (_BYTE)a3 )
-        Com_Error(ERR_DROP, &byte_55A4A0, *v5, *a1);
-      Com_Error(ERR_DROP, &byte_55A460, *v5, *a1);
-    }
-  }
-  return v6;
+  syncFlag=((unsigned char)isFirst == 0)+1;
+  entry->u.parent.flags |= (unsigned short)syncFlag;
+  for(i=0;i<childCount;++i)
+    XAnimSetupSyncNodes_r(treePtr,entry->u.parent.firstChildIndex+i,isFirst);
+  return;
 }
 
 /* ---- XAnimCheckSyncNodes_r  0x00489110 ----  VERIFIED */
-void __cdecl XAnimCheckSyncNodes_r(_DWORD *a1, int a2)
+void __cdecl XAnimCheckSyncNodes_r( unsigned int *treePtr, int node )
 {
-  _DWORD *v2;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
+  XAnim        *source = (XAnim *)treePtr;
+  int           childCount;
+  int           syncFlags;
+  unsigned char isLooping;
+  int           i;
 
-  v2 = a1;
-  v3 = LOWORD(a1[2 * a2 + 2]);
-  if ( LOWORD(a1[2 * a2 + 2]) )
+  childCount = source->entries[node].childCount;
+  if ( !childCount )
+    return;
+
+  syncFlags = source->entries[node].u.parent.flags & 3;
+  if ( syncFlags )
   {
-    v4 = a1[2 * a2 + 3] & 3;
-    if ( (a1[2 * a2 + 3] & 3) != 0 )
-    {
-      if ( v4 == 3 )
-        Com_Error(ERR_DROP, &byte_55A3E0);
-      LOBYTE(a1[2 * a2 + 3]) |= 4u;
-      v5 = 0;
-      for ( LOBYTE(a1) = v4 == 1; v5 < v3; ++v5 )
-        XAnimSetupSyncNodes_r(v2, v5 + HIWORD(v2[2 * a2 + 3]), (int)a1);
-    }
-    else
-    {
-      v6 = 0;
-      if ( LOWORD(a1[2 * a2 + 2]) )
-      {
-        do
-        {
-          XAnimCheckSyncNodes_r(a1, v6 + HIWORD(a1[2 * a2 + 3]));
-          ++v6;
-        }
-        while ( v6 < v3 );
-      }
-    }
+    if ( syncFlags == 3 )
+      Com_Error( ERR_DROP, xmodel_errSyncLoopingAndSyncNonlooping );
+    source->entries[node].u.parent.flags |= 4;
+    isLooping = syncFlags == 1;
+    for ( i = 0; i < childCount; ++i )
+      XAnimSetupSyncNodes_r( treePtr, source->entries[node].u.parent.firstChildIndex + i, isLooping );
+  }
+  else
+  {
+    for ( i = 0; i < childCount; ++i )
+      XAnimCheckSyncNodes_r( treePtr, source->entries[node].u.parent.firstChildIndex + i );
   }
 }
 
 /* ---- XAnimSetupSyncNodes  0x004891B0 ----  [HIGH] */
-void __cdecl XAnimSetupSyncNodes(_DWORD *a1)
+void __cdecl XAnimSetupSyncNodes(unsigned int *a1)
 {
   XAnimCheckSyncNodes_r(a1, 0);
 }
 
 /* ---- XAnimIsPrimitive  0x004891E0 ----  [HIGH] */
-BOOL __fastcall XAnimIsPrimitive(int a1, int a2)
+int __cdecl XAnimIsPrimitive( XAnim *anims, int animIndex )
 {
-  return *(_WORD *)(a2 + 8 * a1 + 8) == 0;
+  return anims->entries[animIndex].childCount == 0;
 }
 
 /* ---- XAnimSetTime_m  0x004891F0 ----  VERIFIED */
-__int16 __cdecl XAnimSetTime_m( int node, XAnimTree *tree, int timeBits )
+void __cdecl XAnimSetTime_m( XAnimTree *tree, int node, float time )
 {
     unsigned short handle = tree->poolNodeHandles[node];
 
     if ( handle ) {
         XAnimState *lane = &XANIM_LANE( handle );
 
-        *(int *)&lane->time    = timeBits;
-        lane->cycleCount       = 0;
-        *(int *)&lane->oldTime = timeBits;
-        lane->oldCycleCount    = 0;
+        lane->time          = time;
+        lane->cycleCount    = 0;
+        lane->oldTime       = time;
+        lane->oldCycleCount = 0;
     }
-    return (__int16)handle;
 }
-#if 0
-// XAnimSetTime_m: hard-sets a node's animation time (writes XAnimState time/oldTime and zeroes both cycle counts).  Cgame trap 145.
-__int16 __cdecl XAnimSetTime_m(int *a1, int a2, int a3)
-{
-  LOWORD(a1) = *(_WORD *)(a2 + 2 * (_DWORD)a1 + 8);
-  if ( (_WORD)a1 )
-  {
-    a1 = &dword_A7A62C[17 * (unsigned __int16)a1 + 7 * xanim_activePoolSlot];
-    *a1 = a3;
-    *((_WORD *)a1 + 4) = 0;
-    a1[1] = a3;
-    *((_WORD *)a1 + 5) = 0;
-  }
-  return (__int16)a1;
-}
-#endif
 
 /* ---- cand_XAnimCopyTiming  0x00489230 ----  VERIFIED */
-int __fastcall cand_XAnimCopyTiming(int a1, int a2)
+int __cdecl cand_XAnimCopyTiming( int srcInfo, int dstInfo )
 {
-  int result;
+  int        slot = xanim_activePoolSlot;
+  XAnimInfo *dst  = (XAnimInfo *)dstInfo;
+  XAnimInfo *src  = (XAnimInfo *)srcInfo;
 
-  result = 28 * xanim_activePoolSlot;
-  *(_DWORD *)(result + a1 + 12) = *(_DWORD *)(28 * xanim_activePoolSlot + a2 + 12);
-  *(_WORD *)(result + a1 + 20) = *(_WORD *)(result + a2 + 20);
-  *(_DWORD *)(result + a1 + 16) = *(_DWORD *)(result + a2 + 16);
-  *(_WORD *)(result + a1 + 22) = *(_WORD *)(result + a2 + 22);
-  return result;
+  dst->states[slot].time          = src->states[slot].time;
+  dst->states[slot].cycleCount    = src->states[slot].cycleCount;
+  dst->states[slot].oldTime       = src->states[slot].oldTime;
+  dst->states[slot].oldCycleCount = src->states[slot].oldCycleCount;
+  return 28 * slot;   /* leftover EAX (callers discard) */
 }
 
 /* ---- XAnimSetUser  0x00489260 ----  [CONFIRMED] */
-int __cdecl XAnimSetUser(int result)
+int __cdecl XAnimSetUser(int slot)
 {
-  xanim_activePoolSlot = result;
-  return result;
+  xanim_activePoolSlot = slot;
+  return slot;
 }
 
 /* ---- XAnimUpdateNotifyIndex_m  0x00489270 ----  VERIFIED */
-int __cdecl XAnimUpdateNotifyIndex_m( int node )
+void __cdecl XAnimUpdateNotifyIndex_m( int node )
 {
-    XAnimTree  *tree = (XAnimTree *)xanim_currentTree;
-    XAnimInfo  *info = &xanim_pool[tree->poolNodeHandles[node]];
+    XAnimInfo  *info = &xanim_pool[((XAnimTree *)xanim_currentTree)->poolNodeHandles[node]];
     XAnimEntry *entry;
 
     if ( !info->notifyName ) {
-        return (__int16)node;
+        return;
     }
 
     if ( *(const int *)&info->states[1].time == 1065353216 ) {
         info->notifyIndex = -1;
-        return (__int16)node;
+        return;
     }
 
-    entry = &tree->sourceTree->entries[node];
+    entry = &((XAnimTree *)xanim_currentTree)->sourceTree->entries[node];
     if ( entry->childCount != 0 ) {
         if ( !info->notifyChildIndex ) {
-            return (__int16)info->notifyChildIndex;
+            return;
         }
-        entry = &tree->sourceTree->entries[info->notifyChildIndex];
+        entry = &((XAnimTree *)xanim_currentTree)->sourceTree->entries[info->notifyChildIndex];
     }
 
     info->notifyIndex = (short)XAnimGetNextNotifyTime( (int)entry, (int)info,
                                            info->states[1].time );
-    return info->notifyIndex;
 }
-#if 0
-// XAnimUpdateNotifyIndex_m: recomputes which notetrack a node will hit next (XAnimInfo.notifyIndex at +0x02).
-__int16 __cdecl XAnimUpdateNotifyIndex_m(int a1)
-{
-  float *v1;
-  bool v2; // zf
-  int v3;
-
-  v1 = (float *)((char *)&xanim_pool + 68 * *(unsigned __int16 *)(xanim_currentTree + 2 * a1 + 8));
-  if ( *((_WORD *)v1 + 2) )
-  {
-    if ( *((_DWORD *)v1 + 10) != 1065353216 )
-    {
-      v2 = *(_WORD *)(*(_DWORD *)xanim_currentTree + 8 * a1 + 8) == 0;
-      v3 = *(_DWORD *)xanim_currentTree + 8 * a1 + 8;
-      if ( !v2 )
-      {
-        LOWORD(a1) = *(_WORD *)v1;
-        if ( !*(_WORD *)v1 )
-          return a1;
-        v3 = *(_DWORD *)xanim_currentTree + 8 * (unsigned __int16)a1 + 8;
-      }
-      LOWORD(a1) = XAnimGetNextNotifyTime(v3, (int)v1, v1[10]);
-      *((_WORD *)v1 + 1) = a1;
-      return a1;
-    }
-    *((_WORD *)v1 + 1) = -1;
-  }
-  return a1;
-}
-#endif
 
 /* ---- XAnimPushTimingToSubtree_m  0x004892D0 ----  VERIFIED */
-int __cdecl XAnimPushTimingToSubtree_m(int a1, int a2)
+void __cdecl XAnimPushTimingToSubtree_m( int node, int srcInfo )
 {
-  int result;
-  unsigned __int16 *v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  char *v8;
-  bool v9;
-  int v10;
+  XAnimTree  *tree       = (XAnimTree *)xanim_currentTree;
+  XAnimEntry *entry      = &tree->sourceTree->entries[node];
+  int         childCount = entry->childCount;
+  int         i;
 
-  result = xanim_currentTree;
-  v3 = (unsigned __int16 *)(*(_DWORD *)xanim_currentTree + 8 * a1 + 8);
-  v4 = 0;
-  v10 = 0;
-  if ( *v3 )
+  for ( i = 0; i < entry->childCount; ++i )
   {
-    do
+    int            child  = entry->u.parent.firstChildIndex + i;
+    unsigned short handle = ((XAnimTree *)xanim_currentTree)->poolNodeHandles[child];
+
+    if ( handle )
     {
-      HIWORD(result) = HIWORD(xanim_currentTree);
-      v5 = v4 + v3[3];
-      LOWORD(result) = *(_WORD *)(xanim_currentTree + 2 * v5 + 8);
-      if ( (_WORD)result )
-      {
-        v6 = (unsigned __int16)result;
-        v7 = 28 * xanim_activePoolSlot;
-        v8 = (char *)&xanim_pool + 68 * v6;
-        v9 = xanim_activePoolSlot == 0;
-        *(_DWORD *)&v8[v7 + 12] = *(_DWORD *)(28 * xanim_activePoolSlot + a2 + 12);
-        *(_WORD *)&v8[v7 + 20] = *(_WORD *)(v7 + a2 + 20);
-        *(_DWORD *)&v8[v7 + 16] = *(_DWORD *)(v7 + a2 + 16);
-        *(_WORD *)&v8[v7 + 22] = *(_WORD *)(v7 + a2 + 22);
-        if ( !v9 )
-          XAnimUpdateNotifyIndex_m(v5);
-        result = XAnimPushTimingToSubtree_m(v5, a2);
-        v4 = v10;
-      }
-      v10 = ++v4;
+      int         slot = xanim_activePoolSlot;
+      XAnimInfo *dst=&xanim_pool[handle];
+      XAnimInfo *src=(XAnimInfo *)srcInfo;
+
+      dst->states[slot].time          = src->states[slot].time;
+      dst->states[slot].cycleCount    = src->states[slot].cycleCount;
+      dst->states[slot].oldTime       = src->states[slot].oldTime;
+      dst->states[slot].oldCycleCount = src->states[slot].oldCycleCount;
+
+      if ( slot )
+        XAnimUpdateNotifyIndex_m( child );
+      XAnimPushTimingToSubtree_m( child, srcInfo );
     }
-    while ( v4 < *v3 );
   }
-  return result;
+
 }
 
 /* ---- XAnimReseedTiming_m  0x00489370 ----  VERIFIED */
+/* Mac 1.3 XAnimUpdateSyncTime: walk up from nodeIndex to the nearest parent with
+   flag 4; re-seed its timing, push it down its subtree, then copy it back up the
+   chain below it.  The clear/copy helpers and the notify update inline here. */
 void __cdecl XAnimReseedTiming_m( int nodeIndex, int forceClear )
 {
-    XAnimTree *tree = (XAnimTree *)xanim_currentTree;
-    XAnim     *source;
-    XAnimInfo *poolNode = 0;
-    XAnimState *state;
-    int        walk;
-    int        cur;
-    int        found = 0;
+    XAnimTree  *tree = (XAnimTree *)xanim_currentTree;
+    int         walk = nodeIndex;
+    XAnimInfo  *info;
+    XAnimEntry *entry;
 
-    if ( nodeIndex != 0 ) {
-        source = tree->sourceTree;
-        walk   = nodeIndex;
-
-        for ( ;; ) {
-            XAnimEntry *entry = &source->entries[walk];
-
-            poolNode = &xanim_pool[ tree->poolNodeHandles[walk] ];
-
-            if ( entry->childCount != 0 && ( entry->u.parent.flags & 4 ) != 0 ) {
-                found = 1;
-                break;
-            }
-            if ( entry->parentIndex == 0 ) {
-                break;
-            }
-            walk = entry->parentIndex;
+    while ( walk ) {
+        entry = &tree->sourceTree->entries[walk];
+        info  = &xanim_pool[tree->poolNodeHandles[walk]];
+        if ( entry->childCount && ( entry->u.parent.flags & 4 ) ) {
+            goto found;
         }
+        walk = entry->parentIndex;
     }
 
-    if ( !found ) {
-        source = tree->sourceTree;
-        if ( source->entries[nodeIndex].childCount != 0 ) {
-            return;
+    if ( !tree->sourceTree->entries[nodeIndex].childCount ) {
+        if ( forceClear
+          || !XAnimParentChainHasWeight_m( nodeIndex, tree )
+          || !XAnimSubtreeHasWeight_m( tree, nodeIndex ) ) {
+            if ( !xanim_activePoolSlot ) {
+                cand_XAnimClearPrimaryTiming( (int)&xanim_pool[tree->poolNodeHandles[nodeIndex]] );
+            } else {
+                cand_XAnimClearSecondaryTiming( (int)&xanim_pool[tree->poolNodeHandles[nodeIndex]] );
+            }
         }
-        if ( forceClear == 0
-          && XAnimParentChainHasWeight_m( nodeIndex, tree )
-          && XAnimSubtreeHasWeight_m( tree, nodeIndex ) ) {
-            return;
-        }
-
-        state = &XANIM_LANE( tree->poolNodeHandles[nodeIndex] );
-        state->time          = 0.0f;
-        state->cycleCount    = 0;
-        state->oldTime       = 0.0f;
-        state->oldCycleCount = 0;
-        return;
     }
+    return;
 
-    if ( forceClear != 0
+found:
+    if ( forceClear
       || !XAnimParentChainHasWeight_m( walk, tree )
       || !XAnimSubtreeHasWeight_m( tree, walk ) ) {
-        state = &poolNode->states[xanim_activePoolSlot];
-        state->time          = 0.0f;
-        state->cycleCount    = 0;
-        state->oldTime       = 0.0f;
-        state->oldCycleCount = 0;
+        if ( !xanim_activePoolSlot ) {
+            cand_XAnimClearPrimaryTiming( (int)info );
+        } else {
+            cand_XAnimClearSecondaryTiming( (int)info );
+        }
     }
 
-    XAnimPushTimingToSubtree_m( nodeIndex, (int)poolNode );
+    XAnimPushTimingToSubtree_m( nodeIndex, (int)info );
 
     if ( nodeIndex == walk ) {
         return;
     }
+    do {
+        XAnimInfo *dst;
 
-    {
-        const XAnimState *src = &poolNode->states[xanim_activePoolSlot];
-        const float          *srcTime          = &src->time;
-        const unsigned short *srcCycleCount    = &src->cycleCount;
-        const float          *srcOldTime       = &src->oldTime;
-        const unsigned short *srcOldCycleCount = &src->oldCycleCount;
-
-        cur = nodeIndex;
-        do {
-            XAnimInfo *node = &xanim_pool[ tree->poolNodeHandles[cur] ];
-
-            state = &node->states[xanim_activePoolSlot];
-            state->time          = *srcTime;
-            state->cycleCount    = *srcCycleCount;
-            state->oldTime       = *srcOldTime;
-            state->oldCycleCount = *srcOldCycleCount;
-
-            if ( xanim_activePoolSlot && node->notifyName != 0 ) {
-                if ( *(const int *)&node->states[1].time == 1065353216 ) {
-                    node->notifyIndex = -1;
+        cand_XAnimCopyTiming( (int)info, (int)&xanim_pool[tree->poolNodeHandles[nodeIndex]] );
+        if ( xanim_activePoolSlot ) {
+            /* XAnimUpdateNotifyIndex_m( nodeIndex ) written out: retail inlines it here only */
+            dst = &xanim_pool[tree->poolNodeHandles[nodeIndex]];
+            if ( dst->notifyName ) {
+                if ( *(const int *)&dst->states[1].time == 1065353216 ) {
+                    dst->notifyIndex = -1;
                 } else {
-                    XAnimEntry *entry = &tree->sourceTree->entries[cur];
-                    int         armed = 1;
-
-                    if ( entry->childCount != 0 ) {
-                        if ( node->notifyChildIndex == 0 ) {
-                            armed = 0;
-                        } else {
-                            entry = &tree->sourceTree->entries[
-                                        node->notifyChildIndex];
+                    entry = &tree->sourceTree->entries[nodeIndex];
+                    if ( entry->childCount == 0 || dst->notifyChildIndex ) {
+                        if ( entry->childCount != 0 ) {
+                            entry = &tree->sourceTree->entries[dst->notifyChildIndex];
                         }
-                    }
-                    if ( armed ) {
-                        node->notifyIndex = (short)XAnimGetNextNotifyTime(
-                            (int)entry, (int)node, node->states[1].time );
+                        dst->notifyIndex = (short)XAnimGetNextNotifyTime(
+                            (int)entry, (int)dst, dst->states[1].time );
                     }
                 }
             }
-
-            cur = tree->sourceTree->entries[cur].parentIndex;
-        } while ( cur != walk );
-    }
-}
-#if 0
-// XAnimReseedTiming_m: applies per-anim flags and notify wiring after an animation is installed.  Reached from every set-anim path after XAnimSetAnimInternal_m.
-char __cdecl XAnimReseedTiming_m(int a1, int a2)
-{
-  int v2;
-  int v3;
-  _DWORD *v4;
-  int i;
-  char *v6;
-  int *v7;
-  int v8;
-  int v9;
-  char *v10;
-  _WORD *v11;
-  int *v13;
-  char *v14;
-  int *v15;
-  char *v16;
-
-  v2 = a1;
-  v3 = a1;
-  v4 = (_DWORD *)xanim_currentTree;
-  if ( a1 )
-  {
-    for ( i = *(_DWORD *)xanim_currentTree; ; v3 = *(unsigned __int16 *)(i + 8 * v3 + 10) )
-    {
-      v6 = (char *)&xanim_pool + 68 * *(unsigned __int16 *)(xanim_currentTree + 2 * v3 + 8);
-      if ( *(_WORD *)(i + 8 * v3 + 8) )
-      {
-        if ( (*(_BYTE *)(i + 8 * v3 + 12) & 4) != 0 )
-          break;
-      }
-      a1 = *(unsigned __int16 *)(i + 8 * v3 + 10);
-      if ( !*(_WORD *)(i + 8 * v3 + 10) )
-        goto LABEL_7;
-    }
-    if ( a2 || !XAnimParentChainHasWeight_m(v3, (_DWORD *)xanim_currentTree) || !XAnimSubtreeHasWeight_m(v4, v3) )
-    {
-      if ( xanim_activePoolSlot )
-      {
-        *((_DWORD *)v6 + 10) = 0;
-        *((_WORD *)v6 + 24) = 0;
-        *((_DWORD *)v6 + 11) = 0;
-        *((_WORD *)v6 + 25) = 0;
-      }
-      else
-      {
-        *((_DWORD *)v6 + 3) = 0;
-        *((_WORD *)v6 + 10) = 0;
-        *((_DWORD *)v6 + 4) = 0;
-        *((_WORD *)v6 + 11) = 0;
-      }
-    }
-    LOBYTE(v7) = XAnimPushTimingToSubtree_m(v2, (int)v6);
-    if ( v2 != v3 )
-    {
-      v9 = 7 * xanim_activePoolSlot;
-      v13 = (int *)&v6[28 * xanim_activePoolSlot + 12];
-      v14 = &v6[28 * xanim_activePoolSlot + 20];
-      v15 = (int *)&v6[28 * xanim_activePoolSlot + 16];
-      v16 = &v6[28 * xanim_activePoolSlot + 22];
-      do
-      {
-        v7 = (int *)((char *)&xanim_pool + 68 * *((unsigned __int16 *)v4 + v2 + 4));
-        v7[v9 + 3] = *v13;
-        LOWORD(v7[v9 + 5]) = *(_WORD *)v14;
-        v7[v9 + 4] = *v15;
-        HIWORD(v7[v9 + 5]) = *(_WORD *)v16;
-        LOBYTE(v7) = xanim_activePoolSlot;
-        if ( !xanim_activePoolSlot )
-          goto LABEL_29;
-        v10 = (char *)&xanim_pool + 68 * *((unsigned __int16 *)v4 + v2 + 4);
-        if ( !*((_WORD *)v10 + 2) )
-          goto LABEL_29;
-        if ( *((_DWORD *)v10 + 10) == 1065353216 )
-        {
-          *((_WORD *)v10 + 1) = -1;
         }
-        else
-        {
-          v11 = (_WORD *)(*v4 + 8 * v2 + 8);
-          if ( !*v11 )
-            goto LABEL_28;
-          LOWORD(v7) = *(_WORD *)v10;
-          if ( *(_WORD *)v10 )
-          {
-            v11 = (_WORD *)(*v4 + 8 * (unsigned __int16)v7 + 8);
-LABEL_28:
-            LOWORD(v7) = XAnimGetNextNotifyTime((int)v11, (int)v10, *((float *)v10 + 10));
-            *((_WORD *)v10 + 1) = (_WORD)v7;
-          }
-        }
-LABEL_29:
-        v2 = *(unsigned __int16 *)(*v4 + 8 * v2 + 10);
-      }
-      while ( v2 != a1 );
-    }
-  }
-  else
-  {
-LABEL_7:
-    v7 = *(int **)xanim_currentTree;
-    if ( !*(_WORD *)(*(_DWORD *)xanim_currentTree + 8 * v2 + 8) )
-    {
-      if ( a2 || !XAnimParentChainHasWeight_m(v2, (_DWORD *)xanim_currentTree) || (LOBYTE(v7) = XAnimSubtreeHasWeight_m(v4, v2), !(_BYTE)v7) )
-      {
-        v8 = *((unsigned __int16 *)v4 + v2 + 4);
-        if ( xanim_activePoolSlot )
-          v7 = &dword_A7A648[17 * v8];
-        else
-          v7 = &dword_A7A62C[17 * v8];
-        *v7 = 0;
-        *((_WORD *)v7 + 4) = 0;
-        v7[1] = 0;
-        *((_WORD *)v7 + 5) = 0;
-      }
-    }
-  }
-  return (char)v7;
+        nodeIndex = tree->sourceTree->entries[nodeIndex].parentIndex;
+    } while ( nodeIndex != walk );
 }
-#endif
 
 /* ---- cand_XAnimSeedParentChain  0x00489570 ----  VERIFIED */
-int __cdecl cand_XAnimSeedParentChain(int result, int a2)
+void __cdecl cand_XAnimSeedParentChain( int node, float blendTime )
 {
-  int i;
+  XAnimTree *tree;
 
-  for ( i = result; i; result = XAnimSetAnimInternal_m(i, 0.0, *(float *)&a2, 1.0, 1, 0, 0) )
+  while ( node )
   {
-    result = xanim_currentTree;
-    i = *(unsigned __int16 *)(*(_DWORD *)xanim_currentTree + 8 * i + 10);
-    if ( *(_WORD *)(xanim_currentTree + 2 * i + 8) )
+    tree = (XAnimTree *)xanim_currentTree;
+    node = tree->sourceTree->entries[node].parentIndex;
+    if ( tree->poolNodeHandles[node] )   /* already seeded -- stop climbing */
       break;
+    XAnimSetAnimInternal_m( node, 0.0f, blendTime, 1.0f, 1, 0, 0 );
   }
-  return result;
 }
 
 /* ---- XAnimSetAnimInternalLimited_m  0x004895C0 ----  VERIFIED */
-int __cdecl XAnimSetAnimInternalLimited_m(
-        __int16 a1,
-        unsigned __int16 a2,
-        int a3,
-        int a4,
-        float a5,
-        int a6,
-        float a7,
-        int a8)
+int __cdecl XAnimSetAnimInternalLimited_m( __int16 notifyType, unsigned __int16 notifyName,
+                                           int tree, int node, float weight,
+                                           float blendTime, float rate, int animFlags )
 {
-  int v8;
+  int result;
 
-  xanim_currentTree = a3;
-  if ( (a5 < 0.001) | __UNORDERED__(a5, 0.001) )
-    a5 = 0.0;
-  v8 = XAnimSetAnimInternal_m(a4, a5, *(float *)&a6, a7, 0, a2, a1);
-  cand_XAnimSeedParentChain(a4, a6);
-  XAnimReseedTiming_m(a4, a8);
+  xanim_currentTree = tree;
+  if ( weight < 0.001f )
+    weight = 0.0f;
+  result = XAnimSetAnimInternal_m( node, weight, blendTime, rate, 0,
+                                   notifyName, notifyType );
+  cand_XAnimSeedParentChain( node, blendTime );
+  XAnimReseedTiming_m( node, animFlags );
   if ( xanim_activePoolSlot )
-    XAnimUpdateNotifyIndex_m(a4);
-  return v8;
+    XAnimUpdateNotifyIndex_m( node );
+  return result;
 }
 
 /* ---- XAnimSetAnimRate_m  0x00489630 ----  VERIFIED */
-int __cdecl XAnimSetAnimRate_m( XAnimTree *tree, int node, float rate )
+void __cdecl XAnimSetAnimRate_m( XAnimTree *tree, int node, float rate )
 {
     unsigned short handle;
 
     handle = tree->poolNodeHandles[node];
     xanim_currentTree = (int)tree;
     XANIM_LANE( handle ).rateScale = rate;
-    return 28 * xanim_activePoolSlot;
 }
-#if 0
-// XAnimSetAnimRate_m: sets a node's rate scale; the same rateScale write as XAnimSetRate_m but with an explicit tree argument.  Cgame trap 142.
-int __cdecl XAnimSetAnimRate_m(int a1, int a2, float a3)
-{
-  int v3;
-  int result;
-
-  v3 = *(unsigned __int16 *)(a1 + 2 * a2 + 8);
-  xanim_currentTree = a1;
-  result = 28 * xanim_activePoolSlot;
-  *((float *)&unk_A7A644 + 17 * v3 + 7 * xanim_activePoolSlot) = a3;
-  return result;
-}
-#endif
 
 /* ---- XAnimIsLooped_m  0x00489660 ----  VERIFIED */
-int __cdecl XAnimIsLooped_m(int a1, int a2)
+int __cdecl XAnimIsLooped_m( const XAnim *sourceTree, int node )
 {
-  if ( *(_WORD *)(a2 + 8 * a1 + 8) )
-    return *(_BYTE *)(a2 + 8 * a1 + 12) & 1;
-  else
-    return *(unsigned __int8 *)(*(_DWORD *)(*(_DWORD *)(a2 + 8 * a1 + 12) + 4) + 2);
+  const XAnimEntry *entry = &sourceTree->entries[node];
+
+  if ( entry->childCount )
+    return entry->u.parent.flags & 1;
+  return *(const unsigned char *)( ((const int *)entry->u.leafAsset)[1] + 2 );
 }
 
 /* ---- XAnimSetAnimKnobInternal_m  0x004896B0 ----  VERIFIED */
-__int16 __cdecl XAnimSetAnimKnobInternal_m( unsigned __int16 notifyName, XAnimTree *tree,
-                            int node, float weight, int blendTimeBits,
-                            float rate, __int16 notifyType, int animFlags )
+void __cdecl XAnimSetAnimKnobInternal_m( XAnimTree *tree, int node, float weight,
+                            float blendTime, float rate, unsigned __int16 notifyName,
+                            __int16 notifyType, int animFlags )
 {
     int ancestor;
 
@@ -2031,318 +1340,134 @@ __int16 __cdecl XAnimSetAnimKnobInternal_m( unsigned __int16 notifyName, XAnimTr
         weight = 0.0f;
     }
 
-    XAnimSetAnimInternal_m( node, weight, *(float *)&blendTimeBits, rate, 0,
+    XAnimSetAnimInternal_m( node, weight, blendTime, rate, 0,
                 notifyName, notifyType );
 
-    if ( node ) {
-        ancestor = node;
-        do {
-            unsigned short handle;
+    ancestor = node;
+    while ( ancestor ) {
+        unsigned short handle;
 
-            ancestor = tree->sourceTree->entries[ancestor].parentIndex;
-            handle   = tree->poolNodeHandles[ancestor];
-            if ( handle && XANIM_LANE( handle ).targetWeight != 0.0f ) {
-                continue;
-            }
-            XAnimSetAnimInternal_m( ancestor, 1.0f, *(float *)&blendTimeBits, 1.0f,
-                        0, 0, 0 );
-        } while ( ancestor );
+        ancestor = tree->sourceTree->entries[ancestor].parentIndex;
+        handle   = tree->poolNodeHandles[ancestor];
+        if ( !handle || XANIM_LANE( handle ).targetWeight == 0.0f ) {
+            XAnimSetAnimInternal_m( ancestor, 1.0f, blendTime, 1.0f, 0, 0, 0 );
+        }
     }
 
     XAnimReseedTiming_m( node, animFlags );
     if ( xanim_activePoolSlot ) {
-        return (__int16)XAnimUpdateNotifyIndex_m( node );
+        XAnimUpdateNotifyIndex_m( node );
     }
-    return (__int16)xanim_activePoolSlot;
 }
-#if 0
-// XAnimSetAnimKnobInternal_m: knob set-anim worker for XAnimSetAnimKnob_m; seeds unweighted ancestors at full weight.
-__int16 __cdecl XAnimSetAnimKnobInternal_m(
-        unsigned __int16 a1,
-        _DWORD *a2,
-        int a3,
-        float a4,
-        int a5,
-        float a6,
-        __int16 a7,
-        int a8)
-{
-  int v8;
-  unsigned __int16 v9;
-  double v10;
-  __int16 result;
 
-  xanim_currentTree = (int)a2;
-  if ( (a4 < 0.001) | __UNORDERED__(a4, 0.001) )
-    a4 = 0.0;
-  v8 = a3;
-  XAnimSetAnimInternal_m(a3, a4, *(float *)&a5, a6, 0, a1, a7);
-  if ( a3 )
-  {
-    do
-    {
-      v8 = *(unsigned __int16 *)(*a2 + 8 * v8 + 10);
-      v9 = *((_WORD *)a2 + v8 + 4);
-      if ( v9 )
-      {
-        v10 = *((float *)&unk_A7A63C + 17 * v9 + 7 * xanim_activePoolSlot);
-        if ( !((v10 == 0.0) | __UNORDERED__(v10, 0.0)) )
-          continue;
-      }
-      XAnimSetAnimInternal_m(v8, 1.0, *(float *)&a5, 1.0, 0, 0, 0);
-    }
-    while ( v8 );
-  }
-  XAnimReseedTiming_m(a3, a8);
-  result = xanim_activePoolSlot;
-  if ( xanim_activePoolSlot )
-    return XAnimUpdateNotifyIndex_m(a3);
-  return result;
-}
-#endif
+/*
+ * A saved XAnimState is serialized (and restored) as a fixed 28-byte record in
+ * this field order, which differs from the in-memory struct order:
+ *   [+0]time [+4]oldTime [+8]cycleCount [+10]oldCycleCount
+ *   [+12]targetWeight [+16]rateScale [+20]weightBlendTimeRemaining [+24]currentWeight
+ */
 
 /* ---- cand_XAnimReadTransform  0x00489780 ----  VERIFIED */
-float *__cdecl cand_XAnimReadTransform(float *this)
+float *__cdecl cand_XAnimReadTransform( float *dstState )
 {
-  int v1;
-  double v2;
-  __int16 v3;
-  double v4;
-  float *result;
-
-  v1 = scrSave_readPos + 4;
-  *this = *(float *)scrSave_readPos;
-  v1 += 4;
-  v2 = *(float *)(v1 - 4);
-  v1 += 2;
-  this[1] = v2;
-  *((_WORD *)this + 4) = *(_WORD *)(v1 - 2);
-  v3 = *(_WORD *)v1;
-  v1 += 2;
-  *((_WORD *)this + 5) = v3;
-  this[4] = *(float *)v1;
-  v1 += 4;
-  this[6] = *(float *)v1;
-  v1 += 8;
-  v4 = *(float *)(v1 - 4);
-  result = (float *)(v1 + 4);
-  this[3] = v4;
-  scrSave_readPos = (int)result;
-  this[5] = *(result - 1);
-  return result;
+  extern float ReadFloat(void);
+  extern __int16 ReadShort(void);
+  XAnimState *state=(XAnimState *)dstState;
+  state->time=ReadFloat();
+  state->oldTime=ReadFloat();
+  state->cycleCount=ReadShort();
+  state->oldCycleCount=ReadShort();
+  state->targetWeight=ReadFloat();
+  state->rateScale=ReadFloat();
+  state->weightBlendTimeRemaining=ReadFloat();
+  state->currentWeight=ReadFloat();
+  return (float *)scrSave_readPos;
 }
 
 /* ---- cand_XAnimWriteState  0x004897E0 ----  VERIFIED */
-int *__cdecl cand_XAnimWriteState(int *a1)
+void __cdecl cand_XAnimWriteState( const XAnimState *state )
 {
-  int v1;
-  int v2;
-  int *v3;
-  __int16 v4;
-  _WORD *v5;
-  __int16 v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  int *result;
-  int v12;
-  int v13;
-  int v14;
+  extern void WriteShort(unsigned short value);
+  extern void WriteFloat(float value);
 
-  v1 = currentPos + 4;
-  v12 = *a1;
-  *(_DWORD *)(currentPos + Hunk_ReallocateTempMemory(currentPos + 4)) = v12;
-  v2 = a1[1];
-  currentPos = v1;
-  v1 += 4;
-  v13 = v2;
-  v3 = (int *)(currentPos + Hunk_ReallocateTempMemory(v1));
-  currentPos = v1;
-  *v3 = v13;
-  v4 = *((_WORD *)a1 + 4);
-  v1 += 2;
-  v5 = (_WORD *)(currentPos + Hunk_ReallocateTempMemory(v1));
-  currentPos = v1;
-  *v5 = v4;
-  v6 = *((_WORD *)a1 + 5);
-  v1 += 2;
-  *(_WORD *)(currentPos + Hunk_ReallocateTempMemory(v1)) = v6;
-  v7 = a1[4];
-  currentPos = v1;
-  v1 += 4;
-  *(_DWORD *)(currentPos + Hunk_ReallocateTempMemory(v1)) = v7;
-  v8 = a1[6];
-  currentPos = v1;
-  v1 += 4;
-  *(_DWORD *)(currentPos + Hunk_ReallocateTempMemory(v1)) = v8;
-  v9 = a1[3];
-  currentPos = v1;
-  v1 += 4;
-  *(_DWORD *)(currentPos + Hunk_ReallocateTempMemory(v1)) = v9;
-  v10 = a1[5];
-  currentPos = v1;
-  v1 += 4;
-  v14 = v10;
-  result = (int *)(currentPos + Hunk_ReallocateTempMemory(v1));
-  currentPos = v1;
-  *result = v14;
-  return result;
+  WriteFloat( state->time );
+  WriteFloat( state->oldTime );
+  WriteShort( state->cycleCount );
+  WriteShort( state->oldCycleCount );
+  WriteFloat( state->targetWeight );
+  WriteFloat( state->rateScale );
+  WriteFloat( state->weightBlendTimeRemaining );
+  WriteFloat( state->currentWeight );
 }
 
 /* ---- cand_XAnimReadString  0x004898F0 ----  VERIFIED */
-__int16 __cdecl cand_XAnimReadString(int a1)
+void __cdecl cand_XAnimReadString( int infoPtr )
 {
-  __int16 *v1;
-  __int16 v2;
-  __int16 v3;
-  char *v4;
-  unsigned int v5;
-  __int16 StringOfLen;
-  int v7;
-  double v8;
-  double v9;
-  __int16 result;
-  double v11;
-
-  v1 = (__int16 *)(scrSave_readPos + 2);
-  *(_WORD *)(a1 + 2) = *(_WORD *)scrSave_readPos;
-  v2 = *v1++;
-  *(_WORD *)a1 = v2;
-  v3 = *v1++;
-  *(_WORD *)(a1 + 6) = v3;
-  LOBYTE(v3) = *(_BYTE *)v1;
-  v4 = (char *)v1 + 1;
-  scrSave_readPos = (int)v4;
-  if ( (_BYTE)v3 )
-  {
-    v5 = strlen(v4);
-    /* type 14 -- `push 0Eh` at 0x0048992F. */
-    StringOfLen = SL_GetStringOfLen(v4, 0, v5 + 1, 14);
-    v4 = (char *)(v5 + 1 + scrSave_readPos);
-  }
-  else
-  {
-    StringOfLen = 0;
-  }
-  *(_WORD *)(a1 + 4) = StringOfLen;
-  *(float *)(a1 + 12) = *(float *)v4;
-  v7 = (int)(v4 + 4);
-  v8 = *(float *)v7;
-  v7 += 4;
-  *(float *)(a1 + 16) = v8;
-  *(_WORD *)(a1 + 20) = *(_WORD *)v7;
-  *(_WORD *)(a1 + 22) = *(_WORD *)(v7 + 2);
-  v7 += 2;
-  *(float *)(a1 + 28) = *(float *)(v7 + 2);
-  v7 += 6;
-  *(float *)(a1 + 36) = *(float *)v7;
-  v7 += 8;
-  *(float *)(a1 + 24) = *(float *)(v7 - 4);
-  v7 += 8;
-  *(float *)(a1 + 32) = *(float *)(v7 - 8);
-  v7 += 6;
-  *(float *)(a1 + 40) = *(float *)(v7 - 10);
-  v7 += 6;
-  v9 = *(float *)(v7 - 12);
-  v7 += 4;
-  *(float *)(a1 + 44) = v9;
-  *(_WORD *)(a1 + 48) = *(_WORD *)(v7 - 12);
-  result = *(_WORD *)(v7 - 10);
-  *(_WORD *)(a1 + 50) = result;
-  *(float *)(a1 + 56) = *(float *)(v7 - 8);
-  v7 += 4;
-  v11 = *(float *)(v7 - 8);
-  v7 += 4;
-  *(float *)(a1 + 64) = v11;
-  scrSave_readPos = v7;
-  *(float *)(a1 + 52) = *(float *)(v7 - 8);
-  *(float *)(a1 + 60) = *(float *)(v7 - 4);
-  return result;
+  extern __int16 ReadShort(void);
+  extern __int16 SafeReadString(void);
+  extern char ReadByte(void);
+  extern __int16 ReadString(void);
+  XAnimInfo *info=(XAnimInfo *)infoPtr;
+  info->notifyIndex=ReadShort();
+  info->notifyChildIndex=ReadShort();
+  info->notifyType=ReadShort();
+  info->notifyName=ReadByte()?ReadString():(__int16)0;
+  cand_XAnimReadTransform((float *)&info->states[0]);
+  cand_XAnimReadTransform((float *)&info->states[1]);
 }
 
 /* ---- cand_XAnimWriteInfo  0x004899F0 ----  VERIFIED */
-int *__cdecl cand_XAnimWriteInfo(int *a1)
+void __cdecl cand_XAnimWriteInfo( int *infoPtr )
 {
-  __int16 v1;
-  int v2;
-  _WORD *v3;
-  __int16 v4;
-  _WORD *v5;
-  __int16 v6;
-  _WORD *v7;
-  int v8;
-  unsigned __int16 v9;
-  _BYTE *v11;
-
-  v1 = *((_WORD *)a1 + 1);
-  v2 = currentPos + 2;
-  v3 = (_WORD *)(currentPos + Hunk_ReallocateTempMemory(currentPos + 2));
-  currentPos = v2;
-  *v3 = v1;
-  v4 = *(_WORD *)a1;
-  v2 += 2;
-  v5 = (_WORD *)(currentPos + Hunk_ReallocateTempMemory(v2));
-  currentPos = v2;
-  *v5 = v4;
-  v6 = *((_WORD *)a1 + 3);
-  v2 += 2;
-  v7 = (_WORD *)(currentPos + Hunk_ReallocateTempMemory(v2));
-  currentPos = v2;
-  *v7 = v6;
-  v8 = v2 + 1;
-  if ( *((_WORD *)a1 + 2) )
-  {
-    *(_BYTE *)(currentPos + Hunk_ReallocateTempMemory(v8)) = 1;
-    v9 = *((_WORD *)a1 + 2);
-    currentPos = v8;
-    WriteString(v9);
-  }
-  else
-  {
-    v11 = (_BYTE *)(currentPos + Hunk_ReallocateTempMemory(v8));
-    currentPos = v8;
-    *v11 = 0;
-  }
-  cand_XAnimWriteState(a1 + 3);
-  return cand_XAnimWriteState(a1 + 10);
+  extern void *TempMalloc(int size);
+  extern void WriteShort(unsigned short value);
+  extern void WriteByte(unsigned char value);
+  extern void SafeWriteString(unsigned short value);
+  XAnimInfo *info=(XAnimInfo *)infoPtr;
+  WriteShort(info->notifyIndex);
+  WriteShort(info->notifyChildIndex);
+  WriteShort(info->notifyType);
+  if(info->notifyName){WriteByte(1);WriteString(info->notifyName);}else WriteByte(0);
+  cand_XAnimWriteState(&info->states[0]);
+  cand_XAnimWriteState(&info->states[1]);
 }
 
 /* ---- cand_XAnimReadInfo  0x00489AB0 ----  VERIFIED */
 void __cdecl cand_XAnimReadInfo( XAnimInfo *dst, const void *src )
 {
-  qmemcpy( dst, src, 0x44u );
+  memcpy( dst, src, 0x44u );
 
   if ( dst->notifyName )
     ++*(unsigned short *)SL_REFSTRING( dst->notifyName );
 }
 
 /* ---- cand_XAnimRestoreTree  0x00489AE0 ----  VERIFIED */
-unsigned int __cdecl cand_XAnimRestoreTree(int a1)
+unsigned int __cdecl cand_XAnimRestoreTree( int treePtr )
 {
-  int v1;
-  int v3;
-  unsigned int result;
-  int i;
-  char *v6;
-  unsigned char *v8;
+  XAnimTree     *tree = (XAnimTree *)treePtr;
+  unsigned int   bitmapBytes;
+  char          *bitmap;
+  int            savedReadPos;
+  unsigned int   nodeCount;
+  int            i;
 
-  v1 = ((unsigned int)(*(_DWORD *)(*(_DWORD *)a1 + 4) - 1) >> 3) + 1;
-  v8 = (unsigned char *)alloca(v1);
-  v3 = scrSave_readPos;
-  Com_Memcpy((int)v8, (int *)scrSave_readPos, v1);
-  result = *(_DWORD *)(*(_DWORD *)a1 + 4);
-  scrSave_readPos = v1 + v3;
-  for ( i = 0; i < (int)result; ++i )
+  bitmapBytes  = ( ( (unsigned int)tree->sourceTree->nodeCount - 1 ) >> 3 ) + 1;
+  bitmap       = (char *)alloca( bitmapBytes );
+  savedReadPos = (int)scrSave_readPos;
+  Com_Memcpy( bitmap, (const void *)scrSave_readPos, bitmapBytes );
+  nodeCount    = tree->sourceTree->nodeCount;
+  scrSave_readPos = (char *)( savedReadPos + bitmapBytes );
+
+  for ( i = 0; i < nodeCount; ++i )
   {
-    if ( ((1 << (i & 7)) & (char)v8[i >> 3]) != 0 )
+    if ( ( bitmap[i >> 3] & (1 << (i & 7)) ) != 0 )
     {
-      v6 = (char *)XAnimAllocInfo((XAnimTree *)a1, i);
-      cand_XAnimReadString((int)v6);
+      XAnimInfo *info = XAnimAllocInfo( tree, i );
+      cand_XAnimReadString( (int)info );
     }
-    result = *(_DWORD *)(*(_DWORD *)a1 + 4);
+    nodeCount = tree->sourceTree->nodeCount;
   }
-  return result;
+  return nodeCount;
 }
 
 /* ---- cand_XAnimSaveTree  0x00489B70 ----  VERIFIED */
@@ -2350,7 +1475,7 @@ void __cdecl cand_XAnimSaveTree( XAnimTree *tree )
 {
   unsigned int   bitmapBytes;
   unsigned char *bitmap;
-  unsigned int   i;
+  int            i;
   int            newPos;
   char          *dst;
 
@@ -2393,13 +1518,13 @@ void __cdecl XAnimCopyTree( const XAnimTree *from, XAnimTree *to )
             continue;
         }
 
-        if ( to->poolNodeHandles[i] ) {
+        if ( !to->poolNodeHandles[i] ) {
+            dst = XAnimAllocInfo( to, i );
+        } else {
             dst = &xanim_pool[ to->poolNodeHandles[i] ];
             if ( dst->notifyName ) {
                 XModelReleaseString( dst->notifyName );
             }
-        } else {
-            dst = XAnimAllocInfo( to, i );
         }
 
         memcpy( dst, &xanim_pool[srcHandle], sizeof( XAnimInfo ) );
@@ -2409,81 +1534,6 @@ void __cdecl XAnimCopyTree( const XAnimTree *from, XAnimTree *to )
         }
     }
 }
-#if 0
-// XAnimCopyTree_m: copies one runtime tree's live pool nodes onto another tree.  Cgame trap 184.
-int __cdecl XAnimCopyTree(int result, int a2)
-{
-  int v2;
-  int v3;
-  int v4;
-  unsigned __int16 *v5;
-  unsigned __int16 v6;
-  char *v7;
-  unsigned __int16 v8;
-  int v9;
-  unsigned __int16 v10;
-  int v11;
-  int i;
-  unsigned __int16 v13;
-  int v14;
-
-  v2 = 0;
-  v14 = *(_DWORD *)(*(_DWORD *)result + 4);
-  v11 = 0;
-  if ( v14 > 0 )
-  {
-    v3 = a2;
-    v4 = result - a2;
-    v5 = (unsigned __int16 *)(a2 + 8);
-    for ( i = v4; ; v4 = i )
-    {
-      v6 = *(unsigned __int16 *)((char *)v5 + v4);
-      v13 = v6;
-      if ( v6 )
-      {
-        if ( *v5 )
-        {
-          v7 = (char *)&xanim_pool + 68 * *v5;
-          v8 = *((_WORD *)v7 + 2);
-          if ( v8 )
-          {
-            v9 = GetRefString_var + 8 * v8;
-            if ( *(_WORD *)v9 )
-            {
-              --*(_WORD *)v9;
-            }
-            else
-            {
-              SL_FreeString(v8, (char *)(v9 + 4), strlen((const char *)(v9 + 4)) + 1);
-              v6 = v13;
-            }
-          }
-        }
-        else
-        {
-          v7 = XAnimAllocInfo(v3, v2);
-        }
-        qmemcpy(v7, (char *)&xanim_pool + 68 * v6, 0x44u);
-        v10 = *((_WORD *)v7 + 2);
-        if ( v10 )
-          ++*(_WORD *)(GetRefString_var + 8 * v10);
-      }
-      else if ( *v5 )
-      {
-        XAnimFreeInfo(*v5);
-        *v5 = 0;
-      }
-      result = v14;
-      v2 = v11 + 1;
-      ++v5;
-      if ( ++v11 >= v14 )
-        break;
-      v3 = a2;
-    }
-  }
-  return result;
-}
-#endif
 
 static void XModelReadSurface(XSurface *surface, const unsigned char **pos,
                               XModelAllocFn alloc);
@@ -2512,30 +1562,31 @@ int __cdecl XModelBad(const XModel *model)
 }
 
 /* ---- SetAnimCheck  0x00489DD0 ----  VERIFIED */
-static void __cdecl SetAnimCheck(int enable)
+void XModel_SetAnimCheck(int result)
 {
-    xmodel_animCheck = enable;
+ xmodel_animCheck=result;
 }
 
 /* ---- ReadQuat  0x00489DE0 ----  VERIFIED */
 int ReadQuat(const short *packed, short *out)
 {
-    short x = packed[0];
-    short y = packed[1];
-    short z = packed[2];
+    int x, y, z;
     int lenSq;
+    int w;
 
-    out[0] = x;
-    out[1] = y;
-    out[2] = z;
+    out[0] = packed[0];
+    out[1] = packed[1];
+    out[2] = packed[2];
+    x = out[0];
+    y = out[1];
+    z = out[2];
     lenSq = 1073676289 - z * z - y * y - x * x;
-    if ( lenSq <= 0 )
-    {
-        out[3] = 0;
-        return 0;
-    }
-    out[3] = (short)(unsigned int)floor(sqrt((double)lenSq) + 0.5);
-    return (int)(unsigned int)floor(sqrt((double)lenSq) + 0.5);
+    if ( lenSq > 0 )
+        w = (int)(unsigned int)floor(sqrt((double)lenSq) + 0.5);
+    else
+        w = 0;
+    out[3] = (short)w;
+    return w;
 }
 
 /* ---- ReadQuat2  0x00489E60 ----  VERIFIED */
@@ -2543,59 +1594,64 @@ int ReadQuat2(const short *packed, short *out)
 {
     short x = packed[0];
     int lenSq;
+    int w;
 
     out[0] = x;
     lenSq = 1073676289 - x * x;
-    if ( lenSq <= 0 )
-    {
-        out[1] = 0;
-        return 0;
-    }
-    out[1] = (short)(unsigned int)floor(sqrt((double)lenSq) + 0.5);
-    return (int)(unsigned int)floor(sqrt((double)lenSq) + 0.5);
+    if ( lenSq > 0 )
+        w = (int)(unsigned int)floor(sqrt((double)lenSq) + 0.5);
+    else
+        w = 0;
+    out[1] = (short)w;
+    return w;
 }
 
 /* ---- XModelExpandQuatToAxis  0x00489EB0 ----  VERIFIED */
-void __cdecl XModelExpandQuatToAxis(float *quat)
+__inline void __cdecl XModelExpandQuatToAxis(float *quat)
 {
+
     float x2, y2, z2;
-    double lengthSq, scale, xx, yy, zz, x, y;
-    float xy, xz, xw, yz, yw, zw;
+    float lengthSq, scale, xx, yy, zz, x, y, xy, zw;
+    float xz, xw, yz, yw;   /* retail's four float spills; xy and zw stay on the
+                             * x87 stack (0x489F19 / 0x489F45) and are never stored */
 
     x2 = quat[0] * quat[0];
     y2 = quat[1] * quat[1];
     z2 = quat[2] * quat[2];
     lengthSq = quat[3] * quat[3] + z2 + y2 + x2;
-    if ( lengthSq == 0.0 )
+    if (lengthSq != 0.0f)
     {
-        quat[0]  = 1.0f; quat[1] = 0.0f; quat[2]  = 0.0f;
-        quat[4]  = 0.0f; quat[5] = 1.0f; quat[6]  = 0.0f;
-        quat[8]  = 0.0f; quat[9] = 0.0f; quat[10] = 1.0f;
-        return;
-    }
-
-    scale = 2.0 / lengthSq;
+    scale = 2.0f / lengthSq;
     xx = x2 * scale;
     yy = scale * y2;
     zz = scale * z2;
     x  = scale * quat[0];
+    xy = x * quat[1];
     xz = (float)(x * quat[2]);
-    xy = (float)(x * quat[1]);
     xw = (float)(x * quat[3]);
     y  = scale * quat[1];
     yz = (float)(y * quat[2]);
     yw = (float)(y * quat[3]);
-    zw = (float)(quat[3] * quat[2] * scale);
+    zw = quat[3] * quat[2] * scale;
 
-    quat[0]  = (float)(1.0 - (zz + yy));
-    quat[1]  = zw + xy;
+    quat[0]  = (float)(1.0f - (zz + yy));
+    quat[1]  = (float)(zw + xy);
     quat[2]  = xz - yw;
-    quat[4]  = xy - zw;
-    quat[5]  = (float)(1.0 - (zz + xx));
+    quat[4]  = (float)(xy - zw);
+    quat[5]  = (float)(1.0f - (zz + xx));
     quat[6]  = yz + xw;
     quat[8]  = yw + xz;
     quat[9]  = yz - xw;
-    quat[10] = (float)(1.0 - (yy + xx));
+    quat[10] = (float)(1.0f - (yy + xx));
+    }
+    else
+    {
+
+        quat[0]  = 1.0f; quat[1] = 0.0f; quat[2]  = 0.0f;
+        quat[4]  = 0.0f; quat[5] = 1.0f; quat[6]  = 0.0f;
+        quat[8]  = 0.0f; quat[9] = 0.0f; quat[10] = 1.0f;
+
+        }
 }
 
 /* ---- XModelSurfsFree  0x00489FE0 ----  VERIFIED */
@@ -2609,11 +1665,12 @@ void __cdecl XModelPartsFree(XModelPartsEntry *entry)
 {
     const XModelPartNameTable *table =
         entry->data->partNameTableSlot->partNameTable;
+    const unsigned short *handles = table->handles;
     int count = table->count;
     int i;
 
     for ( i = 0; i < count; ++i )
-        XModelReleaseString(table->handles[i]);
+        XModelReleaseString(handles[i]);
 }
 
 /* ---- XModelFree  0x0048A070 ----  VERIFIED */
@@ -2625,13 +1682,11 @@ void __cdecl XModelFree(XModel *entry)
 
     for ( lodIndex = 0; lodIndex < XMODEL_LOD_COUNT; ++lodIndex )
     {
-        XModelLodInfo *lod = &info->lodRecords[lodIndex];
-
-        if ( !lod->surfaceNameTable )
+        if ( !info->lodRecords[lodIndex].surfaceNameTable )
             continue;
-        for ( i = 0; i < lod->surfaceCount; ++i )
-            XModelReleaseString(lod->surfaceNameTable[i]);
-        lod->surfaceNameTable = 0;
+        for ( i = 0; i < info->lodRecords[lodIndex].surfaceCount; ++i )
+            XModelReleaseString(info->lodRecords[lodIndex].surfaceNameTable[i]);
+        info->lodRecords[lodIndex].surfaceNameTable = 0;
     }
 }
 
@@ -2639,113 +1694,75 @@ void __cdecl XModelFree(XModel *entry)
 static void ReadBlend(XSurface *surface, XSimpleBlendInfo *blend,
                       const unsigned char **pos)
 {
-    const unsigned char *cursor = *pos;
     short boneIndex;
 
-    boneIndex = *(const short *)cursor;
-    cursor += 2;
+    boneIndex = *(const short *)*pos;
 
     ((unsigned char *)surface->boneUsage)[boneIndex >> 3] |=
         (unsigned char)(1u << (boneIndex & 7));
     blend->boneMatrixOffset = (unsigned int)(boneIndex << XMODEL_BONE_MATRIX_SHIFT);
 
-    blend->position[0] = *(const float *)cursor; cursor += 4;
-    blend->position[1] = *(const float *)cursor; cursor += 4;
-    blend->position[2] = *(const float *)cursor; cursor += 4;
+    *pos += 2;
+    blend->position[0] = *(const float *)*pos; *pos += 4;
+    blend->position[1] = *(const float *)*pos; *pos += 4;
+    blend->position[2] = *(const float *)*pos; *pos += 4;
 
-    *pos = cursor;
+
 }
 
 /* ---- XSurfaceUnstrip  0x0048A160 ---- */
 static void XSurfaceUnstrip(const XStripInfo *strips, unsigned short (*triangles)[3])
 {
-    const unsigned short *stripIndex = strips->stripIndices;
-    int strip;
-
-    for ( strip = 0; strip < strips->stripCount; ++strip )
-    {
-        unsigned char vertexCount = strips->stripVertexCounts[strip];
-        unsigned short previousA = stripIndex[0];
-        unsigned short previousB = stripIndex[1];
-        unsigned short current   = stripIndex[2];
-        int stripVertex;
-
-        stripIndex += 3;
-        if ( previousA != previousB && previousA != current && previousB != current )
-        {
-            (*triangles)[0] = previousA;
-            (*triangles)[1] = previousB;
-            (*triangles)[2] = current;
-            ++triangles;
-        }
-
-        for ( stripVertex = 3; stripVertex < vertexCount; stripVertex += 2 )
-        {
-            unsigned short next = stripIndex[0];
-            unsigned short next2;
-
-            if ( current != previousB && current != next && previousB != next )
-            {
-                (*triangles)[0] = current;
-                (*triangles)[1] = previousB;
-                (*triangles)[2] = next;
-                ++triangles;
-            }
-
-            if ( stripVertex + 1 >= vertexCount )
-            {
-                stripIndex += 1;
-                break;
-            }
-
-            next2 = stripIndex[1];
-            stripIndex += 2;
-            if ( current != next && current != next2 && next != next2 )
-            {
-                (*triangles)[0] = current;
-                (*triangles)[1] = next;
-                (*triangles)[2] = next2;
-                ++triangles;
-            }
-
-            previousB = next;
-            current = next2;
-        }
-    }
+ const unsigned short *stripIndex=strips->stripIndices;
+ unsigned short vertices[3];
+ int strip;
+ for(strip=0;strip<strips->stripCount;++strip){
+ int vertexCount=strips->stripVertexCounts[strip];
+ int stripVertex;
+ vertices[0]=stripIndex[0];vertices[1]=stripIndex[1];vertices[2]=stripIndex[2];stripIndex+=3;
+if(vertices[0]!=vertices[1]&&vertices[0]!=vertices[2]&&vertices[1]!=vertices[2]){(*triangles)[0]=vertices[0];(*triangles)[1]=vertices[1];(*triangles)[2]=vertices[2];++triangles;}
+for(stripVertex=3;stripVertex<vertexCount;){
+ vertices[0]=vertices[2];vertices[2]=*stripIndex++;
+if(vertices[0]!=vertices[1]&&vertices[0]!=vertices[2]&&vertices[1]!=vertices[2]){(*triangles)[0]=vertices[0];(*triangles)[1]=vertices[1];(*triangles)[2]=vertices[2];++triangles;}
+if(++stripVertex>=vertexCount)break;
+ vertices[1]=vertices[2];vertices[2]=*stripIndex++;
+if(vertices[0]!=vertices[1]&&vertices[0]!=vertices[2]&&vertices[1]!=vertices[2]){(*triangles)[0]=vertices[0];(*triangles)[1]=vertices[1];(*triangles)[2]=vertices[2];++triangles;}
+++stripVertex;
+}
+}
 }
 
 /* ---- XModelReadSurface  0x0048A260 ----  VERIFIED */
 static void XModelReadSurface(XSurface *surface, const unsigned char **pos,
                               XModelAllocFn alloc)
 {
-    const unsigned char *cursor = *pos;
-    short stripCount;
-    short singleBoneIndex;
-    short weightedPointCount = 0;
-    short compactWeightedVertexCount = 0;
+    int singleBoneIndex;
+    int weightedPointCount;
+    short compactWeightedVertexCount;
     int totalStripIndices;
-    const unsigned char *stripScan;
-    unsigned char *stripVertexCounts;
-    unsigned short *stripIndices;
+    int stripScan;
     unsigned short *stripIndexOut;
     unsigned char *blendCursor;
     XSurfaceRigidVert *rigidVertex;
+    float (*texCoords)[2];
+    XSurfaceWeightedPoint *weighted;
     XStripInfo strips;
     short triangleAllocCount;
     int i;
+    int j;
 
-    surface->tileMode = *cursor;              cursor += 1;
-    surface->vertexCount = *(const short *)cursor;   cursor += 2;
-    surface->triangleCount = *(const short *)cursor; cursor += 2;
-    stripCount = *(const short *)cursor;             cursor += 2;
-    singleBoneIndex = *(const short *)cursor;        cursor += 2;
+    surface->tileMode = *(*pos);              (*pos) += 1;
+    surface->vertexCount = *(const short *)(*pos);   (*pos) += 2;
+    surface->triangleCount = *(const short *)(*pos); (*pos) += 2;
+    strips.stripCount = *(const short *)(*pos);             (*pos) += 2;
+    singleBoneIndex = *(const short *)(*pos);        (*pos) += 2;
 
     Com_Memset(surface->boneUsage, 0, 16);
 
     if ( singleBoneIndex == XMODEL_NO_SINGLE_BONE )
     {
-        weightedPointCount = *(const short *)cursor;         cursor += 2;
-        compactWeightedVertexCount = *(const short *)cursor; cursor += 2;
+        weightedPointCount = *(const short *)(*pos);         (*pos) += 2;
+        compactWeightedVertexCount = *(const short *)(*pos); (*pos) += 2;
         surface->boneMatrixOffset = XMODEL_NO_SINGLE_BONE;
         surface->vertexData =
             alloc(4 * (9 * (int)surface->vertexCount - (int)compactWeightedVertexCount));
@@ -2759,111 +1776,105 @@ static void XModelReadSurface(XSurface *surface, const unsigned char **pos,
             (short)(singleBoneIndex << XMODEL_BONE_MATRIX_SHIFT);
         ((unsigned char *)surface->boneUsage)[singleBoneIndex >> 3] |=
             (unsigned char)(1u << (singleBoneIndex & 7));
+        weightedPointCount = 0;
         surface->vertexData = alloc(24 * (int)surface->vertexCount);
         surface->weightedPoints = 0;
         surface->texCoords = (float (*)[2])alloc(8 * (int)surface->vertexCount);
     }
 
     totalStripIndices = 0;
-    stripScan = cursor;
-    for ( i = 0; i < stripCount; ++i )
+    stripScan = 0;
+    for ( j = 0; j < strips.stripCount; ++j )
     {
-        unsigned char n = *stripScan;
+        unsigned char n = (*pos)[stripScan];
 
         totalStripIndices += n;
         stripScan += 1 + 2 * (int)n;
     }
 
-    stripVertexCounts = (unsigned char *)alloca((size_t)stripCount);
-    stripIndices = (unsigned short *)alloca((size_t)(2 * totalStripIndices));
+    strips.stripVertexCounts = (unsigned char *)alloca((size_t)strips.stripCount);
+    strips.stripIndices = (unsigned short *)alloca((size_t)(2 * totalStripIndices));
 
-    stripIndexOut = stripIndices;
-    for ( i = 0; i < stripCount; ++i )
+    stripIndexOut = (unsigned short *)strips.stripIndices;
+    for ( j = 0; j < strips.stripCount; ++j )
     {
-        unsigned char n = *cursor;
+        unsigned char n = *(*pos);
 
-        stripVertexCounts[i] = n;
-        cursor += 1;
-        qmemcpy(stripIndexOut, cursor, (size_t)(2 * (int)n));
-        cursor += 2 * (int)n;
+        ((unsigned char *)strips.stripVertexCounts)[j] = n;
+        (*pos) += 1;
+        memcpy(stripIndexOut, (*pos), (size_t)(2 * (int)n));
+        (*pos) += 2 * (int)n;
         stripIndexOut += n;
     }
 
+    texCoords   = surface->texCoords;
     blendCursor = (unsigned char *)surface->vertexData;
-    rigidVertex = (XSurfaceRigidVert *)surface->vertexData;
     for ( i = 0; i < surface->vertexCount; ++i )
     {
+        XSurfaceBlendVert *vert = (XSurfaceBlendVert *)blendCursor;
+
+        vert->normal[0] = *(const float *)(*pos); (*pos) += 4;
+        vert->normal[1] = *(const float *)(*pos); (*pos) += 4;
+        vert->normal[2] = *(const float *)(*pos); (*pos) += 4;
+        (*texCoords)[0] = *(const float *)(*pos); (*pos) += 4;
+        (*texCoords)[1] = *(const float *)(*pos); (*pos) += 4;
+
         if ( singleBoneIndex == XMODEL_NO_SINGLE_BONE )
         {
-            XSurfaceBlendVert *vert = (XSurfaceBlendVert *)blendCursor;
+            vert->additiveWeightCount = *(const short *)(*pos); (*pos) += 2;
 
-            vert->normal[0] = *(const float *)cursor; cursor += 4;
-            vert->normal[1] = *(const float *)cursor; cursor += 4;
-            vert->normal[2] = *(const float *)cursor; cursor += 4;
-            surface->texCoords[i][0] = *(const float *)cursor; cursor += 4;
-            surface->texCoords[i][1] = *(const float *)cursor; cursor += 4;
-            vert->additiveWeightCount = *(const short *)cursor; cursor += 2;
+            ReadBlend(surface, &vert->blend, pos);
 
-            ReadBlend(surface, &vert->blend, &cursor);
-
-            if ( vert->additiveWeightCount == 0 )
+            if ( vert->additiveWeightCount )
             {
-                blendCursor += 32;
+                vert->primaryWeight = *(const float *)(*pos); (*pos) += 4;
+                blendCursor += 36;
             }
             else
             {
-                vert->primaryWeight = *(const float *)cursor; cursor += 4;
-                blendCursor += 36;
+                blendCursor += 32;
             }
+            ++texCoords;
         }
         else
         {
-            rigidVertex->normal[0] = *(const float *)cursor; cursor += 4;
-            rigidVertex->normal[1] = *(const float *)cursor; cursor += 4;
-            rigidVertex->normal[2] = *(const float *)cursor; cursor += 4;
-            surface->texCoords[i][0] = *(const float *)cursor; cursor += 4;
-            surface->texCoords[i][1] = *(const float *)cursor; cursor += 4;
-            rigidVertex->position[0] = *(const float *)cursor; cursor += 4;
-            rigidVertex->position[1] = *(const float *)cursor; cursor += 4;
-            rigidVertex->position[2] = *(const float *)cursor; cursor += 4;
-            ++rigidVertex;
+            rigidVertex = (XSurfaceRigidVert *)blendCursor;
+            rigidVertex->position[0] = *(const float *)(*pos); (*pos) += 4;
+            rigidVertex->position[1] = *(const float *)(*pos); (*pos) += 4;
+            rigidVertex->position[2] = *(const float *)(*pos); (*pos) += 4;
+            blendCursor += 24;
+            ++texCoords;
         }
     }
 
+    weighted = surface->weightedPoints;
     for ( i = 0; i < weightedPointCount; ++i )
     {
-        ReadBlend(surface, &surface->weightedPoints[i].blend, &cursor);
-        surface->weightedPoints[i].weight = *(const float *)cursor;
-        cursor += 4;
+        ReadBlend(surface, &weighted->blend, pos);
+        weighted->weight = *(const float *)(*pos);
+        (*pos) += 4;
+        ++weighted;
     }
 
-    triangleAllocCount = surface->triangleCount;
-    if ( (triangleAllocCount & 1) != 0 )
-        ++triangleAllocCount;
-
-    surface->triangles = (unsigned short (*)[3])alloc(6 * (int)triangleAllocCount);
-
-    strips.stripCount = stripCount;
-    strips.stripVertexCounts = stripVertexCounts;
-    strips.stripIndices = stripIndices;
-    XSurfaceUnstrip(&strips, surface->triangles);
-
-    if ( (surface->triangleCount & 1) != 0 )
-    {
-        unsigned short repeated = surface->triangles[triangleAllocCount - 2][2];
-
-        surface->triangleCount = triangleAllocCount;
-        surface->triangles[triangleAllocCount - 1][0] = repeated;
-        surface->triangles[triangleAllocCount - 1][1] = repeated;
-        surface->triangles[triangleAllocCount - 1][2] = repeated;
+    triangleAllocCount=surface->triangleCount;
+    if ((triangleAllocCount & 1)!=0){
+      surface->triangleCount=++triangleAllocCount;
+      surface->triangles=(unsigned short (*)[3])alloc(6*(int)triangleAllocCount);
+      XSurfaceUnstrip(&strips,surface->triangles);
+      surface->triangles[surface->triangleCount-1][0]=surface->triangles[surface->triangleCount-2][2];
+      surface->triangles[surface->triangleCount-1][1]=surface->triangles[surface->triangleCount-2][2];
+      surface->triangles[surface->triangleCount-1][2]=surface->triangles[surface->triangleCount-2][2];
+    }else{
+      surface->triangles=(unsigned short (*)[3])alloc(6*(int)triangleAllocCount);
+      XSurfaceUnstrip(&strips,surface->triangles);
     }
-
-    *pos = cursor;
 }
 
 /* ---- XModelCreateDefaultSurface  0x0048A800 ----  VERIFIED */
 static void __cdecl XModelCreateDefaultSurface(XSurface *surface)
 {
+    XSurfaceRigidVert *verts;
+    float (*texCoords)[2];
     int i;
 
     surface->triangleCount = 1;
@@ -2878,16 +1889,20 @@ static void __cdecl XModelCreateDefaultSurface(XSurface *surface)
     xmodel_defaultTriangle[1] = 1;
     xmodel_defaultTriangle[2] = 2;
 
+    verts = (XSurfaceRigidVert *)surface->vertexData;
+    texCoords = surface->texCoords;
     for ( i = 0; i < surface->vertexCount; ++i )
     {
-        xmodel_defaultRigidVerts[i].normal[0] = 1.0f;
-        xmodel_defaultRigidVerts[i].normal[1] = 0.0f;
-        xmodel_defaultRigidVerts[i].normal[2] = 0.0f;
-        xmodel_defaultTexCoords[i][0] = 0.0f;
-        xmodel_defaultTexCoords[i][1] = 0.0f;
-        xmodel_defaultRigidVerts[i].position[0] = 0.0f;
-        xmodel_defaultRigidVerts[i].position[1] = 0.0f;
-        xmodel_defaultRigidVerts[i].position[2] = 0.0f;
+        verts->normal[0] = 1.0f;
+        verts->normal[1] = 0.0f;
+        verts->normal[2] = 0.0f;
+        (*texCoords)[0] = 0.0f;
+        (*texCoords)[1] = 0.0f;
+        verts->position[0] = 0.0f;
+        verts->position[1] = 0.0f;
+        verts->position[2] = 0.0f;
+        ++verts;
+        ++texCoords;
     }
 }
 
@@ -2898,8 +1913,8 @@ static XModelPartsEntry *XModelCreateDefaultParts(void)
     xmodel_defaultParts.baseTranslations = 0;
     xmodel_defaultPartStateIndices[0] = 0;
     xmodel_defaultPartNameTable.handles[0] = 0;
-    xmodel_defaultPartsEntry.freeData = 0;
     xmodel_defaultPartNameTable.count = 1;
+    xmodel_defaultPartsEntry.freeData = 0;
     xmodel_defaultPartNameTableSlot.partNameTable = &xmodel_defaultPartNameTable;
     xmodel_defaultParts.partNameTableSlot = &xmodel_defaultPartNameTableSlot;
     xmodel_defaultParts.rootPartCount = 1;
@@ -2941,14 +1956,12 @@ void __cdecl XModelCreateDefault(XModel *entry)
 
     for ( lodIndex = 0; lodIndex < XMODEL_LOD_COUNT; ++lodIndex )
     {
-        XModelLodInfo *lod = &xmodel_defaultCollision.lodRecords[lodIndex];
-
-        lod->surfs = 0;
-        lod->name = (const char *)&empty_string;
-        lod->distance = 0.0f;
-        lod->surfaceCount = 1;
-        lod->surfaceNameTable = xmodel_defaultSurfaceNames;
-        xmodel_defaultSurfaceNames[0] = 0;
+        xmodel_defaultCollision.lodRecords[lodIndex].surfs = 0;
+        xmodel_defaultCollision.lodRecords[lodIndex].name = "";
+        xmodel_defaultCollision.lodRecords[lodIndex].distance = 0.0f;
+        xmodel_defaultCollision.lodRecords[lodIndex].surfaceCount = 1;
+        xmodel_defaultCollision.lodRecords[lodIndex].surfaceNameTable = xmodel_defaultSurfaceNames;
+        memset( xmodel_defaultSurfaceNames, 0, sizeof( xmodel_defaultSurfaceNames ) );
     }
 
     xmodel_defaultCollision.lodRecords[0].surfs = XModelCreateDefaultSurfs();
@@ -2996,7 +2009,7 @@ XModelSurfs *__cdecl XModelSurfsPrecache(const char *name, XModelAllocFn alloc)
     const unsigned char *cursor;
     XModelSurfsData *surfs;
     XSurface *surfaces;
-    short version;
+    int version;
     short surfaceCount;
     int i;
     char path[1024];
@@ -3005,10 +2018,13 @@ XModelSurfs *__cdecl XModelSurfsPrecache(const char *name, XModelAllocFn alloc)
     if ( !entry )
     {
         if ( xmodel_enforceExist )
+        {
             Com_Error(ERR_DROP,
                       "\x15" "Cannot precache 'xmodelsurfs/%s'.\n"
                       "you may need to get latest and run converter to fix",
                       name);
+            return 0;
+        }
         Com_Printf("ERROR: Cannot precache 'xmodelsurfs/%s'", name);
         return 0;
     }
@@ -3018,19 +2034,25 @@ XModelSurfs *__cdecl XModelSurfsPrecache(const char *name, XModelAllocFn alloc)
 
     sprintf(path, "xmodelsurfs/%s", name);
     if ( FS_ReadFile(path, &fileBuffer) < 0 )
+    {
         Com_Error(ERR_DROP, "\x15" "Cannot find 'xmodelsurfs/%s'.", name);
+        return 0;
+    }
 
-    version = *(const short *)fileBuffer;
+    cursor = (const unsigned char *)fileBuffer;
+    version = *(const short *)cursor;
+    cursor += 2;
     if ( version != XMODEL_ASSET_VERSION )
     {
         FS_FreeFile(fileBuffer);
         Com_Error(ERR_DROP,
                   "\x15" "xmodelsurfs '%s' out of date (version %d, expecting %d)",
                   name, version, XMODEL_ASSET_VERSION);
+        return 0;
     }
 
-    surfaceCount = *((const short *)fileBuffer + 1);
-    cursor = (const unsigned char *)fileBuffer + 4;
+    surfaceCount = *(const short *)cursor;
+    cursor += 2;
 
     surfs = (XModelSurfsData *)alloc(12);
     surfs->surfaceCount = surfaceCount;
@@ -3060,23 +2082,33 @@ XModelPartsEntry *__cdecl XModelPartsPrecache(const char *name, XModelAllocFn al
     const unsigned char *cursor;
     XModelPartNameTable *table;
     XModelPartNameTableSlot *slot;
+    unsigned char *parentList;
     XModelPartsData *parts;
     XModelPartColl *partColls;
-    short version;
+    short (*rotation)[4];
+    float (*translation)[3];
+    int version;
     short childPartCount;
     short rootPartCount;
     short totalPartCount;
     int i;
+    vec3_t diff;
     char path[1024];
 
+    /* table lives in its stack slot (retail reloads it for every handle store
+     * instead of strength-reducing &table->handles[i] to a pointer walk) */
+    if ( 0 ) *(void **)0 = (void *)&(table);
     entry = (XModelPartsEntry *)FS_GetDataForFile("xmodelparts", name, "");
     if ( !entry )
     {
         if ( xmodel_enforceExist )
+        {
             Com_Error(ERR_DROP,
                       "\x15" "Cannot precache 'xmodelparts/%s'.\n"
                       "you may need to get latest and run converter to fix",
                       name);
+            return 0;
+        }
         Com_Printf("ERROR: Cannot precache 'xmodelparts/%s'", name);
         return 0;
     }
@@ -3086,72 +2118,88 @@ XModelPartsEntry *__cdecl XModelPartsPrecache(const char *name, XModelAllocFn al
 
     sprintf(path, "xmodelparts/%s", name);
     if ( FS_ReadFile(path, &fileBuffer) < 0 )
+    {
         Com_Error(ERR_DROP, "\x15" "Cannot find 'xmodelparts/%s'.", name);
+        return 0;
+    }
 
-    version = *(const short *)fileBuffer;
+    cursor = (const unsigned char *)fileBuffer;
+    version = *(const short *)cursor;
+    cursor += 2;
     if ( version != XMODEL_ASSET_VERSION )
     {
         FS_FreeFile(fileBuffer);
         Com_Error(ERR_DROP,
                   "\x15" "xmodelparts '%s' out of date (version %d, expecting %d)",
                   name, version, XMODEL_ASSET_VERSION);
+        return 0;
     }
 
-    childPartCount = *((const short *)fileBuffer + 1);
-    rootPartCount  = *((const short *)fileBuffer + 2);
-    totalPartCount = (short)(childPartCount + rootPartCount);
-    cursor = (const unsigned char *)fileBuffer + 6;
+    childPartCount = *(const short *)cursor;
+    cursor += 2;
+    rootPartCount = *(const short *)cursor;
+    cursor += 2;
+    totalPartCount = childPartCount + rootPartCount;
 
-    table = (XModelPartNameTable *)alloc(2 * (int)totalPartCount + 2);
+    table = (XModelPartNameTable *)alloc(2 * totalPartCount + 2);
     table->count = totalPartCount;
     if ( totalPartCount >= XMODEL_MAX_BONES + 1 )
+    {
         Com_Error(ERR_DROP, "\x15" "xmodel '%s' has more than %d bones",
                   name, XMODEL_MAX_BONES);
+        return 0;
+    }
 
-    slot = (XModelPartNameTableSlot *)alloc((int)childPartCount + 7);
+    slot = (XModelPartNameTableSlot *)alloc(childPartCount + 7);
     slot->partNameTable = table;
+    parentList = slot->parentPartDeltas;
 
-    parts = (XModelPartsData *)alloc(24 * (int)childPartCount + 104);
+    parts = (XModelPartsData *)alloc(24 * childPartCount + 104);
     parts->partNameTableSlot = slot;
     parts->baseRotations = (short (*)[4])((char *)parts + 24);
     parts->baseTranslations = childPartCount
-        ? (float (*)[3])((char *)parts + 24 + 8 * (int)childPartCount)
-        : (float (*)[3])0;
-    parts->partStateIndices = (unsigned char *)alloc((int)totalPartCount);
+        ? (float (*)[3])((char *)parts->baseRotations + 8 * childPartCount) : 0;
+    parts->partStateIndices = (unsigned char *)alloc(totalPartCount);
     parts->rootPartCount = rootPartCount;
 
-    partColls = (XModelPartColl *)alloc(40 * (int)totalPartCount);
+    partColls = (XModelPartColl *)alloc(40 * totalPartCount);
 
+    rotation    = parts->baseRotations;
+    translation = parts->baseTranslations;
+    /* parentList[i - rootPartCount], with the base pre-biased: retail indexes
+     * [base + i] (0x48AE6B) instead of strength-reducing a second pointer */
+    parentList -= rootPartCount;
     for ( i = rootPartCount; i < totalPartCount; ++i )
     {
-        int child = i - rootPartCount;
-
-        slot->parentPartDeltas[child] = (unsigned char)(i - *cursor);
+        parentList[i] = (unsigned char)(i - *cursor);
         cursor += 1;
-        parts->baseTranslations[child][0] = *(const float *)cursor; cursor += 4;
-        parts->baseTranslations[child][1] = *(const float *)cursor; cursor += 4;
-        parts->baseTranslations[child][2] = *(const float *)cursor; cursor += 4;
-        ReadQuat((const short *)cursor, parts->baseRotations[child]);
+        VectorCopy( (const float *)cursor, *translation );
+        (*translation)[0] = FloatNoSwap( (*translation)[0] );
+        (*translation)[1] = FloatNoSwap( (*translation)[1] );
+        (*translation)[2] = FloatNoSwap( (*translation)[2] );
+        cursor += 12;
+        ReadQuat((const short *)cursor, *rotation);
         cursor += 6;
+        ++rotation;
+        ++translation;
     }
 
-    for ( i = 0; i < totalPartCount; ++i )
+    for ( i = 0; i < (int)table->count; ++i )
     {
         XModelPartColl *coll = &partColls[i];
-        size_t nameLength = strlen((const char *)cursor);
-        float dx, dy, dz;
+        size_t nameLength = strlen((const char *)cursor)+1;
 
         /* type 10 -- `push 0Ah` at 0x0048AED9. */
         table->handles[i] = (unsigned short)
-            SL_GetStringOfLen((const char *)cursor, 0, nameLength + 1, 10);
-        cursor += nameLength + 1;
+            SL_GetStringOfLen((const char *)cursor, 0, nameLength, 10);
+        cursor += nameLength;
 
-        coll->mins[0] = *(const float *)cursor; cursor += 4;
-        coll->mins[1] = *(const float *)cursor; cursor += 4;
-        coll->mins[2] = *(const float *)cursor; cursor += 4;
-        coll->maxs[0] = *(const float *)cursor; cursor += 4;
-        coll->maxs[1] = *(const float *)cursor; cursor += 4;
-        coll->maxs[2] = *(const float *)cursor; cursor += 4;
+        VectorCopy( (const float *)cursor, coll->mins );
+        coll->mins[2] = FloatNoSwap( coll->mins[2] );
+        cursor += 12;
+        VectorCopy( (const float *)cursor, coll->maxs );
+        coll->maxs[1] = FloatNoSwap( coll->maxs[1] );
+        cursor += 12;
 
         coll->center[0] = coll->maxs[0] + coll->mins[0];
         coll->center[1] = coll->maxs[1] + coll->mins[1];
@@ -3160,13 +2208,11 @@ XModelPartsEntry *__cdecl XModelPartsPrecache(const char *name, XModelAllocFn al
         coll->center[1] = coll->center[1] * 0.5f;
         coll->center[2] = coll->center[2] * 0.5f;
 
-        dx = coll->maxs[0] - coll->center[0];
-        dy = coll->maxs[1] - coll->center[1];
-        dz = coll->maxs[2] - coll->center[2];
-        coll->radiusSq = dz * dz + dy * dy + dx * dx;
+        VectorSubtract( coll->maxs, coll->center, diff );
+        coll->radiusSq = diff[2] * diff[2] + diff[1] * diff[1] + diff[0] * diff[0];
     }
 
-    qmemcpy(parts->partStateIndices, cursor, (size_t)totalPartCount);
+    memcpy(parts->partStateIndices, cursor, (size_t)totalPartCount);
     FS_FreeFile(fileBuffer);
 
     parts->partCollisions = partColls;
@@ -3180,9 +2226,8 @@ static const unsigned char *XModelLoadConfigFile(const char *name,
                                                  const unsigned char *cursor,
                                                  XModelConfig *config)
 {
-    short version;
+    int version;
     int lodIndex;
-    int i;
 
     version = *(const short *)cursor;
     cursor += 2;
@@ -3194,8 +2239,12 @@ static const unsigned char *XModelLoadConfigFile(const char *name,
         return 0;
     }
 
-    for ( i = 0; i < 3; ++i ) { config->mins[i] = *(const float *)cursor; cursor += 4; }
-    for ( i = 0; i < 3; ++i ) { config->maxs[i] = *(const float *)cursor; cursor += 4; }
+    config->mins[0] = *(const float *)cursor; cursor += 4;
+    config->mins[1] = *(const float *)cursor; cursor += 4;
+    config->mins[2] = *(const float *)cursor; cursor += 4;
+    config->maxs[0] = *(const float *)cursor; cursor += 4;
+    config->maxs[1] = *(const float *)cursor; cursor += 4;
+    config->maxs[2] = *(const float *)cursor; cursor += 4;
 
     for ( lodIndex = 0; lodIndex < XMODEL_LOD_COUNT; ++lodIndex )
     {
@@ -3231,7 +2280,7 @@ static const unsigned char *XModelLoadCollData(const unsigned char *cursor,
 
     info->collisionSurfaces = (XModelCollSurf *)alloc(44 * surfaceCount);
 
-    for ( surfaceIndex = 0; surfaceIndex < surfaceCount; ++surfaceIndex )
+    for ( surfaceIndex = 0; surfaceIndex < info->collisionSurfaceCount; ++surfaceIndex )
     {
         XModelCollSurf *surf = &info->collisionSurfaces[surfaceIndex];
         int triCount;
@@ -3240,32 +2289,40 @@ static const unsigned char *XModelLoadCollData(const unsigned char *cursor,
         triCount = *(const int *)cursor;
         cursor += 4;
         surf->numCollTris = triCount;
-        surf->collTris = (XModelCollTri *)alloc(48 * triCount);
+        surf->collTris = (XModelCollTri *)alloc(48 * surf->numCollTris);
 
-        for ( triIndex = 0; triIndex < triCount; ++triIndex )
+        for ( triIndex = 0; triIndex < surf->numCollTris; ++triIndex )
         {
             float *dst = (float *)&surf->collTris[triIndex];
-            int lane;
+            dst[0]=*(const float *)cursor;cursor+=4;
+            dst[1]=*(const float *)cursor;cursor+=4;
+            dst[2]=*(const float *)cursor;cursor+=4;
+            dst[3]=*(const float *)cursor;cursor+=4;
+            dst[4]=*(const float *)cursor;cursor+=4;
+            dst[5]=*(const float *)cursor;cursor+=4;
+            dst[6]=*(const float *)cursor;cursor+=4;
+            dst[7]=*(const float *)cursor;cursor+=4;
+            dst[8]=*(const float *)cursor;cursor+=4;
+            dst[9]=*(const float *)cursor;cursor+=4;
+            dst[10]=*(const float *)cursor;cursor+=4;
+            dst[11]=*(const float *)cursor;cursor+=4;
 
-            for ( lane = 0; lane < 12; ++lane )
-            {
-                dst[lane] = *(const float *)cursor;
-                cursor += 4;
-            }
         }
 
-        surf->expandedMins[0] = *(const float *)cursor        - 0.001f;
-        surf->expandedMins[1] = *((const float *)cursor + 1)  - 0.001f;
-        surf->expandedMins[2] = *((const float *)cursor + 2)  - 0.001f;
-        surf->expandedMaxs[0] = *((const float *)cursor + 3)  + 0.001f;
-        surf->expandedMaxs[1] = *((const float *)cursor + 4)  + 0.001f;
-        surf->expandedMaxs[2] = *((const float *)cursor + 5)  + 0.001f;
-        surf->basePoseIndex   = *((const int *)cursor + 6);
-        surf->contents        = *((const int *)cursor + 7) & 0xDFFF7FFB;
-        surf->surfaceFlags    = *((const int *)cursor + 8);
-        cursor += 36;
-
+        surf->expandedMins[0]=*(const float *)cursor - 0.001f;cursor+=4;
+        surf->expandedMins[1]=*(const float *)cursor - 0.001f;cursor+=4;
+        surf->expandedMins[2]=*(const float *)cursor - 0.001f;cursor+=4;
+        surf->expandedMaxs[0]=*(const float *)cursor + 0.001f;cursor+=4;
+        surf->expandedMaxs[1]=*(const float *)cursor + 0.001f;cursor+=4;
+        surf->expandedMaxs[2]=*(const float *)cursor + 0.001f;cursor+=4;
+        /* retail's register roles (contents in ECX, then copied to EAX for the
+         * OR) come from re-reading surf->contents; the three ints are read off
+         * one cursor bump in this statement order */
+        surf->contents=*(const int *)(cursor + 4) & 0xDFFF7FFB;
+        surf->surfaceFlags=*(const int *)(cursor + 8);
         info->contents |= surf->contents;
+        surf->basePoseIndex=*(const int *)(cursor + 0);
+        cursor+=12;
     }
 
     return cursor;
@@ -3309,16 +2366,14 @@ XModel *__cdecl XModelPrecache(const char *name, int loadSurfaces,
     }
 
     info = entry->info;
-    if ( info )
-    {
-        if ( info == &xmodel_defaultCollision )
-            return entry;
-    }
-    else
+    if ( !info )
     {
         sprintf(path, "xmodel/%s", name);
         if ( FS_ReadFile(path, &fileBuffer) < 0 )
+        {
             Com_Error(ERR_DROP, "\x15" "Cannot find 'xmodel/%s'.", name);
+            return 0;
+        }
 
         cursor = XModelLoadConfigFile(name, (const unsigned char *)fileBuffer, &config);
         if ( !cursor )
@@ -3341,37 +2396,32 @@ XModel *__cdecl XModelPrecache(const char *name, int loadSurfaces,
         namePool = (char *)info + 104;
         for ( lodIndex = 0; lodIndex < XMODEL_LOD_COUNT; ++lodIndex )
         {
-            XModelLodInfo *lod = &info->lodRecords[lodIndex];
-
             strcpy(namePool, config.lods[lodIndex].name);
-            lod->name = namePool;
+            info->lodRecords[lodIndex].name = namePool;
 
             if ( *namePool )
             {
-                short surfaceCount;
-
                 ++info->lodCount;
-                surfaceCount = *(const short *)cursor;
+                info->lodRecords[lodIndex].surfaceCount = *(const short *)cursor;
                 cursor += 2;
-                lod->surfaceCount = surfaceCount;
-                lod->surfaceNameTable =
-                    (unsigned short *)alloc(2 * (int)surfaceCount);
-                for ( i = 0; i < surfaceCount; ++i )
+                info->lodRecords[lodIndex].surfaceNameTable =
+                    (unsigned short *)alloc(2 * info->lodRecords[lodIndex].surfaceCount);
+                for ( i = 0; i < info->lodRecords[lodIndex].surfaceCount; ++i )
                 {
                     const char *surfName = (const char *)cursor;
 
                     cursor += strlen(surfName) + 1;
                     /* type 8 -- `push 8` at 0x0048B473. */
-                    lod->surfaceNameTable[i] = (unsigned short)
+                    info->lodRecords[lodIndex].surfaceNameTable[i] = (unsigned short)
                         SL_GetStringOfLen(surfName, 0, strlen(surfName) + 1, 8);
                 }
             }
             else
             {
-                lod->surfaceNameTable = 0;
+                info->lodRecords[lodIndex].surfaceNameTable = 0;
             }
 
-            lod->distance = config.lods[lodIndex].distance;
+            info->lodRecords[lodIndex].distance = config.lods[lodIndex].distance;
             namePool += nameLengths[lodIndex];
         }
 
@@ -3390,6 +2440,10 @@ XModel *__cdecl XModelPrecache(const char *name, int loadSurfaces,
         info->lodRecords[0].surfs = 0;
         info->lodRecords[1].surfs = 0;
         info->lodRecords[2].surfs = 0;
+    }
+    else if ( info == &xmodel_defaultCollision )
+    {
+        return entry;
     }
 
     info->parts = XModelPartsPrecache(info->lodRecords[0].name, alloc);
@@ -3414,7 +2468,7 @@ XModel *__cdecl XModelPrecache(const char *name, int loadSurfaces,
                 }
 #ifndef DEDICATED
                 if ( xmodel_animCheck && loadSurfaces == 2 )
-                    XModelOptimize(surfs->surfs, allocMesh);
+                    XModelOptimize( (struct XModelSurfsData_s *)surfs->surfs, allocMesh );
 #endif
             }
         }
@@ -3483,27 +2537,31 @@ int __cdecl XModelGetBoneIndex(const XModel *model, unsigned short name)
 {
     const XModelPartNameTable *table =
         model->info->parts->data->partNameTableSlot->partNameTable;
+    const unsigned short *handles = table->handles;
     int partIndex;
 
     for ( partIndex = table->count - 1; partIndex >= 0; --partIndex )
     {
-        if ( table->handles[partIndex] == name )
+        if ( name == handles[partIndex] )
             break;
     }
     return partIndex;
 }
 
-/* ---- XModelGetBounds  0x0048B6B0 ----  VERIFIED */
+/* ---- XModelGetBounds  0x0048B6B0 ----  VERIFIED
+ * No retail caller: inlined into DObjGetBounds.  The mins/maxs pointers are
+ * separate locals so the inlined copy in SV_LinkEntity allocates as retail. */
 void __cdecl XModelGetBounds(const XModel *model, float *mins, float *maxs)
 {
-    const XModelInfo *info = model->info;
+    const float *mn = model->info->mins;
+    const float *mx = model->info->maxs;
 
-    mins[0] = info->mins[0];
-    mins[1] = info->mins[1];
-    mins[2] = info->mins[2];
-    maxs[0] = info->maxs[0];
-    maxs[1] = info->maxs[1];
-    maxs[2] = info->maxs[2];
+    mins[0] = mn[0];
+    mins[1] = mn[1];
+    mins[2] = mn[2];
+    maxs[0] = mx[0];
+    maxs[1] = mx[1];
+    maxs[2] = mx[2];
 }
 
 /* ---- XModelGetSurfaces  0x0048B6E0 ----  VERIFIED */
@@ -3513,7 +2571,7 @@ int __cdecl XModelGetSurfaces(int lodIndex, const XModel *model,
     const XModelSurfsData *surfs = model->info->lodRecords[lodIndex].surfs->surfs;
 
     *surfaces = surfs->surfaces;
-    return surfs->surfaceCount;
+    return model->info->lodRecords[lodIndex].surfs->surfs->surfaceCount;
 }
 
 /* ---- XModelGetSurfaceName  0x0048B710 ----  VERIFIED */
@@ -3533,15 +2591,13 @@ XSurface *__cdecl XSurfaceCloneSurface(const XSurface *surface,
                                        XModelAllocFn alloc)
 {
     XSurface *clone = (XSurface *)alloc(52);
-    int texCoordBytes;
 
-    qmemcpy(clone, surface, 0x34);
+    memcpy(clone, surface, 0x34);
     clone->optimizedDataATI = 0;
     clone->optimizedDataNV = 0;
 
-    texCoordBytes = 8 * (int)clone->vertexCount;
-    clone->texCoords = (float (*)[2])alloc(texCoordBytes);
-    Com_Memcpy(clone->texCoords, surface->texCoords, (size_t)texCoordBytes);
+    clone->texCoords = (float (*)[2])alloc(8 * clone->vertexCount);
+    Com_Memcpy(clone->texCoords, surface->texCoords, 8 * clone->vertexCount);
     return clone;
 }
 
@@ -3564,42 +2620,32 @@ int __cdecl XSurfaceTileMode(const XSurface *surface)
 }
 
 /* ---- XSurfaceGetTris  0x0048B7C0 ---- */
-unsigned int __cdecl XSurfaceGetTris(unsigned int result, int a2, unsigned short a3)
+void __cdecl XSurfaceGetTris( unsigned int out, int surfacePtr,
+                              unsigned short indexOffset )
 {
-  int v4;
-  _DWORD *v5;
-  int v6;
-  int v7;
-  _DWORD *v8;
-  _DWORD *v9;
-  void *v10;
+  XSurface *surface = (XSurface *)surfacePtr;
 
-  if ( a3 )
+  if ( indexOffset )
   {
-    v4 = a3 | (a3 << 16);
-    v5 = *(_DWORD **)(a2 + 28);
-    v6 = *(__int16 *)(a2 + 4) >> 1;
+    /* Same offset added to both packed 16-bit indices of a dword at once. */
+    unsigned int        addBoth = indexOffset | ( indexOffset << 16 );
+    const unsigned int *src = (const unsigned int *)surface->triangles;
+    unsigned int       *dst = (unsigned int *)out;
+    int                 pairs = surface->triangleCount >> 1; /* 2 tris == 3 dwords */
+
     do
     {
-      *(_DWORD *)result = v4 + *v5;
-      v7 = v5[1];
-      v8 = v5 + 1;
-      v9 = (_DWORD *)(result + 4);
-      *v9++ = v4 + v7;
-      *v9 = v4 + v8[1];
-      result = (unsigned int)(v9 + 1);
-      v5 = v8 + 2;
-      --v6;
+      *dst++ = *src++ + addBoth;
+      *dst++ = *src++ + addBoth;
+      *dst++ = *src++ + addBoth;
+      --pairs;
     }
-    while ( v6 );
+    while ( pairs );
   }
   else
   {
-    v10 = (void *)result;
-    result = 6 * *(__int16 *)(a2 + 4);
-    qmemcpy(v10, *(const void **)(a2 + 28), result);
+    memcpy( (void *)out, surface->triangles, 6 * surface->triangleCount );
   }
-  return result;
 }
 
 /* ---- XSurfaceGetBlendInfoArray  0x0048B830 ----  VERIFIED */
@@ -3637,9 +2683,10 @@ void __cdecl XSurfaceRemapTextureCoordinates(XSurface *surface,
 
     for ( i = surface->vertexCount; i; --i )
     {
+        float sourceU = texCoords[sourceUIndex];
         float sourceV = texCoords[sourceVIndex];
 
-        texCoords[0] = texCoords[sourceUIndex] * scale[0] + offset[0];
+        texCoords[0] = sourceU * scale[0] + offset[0];
         texCoords[1] = sourceV * scale[1] + offset[1];
         texCoords += 2;
     }
@@ -3658,8 +2705,9 @@ int __cdecl XModelGetContents(const XModel *model)
 }
 
 /* ---- XSurfaceTransformPoint43  0x0048B8C0 ----  VERIFIED */
-void __cdecl XSurfaceTransformPoint43(const DObjSkelMat *matrix,
-                                      const float *point, float *out)
+/* (no callers) VC7 orders these commutative float terms by parameter order. */
+void __cdecl XSurfaceTransformPoint43(const float *point,
+                                      const DObjSkelMat *matrix, float *out)
 {
     out[0] = matrix->axis[2][0] * point[2] + matrix->axis[1][0] * point[1]
            + point[0] * matrix->axis[0][0] + matrix->origin[0];
@@ -3670,11 +2718,11 @@ void __cdecl XSurfaceTransformPoint43(const DObjSkelMat *matrix,
 }
 
 /* ---- XSurfaceAccumulateWeightedPoint43  0x0048B910 ----  VERIFIED */
-void __cdecl XSurfaceAccumulateWeightedPoint43(const DObjSkelMat *matrix,
-                                               const float *point, float *out,
+void __cdecl XSurfaceAccumulateWeightedPoint43(const float *point, float *out,
+                                               const DObjSkelMat *matrix,
                                                float weight)
 {
-    out[0] += (matrix->axis[1][0] * point[1] + matrix->axis[2][0] * point[2]
+    out[0] += (( matrix->axis[1][0] * point[1] + matrix->axis[2][0] * point[2] )
              + point[0] * matrix->axis[0][0] + matrix->origin[0]) * weight;
     out[1] += (matrix->axis[1][1] * point[1] + matrix->axis[2][1] * point[2]
              + matrix->axis[0][1] * point[0] + matrix->origin[1]) * weight;
@@ -3683,8 +2731,8 @@ void __cdecl XSurfaceAccumulateWeightedPoint43(const DObjSkelMat *matrix,
 }
 
 /* ---- XSurfaceTransformNormal43  0x0048B980 ----  VERIFIED */
-void __cdecl XSurfaceTransformNormal43(const DObjSkelMat *matrix,
-                                       const float *normal, float *out)
+void __cdecl XSurfaceTransformNormal43(const float *normal,
+                                       const DObjSkelMat *matrix, float *out)
 {
     out[0] = matrix->axis[2][0] * normal[2] + matrix->axis[1][0] * normal[1]
            + normal[0] * matrix->axis[0][0];
@@ -3695,8 +2743,8 @@ void __cdecl XSurfaceTransformNormal43(const DObjSkelMat *matrix,
 }
 
 /* ---- XSurfaceTransformVectorRows43  0x0048B9D0 ----  VERIFIED */
-void __cdecl XSurfaceTransformVectorRows43(const DObjSkelMat *matrix,
-                                           const float *vector, float *out)
+void __cdecl XSurfaceTransformVectorRows43(const float *vector,
+                                           const DObjSkelMat *matrix, float *out)
 {
     out[0] = matrix->axis[0][1] * vector[1] + matrix->axis[0][2] * vector[2]
            + vector[0] * matrix->axis[0][0];
@@ -3706,175 +2754,101 @@ void __cdecl XSurfaceTransformVectorRows43(const DObjSkelMat *matrix,
            + matrix->axis[2][2] * vector[2];
 }
 
-/* ---- XSurfaceGetVerts  0x0048BA20 ---- */
-int __cdecl XSurfaceGetVerts(char *a1, float *a2, int a3, int a4, int a5)
+/*
+ * ---- XSurfaceGetVerts  0x0048BA20 ----
+ * Software-skins one XSurface into caller buffers: texCoordsOut (optional raw
+ * copy), positionsOut (xyz positions) and normalsOut (optional xyz normals),
+ * using the DObjSkelMat[] at matrixBase (boneMatrixOffset is a byte offset).
+ * Rigid surfaces use one bone matrix; blended surfaces (boneMatrixOffset == -1)
+ * transform by each vertex's primary bone and accumulate additive weights.
+ */
+void __cdecl XSurfaceGetVerts( const XSurface *surface, const char *matrixBase, float *positionsOut,
+                               float *texCoordsOut, float *normalsOut )
 {
-  bool v6;
-  int result;
-  int v8;
-  int v10;
-  char *v11;
-  unsigned int v12;
-  char *v13;
-  char *v14;
-  char v15;
-  int v16;
-  double v17;
-  int v18;
-  int v19;
-  int v20;
-  double v21;
-  float *v22;
-  int v23;
-  double v24;
-  int v25;
-  int v26;
-  double v27;
-  double v28;
-  double v29;
-  int v30;
+    const char *vertexData;
+    int         boneMatrixOffset;
+    int         vertIndex;
 
-  v6 = a1 == 0;
-  result = a3;
-  v8 = *(_DWORD *)(a3 + 32);
-  v10 = *(__int16 *)(a3 + 6);
-  v30 = v10;
-  if ( !v6 )
-  {
-    v11 = *(char **)(a3 + 36);
-    v12 = 8 * *(__int16 *)(a3 + 2);
-    qmemcpy(a1, v11, 4 * (v12 >> 2));
-    v14 = &v11[4 * (v12 >> 2)];
-    v13 = &a1[4 * (v12 >> 2)];
-    v15 = v12;
-    result = a3;
-    qmemcpy(v13, v14, v15 & 3);
-    v10 = v30;
-  }
-  if ( v10 == -1 )
-  {
-    v18 = *(_DWORD *)(result + 24);
-    result = *(__int16 *)(result + 2);
-    if ( result )
+    vertexData       = (const char *)XSurfaceGetBlendInfoArray( surface );
+    boneMatrixOffset = XSurfaceGetBoneIndex( surface );
+    if ( texCoordsOut )
+        memcpy( texCoordsOut, XSurfaceGetTexCoordArray( surface ), 8 * XSurfaceGetNumVerts( surface ) );
+
+    if ( boneMatrixOffset != -1 )
     {
-      v19 = result;
-      do
-      {
-        if ( a5 )
+        const DObjSkelMat       *mat  = (const DObjSkelMat *)( matrixBase + boneMatrixOffset );
+
+        for ( vertIndex = XSurfaceGetNumVerts( surface ); vertIndex; --vertIndex )
         {
-          v20 = *(_DWORD *)(v8 + 28);
-          v21 = *(float *)(v20 + a4 + 32);
-          v22 = (float *)(a4 + v20);
-          a5 += 12;
-          *(float *)(a5 - 12) = v21 * *(float *)(v8 + 8) + v22[4] * *(float *)(v8 + 4) + *(float *)v8 * *v22;
-          *(float *)(a5 - 8) = v22[9] * *(float *)(v8 + 8) + v22[1] * *(float *)v8 + v22[5] * *(float *)(v8 + 4);
-          *(float *)(a5 - 4) = v22[10] * *(float *)(v8 + 8) + v22[2] * *(float *)v8 + v22[6] * *(float *)(v8 + 4);
+            if ( normalsOut )
+            {
+                XSurfaceTransformNormal43( ((const XSurfaceRigidVert *)vertexData)->normal, mat, normalsOut );
+                normalsOut += 3;
+            }
+            XSurfaceTransformPoint43( ((const XSurfaceRigidVert *)vertexData)->position, mat, positionsOut );
+            vertexData += sizeof( XSurfaceRigidVert );
+            positionsOut += 3;
         }
-        v23 = *(_DWORD *)(v8 + 28);
-        v24 = *(float *)(v23 + a4 + 16);
-        result = a4 + v23;
-        *a2 = v24 * *(float *)(v8 + 20)
-            + *(float *)(result + 32) * *(float *)(v8 + 24)
-            + *(float *)(v8 + 16) * *(float *)result
-            + *(float *)(result + 48);
-        a2[1] = *(float *)(result + 20) * *(float *)(v8 + 20)
-              + *(float *)(result + 4) * *(float *)(v8 + 16)
-              + *(float *)(result + 36) * *(float *)(v8 + 24)
-              + *(float *)(result + 52);
-        a2[2] = *(float *)(result + 24) * *(float *)(v8 + 20)
-              + *(float *)(result + 8) * *(float *)(v8 + 16)
-              + *(float *)(result + 40) * *(float *)(v8 + 24)
-              + *(float *)(result + 56);
-        v25 = *(_DWORD *)(v8 + 12);
-        if ( v25 )
-        {
-          *a2 = *(float *)(v8 + 32) * *a2;
-          a2[1] = a2[1] * *(float *)(v8 + 32);
-          a2[2] = *(float *)(v8 + 32) * a2[2];
-          do
-          {
-            v26 = *(_DWORD *)(v18 + 12);
-            v27 = *(float *)(v18 + 16);
-            v28 = *(float *)(v26 + a4 + 32);
-            result = a4 + v26;
-            v29 = v28 * *(float *)(v18 + 8);
-            --v25;
-            v18 += 20;
-            *a2 = (v29
-                 + *(float *)(result + 16) * *(float *)(v18 - 16)
-                 + *(float *)(v18 - 20) * *(float *)result
-                 + *(float *)(result + 48))
-                * v27
-                + *a2;
-            a2[1] = (*(float *)(result + 36) * *(float *)(v18 - 12)
-                   + *(float *)(result + 4) * *(float *)(v18 - 20)
-                   + *(float *)(result + 20) * *(float *)(v18 - 16)
-                   + *(float *)(result + 52))
-                  * v27
-                  + a2[1];
-            a2[2] = (*(float *)(result + 40) * *(float *)(v18 - 12)
-                   + *(float *)(result + 8) * *(float *)(v18 - 20)
-                   + *(float *)(result + 24) * *(float *)(v18 - 16)
-                   + *(float *)(result + 56))
-                  * v27
-                  + a2[2];
-          }
-          while ( v25 );
-          v8 += 36;
-        }
-        else
-        {
-          v8 += 32;
-        }
-        a2 += 3;
-        --v19;
-      }
-      while ( v19 );
     }
-  }
-  else
-  {
-    v16 = *(__int16 *)(result + 2);
-    if ( *(_WORD *)(result + 2) )
+    else
     {
-      result = v8 + 16;
-      do
-      {
-        if ( a5 )
+        const XSurfaceWeightedPoint *weighted = XSurfaceGetVertexInfoArray( surface );
+
+        for ( vertIndex = XSurfaceGetNumVerts( surface ); vertIndex; --vertIndex )
         {
-          a5 += 12;
-          *(float *)(a5 - 12) = *(float *)v8 * *(float *)(v10 + a4)
-                              + *(float *)(result - 8) * *(float *)(v10 + a4 + 32)
-                              + *(float *)(v10 + a4 + 16) * *(float *)(result - 12);
-          *(float *)(a5 - 8) = *(float *)(v10 + a4 + 4) * *(float *)v8
-                             + *(float *)(v10 + a4 + 36) * *(float *)(result - 8)
-                             + *(float *)(v10 + a4 + 20) * *(float *)(result - 12);
-          *(float *)(a5 - 4) = *(float *)(v10 + a4 + 8) * *(float *)v8
-                             + *(float *)(v10 + a4 + 40) * *(float *)(result - 8)
-                             + *(float *)(v10 + a4 + 24) * *(float *)(result - 12);
+            const XSurfaceBlendVert *vert = (const XSurfaceBlendVert *)vertexData;
+            int                      additiveCount;
+
+            if ( normalsOut )
+            {
+                {
+                const DObjSkelMat *nm = (const DObjSkelMat *)( matrixBase + vert->blend.boneMatrixOffset );
+                XSurfaceTransformNormal43( vert->normal, nm, normalsOut );
+                }
+                normalsOut += 3;
+            }
+            {
+            const DObjSkelMat *pm = (const DObjSkelMat *)( matrixBase + vert->blend.boneMatrixOffset );
+            const float *pp = vert->blend.position;
+            /* VC7 orders the x87 operands of each product itself; the volatile read of
+             * pp[0], the nm/out pointer copies and am->axis[0][0] below are what put
+             * every pair in retail's order (0x48BB8C..0x48BC5D) */
+            positionsOut[0] = ( pm->axis[1][0] * pp[1] + pm->axis[2][0] * pp[2] ) + *(volatile const float *)&pp[0] * pm->axis[0][0] + pm->origin[0];
+            positionsOut[1] = ( pm->axis[0][1] * pp[0] + pm->axis[1][1] * pp[1] ) + pm->axis[2][1] * pp[2] + pm->origin[1];
+            positionsOut[2] = ( pm->axis[0][2] * pp[0] + pm->axis[1][2] * pp[1] ) + pm->axis[2][2] * pp[2] + pm->origin[2];
+            }
+            additiveCount = vert->additiveWeightCount;
+            if ( !additiveCount )
+            {
+                vertexData += sizeof( XSurfaceBlendVert ) - sizeof( float );
+            }
+            else
+            {
+                {
+                float *out = positionsOut;
+                out[0] *= vert->primaryWeight;
+                out[1] *= vert->primaryWeight;
+                out[2] *= vert->primaryWeight;
+                }
+                do
+                {
+                    {
+                    const DObjSkelMat *am = (const DObjSkelMat *)( matrixBase + weighted->blend.boneMatrixOffset );
+                    const float *ap = weighted->blend.position;
+                    float aw = weighted->weight;
+                    positionsOut[0] += ( ( am->axis[1][0] * ap[1] + am->axis[2][0] * ap[2] ) + ap[0] * am->axis[0][0] + am->origin[0] ) * aw;
+                    positionsOut[1] += ( ( am->axis[0][1] * ap[0] + am->axis[2][1] * ap[2] ) + am->axis[1][1] * ap[1] + am->origin[1] ) * aw;
+                    positionsOut[2] += ( ( am->axis[0][2] * ap[0] + am->axis[2][2] * ap[2] ) + am->axis[1][2] * ap[1] + am->origin[2] ) * aw;
+                    }
+                    --additiveCount;
+                    ++weighted;
+                }
+                while ( additiveCount );
+                vertexData += sizeof( XSurfaceBlendVert );
+            }
+            positionsOut += 3;
         }
-        v8 += 24;
-        v17 = *(float *)(v10 + a4 + 16) * *(float *)result;
-        result += 24;
-        a2 += 3;
-        --v16;
-        *(a2 - 3) = v17
-                  + *(float *)(result - 20) * *(float *)(v10 + a4 + 32)
-                  + *(float *)(result - 28) * *(float *)(v10 + a4)
-                  + *(float *)(v10 + a4 + 48);
-        *(a2 - 2) = *(float *)(result - 24) * *(float *)(v10 + a4 + 20)
-                  + *(float *)(v10 + a4 + 4) * *(float *)(result - 28)
-                  + *(float *)(v10 + a4 + 36) * *(float *)(result - 20)
-                  + *(float *)(v10 + a4 + 52);
-        *(a2 - 1) = *(float *)(result - 24) * *(float *)(v10 + a4 + 24)
-                  + *(float *)(v10 + a4 + 8) * *(float *)(result - 28)
-                  + *(float *)(v10 + a4 + 40) * *(float *)(result - 20)
-                  + *(float *)(v10 + a4 + 56);
-      }
-      while ( v16 );
     }
-  }
-  return result;
 }
 
 /* ---- XModelGetNumLods  0x0048BCD0 ----  VERIFIED */
@@ -3902,10 +2876,10 @@ void __cdecl XModelSetTestLods(int lodIndex, float distance)
 /* ---- XModelSetTestLodDist  0x0048BD40 ----  VERIFIED */
 void __cdecl XModelSetTestLodDist(float distance)
 {
-    if ( distance <= 0.0f )
-        xmodel_testLodDist = 0.0f;
-    else
+    if ( distance > 0.0f )
         xmodel_testLodDist = distance;
+    else
+        xmodel_testLodDist = 0.0f;
 }
 
 /* ---- XModelGetLodForDist  0x0048BD70 ----  VERIFIED */
@@ -3915,10 +2889,10 @@ int __cdecl XModelGetLodForDist(const XModel *model, float distance)
     int lodCount;
     int lodIndex;
 
-    if ( xmodel_testLodsEnabled )
-        lod = xmodel_testLodDistances;
-    else
+    if ( !xmodel_testLodsEnabled )
         lod = model->info->lodRecords;
+    else
+        lod = xmodel_testLodDistances;
 
     if ( xmodel_testLodDist != 0.0f )
         distance = xmodel_testLodDist;
@@ -3937,17 +2911,18 @@ int __cdecl XModelGetLodForDist(const XModel *model, float distance)
 /* ---- XModelGetBasePose  0x0048BDE0 ----  VERIFIED */
 void __cdecl XModelGetBasePose(XModel *model, DObjSkelMat *basePose)
 {
+    extern void QuatMultiply(const float *,const float *,float *);
     const XModelPartsData *parts = model->info->parts->data;
     const XModelPartNameTableSlot *slot = parts->partNameTableSlot;
     const unsigned char *deltas = slot->parentPartDeltas;
     const short (*rotation)[4] = parts->baseRotations;
     const float (*translation)[3] = parts->baseTranslations;
     int totalPartCount = slot->partNameTable->count;
-    int rootPartCount = parts->rootPartCount;
     float *row = (float *)basePose;
     int i;
+    float q[4];
 
-    for ( i = rootPartCount; i; --i )
+    for ( i = parts->rootPartCount; i; --i )
     {
         row[0] = 0.0f;
         row[1] = 0.0f;
@@ -3956,55 +2931,45 @@ void __cdecl XModelGetBasePose(XModel *model, DObjSkelMat *basePose)
         row += 16;
     }
 
-    for ( i = rootPartCount; i < totalPartCount; ++i )
+    for ( i = totalPartCount - parts->rootPartCount; i; --i )
     {
-        int child = i - rootPartCount;
-        float qx = (float)rotation[child][0] * 0.000030518509f;
-        float qy = (float)rotation[child][1] * 0.000030518509f;
-        float qz = (float)rotation[child][2] * 0.000030518509f;
-        float qw = (float)rotation[child][3] * 0.000030518509f;
-        const float *parent = &row[-16 * (int)deltas[child]];
-
-        row[0] = qz * parent[1] + qx * parent[3] + qw * parent[0] - qy * parent[2];
-        row[1] = qy * parent[3] - qz * parent[0] + qx * parent[2] + qw * parent[1];
-        row[2] = qz * parent[3] + qy * parent[0] - qx * parent[1] + qw * parent[2];
-        row[3] = qw * parent[3] - qx * parent[0] - qy * parent[1] - qz * parent[2];
+        q[0] = (float)(*rotation)[0] * 0.000030518509f;
+        q[1] = (float)(*rotation)[1] * 0.000030518509f;
+        q[2] = (float)(*rotation)[2] * 0.000030518509f;
+        q[3] = (float)(*rotation)[3] * 0.000030518509f;
+        QuatMultiply( q, &row[-16 * *deltas], row );
+        ++rotation;
         row += 16;
+        ++deltas;
     }
 
-    row = (float *)basePose;
-    for ( i = rootPartCount; i; --i )
+    for ( i = parts->rootPartCount; i; --i )
     {
-        row[0]  = 1.0f; row[1] = 0.0f; row[2]  = 0.0f;
-        row[4]  = 0.0f; row[5] = 1.0f; row[6]  = 0.0f;
-        row[8]  = 0.0f; row[9] = 0.0f; row[10] = 1.0f;
-        row[14] = 0.0f;
-        row[13] = 0.0f;
-        row[12] = 0.0f;
-        row += 16;
+        basePose->axis[0][0] = 1.0f; basePose->axis[0][1] = 0.0f; basePose->axis[0][2] = 0.0f;
+        basePose->axis[1][0] = 0.0f; basePose->axis[1][1] = 1.0f; basePose->axis[1][2] = 0.0f;
+        basePose->axis[2][0] = 0.0f; basePose->axis[2][1] = 0.0f; basePose->axis[2][2] = 1.0f;
+        basePose->origin[2] = 0.0f;
+        basePose->origin[1] = 0.0f;
+        basePose->origin[0] = 0.0f;
+        ++basePose;
     }
 
-    for ( i = rootPartCount; i < totalPartCount; ++i )
+    deltas = slot->parentPartDeltas;
+    for ( i = totalPartCount - parts->rootPartCount; i; --i )
     {
-        int child = i - rootPartCount;
-        const float *parent;
-        const float *t;
+        const DObjSkelMat *parent;
 
-        XModelExpandQuatToAxis(row);
-        parent = &row[-16 * (int)deltas[child]];
-        t = translation[child];
+        XModelExpandQuatToAxis( (float *)basePose );
+        parent = basePose - *deltas;
 
-        row[12] = parent[8] * t[2] + parent[4] * t[1] + t[0] * parent[0] + parent[12];
-        row[13] = parent[9] * t[2] + parent[5] * t[1] + parent[1] * t[0] + parent[13];
-        row[14] = parent[10] * t[2] + parent[6] * t[1] + parent[2] * t[0] + parent[14];
-        row += 16;
+        row = basePose->origin;
+        row[0] = parent->axis[2][0] * (*translation)[2] + parent->axis[1][0] * (*translation)[1] + (*translation)[0] * parent->axis[0][0] + parent->origin[0];
+        row[1] = ( parent->axis[2][1] * (*translation)[2] + parent->axis[1][1] * (*translation)[1] ) + parent->axis[0][1] * (*translation)[0] + parent->origin[1];
+        row[2] = ( parent->axis[2][2] * (*translation)[2] + parent->axis[1][2] * (*translation)[1] ) + parent->axis[0][2] * (*translation)[0] + parent->origin[2];
+        ++basePose;
+        ++translation;
+        ++deltas;
     }
-}
-
-/* ---- sub_48BDE0  no-address ---- */
-void __cdecl sub_48BDE0(XModel *model, DObjSkelMat *basePose)
-{
-    XModelGetBasePose(model, basePose);
 }
 
 extern qboolean CM_TraceBox( const float *start, const float *end,
@@ -4014,7 +2979,10 @@ extern qboolean CM_TraceBox( const float *start, const float *end,
 /* ---- XModelTraceLine  0x0048C070 ----  VERIFIED */
 int __cdecl XModelTraceLine(
         int          model,        /* @<eax>  XModel *                        */
-        int          work,         /* @<esi>  48-byte trace record, narrowed  */
+        trace_t     *work,         /* @<esi>  48-byte trace record; a pointer,
+                                    * not an int: an int parameter makes LTCG treat
+                                    * CM_TraceStaticModel's &work as escaped, which
+                                    * blocks retail's load hoisting at 0x0041FE09 */
         const float *basePose,
         const float *start,
         const float *end,
@@ -4025,45 +2993,50 @@ int __cdecl XModelTraceLine(
   const float   *tris;
   const float   *tri;
   const float   *m;
-  int            numSurfs, surfIndex, surfOffset;
+  int            surfIndex;
   int            numTris, triIndex;
   int            boneIndex, hitBone;
   float          localStart[3];
   float          localEnd[3];
   float          delta[3];
   float          mid[3];
-  float          dx, dy, dz;
-  float          dStart, dEnd, denom, frac, t, u, v;
-  float          n0, n1, n2;
+  /* Values retail keeps on the x87 stack (_PC_53) are floats; the floats are
+   * exactly the values retail spills with fst/fstp. */
+  float         dx, dy, dz;
+  float         dEndX, dStartX, denom, fracX, t, mid2X, uX, vX;
+  float          dStart, dEnd, frac, u;
+  float          fraction;
+  float          normal[3];
 
-  collLod  = *(unsigned char **)(model + 4);
+  /* delta lives in its stack home: retail's final normal store order
+   * ([esi+18h] via EDX, then fstp [esi+10h]/[esi+14h]) */
+  if ( 0 ) *(void **)0 = (void *)&(delta);
   hitBone  = -1;
-  numSurfs = *(int *)(collLod + 0x44);
-  if ( numSurfs <= 0 )
-    return -1;
-
-  surfOffset = 0;
-  for ( surfIndex = 0; surfIndex < numSurfs; surfIndex++, surfOffset += 44 )
+  collLod  = *(unsigned char **)(model + 4);
+  for ( surfIndex = 0; surfIndex < *(int *)(collLod+0x44); surfIndex++ )
   {
-    surf = *(unsigned char **)(collLod + 0x40) + surfOffset;
+    surf = *(unsigned char **)(collLod + 0x40) + 44 * surfIndex;
 
     if ( ( *(int *)(surf + 0x24) & contentmask ) == 0 )
       continue;
 
+    fraction  = *(float *)work;
     boneIndex = *(int *)(surf + 0x20);
     m         = basePose + ( boneIndex << 4 );
 
-    dx = start[0] - m[12];
-    dy = start[1] - m[13];
-    dz = start[2] - m[14];
+    /* 0x48C0CB-0x48C0DF: never stored, used straight from ST. */
+    dx = (float)start[0] - m[12];
+    dy = (float)start[1] - m[13];
+    dz = (float)start[2] - m[14];
     localStart[0] = dx * m[0] + dz * m[2]  + dy * m[1];
-    localStart[1] = dz * m[6] + dy * m[5]  + dx * m[4];
+    localStart[1] = dx * m[4] + ( dy * m[5] + dz * m[6] );
     localStart[2] = dx * m[8] + dz * m[10] + dy * m[9];
 
-    dx = end[0] - m[12];
-    dy = end[1] - m[13];
-    dz = end[2] - m[14];
-    localEnd[0] = dx * m[0] + dz * m[2]  + dy * m[1];
+    /* 0x48C124-0x48C132: likewise kept in registers. */
+    dx = (float)end[0] - m[12];
+    dy = (float)end[1] - m[13];
+    dz = (float)end[2] - m[14];
+    localEnd[0] = ( dx * m[0] ) + dz * m[2] + dy * m[1];
     localEnd[1] = dz * m[6] + dy * m[5]  + dx * m[4];
     localEnd[2] = dx * m[8] + dz * m[10] + dy * m[9];
 
@@ -4074,53 +3047,62 @@ int __cdecl XModelTraceLine(
     if ( CM_TraceBox( localStart, localEnd,
                       (const float *)( surf + 0x08 ),
                       (const float *)( surf + 0x14 ),
-                      *(float *)work ) != qfalse )
+                      fraction ) != qfalse )
       continue;
 
     numTris = *(int *)(surf + 4);
     tris    = *(const float **)surf;
 
-    for ( triIndex = 0; triIndex < numTris; triIndex++ )
+    for(triIndex=0;triIndex<*(int *)(surf+4);++triIndex)
     {
-      tri = tris + triIndex * 12;
+      tri = *(const float **)surf + 12 * triIndex;
 
-      dEnd = localEnd[0] * tri[0] + localEnd[2] * tri[2] + localEnd[1] * tri[1]
-             - tri[3];
-      if ( dEnd >= 0.0f )
+      dEndX = ( (float)localEnd[0] * tri[0] ) + (float)localEnd[2] * tri[2]
+              + (float)localEnd[1] * tri[1] - tri[3];
+      if ( dEndX >= 0.0f )                 /* 0x48C1F4 compares unrounded */
+        continue;
+      dEnd = (float)dEndX;                /* 0x48C1F0 fst */
+
+      dStartX = ( (float)localStart[0] * tri[0] ) + (float)localStart[2] * tri[2]
+                + (float)localStart[1] * tri[1] - tri[3];
+      if ( dStartX <= 0.0f )               /* 0x48C224 */
+        continue;
+      dStart = (float)dStartX;            /* 0x48C220 fst */
+
+      fracX = ( dStart - 0.125f ) / ( dStart - dEnd );
+      if ( fracX >= *(float *)work )      /* 0x48C24D compares unrounded */
+        continue;
+      frac = (float)fracX;                /* 0x48C249 fst; the value stored to work */
+
+      t      = dStart / ( dStart - dEnd );
+      mid[0] = (float)( delta[0] * t + localStart[0] );
+      mid[1] = (float)( delta[1] * t + localStart[1] );
+      mid2X  = t * delta[2] + localStart[2];
+      mid[2] = (float)mid2X;              /* 0x48C282 fst; the unrounded ST0 feeds u */
+
+      uX = mid[2] * tri[6] + (float)mid[1] * tri[5] + (float)mid[0] * tri[4]
+           - tri[7];
+      if ( uX < -0.001f )                 /* 0x48C2A2 compares unrounded */
+        continue;
+      u = (float)uX;                      /* 0x48C29E fst */
+      if ( u > 1.001f )                   /* 0x48C2B3 reloads the float u */
         continue;
 
-      dStart = localStart[0] * tri[0] + localStart[2] * tri[2]
-               + localStart[1] * tri[1] - tri[3];
-      if ( dStart <= 0.0f )
+      /* never stored; uses the float mid[2] */
+      vX = (float)mid[2] * tri[10] + (float)mid[1] * tri[9]
+           + (float)mid[0] * tri[8] - tri[11];
+      if ( vX < -0.001f || u + vX > 1.001f )  /* 0x48C2E0 / 0x48C2ED: u_f + v_unrounded */
         continue;
 
-      denom = dStart - dEnd;
-      frac  = ( dStart - 0.125f ) / denom;
-      if ( frac >= *(float *)work )
-        continue;
-
-      t      = dStart / denom;
-      mid[0] = delta[0] * t + localStart[0];
-      mid[1] = delta[1] * t + localStart[1];
-      mid[2] = t * delta[2] + localStart[2];
-
-      u = mid[2] * tri[6] + mid[1] * tri[5] + mid[0] * tri[4] - tri[7];
-      if ( u < -0.001f || u > 1.001f )
-        continue;
-
-      v = mid[2] * tri[10] + mid[1] * tri[9] + mid[0] * tri[8] - tri[11];
-      if ( v < -0.001f || u + v > 1.001f )
-        continue;
-
-      *(unsigned char *)( work + 47 ) = 0;
-      *(unsigned char *)( work + 46 ) = 0;
+      *(unsigned char *)( (unsigned char *)work + 47 ) = 0;
+      *(unsigned char *)( (unsigned char *)work + 46 ) = 0;
       *(float *)work                  = frac;
-      *(int *)( work + 28 )           = *(int *)( surf + 0x28 );
-      *(int *)( work + 32 )           = *(int *)( surf + 0x24 );
-      *(float *)( work + 16 )         = tri[0];
-      *(float *)( work + 20 )         = tri[1];
-      *(float *)( work + 24 )         = tri[2];
+      *(int *)( (unsigned char *)work + 28 )           = *(int *)( surf + 0x28 );
+      *(int *)( (unsigned char *)work + 32 )           = *(int *)( surf + 0x24 );
       hitBone                         = boneIndex;
+      *(float *)( (unsigned char *)work + 16 )         = tri[0];
+      *(float *)( (unsigned char *)work + 20 )         = tri[1];
+      *(float *)( (unsigned char *)work + 24 )         = tri[2];
     }
   }
 
@@ -4128,93 +3110,68 @@ int __cdecl XModelTraceLine(
     return -1;
 
   m  = basePose + ( hitBone << 4 );
-  n0 = m[8]  * *(float *)( work + 24 ) + m[4] * *(float *)( work + 20 )
-       + m[0] * *(float *)( work + 16 );
-  n1 = m[9]  * *(float *)( work + 24 ) + m[5] * *(float *)( work + 20 )
-       + m[1] * *(float *)( work + 16 );
-  n2 = m[10] * *(float *)( work + 24 ) + m[6] * *(float *)( work + 20 )
-       + m[2] * *(float *)( work + 16 );
-  *(float *)( work + 24 ) = n2;
-  *(float *)( work + 16 ) = n0;
-  *(float *)( work + 20 ) = n1;
+  normal[0] = m[8]  * *(float *)( (unsigned char *)work + 24 ) + m[4] * *(float *)( (unsigned char *)work + 20 )
+       + m[0] * *(float *)( (unsigned char *)work + 16 );
+  normal[1] = m[9]  * *(float *)( (unsigned char *)work + 24 ) + m[5] * *(float *)( (unsigned char *)work + 20 )
+       + m[1] * *(float *)( (unsigned char *)work + 16 );
+  normal[2] = m[10] * *(float *)( (unsigned char *)work + 24 ) + m[6] * *(float *)( (unsigned char *)work + 20 )
+       + m[2] * *(float *)( (unsigned char *)work + 16 );
+  VectorCopy( normal, ((float *)( (unsigned char *)work + 16 )) );
 
   return hitBone;
 }
 
-/* ---- XModelGetStaticBounds  0x0048C3E0 ----  VERIFIED */
-int __cdecl XModelGetStaticBounds(int a1, float *a2, float *a3, float *a4)
-{
-  int v4;
-  float *v6;
-  int i;
-  float v8;
-  float v9;
-  float v10;
-  bool v11;
-  int v12;
-  int v13;
-  int v14;
-  float v15;
-  float v16;
-  float v17;
-  float v18;
-  float v19;
+float *MatrixTransformVector( const float *in, float *m, float *out );   /* universal/com_math.c */
 
-  v4 = *(_DWORD *)(a1 + 4);
-  v14 = v4;
-  if ( !*(_DWORD *)(v4 + 68) )
+/* ---- XModelGetStaticBounds  0x0048C3E0 ----  VERIFIED */
+int __cdecl XModelGetStaticBounds( int model, const float *axis, float *mins,
+                                   float *maxs )
+{
+  const XModelInfo *info = ( (const XModel *)model )->info;
+  int   surfIndex;
+  int   i;
+  float corner[3];
+  float transformed[3];
+
+  if ( !info->collisionSurfaceCount )
     return 0;
-  *a2 = 3.4028235e38;
-  a2[1] = 3.4028235e38;
-  a2[2] = 3.4028235e38;
-  *a4 = -3.4028235e38;
-  a4[1] = -3.4028235e38;
-  a4[2] = -3.4028235e38;
-  v13 = 0;
-  if ( *(int *)(v4 + 68) > 0 )
+
+  mins[0] = 3.4028235e38f;
+  mins[1] = 3.4028235e38f;
+  mins[2] = 3.4028235e38f;
+  maxs[0] = -3.4028235e38f;
+  maxs[1] = -3.4028235e38f;
+  maxs[2] = -3.4028235e38f;
+
+  for ( surfIndex = 0; surfIndex < info->collisionSurfaceCount; ++surfIndex )
   {
-    v12 = 0;
-    while ( 1 )
+    const XModelCollSurf *surf = &info->collisionSurfaces[surfIndex];
+
+    /* Rotate all 8 corners of the surface's expanded AABB and grow bounds. */
+    for ( i = 0; i < 8; ++i )
     {
-      v6 = (float *)(v12 + *(_DWORD *)(v4 + 64));
-      for ( i = 0; i < 8; ++i )
-      {
-        if ( (i & 1) != 0 )
-          v8 = v6[2];
-        else
-          v8 = v6[5];
-        v15 = v8;
-        if ( (i & 2) != 0 )
-          v9 = v6[3];
-        else
-          v9 = v6[6];
-        v16 = v9;
-        if ( (i & 4) != 0 )
-          v10 = v6[4];
-        else
-          v10 = v6[7];
-        v17 = v15 * *a3 + v10 * a3[6] + v16 * a3[3];
-        v18 = v15 * a3[1] + v10 * a3[7] + v16 * a3[4];
-        v19 = v10 * a3[8] + v16 * a3[5] + v15 * a3[2];
-        if ( *a2 > (double)v17 )
-          *a2 = v17;
-        if ( (*a4 < (double)v17) | __UNORDERED__(*a4, v17) )
-          *a4 = v17;
-        if ( a2[1] > (double)v18 )
-          a2[1] = v18;
-        if ( (a4[1] < (double)v18) | __UNORDERED__(a4[1], v18) )
-          a4[1] = v18;
-        if ( a2[2] > (double)v19 )
-          a2[2] = v19;
-        if ( (a4[2] < (double)v19) | __UNORDERED__(a4[2], v19) )
-          a4[2] = v19;
-      }
-      v11 = ++v13 < *(_DWORD *)(v14 + 68);
-      v12 += 44;
-      if ( !v11 )
-        break;
-      v4 = v14;
+      corner[0] = ( i & 1 ) ? surf->expandedMins[0] : surf->expandedMaxs[0];
+      corner[1] = ( i & 2 ) ? surf->expandedMins[1] : surf->expandedMaxs[1];
+      corner[2] = ( i & 4 ) ? surf->expandedMins[2] : surf->expandedMaxs[2];
+      MatrixTransformVector( corner, (float *)axis, transformed );
+
+      if ( mins[0] > transformed[0] )
+        mins[0] = transformed[0];
+      if ( maxs[0] < transformed[0] )
+        maxs[0] = transformed[0];
+      if ( mins[1] > transformed[1] )
+        mins[1] = transformed[1];
+      if ( maxs[1] < transformed[1] )
+        maxs[1] = transformed[1];
+      if ( mins[2] > transformed[2] )
+        mins[2] = transformed[2];
+      if ( maxs[2] < transformed[2] )
+        maxs[2] = transformed[2];
     }
   }
   return 1;
 }
+
+#ifdef __cplusplus
+}
+#endif

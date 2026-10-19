@@ -18,6 +18,7 @@
 #include "jpeglib.h"
 #include "jversion.h"
 #include "jerror.h"
+#include "../renderer/tr_public.h"
 
 /* OPENCOD1 EDIT 1 of 2 in this file.  RTCW reaches its error reporting through
  * `ri.` in tr_local.h; this tree reaches the same two slots of the same import
@@ -26,11 +27,9 @@
  *
  * CoD1 makes THE SAME TWO SUBSTITUTIONS RTCW does, which is why this file is
  * kept rather than replaced with stock libjpeg's stderr version:
- *   0x00517B60 output_message  push buffer / push "%s\n" / push 0 / call ri_Printf
- *   0x00517AE0 error_exit      ...        / push unk_5425B8 / push 0 / call ri_Error
+ *   0x00517B60 output_message  push buffer / push "%s\n" / push 0 / call ri.Printf
+ *   0x00517AE0 error_exit      ...        / push unk_5425B8 ("\x15%s\n") / push 0 / call ri.Error
  * PRINT_ALL and ERR_FATAL are both 0, so the literal 0s below are retail's. */
-extern int (*ri_Printf)();   /* 0x016D8920 */
-extern int (*ri_Error)();    /* 0x016D8924 */
 
 #ifndef EXIT_FAILURE        /* define exit() codes if not provided */
 #define EXIT_FAILURE  1
@@ -84,7 +83,7 @@ error_exit( j_common_ptr cinfo ) {
 	 * the call below is the same code.  Only the ri. spelling changed. */
 	jpeg_destroy( cinfo );
 
-	ri_Error( 0, "%s\n", buffer );      /* ERR_FATAL */
+	ri.Error( 0, "\x15%s\n", buffer );      /* ERR_FATAL; retail unk_5425B8 = "\x15%s\n" */
 }
 
 
@@ -102,7 +101,7 @@ output_message( j_common_ptr cinfo ) {
 	( *cinfo->err->format_message )( cinfo, buffer );
 
 	/* Send it to stderr, adding a newline */
-	ri_Printf( 0, "%s\n", buffer );     /* PRINT_ALL */
+	ri.Printf( 0, "%s\n", buffer );     /* PRINT_ALL */
 }
 
 

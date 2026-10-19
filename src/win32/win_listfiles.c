@@ -4,9 +4,9 @@
 
 #define MAX_FOUND_FILES     0x1000
 
-/* ---- Sys_ListFilteredFiles_r  0x00460570 ----  VERIFIED */
-static void Sys_ListFilteredFiles_r( const char *basedir, char *subdirs,
-                                     char *filter, char **list, int *numfiles ) {
+/* ---- Sys_ListFilteredFiles  0x00460570 ----  VERIFIED */
+static void Sys_ListFilteredFiles( const char *basedir, char *subdirs,
+                                   char *filter, char **list, int *numfiles ) {
 	char search[MAX_OSPATH], filename[MAX_OSPATH];
 	struct _finddata_t findinfo;
 	long findhandle;
@@ -69,7 +69,7 @@ char **Sys_ListFiles( const char *directory, const char *extension,
 
 	if ( filter ) {
 		nfiles = 0;
-		Sys_ListFilteredFiles_r( directory, "", (char *) filter, list, &nfiles );
+		Sys_ListFilteredFiles( directory, "", (char *) filter, list, &nfiles );
 
 		list[nfiles] = NULL;
 		*numfiles = nfiles;
@@ -110,19 +110,30 @@ char **Sys_ListFiles( const char *directory, const char *extension,
 
 	do {
 		if ( ( !wantsubs && flag ^ ( findinfo.attrib & _A_SUBDIR ) ) || ( wantsubs && findinfo.attrib & _A_SUBDIR ) ) {
-			if ( nfiles == MAX_FOUND_FILES - 1 ) {
-				break;
+			/* retail 0x0046087A-0x004608C1: directory entries named ".", ".."
+			   and "CVS" are skipped (Q_stricmpn(..., 99999)), same as
+			   Sys_ListFilteredFiles. */
+			if ( ( findinfo.attrib & _A_SUBDIR )
+			     && ( !Q_stricmp( findinfo.name, "." )
+			       || !Q_stricmp( findinfo.name, ".." )
+			       || !Q_stricmp( findinfo.name, "CVS" ) ) ) {
+				continue;
 			}
 			list[nfiles] = CopyStringInternal( findinfo.name );
 			nfiles++;
+			/* retail 0x00460901: cap tested after the add (inc ebx; cmp ebx,0FFFh; je). */
+			if ( nfiles == MAX_FOUND_FILES - 1 ) {
+				break;
+			}
 		}
 	} while ( _findnext( findhandle, &findinfo ) != -1 );
 
 	list[nfiles] = NULL;
 	_findclose( findhandle );
 
+	*numfiles = nfiles;
+
 	if ( !nfiles ) {
-		*numfiles = 0;
 		return NULL;
 	}
 
@@ -132,7 +143,6 @@ char **Sys_ListFiles( const char *directory, const char *extension,
 	}
 	listCopy[i] = NULL;
 
-	*numfiles = nfiles;
 	return listCopy;
 }
 

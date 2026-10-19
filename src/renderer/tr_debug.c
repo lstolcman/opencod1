@@ -4,18 +4,24 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "tr_records.h"
 #include "tr_shaderregistry.h"
 #include "tr_gl_types.h"
 #include "tr_tess.h"
+#include "tr_dpvsplane.h"   /* dpvsPlane_t (normal/dist/sideOffsets) for the DPVS box cull */
+#include "tr_local.h"       /* shared typed views; include AFTER tr_records.h (needs TRG) */
+/* rendererDebugState is a view of the last 0x80 bytes of tr (tr_local.h) */
+/* Keep the inherited generic names local to this renderer unit. */
+#define pointer (rendererDebugState.polygonVertices)
+#define mode (rendererDebugState.immediateMode)
+
 
 extern int GL_Bind();
 extern int GL_ClientState();
 extern int GL_State();
 void RB_BeginImmediateMode( void );
-char *__cdecl RB_glVertex3f( int xbits, int ybits, int zbits );
+void __cdecl RB_glVertex3f( float x, float y, float z );
+unsigned __int64 __cdecl RB_glColor4fv(const float *v);
 int __cdecl RB_AddQuadStampExt( float *origin, float *left, float *up, int *color,
                                 float s1, float t1, float s2, float t2 );
 void __cdecl RB_BeginSurface( void *shader, int vertexComponentCount );
@@ -26,514 +32,485 @@ void __cdecl RE_RegisterFont( int name, int size, int fontInfo, const char *usag
 extern int R_FogOn();
 int __cdecl R_AddDebugString( int *pos, int *color, int scaleBits, char *text );
 
+/* -------------------------------------------------------------------------
+ *  File-local record layouts for the renderer's debug-draw stores.
+ *
+ *  The RB_Draw functions consume, and the R_Add / RE_ functions produce,
+ *  fixed-stride arrays that the decompiled tree walked as
+ *  `*(unsigned int *)(base + off)`.  The record types below
+ *  are proven by those reads/writes and cross-checked against the CoDUO
+ *  reconstruction (renderer_debug_*), then pinned with offset asserts so a
+ *  wrong offset fails the build.  The pool base pointers stay on the existing
+ *  globals (rbDebug_lines/strings/polygons/plumes, and `pointer` for the debug
+ *  polygon vertices); only the element type is named here.
+ * ------------------------------------------------------------------------- */
+
+/* debugPolygon_t (0x18) -- one filled+wireframe debug polygon; its vertices
+ * live separately in the `pointer` vec3 array at [firstVertex..+vertexCount). */
+typedef struct {
+	vec4_t color;         /* +0x00 */
+	int    firstVertex;   /* +0x10  index into the debug polygon vertex array */
+	int    vertexCount;   /* +0x14 */
+} debugPolygon_t;
+COD1_ASSERT_SIZE(debugPolygon_t, 0x18);
+ASSERT_OFF(debugPolygon_t, firstVertex, 0x10);
+ASSERT_OFF(debugPolygon_t, vertexCount, 0x14);
+
+/* debugLine_t (0x2c) -- one colored line segment (CoDUO renderer_debug_line_t).
+ * depthTest == 0 draws the line without a depth test. */
+typedef struct {
+	vec3_t start;         /* +0x00 */
+	vec3_t end;           /* +0x0c */
+	vec4_t color;         /* +0x18 */
+	int    depthTest;     /* +0x28  qboolean */
+} debugLine_t;
+COD1_ASSERT_SIZE(debugLine_t, 0x2c);
+ASSERT_OFF(debugLine_t, end, 0x0c);
+ASSERT_OFF(debugLine_t, color, 0x18);
+ASSERT_OFF(debugLine_t, depthTest, 0x28);
+
+/* debugString_t (0x80) -- one world-space text label (CoDUO
+ * renderer_debug_string_t); text is a fixed 96-byte buffer. */
+typedef struct {
+	vec3_t origin;        /* +0x00 */
+	vec4_t color;         /* +0x0c */
+	float  scale;         /* +0x1c */
+	char   text[96];      /* +0x20 */
+} debugString_t;
+COD1_ASSERT_SIZE(debugString_t, 0x80);
+ASSERT_OFF(debugString_t, color, 0x0c);
+ASSERT_OFF(debugString_t, scale, 0x1c);
+ASSERT_OFF(debugString_t, text, 0x20);
+
+/* debugPlume_t (0x28) -- a rising, swaying numeric label (CoDUO
+ * renderer_plume_t).  RE_AddPlume fills rgb; RB_AddPlumeStrings owns the alpha
+ * lane (color[3]) while the plume is live and fades it over the second half. */
+typedef struct {
+	vec3_t origin;        /* +0x00 */
+	vec4_t color;         /* +0x0c  alpha set live by RB_AddPlumeStrings */
+	int    labelValue;    /* +0x1c  the integer shown */
+	int    startTime;     /* +0x20  spawn time, ms */
+	int    duration;      /* +0x24  lifetime, ms */
+} debugPlume_t;
+COD1_ASSERT_SIZE(debugPlume_t, 0x28);
+ASSERT_OFF(debugPlume_t, color, 0x0c);
+ASSERT_OFF(debugPlume_t, labelValue, 0x1c);
+ASSERT_OFF(debugPlume_t, startTime, 0x20);
+ASSERT_OFF(debugPlume_t, duration, 0x24);
+
+/* debugVertex_t (0x20) -- one immediate-mode vertex.  Texcoords are stored
+ * as raw float bit patterns (the texcoord globals are ints); the GL pointers
+ * read them as GL_FLOAT.  Two dwords of pad sit before the RGBA8. */
+typedef struct {
+	float xyz[3];         /* +0x00  position */
+	int  s;               /* +0x0c  texcoord S (float bits) */
+	int  t;               /* +0x10  texcoord T (float bits) */
+	float lightmap[2];   /* +0x14  polyVert_t's lightmap ST (tr_surface.c); unused by the debug path */
+	byte color[4];        /* +0x1c  RGBA8 */
+} debugVertex_t;
+COD1_ASSERT_SIZE(debugVertex_t, 0x20);
+ASSERT_OFF(debugVertex_t, s, 0x0c);
+ASSERT_OFF(debugVertex_t, color, 0x1c);
+
+/* glyphInfo_t (0x50) -- one entry of the debug font's 256-glyph table (RTCW
+ * glyphInfo_t; CoD uses float vertBearing/xSkip, as tr_font.h).  rbDebug_font points at the table. */
+typedef struct {
+	int   height;         /* +0x00 */
+	int   top;            /* +0x04 */
+	float vertBearing;    /* +0x08 */
+	float horzBearing;    /* +0x0c */
+	float xSkip;          /* +0x10  horizontal advance */
+	int   imageWidth;     /* +0x14 */
+	int   imageHeight;    /* +0x18 */
+	float s;              /* +0x1c */
+	float t;              /* +0x20 */
+	float s2;             /* +0x24 */
+	float t2;             /* +0x28 */
+	int   glyph;          /* +0x2c  glyph shader/image handle (tr.shaders index) */
+	char  shaderName[32]; /* +0x30 */
+} glyphInfo_t;
+COD1_ASSERT_SIZE(glyphInfo_t, 0x50);
+ASSERT_OFF(glyphInfo_t, vertBearing, 0x08);
+ASSERT_OFF(glyphInfo_t, xSkip, 0x10);
+ASSERT_OFF(glyphInfo_t, imageWidth, 0x14);
+ASSERT_OFF(glyphInfo_t, imageHeight, 0x18);
+ASSERT_OFF(glyphInfo_t, s, 0x1c);
+ASSERT_OFF(glyphInfo_t, glyph, 0x2c);
+
+/* dpvsOccluder_t -- one antiportal occluder cell tested by R_CullBoxDPVS.
+ * Only the three fields the cull reads are named (the head is opaque); no size
+ * assert since the record continues past +0x24. */
+typedef struct {
+	dpvsPlane_t *planes;           /* +0x00  authored face planes */
+	int          planeCount;       /* +0x04 */
+	int          edgeCount;        /* +0x08 */
+	void        *edges;            /* +0x0c */
+	int          vertexCount;      /* +0x10 */
+	vec3_t      *vertices;         /* +0x14 */
+	int          cullPlaneLimit;   /* +0x18  INT_MAX, lowered to the first culling plane index */
+	int          activePlaneCount; /* +0x1c */
+	dpvsPlane_t *activePlanes;     /* +0x20  into dpvs_activePlanes */
+} dpvsOccluder_t;
+ASSERT_OFF(dpvsOccluder_t, cullPlaneLimit, 0x18);
+ASSERT_OFF(dpvsOccluder_t, activePlaneCount, 0x1c);
+ASSERT_OFF(dpvsOccluder_t, activePlanes, 0x20);
+
 /* ---- RB_DrawDebugPolys  0x004DFD00 ----  VERIFIED */
 void RB_DrawDebugPolys()
 {
-  int v0;
-  int v1;
-  int v2;
-  GLenum v3;
+  debugPolygon_t *polys;
+  GLenum          nvDisable;
+  int             fogNum;
+  int             i;
 
-  if ( rbDebug_polygonCount )
+  if ( !rbDebug_polygonCount )
+    return;
+
+  /* select the hunk vertex storage (storage mode 3) */
+  if ( glState_currentStorageMode != 3 )
   {
-    if ( glState_currentStorageMode != 3 )
+    if ( glConfig_NVVertexArrayRange )
     {
-      if ( glConfig_NVVertexArrayRange )
-      {
-        if ( glConfig_NVVertexArrayRange == 1 )
-          v3 = 34077;
-        else
-          v3 = 34099;
-        glDisableClientState(v3);
-        glVertexPointer(tess_vertexComponentCount, 0x1406u, 0, tess_xyz);
-        glNormalPointer(0x1406u, 0, tess_stageNormals);
-        glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords);
-        glColorPointer(4, 0x1401u, 0, tess_stageVertexColors);
-      }
-      else if ( glConfig_ATIVertexArrayObject )
-      {
-        glVertexPointer(tess_vertexComponentCount, 0x1406u, 0, tess_xyz);
-        glNormalPointer(0x1406u, 12, tess_stageNormals);
-        glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords);
-      }
-      glState_currentStorageMode = 3;
+      if ( glConfig_NVVertexArrayRange == 1 )
+        glDisableClientState(34077);
+      else
+        glDisableClientState(34099);
+      glVertexPointer(tess_vertexComponentCount, 0x1406u, 0, tess_xyz);
+      glNormalPointer(0x1406u, 0, tess_stageNormals);
+      glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords[0]);
+      glColorPointer(4, 0x1401u, 0, tess_stageVertexColors);
     }
-    GL_Bind((GLenum *)tr_whiteImage);
-    GL_ClientState(1024);
-    glVertexPointer(3, 0x1406u, 0, pointer);
-    glLoadMatrixf(tr_viewParms_world_modelMatrix);
-    glMatrixMode(0x1701u);
-    glLoadMatrixf(tr_viewParms_projectionMatrix);
-    glMatrixMode(0x1700u);
-    if ( (glState_glStateBits & 0x200000) != 0 )
+    else if ( glConfig_ATIVertexArrayObject )
     {
-      glDisable(0xB60u);
-      glState_glStateBits &= ~0x200000u;
+      glVertexPointer(tess_vertexComponentCount, 0x1406u, 0, tess_xyz);
+      glNormalPointer(0x1406u, 12, tess_stageNormals);
+      glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords[0]);
     }
-    if ( qglLockArraysEXT )
-      qglLockArraysEXT(0, rbDebug_polygonVertexCount);
-    if ( glState_faceCulling != 2 )
+    glState_currentStorageMode = 3;
+  }
+
+  GL_Bind((GLenum *)tr_whiteImage);
+  GL_ClientState(1024);
+  glVertexPointer(3, 0x1406u, 0, pointer);            /* the debug polygon vertex array */
+  glLoadMatrixf(tr_viewParms_world_modelMatrix);
+  glMatrixMode(0x1701u);                               /* GL_PROJECTION */
+  glLoadMatrixf(tr_viewParms_projectionMatrix);
+  glMatrixMode(0x1700u);                               /* GL_MODELVIEW */
+  if ( (glState_glStateBits & 0x200000) != 0 )         /* fog on -> turn it off */
+  {
+    glDisable(0xB60u);                                 /* GL_FOG */
+    glState_glStateBits &= ~0x200000u;
+  }
+  if ( qglLockArraysEXT )
+    qglLockArraysEXT(0, rbDebug_polygonVertexCount);
+  if ( glState_faceCulling != 2 )
+  {
+    glDisable(0xB44u);                                 /* GL_CULL_FACE */
+    glState_faceCulling = 2;
+  }
+
+  for ( i = 0; i < rbDebug_polygonCount; ++i )
+  {
+
+    GL_State(357);                                     /* filled, alpha-blended */
+    qglColor4fv(((debugPolygon_t *)rbDebug_polygons)[i].color);
+    glDrawArrays(9u, ((debugPolygon_t *)rbDebug_polygons)[i].firstVertex, ((debugPolygon_t *)rbDebug_polygons)[i].vertexCount);   /* GL_POLYGON */
+
+    GL_State(4352);                                    /* wireframe overlay */
+    glDepthRange(0.0, 0.0);
+    qglColor3fv(((debugPolygon_t *)rbDebug_polygons)[i].color);
+    glDrawArrays(9u, ((debugPolygon_t *)rbDebug_polygons)[i].firstVertex, ((debugPolygon_t *)rbDebug_polygons)[i].vertexCount);
+    glDepthRange(0.0, 1.0);
+  }
+
+  rbDebug_polygonCount = 0;
+  rbDebug_polygonVertexCount = 0;
+  if ( qglUnlockArraysEXT )
+    qglUnlockArraysEXT();
+
+  /* restore fog if it was on for this view (inlined R_FogOn) */
+  if ( !backEnd_projection2D && (glState_glStateBits & 0x200000) == 0 )
+  {
+    if ( r_fog->integer )
     {
-      glDisable(0xB44u);
-      glState_faceCulling = 2;
-    }
-    v0 = 0;
-    if ( rbDebug_polygonCount > 0 )
-    {
-      v1 = 0;
-      do
+      fogNum = tr_fogPortalView_registered;
+      if ( (backEnd_refdef_rdflags & 8) == 0 )
+        fogNum = glfogNum;
+      if ( fogNum )
       {
-        GL_State(357);
-        qglColor4fv((char *)rbDebug_polygons + v1);
-        glDrawArrays(9u, *(_DWORD *)((char *)rbDebug_polygons + v1 + 16), *(_DWORD *)((char *)rbDebug_polygons + v1 + 20));
-        GL_State(4352);
-        glDepthRange(0.0, 0.0);
-        qglColor3fv((char *)rbDebug_polygons + v1);
-        glDrawArrays(9u, *(_DWORD *)((char *)rbDebug_polygons + v1 + 16), *(_DWORD *)((char *)rbDebug_polygons + v1 + 20));
-        glDepthRange(0.0, 1.0);
-        ++v0;
-        v1 += 24;
-      }
-      while ( v0 < rbDebug_polygonCount );
-    }
-    rbDebug_polygonCount = 0;
-    rbDebug_polygonVertexCount = 0;
-    if ( qglUnlockArraysEXT )
-      qglUnlockArraysEXT();
-    if ( !backEnd_projection2D && (glState_glStateBits & 0x200000) == 0 )
-    {
-      if ( r_fog->integer )
-      {
-        v2 = dword_16C4BB0;
-        if ( (backEnd_refdef_rdflags & 8) == 0 )
-          v2 = glfogNum;
-        if ( v2 )
-        {
-          glEnable(0xB60u);
-          glState_glStateBits |= 0x200000u;
-        }
+        glEnable(0xB60u);                              /* GL_FOG */
+        glState_glStateBits |= 0x200000u;
       }
     }
   }
 }
 
 /* ---- RB_DrawDebugLines  0x004DFFB0 ----  VERIFIED */
-void __cdecl RB_DrawDebugLines(int a1, int a2)
+void __cdecl RB_DrawDebugLines(int lineCount, debugLine_t *lines)
 {
-  int v2;
-  int v3;
-  double v4;
-  double v5;
-  double v6;
-  int v7;
+  int fogNum;
+  int i;
 
-  v2 = a1;
-  if ( a1 )
+  if ( !lineCount )
+    return;
+
+  GL_Bind((GLenum *)tr_whiteImage);
+  RB_BeginImmediateMode();
+  glLoadMatrixf(tr_viewParms_world_modelMatrix);
+  glMatrixMode(0x1701u);                               /* GL_PROJECTION */
+  glLoadMatrixf(tr_viewParms_projectionMatrix);
+  glMatrixMode(0x1700u);                               /* GL_MODELVIEW */
+
+  for ( i = 0; i < lineCount; ++i )
   {
-    GL_Bind((GLenum *)tr_whiteImage);
-    RB_BeginImmediateMode();
-    glLoadMatrixf(tr_viewParms_world_modelMatrix);
-    glMatrixMode(0x1701u);
-    glLoadMatrixf(tr_viewParms_projectionMatrix);
-    glMatrixMode(0x1700u);
-    if ( v2 > 0 )
-    {
-      v3 = a2 + 32;
-      do
-      {
-        GL_State(*(_DWORD *)(v3 + 8) != 0 ? 256 : 65792);
-        mode = 1;
-        v4 = *(float *)(v3 + 4);
-        v5 = *(float *)v3;
-        v6 = *(float *)(v3 - 4) * 255.0;
-        rbDebug_immediateColorR = (unsigned __int64)(*(float *)(v3 - 8) * 255.0);
-        rbDebug_immediateColorG = (unsigned __int64)v6;
-        rbDebug_immediateColorB = (unsigned __int64)(v5 * 255.0);
-        rbDebug_immediateColorA = (unsigned __int64)(v4 * 255.0);
-        RB_glVertex3f(*(_DWORD *)(v3 - 32), *(_DWORD *)(v3 - 28), *(_DWORD *)(v3 - 24));
-        RB_glVertex3f(*(_DWORD *)(v3 - 20), *(_DWORD *)(v3 - 16), *(_DWORD *)(v3 - 12));
-        glDrawArrays(mode, 0, rbDebug_immediateVertexCount);
-        v3 += 44;
-        --v2;
-        rbDebug_immediateVertexCount = 0;
-        mode = 0;
-      }
-      while ( v2 );
-    }
-    rbDebug_immediateModeActive = 0;
-    if ( !backEnd_projection2D && (glState_glStateBits & 0x200000) == 0 )
-    {
-      if ( r_fog->integer )
-      {
-        v7 = dword_16C4BB0;
-        if ( (backEnd_refdef_rdflags & 8) == 0 )
-          v7 = glfogNum;
-        if ( v7 )
-        {
-          glEnable(0xB60u);
-          glState_glStateBits |= 0x200000u;
-        }
-      }
-    }
-    glVertexPointer(3, 0x1406u, 0, tess_xyz);
+    debugLine_t *line = &lines[i];
+
+    GL_State(line->depthTest ? 256 : 65792);           /* 65792 disables the depth test */
+    mode = 1;                                           /* GL_LINES */
+    RB_glColor4fv(line->color);
+    RB_glVertex3f(line->start[0], line->start[1], line->start[2]);
+    RB_glVertex3f(line->end[0], line->end[1], line->end[2]);
+    glDrawArrays(mode, 0, rbDebug_immediateVertexCount);
+    rbDebug_immediateVertexCount = 0;
+    mode = 0;
   }
+
+  /* inlined RB_EndImmediateMode: drop immediate mode, restore fog + vertex array */
+  rbDebug_immediateModeActive = 0;
+  if ( !backEnd_projection2D && (glState_glStateBits & 0x200000) == 0 )
+  {
+    if ( r_fog->integer )
+    {
+      fogNum = tr_fogPortalView_registered;
+      if ( (backEnd_refdef_rdflags & 8) == 0 )
+        fogNum = glfogNum;
+      if ( fogNum )
+      {
+        glEnable(0xB60u);                              /* GL_FOG */
+        glState_glStateBits |= 0x200000u;
+      }
+    }
+  }
+  glVertexPointer(3, 0x1406u, 0, tess_xyz);
 }
 
-/* ---- RB_DrawDebugStrings  0x004E0130 ----  [HIGH] */
-void __cdecl RB_DrawDebugStrings(const char *a1, const char *a2, int a3)
+/* ---- RB_DrawDebugStrings  0x004E0130 ----  [HIGH]
+ * Draw each label as camera-facing glyph quads: first a black drop-shadow quad
+ * offset by `diagonal`, then the text-colored quad. */
+void __cdecl RB_DrawDebugStrings(int stringCount, debugString_t *strings)
 {
-  void *v4;
-  int v5;
-  int v6;
-  double v7;
-  bool v8; // c0
-  bool v9; // c2
-  double v10;
-  bool v11; // c0
-  bool v12; // c2
-  double v13;
-  bool v14; // c0
-  bool v15; // c2
-  double v16;
-  unsigned __int64 v17; // rax
-  double v18;
-  unsigned __int8 *v19;
-  int v20;
-  int v21;
-  char *v22;
-  double v23;
-  double v24;
-  char v25;
-  int v26; // [esp+4Ch] [ebp-68h] BYREF
-  int v27; // [esp+50h] [ebp-64h] BYREF
-  int v28;
-  const char *v29;
-  int v30;
-  float v31[3]; // [esp+60h] [ebp-54h] BYREF
-  float v34;
-  float v35;
-  float v36;
-  float v37;
-  float v38;
-  float v39;
-  float v40;
-  float v41;
-  float v42;
-  float v43;
-  float v44;
-  float v45;
-  int v46[3]; // [esp+9Ch] [ebp-18h] BYREF
-  int v47[3]; // [esp+A8h] [ebp-Ch] BYREF
+  byte shadowColor[4];      /* opaque black */
+  int  currentGlyphShader;
+  int  i;
 
-  v26 = -16777216;
-  if ( a1 )
+  shadowColor[0] = 0;
+  shadowColor[1] = 0;
+  shadowColor[2] = 0;
+  shadowColor[3] = 255;
+  if ( !stringCount )
+    return;
+
+  if ( !rbDebug_font )
   {
-    if ( !rbDebug_font )
-    {
-      rbDebug_font = Z_MallocInternal(0x5048u);
-      RE_RegisterFont((int)"fonts/normalFont", 16, (int)rbDebug_font, (const char *)1);
-    }
-    glLoadMatrixf(tr_viewParms_world_modelMatrix);
-    glMatrixMode(0x1701u);
-    glLoadMatrixf(tr_viewParms_projectionMatrix);
-    glMatrixMode(0x1700u);
-    glDepthRange(0.0, 0.0);
-    v5 = -1;
-    if ( (int)a1 > 0 )
-    {
-      v6 = a3 + 16;
-      v29 = a1;
-      do
-      {
-        if ( (*(float *)(v6 - 4) > 1.0) | __UNORDERED__(1.0, *(float *)(v6 - 4)) || *(float *)(v6 - 4) >= 0.0 )
-        {
-          if ( (*(float *)(v6 - 4) > 1.0) | __UNORDERED__(1.0, *(float *)(v6 - 4)) )
-            v7 = 1.0;
-          else
-            v7 = *(float *)(v6 - 4);
-        }
-        else
-        {
-          v7 = 0.0;
-        }
-        v8 = *(float *)v6 > 1.0;
-        v9 = __UNORDERED__(1.0, *(float *)v6);
-        LOBYTE(v27) = (unsigned __int64)(v7 * 255.0);
-        if ( v8 || v9 || *(float *)v6 >= 0.0 )
-        {
-          if ( (*(float *)v6 > 1.0) | __UNORDERED__(1.0, *(float *)v6) )
-            v10 = 1.0;
-          else
-            v10 = *(float *)v6;
-        }
-        else
-        {
-          v10 = 0.0;
-        }
-        v11 = *(float *)(v6 + 4) > 1.0;
-        v12 = __UNORDERED__(1.0, *(float *)(v6 + 4));
-        BYTE1(v27) = (unsigned __int64)(v10 * 255.0);
-        if ( v11 || v12 || *(float *)(v6 + 4) >= 0.0 )
-        {
-          if ( (*(float *)(v6 + 4) > 1.0) | __UNORDERED__(1.0, *(float *)(v6 + 4)) )
-            v13 = 1.0;
-          else
-            v13 = *(float *)(v6 + 4);
-        }
-        else
-        {
-          v13 = 0.0;
-        }
-        v14 = *(float *)(v6 + 8) > 1.0;
-        v15 = __UNORDERED__(1.0, *(float *)(v6 + 8));
-        BYTE2(v27) = (unsigned __int64)(v13 * 255.0);
-        if ( v14 || v15 || *(float *)(v6 + 8) >= 0.0 )
-        {
-          if ( (*(float *)(v6 + 8) > 1.0) | __UNORDERED__(1.0, *(float *)(v6 + 8)) )
-            v16 = 1.0;
-          else
-            v16 = *(float *)(v6 + 8);
-        }
-        else
-        {
-          v16 = 0.0;
-        }
-        v17 = (unsigned __int64)(v16 * 255.0);
-        v18 = *(float *)(v6 + 12) * 0.5;
-        v4 = *(void **)(v6 - 12);
-        HIDWORD(v17) = *(_DWORD *)(v6 - 8);
-        BYTE3(v27) = v17;
-        v40 = *(float *)(v6 - 16);
-        v34 = backEnd_refdef_viewaxis10 * v18;
-        v41 = *(float *)&v4;
-        LOBYTE(v4) = *(_BYTE *)(v6 + 16);
-        v42 = *((float *)&v17 + 1);
-        v35 = backEnd_refdef_viewaxis11 * v18;
-        v36 = backEnd_refdef_viewaxis12 * v18;
-        v37 = backEnd_refdef_viewaxis20 * v18;
-        v38 = backEnd_refdef_viewaxis21 * v18;
-        v39 = v18 * backEnd_refdef_viewaxis22;
-        v45 = v39 + v36;
-        v43 = (v37 + v34) * -2.0;
-        v44 = (v38 + v35) * -2.0;
-        v45 = v45 * -2.0;
-        if ( (_BYTE)v4 )
-        {
-          v19 = (unsigned __int8 *)(v6 + 16);
-          do
-          {
-            v20 = 80 * *v19;
-            v21 = *(_DWORD *)((char *)rbDebug_font + v20 + 44);
-            v22 = (char *)rbDebug_font + v20;
-            if ( v5 != v21 )
-            {
-              v28 = v21;
-              backEnd_currentEntity = (int)&backEnd_debugEntity;
-              v30 = storageClass;
-              if ( storageClass != glState_currentStorageMode )
-              {
-                if ( glConfig_NVVertexArrayRange )
-                {
-                  RB_SelectStorageNV(storageClass);
-                }
-                else if ( glConfig_ATIVertexArrayObject )
-                {
-                  if ( storageClass == 3 )
-                  {
-                    glVertexPointer(tess_vertexComponentCount, 0x1406u, 0, tess_xyz);
-                    glNormalPointer(0x1406u, 12, tess_stageNormals);
-                    glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords);
-                  }
-                }
-                glState_currentStorageMode = v30;
-              }
-              RB_BeginSurface((void *)tr_shaders[v28], 3);   /* 0x004E0492: mov ecx,tr_shaders[eax*4], eax = var_60 = v28 / push 3 */
-              v5 = v28;
-            }
-            *(float *)v47 = (double)*((int *)v22 + 5) * v34;
-            *(float *)&v47[1] = (double)*((int *)v22 + 5) * v35;
-            *(float *)&v47[2] = (double)*((int *)v22 + 5) * v36;
-            *(float *)v46 = (double)*((int *)v22 + 6) * v37;
-            *(float *)&v46[1] = (double)*((int *)v22 + 6) * v38;
-            *(float *)&v46[2] = (double)*((int *)v22 + 6) * v39;
-            v31[0] = v40 - (double)*((int *)v22 + 5) * v34;
-            v31[1] = v41 - (double)*((int *)v22 + 5) * v35;
-            v31[2] = v42 - (double)*((int *)v22 + 5) * v36;
-            v31[0] = (*((float *)v22 + 2) + *((float *)v22 + 2) - (double)*((int *)v22 + 6)) * v37
-                           + v31[0];
-            v31[1] = (*((float *)v22 + 2) + *((float *)v22 + 2) - (double)*((int *)v22 + 6)) * v38
-                           + v31[1];
-            v23 = (*((float *)v22 + 2) + *((float *)v22 + 2) - (double)*((int *)v22 + 6)) * v39 + v31[2];
-            v31[0] = v31[0] + v43;
-            v31[1] = v31[1] + v44;
-            v31[2] = v23 + v45;
-            RB_AddQuadStampExt(
-              v31,
-              (float *)v47,
-              (float *)v46,
-              &v26,
-              *((float *)v22 + 7),
-              *((float *)v22 + 8),
-              *((float *)v22 + 9),
-              *((float *)v22 + 10));
-            v31[0] = v31[0] - v43;
-            v31[1] = v31[1] - v44;
-            v31[2] = v31[2] - v45;
-            RB_AddQuadStampExt(
-              v31,
-              (float *)v47,
-              (float *)v46,
-              &v27,
-              *((float *)v22 + 7),
-              *((float *)v22 + 8),
-              *((float *)v22 + 9),
-              *((float *)v22 + 10));
-            v24 = *((float *)v22 + 4) * -2.0;
-            v25 = *++v19;
-            v40 = v34 * v24 + v40;
-            v41 = v35 * v24 + v41;
-            v42 = v24 * v36 + v42;
-          }
-          while ( v25 );
-        }
-        v6 += 128;
-        --v29;
-      }
-      while ( v29 );
-    }
-    RB_EndSurface();
-    glDepthRange(0.0, 1.0);
+    rbDebug_font = Z_MallocInternal(0x5048u);
+    RE_RegisterFont((int)"fonts/normalFont", 16, (int)rbDebug_font, (const char *)1);
   }
+  glLoadMatrixf(tr_viewParms_world_modelMatrix);
+  glMatrixMode(0x1701u);                               /* GL_PROJECTION */
+  glLoadMatrixf(tr_viewParms_projectionMatrix);
+  glMatrixMode(0x1700u);                               /* GL_MODELVIEW */
+  glDepthRange(0.0, 0.0);
+
+  currentGlyphShader = -1;
+  for ( i = 0; i < stringCount; ++i )
+  {
+    debugString_t       *str = &strings[i];
+    const unsigned char *text;
+    byte   textColor[4];
+    rfloat halfScale;
+    float  right[3];
+    float  up[3];
+    float  diagonal[3];
+    float  origin[3];
+
+    /* clamp each color component to [0,1] and pack as RGBA8 */
+    textColor[0] = (byte)((rfloat)max(0.0f, min(1.0f, str->color[0])) * 255.0f);
+    textColor[1] = (byte)((rfloat)max(0.0f, min(1.0f, str->color[1])) * 255.0f);
+    textColor[2] = (byte)((rfloat)max(0.0f, min(1.0f, str->color[2])) * 255.0f);
+    textColor[3] = (byte)((rfloat)max(0.0f, min(1.0f, str->color[3])) * 255.0f);
+
+    VectorCopy(str->origin, origin);
+    right[0] = backEnd_refdef_viewaxis10 * (str->scale * 0.5f);
+    right[1] = backEnd_refdef_viewaxis11 * (str->scale * 0.5f);
+    right[2] = backEnd_refdef_viewaxis12 * (str->scale * 0.5f);
+    up[0] = backEnd_refdef_viewaxis20 * (str->scale * 0.5f);
+    up[1] = backEnd_refdef_viewaxis21 * (str->scale * 0.5f);
+    up[2] = backEnd_refdef_viewaxis22 * (str->scale * 0.5f);
+    VectorAdd(up, right, diagonal);
+    VectorScale(diagonal, -2.0f, diagonal);
+
+    for ( text = (const unsigned char *)str->text; *text; ++text )
+    {
+      const glyphInfo_t *glyph = &((const glyphInfo_t *)rbDebug_font)[*text];
+      float  widthOffset[3];
+      float  heightOffset[3];
+      float  glyphOrigin[3];
+      rfloat advance;
+
+      if ( currentGlyphShader != glyph->glyph )
+      {
+        int storage;
+
+        currentGlyphShader = glyph->glyph;
+        backEnd_currentEntity = (int)&backEnd_debugEntity;
+        storage = storageClass;
+        if ( storageClass != glState_currentStorageMode )
+        {
+          if ( glConfig_NVVertexArrayRange )
+          {
+            RB_SelectStorageNV(storageClass);
+          }
+          else if ( glConfig_ATIVertexArrayObject && storageClass == 3 )
+          {
+            glVertexPointer(tess_vertexComponentCount, 0x1406u, 0, tess_xyz);
+            glNormalPointer(0x1406u, 12, tess_stageNormals);
+            glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords[0]);
+          }
+          glState_currentStorageMode = storage;
+        }
+        RB_BeginSurface((void *)tr_shaders[currentGlyphShader], 3);   /* 3 = vertex component count */
+      }
+
+      widthOffset[0] = (rfloat)glyph->imageWidth * right[0];
+      widthOffset[1] = (rfloat)glyph->imageWidth * right[1];
+      widthOffset[2] = (rfloat)glyph->imageWidth * right[2];
+      heightOffset[0] = (rfloat)glyph->imageHeight * up[0];
+      heightOffset[1] = (rfloat)glyph->imageHeight * up[1];
+      heightOffset[2] = (rfloat)glyph->imageHeight * up[2];
+
+      glyphOrigin[0] = origin[0] - (rfloat)glyph->imageWidth * right[0];
+      glyphOrigin[1] = origin[1] - (rfloat)glyph->imageWidth * right[1];
+      glyphOrigin[2] = origin[2] - (rfloat)glyph->imageWidth * right[2];
+      glyphOrigin[0] = ((rfloat)glyph->vertBearing + glyph->vertBearing - glyph->imageHeight) * up[0] + glyphOrigin[0];
+      glyphOrigin[1] = ((rfloat)glyph->vertBearing + glyph->vertBearing - glyph->imageHeight) * up[1] + glyphOrigin[1];
+      glyphOrigin[2] = ((rfloat)glyph->vertBearing + glyph->vertBearing - glyph->imageHeight) * up[2] + glyphOrigin[2];
+
+      /* drop shadow quad (offset by diagonal), then the text quad */
+      VectorAdd(glyphOrigin, diagonal, glyphOrigin);
+      RB_AddQuadStampExt(glyphOrigin, widthOffset, heightOffset, (int *)shadowColor,
+                         glyph->s, glyph->t, glyph->s2, glyph->t2);
+      VectorSubtract(glyphOrigin, diagonal, glyphOrigin);
+      RB_AddQuadStampExt(glyphOrigin, widthOffset, heightOffset, (int *)textColor,
+                         glyph->s, glyph->t, glyph->s2, glyph->t2);
+
+      advance = glyph->xSkip * -2.0f;
+      VectorMA(origin, advance, right, origin);
+    }
+  }
+
+  RB_EndSurface();
+  glDepthRange(0.0, 1.0);
 }
 
 /* ---- RB_AddPlumeStrings  0x004E0660 ----  VERIFIED */
-int RB_AddPlumeStrings()
+#define rbDebug_plumeArray ((debugPlume_t *)rbDebug_plumes)
+void RB_AddPlumeStrings()
 {
-  int result;
-  int v1;
-  _DWORD *v2;
-  int v3;
-  char *v4;
-  double v5;
-  long double v6;
-  char *v7;
-  int v8;
-  int i;
-  float v10[3]; // [esp+10h] [ebp-Ch] BYREF
+  int    i;
+  int    elapsed;
+  rfloat sway;
+  float  labelOrigin[3];
 
-  result = rbDebug_plumeCount;
-  v1 = 0;
-  for ( i = 0; i < rbDebug_plumeCount; result = rbDebug_plumeCount )
+  for ( i = 0; i < rbDebug_plumeCount; )
   {
-    v2 = (char *)rbDebug_plumes + v1;
-    v3 = tr_refdef_time - *(_DWORD *)((char *)rbDebug_plumes + v1 + 32);
-    if ( v3 < 0 || v3 > v2[9] )
+    elapsed = tr_refdef_time - rbDebug_plumeArray[i].startTime;
+    if ( elapsed < 0 || elapsed > rbDebug_plumeArray[i].duration )
     {
-      rbDebug_plumeCount = result - 1;
-      qmemcpy(v2, (char *)rbDebug_plumes + 40 * result - 40, 0x28u);
+      /* expired -- swap the last plume into this slot and re-test it */
+      --rbDebug_plumeCount;
+      rbDebug_plumeArray[i] = rbDebug_plumeArray[rbDebug_plumeCount];
+      continue;
     }
-    else
-    {
-      v2[6] = 1065353216;
-      v4 = (char *)rbDebug_plumes;
-      if ( 2 * v3 > *(_DWORD *)((char *)rbDebug_plumes + v1 + 36) )
-      {
-        *(float *)((char *)rbDebug_plumes + v1 + 24) = 2.0
-                                                    - ((double)v3 + (double)v3)
-                                                    / (double)*(int *)((char *)rbDebug_plumes + v1 + 36);
-        v4 = (char *)rbDebug_plumes;
-      }
-      v5 = (double)v3;
-      v8 = *(_DWORD *)&v4[v1 + 28];
-      v6 = sin(0.012566371 * v5 + (double)i) * 4.0;
-      v10[0] = tr_refdef_viewaxis10 * v6 + *(float *)&v4[v1];
-      v10[1] = tr_refdef_viewaxis11 * v6 + *(float *)&v4[v1 + 4];
-      v10[2] = tr_refdef_viewaxis12 * v6 + *(float *)&v4[v1 + 8] + v5 * 0.064000003;
-      v7 = va("%i", v8);
-      R_AddDebugString(v10, (char *)rbDebug_plumes + v1 + 12, 1056964608, v7);
-      ++i;
-      v1 += 40;
-    }
+
+    rbDebug_plumeArray[i].color[3] = 1.0f;
+    if ( 2 * elapsed > rbDebug_plumeArray[i].duration )       /* fade over the second half of life */
+      rbDebug_plumeArray[i].color[3] = 2.0f - ((rfloat)elapsed + (rfloat)elapsed) / rbDebug_plumeArray[i].duration;
+
+    sway = FCAST(sin((rfloat)elapsed * 0.012566371f + i)) * 4.0f;   /* flt_56913C = 0x3C4DE32E */
+    labelOrigin[0] = tr_refdef_viewaxis10 * sway + rbDebug_plumeArray[i].origin[0];
+    labelOrigin[1] = tr_refdef_viewaxis11 * sway + rbDebug_plumeArray[i].origin[1];
+    labelOrigin[2] = tr_refdef_viewaxis12 * sway + rbDebug_plumeArray[i].origin[2] + (rfloat)elapsed * 0.064000003f;   /* flt_569138 = 0x3D83126F */
+    R_AddDebugString((int *)labelOrigin, (int *)rbDebug_plumeArray[i].color, 0x3F000000,
+                     va("%i", rbDebug_plumeArray[i].labelValue));
+    ++i;
   }
-  return result;
 }
+#undef rbDebug_plumeArray
 
 /* ---- RB_DrawDebug  0x004E07A0 ----  VERIFIED */
-void __cdecl RB_DrawDebug(const char *a1)
+void __cdecl RB_DrawDebug(void)
 {
   RB_AddPlumeStrings();
   RB_DrawDebugPolys();
-  RB_DrawDebugLines(rbDebug_lineCount, (int)rbDebug_lines);
-  RB_DrawDebugLines(rbDebug_locatedLineCount, rbDebug_locatedLines);
+  RB_DrawDebugLines(rbDebug_lineCount, (debugLine_t *)rbDebug_lines);
+  RB_DrawDebugLines(rbDebug_locatedLineCount, (debugLine_t *)rbDebug_locatedLines);
   rbDebug_lineCount = 0;
-  RB_DrawDebugStrings((const char *)rbDebug_stringCount, a1, (int)rbDebug_strings);
-  RB_DrawDebugStrings((const char *)rbDebug_locatedStringCount, a1, rbDebug_locatedStrings);
+  RB_DrawDebugStrings(rbDebug_stringCount, (debugString_t *)rbDebug_strings);
+  RB_DrawDebugStrings(rbDebug_locatedStringCount, (debugString_t *)rbDebug_locatedStrings);
   rbDebug_stringCount = 0;
 }
 
 /* ---- R_AddDebugPolygon  0x004E0810 ----  VERIFIED */
-int __cdecl R_AddDebugPolygon(_DWORD *a1, int a2, const void *a3)
+void __cdecl R_AddDebugPolygon(unsigned int *color, int vertexCount, const void *vertices)
 {
-  int result;
+  debugPolygon_t *poly;
 
-  result = a2 + rbDebug_polygonVertexCount;
-  if ( a2 + rbDebug_polygonVertexCount <= rbDebug_polygonVertexCapacity )
+  if ( vertexCount + rbDebug_polygonVertexCount <= rbDebug_polygonVertexCapacity )
   {
-    result = rbDebug_polygonCount;
+
     if ( rbDebug_polygonCount + 1 <= rbDebug_polygonCapacity )
     {
       if ( !rbDebug_polygons || !pointer )
       {
         rbDebug_polygons = Z_MallocInternal(24 * rbDebug_polygonCapacity);
         pointer = Z_MallocInternal(12 * rbDebug_polygonVertexCapacity);
-        result = rbDebug_polygonCount;
+
       }
-      *((_DWORD *)rbDebug_polygons + 6 * result + 4) = rbDebug_polygonVertexCount;
-      *((_DWORD *)rbDebug_polygons + 6 * rbDebug_polygonCount + 5) = a2;
-      *((_DWORD *)rbDebug_polygons + 6 * rbDebug_polygonCount) = *a1;
-      *((_DWORD *)rbDebug_polygons + 6 * rbDebug_polygonCount + 1) = a1[1];
-      *((_DWORD *)rbDebug_polygons + 6 * rbDebug_polygonCount + 2) = a1[2];
-      *((_DWORD *)rbDebug_polygons + 6 * rbDebug_polygonCount + 3) = a1[3];
-      result = (int)pointer;
+
+      ((debugPolygon_t *)rbDebug_polygons)[rbDebug_polygonCount].firstVertex = rbDebug_polygonVertexCount;
+      ((debugPolygon_t *)rbDebug_polygons)[rbDebug_polygonCount].vertexCount = vertexCount;
+      ((unsigned int *)((debugPolygon_t *)rbDebug_polygons)[rbDebug_polygonCount].color)[0] = color[0];
+      ((unsigned int *)((debugPolygon_t *)rbDebug_polygons)[rbDebug_polygonCount].color)[1] = color[1];
+      ((unsigned int *)((debugPolygon_t *)rbDebug_polygons)[rbDebug_polygonCount].color)[2] = color[2];
+      ((unsigned int *)((debugPolygon_t *)rbDebug_polygons)[rbDebug_polygonCount].color)[3] = color[3];
+
       ++rbDebug_polygonCount;
-      qmemcpy((char *)pointer + 12 * rbDebug_polygonVertexCount, a3, 4 * ((unsigned int)(12 * a2) >> 2));
-      rbDebug_polygonVertexCount += a2;
+      memcpy(&((vec3_t *)pointer)[rbDebug_polygonVertexCount], vertices, 12 * vertexCount);
+      rbDebug_polygonVertexCount += vertexCount;
     }
   }
-  return result;
+
 }
 
 /* ---- R_AddDebugLine  0x004E0940 ----  VERIFIED */
-int __cdecl R_AddDebugLine(_DWORD *a1, _DWORD *a2, _DWORD *a3)
+int __cdecl R_AddDebugLine(unsigned int *start, unsigned int *end, unsigned int *color)
 {
-  int result;
-  int *v4;
+  debugLine_t *line;
 
-  result = rbDebug_lineCount;
-  if ( rbDebug_lineCount + 1 <= rbDebug_lineCapacity )
-  {
-    v4 = (int *)rbDebug_lines;
-    if ( !rbDebug_lines )
-    {
-      v4 = Z_MallocInternal(44 * rbDebug_lineCapacity);
-      result = rbDebug_lineCount;
-      rbDebug_lines = v4;
-    }
-    result = (int)&v4[11 * result];
-    *(_DWORD *)result = *a1;
-    *(_DWORD *)(result + 4) = a1[1];
-    *(_DWORD *)(result + 8) = a1[2];
-    *(_DWORD *)(result + 12) = *a2;
-    *(_DWORD *)(result + 16) = a2[1];
-    *(_DWORD *)(result + 20) = a2[2];
-    *(_DWORD *)(result + 24) = *a3;
-    *(_DWORD *)(result + 28) = a3[1];
-    *(_DWORD *)(result + 32) = a3[2];
-    *(_DWORD *)(result + 36) = a3[3];
-    *(_DWORD *)(result + 40) = 0;
-    ++rbDebug_lineCount;
-  }
-  return result;
+  if ( rbDebug_lineCount + 1 > rbDebug_lineCapacity )
+    return rbDebug_lineCount;
+  if ( !rbDebug_lines )
+    rbDebug_lines = Z_MallocInternal(44 * rbDebug_lineCapacity);
+  line = &((debugLine_t *)rbDebug_lines)[rbDebug_lineCount];
+  VectorCopy( (float *)start, line->start );
+  VectorCopy( (float *)end, line->end );
+  line->color[0] = ((float *)color)[0];
+  line->color[1] = ((float *)color)[1];
+  line->color[2] = ((float *)color)[2];
+  line->color[3] = ((float *)color)[3];
+  line->depthTest = 0;
+  ++rbDebug_lineCount;
+  return (int)line;   /* dead EAX: the line record */
 }
 
 static const int r_debugBoxEdges[24] =
@@ -543,127 +520,97 @@ static const int r_debugBoxEdges[24] =
 };
 
 /* ---- R_AddDebugBox  0x004E09C0 ----  VERIFIED */
-int __cdecl R_AddDebugBox(_DWORD *a1, float *a2, float *a3)
+int __cdecl R_AddDebugBox(float *mins, float *maxs, unsigned int *color)
 {
-  int v5;
-  float *v6;
-  double v7;
-  double v8;
-  double v9;
+  int   result;
+  int   corner;
+  int   axis;
   unsigned int i;
-  int result;
-  float v12[8][3]; // [esp+10h] [ebp-60h] BYREF
+  float corners[8][3]; // [esp+10h] [ebp-60h] BYREF
 
-  v5 = 0;
-  v6 = &v12[0][1];
-  do
+  /* maxs = maxs, mins = mins; bit N of the corner index selects maxs on axis N */
+  for ( corner = 0; corner < 8; ++corner )
   {
-    if ( (v5 & 1) != 0 )
-      v7 = *a2;
-    else
-      v7 = *a3;
-    *(v6 - 1) = v7;
-    if ( (v5 & 2) != 0 )
-      v8 = a2[1];
-    else
-      v8 = a3[1];
-    *v6 = v8;
-    if ( (v5 & 4) != 0 )
-      v9 = a2[2];
-    else
-      v9 = a3[2];
-    v6[1] = v9;
-    ++v5;
-    v6 += 3;
+    for ( axis = 0; axis < 3; axis++ )
+      corners[corner][axis] = (corner & (1 << axis)) ? maxs[axis] : mins[axis];
   }
-  while ( v5 < 8 );
   for ( i = 0; i < 24; i += 2 )
-    result = R_AddDebugLine((_DWORD *)v12[r_debugBoxEdges[i]],
-                            (_DWORD *)v12[r_debugBoxEdges[i + 1]], a1);
+    result = R_AddDebugLine((unsigned int *)corners[r_debugBoxEdges[i]],
+                            (unsigned int *)corners[r_debugBoxEdges[i + 1]], color);
   return result;
 }
 
 /* ---- R_AddDebugString  0x004E0A40 ----  VERIFIED */
-int __cdecl R_AddDebugString(int *a1, int *a2, int a3, char *Source)
+int __cdecl R_AddDebugString(int *origin, int *color, int scaleBits, char *text)
 {
-  int v4;
-  int result;
-  int *v6;
-  int *v7;
+  int            count;
+  int            result;
+  debugString_t *str;
 
-  v4 = rbDebug_stringCount;
+  count = rbDebug_stringCount;
   result = rbDebug_stringCount + 1;
   if ( rbDebug_stringCount + 1 <= rbDebug_stringCapacity )
   {
-    v6 = (int *)rbDebug_strings;
     if ( !rbDebug_strings )
     {
-      v6 = Z_MallocInternal(rbDebug_stringCapacity << 7);
-      v4 = rbDebug_stringCount;
-      rbDebug_strings = v6;
+      rbDebug_strings = Z_MallocInternal(rbDebug_stringCapacity << 7);   /* capacity * 128 */
+      count = rbDebug_stringCount;
     }
-    v7 = &v6[32 * v4];
-    *v7 = *a1;
-    v7[1] = a1[1];
-    v7[2] = a1[2];
-    v7[3] = *a2;
-    v7[4] = a2[1];
-    v7[5] = a2[2];
-    v7[6] = a2[3];
-    v7[7] = a3;
-    strncpy((char *)v7 + 32, Source, 0x5Fu);
-    *((_BYTE *)v7 + 127) = 0;
+    str = &((debugString_t *)rbDebug_strings)[count];
+    memcpy(str->origin, origin, sizeof(str->origin));
+    memcpy(str->color,  color, sizeof(str->color));
+    str->scale = *(float *)&scaleBits;
+    strncpy(str->text, text, 0x5Fu);
+    str->text[0x5F] = 0;
     return ++rbDebug_stringCount;
   }
   return result;
 }
 
 /* ---- R_AddScaledDebugString  0x004E0AD0 ----  VERIFIED */
-int __cdecl R_AddScaledDebugString(int a1, int *a2, char *Source)
+int __cdecl R_AddScaledDebugString(int origin, int *color, char *text)
 {
-  double v4;
-  float v6;
-  float v7[3]; // [esp+Ch] [ebp-Ch] BYREF -- retail vec3_t
+  float dist;
+  float  scale;
+  float  dir[3]; // [esp+Ch] [ebp-Ch] BYREF -- retail vec3_t
 
-  v7[0] = *(float *)a1 - tr_viewParms_originX;
-  v7[1] = *(float *)(a1 + 4) - tr_viewParms_originY;
-  v7[2] = *(float *)(a1 + 8) - tr_viewParms_originZ;
-  v4 = VectorNormalize(v7);
-  v6 = (*(float *)&tr_viewParms_axis02 * v7[2] + *(float *)&tr_viewParms_axis01 * v7[1] + *(float *)&tr_viewParms_axis00 * v7[0] - 0.995) * v4;
-  if ( (v6 < 1.0) | __UNORDERED__(v6, 1.0) )
-    v6 = 1.0;
-  return R_AddDebugString((int *)a1, a2, SLODWORD(v6), Source);
+  /* scale grows for points nearly collinear with the forward axis */
+  dir[0] = *(float *)origin - tr_viewParms_originX;
+  dir[1] = *(float *)(origin + 4) - tr_viewParms_originY;
+  dir[2] = *(float *)(origin + 8) - tr_viewParms_originZ;
+  dist = VectorNormalize(dir);
+  scale = (*(float *)&tr_viewParms_axis02 * dir[2]
+         + *(float *)&tr_viewParms_axis01 * dir[1]
+         + *(float *)&tr_viewParms_axis00 * dir[0] - 0.995f) * dist;   /* flt_569168 = 0x3F7EB852 */
+  if ( scale < 1.0f )
+    scale = 1.0f;
+  return R_AddDebugString((int *)origin, color, *(int *)&scale, text);
 }
 
 /* ---- R_InitDebug  0x004E0B70 ----  VERIFIED */
-int R_InitDebug()
+void R_InitDebug()
 {
-  int result;
 
-  rbDebug_polygonVertexCapacity = 0;  rbDebug_polygonVertexCount = 0;  rbDebug_polygonCapacity = 0;  rbDebug_polygonCount = 0;
-  rbDebug_polygons = 0;  rbDebug_stringCapacity = 0;  rbDebug_stringCount = 0;  rbDebug_strings = 0;
-  rbDebug_font = 0;  rbDebug_locatedStringCount = 0;  rbDebug_locatedStrings = 0;  rbDebug_lineCapacity = 0;
-  rbDebug_lineCount = 0;  rbDebug_lines = 0;  rbDebug_locatedLineCount = 0;  rbDebug_locatedLines = 0;
-  rbDebug_plumeCount = 0;  rbDebug_plumeCapacity = 0;  rbDebug_plumes = 0;  rbDebug_immediateModeActive = 0;
-  mode = 0;           rbDebug_immediateLineWidth = 0;  rbDebug_immediateTexCoordS = 0;  rbDebug_immediateTexCoordT = 0;
-  rbDebug_immediateColorR = 0;   rbDebug_immediateColorG = 0;   rbDebug_immediateColorB = 0;   rbDebug_immediateColorA = 0;
-  rbDebug_immediateVertexCount = 0;  rbDebug_immediateVertexCapacity = 0;  rbDebug_immediateVertices = 0;
-  result = 4097;
-  rbDebug_polygonVertexCapacity = 4096;
-  rbDebug_stringCapacity = 4096;
-  rbDebug_plumeCapacity = 4096;
-  rbDebug_polygonCapacity = 512;
-  rbDebug_lineCapacity = 0x4000;
+
+  
+
+  memset(&rendererDebugState, 0, sizeof(rendererDebugState));
+
+  rendererDebugState.polygonVertexCapacity = 4096;
+  rendererDebugState.stringCapacity = 4096;
+  rendererDebugState.plumeCapacity = 4096;
+  rendererDebugState.polygonCapacity = 512;
+  rendererDebugState.lineCapacity = 0x4000;
   mode = 0;
-  rbDebug_immediateLineWidth = 0;
-  rbDebug_immediateTexCoordS = 0;
-  rbDebug_immediateTexCoordT = 0;
-  rbDebug_immediateColorR = 1;
-  rbDebug_immediateColorG = 1;
-  rbDebug_immediateColorB = 1;
-  rbDebug_immediateColorA = 1;
-  rbDebug_immediateVertexCapacity = 0x2000;
-  return result;
+  rendererDebugState.immediateLineWidth = 0.0f;
+  rendererDebugState.immediateTexCoordS = 0.0f;
+  rendererDebugState.immediateTexCoordT = 0.0f;
+  rendererDebugState.immediateColorR = 1;
+  rendererDebugState.immediateColorG = 1;
+  rendererDebugState.immediateColorB = 1;
+  rendererDebugState.immediateColorA = 1;
+  rendererDebugState.immediateVertexCapacity = 0x2000;
+
 }
 
 /* ---- R_ShutdownDebug  0x004E0C00 ----  VERIFIED */
@@ -707,65 +654,55 @@ void R_ShutdownDebug()
 }
 
 /* ---- RE_LocateDebugStrings  0x004E0CB0 ----  VERIFIED */
-int __cdecl RE_LocateDebugStrings(int a1, int a2)
+int __cdecl RE_LocateDebugStrings(int strings, int count)
 {
   int result;
 
-  result = a1;
-  rbDebug_locatedStrings = a1;
-  rbDebug_locatedStringCount = a2;
+  result = strings;
+  rbDebug_locatedStrings = strings;
+  rbDebug_locatedStringCount = count;
   return result;
 }
 
 /* ---- RE_LocateDebugLines  0x004E0CD0 ----  VERIFIED */
-int __cdecl RE_LocateDebugLines(int a1, int a2)
+int __cdecl RE_LocateDebugLines(int lines, int count)
 {
   int result;
 
-  result = a1;
-  rbDebug_locatedLines = a1;
-  rbDebug_locatedLineCount = a2;
+  result = lines;
+  rbDebug_locatedLines = lines;
+  rbDebug_locatedLineCount = count;
   return result;
 }
 
 /* ---- RE_AddPlume  0x004E0CF0 ----  VERIFIED */
-int *__cdecl RE_AddPlume(int *a1, int a2, _DWORD *a3, int a4)
+void __cdecl RE_AddPlume(int *origin, int labelValue, unsigned int *color, int duration)
 {
-  int *result;
-  int v5;
-
-  result = (int *)rbDebug_plumes;
-  if ( rbDebug_plumes )
+  if ( !rbDebug_plumes )
   {
-    v5 = rbDebug_plumeCount;
-  }
-  else
-  {
-    result = Z_MallocInternal(40 * rbDebug_plumeCapacity);
-    v5 = 0;
-    rbDebug_plumes = result;
+    rbDebug_plumes = Z_MallocInternal(40 * rbDebug_plumeCapacity);
     rbDebug_plumeCount = 0;
   }
-  if ( v5 != rbDebug_plumeCapacity )
+  if ( rbDebug_plumeCount != rbDebug_plumeCapacity )
   {
-    result[10 * v5] = *a1;
-    *((_DWORD *)rbDebug_plumes + 10 * rbDebug_plumeCount + 1) = a1[1];
-    *((_DWORD *)rbDebug_plumes + 10 * rbDebug_plumeCount + 2) = a1[2];
-    *((_DWORD *)rbDebug_plumes + 10 * rbDebug_plumeCount + 3) = *a3;
-    *((_DWORD *)rbDebug_plumes + 10 * rbDebug_plumeCount + 4) = a3[1];
-    *((_DWORD *)rbDebug_plumes + 10 * rbDebug_plumeCount + 5) = a3[2];
-    *((_DWORD *)rbDebug_plumes + 10 * rbDebug_plumeCount + 7) = a2;
-    *((_DWORD *)rbDebug_plumes + 10 * rbDebug_plumeCount + 8) = tr_refdef_time;
-    result = (int *)rbDebug_plumes;
-    *((_DWORD *)rbDebug_plumes + 10 * rbDebug_plumeCount++ + 9) = a4;
+    ((unsigned int *)((debugPlume_t *)rbDebug_plumes)[rbDebug_plumeCount].origin)[0] = origin[0];
+    ((unsigned int *)((debugPlume_t *)rbDebug_plumes)[rbDebug_plumeCount].origin)[1] = origin[1];
+    ((unsigned int *)((debugPlume_t *)rbDebug_plumes)[rbDebug_plumeCount].origin)[2] = origin[2];
+    ((unsigned int *)((debugPlume_t *)rbDebug_plumes)[rbDebug_plumeCount].color)[0] = color[0];
+    ((unsigned int *)((debugPlume_t *)rbDebug_plumes)[rbDebug_plumeCount].color)[1] = color[1];
+    ((unsigned int *)((debugPlume_t *)rbDebug_plumes)[rbDebug_plumeCount].color)[2] = color[2];
+    ((debugPlume_t *)rbDebug_plumes)[rbDebug_plumeCount].labelValue = labelValue;
+    ((debugPlume_t *)rbDebug_plumes)[rbDebug_plumeCount].startTime = tr_refdef_time;
+    ((debugPlume_t *)rbDebug_plumes)[rbDebug_plumeCount].duration = duration;
+    ++rbDebug_plumeCount;
   }
-  return result;
 }
 
 /* ---- RB_BeginImmediateMode  0x004E0E00 ----  VERIFIED */
 void RB_BeginImmediateMode()
 {
-  GLenum v0;
+  debugVertex_t *verts;
+  GLenum         nvDisable;
 
   if ( !rbDebug_immediateVertices )
     rbDebug_immediateVertices = Z_MallocInternal(32 * rbDebug_immediateVertexCapacity);
@@ -774,28 +711,27 @@ void RB_BeginImmediateMode()
   rbDebug_immediateColorB = -1;
   rbDebug_immediateColorA = -1;
   mode = 0;
-  rbDebug_immediateLineWidth = 0;
-  rbDebug_immediateTexCoordS = 0;
-  rbDebug_immediateTexCoordT = 0;
+  rendererDebugState.immediateLineWidth = 0.0f;
+  rendererDebugState.immediateTexCoordS = 0.0f;
+  rendererDebugState.immediateTexCoordT = 0.0f;
   if ( glState_currentStorageMode != 3 )
   {
     if ( glConfig_NVVertexArrayRange )
     {
       if ( glConfig_NVVertexArrayRange == 1 )
-        v0 = 34077;
+        glDisableClientState(34077);
       else
-        v0 = 34099;
-      glDisableClientState(v0);
+        glDisableClientState(34099);
       glVertexPointer(tess_vertexComponentCount, 0x1406u, 0, tess_xyz);
       glNormalPointer(0x1406u, 0, tess_stageNormals);
-      glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords);
+      glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords[0]);
       glColorPointer(4, 0x1401u, 0, tess_stageVertexColors);
     }
     else if ( glConfig_ATIVertexArrayObject )
     {
       glVertexPointer(tess_vertexComponentCount, 0x1406u, 0, tess_xyz);
       glNormalPointer(0x1406u, 12, tess_stageNormals);
-      glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords);
+      glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords[0]);
     }
     glState_currentStorageMode = 3;
   }
@@ -803,11 +739,11 @@ void RB_BeginImmediateMode()
   GL_ClientState(1281);
   if ( (glState_glStateBits & 0x200000) != 0 )
   {
-    glDisable(0xB60u);
+    glDisable(0xB60u);                                 /* GL_FOG */
     glState_glStateBits &= ~0x200000u;
   }
-  glTexCoordPointer(2, 0x1406u, 32, (char *)rbDebug_immediateVertices + 12);
-  glColorPointer(4, 0x1401u, 32, (char *)rbDebug_immediateVertices + 28);
+  glTexCoordPointer(2, 0x1406u, 32, &((debugVertex_t *)rbDebug_immediateVertices)->s);
+  glColorPointer(4, 0x1401u, 32, ((debugVertex_t *)rbDebug_immediateVertices)->color);
   qglNormal3f(0.0f, 0.0f, 1.0f);
   glVertexPointer(3, 0x1406u, 32, rbDebug_immediateVertices);
   rbDebug_immediateModeActive = 1;
@@ -837,66 +773,55 @@ void RB_glEnd()
 }
 
 /* ---- RB_glVertex2i  0x004E1040 ----  VERIFIED */
-char *__cdecl RB_glVertex2i(int a1, int a2)
+void __cdecl RB_glVertex2i(int x, int y)
 {
-  int v3;
-  int v4;
-
-  *(float *)&v4 = (float)a2;
-  *(float *)&v3 = (float)a1;
-  return RB_glVertex3f(v3, v4, 0);
+  RB_glVertex3f((float)x, (float)y, 0.0f);
 }
 
 /* ---- RB_glVertex2f  0x004E1060 ----  VERIFIED */
-char *__cdecl RB_glVertex2f(int a1, int a2)
+void __cdecl RB_glVertex2f(float x, float y)
 {
-  return RB_glVertex3f(a1, a2, 0);
+  RB_glVertex3f(x, y, 0.0f);
 }
 
 /* ---- RB_glVertex2fv  0x004E1080 ----  VERIFIED */
-char *__cdecl RB_glVertex2fv(int *a1)
+void __cdecl RB_glVertex2fv(const float *v)
 {
-  return RB_glVertex3f(*a1, a1[1], 0);
+  RB_glVertex3f(v[0], v[1], 0.0f);
 }
 
 /* ---- RB_glVertex3f  0x004E10A0 ----  VERIFIED */
-char *__cdecl RB_glVertex3f( int xbits, int ybits, int zbits )
+void __cdecl RB_glVertex3f( float x, float y, float z )
 {
-	char *result;
+	debugVertex_t *v;
 
-	result = (char *)rbDebug_immediateVertexCount;
 	if ( rbDebug_immediateVertexCount < rbDebug_immediateVertexCapacity )
 	{
-		result = (char *)rbDebug_immediateVertices + 32 * rbDebug_immediateVertexCount;
-		result[28] = rbDebug_immediateColorR;
-		result[29] = rbDebug_immediateColorG;
-		result[30] = rbDebug_immediateColorB;
-		result[31] = rbDebug_immediateColorA;
-		*((_DWORD *)result + 3) = rbDebug_immediateTexCoordS;
-		*((_DWORD *)result + 4) = rbDebug_immediateTexCoordT;
-		*(_DWORD *)result       = xbits;
-		*((_DWORD *)result + 1) = ybits;
-		*((_DWORD *)result + 2) = zbits;
+		v = &((debugVertex_t *)rbDebug_immediateVertices)[rbDebug_immediateVertexCount];
+		v->color[0] = rbDebug_immediateColorR;
+		v->color[1] = rbDebug_immediateColorG;
+		v->color[2] = rbDebug_immediateColorB;
+		v->color[3] = rbDebug_immediateColorA;
+		v->s = rbDebug_immediateTexCoordS;
+		v->t = rbDebug_immediateTexCoordT;
+		v->xyz[0] = x;
+		v->xyz[1] = y;
+		v->xyz[2] = z;
 		++rbDebug_immediateVertexCount;
 	}
-	return result;
 }
 
 /* ---- RB_glVertex3fv  0x004E1110 ----  VERIFIED */
-char *__cdecl RB_glVertex3fv(int *a1)
+void __cdecl RB_glVertex3fv(const float *v)
 {
-  return RB_glVertex3f(*a1, a1[1], a1[2]);
+  RB_glVertex3f(v[0], v[1], v[2]);
 }
 
 /* ---- RB_glTexCoord2f  0x004E1130 ----  VERIFIED */
-int __cdecl RB_glTexCoord2f(int a1, int a2)
+void __cdecl RB_glTexCoord2f(float s, float t)
 {
-  int result;
-
-  result = a1;
-  rbDebug_immediateTexCoordS = a1;
-  rbDebug_immediateTexCoordT = a2;
-  return result;
+  rbDebug_immediateTexCoordS = *(int *)&s;
+  rbDebug_immediateTexCoordT = *(int *)&t;
 }
 
 /* ---- RB_glTexCoord2fv  0x004E1150 ----  VERIFIED */
@@ -908,269 +833,215 @@ int *__cdecl RB_glTexCoord2fv(int *result)
 }
 
 /* ---- RB_glColor3f  0x004E1170 ----  VERIFIED */
-unsigned __int64 __cdecl RB_glColor3f(float a1, float a2, float a3)
+unsigned __int64 __cdecl RB_glColor3f(float r, float g, float b)
 {
   unsigned __int64 result; // rax
 
-  rbDebug_immediateColorR = (unsigned __int64)(a1 * 255.0);
-  rbDebug_immediateColorG = (unsigned __int64)(a2 * 255.0);
-  result = (unsigned __int64)(a3 * 255.0);
+  rbDebug_immediateColorR = (unsigned __int64)((rfloat)r * 255.0f);
+  rbDebug_immediateColorG = (unsigned __int64)((rfloat)g * 255.0f);
+  result = (unsigned __int64)((rfloat)b * 255.0f);
   rbDebug_immediateColorB = result;
   rbDebug_immediateColorA = -1;
   return result;
 }
 
 /* ---- RB_glColor4f  0x004E11C0 ----  VERIFIED */
-unsigned __int64 __cdecl RB_glColor4f(float a1, float a2, float a3, float a4)
+unsigned __int64 __cdecl RB_glColor4f(float r, float g, float b, float a)
 {
   unsigned __int64 result; // rax
 
-  rbDebug_immediateColorR = (unsigned __int64)(a1 * 255.0);
-  rbDebug_immediateColorG = (unsigned __int64)(a2 * 255.0);
-  rbDebug_immediateColorB = (unsigned __int64)(a3 * 255.0);
-  result = (unsigned __int64)(a4 * 255.0);
+  rbDebug_immediateColorR = (unsigned __int64)((rfloat)r * 255.0f);
+  rbDebug_immediateColorG = (unsigned __int64)((rfloat)g * 255.0f);
+  rbDebug_immediateColorB = (unsigned __int64)((rfloat)b * 255.0f);
+  result = (unsigned __int64)((rfloat)a * 255.0f);
   rbDebug_immediateColorA = result;
   return result;
 }
 
 /* ---- RB_glColor3fv  0x004E1220 ----  VERIFIED */
-unsigned __int64 __cdecl RB_glColor3fv(float *a1)
+unsigned __int64 __cdecl RB_glColor3fv(const float *v)
 {
-  double v1;
-  double v2;
-  unsigned __int64 result; // rax
-
-  v1 = a1[2];
-  v2 = a1[1];
-  rbDebug_immediateColorR = (unsigned __int64)(*a1 * 255.0);
-  rbDebug_immediateColorG = (unsigned __int64)(v2 * 255.0);
-  result = (unsigned __int64)(v1 * 255.0);
-  rbDebug_immediateColorB = result;
-  rbDebug_immediateColorA = -1;
-  return result;
+  return RB_glColor3f(v[0], v[1], v[2]);
 }
 
 /* ---- RB_glColor4fv  0x004E1260 ----  VERIFIED */
-unsigned __int64 __cdecl RB_glColor4fv(float *a1)
+unsigned __int64 __cdecl RB_glColor4fv(const float *v)
 {
-  double v1;
-  double v2;
-  double v3;
-  unsigned __int64 result; // rax
-
-  v1 = a1[3];
-  v2 = a1[2];
-  v3 = a1[1];
-  rbDebug_immediateColorR = (unsigned __int64)(*a1 * 255.0);
-  rbDebug_immediateColorG = (unsigned __int64)(v3 * 255.0);
-  rbDebug_immediateColorB = (unsigned __int64)(v2 * 255.0);
-  result = (unsigned __int64)(v1 * 255.0);
-  rbDebug_immediateColorA = result;
-  return result;
+  return RB_glColor4f(v[0], v[1], v[2], v[3]);
 }
 
 /* ---- RB_glLineWidth  0x004E12B0 ----  VERIFIED */
-void __cdecl RB_glLineWidth(int a1)
+void __cdecl RB_glLineWidth(float width)
 {
-  if ( !((*(float *)&rbDebug_immediateLineWidth == *(float *)&a1) | __UNORDERED__(*(float *)&rbDebug_immediateLineWidth, *(float *)&a1)) )
+  if ( *(float *)&rbDebug_immediateLineWidth != width )
   {
-    rbDebug_immediateLineWidth = a1;
-    qglLineWidth(*(float *)&a1);
+    *(float *)&rbDebug_immediateLineWidth = width;
+    qglLineWidth(width);
   }
 }
 
 /* ---- R_BoxBehindPlane  0x004E12E0 ----  VERIFIED */
-BOOL __cdecl R_BoxBehindPlane(int a1, int a2)
+int __cdecl R_BoxBehindPlane(dpvsPlane_t *plane, int box)
 {
-  double v2;
+  rfloat dot;
 
-  v2 = *(float *)(*(unsigned __int8 *)(a1 + 18) + a2) * *(float *)(a1 + 8)
-     + *(float *)(*(unsigned __int8 *)(a1 + 17) + a2) * *(float *)(a1 + 4)
-     + *(float *)(*(unsigned __int8 *)(a1 + 16) + a2) * *(float *)a1;
-  return ((v2 < *(float *)(a1 + 12)) | __UNORDERED__(v2, *(float *)(a1 + 12))) != 0;
+  /* sideOffsets pick the box corner furthest along +normal; if even that is
+   * behind the plane, the whole box is behind. */
+  dot = *(float *)(box + plane->sideOffsets[2]) * plane->normal[2]
+      + *(float *)(box + plane->sideOffsets[1]) * plane->normal[1]
+      + *(float *)(box + plane->sideOffsets[0]) * plane->normal[0];
+  return dot < plane->distance;
 }
 
 /* ---- R_BoxInFrontOfPlane  0x004E1320 ----  VERIFIED */
-BOOL __cdecl R_BoxInFrontOfPlane(int a1, int a2)
+int __cdecl R_BoxInFrontOfPlane(dpvsPlane_t *plane, int box)
 {
-  return *(float *)(a2 - *(unsigned __int8 *)(a1 + 18) + 28) * *(float *)(a1 + 8)
-       + *(float *)(a2 - *(unsigned __int8 *)(a1 + 17) + 20) * *(float *)(a1 + 4)
-       + *(float *)(a2 - *(unsigned __int8 *)(a1 + 16) + 12) * *(float *)a1 > *(float *)(a1 + 12);
+    float z = *(float *)(box - plane->sideOffsets[2] + 28);
+    float y = *(float *)(box - plane->sideOffsets[1] + 20);
+    float x = *(float *)(box - plane->sideOffsets[0] + 12);
+    return z * plane->normal[2] + y * plane->normal[1] + x * plane->normal[0] > plane->distance;
 }
 
 /* ---- R_CullBoxDPVS  0x004E1360 ----  VERIFIED */
-int __cdecl R_CullBoxDPVS(int a1, int a2, int a3, int a4)
+int __cdecl R_CullBoxDPVS(int numPlanes, int box, dpvsPlane_t *planes, int planeIndex)
 {
-  int v4;
-  int v5;
-  double v6;
-  double v7;
-  double v8;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  double v18;
+  dpvsPlane_t     *nearPlane;
+  dpvsPlane_t     *farPlane;
+  dpvsOccluder_t **occluders;
+  rfloat           dot;
+  float x,y,z;
+  int              i;
+  int              j;
 
-  if ( a4 < dpvs_cullPlaneLimit )
+  
+  if ( planeIndex < dpvs_cullPlaneLimit )
   {
-    v4 = 0;
     dpvs_cullPlaneLimit = 0x7FFFFFFF;
-    if ( a1 > 0 )
+    for ( i = 0; i < numPlanes; ++i )
     {
-      v5 = a3 + 8;
-      do
-      {
-        v6 = *(float *)(*(unsigned __int8 *)(v5 + 8) + a2) * *(float *)(v5 - 8)
-           + *(float *)(*(unsigned __int8 *)(v5 + 9) + a2) * *(float *)(v5 - 4)
-           + *(float *)(*(unsigned __int8 *)(v5 + 10) + a2) * *(float *)v5;
-        if ( (v6 < *(float *)(v5 + 4)) | __UNORDERED__(v6, *(float *)(v5 + 4)) )
-          return 1;
-        ++v4;
-        v5 += 20;
-      }
-      while ( v4 < a1 );
+      dpvsPlane_t *p = &planes[i];
+      dot = *(float *)(box + p->sideOffsets[0]) * p->normal[0]
+          + *(float *)(box + p->sideOffsets[1]) * p->normal[1]
+          + *(float *)(box + p->sideOffsets[2]) * p->normal[2];
+      if ( dot < p->distance )
+        return 1;
     }
   }
-  v7 = *(float *)(*(unsigned __int8 *)(dpvs_activeNearPlane + 18) + a2) * *(float *)(dpvs_activeNearPlane + 8)
-     + *(float *)(*(unsigned __int8 *)(dpvs_activeNearPlane + 17) + a2) * *(float *)(dpvs_activeNearPlane + 4)
-     + *(float *)(*(unsigned __int8 *)(dpvs_activeNearPlane + 16) + a2) * *(float *)dpvs_activeNearPlane;
-  if ( (v7 < *(float *)(dpvs_activeNearPlane + 12)) | __UNORDERED__(v7, *(float *)(dpvs_activeNearPlane + 12)) )
+
+  
+  nearPlane = (dpvsPlane_t *)dpvs_activeNearPlane;
+  z = *(float *)(box + nearPlane->sideOffsets[2]);
+  y = *(float *)(box + nearPlane->sideOffsets[1]);
+  x = *(float *)(box + nearPlane->sideOffsets[0]);
+  dot = z * nearPlane->normal[2] + y * nearPlane->normal[1] + x * nearPlane->normal[0];
+  if ( dot < nearPlane->distance )
     return 1;
-  if ( dpvs_activeFarPlane )
+  farPlane = (dpvsPlane_t *)dpvs_activeFarPlane;
+  if ( farPlane )
   {
-    v8 = *(float *)(*(unsigned __int8 *)(dpvs_activeFarPlane + 18) + a2) * *(float *)(dpvs_activeFarPlane + 8)
-       + *(float *)(*(unsigned __int8 *)(dpvs_activeFarPlane + 17) + a2) * *(float *)(dpvs_activeFarPlane + 4)
-       + *(float *)(*(unsigned __int8 *)(dpvs_activeFarPlane + 16) + a2) * *(float *)dpvs_activeFarPlane;
-    if ( (v8 < *(float *)(dpvs_activeFarPlane + 12)) | __UNORDERED__(v8, *(float *)(dpvs_activeFarPlane + 12)) )
+    z = *(float *)(box + farPlane->sideOffsets[2]);
+  y = *(float *)(box + farPlane->sideOffsets[1]);
+  x = *(float *)(box + farPlane->sideOffsets[0]);
+  dot = z * farPlane->normal[2] + y * farPlane->normal[1] + x * farPlane->normal[0];
+    if ( dot < farPlane->distance )
       return 1;
   }
-  v10 = 0;
-  if ( dpvs_occluderCount <= 0 )
-    return 0;
-  while ( 1 )
+
+  
+  for ( i = 0; i < dpvs_occluderCount; ++i )
   {
-    v11 = *(_DWORD *)(dpvs_occluders + 4 * v10);
-    if ( a4 < *(_DWORD *)(v11 + 24) )
-      break;
-LABEL_16:
-    if ( ++v10 >= dpvs_occluderCount )
-      return 0;
+    dpvsOccluder_t *occluder;
+    occluder = ((dpvsOccluder_t **)dpvs_occluders)[i];
+
+    if ( planeIndex >= occluder->cullPlaneLimit )
+      continue;
+    occluder->cullPlaneLimit = 0x7FFFFFFF;
+    occluder = ((dpvsOccluder_t **)dpvs_occluders)[i];
+    for ( j = 0; ; ++j )
+    {
+      dpvsPlane_t *p;
+      if ( j >= occluder->activePlaneCount )
+        return 1;
+      p = &occluder->activePlanes[j];
+      dot = *(float *)(box + p->sideOffsets[2]) * p->normal[2]
+          + *(float *)(box + p->sideOffsets[1]) * p->normal[1]
+          + *(float *)(box + p->sideOffsets[0]) * p->normal[0];
+      
+
+      if ( !(dot < p->distance) )
+        break;                                           
+    }
+                                          
   }
-  *(_DWORD *)(v11 + 24) = 0x7FFFFFFF;
-  v12 = *(_DWORD *)(dpvs_occluders + 4 * v10);
-  v13 = 0;
-  v14 = 0;
-  while ( v13 < *(_DWORD *)(v12 + 28) )
-  {
-    v15 = *(_DWORD *)(v12 + 32);
-    v16 = *(unsigned __int8 *)(v15 + v14 + 18);
-    v17 = v14 + v15;
-    v18 = *(float *)(a2 + v16) * *(float *)(v17 + 8)
-        + *(float *)(a2 + *(unsigned __int8 *)(v17 + 17)) * *(float *)(v17 + 4)
-        + *(float *)(a2 + *(unsigned __int8 *)(v17 + 16)) * *(float *)v17;
-    if ( !((v18 < *(float *)(v17 + 12)) | __UNORDERED__(v18, *(float *)(v17 + 12))) )
-      goto LABEL_16;
-    ++v13;
-    v14 += 20;
-  }
-  return 1;
+  return 0;
 }
 
 /* ---- R_CullBoxDPVSStrict  0x004E14C0 ----  VERIFIED */
-int __cdecl R_CullBoxDPVSStrict(int a1, int a2, int a3, int a4)
+int __cdecl R_CullBoxDPVSStrict(int numPlanes, dpvsPlane_t *planes, int box, int planeIndex)
 {
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  _DWORD *v8;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  int v15;
+  dpvsOccluder_t **occluders;
+  rfloat           dot;
+  float x,y,z;
+  int              i;
+  int              j;
 
-  v4 = a4;
-  if ( a4 < dpvs_cullPlaneLimit )
+  
+
+  if ( planeIndex < dpvs_cullPlaneLimit )
   {
-    v5 = 0;
-    if ( a1 > 0 )
+    for ( i = 0; i < numPlanes; ++i )
     {
-      v6 = a2 + 8;
-      while ( *(float *)(a3 - *(unsigned __int8 *)(v6 + 9) + 20) * *(float *)(v6 - 4)
-            + *(float *)(a3 - *(unsigned __int8 *)(v6 + 8) + 12) * *(float *)(v6 - 8)
-            + *(float *)(a3 - *(unsigned __int8 *)(v6 + 10) + 28) * *(float *)v6 > *(float *)(v6 + 4) )
-      {
-        ++v5;
-        v6 += 20;
-        if ( v5 >= a1 )
-          goto LABEL_6;
-      }
-      return 1;
+      dpvsPlane_t *p = &planes[i];
+      y = *(float *)(box - p->sideOffsets[1] + 20);
+      x = *(float *)(box - p->sideOffsets[0] + 12);
+      z = *(float *)(box - p->sideOffsets[2] + 28);
+      dot = y * p->normal[1] + x * p->normal[0] + z * p->normal[2];
+      
+      if ( !(dot > p->distance) )
+        return 1;
     }
-LABEL_6:
-    dpvs_cullPlaneLimit = a4 + 1;
+    dpvs_cullPlaneLimit = planeIndex + 1;
   }
-  v7 = 0;
-  v15 = 0;
-  if ( dpvs_occluderCount <= 0 )
-    return 0;
-  while ( 1 )
+
+  for ( i = 0; i < dpvs_occluderCount; ++i )
   {
-    v8 = *(_DWORD **)(dpvs_occluders + 4 * v7);
-    if ( v4 < v8[6] )
-      break;
-LABEL_14:
-    v15 = ++v7;
-    if ( v7 >= dpvs_occluderCount )
-      return 0;
-  }
-  v9 = 0;
-  v10 = 0;
-  while ( v9 < v8[7] )
-  {
-    v11 = v8[8];
-    v12 = *(unsigned __int8 *)(v11 + v10 + 18);
-    v13 = v10 + v11;
-    if ( *(float *)(a3 - v12 + 28) * *(float *)(v13 + 8)
-       + *(float *)(a3 - *(unsigned __int8 *)(v13 + 17) + 20) * *(float *)(v13 + 4)
-       + *(float *)(a3 - *(unsigned __int8 *)(v13 + 16) + 12) * *(float *)v13 > *(float *)(v13 + 12) )
+    dpvsOccluder_t *occluder;
+    occluder = ((dpvsOccluder_t **)dpvs_occluders)[i];
+
+    if ( planeIndex >= occluder->cullPlaneLimit )
+      continue;
+    for ( j = 0; ; ++j )
     {
-      v4 = a4;
-      v8[6] = a4 + 1;
-      v7 = v15;
-      goto LABEL_14;
+      dpvsPlane_t *p;
+      if ( j >= occluder->activePlaneCount )
+        return 1;
+      p = &occluder->activePlanes[j];
+      z = *(float *)(box - p->sideOffsets[2] + 28);
+      y = *(float *)(box - p->sideOffsets[1] + 20);
+      x = *(float *)(box - p->sideOffsets[0] + 12);
+      dot = z * p->normal[2] + y * p->normal[1] + x * p->normal[0];
+      if ( dot > p->distance )
+        break;                                           
     }
-    ++v9;
-    v10 += 20;
+                                          
+    occluder->cullPlaneLimit = planeIndex + 1;
   }
-  return 1;
+  return 0;
 }
 
 /* ---- R_SetPlaneSidesDPVS_dup  0x004E15D0 ----  VERIFIED */
-int __cdecl R_SetPlaneSidesDPVS_dup(int result)
+dpvsPlane_t *__cdecl R_SetPlaneSidesDPVS_dup(dpvsPlane_t *plane)
 {
-  int v1;
-  char v2;
-  char v3;
-
-  v1 = *(_DWORD *)(result + 4);
-  v2 = (*(int *)result <= 0) - 1;
-  *(float *)(result + 12) = *(float *)(result + 12) - 0.001;
-  *(_BYTE *)(result + 16) = v2 & 0xC;
-  v3 = *(int *)(result + 8) <= 0 ? 0 : 0xC;
-  *(_BYTE *)(result + 17) = v1 <= 0 ? 4 : 16;
-  *(_BYTE *)(result + 18) = v3 + 8;
-  return result;
+  /* signed-int tests on the raw float bits classify each normal component's
+   * sign, choosing the box-corner byte offsets; also bevels dist inward */
+  plane->distance -= 0.001f;   /* flt_568E6C = 0x3A83126F */
+  plane->sideOffsets[0] = *(int *)&plane->normal[0] > 0 ? 12 : 0;
+  plane->sideOffsets[1] = *(int *)&plane->normal[1] > 0 ? 16 : 4;
+  plane->sideOffsets[2] = *(int *)&plane->normal[2] > 0 ? 20 : 8;
+  return plane;
 }
 
-unsigned int dword_540568[51] =
+unsigned int colorDebugPortal[51] =   /* 0x00540568 */
 {
 	0x00000000, 0x3F800000, 0x3F800000, 0x3E800000,      /* 0x00540568  0      1      1      0.25  */
 	0x00000000, 0x00000001, 0x00000000, 0x00000002,      /* 0x00540578  r_debugBoxEdges (cube edge pairs) */
@@ -1181,26 +1052,26 @@ unsigned int dword_540568[51] =
 	0x00000005, 0x00000007, 0x00000006, 0x00000007,      /* 0x005405C8  r_debugBoxEdges (cube edge pairs) */
 	0xFF000000, 0xFF0000FF, 0xFF00FF00, 0xFF00FFFF,      /* 0x005405D8  s_consoleColorTable (packed RGBA bytes) */
 	0xFFFF0000, 0xFFFFFF00, 0xFFFF00FF, 0xFFFFFFFF,      /* 0x005405E8  s_consoleColorTable (packed RGBA bytes) */
-	0x3E991687, 0x3F1645A2, 0x3DE978D5, 0x3F800000,      /* 0x005405F8  0.299  0.587  0.114  1     <- flt_5405F8 luminance */
+	0x3E991687, 0x3F1645A2, 0x3DE978D5, 0x3F800000,      /* 0x005405F8  0.299  0.587  0.114  1     <- luminance weights (R_LoadLights) */
 	0x3F800000, 0x3F800000, 0x3F800000, 0x00000000,      /* 0x00540608  1      1      1      0 */
 	0x00000000, 0x00000000, 0x3F800000, 0x00000000,      /* 0x00540618  0      0      1      0 */
 	0x00000000, 0x00000000, 0x3F800000,                  /* 0x00540628  0      0      1 */
 };
-/* ---- dword_541830   0x00541830   retail .rdata, read with get_bytes ---- */
-unsigned int dword_541830[9] =
+/* ---- colorDebugRed   0x00541830   retail .rdata, read with get_bytes ---- */
+unsigned int colorDebugRed[9] =   /* 0x00541830 */
 {
 	0x3F800000, 0x00000000, 0x00000000, 0x3F800000,      /* 0x00541830  1      0      0      1     */
 	0x00000000, 0x3F800000, 0x00000000, 0x3F800000,      /* 0x00541840  0      1      0      1     */
 	0x00000000,                                          /* 0x00541850  0     */
 };
-/* ---- dword_541840   0x00541840   retail .rdata, read with get_bytes ---- */
-unsigned int dword_541840[5] =
+/* ---- colorDebugGreen   0x00541840   retail .rdata, read with get_bytes ---- */
+unsigned int colorDebugGreen[5] =   /* 0x00541840 */
 {
 	0x00000000, 0x3F800000, 0x00000000, 0x3F800000,      /* 0x00541840  0      1      0      1     */
 	0x00000000,                                          /* 0x00541850  0     */
 };
-/* ---- dword_541860   0x00541860   retail .rdata, read with get_bytes ---- */
-unsigned int dword_541860[92] =
+/* ---- colorDebugBlue   0x00541860   retail .rdata, read with get_bytes ---- */
+unsigned int colorDebugBlue[92] =   /* 0x00541860 */
 {
 	0x00000000, 0x00000000, 0x3F800000, 0x3F800000,      /* 0x00541860  0      0      1      1     */
 	0x3F800000, 0x3F800000, 0x00000000, 0x3F800000,      /* 0x00541870  1      1      0      1     */
@@ -1226,8 +1097,8 @@ unsigned int dword_541860[92] =
 	0x3F800000, 0x00000000, 0x3F800000, 0x3F800000,      /* 0x005419B0  1      0      1      1     */
 	0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000,      /* 0x005419C0  1      1      1      1     */
 };
-/* ---- dword_541870   0x00541870   retail .rdata, read with get_bytes ---- */
-unsigned int dword_541870[88] =
+/* ---- colorDebugYellow   0x00541870   retail .rdata, read with get_bytes ---- */
+unsigned int colorDebugYellow[88] =   /* 0x00541870 */
 {
 	0x3F800000, 0x3F800000, 0x00000000, 0x3F800000,      /* 0x00541870  1      1      0      1     */
 	0x3F400000, 0x3F400000, 0x00000000, 0x3F800000,      /* 0x00541880  0.75   0.75   0      1     */
@@ -1340,8 +1211,8 @@ unsigned int rejectedBevelDebugColor[64] =
 	0x3F800000, 0x00000000, 0x3F800000, 0x3F800000,      /* 0x005419B0  1      0      1      1     */
 	0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000,      /* 0x005419C0  1      1      1      1     */
 };
-/* ---- dword_5418F0   0x005418F0   retail .rdata, read with get_bytes ---- */
-unsigned int dword_5418F0[56] =
+/* ---- colorDebugWhite   0x005418F0   retail .rdata, read with get_bytes ---- */
+unsigned int colorDebugWhite[56] =   /* 0x005418F0 */
 {
 	0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000,      /* 0x005418F0  1      1      1      1     */
 	0x3F400000, 0x3F400000, 0x3F400000, 0x3F800000,      /* 0x00541900  0.75   0.75   0.75   1     */
@@ -1390,6 +1261,3 @@ unsigned int clippedLeafDebugColor[40] =
 	0x3F800000, 0x3F800000, 0x3F800000, 0x3F800000,      /* 0x005419C0  1      1      1      1     */
 };
 
-float flt_5405F8 = 0.299f;      /* 0x005405F8  0x3E991687 */
-float flt_5405FC = 0.587f;      /* 0x005405FC  0x3F1645A2 */
-float flt_540600 = 0.114f;      /* 0x00540600  0x3DE978D5 */

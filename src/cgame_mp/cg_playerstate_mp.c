@@ -1,20 +1,7 @@
-/*
- * cg_playerstate.c -- this file acts on changes in a new playerState_t.
- *
- * Call of Duty 1.1 multiplayer client game (cgame_mp_x86.dll, imagebase
- * 0x30000000).  RTCW's cgame/cg_playerstate.c is the ancestor; CG_CheckAmmo,
- * CG_DamageFeedback, CG_Respawn, CG_CheckPlayerstateEvents,
- * CG_CheckChangedPredictableEvents and CG_TransitionPlayerState are all still
- * recognisably its text.  What CoD dropped: the viewDamage_t slot array (the
- * damage splats became cg.damageIndicators, an eight-entry direction-indicator
- * ring), CG_CheckLocalSounds (absent -- no function and no call), and
- * everything CG_TransitionSnapshot now does instead (respawn/map-restart
- * detection moved into cg_snapshot.c).
- *
- * Functions are in address order, which is the original file order.
- *
- * @fidelity: likely
- */
+// cg_playerstate.c -- this file acts on changes in a new playerState_t
+// With normal play, this will be done after local prediction, but when
+// following another player or playing back a demo, it will be checked
+// when the snapshot transitions like all the other entities
 
 #include <string.h>
 #include <stdlib.h>
@@ -25,27 +12,15 @@
 #define YAW                         1
 #define ROLL                        2
 
-/* Owned by other units. */
-void        CG_Printf( const char *msg, ... );                  /* cg_main.c 0x300206F0 */
-                                                                /* cg_main.c 0x30021BF0 */
+void        CG_Printf( const char *msg, ... );
 void        CG_EntityEvent( centity_t *cent, int event, qboolean predicted );
-                                                                /* cg_event.c 0x3001DC10 */
 
-/* universal/q_shared.c, universal/com_math.c */
-void        AngleVectors( const vec3_t angles, vec3_t forward, vec3_t right, vec3_t up );
-
-/* playerState_t::events[] is four deep, cg.predictableEvents[] sixteen. */
 #define MAX_EVENTS                  4
 #define MAX_PREDICTED_EVENTS        16
 
-/* cg.damageIndicators is eight 12-byte records (CG_Respawn memsets 0x60). */
 #define MAX_DAMAGE_INDICATORS       8
 
-/* cg.v_dmg_time = cg.time + DAMAGE_TIME (0x30028A47 adds 0x1F4). */
 #define DAMAGE_TIME                 500
-
-#define ANGLE2SHORT( x )            ( (int)( (x) * ( 65536.0f / 360.0f ) ) & 65535 )
-#define SHORT2ANGLE( x )            ( (float)( x ) * ( 360.0f / 65536.0f ) )
 
 /*
 ==============
@@ -62,7 +37,7 @@ void CG_CheckAmmo( void ) {
 	// see about how many seconds of ammo we have remaining
 	memcpy( weapons, cg.snap->ps.weapons, sizeof( weapons ) );
 
-	if ( !weapons[0] && !weapons[1] ) {     // we start out with no weapons, so don't click on startup
+	if ( !weapons[0] && !weapons[1] ) { // (SA) we start out with no weapons, so don't make a click on startup
 		return;
 	}
 
@@ -85,11 +60,8 @@ void CG_CheckAmmo( void ) {
 
 	if ( !cg.lowAmmoWarning ) {
 		// play a sound on this transition
-		/* cgs.media.noAmmoSound holds the alias STRING trap_Com_SoundAliasString
-		   returned (0x30020AE4), not a handle -- cg_public.h types the media
-		   sound slots sfxHandle_t, hence the cast. */
-		CG_PlaySoundAliasByName( (const char *)cgs.media.noAmmoSound,
-								 cg.snap->ps.clientNum, cg.snap->ps.origin );
+		// (noAmmoSound holds a sound alias name, not a handle)
+		CG_PlayClientSoundAliasByName( (const char *)cgs.media.noAmmoSound );
 	}
 
 	if ( total == 0 ) {
@@ -105,7 +77,6 @@ CG_DamageFeedback
 ==============
 */
 void CG_DamageFeedback( int yawByte, int pitchByte, int damage ) {
-	float left, front;
 	float kick;
 	vec3_t dir;
 	vec3_t angles;
@@ -127,10 +98,8 @@ void CG_DamageFeedback( int yawByte, int pitchByte, int damage ) {
 
 	// if yaw and pitch are both 255, make the damage always centered (falling, etc)
 	if ( yawByte == 255 && pitchByte == 255 ) {
-		/* cg_local.h spells these two damageX (+0x2A8A8) and damageY (+0x2A8A4);
-		   they are RTCW's v_dmg_roll and v_dmg_pitch. */
-		cg.damageX = 0;
-		cg.damageY = -kick;
+		cg.v_dmg_roll = 0;
+		cg.v_dmg_pitch = -kick;
 	} else {
 		// positional
 		pitch = pitchByte / 255.0f * 360;
@@ -141,13 +110,9 @@ void CG_DamageFeedback( int yawByte, int pitchByte, int damage ) {
 		angles[ROLL] = 0;
 
 		AngleVectors( angles, dir, NULL, NULL );
-		VectorSubtract( vec3_origin, dir, dir );
 
-		front = DotProduct( dir, cg.refdef.viewaxis[0] );
-		left = DotProduct( dir, cg.refdef.viewaxis[1] );
-
-		cg.damageX = kick * left;
-		cg.damageY = -kick * front;
+		cg.v_dmg_roll = -kick * DotProduct( dir, cg.refdef.viewaxis[1] );
+		cg.v_dmg_pitch = kick * DotProduct( dir, cg.refdef.viewaxis[0] );
 
 		// replace the oldest direction indicator
 		slot = 0;
@@ -159,10 +124,9 @@ void CG_DamageFeedback( int yawByte, int pitchByte, int damage ) {
 
 		cg.damageIndicators[slot][0] = cg.snap->serverTime;
 		cg.damageIndicators[slot][1] = cg_hudDamageIconTime.integer;
-		/* the third dword is the icon yaw, a float; cg_local.h types the whole
-		   record int. */
+		// the third slot holds the icon yaw as a float
 		*(float *)&cg.damageIndicators[slot][2] =
-			SHORT2ANGLE( ANGLE2SHORT( ( rand() / 32768.0f - 0.5f ) * 20.0f + yaw ) );
+			AngleNormalize360( ( rand() / 32768.0f - 0.5f ) * 20.0f + yaw );
 	}
 
 	cg.v_dmg_time = cg.time + DAMAGE_TIME;
@@ -182,30 +146,34 @@ void CG_Respawn( void ) {
 
 	cg.predictedPlayerState = cg.snap->ps;
 
+	cg.weaponInfo = bg_weaponInfo[ cg.predictedPlayerState.weapon ];
+
 	// display weapons available
 	cg.weaponSelectTime = cg.time;
-
-	cg.weaponInfo = bg_weaponInfo[ cg.predictedPlayerState.weapon ];
 
 	cg.cursorHintIcon = 0;
 	cg.cursorHintTime = 0;
 
-	*(int *)&cg.unknown_0x2AA40[0x5C] = 0;           /* cg+0x2AA9C */
+	cg.cameraMode = qfalse;
 
-	memset( cg.unknown_0x27498, 0, sizeof( cg.unknown_0x27498 ) );
+	VectorClear( cg.previousViewAngles );
+	VectorClear( cg.swayAngles );
+	VectorClear( cg.swayOffsets );
 
 	VectorClear( cg.kick_origin );
 	VectorClear( cg.kick_angles );
-	*(float *)&cg.unknown_0x2A8AC[4] = 0;            /* cg+0x2A8B0 */
+	cg.xyspeed = 0;
 
 	// the ADS / weapon-position lerp block
-	memset( cg.unknown_0x27314, 0, sizeof( cg.unknown_0x27314 ) );
+	memset( &cg.playerEntity, 0, sizeof( cg.playerEntity ) );
 
 	cg.damageTime = 0;
-	cg.damageY = 0;
-	cg.damageX = 0;
+	cg.v_dmg_pitch = 0;
+	cg.v_dmg_roll = 0;
 
-	memset( &cg.unknown_0x2AA40[0x14], 0, 24 );      /* cg+0x2AA54..0x2AA6C */
+	// keep: cleared as float triples, matches original codegen
+	VectorClear( &cg.recoilPitch );
+	VectorClear( &cg.recoilPitchSpeed );
 
 	memset( cg.damageIndicators, 0, sizeof( cg.damageIndicators ) );
 	memset( cg.cameraShakes, 0, sizeof( cg.cameraShakes ) );
@@ -252,8 +220,6 @@ void CG_CheckPlayerstateEvents( playerState_t *ps, playerState_t *ops ) {
 /*
 ==================
 CG_CheckChangedPredictableEvents
-
-Nothing in 1.1 calls this -- the linker kept it.
 ==================
 */
 void CG_CheckChangedPredictableEvents( playerState_t *ps ) {

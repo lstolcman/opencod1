@@ -6,6 +6,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <malloc.h>
 
 /* Retail 0x008E1DD4: the file-static "commands already registered" latch. */
 static qboolean sv_commandsInitialized;
@@ -38,8 +39,6 @@ void SV_ScriptUsage_f( void );
 void SV_StringUsage_f( void );
 void SV_RemoveOperatorCommands( void );
 
-#define SV_STRICMP_N    99999
-
 /* ---- SV_GetPlayerByName  0x00451A80 ---- */
 client_t *SV_GetPlayerByName( void ) {
 	client_t    *cl;
@@ -62,7 +61,7 @@ client_t *SV_GetPlayerByName( void ) {
 		if ( !cl->state ) {
 			continue;
 		}
-		if ( !Q_stricmpn( cl->name, s, SV_STRICMP_N ) ) {
+		if ( !Q_stricmp( cl->name, s ) ) {
 			return cl;
 		}
 
@@ -70,7 +69,7 @@ client_t *SV_GetPlayerByName( void ) {
 		cleanName[sizeof( cleanName ) - 1] = 0;
 		Q_CleanStr( cleanName );
 
-		if ( !Q_stricmpn( cleanName, s, SV_STRICMP_N ) ) {
+		if ( !Q_stricmp( cleanName, s ) ) {
 			return cl;
 		}
 	}
@@ -141,7 +140,7 @@ void SV_Map_f( void ) {
 		return;
 	}
 
-	cheats = ( Q_stricmpn( Cmd_Argv( 0 ), "devmap", SV_STRICMP_N ) == 0 );
+	cheats = ( Q_stricmp( Cmd_Argv( 0 ), "devmap" ) == 0 );
 
 	if ( Q_stricmpn( map, "mp/", 3 ) && Q_stricmpn( map, "mp\\", 3 ) ) {
 		strncpy( mapname, map, 63 );
@@ -151,13 +150,18 @@ void SV_Map_f( void ) {
 		mapname[60] = 0;
 	}
 
-	if ( com_sv_running->integer && !Q_stricmp( mapname, sv_mapname->string ) ) {
+	/* retail 0x00451DC2: CRT _stricmp, not Q_stricmp */
+	if ( com_sv_running->integer && !_stricmp( mapname, sv_mapname->string ) ) {
 		SV_MapRestart_f();
 	} else {
-		SV_SpawnServer( mapname, qfalse );
+		SV_SpawnServer( mapname );
 	}
 
-	Cvar_Set2( "sv_cheats", cheats ? "1" : "0", qtrue );
+	if ( cheats ) {
+		Cvar_Set2( "sv_cheats", "1", qtrue );
+	} else {
+		Cvar_Set2( "sv_cheats", "0", qtrue );
+	}
 }
 
 /* ---- SV_MapRestart_f  0x00451E20 ---- */
@@ -181,29 +185,28 @@ void SV_MapRestart_f( void ) {
 	matchState = VM_Call( vm, GAME_GET_MATCH_STATE );
 
 	if ( !matchState ) {
+		/* retail 0x00451EA5: CRT _stricmp, not Q_stricmp */
 		if ( sv_gametype->latchedString
-			 && Q_stricmp( sv_gametype->latchedString, sv_gametype->string ) ) {
+			 && _stricmp( sv_gametype->latchedString, sv_gametype->string ) ) {
 			Com_Printf( "g_gametype variable change -- restarting.\n" );
-			strncpy( mapname, Cvar_VariableString( "mapname" ), 63 );
-			mapname[63] = 0;
-			SV_SpawnServer( mapname, qfalse );
+			Q_strncpyz( mapname, Cvar_VariableString( "mapname" ), sizeof( mapname ) );
+			SV_SpawnServer( mapname );
 			return;
 		}
 
 		if ( sv_maxclients->modified ) {
-			cvar_t  *var;
-
 			Com_Printf( "sv_maxclients variable change -- restarting.\n" );
-			var = Cvar_FindVar( "mapname" );
-			strncpy( mapname, var ? var->string : "", 63 );
-			mapname[63] = 0;
-			SV_SpawnServer( mapname, qfalse );
+			Q_strncpyz( mapname, Cvar_VariableString( "mapname" ), sizeof( mapname ) );
+			SV_SpawnServer( mapname );
 			return;
 		}
 	}
 
-	svs.nextSnapshotEntities = 0;
-	svs.nextSnapshotClients = 0;
+	/* Retail 0x00451F86..0x00451FA4 is SV_InitArchivedSnapshot (0x004586B0) inlined: it clears
+	   svs+0x28/+0x2C and the four archive/cache counters. It never touches
+	   svs.nextSnapshotEntities/nextSnapshotClients (+0x18/+0x1C). */
+	svs.archiveEnabled = qfalse;             /* svs+0x28, retail 0x00451F86 */
+	svs.nextArchivedSnapshotFrames = 0;      /* svs+0x2C, retail 0x00451F8C */
 	svs.nextArchivedSnapshotBuffer = 0;
 	svs.nextCachedSnapshotEntities = 0;
 	svs.nextCachedSnapshotClients = 0;
@@ -257,7 +260,7 @@ void SV_MapRestart_f( void ) {
 char *SV_GetMapRotationToken( void ) {
 	char    *data_p;
 	char    *token;
-	char remainder[MAX_STRING_CHARS];
+	char    *remainder;
 
 	data_p = sv_mapRotationCurrent->string;
 
@@ -274,7 +277,10 @@ char *SV_GetMapRotationToken( void ) {
 		return NULL;
 	}
 
-	Q_strncpyz( remainder, data_p, sizeof( remainder ) );
+	/* Retail copies the whole remainder (no length cap) onto the stack before Cvar_Set2 frees
+	   the string data_p points into. */
+	remainder = (char *)_alloca( strlen( data_p ) + 1 );   /* retail 0x0045218A __alloca_probe */
+	strcpy( remainder, data_p );
 	Cvar_Set2( "sv_mapRotationCurrent", remainder, qtrue );
 	return token;
 }
@@ -299,8 +305,9 @@ void SV_MapRotate_f( void ) {
 		token = SV_GetMapRotationToken();
 	}
 
+	/* retail 0x00452286 / 0x004522C7 / 0x004522FC compare with the CRT _stricmp, not Q_stricmp */
 	while ( token ) {
-		if ( !Q_stricmp( token, "gametype" ) ) {
+		if ( !_stricmp( token, "gametype" ) ) {
 			value = SV_GetMapRotationToken();
 			if ( !value ) {
 				Com_Printf( "No gametype specified after 'gametype' keyword "
@@ -311,8 +318,8 @@ void SV_MapRotate_f( void ) {
 
 			Com_Printf( "Setting g_gametype: %s.\n", value );
 			if ( com_sv_running->integer
-				 && Q_stricmp( sv_gametype->string, value ) ) {
-				VM_Call( vm, GAME_UPDATE_CVARS, 0 );
+				 && _stricmp( sv_gametype->string, value ) ) {
+				VM_Call( vm, 15, 0 );   /* vmMain 15: level.matchState = 0 -- retail 0x004522D8 push 0 / 0x004522DA push 0Fh */
 			}
 			Cvar_Set2( "g_gametype", value, qtrue );
 
@@ -320,7 +327,7 @@ void SV_MapRotate_f( void ) {
 			continue;
 		}
 
-		if ( Q_stricmp( token, "map" ) ) {
+		if ( _stricmp( token, "map" ) ) {
 			Com_Printf( "Unknown keyword '%s' in sv_mapRotation.\n", token );
 			token = SV_GetMapRotationToken();
 			continue;
@@ -359,68 +366,28 @@ void SV_Kick_f( void ) {
 	}
 
 	cl = SV_GetPlayerByName();
-	if ( cl ) {
-		if ( cl->netchan.remoteAddress.type == NA_LOOPBACK ) {
-			SV_SendServerCommand( NULL, 0, "e \"EXE_CANNOTKICKHOSTPLAYER\"" );
-			return;
+	if ( !cl ) {
+		if ( !Q_stricmp( Cmd_Argv( 1 ), "all" ) ) {
+			for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
+				if ( !cl->state ) {
+					continue;
+				}
+				if ( cl->netchan.remoteAddress.type == NA_LOOPBACK ) {
+					continue;
+				}
+				SV_DropClient( cl, "EXE_PLAYERKICKED" );
+				cl->lastPacketTime = svs.time;
+			}
 		}
-		SV_DropClient( cl, "EXE_PLAYERKICKED" );
-		cl->lastPacketTime = svs.time;
 		return;
 	}
 
-	if ( Q_stricmpn( Cmd_Argv( 1 ), "all", SV_STRICMP_N ) ) {
-		return;
-	}
-
-	for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
-		if ( !cl->state ) {
-			continue;
-		}
-		if ( cl->netchan.remoteAddress.type == NA_LOOPBACK ) {
-			continue;
-		}
-		SV_DropClient( cl, "EXE_PLAYERKICKED" );
-		cl->lastPacketTime = svs.time;
-	}
-}
-
-/* ---- SV_BanClient  no-address ---- */
-static void SV_BanClient( client_t *cl ) {
 	if ( cl->netchan.remoteAddress.type == NA_LOOPBACK ) {
 		SV_SendServerCommand( NULL, 0, "e \"EXE_CANNOTKICKHOSTPLAYER\"" );
 		return;
 	}
-
-	if ( !svs.authorizeAddress.ip[0] ) {
-		if ( svs.authorizeAddress.type == NA_BAD ) {
-			return;
-		}
-		Com_Printf( "Resolving %s\n", "codauthorize.activision.com" );
-		if ( NET_StringToAdr( "codauthorize.activision.com",
-							  &svs.authorizeAddress ) == qfalse ) {
-			Com_Printf( "Couldn't resolve address\n" );
-			return;
-		}
-		svs.authorizeAddress.port = BigShort( (short)PORT_AUTHORIZE );
-		Com_Printf( "%s resolved to %i.%i.%i.%i:%i\n",
-					"codauthorize.activision.com",
-					svs.authorizeAddress.ip[0], svs.authorizeAddress.ip[1],
-					svs.authorizeAddress.ip[2], svs.authorizeAddress.ip[3],
-					BigShort( (short)svs.authorizeAddress.port ) );
-	}
-
-	if ( svs.authorizeAddress.type == NA_BAD ) {
-		return;
-	}
-
-	NET_OutOfBandPrint( NS_SERVER, svs.authorizeAddress,
-						"banUser %i.%i.%i.%i",
-						cl->netchan.remoteAddress.ip[0],
-						cl->netchan.remoteAddress.ip[1],
-						cl->netchan.remoteAddress.ip[2],
-						cl->netchan.remoteAddress.ip[3] );
-	Com_Printf( "%s was banned from coming back\n", cl->name );
+	SV_DropClient( cl, "EXE_PLAYERKICKED" );
+	cl->lastPacketTime = svs.time;
 }
 
 /* ---- SV_Ban_f  0x004524D0 ---- */
@@ -438,8 +405,37 @@ void SV_Ban_f( void ) {
 	}
 
 	cl = SV_GetPlayerByName();
-	if ( cl ) {
-		SV_BanClient( cl );
+	if ( !cl ) {
+		return;
+	}
+
+	if ( cl->netchan.remoteAddress.type == NA_LOOPBACK ) {
+		SV_SendServerCommand( NULL, 0, "e \"EXE_CANNOTKICKHOSTPLAYER\"" );
+		return;
+	}
+
+	if ( !svs.authorizeAddress.ip[0] && svs.authorizeAddress.type != NA_BAD ) {
+		Com_Printf( "Resolving %s\n", "codauthorize.activision.com" );
+		if ( !NET_StringToAdr( "codauthorize.activision.com", &svs.authorizeAddress ) ) {
+			Com_Printf( "Couldn't resolve address\n" );
+			return;
+		}
+		svs.authorizeAddress.port = BigShort( (short)PORT_AUTHORIZE );
+		Com_Printf( "%s resolved to %i.%i.%i.%i:%i\n",
+					"codauthorize.activision.com",
+					svs.authorizeAddress.ip[0], svs.authorizeAddress.ip[1],
+					svs.authorizeAddress.ip[2], svs.authorizeAddress.ip[3],
+					BigShort( (short)svs.authorizeAddress.port ) );
+	}
+
+	if ( svs.authorizeAddress.type != NA_BAD ) {
+		NET_OutOfBandPrint( NS_SERVER, svs.authorizeAddress,
+							"banUser %i.%i.%i.%i",
+							cl->netchan.remoteAddress.ip[0],
+							cl->netchan.remoteAddress.ip[1],
+							cl->netchan.remoteAddress.ip[2],
+							cl->netchan.remoteAddress.ip[3] );
+		Com_Printf( "%s was banned from coming back\n", cl->name );
 	}
 }
 
@@ -458,8 +454,37 @@ void SV_BanNum_f( void ) {
 	}
 
 	cl = SV_GetPlayerByNum();
-	if ( cl ) {
-		SV_BanClient( cl );
+	if ( !cl ) {
+		return;
+	}
+
+	if ( cl->netchan.remoteAddress.type == NA_LOOPBACK ) {
+		SV_SendServerCommand( NULL, 0, "e \"EXE_CANNOTKICKHOSTPLAYER\"" );
+		return;
+	}
+
+	if ( !svs.authorizeAddress.ip[0] && svs.authorizeAddress.type != NA_BAD ) {
+		Com_Printf( "Resolving %s\n", "codauthorize.activision.com" );
+		if ( !NET_StringToAdr( "codauthorize.activision.com", &svs.authorizeAddress ) ) {
+			Com_Printf( "Couldn't resolve address\n" );
+			return;
+		}
+		svs.authorizeAddress.port = BigShort( (short)PORT_AUTHORIZE );
+		Com_Printf( "%s resolved to %i.%i.%i.%i:%i\n",
+					"codauthorize.activision.com",
+					svs.authorizeAddress.ip[0], svs.authorizeAddress.ip[1],
+					svs.authorizeAddress.ip[2], svs.authorizeAddress.ip[3],
+					BigShort( (short)svs.authorizeAddress.port ) );
+	}
+
+	if ( svs.authorizeAddress.type != NA_BAD ) {
+		NET_OutOfBandPrint( NS_SERVER, svs.authorizeAddress,
+							"banUser %i.%i.%i.%i",
+							cl->netchan.remoteAddress.ip[0],
+							cl->netchan.remoteAddress.ip[1],
+							cl->netchan.remoteAddress.ip[2],
+							cl->netchan.remoteAddress.ip[3] );
+		Com_Printf( "%s was banned from coming back\n", cl->name );
 	}
 }
 
@@ -526,7 +551,7 @@ void SV_Status_f( void ) {
 			Com_Printf( "ZMBI " );
 		} else {
 			ping = cl->ping;
-			if ( ping > 9999 ) {
+			if ( ping >= 9999 ) {
 				ping = 9999;
 			}
 			Com_Printf( "%4i ", ping );

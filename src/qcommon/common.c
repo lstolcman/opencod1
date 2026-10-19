@@ -13,8 +13,15 @@
 
 
 #include <setjmp.h>
+
+/* Globals owned by this unit.  The weapon-info
+ * block tracks the cgame's cached weapon-config hunk; dobj_defaultTracePartRemapHandle is the
+ * shared empty trace part-remap string handle (16-bit, in a dword slot) that
+ * Com_Init/Com_Restart create inline. */
+int com_weaponInfoBlockPtr;      /* 0x01407414 */
+int com_weaponInfoBlockOwner;    /* 0x01407418 */
+int dobj_defaultTracePartRemapHandle;               /* 0x0140733C */
 #include <time.h>
-#include "../qcommon/hexrays_shim.h"
 
 #define MAX_CONSOLE_LINES   32
 #define MAX_PUSHED_EVENTS   256
@@ -54,6 +61,11 @@ int com_skelTimeStamp;
 int com_skelInvalidated;
 int com_skelInvalidated2;
 
+/* com_speeds times */
+int time_game;                  /* 0x0163A238 */
+int time_frontend;              /* 0x0163B3CC, renderer frontend */
+int time_backend;               /* 0x0163B3D0, renderer backend */
+
 fileHandle_t com_journalFile;
 fileHandle_t com_journalDataFile;
 
@@ -62,6 +74,25 @@ const char *com_quitReason;
 static jmp_buf abortframe;
 static int com_errorCode;
 extern int scr_updatingScreen;
+
+/* Com_SafeMode/Com_ForceSafeMode state. */
+int com_safemode;   /* 0x01407404 */
+int com_hunkMeminfoRunningTotal;   /* 0x0163A204, RTCW com_hunkusedvalue */
+
+/* Retail Com_Error inlines Scr_Abort (0x00475960) and, on the client build,
+ * MSS_ErrorCleanup (0x00450240).  File-local prototypes: script/scr_import.c
+ * carries its own differently-typed Scr_Abort extern, so it is not added to
+ * qcommon.h, and the miles directory is not part of the dedicated build. */
+extern void Scr_Abort( void );
+extern void Hunk_ClearTempMemory( void );
+extern int Hunk_ClearTempMemoryHigh( void );
+#ifndef DEDICATED
+extern void MSS_ErrorCleanup( void );
+#endif
+/* The client refexport table `re` (0x01432860, defined in client_mp/cl_main_mp.c; the
+ * dedicated build's is in null/null_client.c): Com_Error
+ * calls re_ResetImageAllocations (+0xB0) when non-NULL, Com_Shutdown re_ShutdownPtr. */
+#include "../client_mp/cl_refapi.h"
 
 static char     *com_consoleLines[MAX_CONSOLE_LINES];
 static int com_numConsoleLines;
@@ -111,7 +142,9 @@ void Com_EndRedirect( void ) {
 
 /* ---- Com_PrintMessage  0x00435620 ---- */
 void Com_PrintMessage( int channel, const char *msg ) {
-	Cod1_HangWatchdogNote( msg );
+#ifndef COD1_VC7
+	Cod1_HangWatchdogNote( msg );    /* tree-only hang diagnostics */
+#endif
 
 	if ( rd_buffer ) {
 		if ( channel != 4 ) {
@@ -126,7 +159,7 @@ void Com_PrintMessage( int channel, const char *msg ) {
 
 	if ( channel != 4 ) {
 		if ( com_dedicated && !com_dedicated->integer ) {
-			CL_ConsolePrint( msg, channel, 0, 0 );
+			CL_ConsolePrint( channel, msg, 0, 0 );
 		}
 		Conbuf_AppendText( msg );
 	}
@@ -158,7 +191,7 @@ void Com_PrintMessage( int channel, const char *msg ) {
 /* ---- Com_Printf  0x004357B0 ---- */
 void QDECL Com_Printf( const char *fmt, ... ) {
 	va_list argptr;
-	char msg[MAXPRINTMSG + 4];
+	char msg[MAXPRINTMSG];
 
 	va_start( argptr, fmt );
 	_vsnprintf( msg, MAXPRINTMSG, fmt, argptr );
@@ -185,16 +218,14 @@ void QDECL Com_DPrintf( const char *fmt, ... ) {
 	Com_Printf( "%s", msg );
 }
 
-extern int ( *com_serverEndpoint )();
-
 /* ---- Com_Shutdown  0x004358A0 ---- */
 void Com_Shutdown( const char *finalmsg ) {
 	CL_Disconnect( qtrue );
 	CL_ShutdownCGame();
 	CL_ShutdownUI();
 
-	if ( com_serverEndpoint ) {
-		com_serverEndpoint( 0 );
+	if ( re_ShutdownPtr ) {
+		re_ShutdownPtr( 0 );
 	}
 
 	cls_loadingPlaque = 0;
@@ -213,34 +244,23 @@ void Com_Shutdown( const char *finalmsg ) {
 
 /* ---- Com_ErrorCleanup  0x00435910 ---- */
 void Com_ErrorCleanup( void ) {
-	switch ( com_errorCode ) {
-	case ERR_SERVERDISCONNECT:
+	if ( com_errorCode == ERR_SERVERDISCONNECT ) {
 		Com_Shutdown( "EXE_DISCONNECTEDFROMOWNLISTENSERVER" );
 		com_errorEntered = qfalse;
-		Com_Restart();
-		return;
-
-	case ERR_AUTOUPDATE:
+	} else if ( com_errorCode == ERR_AUTOUPDATE ) {
 		Com_Shutdown( "EXE_ENDOFGAME" );
 		com_errorEntered = qfalse;
-		Com_Restart();
-		return;
-
-	case ERR_DROP:
-	case ERR_DISCONNECT:
+	} else if ( com_errorCode == ERR_DROP || com_errorCode == ERR_DISCONNECT ) {
 		Com_Printf( "********************\nERROR: %s\n********************\n", com_errorMessage );
 		if ( com_errorCode == ERR_DROP && ( !com_dedicated || !com_dedicated->integer ) ) {
-			CL_ConsoleFixPosition( 0 );
+			CL_ConsoleFixPosition();
 		}
 		Com_Shutdown( com_errorMessage );
 		com_errorEntered = qfalse;
 		if ( com_errorCode == ERR_DROP && Cvar_Get( "r_vc_compile", "0", 0 )->integer == 2 ) {
 			Com_Quit_f();
 		}
-		Com_Restart();
-		return;
-
-	case ERR_NEED_CD:
+	} else if ( com_errorCode == ERR_NEED_CD ) {
 		Com_Shutdown( "EXE_SERVERDIDNTHAVECD" );
 		if ( com_cl_running && com_cl_running->integer ) {
 			com_errorEntered = qfalse;
@@ -248,13 +268,8 @@ void Com_ErrorCleanup( void ) {
 		} else {
 			Com_Printf( "Server didn't have CD\n" );
 		}
-		Com_Restart();
-		return;
-
-	default:
-		Com_Restart();
-		return;
 	}
+	Com_Restart();
 }
 
 /* ---- Com_CleanupSkeletons  0x00435A20 ---- */
@@ -292,15 +307,26 @@ void QDECL Com_Error( int code, const char *fmt, ... ) {
 	va_list argptr;
 	static int lastErrorTimeLocal;
 	int currentTime;
+	char errorMessageCopy[MAXPRINTMSG];
 
 	if ( com_errorEntered ) {
 		Sys_Error( "recursive error after: %s", com_errorMessage );
 	}
-	com_errorEntered = qtrue;
 
 	va_start( argptr, fmt );
 	vsprintf( com_errorMessage, fmt, argptr );
 	va_end( argptr );
+
+	/* Retail keeps the raw, unlocalized message (0x00435B29) for the fatal
+	 * SV_Shutdown reason below. */
+	strcpy( errorMessageCopy, com_errorMessage );
+
+	/* Retail 0x00435B46: codes 6 (script) and 7 (localization) are demoted
+	 * to ERR_DROP before every later test and before com_errorCode. */
+	if ( code == 6 || code == 7 ) {
+		code = ERR_DROP;
+	}
+	com_errorEntered = qtrue;
 
 	if ( code == ERR_DISCONNECT || code == ERR_NEED_CD || code == ERR_AUTOUPDATE ) {
 		char *localized;
@@ -317,54 +343,76 @@ void QDECL Com_Error( int code, const char *fmt, ... ) {
 		Com_SetErrorMessage( com_errorMessage );
 	}
 
-	Hunk_ResetTempMark();
+	Hunk_ClearTempMemory();
+	Hunk_ClearTempMemoryHigh();
 	if ( code != ERR_DISCONNECT ) {
-		Scr_Shutdown();
+		Scr_Abort();                    /* retail 0x00435BEB, inlined */
 	}
+#ifndef DEDICATED
+	MSS_ErrorCleanup();                 /* retail 0x00435BF8, inlined */
+#endif
 	Com_CleanupSkeletons();
 	Com_ResetParseSessions();
+#ifndef DEDICATED
+	if ( re_ResetImageAllocations ) {   /* retail 0x00435C22 */
+		re_ResetImageAllocations();
+	}
+#endif
 	FS_ResetFiles();
 
 	if ( code == ERR_DROP ) {
 		Cbuf_Init();
 	}
 
+	/* retail 0x00435C6E: drop a game- or cgame-owned weapon-info block */
+	if ( com_weaponInfoBlockOwner == 1 || com_weaponInfoBlockOwner == 2 ) {
+		com_weaponInfoBlockPtr = 0;
+		com_weaponInfoBlockOwner = 0;
+	}
+
 	FS_PureServerSetLoadedPaks( "", "" );
 
 	currentTime = Sys_Milliseconds();
-	if ( currentTime - lastErrorTime >= 100 ) {
+	if ( currentTime - lastErrorTime < 100 ) {
+		if ( ++errorCount > 3 ) {
+			code = ERR_FATAL;
+		}
+	} else {
 		errorCount = 0;
-	} else if ( ++errorCount > 3 ) {
-		code = ERR_FATAL;
 	}
 	lastErrorTime = currentTime;
 
-	if ( code != ERR_SERVERDISCONNECT && code != ERR_AUTOUPDATE && code != ERR_DROP
-		 && code != ERR_DISCONNECT && code != ERR_NEED_CD ) {
-		Com_Printf( "********************\nFATAL ERROR (code %i): %s\n"
-					"********************\n", code, com_errorMessage );
-		CL_Shutdown();
-		SV_Shutdown( va( "EXE_SERVERFATALERROR\x15%s", com_errorMessage ) );
-		Hunk_ClearToStart();
-		Com_Close();
-		Sys_Error( "%s", com_errorMessage );
+	if ( code == ERR_SERVERDISCONNECT || code == ERR_AUTOUPDATE || code == ERR_DROP
+		 || code == ERR_DISCONNECT || code == ERR_NEED_CD ) {
+		/* Errors raised while drawing bypass SCR_UpdateScreen's normal cleanup.
+		 * Retail clears this guard before aborting so subsequent frames can draw. */
+		scr_updatingScreen = qfalse;
+		com_errorCode = code;
+		longjmp( abortframe, -1 );
 	}
 
-	com_errorCode = code;
-	/* Errors raised while drawing bypass SCR_UpdateScreen's normal cleanup.
-	 * Retail clears this guard before aborting so subsequent frames can draw. */
-	scr_updatingScreen = qfalse;
-	longjmp( abortframe, -1 );
+	CL_Shutdown();
+	SV_Shutdown( va( "EXE_SERVER_FATAL_CRASHED\x15 \x14%s", errorMessageCopy ) );
+	Hunk_ClearToStart();
+	Com_Close();
+	Sys_Error( "%s", com_errorMessage );
 }
+
+/* Com_Quit_f ends in a tail jump to Sys_Quit (win32/win_error.c, 0x00463130). */
+extern void Sys_Quit( void );
 
 /* ---- Com_Quit_f  0x00435D80 ---- */
 void Com_Quit_f( void ) {
+#ifdef DEDICATED
+	/* Tree-only, dedicated build only: retail prints nothing here. */
 	Com_Printf( "----- Com_Quit_f (%s) -----\n",
 				com_quitReason ? com_quitReason : "quit command" );
 	com_quitReason = NULL;
+#endif
 
 	if ( !com_errorEntered ) {
-		Hunk_ResetTempMark();
+		Hunk_ClearTempMemory();
+		Hunk_ClearTempMemoryHigh();
 		Com_CleanupSkeletons();
 		Sys_DestroySplashWindow();
 		CL_Shutdown();
@@ -376,16 +424,7 @@ void Com_Quit_f( void ) {
 		FS_ShutdownServerReferencedPaks();
 	}
 
-	Sys_ShutdownTimer();
-	IN_Shutdown();
-	Sys_DestroyConsole();
-	Sys_DeleteInstanceMarker();
-
-	Cvar_Shutdown();
-	Cmd_Shutdown();
-	Sys_PlatformExit();
-
-	exit( 0 );
+	Sys_Quit();
 }
 
 /* ---- Com_ParseCommandLine  0x00435E40 ---- */
@@ -418,11 +457,15 @@ qboolean Com_SafeMode( void ) {
 			return qtrue;
 		}
 	}
-	return qfalse;
+	/* retail 0x00435F0A: fall back to com_safemode, which Com_ForceSafeMode
+	 * sets (retail's Sys_CheckCrashOrRerun also sets it on the improper-quit
+	 * prompt's IDYES) */
+	return com_safemode;
 }
 
 /* ---- Com_ForceSafeMode  0x00435F30 ---- */
 void Com_ForceSafeMode( void ) {
+	com_safemode = 1;
 }
 
 /* ---- Com_StartupVariable  0x00435F40 ---- */
@@ -637,10 +680,6 @@ int Com_EventLoop( void ) {
 	byte bufData[MAX_MSGLEN];
 	msg_t buf;
 
-	if ( !msgInit ) {
-		MSG_initHuffman();
-	}
-
 	MSG_Init( &buf, bufData, sizeof( bufData ) );
 
 	while ( 1 ) {
@@ -674,26 +713,22 @@ int Com_EventLoop( void ) {
 			CL_MouseEvent( ev.evValue, ev.evValue2, ev.evTime );
 			break;
 		case SE_JOYSTICK_AXIS:
-			if ( ev.evValue >= MAX_JOYSTICK_AXIS ) {
-				Com_Error( ERR_DROP, "\x15" "CL_JoystickEvent: bad axis %i", ev.evValue );
-			}
 			CL_JoystickEvent( ev.evValue, ev.evValue2, ev.evTime );
 			break;
 		case SE_CONSOLE:
-			Com_Printf( "[con] %s\n", (char *)ev.evPtr );
 			Cbuf_AddText( (char *)ev.evPtr );
-			Cbuf_AddText( "\n" );
 			free( ev.evPtr );
+			Cbuf_AddText( "\n" );
 			break;
 		case SE_PACKET:
 			evFrom = *(netadr_t *)ev.evPtr;
 			buf.cursize = ev.evPtrLength - sizeof( evFrom );
 			if ( (unsigned int)buf.cursize > (unsigned int)buf.maxsize ) {
-				Com_Printf( "Com_EventLoop: oversize packet\n" );
 				free( ev.evPtr );
+				Com_Printf( "Com_EventLoop: oversize packet\n" );
 				continue;
 			}
-			Com_Memcpy( buf.data, (byte *)( (netadr_t *)ev.evPtr + 1 ), buf.cursize );
+			memcpy( buf.data, (byte *)( (netadr_t *)ev.evPtr + 1 ), buf.cursize );
 			free( ev.evPtr );
 			if ( com_sv_running->integer ) {
 				Com_RunAndTimeServerPacket( &evFrom, &buf );
@@ -723,8 +758,9 @@ int Com_Milliseconds( void ) {
 void Com_Error_f( void ) {
 	if ( Cmd_Argc() > 1 ) {
 		Com_Error( ERR_DROP, "\x15" "Testing drop error" );
+	} else {
+		Com_Error( ERR_FATAL, "\x15" "Testing fatal error" );
 	}
-	Com_Error( ERR_FATAL, "\x15" "Testing fatal error" );
 }
 
 /* ---- Com_Freeze_f  0x004368C0 ---- */
@@ -752,6 +788,9 @@ void Com_Freeze_f( void ) {
 void Com_Crash_f( void ) {
 	*(int *)0 = 0x12345678;
 }
+
+/* retail 0x0057AC78 starts as 32 spaces + NUL (36-byte slot), not zeros */
+char cl_cdkey[34] = "                " "                ";   /* 0x0057AC78 */
 
 /* ---- Com_ReadCDKey  0x00436930 ---- */
 void Com_ReadCDKey( const char *filename ) {
@@ -802,7 +841,8 @@ void Com_AppendCDKey( const char *filename ) {
 	}
 
 	Com_Memset( buffer, 0, sizeof( buffer ) );
-	Com_Memset( checksum, 0, sizeof( checksum ) );
+	/* retail 0x00436AD0 clears only buffer: checksum stays uninitialised past the four
+	   bytes read (Com_ReadCDKey above and Mac 1.3 clear both) */
 
 	FS_Read( buffer, 16, f );
 	FS_Read( checksum, 4, f );
@@ -877,7 +917,9 @@ qboolean Com_ConfigureFileChanged( void ) {
 
 	len = FS_ReadFile( "configure_mp.csv", &buffer );
 	if ( len < 0 ) {
-		Com_Error( ERR_FATAL, "EXE_ERR_NOTFOUND" );
+		/* 0x00436D5B -> 0x00562BD0, the same string Com_SetRecommended uses:
+		 * the localized key, then \x15 and the literal file name */
+		Com_Error( ERR_FATAL, "EXE_ERR_NOT_FOUND\x15" "configure_mp.csv" );
 	}
 
 	checksum = Com_ConfigureChecksum( (const char *)buffer, len );
@@ -886,148 +928,218 @@ qboolean Com_ConfigureFileChanged( void ) {
 	return Sys_ConfigureChecksumChanged( checksum );
 }
 
-extern double sys_cpuMHzValue;
-extern signed __int32 sys_sysMBValue;
-extern int sys_vidMBValue;
+/* the hardware info record (Sys_GetInfo, win_main.c, copies it out) */
+typedef struct {
+	double  cpuMHz;
+	int     sysMB;
+	int     vidMB;
+} sysInfo_t;
+
+void Com_SetCSV( qboolean enabled );
+char *Com_ParseOnLine( char **data_p );
 
 /* ---- Com_SetRecommended  0x00436DB0 ---- */
 void Com_SetRecommended( int restart ) {
 	void        *buffer;
 	char        *data;
+	char        *tok;
+	char        *p;
 	int len, checksum;
 	char cvarNames[256][128];
 	char cvarValues[256][256];
 	int numCvars;
-	double cpuMhz;
-	int sysMb, vidMb;
 	int i;
-	double bestCpuMhz;
-	int bestSysMb, bestVidMb;
+	int c;
+	sysInfo_t info;
+	sysInfo_t best;
+	sysInfo_t row;
 	qboolean rowIsNewBest;
+	cvar_t *var;
 
 	Com_Printf( "========= autoconfigure\n" );
 
-	cpuMhz = Sys_GetCPUSpeed() * 1.02;
-	sysMb = Sys_GetSystemRam();
-	vidMb = sys_vidMBValue;
-	if ( sysMb < 128 ) {
-		sysMb = 128;
+	/* 0x00436DCB: Sys_GetInfo written out as retail inlines it (the copy of the
+	 * hardware info Sys_DetectHardware_m stored at startup; a call would number
+	 * Sys_GetInfo early in common.obj and flip the Netchan_Process tie), then
+	 * fmul 1.02 (0x3FF051EB851EB852).  Retail copies the whole 16-byte record
+	 * (struct copy, so the two cpu dwords are stored and then overwritten by the
+	 * fstp); the volatile dword stores keep VC7 from deleting them as dead.  The
+	 * only remaining difference is the GS cookie store, which any volatile access
+	 * keeps ahead of the first push. */
+	( (volatile int *) &info )[0] = ( (const int *) &sys_cpuMHzValue )[0];
+	( (volatile int *) &info )[1] = ( (const int *) &sys_cpuMHzValue )[1];
+	info.sysMB = sys_sysMBValue;
+	info.vidMB = sys_vidMBValue;
+	info.cpuMHz = sys_cpuMHzValue * 1.02;
+	if ( info.sysMB < 128 ) {
+		info.sysMB = 128;
 	} else {
-		sysMb += 8;
+		info.sysMB += 8;
 	}
-	if ( vidMb < 32 ) {
-		vidMb = 32;
+	if ( info.vidMB < 32 ) {
+		info.vidMB = 32;
 	}
 
 	len = FS_ReadFile( "configure_mp.csv", &buffer );
 	if ( len < 0 ) {
-		Com_Error( ERR_FATAL, "EXE_ERR_NOT_FOUND" );
+		/* 0x00436E51 -> 0x00562BD0: the localized key, then \x15 and the
+		 * literal file name (the same string Com_ConfigureFileChanged uses) */
+		Com_Error( ERR_FATAL, "EXE_ERR_NOT_FOUND\x15" "configure_mp.csv" );
 	}
 	data = buffer;
 
 	Com_BeginParseSession( "configure_mp.csv" );
-	parseInfo->csv = qtrue;
+	Com_SetCSV( qtrue );
 
 	numCvars = 0;
+	best.cpuMHz = -1.0;   /* 0x00436E88: 0xBFF00000:00000000 */
+	best.sysMB = 0;
+	best.vidMB = 0;
 
-	if ( Q_stricmp( Com_ParseExt( &data, qtrue ), "cpu mhz" ) ) {
-		Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: \"cpu mhz\" should be the first column\n" );
-	}
-	if ( Q_stricmp( Com_ParseExt( &data, qfalse ), "sys mb" ) ) {
-		Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: \"sys mb\" should be the second column\n" );
-	}
-	if ( Q_stricmp( Com_ParseExt( &data, qfalse ), "vid mb" ) ) {
-		Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: \"vid mb\" should be the third column\n" );
-	}
+	/* the header is the first row that is not a comment (the shipped
+	 * configure_mp.csv opens with comment lines); every later row is data */
 	while ( 1 ) {
-		char *tok = Com_ParseExt( &data, qfalse );
-		if ( !tok[0] ) {
-			break;
-		}
-		if ( strlen( tok ) > 127 ) {
-			Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: cvar name \"%s\" longer than %i\n", tok, 127 );
-		}
-		if ( numCvars >= 256 ) {
-			Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: more than %i cvars\n", 256 );
-		}
-		strcpy( cvarNames[numCvars], tok );
-		numCvars++;
-	}
-
-	bestCpuMhz = -2.0;
-	bestSysMb = 0;
-	bestVidMb = 0;
-
-	while ( 1 ) {
-		char *tok = Com_ParseExt( &data, qfalse );
-		double rowCpuMhz;
-		int rowSysMb, rowVidMb;
-
+		tok = Com_Parse( &data );
 		if ( !data ) {
 			break;
 		}
-		if ( !tok[0] || tok[0] == '#' ) {
-			while ( *data && *data != '\n' ) {
-				data++;
-			}
-			if ( *data == '\n' ) {
-				data++;
-				parseInfo->currentLine++;
-			}
-			continue;
-		}
+		if ( tok[0] && tok[0] != '#' ) {
+			if ( !numCvars ) {
+				/* retail 0x00436F06 / 0x00436F65 / 0x00436FC4: CRT _stricmp */
+				if ( _stricmp( tok, "cpu mhz" ) ) {
+					Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: \"cpu mhz\" should be the first column\n" );
+				}
+				/* Com_ParseOnLine, written out as retail inlines it here */
+				if ( parseInfo->ungetReady ) {
+					parseInfo->ungetReady = qfalse;
+					if ( !parseInfo->spaceDelimited ) {
+						tok = parseInfo->token;
+						goto gotSysMb;
+					}
+					data = parseInfo->ungetTokenSave;
+					parseInfo->currentLine = parseInfo->ungetLineSave;
+				}
+				tok = Com_ParseExt( &data, qfalse );
+gotSysMb:
+				if ( _stricmp( tok, "sys mb" ) ) {
+					Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: \"sys mb\" should be the second column\n" );
+				}
+				/* Com_ParseOnLine, written out as retail inlines it here */
+				if ( parseInfo->ungetReady ) {
+					parseInfo->ungetReady = qfalse;
+					if ( !parseInfo->spaceDelimited ) {
+						tok = parseInfo->token;
+						goto gotVidMb;
+					}
+					data = parseInfo->ungetTokenSave;
+					parseInfo->currentLine = parseInfo->ungetLineSave;
+				}
+				tok = Com_ParseExt( &data, qfalse );
+gotVidMb:
+				if ( _stricmp( tok, "vid mb" ) ) {
+					Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: \"vid mb\" should be the third column\n" );
+				}
+				while ( 1 ) {
+					tok = Com_ParseOnLine( &data );
+					if ( !data ) {
+						Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: unexpected end-of-file" );
+					}
+					if ( !tok[0] ) {
+						break;
+					}
+					if ( strlen( tok ) > 127 ) {
+						Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: cvar name \"%s\" longer than %i\n", tok, 127 );
+					}
+					if ( numCvars >= sizeof( cvarNames ) / sizeof( cvarNames[0] ) ) {
+						Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: more than %i cvars\n", 256 );
+					}
+					strcpy( cvarNames[numCvars++], tok );
+				}
+			} else {
+				row.cpuMHz = atof( tok );
+				if ( row.cpuMHz < 0.0 ) {
+					Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: cpu mhz %g not allowed to be less than 0\n", row.cpuMHz );
+				}
+				/* Com_ParseOnLine, written out as retail inlines it here */
+				if ( parseInfo->ungetReady ) {
+					parseInfo->ungetReady = qfalse;
+					if ( !parseInfo->spaceDelimited ) {
+						tok = parseInfo->token;
+						goto gotRowSysMb;
+					}
+					data = parseInfo->ungetTokenSave;
+					parseInfo->currentLine = parseInfo->ungetLineSave;
+				}
+				tok = Com_ParseExt( &data, qfalse );
+gotRowSysMb:
+				row.sysMB = atol( tok );
+				if ( row.sysMB < 128 ) {
+					Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: sys mb %i not allowed to be less than 128\n", row.sysMB );
+				}
+				/* Com_ParseOnLine, written out as retail inlines it here */
+				if ( parseInfo->ungetReady ) {
+					parseInfo->ungetReady = qfalse;
+					if ( !parseInfo->spaceDelimited ) {
+						tok = parseInfo->token;
+						goto gotRowVidMb;
+					}
+					data = parseInfo->ungetTokenSave;
+					parseInfo->currentLine = parseInfo->ungetLineSave;
+				}
+				tok = Com_ParseExt( &data, qfalse );
+gotRowVidMb:
+				row.vidMB = atol( tok );
+				if ( row.vidMB < 32 ) {
+					Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: vid mb %i not allowed to be less than 32\n", row.vidMB );
+				}
 
-		rowCpuMhz = atof( tok );
-		if ( rowCpuMhz < 0.0 ) {
-			Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: cpu mhz %g not allowed to be less than 0\n", rowCpuMhz );
-		}
+				rowIsNewBest = qfalse;
+				if ( info.cpuMHz >= row.cpuMHz && info.sysMB >= row.sysMB && info.vidMB >= row.vidMB
+					 && ( best.cpuMHz < info.cpuMHz
+					   || ( best.cpuMHz == info.cpuMHz
+						 && ( best.vidMB < info.vidMB
+						   || ( best.vidMB == info.vidMB && best.sysMB < info.sysMB ) ) ) ) ) {
+					rowIsNewBest = qtrue;
+					best = row;
+				}
 
-		tok = Com_ParseExt( &data, qfalse );
-		rowSysMb = atol( tok );
-		if ( rowSysMb < 128 ) {
-			Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: sys mb %i not allowed to be less than 128\n", rowSysMb );
-		}
+				for ( i = 0 ; i < numCvars ; i++ ) {
+					tok = Com_ParseOnLine( &data );
+					if ( !data ) {
+						Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: unexpected end-of-file" );
+					}
+					if ( !tok[0] ) {
+						Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: missing entry for cvar '%s' in row %lg %i %i\n",
+								   cvarNames[i], row.cpuMHz, row.sysMB, row.vidMB );
+					}
+					if ( strlen( tok ) > 255 ) {
+						Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: entry '%s' for cvar '%s' in row %lg %i %i is longer than %i\n",
+								   tok, cvarNames[i], row.cpuMHz, row.sysMB, row.vidMB, 255 );
+					}
+					if ( rowIsNewBest ) {
+						strcpy( cvarValues[i], tok );
+					}
+				}
 
-		tok = Com_ParseExt( &data, qfalse );
-		rowVidMb = atol( tok );
-		if ( rowVidMb < 32 ) {
-			Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: vid mb %i not allowed to be less than 32\n", rowVidMb );
-		}
-
-		rowIsNewBest = qfalse;
-		if ( cpuMhz >= rowCpuMhz && sysMb >= rowSysMb && vidMb >= rowVidMb
-		     && ( bestCpuMhz < cpuMhz
-		       || ( bestCpuMhz == cpuMhz
-		         && ( bestVidMb < vidMb
-		           || ( bestVidMb == vidMb && bestSysMb < sysMb ) ) ) ) ) {
-			rowIsNewBest = qtrue;
-			bestCpuMhz = rowCpuMhz;
-			bestSysMb = rowSysMb;
-			bestVidMb = rowVidMb;
-		}
-
-		for ( i = 0 ; i < numCvars ; i++ ) {
-			tok = Com_ParseExt( &data, qfalse );
-			if ( !data ) {
-				Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: unexpected end-of-file" );
+				tok = Com_ParseOnLine( &data );
+				if ( tok[0] ) {
+					/* 0x0043739F: prints the current row's values */
+					Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: extra cvar value column(s) in row %lg %i %i\n",
+							   row.cpuMHz, row.sysMB, row.vidMB );
+				}
 			}
-			if ( !tok[0] ) {
-				Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: missing entry for cvar '%s' in row %lg %i %i\n",
-						   cvarNames[i], rowCpuMhz, rowSysMb, rowVidMb );
+		} else {
+			/* Com_SkipRestOfLine, written out as retail inlines it: a call here would
+			 * number that symbol earlier in common.obj and flip the PC_EvaluateTokens tie */
+			p = data;
+			while ( ( c = *p ) != 0 ) {
+				p++;
+				if ( c == '\n' ) {
+					parseInfo->currentLine++;
+					break;
+				}
 			}
-			if ( strlen( tok ) > 255 ) {
-				Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: entry '%s' for cvar '%s' in row %lg %i %i is longer than %i\n",
-						   tok, cvarNames[i], rowCpuMhz, rowSysMb, rowVidMb, 255 );
-			}
-			if ( rowIsNewBest ) {
-				strcpy( cvarValues[i], tok );
-			}
-		}
-
-		tok = Com_ParseExt( &data, qfalse );
-		if ( tok[0] ) {
-			Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: extra cvar value column(s) in row %lg %i %i\n",
-					   bestCpuMhz, bestSysMb, bestVidMb );
+			data = p;
 		}
 	}
 
@@ -1035,48 +1147,44 @@ void Com_SetRecommended( int restart ) {
 
 	checksum = Com_ConfigureChecksum( (const char *) buffer, len );
 
-	if ( bestCpuMhz < 0.0 || !bestSysMb || !bestVidMb ) {
+	/* 0x0043745B-0x004374B2: retail frees the CSV (inlined FS_FreeFile) right
+	 * after the checksum, before the best-row check at 0x004374B8, the
+	 * printout, the configure_mp.cfg exec and the cvar sets. */
+	FS_FreeFile( buffer );
+
+	if ( best.cpuMHz >= 0.0 && best.sysMB && best.vidMB ) {
+		Com_Printf( "configure_mp.csv: using configuration %.0f cpu MHz %i sys MB %i vid MB\n",
+					best.cpuMHz, best.sysMB, best.vidMB );
+
+		Cbuf_AddText( "exec configure_mp.cfg" );
+		Cbuf_Execute();
+
+		for ( i = 0 ; i < numCvars ; i++ ) {
+			Cvar_Set2( cvarNames[i], cvarValues[i], qtrue );
+			var = Cvar_FindVar( cvarNames[i] );
+			var->flags |= CVAR_ARCHIVE;
+		}
+
+		Sys_SetConfigCvars( checksum );
+
+		if ( restart ) {
+			/* retail calls Cbuf_AddText here (0x0043756B); LTCG would inline it */
+#pragma inline_depth( 0 )
+			Cbuf_AddText( "snd_restart\n" );
+#pragma inline_depth()
+		}
+	} else {
 		Com_Error( ERR_FATAL, "\x15" "configure_mp.csv: \x14" "EXE_ERR_COULDNT_CONFIGURE" "\x15" " %.0f cpu MHz %i sys MB %i vid MB\n",
 				   sys_cpuMHzValue, sys_sysMBValue, sys_vidMBValue );
 	}
-
-	Com_Printf( "configure_mp.csv: using configuration %.0f cpu MHz %i sys MB %i vid MB\n",
-				bestCpuMhz, bestSysMb, bestVidMb );
-
-	Cbuf_AddText( "exec configure_mp.cfg" );
-	Cbuf_Execute();
-
-	for ( i = 0 ; i < numCvars ; i++ ) {
-		cvar_t *var;
-		Cvar_Set2( cvarNames[i], cvarValues[i], qtrue );
-		var = Cvar_FindVar( cvarNames[i] );
-		if ( var ) {
-			var->flags |= CVAR_ARCHIVE;
-		}
-	}
-
-	FS_FreeFile( buffer );
-
-	Sys_SetConfigCvars( checksum );
-
-	if ( restart ) {
-		Cbuf_AddText( "snd_restart\n" );
-	}
 }
 
-extern int dword_140733C;
 extern unsigned short SL_GetStringOfLen( const char *text, unsigned char user,
                                          unsigned int size, int type );
 
 /* ---- Com_Init  0x004375C0 ---- */
 void Com_Init( char *commandLine ) {
 	char    *s;
-	extern void Com_BindHunkGlobals( void );
-	extern void FX_StaticInit( void );
-
-	Com_BindHunkGlobals();
-
-	FX_StaticInit();
 
 	Com_Printf( "%s %s build %s %s\n", "COD MP", "1.1", "win-x86", "Oct  8 2003" );
 
@@ -1115,7 +1223,7 @@ void Com_Init( char *commandLine ) {
 	Cbuf_AddText( "exec autoexec_mp.cfg\n" );
 
 	if ( Com_SafeMode() ) {
-		Cbuf_AddText( "exec default_mp.cfg\n" );
+		Cbuf_AddText( "exec safemode_mp.cfg\n" );   /* 0x00437704 */
 	}
 
 	Cbuf_Execute();
@@ -1143,7 +1251,7 @@ void Com_Init( char *commandLine ) {
 	com_dedicated = Cvar_Get( "dedicated", "0", CVAR_LATCH );
 #endif
 	if ( com_dedicated->integer ) {
-		Sys_DestroySplashWindow();
+		Sys_HideSplashWindow();	/* retail inlines the hide only (0x0043779D) */
 		Sys_ShowConsole( 1, qtrue );
 		Sys_DeleteInstanceMarker();
 	}
@@ -1169,6 +1277,8 @@ void Com_Init( char *commandLine ) {
 	com_introplayed = Cvar_Get( "com_introplayed", "0", CVAR_ARCHIVE );
 	com_animCheck = Cvar_Get( "com_animCheck", "0", 0 );
 
+	com_hunkMeminfoRunningTotal = 0;   /* 0x00437992 (RTCW com_hunkusedvalue = 0) */
+
 	if ( com_dedicated->integer && !com_viewlog->integer ) {
 		Cvar_Set2( "viewlog", "1", qtrue );
 	}
@@ -1183,25 +1293,26 @@ void Com_Init( char *commandLine ) {
 	Cmd_AddCommand( "writedefaults", Com_WriteDefaults_f );
 
 	s = va( "%s %s build %s %s", "COD MP", "1.1", getBuildNumber(), "win-x86" );
-	com_version = Cvar_Get( "version", s, CVAR_ROM | CVAR_SERVERINFO );
+	com_version = Cvar_Get( "version", s, CVAR_ROM );   /* 0x00437A66 push 40h */
 	com_shortversion = Cvar_Get( "shortversion", "1.1", CVAR_ROM | CVAR_SERVERINFO );
 
 	Sys_Init();
 
 	Netchan_Init( Com_Milliseconds() & 0xffff );
 
-	Scr_Init();
-	VM_Init();
+	Scr_Init( com_developer->integer, com_developer_script->integer );
 
 	{
 		extern int XAnimInit( void );          /* XAnimInit, 0x00482F00 */
-		char emptyString[20];
+		int  emptyString[5];    /* not a char array: retail has no /GS cookie here */
 
 		XAnimInit();
 		Com_Memset( emptyString, 0, sizeof( emptyString ) );
-		*(unsigned short *) &dword_140733C =
-			(unsigned short) SL_GetStringOfLen( emptyString, 0, 17, 12 );
+		*(unsigned short *) &dobj_defaultTracePartRemapHandle =
+			(unsigned short) SL_GetStringOfLen( (const char *)emptyString, 0, 17, 12 );
 	}
+
+	VM_Init();   /* retail inlines it after the XAnimInit block (0x00437B1B) */
 
 	SV_Init();
 	NET_Init();
@@ -1225,7 +1336,8 @@ void Com_Init( char *commandLine ) {
 	}
 
 	if ( !com_dedicated->integer && !com_introplayed->integer ) {
-		Cvar_Set2( "com_introplayed", "1", qtrue );
+		Cvar_Set2( com_introplayed->name, "1", qtrue );
+		Cbuf_AddText( "cinematic atvi.RoQ\n" );   /* 0x00437BC7 */
 		Cvar_Set2( "nextmap", "cinematic iw_logo.roq", qtrue );
 	}
 
@@ -1289,7 +1401,8 @@ void Com_WriteConfig_f( void ) {
 		return;
 	}
 
-	Q_strncpyz( filename, Cmd_Argv( 1 ), sizeof( filename ) );
+	/* cmd_argv[1], not Cmd_Argv( 1 ): the folded inline copy allocates eax/ecx/edx differently */
+	Q_strncpyz( filename, cmd_argv[1], sizeof( filename ) );
 	Com_DefaultExtension( filename, sizeof( filename ), ".cfg" );
 	Com_Printf( "Writing %s.\n", filename );
 	Com_WriteConfigToFile( filename );
@@ -1304,7 +1417,8 @@ void Com_WriteDefaults_f( void ) {
 		return;
 	}
 
-	Q_strncpyz( filename, Cmd_Argv( 1 ), sizeof( filename ) );
+	/* cmd_argv[1], not Cmd_Argv( 1 ): the folded inline copy allocates eax/ecx/edx differently */
+	Q_strncpyz( filename, cmd_argv[1], sizeof( filename ) );
 	Com_DefaultExtension( filename, sizeof( filename ), ".cfg" );
 	Com_Printf( "Writing %s.\n", filename );
 	Com_WriteDefaultsToFile( filename );
@@ -1378,10 +1492,9 @@ void Com_Frame( void ) {
 		timeBeforeFirstEvents = Sys_Milliseconds();
 	}
 
-	if ( !com_dedicated->integer && com_maxfps->integer > 0 ) {
+	minMsec = 1;
+	if ( com_maxfps->integer > 0 && !com_dedicated->integer ) {
 		minMsec = 1000 / com_maxfps->integer;
-	} else {
-		minMsec = 1;
 	}
 	do {
 		com_frameTime = Com_EventLoop();
@@ -1408,19 +1521,21 @@ void Com_Frame( void ) {
 
 		Cvar_Get( "dedicated", "0", 0 );
 		com_dedicated->modified = qfalse;
-		if ( com_dedicated->integer ) {
+		if ( !com_dedicated->integer ) {
+			if ( !Sys_CheckCrashOrRerun() ) {
+				Com_Printf( "cannot become non-dedicated, since a non-dedicated game is already running\n" );
+				Cvar_Set2( "dedicated", va( "%i", wasDedicated ), qtrue );
+				Cvar_Get( "dedicated", "1", 0 );
+				com_dedicated->modified = qfalse;
+			} else {
+				CL_Init();
+				CL_StartHunkUsers();
+				Sys_ShowConsole( com_viewlog->integer, qfalse );
+			}
+		} else {
 			CL_Shutdown();
 			Sys_ShowConsole( 1, qtrue );
 			Sys_DeleteInstanceMarker();
-		} else if ( Sys_CheckCrashOrRerun() ) {
-			CL_Init();
-			CL_StartHunkUsers();
-			Sys_ShowConsole( com_viewlog->integer, qfalse );
-		} else {
-			Com_Printf( "cannot become non-dedicated, since a non-dedicated game is already running\n" );
-			Cvar_Set2( "dedicated", va( "%i", wasDedicated ), qtrue );
-			Cvar_Get( "dedicated", "1", 0 );
-			com_dedicated->modified = qfalse;
 		}
 	}
 
@@ -1437,13 +1552,15 @@ void Com_Frame( void ) {
 		CL_Frame( msec );
 
 		if ( com_statmon->integer || com_speeds->integer ) {
-			int now = Sys_Milliseconds();
-			if ( com_statmon->integer && com_lastStatmonTime
-				 && ( now - com_lastStatmonTime ) > 33 ) {
+			int last = com_lastStatmonTime;
+
+			com_lastStatmonTime = Sys_Milliseconds();
+			if ( com_statmon->integer && com_lastStatmonTime - last > 33 && last ) {
 				StatMon_Warning( 0, 3000, "gfx/2d/warning@fps.jpg" );
 			}
-			com_lastStatmonTime = now;
-			timeAfter = now;
+			if ( com_speeds->integer ) {
+				timeAfter = com_lastStatmonTime;
+			}
 		}
 	}
 
@@ -1451,9 +1568,9 @@ void Com_Frame( void ) {
 		int all, sv, ev, cl;
 
 		all = timeAfter - timeBeforeServer;
-		sv = timeBeforeEvents - time_frontend - timeBeforeServer;
-		ev = timeBeforeServer - timeBeforeFirstEvents + timeBeforeClient - timeBeforeEvents;
-		cl = timeAfter - time_game - time_backend - timeBeforeClient;
+		sv = timeBeforeEvents - timeBeforeServer - time_frontend;
+		ev = timeBeforeClient + timeBeforeServer - timeBeforeFirstEvents - timeBeforeEvents;
+		cl = timeAfter - timeBeforeClient - ( time_backend + time_game );
 
 		Com_Printf( "frame:%i all:%3i sv:%3i ev:%3i cl:%3i gm:%3i rf:%3i bk:%3i\n",
 					com_frameNumber, all, sv, ev, cl, time_frontend, time_backend, time_game );
@@ -1462,9 +1579,18 @@ void Com_Frame( void ) {
 	com_frameNumber++;
 }
 
+void Com_ShutdownDObj( void );
+extern int Scr_FreeGameStringRef_m( void );
+extern void XAnimShutdown( void );
+
 /* ---- Com_Close  0x00438330 ---- */
+/* Retail runs the same shutdown prefix Com_Restart uses before the logfile
+ * and journal closes. */
 void Com_Close( void ) {
-	Scr_Shutdown();
+	Com_ShutdownDObj();           /* inlined 0x00438330 */
+	Scr_FreeGameStringRef_m();    /* XAnimShutdownSmallTreePool 0x00480DD0 */
+	XAnimShutdown();              /* 0x00482FD0 */
+	Scr_Shutdown();               /* inlined 0x0043834C */
 
 	if ( logfile ) {
 		FS_FCloseFile( logfile );
@@ -1498,13 +1624,14 @@ static void FindMatches( const char *s ) {
 		return;
 	}
 
+	/* 0x00438404: zero every mismatching position without breaking, and no
+	 * terminator after the loop, so a later match that is a prefix of
+	 * shortestMatch leaves the longer string in place (Q3 1.17 behaviour) */
 	for ( i = 0 ; s[i] ; i++ ) {
 		if ( tolower( shortestMatch[i] ) != tolower( s[i] ) ) {
 			shortestMatch[i] = 0;
-			break;
 		}
 	}
-	shortestMatch[i] = 0;
 }
 
 /* ---- PrintMatches  0x00438440 ---- */
@@ -1515,62 +1642,59 @@ static void PrintMatches( const char *s ) {
 }
 
 /* ---- keyConcatArg  0x00438480 ---- */
-static void keyConcatArg( char *dest, int destsize, const char *src ) {
-	int i;
+static void keyConcatArg( void ) {
+	int  i;
+	char *arg;
 
 	for ( i = 1 ; i < Cmd_Argc() ; i++ ) {
-		char *arg;
-		qboolean quoted;
-
-		Q_strcat( dest, destsize, " " );
-
+		Q_strcat( completionField->buffer, sizeof( completionField->buffer ), " " );
 		arg = Cmd_Argv( i );
-		quoted = ( strchr( arg, ' ' ) != NULL );
-		if ( quoted ) {
-			Q_strcat( dest, destsize, "\"" );
+		while ( *arg ) {
+			if ( *arg == ' ' ) {
+				Q_strcat( completionField->buffer, sizeof( completionField->buffer ), "\"" );
+				break;
+			}
+			arg++;
 		}
-		Q_strcat( dest, destsize, arg );
-		if ( quoted ) {
-			Q_strcat( dest, destsize, "\"" );
+		Q_strcat( completionField->buffer, sizeof( completionField->buffer ), Cmd_Argv( i ) );
+		if ( *arg == ' ' ) {
+			Q_strcat( completionField->buffer, sizeof( completionField->buffer ), "\"" );
 		}
 	}
 }
 
 /* ---- ConcatRemaining  0x00438660 ---- */
-static void ConcatRemaining( char *dest, int destsize, const char *src, const char *start ) {
+static void ConcatRemaining( const char *src, const char *start ) {
 	char *str;
 
 	str = strstr( src, start );
 	if ( !str ) {
-		keyConcatArg( dest, destsize, src );
+		keyConcatArg();
 		return;
 	}
 
 	str += strlen( start );
-	Q_strcat( dest, destsize, str );
+	Q_strcat( completionField->buffer, sizeof( completionField->buffer ), str );
 }
 
 /* ---- Field_CompleteCommand  0x004386B0 ---- */
 void Field_CompleteCommand( field_t *field ) {
 	field_t temp;
-	char    *cmd;
 
 	completionField = field;
 
 	Cmd_TokenizeString( completionField->buffer );
 
-	cmd = Cmd_Argv( 0 );
-	if ( cmd[0] == '\\' || cmd[0] == '/' ) {
-		cmd++;
+	completionString = Cmd_Argv( 0 );
+	if ( completionString[0] == '\\' || completionString[0] == '/' ) {
+		completionString++;
 	}
-	completionString = cmd;
-
-	if ( !strlen( completionString ) ) {
-		return;
-	}
-
 	matchCount = 0;
 	shortestMatch[0] = 0;
+
+	if ( strlen( completionString ) == 0 ) {
+		return;
+	}
 
 	Cmd_CommandCompletion( FindMatches );
 	Cvar_CommandCompletion( FindMatches );
@@ -1586,8 +1710,7 @@ void Field_CompleteCommand( field_t *field ) {
 		if ( Cmd_Argc() == 1 ) {
 			Q_strcat( completionField->buffer, sizeof( completionField->buffer ), " " );
 		} else {
-			ConcatRemaining( completionField->buffer, sizeof( completionField->buffer ),
-							 temp.buffer, completionString );
+			ConcatRemaining( temp.buffer, completionString );
 		}
 		completionField->cursor = strlen( completionField->buffer );
 		return;
@@ -1595,8 +1718,7 @@ void Field_CompleteCommand( field_t *field ) {
 
 	Com_sprintf( completionField->buffer, sizeof( completionField->buffer ), "\\%s", shortestMatch );
 	completionField->cursor = strlen( completionField->buffer );
-	ConcatRemaining( completionField->buffer, sizeof( completionField->buffer ),
-					 temp.buffer, completionString );
+	ConcatRemaining( temp.buffer, completionString );
 
 	Com_Printf( "]%s\n", completionField->buffer );
 
@@ -1612,71 +1734,54 @@ byte com_dobjAllocBits[MAX_DOBJS / 4];
 byte com_dobjPool[MAX_DOBJS * DOBJ_SIZE];
 int com_dobjLastIndex;
 
-extern int com_dobjInited;
-extern int com_dobjPoolInited;
-
-extern int scrVarPub_developer;
-extern int scrVarPub_developerScript;
-extern int dword_140733C;
+int com_dobjInited;   /* 0x01407400 */
 
 extern int Scr_FreeGameStringRef_m( void );
-extern int XAnimShutdown( void );
+extern void XAnimShutdown( void );
 extern int XAnimInit( void );
 extern unsigned short SL_GetStringOfLen( const char *text, unsigned char user,
 										 unsigned int size, int type );
 
 /* ---- Com_GetClientDObj  0x00438890 ---- */
 void *Com_GetClientDObj( int handle ) {
-	unsigned short index;
+	short index;
 
 	index = com_clientDObjHandles[handle];
-	if ( !index ) {
-		return NULL;
+	if ( index ) {
+		return &com_dobjPool[index * DOBJ_SIZE];
 	}
-	return &com_dobjPool[index * DOBJ_SIZE];
+	return NULL;
 }
 
 /* ---- Com_GetServerDObj  0x004388B0 ---- */
 void *Com_GetServerDObj( int handle ) {
-	unsigned short index;
+	short index;
 
 	index = com_serverDObjHandles[handle];
-	if ( !index ) {
-		return NULL;
+	if ( index ) {
+		return &com_dobjPool[index * DOBJ_SIZE];
 	}
-	return &com_dobjPool[index * DOBJ_SIZE];
+	return NULL;
 }
 
 /* ---- Com_GetFreeDObjIndex  0x004388D0 ---- */
 int Com_GetFreeDObjIndex( void ) {
 	int index;
 
-	index = com_dobjLastIndex + 1;
-
-	if ( index < MAX_DOBJS ) {
-		while ( ( com_dobjAllocBits[index >> 2] & ( 3 << ( 2 * ( index & 3 ) ) ) ) != 0 ) {
-			index++;
-			if ( index >= MAX_DOBJS ) {
-				goto wrap;
-			}
-		}
-		com_dobjLastIndex = index;
-		return index;
-	}
-
-wrap:
-	index = 1;
-	if ( com_dobjLastIndex < 1 ) {
-		Com_Error( ERR_DROP, "\x15" "No free DObjs" );
-	}
-	while ( ( com_dobjAllocBits[index >> 2] & ( 3 << ( 2 * ( index & 3 ) ) ) ) != 0 ) {
-		index++;
-		if ( index > com_dobjLastIndex ) {
-			Com_Error( ERR_DROP, "\x15" "No free DObjs" );
+	for ( index = com_dobjLastIndex + 1; index < MAX_DOBJS; index++ ) {
+		if ( !( com_dobjAllocBits[index >> 2] & ( 3 << ( 2 * ( index & 3 ) ) ) ) ) {
+			com_dobjLastIndex = index;
+			return index;
 		}
 	}
-	com_dobjLastIndex = index;
-	return index;
+	for ( index = 1; index <= com_dobjLastIndex; index++ ) {
+		if ( !( com_dobjAllocBits[index >> 2] & ( 3 << ( 2 * ( index & 3 ) ) ) ) ) {
+			com_dobjLastIndex = index;
+			return index;
+		}
+	}
+	Com_Error( ERR_DROP, "\x15" "No free DObjs" );
+	return 0;
 }
 
 /* ---- Com_ShutdownDObj  0x00438BC0 ---- */
@@ -1691,14 +1796,13 @@ void Com_InitDObj( void ) {
 	Com_Memset( com_dobjAllocBits, 0, sizeof( com_dobjAllocBits ) );
 	Com_Memset( com_clientDObjHandles, 0, sizeof( com_clientDObjHandles ) );
 	Com_Memset( com_serverDObjHandles, 0, sizeof( com_serverDObjHandles ) );
-	com_dobjPoolInited = 1;
 	com_dobjLastIndex = 1;
 	com_dobjInited = 1;
 }
 
 /* ---- Com_Restart  0x00438BE0 ---- VERIFIED */
 void Com_Restart( void ) {
-	char emptyString[20];
+	int emptyString[5];    /* not a char array: retail has no /GS cookie here */
 
 	Com_ShutdownDObj();
 
@@ -1706,15 +1810,13 @@ void Com_Restart( void ) {
 	XAnimShutdown();
 	Scr_Shutdown();
 
-	scrVarPub_developer = com_developer ? com_developer->integer : 0;
-	scrVarPub_developerScript = com_developer_script ? com_developer_script->integer : 0;
-	Scr_Init();
+	Scr_Init( com_developer->integer, com_developer_script->integer );
 
 	XAnimInit();
 
 	Com_Memset( emptyString, 0, sizeof( emptyString ) );
-	*(unsigned short *) &dword_140733C =
-		(unsigned short) SL_GetStringOfLen( emptyString, 0, 17, 12 );
+	*(unsigned short *) &dobj_defaultTracePartRemapHandle =
+		(unsigned short) SL_GetStringOfLen( (const char *)emptyString, 0, 17, 12 );
 
 	Com_InitDObj();
 }
@@ -1724,18 +1826,12 @@ void Com_Restart( void ) {
  * Merged from common_raw.c (retail linked it as a separate translation unit).
  * ========================================================================== */
 
-/* globals cod1_globals.h declared for the merged unit; kept local here so
-   that header (int-typed com_version etc.) stays out of this TU. */
-extern int com_weaponInfoBlockPtr;      /* 0x01407414 */
-extern int com_weaponInfoBlockOwner;    /* 0x01407418 */
-extern unsigned char empty_string[4];   /* 0x00559228 */
-
 void *Hunk_AllocAlignInternal( int size, int align );
 void *Hunk_AllocLowAlignInternal( int size, int align );
 
-extern char DObjCreate( short scrNotifyId, void *dobj, void *models,
-						unsigned short modelCount, void *tree );
-extern int  DObjFree( unsigned int releaseTree, void *dobj );
+extern void DObjCreate( void *models, unsigned short modelCount, void *tree,
+						void *dobj, unsigned short scrNotifyId );
+extern void DObjFree( unsigned int releaseTree, void *dobj );
 
 unsigned short  MT_AllocIndex( int size, int type );
 void            MT_FreeIndex( unsigned short blockIndex, unsigned int size );
@@ -1747,27 +1843,21 @@ char *Com_ParseOnLine( char **data_p );
 
 #define DOBJ_STRIDE 88
 
-#define DOBJ_CLIENT_HANDLE_OK( h ) \
-	( (unsigned int)( h ) < (unsigned int)MAX_CLIENT_DOBJS )
-#define DOBJ_SERVER_HANDLE_OK( h ) \
-	( (unsigned int)( h ) < (unsigned int)MAX_DOBJS )
+/* Retail 0x00438950 / 0x004389B0 / 0x00438A10 / 0x00438A70 index the handle
+ * tables without a range check; an out-of-range handle is not rejected. */
 
 /* ---- Com_ClientDObjCreate  0x00438950 ---- VERIFIED */
 void Com_ClientDObjCreate( void *models, unsigned short modelCount, void *tree,
 						   int handle, unsigned short scrNotifyId ) {
 	int index;
 
-	if ( !DOBJ_CLIENT_HANDLE_OK( handle ) ) {
-		Com_Printf( "Com_ClientDObjCreate: handle %i out of range\n", handle );
-		return;
-	}
 	index = Com_GetFreeDObjIndex();
 
 	com_dobjAllocBits[index >> 2] |= (byte)( 1 << ( 2 * ( index & 3 ) ) );
 	com_clientDObjHandles[handle] = (unsigned short)index;
 
-	DObjCreate( (short)scrNotifyId, &com_dobjPool[index * DOBJ_STRIDE],
-				models, modelCount, tree );
+	DObjCreate( models, modelCount, tree,
+				&com_dobjPool[index * DOBJ_STRIDE], scrNotifyId );
 }
 
 /* ---- Com_ServerDObjCreate  0x004389B0 ---- VERIFIED */
@@ -1775,40 +1865,28 @@ void Com_ServerDObjCreate( void *models, unsigned short modelCount, void *tree,
 						   int handle, unsigned short scrNotifyId ) {
 	int index;
 
-	if ( !DOBJ_SERVER_HANDLE_OK( handle ) ) {
-		Com_Printf( "Com_ServerDObjCreate: handle %i out of range\n", handle );
-		return;
-	}
 	index = Com_GetFreeDObjIndex();
 
 	com_dobjAllocBits[index >> 2] |= (byte)( 2 << ( 2 * ( index & 3 ) ) );
 	com_serverDObjHandles[handle] = (unsigned short)index;
 
-	DObjCreate( (short)scrNotifyId, &com_dobjPool[index * DOBJ_STRIDE],
-				models, modelCount, tree );
+	DObjCreate( models, modelCount, tree,
+				&com_dobjPool[index * DOBJ_STRIDE], scrNotifyId );
 }
 
 /* ---- Com_SafeClientDObjFree  0x00438A10 ---- VERIFIED */
 void Com_SafeClientDObjFree( int handle, unsigned int releaseTree ) {
 	int  index;
-	int  shift;
-	byte bits;
 
-	if ( !DOBJ_CLIENT_HANDLE_OK( handle ) ) {
-		Com_Printf( "Com_SafeClientDObjFree: handle %i out of range\n", handle );
-		return;
-	}
 	index = (short)com_clientDObjHandles[handle];
 	if ( !index ) {
 		return;
 	}
-	com_clientDObjHandles[handle] = 0;
+	/* retail 0x00438A1D stores with no bound check; a pointer store keeps modern /GS from adding a range-check fast-fail */
+	*( com_clientDObjHandles + handle ) = 0;
 
-	shift = 2 * ( index & 3 );
-	bits  = com_dobjAllocBits[index >> 2] & (byte)~( 1 << shift );
-	com_dobjAllocBits[index >> 2] = bits;
-
-	if ( ( bits & (byte)( 3 << shift ) ) == 0 ) {
+	com_dobjAllocBits[index >> 2] &= ~( 1 << ( 2 * ( index & 3 ) ) );
+	if ( !( com_dobjAllocBits[index >> 2] & ( 3 << ( 2 * ( index & 3 ) ) ) ) ) {
 		DObjFree( releaseTree, &com_dobjPool[index * DOBJ_STRIDE] );
 	}
 }
@@ -1816,24 +1894,16 @@ void Com_SafeClientDObjFree( int handle, unsigned int releaseTree ) {
 /* ---- Com_SafeServerDObjFree  0x00438A70 ---- VERIFIED */
 void Com_SafeServerDObjFree( int handle, unsigned int releaseTree ) {
 	int  index;
-	int  shift;
-	byte bits;
 
-	if ( !DOBJ_SERVER_HANDLE_OK( handle ) ) {
-		Com_Printf( "Com_SafeServerDObjFree: handle %i out of range\n", handle );
-		return;
-	}
 	index = (short)com_serverDObjHandles[handle];
 	if ( !index ) {
 		return;
 	}
-	com_serverDObjHandles[handle] = 0;
+	/* retail 0x00438A7D stores with no bound check; a pointer store keeps modern /GS from adding a range-check fast-fail */
+	*( com_serverDObjHandles + handle ) = 0;
 
-	shift = 2 * ( index & 3 );
-	bits  = com_dobjAllocBits[index >> 2] & (byte)~( 2 << shift );
-	com_dobjAllocBits[index >> 2] = bits;
-
-	if ( ( bits & (byte)( 3 << shift ) ) == 0 ) {
+	com_dobjAllocBits[index >> 2] &= ~( 2 << ( 2 * ( index & 3 ) ) );
+	if ( !( com_dobjAllocBits[index >> 2] & ( 3 << ( 2 * ( index & 3 ) ) ) ) ) {
 		DObjFree( releaseTree, &com_dobjPool[index * DOBJ_STRIDE] );
 	}
 }
@@ -1842,18 +1912,13 @@ void Com_SafeServerDObjFree( int handle, unsigned int releaseTree ) {
 void Com_SyncClientDObjsFromServer_m( void ) {
 	int  i;
 	int  index;
-	int  shift;
-	byte bits;
 
 	for ( i = 0; i < MAX_DOBJS; i++ ) {
 		index = (short)com_clientDObjHandles[i];
 		if ( index ) {
-			shift = 2 * ( index & 3 );
-			bits  = com_dobjAllocBits[index >> 2] & (byte)~( 1 << shift );
-			com_dobjAllocBits[index >> 2] = bits;
+			com_dobjAllocBits[index >> 2] &= ~( 1 << ( 2 * ( index & 3 ) ) );
 			com_clientDObjHandles[i] = 0;
-
-			if ( ( bits & (byte)( 3 << shift ) ) == 0 ) {
+			if ( !( com_dobjAllocBits[index >> 2] & ( 3 << ( 2 * ( index & 3 ) ) ) ) ) {
 				DObjFree( 0, &com_dobjPool[index * DOBJ_STRIDE] );
 			}
 		}
@@ -1868,7 +1933,7 @@ void Com_SyncClientDObjsFromServer_m( void ) {
 }
 
 /* ---- Hunk_AllocXAnimCreateTree  0x00438CD0 ---- VERIFIED */
-void *__cdecl Hunk_AllocXAnimCreateTree(unsigned int size)
+void *__cdecl Hunk_AllocXAnimCreateTree(int size)
 {
   return Hunk_AllocLowAlignInternal(size, 32);
 }
@@ -1885,48 +1950,62 @@ void *__cdecl Hunk_AllocXModelPrecacheMesh(unsigned int size)
   return Hunk_AllocAlignInternal(size, 32);
 }
 
-/* ---- Com_XAnimCreateTree  0x00438D00 ---- VERIFIED */
-void *__cdecl Com_XAnimCreateTree(void *anims, void *tag)
-{
-  int v2 = (int)anims;
-  unsigned int v3;
-  int *v4;
+/* Minimal views of the XAnim structures these tree helpers touch.  Only the
+   fields read below are named; the offsets are pinned against the layout
+   recovered for CoDMP.exe.  Distinct file-local names avoid clashing with the
+   full definitions that live with the XAnim system. */
+typedef struct comXAnim_s {
+	const char *name;       /* +0x00 */
+	int         nodeCount;  /* +0x04 */
+} comXAnim_t;
+COD1_STATIC_ASSERT( offsetof( comXAnim_t, nodeCount ) == 4,
+                    "comXAnim_t.nodeCount must be at +0x04" );
 
-  v3 = 2 * *(_DWORD *)(v2 + 4) + 8 + 2 * (3 * *(_DWORD *)(v2 + 4) + 1);
-  v4 = (int *)Hunk_AllocLowAlignInternal(v3, 32);
-  Com_Memset(v4, 0, v3);
-  *v4 = v2;
-  return v4;
+/* A tree is a variable-length block: this header points back at the source
+   XAnim, and the trailing per-node data (sized from nodeCount) stays untyped. */
+typedef struct comXAnimTree_s {
+	comXAnim_t *sourceTree; /* +0x00 */
+} comXAnimTree_t;
+COD1_STATIC_ASSERT( offsetof( comXAnimTree_t, sourceTree ) == 0,
+                    "comXAnimTree_t.sourceTree must be at +0x00" );
+
+void *XAnimAllocRuntimeTree( void *sourceTree, void *(__cdecl *alloc)(int) );
+
+/* ---- Com_XAnimCreateTree  0x00438D00 ---- VERIFIED */
+/* the callback keeps Hunk_AllocXAnimCreateTree (unreferenced in retail) on a stack convention */
+void *__cdecl Com_XAnimCreateTree( void *anims, void *tag ) {
+	return XAnimAllocRuntimeTree( anims, Hunk_AllocXAnimCreateTree );
 }
 
 /* ---- MT_AllocAnimTree  0x00438D40 ---- VERIFIED */
 void *__cdecl MT_AllocAnimTree(int size)
 {
-  return (void *)&scrMemTree_blocks[8 * (unsigned __int16)MT_AllocIndex(size, MT_TYPE_ANIMTREE)];
+  return (void *)&scrMemTree_blocks[8 * (unsigned short)MT_AllocIndex(size, MT_TYPE_ANIMTREE)];
 }
 
 /* ---- Com_XAnimCreateSmallTree  0x00438D60 ---- VERIFIED */
-void *__cdecl Com_XAnimCreateSmallTree(void *anims, void *tag)
-{
-  int v2 = (int)anims;
-  int v3;
-  int *v4;
-
-  v3 = 2 * *(_DWORD *)(v2 + 4) + 8 + 2 * (3 * *(_DWORD *)(v2 + 4) + 1);
-  v4 = (int *)&scrMemTree_blocks[8 * (unsigned __int16)MT_AllocIndex(v3, MT_TYPE_ANIMTREE)];
-  Com_Memset(v4, 0, v3);
-  *v4 = v2;
-  return v4;
+/* retail inlines XAnimAllocRuntimeTree; passing MT_AllocAnimTree keeps that one on a stack convention */
+void *__cdecl Com_XAnimCreateSmallTree( void *anims, void *tag ) {
+	return XAnimAllocRuntimeTree( anims, MT_AllocAnimTree );
 }
 
 /* ---- Com_XAnimFreeSmallTree  0x00438DA0 ---- VERIFIED */
-void __cdecl Com_XAnimFreeSmallTree(void *tree)
-{
-  int v1 = (int)tree;
+void __cdecl Com_XAnimFreeSmallTree( void *tree ) {
+	const comXAnimTree_t *t = (const comXAnimTree_t *)tree;
+	int nodeCount = t->sourceTree->nodeCount;
+	struct {
+		int headerSize;
+		int remapCount;
+	} layout;   /* a struct local keeps 2n+8 and 3n+1 apart as retail does (cf. XAnimAllocRuntimeTree) */
+	int size;
 
-  MT_FreeIndex(
-    (unsigned short)( ( (unsigned char *)tree - scrMemTree_blocks ) >> 3 ),
-    2 * *(_DWORD *)(*(_DWORD *)v1 + 4) + 8 + 2 * (3 * *(_DWORD *)(*(_DWORD *)v1 + 4) + 1));
+	layout.headerSize = 2 * nodeCount + 8;
+	layout.remapCount = 3 * nodeCount + 1;
+	size = layout.headerSize + 2 * layout.remapCount;
+
+	MT_FreeIndex(
+		(unsigned short)( ( (unsigned char *)tree - scrMemTree_blocks ) >> 3 ),
+		size );
 }
 
 /* ---- Com_GetWeaponInfoMemory  0x00438DC0 ---- VERIFIED */
@@ -1966,50 +2045,34 @@ void __cdecl Com_FreeWeaponInfoMemory( int owner, int iSource )
 }
 
 /* ---- Com_SaveCvarsToBuffer  0x00438E30 ---- VERIFIED */
-qboolean __cdecl Com_SaveCvarsToBuffer(const char **cvarNames, int cvarCount, char *buffer, int bufferSize)
-{
-  int v3;
-  int v4;  /* SIGNED in retail (`sub ebx,eax`), so keep it signed */
-  cvar_t *Var;
-  char *string;
-  int v8;
+qboolean __cdecl Com_SaveCvarsToBuffer( const char **cvarNames, int cvarCount,
+										char *buffer, int bufferSize ) {
+	int i;
+	int written;
 
-  v3 = 0;
-  if ( cvarCount > 0 )
-  {
-    v4 = bufferSize;
-    do
-    {
-      Var = Cvar_FindVar(cvarNames[v3]);
-      if ( Var )
-        string = Var->string;
-      else
-        string = (char *)&empty_string;
-      v8 = _snprintf(buffer, (size_t)v4, "%s \"%s\"\n", cvarNames[v3], string);
-      if ( v8 < 0 )
-        return qfalse;      /* 0x00438E9B: buffer full, `xor eax,eax` */
-      buffer += v8;
-      v4 -= v8;
-      ++v3;
-    }
-    while ( v3 < cvarCount );
-  }
-  return qtrue;             /* 0x00438E94: `mov eax,1` */
+	for ( i = 0; i < cvarCount; i++ ) {
+		written = _snprintf( buffer, (size_t)bufferSize, "%s \"%s\"\n",
+							 cvarNames[i], Cvar_VariableString( cvarNames[i] ) );
+		if ( written < 0 ) {
+			return qfalse;      /* 0x00438E9B: buffer full, `xor eax,eax` */
+		}
+		buffer += written;
+		bufferSize -= written;  /* SIGNED in retail (`sub ebx,eax`) */
+	}
+	return qtrue;               /* 0x00438E94: `mov eax,1` */
 }
 
 /* ---- Com_LoadCvarsFromBuffer  0x00438EB0 ---- VERIFIED */
 qboolean __cdecl Com_LoadCvarsFromBuffer( const char **cvarNames, int cvarCount,
 										  char *text, const char *filename )
 {
-	/* Retail's own 0x10004-byte stack array; only cvarCount bytes are used. */
-	byte seen[65540];
+	/* only cvarCount bytes are used; 64 KB gives retail's 0x1000C frame */
+	byte seen[65536];
 	char *token;
-	char *p;
 	int found;
 	int i;
-	int c;
 
-	Com_Memset( seen, 0, cvarCount );
+	memset( seen, 0, cvarCount );
 	found = 0;
 
 	Com_BeginParseSession( filename );
@@ -2020,57 +2083,35 @@ qboolean __cdecl Com_LoadCvarsFromBuffer( const char **cvarNames, int cvarCount,
 			break;
 		}
 
+		/* retail layout: search loop, warning, skip, then the found block
+		   (0x00438FB9) jumping back to the skip */
 		for ( i = 0; i < cvarCount; i++ ) {
 			if ( !_stricmp( token, cvarNames[i] ) ) {
-				break;
-			}
-		}
-
-		if ( i == cvarCount ) {
-			Com_Printf( "^3WARNING: unknown cvar '%s' in file '%s'\n",
-						token, filename );
-		} else {
-			/* inlined at 0x00438FB9; qfalse = stay on this line */
-			Cvar_Set2( cvarNames[i], Com_ParseOnLine( &text ), qtrue );
-			if ( !seen[i] ) {
-				seen[i] = 1;
-				found++;
-			}
-		}
-
-		p = text;
-		if ( !p ) {
-			continue;
-		}
-		c = *p;
-		if ( c ) {
-			for ( ;; ) {
-				p++;
-				if ( c == '\n' ) {
-					parseInfo->currentLine++;
-					break;
+				Cvar_Set2( cvarNames[i], Com_ParseOnLine( &text ), qtrue );
+				if ( !seen[i] ) {
+					seen[i] = 1;
+					found++;
 				}
-				c = *p;
-				if ( !c ) {
-					break;
-				}
+				goto skipLine;
 			}
 		}
-		text = p;
+		Com_Printf( "^3WARNING: unknown cvar '%s' in file '%s'\n",
+					token, filename );
+skipLine:
+		Com_SkipRestOfLine( &text );
 	}
 
 	Com_EndParseSession();                   /* inlined at 0x0043903B */
 
-	if ( found != cvarCount ) {
-		Com_Printf(
-			"^1ERROR: the following cvars were not specified in file '%s'\n",
-			filename );
-		for ( i = 0; i < cvarCount; i++ ) {
-			if ( !seen[i] ) {
-				Com_Printf( "^1  %s\n", cvarNames[i] );
-			}
-		}
-		return qfalse;                       /* 0x004390D8 */
+	if ( found == cvarCount ) {
+		return qtrue;                        /* 0x00439078 */
 	}
-	return qtrue;                            /* 0x00439078 */
+	Com_Printf( "^1ERROR: the following cvars were not specified in file '%s'\n",
+				filename );
+	for ( i = 0; i < cvarCount; i++ ) {
+		if ( !seen[i] ) {
+			Com_Printf( "^1  %s\n", cvarNames[i] );
+		}
+	}
+	return qfalse;                           /* 0x004390D8 */
 }

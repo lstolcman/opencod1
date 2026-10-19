@@ -104,9 +104,8 @@ qboolean Cvar_Command( void ) {
 
 /* ---- Cvar_Toggle_f  0x00439CD0 ---- VERIFIED */
 void Cvar_Toggle_f( void ) {
-	cvar_t *var;
 	const char *string;
-	int i;
+	int i, v;
 
 	if ( Cmd_Argc() < 2 ) {
 		Com_Printf( "usage: toggle <variable> <optional value sequence>\n" );
@@ -114,14 +113,13 @@ void Cvar_Toggle_f( void ) {
 	}
 
 	if ( Cmd_Argc() == 2 ) {
-		var = Cvar_FindVar( Cmd_Argv( 1 ) );
-		Cvar_Set2( Cmd_Argv( 1 ),
-				   va( "%i", var ? (int)var->value == 0 : 1 ), qfalse );
+		v = (int)Cvar_VariableValue( Cmd_Argv( 1 ) );
+		v = !v;
+		Cvar_Set2( Cmd_Argv( 1 ), va( "%i", v ), qfalse );
 		return;
 	}
 
-	var = Cvar_FindVar( Cmd_Argv( 1 ) );
-	string = var ? var->string : "";
+	string = Cvar_VariableString( Cmd_Argv( 1 ) );
 
 	for ( i = 2; i < Cmd_Argc() - 1; i++ ) {
 		if ( !strcmp( string, Cmd_Argv( i ) ) ) {
@@ -212,22 +210,12 @@ void Cvar_SetA_f( void ) {
 
 /* ---- Cvar_SetFromCvar_f  0x0043A070 ---- VERIFIED */
 void Cvar_SetFromCvar_f( void ) {
-	cvar_t  *v;
-	const char *value;
-
 	if ( Cmd_Argc() != 3 ) {
 		Com_Printf( "usage: setfromcvar <variable> <variablein>\n" );
 		return;
 	}
 
-	v = Cvar_FindVar( Cmd_Argv( 2 ) );
-	if ( v ) {
-		value = v->string;
-	} else {
-		value = "";
-	}
-
-	Cvar_Set2( Cmd_Argv( 1 ), value, qfalse );
+	Cvar_Set2( Cmd_Argv( 1 ), Cvar_VariableString( Cmd_Argv( 2 ) ), qfalse );
 }
 
 /* ---- Cvar_Reset_f  0x0043A0D0 ---- VERIFIED */
@@ -346,9 +334,9 @@ void Cvar_Dump_f( void ) {
 /* ---- Com_CvarDump  0x0043A3C0 ---- VERIFIED */
 void Com_CvarDump( int channel ) {
 	cvar_t  *var;
-	int i;
-	char    *match;
-	char buffer[8196];
+	const char *match;
+	int count;
+	char buffer[8192];
 
 	if ( Cmd_Argc() > 1 ) {
 		match = Cmd_Argv( 1 );
@@ -360,24 +348,24 @@ void Com_CvarDump( int channel ) {
 		return;
 	}
 
-	i = 0;
+	count = 0;
 	Com_PrintMessage( channel,
 					  "=============================== CVAR DUMP ========================================\n" );
 
-	for ( var = cvar_vars ; var ; var = var->next, i++ ) {
+	for ( var = cvar_vars ; var ; var = var->next, count++ ) {
 		if ( match && !Com_Filter( match, var->name, qfalse ) ) {
 			continue;
 		}
 		if ( var->latchedString ) {
-			Com_sprintf( buffer, sizeof( buffer ), "      %s \"%s\" -- latched \"%s\"\n",
+			Com_sprintf( buffer, 8192, "      %s \"%s\" -- latched \"%s\"\n",
 						 var->name, var->string, var->latchedString );
 		} else {
-			Com_sprintf( buffer, sizeof( buffer ), "      %s \"%s\"\n", var->name, var->string );
+			Com_sprintf( buffer, 8192, "      %s \"%s\"\n", var->name, var->string );
 		}
 		Com_PrintMessage( channel, buffer );
 	}
 
-	Com_sprintf( buffer, sizeof( buffer ), "\n%i total cvars\n%i cvar indexes\n", i, cvar_numIndexes );
+	Com_sprintf( buffer, 8192, "\n%i total cvars\n%i cvar indexes\n", count, cvar_numIndexes );
 	Com_PrintMessage( channel, buffer );
 	Com_PrintMessage( channel,
 					  "=============================== END CVAR DUMP =====================================\n" );

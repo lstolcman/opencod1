@@ -1,27 +1,7 @@
-/*
- * cg_snapshot.c -- things that happen on snapshot transition, not necessarily
- * every single rendered frame.
- *
- * Call of Duty 1.1 multiplayer client game (cgame_mp_x86.dll, imagebase
- * 0x30000000).  RTCW's cgame/cg_snapshot.c is the ancestor; the seven functions
- * and their order are unchanged.  What CoD changed:
- *
- *   - cg.nextSnap is never cleared.  CG_TransitionSnapshot does
- *     cg.snap = cg.nextSnap and stops there, so CG_ProcessSnapshots spells
- *     "no next frame" as `cg.nextSnap == cg.snap` where RTCW writes
- *     `!cg.nextSnap`.  Nothing in 1.1 ever nulls either pointer once set.
- *   - centity_t has no `interpolate`; `currentValid` does both jobs.
- *   - CG_SetNextSnap grew the per-client half: it drives bg_clientinfo[] out of
- *     the snapshot's 64 clientState_t records (names, model and attach-model
- *     configstrings) and rebuilds each client's DObj.  That is where the
- *     92-byte clientState_t layout below comes from.
- *   - CG_ResetEntity is where nextState is promoted to currentState, and it
- *     addresses cent->nextState throughout, including the eType switch.
- *
- * Functions are in address order, which is the original file order.
- *
- * @fidelity: likely
- */
+// cg_snapshot.c -- things that happen on snapshot transition,
+// not necessarily every single rendered frame
+//
+// cg.nextSnap is never cleared; cg.nextSnap == cg.snap means there is no next frame.
 
 #define _CRT_SECURE_NO_WARNINGS
 
@@ -29,45 +9,33 @@
 
 #include "cg_local.h"
 
-/* Owned by other units. */
-void        CG_Printf( const char *msg, ... );                  /* cg_main.c 0x300206F0 */
-void        CG_Error( const char *msg, ... );                   /* cg_main.c 0x30020750 */
-const char *CG_ConfigString( int index );                       /* cg_main.c 0x30021B00 */
-const char *CG_SafeTranslateString_Internal( const char *module, const char *reference );
-                                                                /* cg_main.c 0x30022840 */
-void        CG_SetFrameInterpolation( void );                   /* cg_ent.c 0x3001BBF0 */
-void        CG_CheckEvents( centity_t *cent );                  /* cg_event.c 0x3001EA10 */
-void        CG_CheckPreEvents( centity_t *cent );               /* cg_event.c 0x3001EB10 */
-void        CG_AddLagometerSnapshotInfo( snapshot_t *snap );    /* cg_draw.c 0x30015400 */
-void        CG_ResetPlayerEntity( centity_t *cent );            /* cg_players.c 0x300285C0 */
-void        CG_ExecuteNewServerCommands( int latestSequence );  /* cg_servercmds.c 0x3002E580 */
-void        CG_UpdateHandViewmodels( const char *modelName );   /* cg_weapons.c 0x30035FD0 */
+void        CG_Printf( const char *msg, ... );
+void        CG_Error( const char *msg, ... );
+const char *CG_ConfigString( int index );
+const char *CG_SafeTranslateString_Internal( const char *reference, const char *module );
+void        CG_SetFrameInterpolation( void );
+void        CG_CheckEvents( centity_t *cent );
+void        CG_CheckPreEvents( centity_t *cent );
+void        CG_AddLagometerSnapshotInfo( snapshot_t *snap );
+void        CG_ResetPlayerEntity( centity_t *cent );
+void        CG_ExecuteNewServerCommands( int latestSequence );
+void        CG_UpdateHandViewmodels( const char *modelName );
 
-/* bg_misc.c.  BG_UpdatePlayerDObj is bg_public.h's -- one source, two
-   builds, behind bg_animation.c's CGAMEDLL conditional. */
 void        BG_PlayerStateToEntityState( playerState_t *ps, entityState_t *s, qboolean snap );
-
-/* bg_animation.c's clocks and the root script animation. */
-extern int          bgs_time;
-extern int          bgs_animTime;
-extern scr_anim_t   bgs_rootAnim;
 
 #define ET_PLAYER                   1
 #define ET_CORPSE                   2
 
 #define EF_TELEPORT_BIT             0x00000008
-/* set on a corpse that inherits the client's live anim tree instead of
-   restarting it (CG_ResetEntity 0x3002F986). */
+// corpse inherits the client's live anim tree instead of restarting it
 #define EF_CORPSE_KEEPANIM          0x00000800
 
-/* playerState_t.pm_flags; the two spellings the game module already uses. */
 #define PMF_FOLLOW                  0x00010000
 #define PMF_INWORLD                 0x00040000
 
-/* playerState_t.stats[] index the server bumps on respawn (g_client_mp.c). */
+// bumped by the server on respawn
 #define STAT_SPAWN_COUNT            5
 
-/* configstring bases; both are g_utils_mp.c's on the server side. */
 #define CS_MODELS                   268
 #define CS_TAGS                     108
 
@@ -75,28 +43,11 @@ extern scr_anim_t   bgs_rootAnim;
 #define SNAPFLAG_SERVERCOUNT        4
 
 /*
- * The 92-byte per-client record cg_public.h carries size-only.  CG_SetNextSnap
- * (0x3002FCD0..0x3002FF5B) is the only reader in the module: it drives exactly
- * the bg_clientinfo[] members the server fills in ClientEndFrame, through the
- * same two configstring bases.
- */
-typedef struct cgClientState_t {
-	int clientNum;                                  /* +0x00 -> ci->clientNum, 0x3002FCF3 */
-	int team;                                       /* +0x04 -> ci->team,      0x3002FD00 */
-	int modelIndex;                                 /* +0x08 CS_MODELS + this, 0x3002FD7E */
-	int attachModelIndex[MAX_ATTACHED_MODELS];      /* +0x0C CS_MODELS + this, 0x3002FE15 */
-	int attachTagIndex[MAX_ATTACHED_MODELS];        /* +0x24 CS_TAGS   + this, 0x3002FE96 */
-	char name[32];                                  /* +0x3C strncpy 31,       0x3002FD6D */
-} cgClientState_t;
-CG_ASSERT_SIZE( cgClientState_t, 92 );
-
-/*
 ==================
 CG_ResetEntity
 
 Promotes cent->nextState and restarts everything that must not interpolate
-across the gap.  Every read below is of nextState, including the eType switch
-(0x3002F8A9).
+across the gap.
 ==================
 */
 static void CG_ResetEntity( centity_t *cent ) {
@@ -104,11 +55,12 @@ static void CG_ResetEntity( centity_t *cent ) {
 	int num;
 	void            *corpseTree;
 
-	cent->currentState = cent->nextState;
-
-	memset( cent->unknown_0x210, 0, 12 );
+	// keep: before the copy, matches original codegen
+	VectorClear( cent->lightingOrigin );
 	cent->currentValid = qtrue;
-	*(int *)&cent->unknown_0x1F0[0] = 0;
+	cent->bTrailMade = qfalse;
+
+	cent->currentState = cent->nextState;
 
 	BG_EvaluateTrajectory( &cent->nextState.pos, cg.time, cent->lerpOrigin );
 	BG_EvaluateTrajectory( &cent->nextState.apos, cg.time, cent->lerpAngles );
@@ -149,15 +101,12 @@ static void CG_ResetEntity( centity_t *cent ) {
 		if ( cent->currentState.eFlags & EF_CORPSE_KEEPANIM ) {
 			cent->previousEventSequence = 0;
 			cent->previousPreEventSequence = 0;
-			trap_syscall_0xB8( (int)ci->animTree, (int)corpseTree );
+			trap_XAnimCloneAnimTree( ci->animTree, corpseTree );
 		} else {
 			cent->previousEventSequence = cent->nextState.eventSequence;
 			cent->previousPreEventSequence = cent->nextState.eventSequence;
-			/* the whole dword, not bgs_rootAnim.index: 0x3002F9C6 is a plain
-			   `mov ecx, bgs_rootAnimHandle` with no movzx, and the wrapper
-			   narrows it.  Same value -- index is the low half -- so the C4761
-			   this raises is retail's, not a slip.  Do not "fix" it to .index. */
-			trap_XAnimClearTreeGoalWeights( (int)ci->animTree, *(int *)&bgs_rootAnim, 0 );
+			// keep: the whole dword, not .index (the C4761 warning is expected)
+			trap_XAnimClearTreeGoalWeights( ci->animTree, *(int *)&bgs_rootAnim, 0 );
 		}
 		break;
 
@@ -172,8 +121,7 @@ static void CG_ResetEntity( centity_t *cent ) {
 ===============
 CG_TransitionEntity
 
-cent->nextState is moved to cent->currentState and events are fired.  Nothing
-in 1.1 reaches the standalone copy; every call site got it inlined.
+cent->nextState is moved to cent->currentState and events are fired
 ===============
 */
 static void CG_TransitionEntity( centity_t *cent ) {
@@ -193,7 +141,7 @@ All other times will use CG_TransitionSnapshot instead.
 ==================
 */
 static void CG_SetInitialSnapshot( snapshot_t *snap ) {
-	centity_t   *cent;
+	int i;
 
 	cg.snap = snap;
 
@@ -201,11 +149,11 @@ static void CG_SetInitialSnapshot( snapshot_t *snap ) {
 	bgs_time = cg.time;
 	cg.oldTime = cg.time;
 
-	for ( cent = cg_entities ; cent < cg_entities + MAX_GENTITIES ; cent++ ) {
-		cent->currentValid = qfalse;
+	for ( i = 0 ; i < MAX_GENTITIES ; i++ ) {
+		cg_entities[i].currentValid = qfalse;
 	}
 
-	trap_syscall_0xD7( 1.0f, 0 );
+	trap_MSS_FadeAllSounds( 1.0f, 0 );
 
 	// set our local weapon selection pointer to
 	// what the server has indicated the current weapon is
@@ -222,8 +170,9 @@ The transition point from snap to nextSnap has passed
 static void CG_TransitionSnapshot( void ) {
 	centity_t           *cent;
 	clientInfo_t        *ci;
-	const cgClientState_t   *cs;
+	const clientState_t     *cs;
 	snapshot_t          *oldFrame;
+	playerState_t       *ops, *ps;
 	void                *animTree;
 	int i;
 
@@ -235,19 +184,17 @@ static void CG_TransitionSnapshot( void ) {
 	// retire the clientInfo of anyone who was in the old frame and did not
 	// re-announce himself in it
 	for ( i = 0 ; i < cg.snap->numClients ; i++ ) {
-		cs = (const cgClientState_t *)&cg.snap->clients[ i ];
+		cs = &cg.snap->clients[ i ];
 		ci = &bg_clientinfo[ cs->clientNum ];
 
-		if ( *(int *)ci->unknown_0x004 ) {
-			*(int *)ci->unknown_0x004 = 0;
+		if ( ci->nextValid ) {
+			ci->nextValid = qfalse;
 		} else {
 			animTree = ci->animTree;
 			memset( ci, 0, sizeof( clientInfo_t ) );
 			ci->animTree = animTree;
 
-			trap_SafeDObjFree( cs->clientNum, 1 );
-			cg.iEntityLastType[ cs->clientNum ] = 0;
-			cg.pEntityLastXModel[ cs->clientNum ] = NULL;
+			CG_SafeDObjFree( cs->clientNum );
 		}
 	}
 
@@ -266,11 +213,14 @@ static void CG_TransitionSnapshot( void ) {
 		CG_TransitionEntity( cent );
 	}
 
+	ops = &oldFrame->ps;
+	ps = &cg.snap->ps;
+
 	// if we are not doing client side movement prediction for any
 	// reason, then the client events and view changes will be issued now
 	if ( cg.demoPlayback || ( cg.snap->ps.pm_flags & PMF_FOLLOW )
 		 || cg_nopredict.integer || g_synchronousClients.integer ) {
-		CG_TransitionPlayerState( &cg.snap->ps, &oldFrame->ps );
+		CG_TransitionPlayerState( ps, ops );
 	}
 }
 
@@ -287,42 +237,38 @@ static void CG_SetNextSnap( snapshot_t *snap ) {
 	entityState_t       *es;
 	centity_t           *cent;
 	clientInfo_t        *ci;
-	const cgClientState_t   *cs;
+	const clientState_t     *cs;
 	const char          *s;
 
 	cg.nextSnap = snap;
 
-	trap_syscall_0x94();
+	trap_DObjInvalidateSkels();
 	CG_SetFrameInterpolation();
 
 	// execute any server string commands before transitioning entities
 	CG_ExecuteNewServerCommands( snap->serverCommandSequence );
 
 	for ( num = 0 ; num < snap->numClients ; num++ ) {
-		cs = (const cgClientState_t *)&snap->clients[ num ];
+		cs = &snap->clients[ num ];
 		ci = &bg_clientinfo[ cs->clientNum ];
 
 		ci->infoValid = qtrue;
-		*(int *)ci->unknown_0x004 = 1;
+		ci->nextValid = qtrue;
 		ci->clientNum = cs->clientNum;
 		ci->team = cs->team;
 
 		if ( strcmp( ci->name, cs->name ) ) {
 			if ( ci->name[0] ) {
-				trap_GameMessage( va( "%s^7 %s %s", ci->name,
-									  CG_SafeTranslateString_Internal( "cgame",
-																	   "CGAME_PLAYERRENAMES" ),
-									  cs->name ),
-								  cg_gameMessageWidth.integer );
+				CG_GameMessage( va( "%s^7 %s %s", ci->name,
+									CG_SafeTranslateString( "CGAME_PLAYERRENAMES" ),
+									cs->name ) );
 			}
-			strncpy( ci->name, cs->name, sizeof( ci->name ) - 1 );
-			ci->name[ sizeof( ci->name ) - 1 ] = 0;
+			Q_strncpyz( ci->name, cs->name, sizeof( ci->name ) );
 		}
 
 		s = CG_ConfigString( CS_MODELS + cs->modelIndex );
 		if ( strcmp( ci->modelName, s ) ) {
-			strncpy( ci->modelName, s, sizeof( ci->modelName ) - 1 );
-			ci->modelName[ sizeof( ci->modelName ) - 1 ] = 0;
+			Q_strncpyz( ci->modelName, s, sizeof( ci->modelName ) );
 			ci->dobjNeedsUpdate = 1;
 		}
 
@@ -345,8 +291,8 @@ static void CG_SetNextSnap( snapshot_t *snap ) {
 
 	CG_UpdateHandViewmodels( CG_ConfigString( CS_MODELS + snap->ps.viewmodelIndex ) );
 
-	cg.unknown_0x2A798 = snap->ps.stats[3];
-	cg.unknown_0x2A79C = snap->ps.stats[4];
+	cg.identifyClientNum = snap->ps.stats[3];
+	cg.identifyClientHealth = snap->ps.stats[4];
 
 	// if changing follow mode, don't interpolate
 	if ( snap->ps.clientNum != cg.snap->ps.clientNum ) {
@@ -395,12 +341,12 @@ static void CG_SetNextSnap( snapshot_t *snap ) {
 	}
 
 	for ( num = 0 ; num < snap->numClients ; num++ ) {
-		cs = (const cgClientState_t *)&snap->clients[ num ];
+		cs = &snap->clients[ num ];
 		cent = &cg_entities[ cs->clientNum ];
 
 		if ( cent->currentValid ) {
 			es = &cent->nextState;
-			BG_UpdatePlayerDObj( trap_syscall_0xA2( es->clientNum ),
+			BG_UpdatePlayerDObj( trap_GetClientDObj( es->clientNum ),
 								 es, &bg_clientinfo[ es->clientNum ] );
 		}
 	}
@@ -472,6 +418,11 @@ CG_ProcessSnapshots
 We are trying to set up a renderable view, so determine
 what the simulated time is, and try to get snapshots
 both before and after that time if available.
+
+If we don't have a valid cg.snap after exiting this function,
+then a 3D game view cannot be rendered.  This should only happen
+right after the initial connection.  After cg.snap has been valid
+once, it will never turn invalid.
 ============
 */
 void CG_ProcessSnapshots( void ) {
@@ -500,6 +451,8 @@ void CG_ProcessSnapshots( void ) {
 			return;
 		}
 
+		// set our weapon selection to what
+		// the playerstate is currently using
 		if ( !( snap->snapFlags & SNAPFLAG_NOT_ACTIVE ) ) {
 			CG_SetInitialSnapshot( snap );
 			CG_SetNextSnap( snap );
@@ -532,7 +485,7 @@ void CG_ProcessSnapshots( void ) {
 			}
 
 			// if time went backwards, we have a level restart
-			if ( snap->serverTime < cg.snap->serverTime ) {
+			if ( snap->serverTime - cg.snap->serverTime < 0 ) {
 				CG_Error( "CG_ProcessSnapshots: Server time went backwards" );
 			}
 
@@ -540,7 +493,9 @@ void CG_ProcessSnapshots( void ) {
 		}
 
 		// if our time is < nextFrame's, we have a nice interpolating state
-		if ( cg.time >= cg.snap->serverTime && cg.time < cg.nextSnap->serverTime ) {
+		// (keep: wrap-safe differences, matches original codegen)
+
+		if ( cg.time - cg.snap->serverTime >= 0 && cg.time - cg.nextSnap->serverTime < 0 ) {
 			break;
 		}
 
@@ -548,7 +503,7 @@ void CG_ProcessSnapshots( void ) {
 		CG_TransitionSnapshot();
 	} while ( 1 );
 
-	if ( cg.time < cg.snap->serverTime ) {
+	if ( cg.time - cg.snap->serverTime < 0 ) {
 		// this can happen right after a vid_restart
 		cg.time = cg.snap->serverTime;
 		bgs_time = cg.time;

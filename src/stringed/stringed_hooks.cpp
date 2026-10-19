@@ -9,9 +9,17 @@
  * @fidelity: verified
  */
 
+#ifdef __cplusplus
+/* retail built this unit as C++ with exceptions (/TP /GX); every name keeps C linkage */
+extern "C" {
+#endif
+
 #include "../qcommon/qcommon.h"
 
 #include <string.h>
+/* ---- module-owned globals ---- */
+cvar_t *cl_languagesavailable;
+
 
 extern cvar_t   *cl_language;                    /* 0x0161734C */
 extern cvar_t   *cl_languagesavailable;          /* 0x015CE830 */
@@ -21,25 +29,18 @@ extern cvar_t   *cl_languagewarningsaserrors;    /* 0x01432844 */
 
 extern cvar_t   *fs_ignoreLocalized;
 
-extern int      g_currentAsian;
+/* 0x00CA26C0; the 1.3 Mac stringed_hooks.c defines g_currentAsian here too */
+int             g_currentAsian;
 
 #define SE_GETSTRING    SE_GetString
 extern char *SE_GetString( const char *key, int wantReference );
-extern int   Clear__16CStringEdPackageFi( void *package, int bKeepFileInfo );
+typedef struct { void *package; } SePackageRef;   /* Clear keeps its receiver on the stack */
+static __inline SePackageRef SePackageRefArgument(void *package) { SePackageRef ref; ref.package=package; return ref; }
+extern int __stdcall   Clear__16CStringEdPackageFi( SePackageRef packageRef, int bKeepFileInfo );
 extern int   SE_GetNumLanguages__Fv( void );
 extern char *SE_LoadAllLanguageFiles_m( const char *languageName, int force );
 
 extern int  TheStringPackage;                   /* 0x01407450 */
-
-typedef struct seh_searchpath_s {
-	struct seh_searchpath_s *next;
-	void                    *pack;
-	void                    *dir;
-	int                      localized;
-	int                      language;
-} seh_searchpath_t;
-
-extern seh_searchpath_t *fs_searchpaths;
 
 int SEH_StringEd_SetLanguageStrings( int language );
 
@@ -48,14 +49,18 @@ int SEH_StringEd_SetLanguageStrings( int language );
 #define LANGUAGE_FIRST_ASIAN    8
 #define LANGUAGE_LAST_ASIAN     12
 
-static const char *seh_languageNames[NUM_LANGUAGES] = {
-	"english",   "french",     "german",   "italian",
-	"spanish",   "british",    "russian",  "polish",
-	"korean",    "taiwanese",  "japanese", "chinese",
-	"thai",      "leet"
-};
+/* retail 0x00571B30: {name, present} pairs */
+typedef struct {
+	const char *name;
+	int         present;
+} seh_language_t;
 
-static int seh_languagePresent[NUM_LANGUAGES];
+static seh_language_t seh_languages[NUM_LANGUAGES] = {
+	{ "english" },   { "french" },     { "german" },   { "italian" },
+	{ "spanish" },   { "british" },    { "russian" },  { "polish" },
+	{ "korean" },    { "taiwanese" },  { "japanese" }, { "chinese" },
+	{ "thai" },      { "leet" }
+};
 
 #define SEH_MARK_LOC_ON     0x14
 #define SEH_MARK_LOC_OFF    0x15
@@ -76,7 +81,8 @@ static char szSafeTranslate[MAX_LOCALIZED_LEN];
 int SEH_UpdateCurrentLanguage( void ) {
 	int language;
 
-	cl_language = Cvar_Get( "cl_language", "0", CVAR_ARCHIVE | CVAR_LATCH );
+	/* retail discards the result and reads the cl_language global */
+	Cvar_Get( "cl_language", "0", CVAR_ARCHIVE | CVAR_LATCH );
 
 	language = cl_language->integer;
 	g_currentAsian = ( language >= LANGUAGE_FIRST_ASIAN && language <= LANGUAGE_LAST_ASIAN );
@@ -91,18 +97,20 @@ int SEH_GetCurrentLanguage( void ) {
 
 /* ---- SEH_GetLanguageName  0x004A9A00 ---- */
 const char *SEH_GetLanguageName( int language ) {
-	if ( (unsigned int)language >= NUM_LANGUAGES ) {
-		return seh_languageNames[0];
+	if ( language >= 0 && language < NUM_LANGUAGES ) {
+		return seh_languages[language].name;
 	}
-	return seh_languageNames[language];
+	return seh_languages[0].name;
 }
 
 /* ---- SEH_GetLanguageIndexForName  0x004A9A20 ---- */
 qboolean SEH_GetLanguageIndexForName( const char *name, int *languageOut ) {
-	int i;
+	int         i;
+	const char  *langName;
 
 	for ( i = 0 ; i < NUM_LANGUAGES ; i++ ) {
-		if ( name && seh_languageNames[i] && !Q_stricmpn( name, seh_languageNames[i], 99999 ) ) {
+		langName = seh_languages[i].name;
+		if ( name && langName && !Q_stricmpn( name, langName, 99999 ) ) {
 			*languageOut = i;
 			return qtrue;
 		}
@@ -123,33 +131,24 @@ int SEH_InitLanguage( void ) {
 	return SEH_UpdateCurrentLanguage();
 }
 
-/* SEH_LanguageHasAssets  0x004A9B65 */
-static qboolean SEH_LanguageHasAssets( int language ) {
-	seh_searchpath_t *search;
-
-	for ( search = fs_searchpaths ; search ; search = search->next ) {
-		if ( search->localized && search->language == language ) {
-			return qtrue;
-		}
-	}
-	return qfalse;
-}
+/* universal/com_files.c 0x00428D20, inlined into SEH_UpdateLanguageInfo by LTCG */
+extern qboolean FS_LanguageHasAssets( int language );
 
 /* ---- SEH_UpdateLanguageInfo  0x004A9B10 ---- */
+/* Cvar_Set (inlined) rather than Cvar_Set2(.., qtrue): retail's ebx/edi choice for 0/1 */
 void SEH_UpdateLanguageInfo( void ) {
 	int i;
 	int numLanguages;
-	int result;
 
 	SEH_UpdateCurrentLanguage();
 
 	numLanguages = 0;
 	for ( i = 0 ; i < NUM_LANGUAGES ; i++ ) {
-		if ( SEH_LanguageHasAssets( i ) ) {
-			seh_languagePresent[i] = 1;
+		if ( FS_LanguageHasAssets( i ) ) {
+			seh_languages[i].present = 1;
 			numLanguages++;
 		} else {
-			seh_languagePresent[i] = 0;
+			seh_languages[i].present = 0;
 		}
 	}
 
@@ -157,91 +156,108 @@ void SEH_UpdateLanguageInfo( void ) {
 		Com_Printf( "^1ERROR: No languages available because no localized assets were found\n" );
 	}
 
-	Cvar_Set2( "cl_languagesavailable", va( "%i", numLanguages ), qtrue );
+	Cvar_Set( "cl_languagesavailable", va( "%i", numLanguages ) );
 
-	result = SEH_StringEd_SetLanguageStrings( cl_language->integer );
-	if ( result ) {
-		return;
-	}
-
-	for ( i = 0 ; i < NUM_LANGUAGES ; i++ ) {
-		if ( !seh_languagePresent[i] ) {
-			continue;
+	if ( !SEH_StringEd_SetLanguageStrings( cl_language->integer ) ) {
+		for ( i = 0 ; i < NUM_LANGUAGES ; i++ ) {
+			if ( seh_languages[i].present ) {
+				Cvar_Set( "cl_language", va( "%i", i ) );
+				SEH_UpdateCurrentLanguage();
+				if ( SEH_StringEd_SetLanguageStrings( i ) ) {
+					break;
+				}
+			}
 		}
 
-		Cvar_Set2( "cl_language", va( "%i", i ), qtrue );
-		SEH_UpdateCurrentLanguage();
-
-		result = SEH_StringEd_SetLanguageStrings( i );
-		if ( result ) {
-			break;
+		if ( i == NUM_LANGUAGES ) {
+			Cvar_Set( "cl_language", "0" );
+			SEH_UpdateCurrentLanguage();
 		}
-	}
-
-	if ( i == NUM_LANGUAGES ) {
-		Cvar_Set2( "cl_language", "0", qtrue );
-		SEH_UpdateCurrentLanguage();
 	}
 }
 
+/* retail 0x004A9C90 indexes {name,present}[14] at 0x571B30 with no range check.
+ * The words it reads out of range are static .data: indices -13..-1 (0x571ACC..0x571B2C)
+ * are zero. After the table come zlib's z_errmsg, static_l/d/bl_desc, inflate_mask and
+ * fixed tables: indices 14..63 are nonzero except 22, 26, 36 and 49. Further out (below -13
+ * the infoParm table, above 63 the rest of zlib's fixed tables and beyond) is not emulated
+ * and is treated as 0. */
+#ifndef COD1_VC7
+static int SEH_RetailLanguagePresentWord( int k ) {
+	if ( k >= 0 && k < NUM_LANGUAGES ) {
+		return seh_languages[k].present;
+	}
+	return ( k >= NUM_LANGUAGES && k <= 63 && k != 22 && k != 26 && k != 36 && k != 49 );
+}
+#endif
+
 /* ---- SEH_VerifyLanguageSelection  0x004A9C90 ---- */
+/* No range clamp, as in retail: an out-of-range language reads the neighbouring
+ * retail words (see SEH_RetailLanguagePresentWord), so 14..21 (and the other nonzero
+ * words up to 63) come back unchanged and the rest scan from the signed remainder. */
 int SEH_VerifyLanguageSelection( int language ) {
 	int i;
 
-	if ( (unsigned int)language >= NUM_LANGUAGES ) {
-		language = 0;
-	}
-
-	if ( seh_languagePresent[language] ) {
+#ifdef COD1_VC7
+	/* retail's own unchecked reads; the out-of-range words are whatever lies next to the table */
+	if ( seh_languages[language].present ) {
 		return language;
 	}
 
 	for ( i = 0 ; i < NUM_LANGUAGES ; i++ ) {
-		if ( seh_languagePresent[( i + language ) % NUM_LANGUAGES] ) {
+		if ( seh_languages[( i + language ) % NUM_LANGUAGES].present ) {
 			return ( i + language ) % NUM_LANGUAGES;
 		}
 	}
 
 	return 0;
+#else
+	if ( SEH_RetailLanguagePresentWord( language ) ) {
+		return language;
+	}
+
+	for ( i = 0 ; i < NUM_LANGUAGES ; i++ ) {
+		if ( SEH_RetailLanguagePresentWord( ( i + language ) % NUM_LANGUAGES ) ) {	/* signed %, same as cdq/idiv */
+			return ( i + language ) % NUM_LANGUAGES;
+		}
+	}
+
+	return 0;
+#endif
 }
 
 /* ---- SEH_StringEd_SetLanguageStrings  0x004A9D00 ---- */
 int SEH_StringEd_SetLanguageStrings( int language ) {
-	const char  *name;
 	char        *err;
-	int         warn;
 
-	Clear__16CStringEdPackageFi( (void *)&TheStringPackage, 1 );
+	Clear__16CStringEdPackageFi( SePackageRefArgument( (void *)&TheStringPackage ), 1 );
 
-	warn = ( fs_ignoreLocalized && !fs_ignoreLocalized->integer
-			 && cl_languagewarnings && cl_languagewarnings->integer );
-
+	/* retail reads the cvars with no NULL checks */
 	if ( !SE_GetNumLanguages__Fv() ) {
-		if ( warn ) {
-			name = SEH_GetLanguageName( language );
-			if ( cl_languagewarningsaserrors && cl_languagewarningsaserrors->integer ) {
+		if ( !fs_ignoreLocalized->integer && cl_languagewarnings->integer ) {
+			if ( cl_languagewarningsaserrors->integer ) {
 				Com_Error( ERR_LOCALIZATION,
-						   "No language string information available for %s", name );
+						   "No language string information available for %s", SEH_GetLanguageName( language ) );
+			} else {
+				Com_Printf( "^3WARNING: No language string information available for %s\n", SEH_GetLanguageName( language ) );
 			}
-			Com_Printf( "^3WARNING: No language string information available for %s\n", name );
 		}
 		return qfalse;
 	}
 
 	err = SE_LoadAllLanguageFiles_m( SEH_GetLanguageName( language ), 1 );
-	if ( !err ) {
-		return qtrue;
-	}
-
-	if ( warn ) {
-		name = SEH_GetLanguageName( language );
-		if ( cl_languagewarningsaserrors && cl_languagewarningsaserrors->integer ) {
-			Com_Error( ERR_LOCALIZATION,
-					   "Could not load localization strings for %s: %s", name, err );
+	if ( err ) {
+		if ( !fs_ignoreLocalized->integer && cl_languagewarnings->integer ) {
+			if ( cl_languagewarningsaserrors->integer ) {
+				Com_Error( ERR_LOCALIZATION,
+						   "Could not load localization strings for %s: %s", SEH_GetLanguageName( language ), err );
+			} else {
+				Com_Printf( "^3WARNING: Could not load localization strings for %s: %s\n", SEH_GetLanguageName( language ), err );
+			}
 		}
-		Com_Printf( "^3WARNING: Could not load localization strings for %s: %s\n", name, err );
+		return qfalse;
 	}
-	return qfalse;
+	return qtrue;
 }
 
 /* ---- SEH_StringEd_GetString  0x004A9E20 ---- */
@@ -256,32 +272,33 @@ char *SEH_StringEd_GetString( const char *key ) {
 char *SEH_SafeTranslateString( const char *key ) {
 	char *translated;
 
-	translated = (char *)key;
-	if ( cl_languagetranslate && cl_languagetranslate->integer && key[0] && key[1] ) {
-		translated = SE_GETSTRING( key, 0 );
-	}
+	translated = SEH_StringEd_GetString( key );
 
 	if ( translated ) {
 		return translated;
 	}
 
-	if ( cl_languagewarnings && cl_languagewarnings->integer ) {
-		if ( cl_languagewarningsaserrors && cl_languagewarningsaserrors->integer ) {
+	/* retail 0x004A9E87: no NULL checks on the warning cvars, Com_Error/Com_Printf
+	 * is an if/else, and the result is built with unbounded strcpy/strcat. */
+	if ( cl_languagewarnings->integer ) {
+		if ( cl_languagewarningsaserrors->integer ) {
 			Com_Error( ERR_LOCALIZATION, "Could not translate exe string \"%s\"", key );
+		} else {
+			Com_Printf( "^3WARNING: Could not translate exe string \"%s\"\n", key );
 		}
-		Com_Printf( "^3WARNING: Could not translate exe string \"%s\"\n", key );
-		Com_sprintf( szSafeTranslate, sizeof( szSafeTranslate ),
-					 "^1UNLOCALIZED(^7%s^1)^7", key );
+		strcpy( szSafeTranslate, "^1UNLOCALIZED(^7" );
+		strcat( szSafeTranslate, key );
+		strcat( szSafeTranslate, "^1)^7" );
 	} else {
-		Q_strncpyz( szSafeTranslate, key, sizeof( szSafeTranslate ) );
+		strcpy( szSafeTranslate, key );
 	}
 
 	return szSafeTranslate;
 }
 
 /* ---- SEH_GetLocalizedTokenReference  0x004A9F80 ---- */
-static qboolean SEH_GetLocalizedTokenReference( int flag, const char *type,
-												const char *token, char *out ) {
+static qboolean SEH_GetLocalizedTokenReference( char *out, const char *token,
+												const char *type, int flag ) {
 	char *translated;
 
 	if ( cl_languagetranslate && cl_languagetranslate->integer && token[0] && token[1] ) {
@@ -296,8 +313,9 @@ static qboolean SEH_GetLocalizedTokenReference( int flag, const char *type,
 				 && flag != LOCMSG_NOERR ) {
 				Com_Error( ERR_LOCALIZATION,
 						   "Could not translate part of %s: \"%s\"", type, token );
+			} else {
+				Com_Printf( "^3WARNING: Could not translate part of %s: \"%s\"\n", type, token );
 			}
-			Com_Printf( "^3WARNING: Could not translate part of %s: \"%s\"\n", type, token );
 			translated = va( "^1UNLOCALIZED(^7%s^1)^7", token );
 		} else {
 			translated = va( "%s", token );
@@ -308,9 +326,13 @@ static qboolean SEH_GetLocalizedTokenReference( int flag, const char *type,
 		}
 	}
 
+#ifdef COD1_VC7
+	strcpy( out, translated );	/* retail copies even when translated == out */
+#else
 	if ( translated != out ) {
 		strcpy( out, translated );
 	}
+#endif
 	return qtrue;
 }
 
@@ -332,66 +354,61 @@ char *SEH_LocalizeTextMessage( const char *text, const char *type, int flag ) {
 	int         i;
 
 	iCurrString = ( iCurrString + 1 ) % 2;
+	memset( szStrings[iCurrString], 0, sizeof( szStrings[0] ) );
 	out = szStrings[iCurrString];
-	memset( out, 0, MAX_LOCALIZED_LEN );
 
-	szInsertBuf[0] = '\0';
+#ifndef COD1_VC7
+	szInsertBuf[0] = '\0';	/* retail leaves it uninitialised (read only if no "%s" is found in out) */
+#endif
 
-	in             = text;
-	tokStart       = text;
 	outLen         = 0;
-	tokLen         = 0;
-	insertLevel    = 0;
-	tokenHasInsert = 0;
 	locOn          = 1;
 	insertEnabled  = 1;
+	insertLevel    = 0;
+	tokenHasInsert = 0;
 	locSkipped     = 0;
+	tokStart       = text;
+	in             = text;
 
 	while ( *tokStart ) {
-		while ( *in && *in != SEH_MARK_LOC_ON && *in != SEH_MARK_LOC_OFF
-				&& *in != SEH_MARK_NO_INSERT ) {
+		if ( *in && *in != SEH_MARK_LOC_ON && *in != SEH_MARK_LOC_OFF
+			 && *in != SEH_MARK_NO_INSERT ) {
 			in++;
-		}
+		} else {
+			if ( in > tokStart ) {
+				tokLen = in - tokStart;
+				/* inlined in retail (0x004AA0F4 strncpy + terminator, no bound check) */
+				Q_strncpyz( szTokenBuf, tokStart, tokLen + 1 );
 
-		if ( in > tokStart ) {
-			tokLen = in - tokStart;
-			strncpy( szTokenBuf, tokStart, tokLen );
-			szTokenBuf[tokLen] = '\0';
-
-			if ( locOn ) {
-				if ( !SEH_GetLocalizedTokenReference( flag, type, szTokenBuf, szTokenBuf ) ) {
-					return NULL;
+				if ( locOn ) {
+					if ( !SEH_GetLocalizedTokenReference( szTokenBuf, szTokenBuf, type, flag ) ) {
+						return NULL;
+					}
+					tokLen = strlen( szTokenBuf );
 				}
-				tokLen = strlen( szTokenBuf );
-			}
 
-			if ( tokLen + outLen >= MAX_LOCALIZED_LEN ) {
-				if ( cl_languagewarnings && cl_languagewarnings->integer
-					 && cl_languagewarningsaserrors && cl_languagewarningsaserrors->integer
-					 && flag != LOCMSG_NOERR ) {
-					Com_Error( ERR_DROP, "%s too long when translated: \"%s\"", type, text );
+				if ( tokLen + outLen >= sizeof( szTokenBuf ) ) {
+					if ( cl_languagewarnings && cl_languagewarnings->integer
+						 && cl_languagewarningsaserrors && cl_languagewarningsaserrors->integer
+						 && flag != LOCMSG_NOERR ) {
+						Com_Error( ERR_DROP, "%s too long when translated: \"%s\"", type, text );
+					}
+					Com_Printf( "%s too long when translated: \"%s\"\n", type, text );
 				}
-				Com_Printf( "%s too long when translated: \"%s\"\n", type, text );
-			}
 
-			for ( i = 0 ; i < tokLen - 1 ; i++ ) {
-				if ( szTokenBuf[i] != '%' || szTokenBuf[i + 1] != 's' ) {
-					continue;
+				for ( i = 0 ; i < tokLen - 1 ; i++ ) {
+					if ( szTokenBuf[i] == '%' && szTokenBuf[i + 1] == 's' ) {
+						if ( insertEnabled && !tokenHasInsert ) {
+							insertLevel++;
+							tokenHasInsert = 1;
+						} else {
+							szTokenBuf[i] = SEH_MARK_NO_INSERT;
+							locSkipped = 1;
+						}
+					}
 				}
-				if ( insertEnabled && !tokenHasInsert ) {
-					insertLevel++;
-					tokenHasInsert = 1;
-				} else {
-					szTokenBuf[i] = SEH_MARK_NO_INSERT;
-					locSkipped = 1;
-				}
-			}
 
-			if ( insertLevel == tokenHasInsert ) {
-				strcpy( &out[outLen], szTokenBuf );
-			} else {
-				at = 0;
-				if ( outLen - 1 > 0 ) {
+				if ( insertLevel - tokenHasInsert ) {
 					for ( at = 0 ; at < outLen - 1 ; at++ ) {
 						if ( out[at] == '%' && out[at + 1] == 's' ) {
 							strcpy( szInsertBuf, &out[at + 2] );
@@ -399,31 +416,33 @@ char *SEH_LocalizeTextMessage( const char *text, const char *type, int flag ) {
 							break;
 						}
 					}
+					strcpy( &out[at], szTokenBuf );
+					strcpy( &out[at + tokLen], szInsertBuf );
+					outLen -= 2;
+					insertLevel--;
+				} else {
+					strcpy( &out[outLen], szTokenBuf );
 				}
-				strcpy( &out[at], szTokenBuf );
-				strcpy( &out[at + tokLen], szInsertBuf );
-				outLen -= 2;
-				insertLevel--;
+
+				tokenHasInsert = 0;
+				outLen += tokLen;
 			}
 
-			outLen += tokLen;
-			tokenHasInsert = 0;
-		}
+			insertEnabled = 1;
+			if ( *in == SEH_MARK_LOC_ON ) {
+				locOn = 1;
+				in++;
+			} else if ( *in == SEH_MARK_LOC_OFF ) {
+				locOn = 0;
+				in++;
+			}
+			if ( *in == SEH_MARK_NO_INSERT ) {
+				insertEnabled = 0;
+				in++;
+			}
 
-		insertEnabled = 1;
-		if ( *in == SEH_MARK_LOC_ON ) {
-			locOn = 1;
-			in++;
-		} else if ( *in == SEH_MARK_LOC_OFF ) {
-			locOn = 0;
-			in++;
+			tokStart = in;
 		}
-		if ( *in == SEH_MARK_NO_INSERT ) {
-			in++;
-			insertEnabled = 0;
-		}
-
-		tokStart = in;
 	}
 
 	if ( locSkipped ) {
@@ -436,3 +455,7 @@ char *SEH_LocalizeTextMessage( const char *text, const char *type, int flag ) {
 
 	return out;
 }
+
+#ifdef __cplusplus
+}
+#endif

@@ -6,7 +6,9 @@
 #include <windows.h>
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/cod1_globals.h"
+#include "../renderer/tr_public.h"
+#include "../renderer/tr_local.h"   /* renderer cvars, glState, backEndStorage (RTCW includes it here too) */
+#include "win_wgl.h"
 
 #define RCVAR( n )  ( (cvar_t *)( n ) )
 
@@ -20,39 +22,35 @@ unsigned short s_oldHardwareGamma[GAMMA_CHANNELS][GAMMA_ENTRIES];
 /* ---- WG_CheckHardwareGamma  0x00515C30 ----  VERIFIED */
 void WG_CheckHardwareGamma( void ) {
 	HDC		hDC;
-	int		i;
 
 	glConfig_deviceSupportsGamma = qfalse;
 
-	if ( RCVAR( r_ignorehwgamma )->integer ) {
-		return;
-	}
+	if ( !RCVAR( r_ignorehwgamma )->integer ) {
+		hDC = GetDC( GetDesktopWindow() );
+		glConfig_deviceSupportsGamma = GetDeviceGammaRamp( hDC, s_oldHardwareGamma );
+		ReleaseDC( GetDesktopWindow(), hDC );
 
-	hDC = GetDC( GetDesktopWindow() );
-	glConfig_deviceSupportsGamma =
-		GetDeviceGammaRamp( hDC, s_oldHardwareGamma );
-	ReleaseDC( GetDesktopWindow(), hDC );
+		if ( glConfig_deviceSupportsGamma ) {
+			if ( ( HIBYTE( s_oldHardwareGamma[0][255] ) <= HIBYTE( s_oldHardwareGamma[0][0] ) ) ||
+				 ( HIBYTE( s_oldHardwareGamma[1][255] ) <= HIBYTE( s_oldHardwareGamma[1][0] ) ) ||
+				 ( HIBYTE( s_oldHardwareGamma[2][255] ) <= HIBYTE( s_oldHardwareGamma[2][0] ) ) ) {
+				glConfig_deviceSupportsGamma = qfalse;
+				ri.Printf( GAMMA_PRINT_WARNING,
+					"WARNING: device has broken gamma support, generated gamma.dat\n" );
+			}
 
-	if ( !glConfig_deviceSupportsGamma ) {
-		return;
-	}
+			if ( HIBYTE( s_oldHardwareGamma[0][181] ) == 255 ) {
+				int g;
 
-	if ( ( s_oldHardwareGamma[0][255] >> 8 ) <= ( s_oldHardwareGamma[0][0] >> 8 ) ||
-		 ( s_oldHardwareGamma[1][255] >> 8 ) <= ( s_oldHardwareGamma[1][0] >> 8 ) ||
-		 ( s_oldHardwareGamma[2][255] >> 8 ) <= ( s_oldHardwareGamma[2][0] >> 8 ) ) {
-		glConfig_deviceSupportsGamma = qfalse;
-		ri_Printf( GAMMA_PRINT_WARNING,
-			"WARNING: device has broken gamma support, generated gamma.dat\n" );
-	}
-
-	if ( ( s_oldHardwareGamma[0][181] >> 8 ) == 255 ) {
-		ri_Printf( GAMMA_PRINT_WARNING,
-			"WARNING: suspicious gamma tables, using linear ramp for restoration\n" );
-		/* Stops at 254: retail's `cmp eax, 0FFh / jl` leaves entry 255 alone. */
-		for ( i = 0; i < 255; i++ ) {
-			s_oldHardwareGamma[0][i] = (unsigned short)( i << 8 );
-			s_oldHardwareGamma[1][i] = (unsigned short)( i << 8 );
-			s_oldHardwareGamma[2][i] = (unsigned short)( i << 8 );
+				ri.Printf( GAMMA_PRINT_WARNING,
+					"WARNING: suspicious gamma tables, using linear ramp for restoration\n" );
+				/* Stops at 254: retail's `cmp eax, 0FFh / jl` leaves entry 255 alone. */
+				for ( g = 0; g < 255; g++ ) {
+					s_oldHardwareGamma[0][g] = (unsigned short)( g << 8 );
+					s_oldHardwareGamma[1][g] = (unsigned short)( g << 8 );
+					s_oldHardwareGamma[2][g] = (unsigned short)( g << 8 );
+				}
+			}
 		}
 	}
 }
@@ -71,7 +69,7 @@ void WG_RestoreGamma( void ) {
 }
 
 /* 0x019BFFE4. Retail calls it `hdc`; win_glimp.c owns the storage under the RTCW spelling. */
-extern HDC glw_hDC;
+
 
 /* ---- GLimp_SetGamma  0x00515D20 ----  VERIFIED */
 void GLimp_SetGamma( unsigned char *red, unsigned char *green, unsigned char *blue ) {
@@ -81,7 +79,7 @@ void GLimp_SetGamma( unsigned char *red, unsigned char *green, unsigned char *bl
 
 	if ( !glConfig_deviceSupportsGamma
 		|| RCVAR( r_ignorehwgamma )->integer
-		|| !glw_hDC ) {
+		|| !glw_state.hDC ) {
 		return;
 	}
 
@@ -118,7 +116,7 @@ void GLimp_SetGamma( unsigned char *red, unsigned char *green, unsigned char *bl
 		}
 	}
 
-	if ( !SetDeviceGammaRamp( glw_hDC, table ) ) {
+	if ( !SetDeviceGammaRamp( glw_state.hDC, table ) ) {
 		Com_Printf( "SetDeviceGammaRamp failed.\n" );
 	}
 }

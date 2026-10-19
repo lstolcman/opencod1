@@ -4,7 +4,7 @@
 #ifndef TR_RECORDS_H
 #define TR_RECORDS_H
 
-#define BACKEND   ((char *)(void *)unk_16D89C0)      /* 0x016D89C0, backEnd_t,   6,732 */
+#define BACKEND   ((char *)(void *)backEndStorage)      /* 0x016D89C0, backEnd_t,   6,732 */
 #define TRG       ((char *)(void *)&tr_registered)   /* 0x016C4D40, trGlobals_t, 80,852 */
 
 #define backEnd_viewParms_viewportX        (*(int *)(BACKEND + 0x02B0))
@@ -78,8 +78,6 @@ typedef struct {
 #define tr_viewParms_axis22                (*(int *)(TRG + 0x063C))
 #define tr_viewParms_world                  (*(unsigned char (*)[124])(TRG + 0x068C))
 #define tr_viewParms_world_modelMatrix                  (*(float (*)[16])(TRG + 0x06C8))
-#define unk_16C5410                  (*(unsigned char (*)[416])(TRG + 0x06D0))
-#define flt_16C5450                  (*(float *)(TRG + 0x0710))
 #define tr_viewParms_isPortal                (*(int *)(TRG + 0x0714))
 #define tr_viewParms_isMirror                (*(int *)(TRG + 0x0718))
 #define tr_viewParms_frameSceneNum                (*(int *)(TRG + 0x071C))
@@ -90,36 +88,9 @@ typedef struct {
 #define tr_viewParms_lodBias                  (*(float *)(TRG + 0x0750))
 #define tr_viewParms_lodScale                  (*(float *)(TRG + 0x0754))
 #define tr_viewParms_projectionMatrix                  (*(float (*)[16])(TRG + 0x0758))
-#define dword_16C549C                (*(int *)(TRG + 0x075C))
-#define dword_16C54A0                (*(int *)(TRG + 0x0760))
-#define dword_16C54A4                (*(int *)(TRG + 0x0764))
-#define dword_16C54A8                (*(int *)(TRG + 0x0768))
-#define flt_16C54AC                  (*(float *)(TRG + 0x076C))
-#define dword_16C54B0                (*(int *)(TRG + 0x0770))
-#define dword_16C54B4                (*(int *)(TRG + 0x0774))
-#define flt_16C54B8                  (*(float *)(TRG + 0x0778))
-#define flt_16C54BC                  (*(float *)(TRG + 0x077C))
-#define dword_16C54C0                (*(int *)(TRG + 0x0780))
-#define dword_16C54C4                (*(int *)(TRG + 0x0784))
-#define dword_16C54C8                (*(int *)(TRG + 0x0788))
-#define dword_16C54CC                (*(int *)(TRG + 0x078C))
-#define flt_16C54D0                  (*(float *)(TRG + 0x0790))
-#define dword_16C54D4                (*(int *)(TRG + 0x0794))
 #define tr_viewParms_depthHackProjectionMatrix                  (*(float (*)[16])(TRG + 0x0798))
-#define flt_16C5510                  (*(float *)(TRG + 0x07D0))
 #define tr_viewParms_frustum                (*(int (*)[38])(TRG + 0x07D8))
 #define tr_viewParms_frustum0NormalY                (*(int (*)[37])(TRG + 0x07DC))
-#define dword_16C5520                (*(int (*)[36])(TRG + 0x07E0))
-#define dword_16C5524                (*(int (*)[35])(TRG + 0x07E4))
-#define dword_16C552C                (*(int *)(TRG + 0x07EC))
-#define dword_16C5530                (*(int *)(TRG + 0x07F0))
-#define dword_16C5534                (*(int *)(TRG + 0x07F4))
-#define dword_16C5540                (*(int *)(TRG + 0x0800))
-#define dword_16C5544                (*(int *)(TRG + 0x0804))
-#define dword_16C5548                (*(int *)(TRG + 0x0808))
-#define dword_16C5554                (*(int *)(TRG + 0x0814))
-#define dword_16C5558                (*(int *)(TRG + 0x0818))
-#define dword_16C555C                (*(int *)(TRG + 0x081C))
 #define tr_viewParms_zFar                  (*(float *)(TRG + 0x0828))
 #define tr_viewParms_dirty                  (*(float *)(TRG + 0x082C))
 #define tr_viewParms_glFog                (*(int (*)[16])(TRG + 0x0830))
@@ -178,112 +149,47 @@ typedef struct {
 
 #define FOGBASE   ((char *)(void *)&tr_fogTable)
 
-#define dword_16C4C40   (*(int *)(FOGBASE + 320))   /* fog[5], base+0x140 */
-#define dword_16C4C80   (*(int *)(FOGBASE + 384))   /* fog[6], base+0x180 */
-#define dword_16C4CC0   (*(int *)(FOGBASE + 448))   /* fog[7], base+0x1C0 */
+#define tr_fogCurrent_mode   (*(int *)(FOGBASE + 320))   /* fog[5], base+0x140 */
 
-#undef  dword_16C4B04
-#define dword_16C4B04    ((int *)(FOGBASE + 0x004))
-#undef  dword_16C4B10
-#define dword_16C4B10    (*(int *)(FOGBASE + 0x010))
-#undef  dword_16C4B14
-#define dword_16C4B14    (*(int *)(FOGBASE + 0x014))
-#undef  dword_16C4B18
-#define dword_16C4B18    (*(int *)(FOGBASE + 0x018))
-#undef  dword_16C4B1C
-#define dword_16C4B1C    (*(int *)(FOGBASE + 0x01C))
-#undef  dword_16C4B2C
-#define dword_16C4B2C    ((int *)(FOGBASE + 0x02C))
-#undef  dword_16C4B30
-#define dword_16C4B30    ((int *)(FOGBASE + 0x030))
-#undef  dword_16C4B34
-#define dword_16C4B34    (*(int *)(FOGBASE + 0x034))
-#undef  dword_16C4B38
-#define dword_16C4B38    (*(int *)(FOGBASE + 0x038))
-#undef  unk_16C4B40
-#define unk_16C4B40      (*(unsigned char *)(FOGBASE + 0x040))
-#undef  dword_16C4B70
-#define dword_16C4B70    (*(int *)(FOGBASE + 0x070))
-#undef  unk_16C4B80
-#define unk_16C4B80      (*(unsigned char *)(FOGBASE + 0x080))
-#undef  dword_16C4BB0
-#define dword_16C4BB0    (*(int *)(FOGBASE + 0x0B0))
-#undef  dword_16C4BB8
-#define dword_16C4BB8    (*(int *)(FOGBASE + 0x0B8))
-#undef  unk_16C4BC0
-#define unk_16C4BC0      (*(unsigned char *)(FOGBASE + 0x0C0))
-#undef  dword_16C4BF0
-#define dword_16C4BF0    (*(int *)(FOGBASE + 0x0F0))
-#undef  dword_16C4C30
-#define dword_16C4C30    (*(int *)(FOGBASE + 0x130))
-#undef  dword_16C4C40
-#define dword_16C4C40    (*(int *)(FOGBASE + 0x140))
-#undef  flt_16C4C50
-#define flt_16C4C50      (*(float *)(FOGBASE + 0x150))
-#undef  flt_16C4C54
-#define flt_16C4C54      (*(float *)(FOGBASE + 0x154))
-#undef  flt_16C4C58
-#define flt_16C4C58      (*(float *)(FOGBASE + 0x158))
-#undef  flt_16C4C5C
-#define flt_16C4C5C      (*(float *)(FOGBASE + 0x15C))
-#undef  flt_16C4C60
-#define flt_16C4C60      (*(float *)(FOGBASE + 0x160))
-#undef  flt_16C4C64
-#define flt_16C4C64      (*(float *)(FOGBASE + 0x164))
-#undef  flt_16C4C6C
-#define flt_16C4C6C      (*(float *)(FOGBASE + 0x16C))
-#undef  dword_16C4C70
-#define dword_16C4C70    (*(int *)(FOGBASE + 0x170))
-#undef  dword_16C4C74
-#define dword_16C4C74    (*(int *)(FOGBASE + 0x174))
-#undef  dword_16C4C78
-#define dword_16C4C78    (*(int *)(FOGBASE + 0x178))
-#undef  dword_16C4C7C
-#define dword_16C4C7C    (*(int *)(FOGBASE + 0x17C))
-#undef  dword_16C4C80
-#define dword_16C4C80    (*(int *)(FOGBASE + 0x180))
-#undef  flt_16C4C90
-#define flt_16C4C90      (*(float *)(FOGBASE + 0x190))
-#undef  flt_16C4C94
-#define flt_16C4C94      (*(float *)(FOGBASE + 0x194))
-#undef  flt_16C4C98
-#define flt_16C4C98      (*(float *)(FOGBASE + 0x198))
-#undef  flt_16C4CA0
-#define flt_16C4CA0      (*(float *)(FOGBASE + 0x1A0))
-#undef  flt_16C4CA4
-#define flt_16C4CA4      (*(float *)(FOGBASE + 0x1A4))
-#undef  flt_16C4CAC
-#define flt_16C4CAC      (*(float *)(FOGBASE + 0x1AC))
-#undef  dword_16C4CB8
-#define dword_16C4CB8    (*(int *)(FOGBASE + 0x1B8))
-#undef  dword_16C4CC0
-#define dword_16C4CC0    (*(int *)(FOGBASE + 0x1C0))
-#undef  dword_16C4CC8
-#define dword_16C4CC8    (*(int *)(FOGBASE + 0x1C8))
-#undef  dword_16C4CCC
-#define dword_16C4CCC    (*(int *)(FOGBASE + 0x1CC))
-#undef  flt_16C4CD0
-#define flt_16C4CD0      (*(float *)(FOGBASE + 0x1D0))
-#undef  flt_16C4CD4
-#define flt_16C4CD4      (*(float *)(FOGBASE + 0x1D4))
-#undef  flt_16C4CD8
-#define flt_16C4CD8      (*(float *)(FOGBASE + 0x1D8))
-#undef  flt_16C4CE0
-#define flt_16C4CE0      (*(float *)(FOGBASE + 0x1E0))
-#undef  flt_16C4CE4
-#define flt_16C4CE4      (*(float *)(FOGBASE + 0x1E4))
-#undef  flt_16C4CEC
-#define flt_16C4CEC      (*(float *)(FOGBASE + 0x1EC))
-#undef  dword_16C4CF0
-#define dword_16C4CF0    (*(int *)(FOGBASE + 0x1F0))
-#undef  dword_16C4CF8
-#define dword_16C4CF8    (*(int *)(FOGBASE + 0x1F8))
-#undef  dword_16C4CFC
-#define dword_16C4CFC    (*(int *)(FOGBASE + 0x1FC))
+#undef  tr_fogSky
+#define tr_fogSky      (*(unsigned char *)(FOGBASE + 0x040))
+#undef  tr_fogSky_registered
+#define tr_fogSky_registered    (*(int *)(FOGBASE + 0x070))
+#undef  tr_fogPortalView
+#define tr_fogPortalView      (*(unsigned char *)(FOGBASE + 0x080))
+#undef  tr_fogPortalView_registered
+#define tr_fogPortalView_registered    (*(int *)(FOGBASE + 0x0B0))
+#undef  tr_fogPortalView_clearScreen
+#define tr_fogPortalView_clearScreen    (*(int *)(FOGBASE + 0x0B8))
+#undef  tr_fogReset_registered
+#define tr_fogReset_registered    (*(int *)(FOGBASE + 0x0F0))
+#undef  tr_fogMap_registered
+#define tr_fogMap_registered    (*(int *)(FOGBASE + 0x130))
+#undef  tr_fogCurrent_mode
+#define tr_fogCurrent_mode    (*(int *)(FOGBASE + 0x140))
+#undef  tr_fogCurrent_colorR
+#define tr_fogCurrent_colorR      (*(float *)(FOGBASE + 0x150))
+#undef  tr_fogCurrent_colorG
+#define tr_fogCurrent_colorG      (*(float *)(FOGBASE + 0x154))
+#undef  tr_fogCurrent_colorB
+#define tr_fogCurrent_colorB      (*(float *)(FOGBASE + 0x158))
+#undef  tr_fogCurrent_colorA
+#define tr_fogCurrent_colorA      (*(float *)(FOGBASE + 0x15C))
+#undef  tr_fogCurrent_end
+#define tr_fogCurrent_end      (*(float *)(FOGBASE + 0x164))
+#undef  tr_fogCurrent_registered
+#define tr_fogCurrent_registered    (*(int *)(FOGBASE + 0x170))
+#undef  tr_fogCurrent_drawSky
+#define tr_fogCurrent_drawSky    (*(int *)(FOGBASE + 0x174))
+#undef  tr_fogCurrent_clearScreen
+#define tr_fogCurrent_clearScreen    (*(int *)(FOGBASE + 0x178))
+#undef  tr_fogTarget_registered
+#define tr_fogTarget_registered    (*(int *)(FOGBASE + 0x1F0))
 
 
 #define SUNBASE   ((char *)(void *)&rendererSunState)
 
+#define rendererSunState_spriteShader          (*(int *)(SUNBASE +   0))
 #define rendererSunState_spriteVert0X            (*(float *)(SUNBASE +   4))
 #define rendererSunState_spriteVert0Y            (*(float *)(SUNBASE +   8))
 #define rendererSunState_spriteVert0Z            (*(float *)(SUNBASE +  12))
@@ -325,9 +231,9 @@ typedef struct {
 
 #define WLDBASE   ((char *)(void *)&s_worldData)
 
-#define byte_11A3127           (*(unsigned char *)(WLDBASE +  63))
+#define s_worldData_nameTerminator           (*(unsigned char *)(WLDBASE +  63))
 #define s_worldData_baseName           (*(char *)(WLDBASE +  64))
-#define byte_11A3167           (*(unsigned char *)(WLDBASE + 127))
+#define s_worldData_baseNameTerminator           (*(unsigned char *)(WLDBASE + 127))
 #define s_worldData_dataSize          (*(int *)(WLDBASE + 128))
 #define s_worldData_numShaders          (*(int *)(WLDBASE + 132))
 #define s_worldData_shaders          (*(int *)(WLDBASE + 136))
@@ -379,6 +285,16 @@ typedef struct {
 #define s_worldData_cullGroupIndexes          (*(int *)(WLDBASE + 336))
 
 #define tr_sunName     (*(unsigned char *)(TRG + 0x00E0))
-#define byte_16C4E5F   (*(unsigned char *)(TRG + 0x011F))
+#define tr_sunName_63   (*(unsigned char *)(TRG + 0x011F))
+
+/* Registration state R_RegisterStaticModel, R_RegisterModel and the image loader share:
+ * fields of tr in retail, so their stores keep retail's order against each other. */
+#define tr_ignorePrecacheErrorCount     (*(int *)(TRG + 0x0120))   /* 0x016C4E60 */
+#define tr_modelsFinishedLoading        (*(int *)(TRG + 0x0124))   /* 0x016C4E64 */
+#define tr_delayedImageGroup            (*(int *)(TRG + 0x0128))   /* 0x016C4E68 */
+#define tr_delayedImageGroupTriCount    (*(int *)(TRG + 0x012C))   /* 0x016C4E6C */
+#define tr_delayedImageGroupSequence    (*(int *)(TRG + 0x0134))   /* 0x016C4E74 */
+#define tr_registeredStaticModels       (*(int (*)[2048])(TRG + 0x2AF8))   /* 0x016C7838; R_RegisterStaticModel caps at 2048 */
+#define tr_registeredStaticModelCount   (*(int *)(TRG + 0x4AF8))   /* 0x016C9838 */
 
 #endif

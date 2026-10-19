@@ -8,6 +8,39 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+serverStatic_t svs;             /* 0x016B2AA0, persistent server info */
+server_t sv;                    /* 0x016515A0, local server */
+
+cvar_t   *sv_gametype;          /* 0x016BDB78 */
+cvar_t   *sv_mapname;           /* 0x016BDB7C */
+cvar_t   *sv_hostname;          /* 0x016BDB5C */
+cvar_t   *sv_maxclients;        /* 0x016BDB58 */
+cvar_t   *sv_maxRate;           /* 0x016BDB80 */
+cvar_t   *sv_allowAnonymous;    /* 0x016BDB64 */
+cvar_t   *sv_serverid;          /* 0x016BDBAC */
+cvar_t   *sv_pure;              /* 0x016B2A8C */
+cvar_t   *sv_fps;               /* 0x016BDBA8 */
+cvar_t   *sv_timeout;           /* 0x016BDBA0 */
+cvar_t   *sv_killserver;        /* 0x016BDB74 */
+cvar_t   *sv_privateClients;    /* 0x016BDB54 */
+cvar_t   *sv_minPing;           /* 0x016BDB8C */
+cvar_t   *sv_maxPing;           /* 0x01651584 */
+cvar_t   *sv_floodProtect;      /* 0x016BDB6C */
+cvar_t   *sv_showCommands;      /* 0x016BDB84 */
+cvar_t   *sv_rconPassword;      /* 0x016B2A90 */
+cvar_t   *sv_privatePassword;   /* 0x016BDB94 */
+cvar_t   *sv_zombietime;        /* 0x016BDB90 */
+cvar_t   *sv_allowDownload;     /* 0x016BDB70 */
+cvar_t   *sv_reconnectlimit;    /* 0x016BDB68 */
+cvar_t   *sv_showloss;          /* 0x016BDB60 */
+cvar_t   *sv_padPackets;        /* 0x016BDBA4 */
+cvar_t   *sv_onlyVisibleClients; /* 0x016BDB98 */
+cvar_t   *sv_showAverageBPS;    /* 0x016BDB9C */
+cvar_t   *sv_mapRotation;       /* 0x016BDBB0 */
+cvar_t   *sv_mapRotationCurrent; /* 0x016BDB88 */
+
+int      sv_rconLastTime;       /* 0x014073D4, SVC_RemoteCommand throttle */
+
 /* The rcon output sink is 0x3FF0 bytes on SVC_RemoteCommand's stack (0x0045A711 `mov dword_8AAB58, 3FF0h`), i.e. MAX_MSGLEN - 16. */
 #define SV_OUTPUTBUF_LENGTH     ( MAX_MSGLEN - 16 )
 
@@ -207,13 +240,12 @@ void SVC_RemoteCommand( netadr_t from, msg_t *msg ) {
 		for ( i = 2 ; i < Cmd_Argc() ; i++ ) {
 			len = Com_AddToString( Cmd_Argv( i ), remaining, len,
 								   sizeof( remaining ), 1 );
-			if ( len >= (int)sizeof( remaining ) ) {
-				break;
-			}
-			remaining[len++] = ' ';
+			len = Com_AddToString( " ", remaining, len,
+								   sizeof( remaining ), 0 );
 		}
 		if ( len < (int)sizeof( remaining ) ) {
-			remaining[len] = 0;
+			/* retail 0x0045A7CD stores with no bound check; a pointer store keeps modern /GS from adding a range-check fast-fail */
+			*( remaining + len ) = 0;
 			Cmd_ExecuteString( remaining );
 		}
 	}
@@ -230,10 +262,10 @@ unsigned short SV_AllocClientScriptPers( void ) {
 }
 
 /* ---- SV_FreeClientScriptId  0x0045AE20 ---- */
+/* No zero test: retail 0x0045AE20 and every inlined copy (SV_DropClient
+ * 0x00453F0D, SV_FreeClients 0x0045958C, ...) run RemoveRefToObject on
+ * scriptId unconditionally. */
 void SV_FreeClientScriptId( client_t *client ) {
-	if ( !client->scriptId ) {
-		return;
-	}
 	RemoveRefToObject( client->scriptId );
 	client->scriptId = 0;
 }
@@ -241,140 +273,65 @@ void SV_FreeClientScriptId( client_t *client ) {
 netadr_t sv_masterAdr[MAX_MASTER_SERVERS];
 static netadr_t sv_masterGcsAdr[MAX_MASTER_SERVERS];
 
-static int sv_csDumped;
-
-/* ---- SV_DumpConfigstrings  no-address ---- */
-static void SV_DumpConfigstrings( void ) {
-	int i;
-	int nonEmpty = 0;
-	const char  *s;
-
-	Com_Printf( "----- configstrings (non-empty) -----\n" );
-	for ( i = 0 ; i < MAX_CONFIGSTRINGS ; i++ ) {
-		s = sv.configstrings[i];
-		if ( !s || !s[0] ) {
-			continue;
-		}
-		nonEmpty++;
-		Com_Printf( "  cs[%4d] %.140s\n", i, s );
-	}
-	Com_Printf( "----- %d non-empty; script KV block %d..%d -----\n",
-				nonEmpty, CS_SCRIPT_KV_BASE,
-				CS_SCRIPT_KV_BASE + 2 * CS_SCRIPT_KV_COUNT - 1 );
-	for ( i = 0 ; i < CS_SCRIPT_KV_COUNT ; i++ ) {
-		const char  *k = sv.configstrings[CS_SCRIPT_KV_BASE + i];
-		const char  *v = sv.configstrings[CS_SCRIPT_KV_BASE + CS_SCRIPT_KV_COUNT + i];
-		if ( !k || !k[0] ) {
-			break;
-		}
-		Com_Printf( "  kv[%2d] %-28s = %.100s\n", i, k, v ? v : "" );
-	}
-	Com_Printf( "-------------------------------------\n" );
-}
-
-/* ---- SV_DebugMenuShot  no-address ---- */
-static void SV_DebugMenuShot( void ) {
-	static cvar_t   *sv_debugMenu;
-	int i;
-	char index[64];
-
-	if ( !sv_debugMenu ) {
-		sv_debugMenu = Cvar_Get( "sv_debugMenu", "", 0 );
-	}
-	if ( !sv_debugMenu->string[0] ) {
-		return;
-	}
-
-	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		if ( svs.clients[i].state == CS_ACTIVE ) {
-			break;
-		}
-	}
-	if ( i >= sv_maxclients->integer ) {
-		return;
-	}
-
-	Q_strncpyz( index, sv_debugMenu->string, sizeof( index ) );
-	Cvar_Set2( "sv_debugMenu", "", qtrue );
-
-	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		if ( svs.clients[i].state != CS_ACTIVE ) {
-			continue;
-		}
-		Com_Printf( "SVCMD* forcing menu to cl%d: [m %s]\n", i, index );
-		SV_SendServerCommand( &svs.clients[i], qtrue, "m %s", index );
-	}
-}
-
 /* ---- SV_ExpandNewlines  0x004596C0 ---- */
 char *SV_ExpandNewlines( const char *string ) {
 	static char buf[1024];
-	unsigned int l;
+	int l;
 
 	l = 0;
-	while ( *string ) {
-		if ( l >= 1021 ) {
-			break;
-		}
+	while ( *string && l < sizeof( buf ) - 3 ) {
 		if ( *string == '\n' ) {
 			buf[l++] = '\\';
-			buf[l] = 'n';
-		} else if ( *string == 20 || *string == 21 ) {
-			string++;
-			continue;
-		} else {
-			buf[l] = *string;
+			buf[l++] = 'n';
+		} else if ( *string != 20 && *string != 21 ) {
+			buf[l++] = *string;
 		}
-		l++;
 		string++;
 	}
-	buf[l] = 0;
+	/* retail 0x004596FE terminates with no bound check; a pointer store keeps modern /GS from adding a range-check fast-fail */
+	*( buf + l ) = 0;
 
 	return buf;
 }
 
 /* ---- SV_IsFirstTokenEqual  0x00459710 ---- */
 qboolean SV_IsFirstTokenEqual( const char *a, const char *b ) {
-	while ( *b && *a && *b != ' ' && *a != ' ' ) {
-		if ( *b != *a ) {
+	while ( *a && *b && *a != ' ' && *b != ' ' ) {
+		if ( *a != *b ) {
 			return qfalse;
 		}
-		b++;
 		a++;
+		b++;
 	}
 
-	if ( *b && *b != ' ' ) {
+	if ( *a && *a != ' ' ) {
 		return qfalse;
 	}
 
-	return ( !*a || *a == ' ' ) ? qtrue : qfalse;
+	return ( !*b || *b == ' ' ) ? qtrue : qfalse;
 }
 
 /* ---- SV_CanReplaceServerCommand  0x00459760 ---- */
 int SV_CanReplaceServerCommand( client_t *client, const char *cmd ) {
 	int i;
-	int last;
-	char c;
-	reliableCommands_t  *rc;
+	int index;
 
-	last = client->reliableSequence;
-
-	for ( i = client->reliableSent + 1 ; i <= last ; i++ ) {
-		rc = &client->reliableCommands[i & ( MAX_RELIABLE_COMMANDS - 1 )];
-		if ( !rc->cmdType ) {
+	for ( i = client->reliableSent + 1 ; i <= client->reliableSequence ; i++ ) {
+		index = i & ( MAX_RELIABLE_COMMANDS - 1 );
+		if ( !client->reliableCommands[index].cmdType ) {
 			continue;
 		}
-
-		c = cmd[0];
-		if ( c != rc->command[0] || ( c >= 'x' && c <= 'z' ) ) {
+		if ( cmd[0] != client->reliableCommands[index].command[0] ) {
 			continue;
 		}
-
-		if ( !strcmp( cmd + 1, rc->command + 1 ) ) {
+		if ( cmd[0] >= 'x' && cmd[0] <= 'z' ) {
+			continue;
+		}
+		if ( !strcmp( cmd + 1, client->reliableCommands[index].command + 1 ) ) {
 			return i;
 		}
 
-		switch ( c ) {
+		switch ( cmd[0] ) {
 		case 'a':
 		case 'b':
 		case 'o':
@@ -385,15 +342,11 @@ int SV_CanReplaceServerCommand( client_t *client, const char *cmd ) {
 			return i;
 		case 'd':
 		case 'v':
-			if ( SV_IsFirstTokenEqual( rc->command + 2, cmd + 2 ) ) {
+			if ( SV_IsFirstTokenEqual( cmd + 2, client->reliableCommands[index].command + 2 ) ) {
 				return i;
 			}
 			break;
-		default:
-			break;
 		}
-
-		last = client->reliableSequence;
 	}
 
 	return -1;
@@ -403,20 +356,19 @@ int SV_CanReplaceServerCommand( client_t *client, const char *cmd ) {
 void SV_CullIgnorableServerCommands( client_t *client ) {
 	int i;
 	int keep;
+	int from;
+	int to;
 
 	keep = client->reliableSent + 1;
 
 	for ( i = keep ; i <= client->reliableSequence ; i++ ) {
-		int from = i & ( MAX_RELIABLE_COMMANDS - 1 );
-		int to = keep & ( MAX_RELIABLE_COMMANDS - 1 );
-
+		from = i & ( MAX_RELIABLE_COMMANDS - 1 );
 		if ( !client->reliableCommands[from].cmdType ) {
 			continue;
 		}
+		to = keep & ( MAX_RELIABLE_COMMANDS - 1 );
 		if ( to != from ) {
-			Com_Memcpy( &client->reliableCommands[to],
-						&client->reliableCommands[from],
-						sizeof( reliableCommands_t ) );
+			client->reliableCommands[to] = client->reliableCommands[from];
 		}
 		keep++;
 	}
@@ -428,56 +380,35 @@ void SV_CullIgnorableServerCommands( client_t *client ) {
 void SV_AddServerCommand( client_t *client, int isReliable, const char *cmd ) {
 	int i, j;
 	int replace;
-	reliableCommands_t  *rc;
 
 	if ( client->bIsTestClient ) {
 		return;
-	}
-
-	if ( sv_debugSpawn && sv_debugSpawn->integer ) {
-		Com_Printf( "SVCMD+ cl%d st%d rel%d seq%d ack%d sent%d [%.90s]\n",
-					(int)( client - svs.clients ), client->state, isReliable,
-					client->reliableSequence, client->reliableAcknowledge,
-					client->reliableSent, cmd ? cmd : "(null)" );
 	}
 
 	if ( !( client->reliableSequence - client->reliableAcknowledge < 32
 			&& client->state == CS_ACTIVE ) ) {
 		SV_CullIgnorableServerCommands( client );
 		if ( !isReliable ) {
-			if ( sv_debugSpawn && sv_debugSpawn->integer ) {
-				Com_Printf( "SVCMD! dropped ignorable cl%d [%.90s]\n",
-							(int)( client - svs.clients ), cmd ? cmd : "(null)" );
-			}
 			return;
 		}
 	}
 
 	replace = SV_CanReplaceServerCommand( client, cmd );
-	if ( sv_debugSpawn && sv_debugSpawn->integer && replace >= 0 ) {
-		Com_Printf( "SVCMD~ cl%d replaces seq%d [%.60s] with [%.60s]\n",
-					(int)( client - svs.clients ), replace,
-					client->reliableCommands[replace & ( MAX_RELIABLE_COMMANDS - 1 )].command,
-					cmd ? cmd : "(null)" );
-	}
-	if ( replace < 0 ) {
-		client->reliableSequence++;
-	} else {
-		i = replace + 1;
-		while ( i <= client->reliableSequence ) {
-			Com_Memcpy( &client->reliableCommands[replace & ( MAX_RELIABLE_COMMANDS - 1 )],
-						&client->reliableCommands[i & ( MAX_RELIABLE_COMMANDS - 1 )],
-						sizeof( reliableCommands_t ) );
-			replace++;
-			i++;
+	if ( replace >= 0 ) {
+		for ( i = replace + 1 ; i <= client->reliableSequence ; i++, replace++ ) {
+			client->reliableCommands[replace & ( MAX_RELIABLE_COMMANDS - 1 )]
+				= client->reliableCommands[i & ( MAX_RELIABLE_COMMANDS - 1 )];
 		}
+	} else {
+		client->reliableSequence++;
 	}
 
 	if ( client->reliableSequence - client->reliableAcknowledge == 65 ) {
 		Com_Printf( "===== pending server commands =====\n" );
 		for ( j = client->reliableAcknowledge + 1 ; j <= client->reliableSequence ; j++ ) {
-			rc = &client->reliableCommands[j & ( MAX_RELIABLE_COMMANDS - 1 )];
-			Com_Printf( "cmd %5d: %8d: %s\n", j, rc->cmdTime, rc->command );
+			Com_Printf( "cmd %5d: %8d: %s\n", j,
+						client->reliableCommands[j & ( MAX_RELIABLE_COMMANDS - 1 )].cmdTime,
+						client->reliableCommands[j & ( MAX_RELIABLE_COMMANDS - 1 )].command );
 		}
 		Com_Printf( "cmd %5d: %8d: %s\n", j, svs.time, cmd );
 
@@ -489,10 +420,11 @@ void SV_AddServerCommand( client_t *client, int isReliable, const char *cmd ) {
 		cmd = "w \"EXE_SERVERCOMMANDOVERFLOW\"";
 	}
 
-	rc = &client->reliableCommands[client->reliableSequence & ( MAX_RELIABLE_COMMANDS - 1 )];
-	MSG_WriteReliableCommandToBuffer( cmd, sizeof( rc->command ), rc->command );
-	rc->cmdTime = svs.time;
-	rc->cmdType = isReliable;
+	replace = client->reliableSequence & ( MAX_RELIABLE_COMMANDS - 1 );
+	MSG_WriteReliableCommandToBuffer( cmd, sizeof( client->reliableCommands[replace].command ),
+									  client->reliableCommands[replace].command );
+	client->reliableCommands[replace].cmdTime = svs.time;
+	client->reliableCommands[replace].cmdType = isReliable;
 }
 
 /* ---- SV_SendServerCommand  0x00459A90 ---- */
@@ -515,8 +447,7 @@ void QDECL SV_SendServerCommand( client_t *client, int isReliable, const char *f
 		Com_Printf( "broadcast: %s\n", SV_ExpandNewlines( message ) );
 	}
 
-	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		cl = &svs.clients[i];
+	for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
 		if ( cl->state < CS_PRIMED ) {
 			continue;
 		}
@@ -566,11 +497,23 @@ void SV_MasterHeartbeat( const char *hbname ) {
 	svs.nextHeartbeatTime = svs.time + 180000;
 
 	for ( i = 0 ; i < MAX_MASTER_SERVERS ; i++ ) {
-		if ( !sv_master[i] ) {
+		if ( !sv_master[i]->string[0] ) {
 			continue;
 		}
-		if ( !SV_ResolveMaster( sv_master[i], &sv_masterAdr[i] ) ) {
-			continue;
+		if ( sv_master[i]->modified ) {
+			sv_master[i]->modified = qfalse;
+			Com_Printf( "Resolving %s\n", sv_master[i]->string );
+			if ( !NET_StringToAdr( sv_master[i]->string, &sv_masterAdr[i] ) ) {
+				Com_Printf( "Couldn't resolve address: %s\n", sv_master[i]->string );
+				Cvar_Set2( sv_master[i]->name, "", qtrue );
+				sv_master[i]->modified = qfalse;
+				continue;
+			}
+			if ( !strstr( ":", sv_master[i]->string ) ) {
+				sv_masterAdr[i].port = BigShort( PORT_MASTER );
+			}
+			Com_Printf( "%s resolved to %i.%i.%i.%i:%i\n", sv_master[i]->string,
+				sv_masterAdr[i].ip[0], sv_masterAdr[i].ip[1], sv_masterAdr[i].ip[2], sv_masterAdr[i].ip[3], BigShort( sv_masterAdr[i].port ) );
 		}
 
 		Com_Printf( "Sending heartbeat to %s\n", sv_master[i]->string );
@@ -587,11 +530,23 @@ void SV_MasterGameCompleteStatus( void ) {
 	}
 
 	for ( i = 0 ; i < MAX_MASTER_SERVERS ; i++ ) {
-		if ( !sv_master[i] ) {
+		if ( !sv_master[i]->string[0] ) {
 			continue;
 		}
-		if ( !SV_ResolveMaster( sv_master[i], &sv_masterGcsAdr[i] ) ) {
-			continue;
+		if ( sv_master[i]->modified ) {
+			sv_master[i]->modified = qfalse;
+			Com_Printf( "Resolving %s\n", sv_master[i]->string );
+			if ( !NET_StringToAdr( sv_master[i]->string, &sv_masterGcsAdr[i] ) ) {
+				Com_Printf( "Couldn't resolve address: %s\n", sv_master[i]->string );
+				Cvar_Set2( sv_master[i]->name, "", qtrue );
+				sv_master[i]->modified = qfalse;
+				continue;
+			}
+			if ( !strstr( ":", sv_master[i]->string ) ) {
+				sv_masterGcsAdr[i].port = BigShort( PORT_MASTER );
+			}
+			Com_Printf( "%s resolved to %i.%i.%i.%i:%i\n", sv_master[i]->string,
+				sv_masterGcsAdr[i].ip[0], sv_masterGcsAdr[i].ip[1], sv_masterGcsAdr[i].ip[2], sv_masterGcsAdr[i].ip[3], BigShort( sv_masterGcsAdr[i].port ) );
 		}
 
 		Com_Printf( "Sending gameCompleteStatus to %s\n", sv_master[i]->string );
@@ -607,10 +562,10 @@ void SV_MasterShutdown( void ) {
 
 /* ---- SV_GetClientScore  0x00459EA0 ---- */
 int SV_GetClientScore( client_t *client ) {
-	if ( !vm ) {
-		return 0;
+	if ( vm ) {
+		return VM_Call( vm, GAME_GET_CLIENT_SCORE, (int)( client - svs.clients ) );
 	}
-	return VM_Call( vm, GAME_GET_CLIENT_SCORE, (int)( client - svs.clients ) );
+	return 0;
 }
 
 /* ---- SV_FlushRedirect  0x0045A5A0 ---- */
@@ -622,14 +577,17 @@ void SV_FlushRedirect( char *outputbuf ) {
 void SV_ConnectionlessPacket( netadr_t from, msg_t *msg ) {
 	char    *s;
 	char    *c;
+	int     size;
 
+	/* retail reads cursize once, before MSG_BeginReading, and passes that value to NetProf_AddPacket */
+	size = msg->cursize;
 	MSG_BeginReading( msg );
 	MSG_ReadLong( msg );
 
 	if ( net_profile->integer ) {
 		NetProf_PrepProfiling( &svs.pOOBProf );
 		/* An incoming packet is added to the OOB profile's SEND stream. Retail bug; preserved. */
-		NetProf_AddPacket( (netsrc_t)msg->cursize, 0, NULL, from );
+		NetProf_AddPacket( &( (netProfileInfo_t *)svs.pOOBProf )->send, size, 0 );
 	}
 
 	if ( !Q_strncmp( "connect", (const char *)msg->data + 4, 7 ) ) {
@@ -642,19 +600,15 @@ void SV_ConnectionlessPacket( netadr_t from, msg_t *msg ) {
 
 	Com_DPrintf( "SV packet %s : %s\n", NET_AdrToString( from ), c );
 
-	if ( !c ) {
-		return;
-	}
-
-	if ( !Q_stricmpn( c, "getstatus", 99999 ) ) {
+	if ( !Q_stricmp( c, "getstatus" ) ) {
 		SVC_Status( from );
-	} else if ( !Q_stricmpn( c, "getinfo", 99999 ) ) {
+	} else if ( !Q_stricmp( c, "getinfo" ) ) {
 		SVC_Info( from );
-	} else if ( !Q_stricmpn( c, "getchallenge", 99999 ) ) {
+	} else if ( !Q_stricmp( c, "getchallenge" ) ) {
 		SV_GetChallenge( from );
-	} else if ( !Q_stricmpn( c, "connect", 99999 ) ) {
+	} else if ( !Q_stricmp( c, "connect" ) ) {
 		SV_DirectConnect( from );
-	} else if ( !Q_stricmpn( c, "ipAuthorize", 99999 ) ) {
+	} else if ( !Q_stricmp( c, "ipAuthorize" ) ) {
 		SV_AuthorizeIpPacket( from );
 	} else if ( !Q_stricmp( c, "rcon" ) ) {
 		SVC_RemoteCommand( from, msg );
@@ -687,9 +641,7 @@ void SV_PacketEvent( netadr_t from, msg_t *msg ) {
 	}
 	qport = MSG_ReadShort( msg ) & 0xffff;
 
-	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		cl = &svs.clients[i];
-
+	for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
 		if ( cl->state == CS_FREE ) {
 			continue;
 		}
@@ -712,15 +664,15 @@ void SV_PacketEvent( netadr_t from, msg_t *msg ) {
 				cl->reliableAcknowledge = MSG_ReadLong( msg );
 
 				if ( cl->reliableSequence - cl->reliableAcknowledge
-					 < MAX_RELIABLE_COMMANDS ) {
+					 >= MAX_RELIABLE_COMMANDS ) {
+					cl->reliableAcknowledge = cl->reliableSequence;
+				} else {
 					SV_Netchan_Decode( cl, msg->data + msg->readcount,
 									   msg->cursize - msg->readcount );
 					if ( cl->state != CS_ZOMBIE ) {
 						cl->lastPacketTime = svs.time;
-						SV_ExecuteClientMessage( msg, cl );
+						SV_ExecuteClientMessage( cl, msg );
 					}
-				} else {
-					cl->reliableAcknowledge = cl->reliableSequence;
 				}
 			}
 		}
@@ -740,14 +692,18 @@ done:
 /* ---- SV_CalcPings  0x0045ACB0 ---- */
 void SV_CalcPings( void ) {
 	int i, j;
+	int delta;
 	int total, count;
 	client_t    *cl;
-	clientSnapshot_t    *frame;
 
 	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
 		cl = &svs.clients[i];
 
-		if ( cl->state != CS_ACTIVE || !cl->gentity ) {
+		if ( cl->state != CS_ACTIVE ) {
+			cl->ping = 999;
+			continue;
+		}
+		if ( !cl->gentity ) {
 			cl->ping = 999;
 			continue;
 		}
@@ -755,12 +711,12 @@ void SV_CalcPings( void ) {
 		total = 0;
 		count = 0;
 		for ( j = 0 ; j < PACKET_BACKUP ; j++ ) {
-			frame = &cl->frames[j];
-			if ( (int)frame->messageAcked <= 0 ) {
+			if ( (int)cl->frames[j].messageAcked <= 0 ) {
 				continue;
 			}
+			delta = cl->frames[j].messageAcked - cl->frames[j].messageSent;
 			count++;
-			total += frame->messageAcked - frame->messageSent;
+			total += delta;
 		}
 
 		if ( !count ) {
@@ -787,9 +743,7 @@ void SV_CheckTimeouts( void ) {
 	droppoint = svs.time - 1000 * sv_timeout->integer;
 	zombiepoint = svs.time - 1000 * sv_zombietime->integer;
 
-	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		cl = &svs.clients[i];
-
+	for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
 		if ( cl->lastPacketTime > svs.time ) {
 			cl->lastPacketTime = svs.time;
 		}
@@ -801,14 +755,15 @@ void SV_CheckTimeouts( void ) {
 		if ( cl->state == CS_ZOMBIE && cl->lastPacketTime < zombiepoint ) {
 			Com_DPrintf( "Going from CS_ZOMBIE to CS_FREE for %s\n", cl->name );
 			cl->state = CS_FREE;
-		} else if ( cl->state < CS_CONNECTED || cl->lastPacketTime >= droppoint ) {
-			cl->timeoutCount = 0;
-		} else {
-			cl->timeoutCount++;
-			if ( cl->timeoutCount > 5 ) {
+			continue;
+		}
+		if ( cl->state >= CS_CONNECTED && cl->lastPacketTime < droppoint ) {
+			if ( ++cl->timeoutCount > 5 ) {
 				SV_DropClient( cl, "EXE_TIMEDOUT" );
 				cl->state = CS_FREE;
 			}
+		} else {
+			cl->timeoutCount = 0;
 		}
 	}
 }
@@ -817,14 +772,15 @@ void SV_CheckTimeouts( void ) {
 qboolean SV_CheckPaused( void ) {
 	int i;
 	int count;
+	client_t    *cl;
 
 	if ( !cl_paused->integer ) {
 		return qfalse;
 	}
 
 	count = 0;
-	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		if ( svs.clients[i].state >= CS_CONNECTED ) {
+	for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
+		if ( cl->state >= CS_CONNECTED ) {
 			count++;
 		}
 	}
@@ -838,8 +794,6 @@ qboolean SV_CheckPaused( void ) {
 	return qtrue;
 }
 
-extern void SV_TestClientFrame( void );   /* TEMPORARY scaffolding, sv_client_mp.c */
-
 /* ---- SV_RunFrame  0x0045AFD0 ---- */
 void SV_RunFrame( void ) {
 	VM_Call( vm, GAME_UPDATE_CVARS );
@@ -849,7 +803,6 @@ void SV_RunFrame( void ) {
 	}
 	com_skelInvalidated = 1;
 
-	SV_TestClientFrame();   /* TEMPORARY scaffolding, see sv_client_mp.c */
 	VM_Call( vm, GAME_RUN_FRAME, svs.time );
 
 	com_skelInvalidated = 0;
@@ -858,9 +811,10 @@ void SV_RunFrame( void ) {
 	}
 }
 
+playerState_t   *SV_GameClientNum( int clientNum );   /* sv_game_mp.c 0x00455890 */
+
 /* ---- SV_BotUserMove  0x0045B030 ---- */
 void SV_BotUserMove( client_t *client ) {
-	int clientNum;
 	usercmd_t cmd;
 
 	if ( !client->gentity ) {
@@ -868,21 +822,19 @@ void SV_BotUserMove( client_t *client ) {
 	}
 
 	memset( &cmd, 0, sizeof( cmd ) );
-	clientNum = (int)( client - svs.clients );
 
-	cmd.weapon = (byte)( (playerState_t *)( (byte *)sv.gameClients
-											+ clientNum * sv.gameClientSize ) )->weapon;
+	cmd.weapon = (byte)SV_GameClientNum( (int)( client - svs.clients ) )->weapon;
 
-	if ( !VM_Call( vm, GAME_GET_ARCHIVE_TIME, clientNum ) ) {
-		if ( rand() * ( 1.0 / 32768.0 ) < 0.5 ) {
+	if ( !VM_Call( vm, GAME_GET_ARCHIVE_TIME, (int)( client - svs.clients ) ) ) {
+		if ( rand() * ( 1.0f / 32768.0f ) < 0.5f ) {
 			cmd.buttons |= 1;
 		}
-		if ( rand() * ( 1.0 / 32768.0 ) < 0.5 ) {
+		if ( rand() * ( 1.0f / 32768.0f ) < 0.5f ) {
 			cmd.buttons |= 0x40;
 		}
-		if ( rand() * ( 1.0 / 32768.0 ) < 0.33000001 ) {
+		if ( rand() * ( 1.0f / 32768.0f ) < 0.33f ) {
 			cmd.forwardmove = 127;
-		} else if ( rand() * ( 1.0 / 32768.0 ) < 0.5 ) {
+		} else if ( rand() * ( 1.0f / 32768.0f ) < 0.5f ) {
 			cmd.forwardmove = -127;
 		}
 	}
@@ -901,8 +853,7 @@ void SV_UpdateBots( void ) {
 	}
 	com_skelInvalidated = 1;
 
-	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		cl = &svs.clients[i];
+	for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
 		if ( cl->state == CS_FREE ) {
 			continue;
 		}
@@ -918,7 +869,7 @@ void SV_UpdateBots( void ) {
 }
 
 /* ---- SV_RestartAfterCounterWrap  no-address ---- */
-static void SV_RestartAfterCounterWrap( const char *message ) {
+static __forceinline void SV_RestartAfterCounterWrap( const char *message ) {
 	char mapname[MAX_QPATH];
 
 	strncpy( mapname, sv_mapname->string, MAX_QPATH - 1 );
@@ -931,7 +882,7 @@ static void SV_RestartAfterCounterWrap( const char *message ) {
 void SV_Frame( int msec ) {
 	int frameMsec;
 	int startTime;
-	int i;
+	qboolean more;
 
 	if ( sv_killserver->integer ) {
 		Com_Shutdown( "EXE_SERVERKILLED" );
@@ -1004,27 +955,13 @@ void SV_Frame( int msec ) {
 		cvar_modifiedFlags &= ~CVAR_WOLFINFO;
 	}
 
-	if ( sv_debugSpawn && sv_debugSpawn->integer && !sv_csDumped ) {
-		for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-			if ( svs.clients[i].state == CS_ACTIVE ) {
-				break;
-			}
-		}
-		if ( i < sv_maxclients->integer ) {
-			sv_csDumped = 1;
-			SV_DumpConfigstrings();
-		}
-	}
-
-	SV_DebugMenuShot();
-
 	SV_UpdateBots();
 
 	startTime = com_speeds->integer ? Sys_Milliseconds() : 0;
 
 	SV_CalcPings();
 
-	for ( ;; ) {
+	do {
 		sv.timeResidual -= frameMsec;
 		svs.time += frameMsec;
 
@@ -1033,11 +970,15 @@ void SV_Frame( int msec ) {
 		/* retail stores 0 to scrVmGlob.loading (0x00A7A5E0) inline; script/scr_vm_state.c owns that word and exposes this setter. */
 		Scr_SetLoading( qfalse );
 
-		if ( sv.timeResidual < frameMsec ) {
-			break;
+		/* retail (Mac 1.3: while(1) {...; if (residual < frameMsec) break; SV_ArchiveSnapshot();})
+		   jumps straight back to the loop top after the archive; a plain mid-exit loop gets rotated
+		   by VC7, a constant flag threads into retail's shape */
+		more = qfalse;
+		if ( sv.timeResidual >= frameMsec ) {
+			SV_ArchiveSnapshot();
+			more = qtrue;
 		}
-		SV_ArchiveSnapshot();
-	}
+	} while ( more );
 
 	if ( com_speeds->integer ) {
 		time_frontend = Sys_Milliseconds() - startTime;

@@ -4,268 +4,293 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
+#include "tr_records.h"
 #include "tr_gl_types.h"
 #include "tr_tess.h"
+#include "tr_local.h"
+/* ---- renderer-owned globals ---- */
+int s_fftBitReverse[256];
+int s_numWaterMaps;
+
 
 extern int GL_Bind();
-extern int R_AllocImage();
-extern int R_CreateImageInternal();
-extern int R_FreeImage();
+extern int __cdecl R_CreateImage( char *name, int flags, int imageTrack,
+                                  unsigned __int8 *pixels, int width, int height,
+                                  int format, float *colorScale );
 
 
-typedef struct { unsigned char b[52]; } waterMap_t;
+/* ------------------------------------------------------------------------- *
+ *  File-local water types.
+ *
+ *  CoD's animated-water shader deforms a heightfield with an inverse FFT of a
+ *  Phillips-style ocean spectrum, then bakes the result into a normal map that
+ *  is re-uploaded each frame.  The decompiled code reaches the per-map record
+ *  and the complex spectrum through `*(unsigned int *)(p + off)` soup; the two record
+ *  types below type that pointer-passed data.  Both are file-local (CoD-only,
+ *  no RTCW analog); every offset is proven by the decompiled reads and matches
+ *  the CoDUO reconstruction (renderer_water.c), pinned with asserts so a wrong
+ *  offset fails the build.  Field names follow CoDUO.
+ * ------------------------------------------------------------------------- */
+
+/* one complex sample (real, imaginary) -- spectrum bin / FFT working element */
+typedef struct {
+	float real;             /* +0x00 */
+	float imaginary;        /* +0x04 */
+} waterComplex_t;
+COD1_ASSERT_SIZE(waterComplex_t, 0x08);
+ASSERT_OFF(waterComplex_t, imaginary, 0x04);
+
+/* one cached water surface: its baked normal texture plus the parameters and
+ * pre-rolled spectrum used to re-derive it every frame.  Retail record is
+ * 13 dwords (0x34); R_GetWaterTexture block-copies it whole from the parser. */
+typedef struct {
+	void           *image;                 /* +0x00  GL image (width @ +64, height @ +66) */
+	int             uploadFrame;           /* +0x04  tr.frameCount of the last upload */
+	waterComplex_t *initialFrequencies;    /* +0x08  h0(k), textureWidth*textureHeight bins */
+	float          *angularFrequencies;    /* +0x0c  w(k), one per bin (== base + 8*texelCount) */
+	int             textureWidth;          /* +0x10 */
+	int             textureHeight;         /* +0x14 */
+	float           horizontalWorldLength; /* +0x18  world span mapped across the height axis */
+	float           verticalWorldLength;   /* +0x1c  world span mapped across the width axis */
+	float           gravity;               /* +0x20 */
+	float           windVelocity;          /* +0x24 */
+	float           windDirection[2];      /* +0x28  [0] = x, [1] = y */
+	float           amplitude;             /* +0x30 */
+} waterMap_t;
+COD1_ASSERT_SIZE(waterMap_t, 0x34);
+ASSERT_OFF(waterMap_t, uploadFrame, 0x04);
+ASSERT_OFF(waterMap_t, initialFrequencies, 0x08);
+ASSERT_OFF(waterMap_t, angularFrequencies, 0x0c);
+ASSERT_OFF(waterMap_t, textureWidth, 0x10);
+ASSERT_OFF(waterMap_t, textureHeight, 0x14);
+ASSERT_OFF(waterMap_t, horizontalWorldLength, 0x18);
+ASSERT_OFF(waterMap_t, verticalWorldLength, 0x1c);
+ASSERT_OFF(waterMap_t, gravity, 0x20);
+ASSERT_OFF(waterMap_t, windVelocity, 0x24);
+ASSERT_OFF(waterMap_t, windDirection, 0x28);
+ASSERT_OFF(waterMap_t, amplitude, 0x30);
+
+/* 0x011EE0B0: 256 { cos, sin } twiddle pairs, angle step 2*pi/256. */
+static waterComplex_t s_fftTwiddle[256];
+
+/* 0x011EDD70: the sixteen cached water-map records. */
 static waterMap_t s_waterMaps[16];
 
-/* 0x011EE0B0.  256 { cos, sin } pairs, step 2*pi/256 == 0.024543693. */
-static float s_fftTwiddle[512];
+/* s_fftBitReverse[256] (8-bit reversal table) is defined above; s_numWaterMaps
+ * is defined above too (extern in tr_local.h). */
 
-#define dword_11EE0B0  ((int *)s_fftTwiddle)
-#define dword_11EE0B4  (s_fftTwiddle + 1)
-#define unk_11EDD70    (*(unsigned char *)s_waterMaps)
-#define dword_11EDD78  ((int *)((char *)s_waterMaps + 8))
-#define dword_11EDD7C  ((int *)((char *)s_waterMaps + 12))
 
-/* ---- FFT_Init  0x00506EE0 ----  VERIFIED */
-float *FFT_Init()
+/* Retail's inlined fsincos block (FFT_Init 0x00506F7E) saves eax/ecx around
+ * itself: an inline-asm SinCos like cgame's CG_SinCos, not com_math.c's. */
+static __inline void R_WaterSinCos( float radians, float *sinOut, float *cosOut )
 {
-  int v0;
-  float *v1;
-  float *result;
-  int v3;
-  float v4;
-
-  v0 = 0;
-  v3 = 0;
-  v1 = dword_11EE0B4;
-  do
-  {
-    s_fftBitReverse[v0] = 0;
-    if ( (v0 & 1) != 0 )
-      s_fftBitReverse[v0] = 128;
-    if ( (v0 & 2) != 0 )
-      s_fftBitReverse[v0] |= 0x40u;
-    if ( (v0 & 4) != 0 )
-      s_fftBitReverse[v0] |= 0x20u;
-    if ( (v0 & 8) != 0 )
-      s_fftBitReverse[v0] |= 0x10u;
-    if ( (v0 & 0x10) != 0 )
-      s_fftBitReverse[v0] |= 8u;
-    if ( (v0 & 0x20) != 0 )
-      s_fftBitReverse[v0] |= 4u;
-    if ( (v0 & 0x40) != 0 )
-      s_fftBitReverse[v0] |= 2u;
-    if ( (char)v0 < 0 )
-      s_fftBitReverse[v0] |= 1u;
-    v4 = (double)v3 * 0.024543693289160728;
-    *(v1 - 1) = cos(v4);
-    *v1 = sin(v4);
-    result = v1 - 1;
-    ++v0;
-    v1 += 2;
-    v3 = v0;
-  }
-  while ( v0 < 256 );
-  return result;
+	__asm {
+		push    eax
+		push    ecx
+		fld     radians
+		fsincos
+		mov     ecx, cosOut
+		mov     eax, sinOut
+		fstp    dword ptr [ecx]
+		fstp    dword ptr [eax]
+		pop     ecx
+		pop     eax
+	}
 }
 
-/* ---- FFT  0x00506FB0 ----  [HIGH] */
-void __cdecl FFT(int bits, int *a1, int a2)
+/* ---- FFT_Init  0x00506EE0 ----  VERIFIED
+ * Build the two lookup tables the FFT needs: the 8-bit bit-reversal permutation
+ * and the twiddle-factor circle (angle step 2*pi/256). */
+void FFT_Init( void )
 {
-  char v2;
-  int v3;
-  int v4;
-  int *v5;
-  int v6;
-  int v7;
-  int *v8;
-  float *v9;
-  unsigned int v10;
-  float *v11;
-  double v12;
-  double v13;
-  double v14;
-  double v15;
-  double v16;
-  double v17;
-  double v18;
-  double v19;
-  double v20;
-  double v21;
-  double v22; // rt0
-  double v23;
-  signed int v24;
-  int result;
-  int v26;
-  signed int v27;
-  unsigned int v28;
-  int v29;
-  int v30;
-  float *v31;
-  double v32;
-  double v33;
-  bool v34; // cc
-  float v35;
-  int v36;
-  float v37;
-  unsigned int v38;
-  unsigned int v39;
-  int v40;
-  int v41;
-  int v42;
-  int v43;
-  int v44;
-  char v45;
-  char v46;
+  int i;
+  int bit;
 
-  v3 = 0;
-  v2 = (char)bits;
-  v45 = 8 - v2;
-  v4 = a2;
-  v44 = 1 << v2;
-  v41 = 0;
-  if ( 1 << v2 > 0 )
+  for ( i = 0; i < 256; ++i )
   {
-    v5 = a1;
-    do
+    s_fftBitReverse[i] = 0;
+    for ( bit = 0; bit < 8; ++bit )
     {
-      v6 = s_fftBitReverse[v3] >> v45;
-      if ( v6 < v3 )
-      {
-        v7 = *v5;
-        v8 = &a1[2 * a2 * v6];
-        v36 = v5[1];
-        *v5 = *v8;
-        v5[1] = v8[1];
-        v3 = v41;
-        *v8 = v7;
-        v8[1] = v36;
-      }
-      v5 += 2 * a2;
-      v41 = ++v3;
+      if ( ( i & ( 1 << bit ) ) != 0 )
+        s_fftBitReverse[i] |= 1 << ( 7 - bit );
     }
-    while ( v3 < v44 );
+
+    R_WaterSinCos( i * 0.02454369328916073f, &s_fftTwiddle[i].imaginary, &s_fftTwiddle[i].real );
   }
-  v9 = (float *)a1;
-  v10 = (unsigned int)v44 >> 2;
-  v11 = (float *)&a1[2 * a2];
-  do
+}
+
+/* ---- FFT  0x00506FB0 ----  VERIFIED
+ * In-place decimation-in-time inverse FFT over `count = 1 << bits` complex
+ * samples spaced `stride` apart: a bit-reversal reorder, a radix-4 first pass,
+ * then radix-2 combine passes with twiddle factors.  The radix-4 B/D outputs
+ * use CoD1's sign convention (the negation of CoDUO's), verified term-by-term
+ * against the decompile.  Parameter order is retail's (bits, data, stride);
+ * cross-file callers rely on it.  The radix-4 pass is retail's inline asm (a
+ * do-while over count >> 2 groups, no guard: count >= 4 assumed); it is why the
+ * function has an EBP frame while `bits` still arrives in ECX under LTCG.
+ * No double locals here: a double makes LTCG pad the callers' frames. */
+void __cdecl FFT( int bits, waterComplex_t *data, int stride )
+{
+  int            shift;          /* 8 - bits, then the twiddle shift (one slot in retail) */
+  int            count;
+  int            span;
+  int            i;
+  int            twiddleIndex;
+  int            doubleSpan;
+  waterComplex_t twiddle;
+
+  count = 1 << bits;
+  shift = 8 - bits;
+
+  /* ---- bit-reversal reorder ---- */
+  for ( i = 0; i < count; ++i )
   {
-    v12 = v9[1];
-    v13 = v9[4 * a2];
-    v14 = v9[4 * a2 + 1];
-    v15 = *v9;
-    v16 = v15 + *v11;
-    v17 = v13 + v11[4 * a2];
-    *v9 = v16 + v17;
-    v9[4 * a2] = v16 - v17;
-    v18 = v9[4 * a2 + 1] + v11[4 * a2 + 1];
-    v19 = v9[1] + v11[1];
-    v9[1] = v19 + v18;
-    v9[4 * a2 + 1] = v19 - v18;
-    v20 = v11[4 * a2 + 1] - v14;
-    v21 = *v11 - v15;
-    *v11 = v21 - v20;
-    v22 = v11[4 * a2] - v13;
-    v11[4 * a2] = v20 + v21;
-    v23 = v11[1] - v12;
-    v11[1] = v22 + v23;
-    v11[4 * a2 + 1] = v23 - v22;
-    --v10;
-    v9 += 8 * a2;
-    v11 += 8 * a2;
-  }
-  while ( v10 );
-  v24 = v44;
-  result = 4;
-  v43 = 4;
-  v46 = 5;
-  if ( v44 > 4 )
-  {
-    while ( 1 )
+    int reversed = s_fftBitReverse[i] >> shift;
+
+    if ( reversed < i )
     {
-      v26 = 0;
-      v27 = 2 * result;
-      v39 = 2 * result;
-      v40 = 0;
-      if ( result > 0 )
-      {
-        v28 = v4 * v24;
-        result = 0;
-        v38 = v28;
-        v42 = 0;
-        do
-        {
-          v29 = v26 << v46;
-          v35 = *(float *)&s_fftTwiddle[2 * v29];
-          v37 = dword_11EE0B4[2 * v29];
-          if ( result < v28 )
-          {
-            v30 = v4 * v39;
-            v31 = (float *)&a1[2 * v42 + 2 * v4 * v43];
-            v28 = v38;
-            do
-            {
-              v32 = v35 * *v31 - v37 * v31[1];
-              v33 = v35 * v31[1] + v37 * *v31;
-              *v31 = *(float *)&a1[2 * result] - v32;
-              v31[1] = *(float *)&a1[2 * result + 1] - v33;
-              v31 += 2 * v30;
-              *(float *)&a1[2 * result] = v32 + *(float *)&a1[2 * result];
-              *(float *)&a1[2 * result + 1] = v33 + *(float *)&a1[2 * result + 1];
-              result += v30;
-            }
-            while ( result < v38 );
-            v4 = a2;
-            result = v42;
-          }
-          v26 = v40 + 1;
-          result += v4;
-          v34 = ++v40 < v43;
-          v42 = result;
-        }
-        while ( v34 );
-        v27 = v39;
-        v24 = v44;
-      }
-      v43 = v27;
-      --v46;
-      if ( v27 >= v24 )
-        break;
-      result = v27;
+      waterComplex_t tmp      = data[i * stride];
+      data[i * stride]        = data[reversed * stride];
+      data[reversed * stride] = tmp;
     }
   }
+
+  /* ---- radix-4 first pass (retail inline asm) ---- */
+  __asm
+  {
+    mov     eax, stride
+    mov     edi, data
+    mov     ecx, count
+    lea     eax, [eax*8]
+    shr     ecx, 2
+    lea     esi, [edi+eax]
+  radix4:
+    fld     dword ptr [edi+4]
+    fld     dword ptr [edi+eax*2]
+    fld     dword ptr [edi+eax*2+4]
+    fld     dword ptr [edi]
+    fld     dword ptr [edi]
+    fld     dword ptr [edi+eax*2]
+    fxch    st(1)
+    fadd    dword ptr [esi]
+    fxch    st(1)
+    fadd    dword ptr [esi+eax*2]
+    fld     st(1)
+    fld     st(1)
+    faddp   st(1), st
+    fxch    st(2)
+    fsubrp  st(1), st
+    fxch    st(1)
+    fstp    dword ptr [edi]
+    fstp    dword ptr [edi+eax*2]
+    fld     dword ptr [edi+4]
+    fld     dword ptr [edi+eax*2+4]
+    fxch    st(1)
+    fadd    dword ptr [esi+4]
+    fxch    st(1)
+    fadd    dword ptr [esi+eax*2+4]
+    fld     st(1)
+    fld     st(1)
+    faddp   st(1), st
+    fxch    st(2)
+    fsubrp  st(1), st
+    fxch    st(1)
+    fstp    dword ptr [edi+4]
+    fstp    dword ptr [edi+eax*2+4]
+    fsubr   dword ptr [esi]
+    fxch    st(1)
+    fsubr   dword ptr [esi+eax*2+4]
+    fld     st(1)
+    fld     st(1)
+    fsubp   st(1), st
+    fxch    st(2)
+    faddp   st(1), st
+    fxch    st(1)
+    fstp    dword ptr [esi]
+    fxch    st(1)
+    fsubr   dword ptr [esi+eax*2]
+    fxch    st(1)
+    fstp    dword ptr [esi+eax*2]
+    fxch    st(1)
+    fsubr   dword ptr [esi+4]
+    fld     st(1)
+    fld     st(1)
+    faddp   st(1), st
+    fxch    st(2)
+    fsubp   st(1), st
+    fxch    st(1)
+    fstp    dword ptr [esi+4]
+    fstp    dword ptr [esi+eax*2+4]
+    dec     ecx
+    lea     edi, [edi+eax*4]
+    lea     esi, [esi+eax*4]
+    jne     radix4
+  }
+
+  /* ---- radix-2 combine passes ---- */
+  span  = 4;
+  shift = 5;
+  while ( span < count )
+  {
+    doubleSpan = 2 * span;
+    for ( twiddleIndex = 0; twiddleIndex < span; ++twiddleIndex )
+    {
+      unsigned index;
+
+      twiddle = s_fftTwiddle[twiddleIndex << shift];
+      for ( index = twiddleIndex * stride; index < (unsigned)( count * stride ); index += doubleSpan * stride )
+      {
+        waterComplex_t *upper = &data[index + span * stride];
+        rfloat          productReal      = twiddle.real * upper->real - twiddle.imaginary * upper->imaginary;
+        rfloat          productImaginary = twiddle.real * upper->imaginary;
+
+        productImaginary += twiddle.imaginary * upper->real;   /* this form keeps retail's term order */
+
+        upper->real            = data[index].real - productReal;
+        upper->imaginary       = data[index].imaginary - productImaginary;
+        data[index].real      += productReal;
+        data[index].imaginary += productImaginary;
+      }
+    }
+
+    span = doubleSpan;
+    --shift;
+  }
 }
 
-/* ---- GaussianRandom  0x005071D0 ----  VERIFIED */
-float *__cdecl GaussianRandom(float *a1, float *a2)
+/* ---- GaussianRandom  0x005071D0 ----  VERIFIED
+ * Marsaglia polar method: two standard normals from rejection-sampled points
+ * in the unit disc.  The x87 fyl2x that produced a natural log is written as
+ * log(); 2 * (r / 32768) is retail's fmul 1/32768 + fadd st,st.  Returning
+ * void keeps it cdecl under LTCG (a pointer return moved `real` into ESI). */
+void __cdecl GaussianRandom( float *real, float *imaginary )
 {
-  int v2;
-  double v3;
-  long double v4;
-  float *result;
-  long double v6;
-  float v7;
-  int v8;
+  float  x;
+  rfloat y;
+  rfloat radiusSquared;
+  rfloat scale;
 
   do
   {
-    v2 = rand();
-    v7 = (double)v2 * 0.000030517578125 + (double)v2 * 0.000030517578125 - 1.0;
-    v8 = rand();
-    v3 = (double)v8 * 0.000030517578125 + (double)v8 * 0.000030517578125 - 1.0;
-    v4 = v3 * v3 + v7 * v7;
+    x = 2.0f * ( rand() / 32768.0f ) - 1.0f;
+    y = 2.0f * ( rand() / 32768.0f ) - 1.0f;
+    radiusSquared = y * y + x * x;
   }
-  while ( v4 > 1.0 );
-  result = a1;
-  v6 = sqrt(__FYL2X__(v4, 0.6931471805599453094) * -2.0 / v4);
-  *a1 = v7 * v6;
-  *a2 = v6 * v3;
-  return result;
+  while ( radiusSquared > 1.0f );
+
+  scale      = sqrt( log( radiusSquared ) * -2.0 / radiusSquared );
+  *real      = x * scale;
+  *imaginary = scale * y;
 }
 
-/* ---- R_WaterExp  no-address ----  [HIGH] */
+/* ---- R_WaterExp  no-address ----  [HIGH]
+ * exp(x) the way retail's x87 computes it (2^(x*log2 e), split into integer +
+ * fractional scale).  Under VC7 this is the exp() intrinsic, which emits exactly
+ * that sequence inline in PickWaterFrequencies; the modern build keeps the x87
+ * asm so it does not switch to the CRT's SSE exp. */
+#ifdef COD1_VC7
+#define R_WaterExp( x ) exp( x )
+#else
 static double R_WaterExp( double x )
 {
 	double r;
@@ -288,383 +313,385 @@ static double R_WaterExp( double x )
 	}
 	return r;
 }
+#endif
 
-/* ---- PickWaterFrequencies  0x00507270 ----  VERIFIED */
-int __cdecl PickWaterFrequencies(int a1)
+/* ---- R_WaterFtol  no-address ----  [HIGH]
+ * myftol (0x00515940) as retail inlines it: the float argument is stored to a
+ * 4-byte slot, then fld / fistp ftol_tempSpill / mov eax, ftol_tempSpill
+ * (round to nearest under the default control word). */
+static int R_WaterFtol( float f )
 {
-  int v1;
-  int v2; // kr00_4
-  int result;
-  int v4;
-  int v5;
-  double v6;
-  double v7;
-  double v11;
-  int j;
-  float v13;
-  float v14;
-  int v15;
-  float v16;
-  float i;
-  float v18;
-  float v19;
-  float v20;
-  float v21; // [esp+28h] [ebp-8h] BYREF
-  float v22; // [esp+2Ch] [ebp-4h] BYREF
+	__asm fld   f
+	__asm fistp ftol_tempSpill
+	return ftol_tempSpill;
+}
 
-  v1 = *(_DWORD *)(a1 + 16);
-  v2 = *(_DWORD *)(a1 + 20);
-  result = v2 / 2;
-  v4 = 0;
-  v19 = *(float *)(a1 + 36) * *(float *)(a1 + 36) / *(float *)(a1 + 32) * (*(float *)(a1 + 36) * *(float *)(a1 + 36));
-  v16 = 6.2831854820251465 / ((double)v2 * *(float *)(a1 + 24));
-  v15 = v2 / -2;
-  for ( i = 6.2831854820251465 / ((double)v1 * *(float *)(a1 + 28)); v15 < result; ++v15 )
+/* ---- PickWaterFrequencies  0x00507270 ----  VERIFIED
+ * Fill the map's h0(k) spectrum and per-bin angular frequency from a
+ * Phillips-style ocean spectrum shaped by wind speed/direction.  Both CRT
+ * random draws are consumed for every bin, before the spectrum gate.  The
+ * 8-byte gaussian struct local is what gives retail its and esp,-8 frame. */
+void __cdecl PickWaterFrequencies( waterMap_t *waterMap )
+{
+  int   textureWidth  = waterMap->textureWidth;
+  int   textureHeight = waterMap->textureHeight;
+  float windLengthScaleSquared;
+  float rowWaveStep;
+  float columnWaveStep;
+  int   frequencyIndex = 0;
+  int   row, column;
+
+  windLengthScaleSquared = waterMap->windVelocity * waterMap->windVelocity / waterMap->gravity
+                         * ( waterMap->windVelocity * waterMap->windVelocity );
+#ifdef COD1_VC7
+  rowWaveStep    = 6.2831855f / ( textureHeight * waterMap->horizontalWorldLength );
+  columnWaveStep = 6.2831855f / ( textureWidth  * waterMap->verticalWorldLength );
+#else   /* modern: retail's x87 keeps the product and the quotient at double precision */
+  rowWaveStep    = 6.2831855f / ( (double)textureHeight * waterMap->horizontalWorldLength );
+  columnWaveStep = 6.2831855f / ( (double)textureWidth  * waterMap->verticalWorldLength );
+#endif
+
+  for ( row = -waterMap->textureHeight / 2; row < waterMap->textureHeight / 2; ++row )
   {
-    v14 = (double)v15 * v16;
-    v5 = v1 / -2;
-    for ( j = v1 / -2; v5 < v1 / 2; j = v5 )
+    float rowWaveNumber = row * rowWaveStep;
+
+    for ( column = -waterMap->textureWidth / 2; column < waterMap->textureWidth / 2; ++column )
     {
-      v13 = (double)j * i;
-      GaussianRandom(&v21, &v22);
-      v18 = v14 * v14;
-      v6 = v13 * v13 + v18;
-      v20 = sqrt(v6) * *(float *)(a1 + 32);
-      v7 = v13 * *(float *)(a1 + 44) + v14 * *(float *)(a1 + 40);
-      if ( v7 > 0.0 )
+      float  columnWaveNumber = column * columnWaveStep;
+      float  rowWaveNumberSquared;
+      rfloat waveNumberSquared;
+      float  angularFrequencySquared;
+      rfloat windDotWave;
+      waterComplex_t gaussian;
+
+      GaussianRandom( &gaussian.real, &gaussian.imaginary );
+
+      rowWaveNumberSquared    = rowWaveNumber * rowWaveNumber;
+      waveNumberSquared       = columnWaveNumber * columnWaveNumber + rowWaveNumberSquared;
+      angularFrequencySquared = sqrt( waveNumberSquared ) * waterMap->gravity;
+      windDotWave             = columnWaveNumber * waterMap->windDirection[1]
+                              + rowWaveNumber    * waterMap->windDirection[0];
+
+      if ( windDotWave <= 0.0f )
       {
-        v11 = sqrt(R_WaterExp(-1.0 / (v6 * v19))
-                   * *(float *)(a1 + 48) / (v6 * v6 * v6) * (v7 * v7) * 0.5)
-            * *(float *)(a1 + 48);
-        *(float *)(*(_DWORD *)(a1 + 8) + 8 * v4) = v21 * v11;
-        *(float *)(*(_DWORD *)(a1 + 8) + 8 * v4 + 4) = v22 * v11;
-        *(float *)(*(_DWORD *)(a1 + 12) + 4 * v4) = sqrt(v20);
+        waterMap->initialFrequencies[frequencyIndex].real      = 0.0f;
+        waterMap->initialFrequencies[frequencyIndex].imaginary = 0.0f;
+        waterMap->angularFrequencies[frequencyIndex]           = 0.0f;
       }
       else
       {
-        *(_DWORD *)(*(_DWORD *)(a1 + 8) + 8 * v4) = 0;
-        *(_DWORD *)(*(_DWORD *)(a1 + 8) + 8 * v4 + 4) = 0;
-        *(_DWORD *)(*(_DWORD *)(a1 + 12) + 4 * v4) = 0;
+        rfloat phillips;
+        rfloat scale;
+
+        phillips = R_WaterExp( -1.0f / ( waveNumberSquared * windLengthScaleSquared ) ) * waterMap->amplitude
+                 / ( waveNumberSquared * waveNumberSquared * waveNumberSquared )
+                 * ( windDotWave * windDotWave );
+        scale    = sqrt( phillips * 0.5f ) * waterMap->amplitude;
+
+        waterMap->initialFrequencies[frequencyIndex].real      = gaussian.real * scale;
+        waterMap->initialFrequencies[frequencyIndex].imaginary = gaussian.imaginary * scale;
+        waterMap->angularFrequencies[frequencyIndex]           = sqrt( angularFrequencySquared );
       }
-      v1 = *(_DWORD *)(a1 + 16);
-      ++v4;
-      ++v5;
+
+      ++frequencyIndex;
     }
-    result = *(_DWORD *)(a1 + 20) / 2;
   }
-  return result;
 }
 
-/* ---- WaterFrequenciesAtTime  0x00507430 ----  VERIFIED */
-int __cdecl WaterFrequenciesAtTime(int a1, _DWORD *a2, float a3)
+/* ---- WaterFrequenciesAtTime  0x00507430 ----  VERIFIED
+ * Rotate each spectrum bin by its phase at `timeSeconds`, sampling tr.sinTable
+ * (the +255 offset gives the cosine term for the real part).  The phase is
+ * spilled to a float, then converted by an inlined myftol (round-to-nearest
+ * fistp into ftol_tempSpill) and masked to the 1024-entry table. */
+void __cdecl WaterFrequenciesAtTime( waterComplex_t *frequencies, waterMap_t *waterMap, float timeSeconds )
 {
-  int result;
-  int v4;
-  int j;
-  float *v6;
-  int v7;
+  int index = 0;
+  int row, column;
+
+  for ( row = -waterMap->textureHeight / 2; row < waterMap->textureHeight / 2; ++row )
+  {
+    for ( column = -waterMap->textureWidth / 2; column < waterMap->textureWidth / 2; ++column )
+    {
+      if ( waterMap->angularFrequencies[index] == 0.0f )
+      {
+        frequencies[index].real      = 0.0f;
+        frequencies[index].imaginary = 0.0f;
+      }
+      else
+      {
+        int sineIndex   = R_WaterFtol( timeSeconds * waterMap->angularFrequencies[index] * 162.97466f ) & 0x3FF; /* 1024/(2*pi) */
+        int cosineIndex = ( sineIndex + 255 ) & 0x3FF;
+
+        frequencies[index].real      = tr_sinTable[cosineIndex] * waterMap->initialFrequencies[index].real;
+        frequencies[index].imaginary = tr_sinTable[sineIndex]   * waterMap->initialFrequencies[index].imaginary;
+      }
+
+      ++index;
+    }
+  }
+}
+
+/* ---- WaterAmplitudesFromFrequencies  0x00507520 ----  VERIFIED
+ * Inverse-transform the time-rotated spectrum into a spatial heightfield: an
+ * FFT along every row, then along every column.  Retail's EAX is left at
+ * textureWidth (dead). */
+void __cdecl WaterAmplitudesFromFrequencies( waterMap_t *waterMap, waterComplex_t *amplitudes )
+{
+  int rowLog2;       /* log2(textureHeight) */
+  int columnLog2;    /* log2(textureWidth)  */
   int i;
-  float v9;
 
-  result = (int)a2[5] / 2;
-  v4 = 0;
-  for ( i = (int)a2[5] / -2; i < result; ++i )
-  {
-    for ( j = (int)a2[4] / -2; j < (int)a2[4] / 2; ++j )
-    {
-      v6 = (float *)(a2[3] + 4 * v4);
-      if ( (*v6 == 0.0) | __UNORDERED__(*v6, 0.0) )
-      {
-        *(_DWORD *)(a1 + 8 * v4) = 0;
-        *(_DWORD *)(a1 + 8 * v4 + 4) = 0;
-      }
-      else
-      {
-        v9 = a3 * *v6 * 162.9746551513671875;
-        ftol_tempSpill = (int)v9;
-        v7 = (int)v9 & 0x3FF;
-        *(float *)(a1 + 8 * v4) = tr_sinTable[((_WORD)v7 + 255) & 0x3FF] * *(float *)(a2[2] + 8 * v4);
-        *(float *)(a1 + 8 * v4 + 4) = tr_sinTable[v7] * *(float *)(a2[2] + 8 * v4 + 4);
-      }
-      ++v4;
-    }
-    result = (int)a2[5] / 2;
-  }
-  return result;
+  rowLog2 = 0;
+  while ( waterMap->textureHeight != ( 1 << rowLog2 ) )
+    ++rowLog2;
+  columnLog2 = 0;
+  while ( waterMap->textureWidth != ( 1 << columnLog2 ) )
+    ++columnLog2;
+
+  for ( i = 0; i < waterMap->textureHeight; ++i )
+    FFT( columnLog2, amplitudes + i * waterMap->textureWidth, 1 );
+
+  for ( i = 0; i < waterMap->textureWidth; ++i )
+    FFT( rowLog2, amplitudes + i, waterMap->textureWidth );
 }
 
-/* ---- WaterAmplitudesFromFrequencies  0x00507520 ----  VERIFIED */
-int __cdecl WaterAmplitudesFromFrequencies(int a1, int *a2)
+/* ---- WaterNormalsFromAmplitudes  0x005075B0 ----  VERIFIED
+ * Turn the heightfield into a packed RGBA normal map.  The height at each texel
+ * is the magnitude of its complex amplitude (overwriting the real part), and
+ * each normal is the cross of the toroidally-wrapped column/row height slopes
+ * against a constant Z.  The Z term is texelCount^2 in wrapped 32-bit int math
+ * (0 for a 256x256 map), matching retail exactly.  Retail's per-row texel loop
+ * is an inline-asm block (EBP frame, stack arguments, fistp per component =
+ * round to nearest, `fmul st(0), st` squares); the locals it names live in the
+ * frame in declaration order. */
+void __cdecl WaterNormalsFromAmplitudes( unsigned int *normalPixels, waterComplex_t *amplitudes, waterMap_t *waterMap )
 {
-  int v2;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  int result;
-  int v8;
-  int *v9;
+  int   currentIndex;
+  int   previousColumnIndex;
+  int   texelCount;
+  int   previousRowIndex;
+  int   row;
+  float normalScale;
+  float normalZSquared;
+  int   textureWidth;
+  int   component;
+  int   texelMask;
+  int   index;
 
-  v2 = *(_DWORD *)(a1 + 20);
-  v3 = 0;
-  if ( v2 != 1 )
+  texelCount     = waterMap->textureWidth * waterMap->textureHeight;
+  normalZSquared = (int)( (unsigned)texelCount * (unsigned)texelCount );   /* wrapped int square */
+  textureWidth   = waterMap->textureWidth;
+  normalScale    = 127.0f;
+
+  /* collapse each complex amplitude to its magnitude, stored back in .real */
+  for ( index = 0; index < texelCount; ++index )
+#ifdef COD1_VC7
+    amplitudes[index].real = sqrt( amplitudes[index].imaginary * amplitudes[index].imaginary
+                                 + amplitudes[index].real * amplitudes[index].real );
+#else   /* modern: keep the products at double precision like retail's x87 */
+    amplitudes[index].real = sqrt( (double)amplitudes[index].imaginary * amplitudes[index].imaginary
+                                 + (double)amplitudes[index].real * amplitudes[index].real );
+#endif
+
+  texelMask           = texelCount - 1;
+  currentIndex        = 0;
+  previousColumnIndex = waterMap->textureWidth - 1;
+  previousRowIndex    = texelCount - waterMap->textureWidth;
+
+  for ( row = 0; row < waterMap->textureHeight; ++row )
   {
-    do
-      ++v3;
-    while ( v2 != 1 << v3 );
-  }
-  v4 = *(_DWORD *)(a1 + 16);
-  v5 = 0;
-  if ( v4 != 1 )
-  {
-    do
-      ++v5;
-    while ( v4 != 1 << v5 );
-  }
-  v6 = 0;
-  if ( v2 > 0 )
-  {
-    do
+    __asm
     {
-      /* v5 == log2(cols).  0x00507570. */
-      FFT(v5, &a2[2 * v6 * *(_DWORD *)(a1 + 16)], 1);
-      ++v6;
+      mov     esi, amplitudes
+      mov     ebx, previousColumnIndex
+      mov     edx, previousRowIndex
+      mov     eax, currentIndex
+      mov     ecx, textureWidth
+      mov     edi, normalPixels
+      lea     ebx, [esi+ebx*8]
+      lea     edx, [esi+edx*8]
+      lea     esi, [esi+eax*8]
+    nextTexel:
+      fld     dword ptr [ebx]          /* previous column height */
+      fld     dword ptr [edx]          /* previous row height */
+      fxch    st(1)
+      fsub    dword ptr [esi]          /* columnDifference */
+      fxch    st(1)
+      fsub    dword ptr [esi]          /* rowDifference */
+      fld     st(1)
+      fmul    st(0), st
+      fld     st(1)
+      fmul    st(0), st
+      fxch    st(1)
+      fadd    normalZSquared           /* ( cd^2 + Z ) + rd^2 */
+      faddp   st(1), st
+      fsqrt
+      fld     normalScale
+      fdivrp  st(1), st                /* scale = 127 / length */
+      mov     ebx, esi
+      add     edx, 8
+      add     esi, 8
+      fild    texelCount
+      mov     eax, 0FF7Fh
+      fmul    st, st(1)
+      fistp   component                /* normal Z */
+      add     eax, component
+      fxch    st(1)
+      shl     eax, 8
+      fmul    st, st(1)
+      add     eax, 7Fh
+      fistp   component                /* normal Y */
+      add     eax, component
+      fmulp   st(1), st
+      shl     eax, 8
+      fistp   component                /* normal X */
+      add     eax, 7Fh
+      add     eax, component
+      mov     [edi], eax
+      add     edi, 4
+      dec     ecx
+      jne     nextTexel
+      mov     normalPixels, edi
     }
-    while ( v6 < *(_DWORD *)(a1 + 20) );
+
+    currentIndex        += waterMap->textureWidth;
+    previousColumnIndex += waterMap->textureWidth;
+    previousRowIndex     = ( currentIndex - waterMap->textureWidth + texelCount ) & texelMask;
   }
-  result = *(_DWORD *)(a1 + 16);
-  v8 = 0;
-  if ( result > 0 )
-  {
-    v9 = a2;
-    do
-    {
-      /* v3 == log2(rows).  0x00507592. */
-      FFT(v3, v9, result);
-      result = *(_DWORD *)(a1 + 16);
-      ++v8;
-      v9 += 2;
-    }
-    while ( v8 < result );
-  }
-  return result;
 }
 
-/* ---- WaterNormalsFromAmplitudes  0x005075B0 ----  VERIFIED */
-int __cdecl WaterNormalsFromAmplitudes(_DWORD *a1, int a2, int a3)
+/* ---- WatersEquivalent  0x005076F0 ----  VERIFIED
+ * Two water configs match if their dimensions and world lengths are identical
+ * and their amplitude/gravity/wind speed and wind direction are within
+ * tolerance -- lets several water surfaces share one generated texture.
+ * `a` is the cached map, `b` the new config (LTCG passes them in EDX / ECX).
+ * The accumulated dot keeps retail's term order; the float `mag` is retail's
+ * dead fst dword (the unrounded value feeds the divide). */
+int __fastcall WatersEquivalent( const waterMap_t *a, const waterMap_t *b )
 {
-  int v3;
-  int v4;
-  double v5;
-  double v6;
-  int v7;
-  int result;
-  int v9;
-  _DWORD *v10;
-  float *v11;
-  float *v12;
-  float *v13;
-  double v14;
-  double v15;
-  long double v16; // rtt
-  int v17;
-  int v18;
-  int v19;
-  float i;
-  int j;
-  int v22;
-  int v23;
-  int v24;
-  int v25;
+  rfloat dot;
+  rfloat mag;
 
-  v3 = *(_DWORD *)(a3 + 16) * *(_DWORD *)(a3 + 20);
-  v19 = *(_DWORD *)(a3 + 16);
-  v4 = 0;
-  v23 = v3;
-  for ( i = (float)(v3 * v3); v4 < v3; *(float *)(a2 + 8 * v4 - 8) = sqrt(v5 * v5 + v6 * v6) )
-  {
-    v5 = *(float *)(a2 + 8 * v4++ + 4);
-    v6 = *(float *)(a2 + 8 * v4 - 8);
-  }
-  v18 = v3 - 1;
-  v7 = *(_DWORD *)(a3 + 16);
-  result = v3 - v7;
-  v22 = result;
-  v25 = 0;
-  v24 = v7 - 1;
-  for ( j = 0; j < *(_DWORD *)(a3 + 20); ++j )
-  {
-    v9 = v19;
-    v10 = a1;
-    v11 = (float *)(a2 + 8 * v24);
-    v12 = (float *)(a2 + 8 * v22);
-    v13 = (float *)(a2 + 8 * v25);
-    do
-    {
-      v14 = *v11 - *v13;
-      v15 = *v12 - *v13;
-      v11 = v13;
-      v12 += 2;
-      v13 += 2;
-      v16 = 127.0 / sqrt(v15 * v15 + v14 * v14 + i);
-      *v10++ = (int)(v14 * v16) + (((int)(v15 * v16) + (((int)((double)v23 * v16) + 65407) << 8) + 127) << 8) + 127;
-      --v9;
-    }
-    while ( v9 );
-    a1 = v10;
-    v17 = *(_DWORD *)(a3 + 16);
-    v25 += v17;
-    v24 += v17;
-    v22 = v18 & (v23 + v25 - v17);
-    result = j + 1;
-  }
-  return result;
-}
-
-/* ---- WatersEquivalent  0x005076F0 ----  VERIFIED */
-BOOL __fastcall WatersEquivalent(int a1, int a2)
-{
-  float adx, ady, bdx, bdy;
-  double dot, mag;
-
-  if ( *(_DWORD *)(a2 + 16) != *(_DWORD *)(a1 + 16) )
-    return 0;
-  if ( *(_DWORD *)(a2 + 20) != *(_DWORD *)(a1 + 20) )
-    return 0;
-  if ( !((*(float *)(a2 + 24) == *(float *)(a1 + 24))
-         | __UNORDERED__(*(float *)(a2 + 24), *(float *)(a1 + 24))) )
-    return 0;
-  if ( !((*(float *)(a2 + 28) == *(float *)(a1 + 28))
-         | __UNORDERED__(*(float *)(a2 + 28), *(float *)(a1 + 28))) )
-    return 0;
-  if ( !(fabs(*(float *)(a2 + 48) - *(float *)(a1 + 48)) <= 0.0010000000474974513) )
-    return 0;
-  if ( !(fabs(*(float *)(a2 + 32) - *(float *)(a1 + 32)) <= 0.1) )
-    return 0;
-  if ( !(fabs(*(float *)(a2 + 36) - *(float *)(a1 + 36)) <= 0.1) )
+  if ( a->textureWidth != b->textureWidth
+    || a->textureHeight != b->textureHeight
+    || a->horizontalWorldLength != b->horizontalWorldLength
+    || a->verticalWorldLength != b->verticalWorldLength
+    || fabs( a->amplitude - b->amplitude ) > 0.001f
+    || fabs( a->gravity - b->gravity ) > 0.1
+    || fabs( a->windVelocity - b->windVelocity ) > 0.1 )
     return 0;
 
-  /* 0x0050776E-0x005077C7 */
-  adx = *(float *)(a1 + 40);
-  ady = *(float *)(a1 + 44);
-  bdx = *(float *)(a2 + 40);
-  bdy = *(float *)(a2 + 44);
-  dot = adx * bdx + ady * bdy;
-  mag = sqrt((double)(adx * adx + ady * ady) * (double)(bdx * bdx + bdy * bdy));
-  if ( !(fabs(dot / (mag + 1e-10) - 1.0) <= 0.0010000000474974513) )
+  /* compare wind directions by the cosine of the angle between them */
+  dot  = a->windDirection[0] * b->windDirection[0];
+  dot += a->windDirection[1] * b->windDirection[1];
+  mag = sqrt( (double)( b->windDirection[0] * b->windDirection[0] + b->windDirection[1] * b->windDirection[1] )
+            * (double)( a->windDirection[0] * a->windDirection[0] + a->windDirection[1] * a->windDirection[1] ) )
+      + 1e-10;
+  if ( fabs( dot / mag - 1.0f ) > 0.001f )
     return 0;
+
   return 1;
 }
 
-/* ---- R_InitWater  0x005077E0 ----  VERIFIED */
-float *R_InitWater()
+/* ---- R_InitWater  0x005077E0 ----  VERIFIED
+ * Reset the water-map cache and (re)build the FFT tables. */
+void R_InitWater( void )
 {
   s_numWaterMaps = 0;
-  return FFT_Init();
+  FFT_Init();
 }
 
-/* ---- R_GetWaterTexture  0x005077F0 ----  VERIFIED */
-int *__cdecl R_GetWaterTexture(_DWORD *a1)
+/* ---- R_GetWaterTexture  0x005077F0 ----  VERIFIED
+ * Look up (or create) the cached water map for a shader's configuration: reuse
+ * an equivalent existing map, else allocate the spectrum, pre-roll it, and
+ * create the *water%i normal texture.  Returns the map, or NULL if the image
+ * failed. */
+waterMap_t *__cdecl R_GetWaterTexture( waterMap_t *config )
 {
-  int v1;
-  int v2;
-  void *v4;
-  int v6;
-  int v7;
-  void *v8;
-  int v9;
-  int v10;
-  char *v11;
-  int v12;
-  int v14;
-  int *v15;
-  int v16;
+  waterMap_t *waterMap;
+  int         mapIndex;
+  int         texelCount;
+  void       *pixels;
 
-  v1 = s_numWaterMaps;
-  v2 = 0;
-  v14 = 0;
-  if ( s_numWaterMaps > 0 )
+  for ( mapIndex = 0; mapIndex < s_numWaterMaps; ++mapIndex )
   {
-    v4 = &s_waterMaps;
-    do
-    {
-      if ( WatersEquivalent((int)a1, (int)v4) )
-        return (int *)((char *)&s_waterMaps + 52 * v2);
-      ++v2;
-      v4 = (char *)v4 + 52;   /* 0x00507820  add edx, 34h */
-    }
-    while ( v2 < v1 );
-    v14 = v2;
-    if ( v2 == 16 )
-      ri_Error(1, "\x15" "map uses more than %i waterMap textures", 16);
+    if ( WatersEquivalent( &s_waterMaps[mapIndex], config ) )
+      return &s_waterMaps[mapIndex];
   }
-  v6 = a1[4] * a1[5];
-  v16 = 13 * v2;
-  v15 = (int *)((char *)&s_waterMaps + 52 * v2);
-  qmemcpy(v15, a1, 0x34u);
-  v7 = ri_Hunk_Alloc(12 * v6);
-  dword_11EDD78[v16] = v7;
-  dword_11EDD7C[v16] = v7 + 8 * v6;
-  PickWaterFrequencies((int)v15);
-  v8 = (void *)ri_Hunk_AllocateTempMemory(4 * a1[4] * a1[5]);
-  memset(v8, 0xFFu, 4 * a1[4] * a1[5]);
-  v9 = a1[5];
-  v10 = a1[4];
-  v11 = va("*water%i", v14);
-  v12 = R_AllocImage(v11, 3553, v10, v9, 0, 8);
-  if ( !R_CreateImageInternal(v12, 0, (unsigned __int8 *)v8, 0xDE1u, 6408) )
-  {
-    R_FreeImage(v12);
-    v12 = 0;
-  }
-  *v15 = v12;
-  ri_Hunk_FreeTempMemory(v8);
-  if ( !*v15 )
+
+  if ( mapIndex == 16 )
+    ri.Error( 1, "\x15" "map uses more than %i waterMap textures", 16 );
+
+  texelCount = config->textureWidth * config->textureHeight;
+  waterMap   = &s_waterMaps[mapIndex];
+
+  /* copy the whole parser record (including the uninitialised uploadFrame,
+   * which retail leaves for RB_UploadWaterTexture to compare against) before
+   * replacing the image and the two spectrum pointers. */
+  memcpy( waterMap, config, sizeof( waterMap_t ) );
+  s_waterMaps[mapIndex].initialFrequencies = (waterComplex_t *)ri.Hunk_Alloc( 12 * texelCount );
+  s_waterMaps[mapIndex].angularFrequencies = (float *)&s_waterMaps[mapIndex].initialFrequencies[texelCount];
+  PickWaterFrequencies( waterMap );
+
+  pixels = (void *)ri.Hunk_AllocateTempMemory( 4 * config->textureWidth * config->textureHeight );
+  memset( pixels, 0xFF, 4 * config->textureWidth * config->textureHeight );
+
+  /* R_CreateImage is inlined by LTCG here (flags 0: no delayed upload) */
+  waterMap->image = (void *)R_CreateImage( va( "*water%i", mapIndex ), 0, 8, (unsigned char *)pixels,
+                                           config->textureWidth, config->textureHeight, 6408, 0 );   /* GL_RGBA */
+  ri.Hunk_FreeTempMemory( pixels );
+
+  if ( !waterMap->image )
     return 0;
+
   ++s_numWaterMaps;
-  return v15;
+  return waterMap;
 }
 
-/* ---- RB_UploadWaterTexture  0x00507950 ----  VERIFIED */
-void __cdecl RB_UploadWaterTexture(_DWORD *water, int a1, int a2)
+/* ---- RB_UploadWaterTexture  0x00507950 ----  VERIFIED
+ * Once per frame, re-derive the water normal map for the current time and blit
+ * it into the map's texture on the given texture unit.  The two big locals are
+ * the retail 256x256 stack workspaces (spectrum + packed RGBA normals); the
+ * byte-typed normal buffer is what gives retail its /GS cookie. */
+void __cdecl RB_UploadWaterTexture( waterMap_t *water, int time, int textureUnit )
 {
-  _DWORD *v3;
-  int v4;
-  float v5;
-  _DWORD pixels[65536]; // [esp+14h] [ebp-C0004h] BYREF
-  int v7[131073]; // [esp+40014h] [ebp-80004h] BYREF
-  unsigned int retaddr;
+  byte           normalPixels[65536 * 4];  /* 256*256 packed RGBA normals */
+  waterComplex_t amplitudes[65536];        /* 256*256 complex working buffer */
 
-  v3 = water;
-  v4 = water[1];
-  v7[0x20000] = retaddr ^ _security_cookie;
-  if ( v4 != tr_frameCount )
+  if ( water->uploadFrame != tr_frameCount )
   {
-    v3[1] = tr_frameCount;
-    v5 = (double)a1 * 0.0010000000474974513;
-    WaterFrequenciesAtTime((int)v7, v3, v5);
-    WaterAmplitudesFromFrequencies((int)v3, v7);
-    WaterNormalsFromAmplitudes(pixels, (int)v7, (int)v3);
-    if ( glState_currentTmu != a2 )
+    water->uploadFrame = tr_frameCount;
+
+#ifdef COD1_VC7
+    WaterFrequenciesAtTime( amplitudes, water, time * 0.001f );   /* ms -> s */
+#else   /* modern: retail's fild/fmul product is exact before the float rounding */
+    WaterFrequenciesAtTime( amplitudes, water, (float)( (double)time * 0.001f ) );
+#endif
+    WaterAmplitudesFromFrequencies( water, amplitudes );
+    WaterNormalsFromAmplitudes( (unsigned int *)normalPixels, amplitudes, water );
+
+    /* GL_SelectTexture, inlined by retail */
+    if ( glState_currentTmu != textureUnit )
     {
-      qglActiveTextureARB(a2 + 33984);
-      glState_currentTmu = a2;
+      qglActiveTextureARB( textureUnit + 33984 );          /* GL_TEXTURE0_ARB */
+      glState_currentTmu = textureUnit;
     }
-    if ( glState_currentClientTmu != a2 )
+    if ( glState_currentClientTmu != textureUnit )
     {
-      qglClientActiveTextureARB(a2 + 33984);
-      glState_currentClientTmu = a2;
+      qglClientActiveTextureARB( textureUnit + 33984 );
+      glState_currentClientTmu = textureUnit;
     }
-    GL_Bind((GLenum *)*v3);
+
+    GL_Bind( (GLenum *)water->image );
     glTexSubImage2D(
-      0xDE1u,
+      0xDE1u,                                              /* GL_TEXTURE_2D */
       0,
       0,
       0,
-      *(unsigned __int16 *)(*v3 + 64),
-      *(unsigned __int16 *)(*v3 + 66),
-      0x1908u,
-      0x1401u,
-      pixels);
+      *(unsigned short *)( (char *)water->image + 64 ),    /* image->width */
+      *(unsigned short *)( (char *)water->image + 66 ),    /* image->height */
+      0x1908u,                                             /* GL_RGBA */
+      0x1401u,                                             /* GL_UNSIGNED_BYTE */
+      normalPixels );
   }
 }

@@ -7,29 +7,37 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "mss32.h"
+
+/* ---- miles/MSS sound globals ---- */
+int mss_q3fs;
+int mss_roomtype;
+int mss_volume;
+int mss_wetlevel;
+int mss_3d_provider;                /* 0x01651574 */
+int (*mss_bits)();                  /* 0x01651568 */
+int mss_khz;                        /* 0x0165156C */
+int mss_stereo;                     /* 0x01651560 */
+cvar_t *mss_errorOnMissing;         /* 0x01651564, read by com_sndalias.c */
+
 
 extern void *Com_PickSoundAlias( const char *name, int source );
 extern int Com_UnloadSoundAliasSounds();
+/* universal/com_sndalias.c 0x004340B0.  Declared locally rather than by
+   including universal/com_sndalias.h. */
+void Com_UnloadSoundAliases( int source );
 extern int FS_FOpenFileRead_Internal();
 extern int Hunk_AllocAlignInternal();
 extern int j__atol();
-extern int FastRound();
-extern int sub_524F40();
+extern int __cdecl FastRound( float f );   /* client_mp/cl_console_mp.c 0x00408370 */
+vec_t DistanceSquared( const vec3_t p1, const vec3_t p2 );   /* com_math.c (/Op), LTCG-inlined */
+#ifdef COD1_VC7
+double Distance( const vec3_t p1, const vec3_t p2 );         /* com_math.c (vec_t, /Op), LTCG-inlined; double here: MSS_StartAlias3DSample re-stores it (0x0044CC5D) */
+#else
+vec_t Distance( const vec3_t p1, const vec3_t p2 );
+#endif
 
-extern unsigned int __stdcall timeGetTime( void );
-
-#define mss_digitalDriver       mss_digitalDriver
-#define mss_3DProvider          mss_3DProvider
-#define mss_driverRate          mss_driverRate
-#define mss_driverBits          mss_driverBits
-#define mss_driverChannels      mss_driverChannels
-#define mss_num2DChannels       mss_num2DChannels
-#define mss_numStreamChannels   mss_numStreamChannels
-
-#define mss_max3DChannels       ( *(int *)&mss_max3DChannels )
+__declspec( dllimport ) unsigned long __stdcall timeGetTime( void );
 
 #define MSS_CVAR( g )   ( (cvar_t *)(void *)( g ) )
 
@@ -44,9 +52,27 @@ extern unsigned int __stdcall timeGetTime( void );
 #define MSS_FIRST_FREE_STREAM   5
 #define MSS_NUM_ALIAS_CHANNELS  10
 
+/* the <windef.h> min / max macros */
+#define MSS_MIN( a, b )     ( ( ( a ) < ( b ) ) ? ( a ) : ( b ) )
+#define MSS_MAX( a, b )     ( ( ( a ) > ( b ) ) ? ( a ) : ( b ) )
+
 #define MSS_NO_ENTITY           0x400
 
-#define MSS_FTOL( f )           ( (int)( (f) + 9.313225746154785e-10 ) )
+/* Every retail float-to-int conversion modelled by MSS_FTOL is FastRound
+ * 0x00408370 (14 inlined copies in this range, e.g. 0x0044CA4F-0x0044CA5B,
+ * plus direct calls at 0x00450DD6 / 0x0045106D / 0x004510B4): the value is
+ * stored to a float, reloaded, 2^-30 is added and fistp rounds to nearest.
+ * No site uses the truncating __ftol2 of an (int) cast. */
+#define MSS_FTOL( f )           FastRound( (float)( f ) )
+
+/* An int converted for float arithmetic: retail's (float) conversion gives
+ * fild x; fmul/fdivr ..., unrounded on the x87 under VC7 (a (double) cast
+ * emits fld y; fimul x instead); the modern build keeps double. */
+#ifdef COD1_VC7
+#define MSS_I2F( x )            ( (float)( x ) )
+#else
+#define MSS_I2F( x )            ( (double)( x ) )
+#endif
 
 typedef struct {
 	int      entnum;        /* +0x00  0..1023, or MSS_NO_ENTITY             */
@@ -63,6 +89,7 @@ typedef struct {
 	vec3_t   localOrigin;   /* +0x28  offset in the entity's own frame      */
 	int      paused;        /* +0x34                                        */
 } mssChannel_t;
+COD1_ASSERT_SIZE( mssChannel_t, 0x38 );
 
 typedef struct {
 	int      spatialized;   /* +0x00 */
@@ -74,17 +101,107 @@ typedef struct {
 	float    rate;
 } mssBackgroundFade_t;
 
-static mssChannel_t        mss_channels[ MSS_NUM_CHANNELS ];
-static int                 mss_2DHandles[ MSS_MAX_2D ];        /* 0x008E1968 */
-static int                 mss_3DHandles[ MSS_MAX_3D ];        /* 0x008E19E8 */
-static int                 mss_streamHandles[ MSS_MAX_STREAM ];/* 0x008E1A68 */
-static mssStreamInfo_t     mss_streamInfo[ MSS_MAX_STREAM ];   /* 0x008E1A9C */
-static mssBackgroundFade_t mss_bgFade[ MSS_NUM_BACKGROUND ];   /* 0x008E0814 */
+/* The Miles state block 0x008E0760..0x008E1BD0, one global as in retail
+   (MSS_Shutdown clears it with rep stosd).  The stream handles of channels
+   32..44 are addressed from the 3D table's base (mss_3DHandles + chan). */
+static struct {
+	int                 digitalDriver;                         /* 0x008E0760 */
+	int                 provider3D;                            /* 0x008E0764 */
+	int                 driverRate;                            /* 0x008E0768 */
+	int                 driverBits;                            /* 0x008E076C */
+	int                 driverChannels;                        /* 0x008E0770 */
+	float               timeScale;                             /* 0x008E0774 */
+	int                 paused;                                /* 0x008E0778 */
+	int                 pauseTime;                             /* 0x008E077C */
+	int                 cpuPercent;                            /* 0x008E0780 */
+	void               *pendingRestore;                        /* 0x008E0784 */
+	int                 pendingRestoreSize;                    /* 0x008E0788 */
+	float               masterVolume;                          /* 0x008E078C */
+	float               globalFade[3];                         /* 0x008E0790 cur, target, rate */
+	float               channelFade[ MSS_NUM_ALIAS_CHANNELS ][3];/* 0x008E079C */
+	mssBackgroundFade_t bgFade[ MSS_NUM_BACKGROUND ];          /* 0x008E0814 */
+	int                 ambientSlot;                           /* 0x008E083C */
+	int                 roomType;                              /* 0x008E0840 */
+	float               wetLevel;                              /* 0x008E0844 */
+	float               wetTarget;                             /* 0x008E0848 */
+	float               wetRate;                               /* 0x008E084C */
+	vec3_t              listenerOrigin;                        /* 0x008E0850 */
+	vec3_t              listenerAxis[3];                       /* 0x008E085C */
+	int                 listenerEntnum;                        /* 0x008E0880 */
+	int                 time;                                  /* 0x008E0884 */
+	int                 loopFrameTime;                         /* 0x008E0888 */
+	int                 anyMasters;                            /* 0x008E088C */
+	mssChannel_t        channels[ MSS_NUM_CHANNELS ];          /* 0x008E0890 */
+	int                 handles2D[ MSS_MAX_2D ];               /* 0x008E1968 */
+	int                 handles3D[ MSS_MAX_3D ];               /* 0x008E19E8 */
+	int                 handlesStream[ MSS_MAX_STREAM ];       /* 0x008E1A68 */
+	mssStreamInfo_t     streamInfo[ MSS_MAX_STREAM ];          /* 0x008E1A9C */
+	int                 num2DChannels;                         /* 0x008E1B6C */
+	int                 max3DChannels;                         /* 0x008E1B70 */
+	int                 numStreamChannels;                     /* 0x008E1B74 */
+	int                 rawSampleHandle;                       /* 0x008E1B78 */
+	int                 rawSampleRate;                         /* 0x008E1B7C */
+	int                 rawSampleWidthBytes;                   /* 0x008E1B80 */
+	int                 rawChannelCount;                       /* 0x008E1B84 */
+	void               *rawRingBuffer;                         /* 0x008E1B88 */
+	char                rawSegmentReady[32];                   /* 0x008E1B8C */
+	int                 rawSegmentSize;                        /* 0x008E1BAC */
+	int                 rawWriteSegmentOffset;                 /* 0x008E1BB0 */
+	int                 rawReadSegmentIndex;                   /* 0x008E1BB4 */
+	int                 rawWriteSegmentIndex;                  /* 0x008E1BB8 */
+	double              rawSampleTimeBaseMsec;                 /* 0x008E1BC0 */
+	double              rawSampleTimePerByteMsec;              /* 0x008E1BC8 */
+} mss_state;
 
-static float               mss_channelFade[ MSS_NUM_ALIAS_CHANNELS ][3];
-
-static vec3_t              mss_listenerOrigin;
-static vec3_t              mss_listenerAxis[3];
+#define mss_digitalDriver            mss_state.digitalDriver
+#define mss_3DProvider               mss_state.provider3D
+#define mss_driverRate               mss_state.driverRate
+#define mss_driverBits               mss_state.driverBits
+#define mss_driverChannels           mss_state.driverChannels
+#define mss_timeScale                mss_state.timeScale
+#define mss_paused                   mss_state.paused
+#define mss_pauseTime                mss_state.pauseTime
+#define mss_cpuPercent               mss_state.cpuPercent
+#define mss_pendingRestore           mss_state.pendingRestore
+#define mss_pendingRestoreSize       mss_state.pendingRestoreSize
+#define mss_masterVolume             mss_state.masterVolume
+#define mss_globalFade               mss_state.globalFade
+#define mss_globalFadeCur            mss_state.globalFade[0]
+#define mss_globalFadeTarget         mss_state.globalFade[1]
+#define mss_globalFadeRate           mss_state.globalFade[2]
+#define mss_channelFade              mss_state.channelFade
+#define mss_bgFade                   mss_state.bgFade
+#define mss_ambientSlot              mss_state.ambientSlot
+#define mss_roomType                 mss_state.roomType
+#define mss_wetLevel                 mss_state.wetLevel
+#define mss_wetTarget                mss_state.wetTarget
+#define mss_wetRate                  mss_state.wetRate
+#define mss_listenerOrigin           mss_state.listenerOrigin
+#define mss_listenerAxis             mss_state.listenerAxis
+#define mss_listenerEntnum           mss_state.listenerEntnum
+#define mss_time                     mss_state.time
+#define mss_loopFrameTime            mss_state.loopFrameTime
+#define mss_anyMasters               mss_state.anyMasters
+#define mss_channels                 mss_state.channels
+#define mss_2DHandles                mss_state.handles2D
+#define mss_3DHandles                mss_state.handles3D
+#define mss_streamHandles            mss_state.handlesStream
+#define mss_streamInfo               mss_state.streamInfo
+#define mss_num2DChannels            mss_state.num2DChannels
+#define mss_max3DChannels            mss_state.max3DChannels
+#define mss_numStreamChannels        mss_state.numStreamChannels
+#define mss_rawSampleHandle          mss_state.rawSampleHandle
+#define mss_rawSampleRate            mss_state.rawSampleRate
+#define mss_rawSampleWidthBytes      mss_state.rawSampleWidthBytes
+#define mss_rawChannelCount          mss_state.rawChannelCount
+#define mss_rawRingBuffer            mss_state.rawRingBuffer
+#define mss_rawSegmentReady          mss_state.rawSegmentReady
+#define mss_rawSegmentSize           mss_state.rawSegmentSize
+#define mss_rawWriteSegmentOffset    mss_state.rawWriteSegmentOffset
+#define mss_rawReadSegmentIndex      mss_state.rawReadSegmentIndex
+#define mss_rawWriteSegmentIndex     mss_state.rawWriteSegmentIndex
+#define mss_rawSampleTimeBaseMsec    mss_state.rawSampleTimeBaseMsec
+#define mss_rawSampleTimePerByteMsec mss_state.rawSampleTimePerByteMsec
 
 #define MSS_2D_HANDLE( c )      mss_2DHandles[ (c) - MSS_FIRST_2D ]
 #define MSS_3D_HANDLE( c )      mss_3DHandles[ (c) ]
@@ -108,6 +225,30 @@ static vec3_t              mss_listenerAxis[3];
 #define AL_STREAMFOUND( a ) ( *(unsigned char *)( (char *)(a) + 55 ) )
 #define AL_DUCKVOL( a )     ( *(float *)      ( (char *)(a) + 56 ) )
 
+/* Sound alias layout (com_sndalias.c's snd_alias_t).  VC7 emits retail's
+   fld [a] / fcomp [b] only for fields read through an uncast struct pointer;
+   the cast-and-offset AL_ macros give fld / fld / fcompp. */
+typedef struct mssAlias_s {
+	const char *name;           /* +0x00 */
+	const char *file;           /* +0x04 */
+	const char *subtitle;       /* +0x08 */
+	int        *soundData;      /* +0x0C */
+	int         pickSequence;   /* +0x10 */
+	float       volMin;         /* +0x14 */
+	float       volMax;         /* +0x18 */
+	float       pitchMin;       /* +0x1C */
+	float       pitchMax;       /* +0x20 */
+	float       distMin;        /* +0x24 */
+	float       distMax;        /* +0x28 */
+	int         channel;        /* +0x2C */
+	int         type;           /* +0x30 */
+	unsigned char loop;         /* +0x34 */
+	unsigned char isMaster;     /* +0x35 */
+	unsigned char isSlave;      /* +0x36 */
+	unsigned char streamExists; /* +0x37 */
+	float       slavePercent;   /* +0x38 */
+} mssAlias_t;
+
 #define AL_TYPE_SAMPLE      1
 #define AL_TYPE_STREAM      2
 
@@ -120,29 +261,10 @@ static vec3_t              mss_listenerAxis[3];
 #define SND_SAMPLES( s )    ( ((unsigned int *)(s))[6] )
 #define SND_BLOCKSIZE( s )  ( ((unsigned int *)(s))[7] )
 
-#define mss_paused              mss_paused    /* 0x008E0778 */
-#define mss_pauseTime           mss_pauseTime
-#define mss_cpuPercent          mss_cpuPercent
-#define mss_pendingRestore      mss_pendingRestore
-#define mss_pendingRestoreSize  mss_pendingRestoreSize
-#define mss_masterVolume        mss_masterVolume
-#define mss_globalFadeCur       mss_globalFadeCur
-#define mss_globalFadeTarget    ( *(float *)&mss_globalFadeTarget )
-#define mss_globalFadeRate      mss_globalFadeRate
-#define mss_ambientSlot         mss_ambientSlot
-#define mss_roomType            mss_roomType
-#define mss_wetLevel            ( *(float *)&mss_wetLevel )
-#define mss_wetTarget           ( *(float *)&mss_wetTarget )
-#define mss_wetRate             mss_wetRate
-#define mss_listenerEntnum      mss_listenerEntnum
-#define mss_time                mss_time
-#define mss_loopFrameTime       mss_loopFrameTime
-#define mss_anyMasters          mss_anyMasters
-#define mss_timeScale           mss_timeScale
 
-static int   MSS_UpdateBackgroundVolume( int msec, int slot );
+static int   MSS_UpdateBackgroundVolume( int slot, int msec );
 static void  MSS_SpatializeStream( float *volume, int slot, float *pan );
-static int   MSS_FindReplacableChannel( int first, int count, int entnum, int priority );
+static int   MSS_FindReplacableChannel( int entnum, int priority, int first, int count );
 static void *MSS_StartBackground( void *alias, int slot, int msec );
 
 typedef struct {
@@ -153,18 +275,22 @@ typedef struct {
 	float       rateScale;
 } mssOverlay_t;
 
-int  MSS_PauseSounds( void );
-int  MSS_UnpauseSounds( void );
-int  MSS_StopSounds( int flags );
-int  MSS_Update( void );
+void MSS_PauseSounds( void );
+void MSS_UnpauseSounds( void );
+void MSS_UpdatePause( void );
+void  MSS_StopSounds( int flags );
+void MSS_Update( void );
 void MSS_Restore( int buffer, int size );
 
 extern char *FS_ShortOSFilePath( const char *fullpath );
 
 /* ---- MSS_Alloc  0x0044B930 ---- CONFIRMED */
-void __cdecl MSS_Alloc(void *this)
+void __cdecl MSS_Alloc( void *size )
 {
-  Hunk_AllocAlignInternal(((unsigned int)this + 3) & 0xFFFFFFFC, 32);
+	/* Miles memory-alloc callback: round the requested size up to a multiple of
+	   4 and hand it to the hunk allocator.  The result is returned in EAX by the
+	   tail call (the recovered prototype is void, so it is left implicit). */
+	Hunk_AllocAlignInternal( ( (unsigned int)size + 3 ) & 0xFFFFFFFC, 32 );
 }
 
 /* ---- MSS_Free  0x0044B940 ---- CONFIRMED */
@@ -174,12 +300,11 @@ void MSS_Free()
 }
 
 /* ---- MSS_FileOpenCallback  0x0044B950 ---- CONFIRMED */
-int __stdcall MSS_FileOpenCallback(char *Source, fileHandle_t *file)
+int __stdcall MSS_FileOpenCallback( char *filename, fileHandle_t *file )
 {
-  int Internal;
+	int len = FS_FOpenFileRead_Internal( filename, file, qtrue, 1 );
 
-  Internal = FS_FOpenFileRead_Internal(Source, file, qtrue, 1);
-  return Internal == -1 ? 0 : Internal;
+	return ( len == -1 ) ? 0 : len;
 }
 
 /* ---- MSS_FileCloseCallback  0x0044B980 ---- CONFIRMED */
@@ -232,27 +357,24 @@ int MSS_Init2D( void )
 	case 44:
 		rate = 44100;               /* 0xAC44 */
 		break;
-	case 22:
-		rate = 22050;               /* 0x5622 */
-		break;
 	default:
 		Com_Printf( "invalid value %i for mss_khz, using 22 khz instead\n",
 					MSS_CVAR( mss_khz )->integer );
-		rate = 22050;
+		/* fall through: retail duplicates the 22 kHz store into both paths */
+	case 22:
+		rate = 22050;               /* 0x5622 */
 		break;
 	}
 
-	if ( MSS_CVAR( mss_bits )->integer == 8 ) {
-		bytes = 1;
-	} else {
+	if ( MSS_CVAR( mss_bits )->integer != 8 ) {
 		if ( MSS_CVAR( mss_bits )->integer != 16 ) {
 			Com_Printf( "invalid value %i for mss_bits (should be 8 or 16), "
-						"using 16 instead\n", MSS_CVAR( mss_bits )->integer );
+				"using 16 instead\n", MSS_CVAR( mss_bits )->integer );
 		}
 		bytes = 2;
-	}
+	} else { bytes = 1; }
 
-	channels    = MSS_CVAR( mss_stereo )->integer ? 2 : 1;
+	channels = MSS_CVAR( mss_stereo )->integer ? 2 : 1;
 	channelName = ( channels == 2 ) ? "stereo" : "mono";
 
 	Com_Printf( "Attempting %i kHz %i bit %s sound\n",
@@ -271,177 +393,100 @@ int MSS_Init2D( void )
 	mss_driverRate        = rate;   /* 0x008E0768 */
 	mss_driverBits        = 8 * bytes;
 	mss_driverChannels    = channels;
-	*(float *)&mss_timeScale = 1.0f;
+	mss_timeScale         = 1.0f;
 
-	Com_Printf( "2D provider initialized at %i %i %i\n",
-				rate, 8 * bytes, channels );
+	/* Retail 0x0044BB1A pushes only the format (push 55FC48h, then
+	 * add esp,4 at 0x0044BB54), with no varargs after it.  The three %i
+	 * therefore read the next stack dwords: the edi, esi and ebp this
+	 * function's prologue saved, which still hold MSS_Init's caller's
+	 * values (0x0040FE98 / 0x0041161C) because MSS_Init has not changed
+	 * them by its call at 0x0044FFA8.  The printed numbers are
+	 * nondeterministic garbage, so no fixed value can stand in for them. */
+	Com_Printf( "2D provider initialized at %i %i %i\n" );
 	return 1;
 }
-#if 0
-int MSS_Init2D()
-{
-  int v0; // eax
-  int v1; // ebp
-  int v2; // eax
-  int v3; // edi
-  int v4; // esi
-  const char *v5; // eax
-  const char *error; // eax
-  int v8; // [esp+0h] [ebp-10h]
-  int v9; // [esp+4h] [ebp-Ch]
-  int v10; // [esp+8h] [ebp-8h]
-
-  v0 = *(_DWORD *)(mss_khz + 32);
-  switch ( v0 )
-  {
-    case 11:
-      v1 = 11025;
-      break;
-    case 22:
-LABEL_5:
-      v1 = 22050;
-      break;
-    case 44:
-      v1 = 44100;
-      break;
-    default:
-      Com_Printf("invalid value %i for mss_khz, using 22 khz instead\n", *(_DWORD *)(mss_khz + 32));
-      goto LABEL_5;
-  }
-  v2 = *(_DWORD *)(mss_bits + 32);
-  if ( v2 == 8 )
-  {
-    v3 = 1;
-  }
-  else
-  {
-    if ( v2 != 16 )
-      Com_Printf("invalid value %i for mss_bits (should be 8 or 16), using 16 instead\n", *(_DWORD *)(mss_bits + 32));
-    v3 = 2;
-  }
-  v4 = *(_DWORD *)(mss_stereo + 32);
-  v5 = "stereo";
-  if ( v4 == 0 )
-    v5 = "mono";
-  Com_Printf("Attempting %i kHz %i bit %s sound\n", v1 / 1000, 8 * v3, v5);
-  AIL_set_preference(1, 77);
-  mss_digitalDriver = AIL_open_digital_driver(v1, v3, (v4 != 0) + 1, 0);
-  if ( mss_digitalDriver )
-  {
-    mss_num2DChannels = 32;
-    mss_numStreamChannels = 13;
-    mss_driverRate = v1;
-    mss_driverBits = 8 * v3;
-    mss_driverChannels = (v4 != 0) + 1;
-    mss_timeScale = 1.0;
-    Com_Printf("2D provider initialized at %i %i %i\n", v8, v9, v10);
-    return 1;
-  }
-  else
-  {
-    error = (const char *)AIL_last_error();
-    Com_Printf("couldn't initialize 2D provider: %s\n", error);
-    return 0;
-  }
-}
-#endif
 
 /* ---- MSS_Init3DProvider  0x0044BB70 ---- CONFIRMED */
-int __cdecl MSS_Init3DProvider(char *String2, char *String1)
+int __cdecl MSS_Init3DProvider( char *requestedName, int verbose )
 {
-  char *v2;
-  int v3;
-  int v4;
-  const char *v5;
-  int v6;
-  const char *error;
-  int v8;
-  const char *v10;
-  int v11;
-  int v12;
+	char *name;
+	int   enumHandle;
+	int   providerId;
+	int   requestedId;
+	int   fallbackId;      /* "Miles Fast 2D Positional Audio" */
 
-  v2 = String1;
-  v3 = 0;
-  if ( String1 )
-    Com_Printf("available 3D providers:\n");
-  v4 = 0;
-  v12 = 0;
-  while ( AIL_enumerate_3D_providers(&v12, &v11, &String1) )
-  {
-    if ( v2 )
-      Com_Printf("  %s\n", String1);
-    if ( !_stricmp(String1, String2) )
-      v4 = v11;
-    if ( !_stricmp(String1, "Miles Fast 2D Positional Audio") )
-      v3 = v11;
-  }
-  mss_3DProvider = 0;
-  if ( v4 )
-  {
-    if ( AIL_open_3D_provider(v4) )
-    {
-      error = (const char *)AIL_last_error();
-      Com_Printf("couldn't open 3D provider '%s': %s\n", String2, error);
-      v6 = mss_3DProvider;
-      v5 = String2;
-    }
-    else
-    {
-      v5 = String2;
-      Com_Printf("using 3D provider '%s'\n", String2);
-      v6 = v4;
-      mss_3DProvider = v4;
-    }
-    if ( v6 )
-      goto LABEL_16;
-  }
-  else
-  {
-    v5 = String2;
-  }
-  if ( !v3 )
-    return 0;
-  if ( v3 == v4 )
-    return 0;
-  if ( *v5 )
-  {
-    if ( _stricmp(v5, "Miles Fast 2D Positional Audio") )
-      Com_Printf("trying to use 'Miles Fast 2D Positional Audio' instead of '%s'\n", v5);
-  }
-  if ( AIL_open_3D_provider(v3) )
-  {
-    v10 = (const char *)AIL_last_error();
-    Com_Printf("couldn't open 3D provider '%s': %s\n", "Miles Fast 2D Positional Audio", v10);
-  }
-  else
-  {
-    Com_Printf("using 3D provider '%s'\n", "Miles Fast 2D Positional Audio");
-    mss_3DProvider = v3;
-    Cvar_Set2("mss_3d_provider", "Miles Fast 2D Positional Audio", qtrue);
-  }
-  v6 = mss_3DProvider;
-  if ( !mss_3DProvider )
-    return 0;
-LABEL_16:
-  AIL_3D_provider_attribute(v6, "Maximum supported samples", &mss_max3DChannels);
-  v8 = mss_max3DChannels;
-  if ( mss_max3DChannels > 32 )
-  {
-    v8 = 32;
-    mss_max3DChannels = 32;
-  }
-  Com_Printf("%i max 3D channels\n", v8);
-  AIL_set_3D_distance_factor(mss_3DProvider, 0.0254f);
-  return 1;
+	if ( verbose ) {
+		Com_Printf( "available 3D providers:\n" );
+	}
+
+	requestedId = 0;
+	fallbackId = 0;
+	enumHandle = 0;
+	while ( AIL_enumerate_3D_providers( &enumHandle, &providerId, &name ) ) {
+		if ( verbose ) {
+			Com_Printf( "  %s\n", name );
+		}
+		if ( !_stricmp( name, requestedName ) ) {
+			requestedId = providerId;
+		}
+		if ( !_stricmp( name, "Miles Fast 2D Positional Audio" ) ) {
+			fallbackId = providerId;
+		}
+	}
+
+	mss_3DProvider = 0;
+
+	if ( requestedId ) {
+		if ( !AIL_open_3D_provider( requestedId ) ) {
+			Com_Printf( "using 3D provider '%s'\n", requestedName );
+			mss_3DProvider = requestedId;
+		} else {
+			Com_Printf( "couldn't open 3D provider '%s': %s\n",
+						requestedName, AIL_last_error() );
+		}
+	}
+
+	if ( !mss_3DProvider ) {
+		/* requested provider unavailable or failed to open -- fall back to the
+		   "Miles Fast 2D Positional Audio" software provider */
+		if ( !fallbackId || fallbackId == requestedId ) {
+			return 0;
+		}
+		if ( *requestedName
+			&& _stricmp( requestedName, "Miles Fast 2D Positional Audio" ) ) {
+			Com_Printf( "trying to use 'Miles Fast 2D Positional Audio' instead of '%s'\n",
+						requestedName );
+		}
+		if ( !AIL_open_3D_provider( fallbackId ) ) {
+			Com_Printf( "using 3D provider '%s'\n", "Miles Fast 2D Positional Audio" );
+			mss_3DProvider = fallbackId;
+			Cvar_Set2( "mss_3d_provider", "Miles Fast 2D Positional Audio", qtrue );
+		} else {
+			Com_Printf( "couldn't open 3D provider '%s': %s\n",
+						"Miles Fast 2D Positional Audio", AIL_last_error() );
+		}
+		if ( !mss_3DProvider ) {
+			return 0;
+		}
+	}
+
+	AIL_3D_provider_attribute( mss_3DProvider, "Maximum supported samples",
+							   &mss_max3DChannels );
+	if ( mss_max3DChannels > 32 ) {
+		mss_max3DChannels = 32;
+	}
+	Com_Printf( "%i max 3D channels\n", mss_max3DChannels );
+	AIL_set_3D_distance_factor( mss_3DProvider, 0.0254f );
+	return 1;
 }
 
 /* ---- MSS_SetListener  0x0044BD60 ---- */
-int __cdecl MSS_SetListener( int *axis, int *origin, int entnum )
+void __cdecl MSS_SetListener( int *axis, int *origin, int entnum )
 {
 	int i;
 
 	if ( !mss_digitalDriver ) {
-		return 0;
+		return;
 	}
 	for ( i = 0 ; i < 9 ; i++ ) {
 		((float *)mss_listenerAxis)[i] = *(float *)&axis[i];
@@ -450,7 +495,6 @@ int __cdecl MSS_SetListener( int *axis, int *origin, int entnum )
 		mss_listenerOrigin[i] = *(float *)&origin[i];
 	}
 	mss_listenerEntnum = entnum;
-	return 0;
 }
 
 /* ---- MSS_InitChannels  0x0044BDE0 ---- */
@@ -458,16 +502,8 @@ int MSS_InitChannels( void )
 {
 	int i;
 
-	if ( mss_num2DChannels > MSS_MAX_2D ) {
-		mss_num2DChannels = MSS_MAX_2D;
-	}
-	if ( mss_max3DChannels > MSS_MAX_3D ) {
-		mss_max3DChannels = MSS_MAX_3D;
-	}
-	if ( mss_numStreamChannels > MSS_MAX_STREAM ) {
-		mss_numStreamChannels = MSS_MAX_STREAM;
-	}
-
+	/* Retail 0x0044BDE0 does not clamp the counts here: MSS_Init2D
+	 * sets 32 / 13 and MSS_Init3DProvider clamps the 3D count to 32. */
 	for ( i = 0 ; i < mss_num2DChannels ; i++ ) {
 		mss_2DHandles[i] = AIL_allocate_sample_handle( mss_digitalDriver );
 		if ( !mss_2DHandles[i] ) {
@@ -489,157 +525,179 @@ int MSS_InitChannels( void )
 }
 
 /* ---- MSS_Attenuate  0x0044BE80 ---- VERIFIED */
-double __cdecl MSS_Attenuate(float distance, float minDist, float maxDist)
+float __cdecl MSS_Attenuate( float distance, float minDist, float maxDist )
 {
-  double v3;
-  double v5;
+	rfloat delta = distance - minDist;
+	rfloat frac;
 
-  v3 = distance - minDist;
-  if ( v3 <= 0.0 )
-    return 1.0;
-  v5 = v3 / (maxDist - minDist);
-  if ( v5 < 1.0 )
-    return 1.0 - v5;
-  else
-    return 0.0;
+	if ( delta <= 0.0f ) {
+		return 1.0f;
+	}
+	frac = delta / ( maxDist - minDist );
+	if ( frac >= 1.0f ) {
+		return 0.0f;
+	}
+	return 1.0f - frac;
 }
 
 /* ---- MSS_GetCurrent3DPosition  0x0044BED0 ---- */
-int __cdecl MSS_GetCurrent3DPosition( int entnum, float *out, const float *localOffset )
+void __cdecl MSS_GetCurrent3DPosition( int entnum, const float *localOffset, float *out )
 {
-	vec3_t entOrigin;       /* [esp+0x00] -- ONE vec3_t, not three floats */
-	float  axis[9];         /* [esp+0x0C] */
-	vec3_t result;
+	vec3_t origin;
+	vec3_t axis[3];
 
-	VM_Call( cgvm, 13 , entnum, entOrigin, axis );
+	VM_Call( cgvm, 13 , entnum, origin, axis );
 
-	result[0] = entOrigin[0] + axis[0] * localOffset[0]
-	                         + axis[3] * localOffset[1]
-	                         + axis[6] * localOffset[2];
-	result[1] = entOrigin[1] + axis[1] * localOffset[0]
-	                         + axis[4] * localOffset[1]
-	                         + axis[7] * localOffset[2];
-	result[2] = entOrigin[2] + axis[2] * localOffset[0]
-	                         + axis[5] * localOffset[1]
-	                         + axis[8] * localOffset[2];
-
-	out[0] = result[0];
-	out[1] = result[1];
-	out[2] = result[2];
-	return *(int *)&result[2];
+	VectorMA( origin, localOffset[0], axis[0], origin );
+	VectorMA( origin, localOffset[1], axis[1], origin );
+	VectorMA( origin, localOffset[2], axis[2], origin );
+	VectorCopy( origin, out );
 }
 
 /* ---- MSS_Set3DPosition  0x0044BF70 ---- */
-int __cdecl MSS_Set3DPosition( const float *origin, int handle )
+void __cdecl MSS_Set3DPosition( int handle, const float *origin )
 {
 	vec3_t d;
-	float  forward, left, up;
+	vec3_t local;   /* forward, left, up */
 
 	VectorSubtract( origin, mss_listenerOrigin, d );
 
-	forward = DotProduct( mss_listenerAxis[0], d );
-	left    = DotProduct( mss_listenerAxis[1], d );
-	up      = DotProduct( mss_listenerAxis[2], d );
+	local[0] = DotProduct( mss_listenerAxis[0], d );
+	local[1] = DotProduct( mss_listenerAxis[1], d );
+	local[2] = DotProduct( mss_listenerAxis[2], d );
 
-	AIL_set_3D_position( handle, -left, up, forward );
-	return *(int *)&forward;
+	AIL_set_3D_position( handle, -local[1], local[2], local[0] );
 }
 
 /* ---- MSS_IsAliasChannel3D  0x0044C020 ---- HIGH */
-BOOL __cdecl MSS_IsAliasChannel3D(int a1)
+int __cdecl MSS_IsAliasChannel3D( int aliasChan )
 {
-  return a1 != 1 && (a1 <= 5 || a1 > 9);
+	return aliasChan != 1 && ( aliasChan <= 5 || aliasChan > 9 );
 }
 
 /* ---- MSS_SetChannelInfo  0x0044C040 ---- */
-static void MSS_SetChannelInfo( const float *origin, int entnum, void *alias, int chan,
+static void MSS_SetChannelInfo( int entnum, const float *origin, void *alias, int chan,
                                 void *alias2, float blend, float volume, float pitch,
                                 int baseRate, int lengthMs, int offsetMs )
 {
-	mssChannel_t *ch = &mss_channels[chan];
-	int           aliasChan = AL_CHANNEL( alias );
-
 	if ( entnum >= 0 && entnum < MSS_NO_ENTITY
-		&& aliasChan != 1 && !( aliasChan > 5 && aliasChan <= 9 ) ) {
+		&& MSS_IsAliasChannel3D( AL_CHANNEL( alias ) ) ) {
 		vec3_t entOrigin;
 		float  axis[9];
-		vec3_t d;
+#ifdef COD1_VC7
+		vec3_t delta;
+		vec3_t org;
 
 		VM_Call( cgvm, 13, entnum, entOrigin, axis );
-		VectorSubtract( origin, entOrigin, d );
 
-		ch->localOrigin[0] = axis[0] * d[0] + axis[1] * d[1] + axis[2] * d[2];
-		ch->localOrigin[1] = axis[3] * d[0] + axis[4] * d[1] + axis[5] * d[2];
-		ch->localOrigin[2] = axis[6] * d[0] + axis[7] * d[1] + axis[8] * d[2];
+		/* Retail 0x0044C095-0x0044C115: VC7 keeps delta[1] and delta[2] on
+		 * the x87 stack (delta[0] and org[2] are stored) and sums each row
+		 * z, y, then x. */
+		VectorCopy( origin, org );
+		VectorSubtract( org, entOrigin, delta );
+		mss_channels[chan].localOrigin[0] = DotProduct( delta, &axis[0] );
+		mss_channels[chan].localOrigin[1] = DotProduct( delta, &axis[3] );
+		mss_channels[chan].localOrigin[2] = DotProduct( delta, &axis[6] );
+#else
+		float  d0;
+		double d1, d2;
+
+		VM_Call( cgvm, 13, entnum, entOrigin, axis );
+
+		/* Retail's precision: d0 is rounded to a float, d1 and d2 are not,
+		 * and each row sums z, y, then x. */
+		d0 = origin[0] - entOrigin[0];
+		d1 = origin[1] - entOrigin[1];
+		d2 = origin[2] - entOrigin[2];
+
+		mss_channels[chan].localOrigin[0] = axis[2] * d2 + axis[1] * d1 + axis[0] * d0;
+		mss_channels[chan].localOrigin[1] = axis[5] * d2 + axis[4] * d1 + axis[3] * d0;
+		mss_channels[chan].localOrigin[2] = axis[8] * d2 + axis[7] * d1 + axis[6] * d0;
+#endif
 	} else {
-		ch->localOrigin[0] = 0.0f;
-		ch->localOrigin[1] = 0.0f;
-		ch->localOrigin[2] = 0.0f;
+		VectorClear( mss_channels[chan].localOrigin );
 	}
 
-	ch->entnum    = entnum;
-	ch->channel   = aliasChan;
-	ch->volume    = volume;
-	ch->pitch     = pitch;
-	ch->baseRate  = baseRate;
-	ch->alias     = alias;
-	ch->alias2    = alias2;
-	ch->blend     = blend;
-	ch->touchTime = mss_loopFrameTime;
-	ch->endTime   = mss_time - offsetMs + lengthMs;
-
-	ch->paused = ( mss_paused && aliasChan != 1 ) ? 1 : 0;
+	mss_channels[chan].entnum    = entnum;
+	mss_channels[chan].channel   = AL_CHANNEL( alias );
+	mss_channels[chan].volume    = volume;
+	mss_channels[chan].pitch     = pitch;
+	mss_channels[chan].baseRate  = baseRate;
+	mss_channels[chan].alias     = alias;
+	mss_channels[chan].alias2    = alias2;
+	mss_channels[chan].blend     = blend;
+	mss_channels[chan].touchTime = mss_loopFrameTime;
+	mss_channels[chan].endTime   = mss_time - offsetMs + lengthMs;
+	mss_channels[chan].paused    = mss_paused && AL_CHANNEL( alias ) != 1;
 }
 
 /* ---- MSS_CompareReplacableChannels  0x0044C1D0 ---- */
-static int MSS_CompareReplacableChannels( int a, int b, int entnum )
+int MSS_CompareReplacableChannels( int a, int b, int entnum )
 {
-	const mssChannel_t *ca = &mss_channels[a];
-	const mssChannel_t *cb = &mss_channels[b];
-	int                 d;
+	int diff;
 
-	if ( ca->entnum != cb->entnum ) {
-		if ( cb->entnum == entnum ) {
+	if ( mss_channels[a].entnum != mss_channels[b].entnum ) {
+		if ( mss_channels[a].entnum == entnum ) {
 			return -1;
 		}
-		if ( ca->entnum == entnum ) {
+		if ( mss_channels[b].entnum == entnum ) {
 			return 1;
 		}
 	}
-	d = cb->channel - ca->channel;
-	if ( d ) {
-		return d;
+	diff = mss_channels[a].channel - mss_channels[b].channel;
+	if ( diff ) {
+		return diff;
 	}
-	return cb->endTime - ca->endTime;
+	diff = mss_channels[a].endTime - mss_channels[b].endTime;
+	if ( diff ) {
+		return diff;
+	}
+	return 0;
 }
 
 /* ---- MSS_IsChannelReplacable  0x0044C220 ---- */
-static qboolean MSS_IsChannelReplacable( int chan, int priority )
+qboolean MSS_IsChannelReplacable( int chan, int entnum, int priority )
 {
-	return ( mss_channels[chan].channel <= priority ) ? qtrue : qfalse;
+	return mss_channels[chan].channel <= priority;
 }
 
 /* ---- MSS_SpatializeStream  0x0044C240 ---- */
 static void MSS_SpatializeStream( float *volume, int slot, float *pan )
 {
-	mssChannel_t *ch = &mss_channels[ MSS_FIRST_STREAM + slot ];
-	vec3_t        dir;
-	float         dist, minDist, maxDist, f, atten, left;
+	vec3_t      dir;
+	mssAlias_t *alias, *alias2;
+	float       left, blend, minDist;
+	rfloat      dist, diff, f, atten;
 
 	VectorSubtract( mss_streamInfo[slot].origin, mss_listenerOrigin, dir );
 	dist = VectorNormalize( dir );
 
-	left    = DotProduct( mss_listenerAxis[1], dir );
-	minDist = ( 1.0f - ch->blend ) * AL_MINDIST( ch->alias )
-	        +          ch->blend   * AL_MINDIST( ch->alias2 );
+#ifdef COD1_VC7
+	left   = DotProduct( dir, mss_listenerAxis[1] );
+#else
+	/* Retail 0x0044C282-0x0044C2BF sums z, y, then x. */
+	left   = mss_listenerAxis[1][2] * dir[2] + mss_listenerAxis[1][1] * dir[1]
+	       + mss_listenerAxis[1][0] * dir[0];
+#endif
+	alias  = mss_channels[ MSS_FIRST_STREAM + slot ].alias;
+	alias2 = mss_channels[ MSS_FIRST_STREAM + slot ].alias2;
+	blend  = mss_channels[ MSS_FIRST_STREAM + slot ].blend;
 
-	if ( dist - minDist > 0.0f ) {
-		maxDist = ( 1.0f - ch->blend ) * AL_MAXDIST( ch->alias )
-		        +          ch->blend   * AL_MAXDIST( ch->alias2 );
-		f = ( dist - minDist ) / ( maxDist - minDist );
-		atten = ( f < 1.0f ) ? 1.0f - f : 0.0f;
-	} else {
+	/* Retail 0x0044C2C4-0x0044C330: 1 - blend scales minDist unrounded and
+	 * is kept (fst) for maxDist.  Only minDist is stored; the difference,
+	 * the ratio and the attenuation stay on the x87 stack.  The first test
+	 * is "<= 0" and the second "< 1" with C0 alone, so a NaN takes the
+	 * attenuating path and yields 1 - f. */
+	minDist = ( 1.0f - blend ) * alias->distMin
+	        +          blend   * alias2->distMin;
+	diff    = dist - minDist;
+
+	if ( diff <= 0.0f ) {
 		atten = 1.0f;
+	} else {
+		f = diff / ( ( 1.0f - blend ) * alias->distMax
+		           +          blend   * alias2->distMax - minDist );
+		atten = ( f >= 1.0f ) ? 0.0f : 1.0f - f;
 	}
 
 	*volume = atten * *volume;
@@ -647,40 +705,16 @@ static void MSS_SpatializeStream( float *volume, int slot, float *pan )
 }
 
 /* ---- MSS_FindReplacableChannel  0x0044C350 ---- */
-static int MSS_FindReplacableChannel( int first, int count, int entnum, int priority )
+static int MSS_FindReplacableChannel( int entnum, int priority, int first, int count )
 {
-	int best = -1;
-	int i;
+	int best;
+	int chan;
 
-	for ( i = first ; i < first + count ; i++ ) {
-		const mssChannel_t *c = &mss_channels[i];
-		int                 d;
-
-		if ( c->channel > priority ) {
-			continue;
-		}
-		if ( best < 0 ) {
-			best = i;
-			continue;
-		}
-		if ( c->entnum != mss_channels[best].entnum ) {
-			if ( c->entnum == entnum ) {
-				best = i;
-				continue;
-			}
-			if ( mss_channels[best].entnum == entnum ) {
-				continue;
-			}
-		}
-		d = c->channel - mss_channels[best].channel;
-		if ( !d ) {
-			d = c->endTime - mss_channels[best].endTime;
-			if ( !d ) {
-				continue;
-			}
-		}
-		if ( d < 0 ) {
-			best = i;
+	best = -1;
+	for ( chan = first ; chan < first + count ; chan++ ) {
+		if ( MSS_IsChannelReplacable( chan, entnum, priority )
+			&& ( best < 0 || MSS_CompareReplacableChannels( chan, best, entnum ) < 0 ) ) {
+			best = chan;
 		}
 	}
 	return best;
@@ -711,8 +745,10 @@ void MSS_Unpause2DChannel( int chan, int elapsed )
 /* ---- MSS_Is2DChannelFree  0x0044C440 ---- */
 qboolean MSS_Is2DChannelFree( int chan )
 {
-	return ( !mss_channels[chan].paused
-		&& AIL_sample_status( MSS_2D_HANDLE( chan ) ) == SMP_DONE ) ? qtrue : qfalse;
+	if ( mss_channels[chan].paused ) {
+		return qfalse;
+	}
+	return AIL_sample_status( MSS_2D_HANDLE( chan ) ) == SMP_DONE;
 }
 
 /* ---- MSS_FindFree2DChannel  0x0044C470 ---- */
@@ -721,13 +757,12 @@ int MSS_FindFree2DChannel( int entnum, int priority )
 	int i, chan;
 
 	for ( i = 0 ; i < mss_num2DChannels ; i++ ) {
-		if ( !mss_channels[ MSS_FIRST_2D + i ].paused
-			&& AIL_sample_status( mss_2DHandles[i] ) == SMP_DONE ) {
+		if ( MSS_Is2DChannelFree( MSS_FIRST_2D + i ) ) {
 			return MSS_FIRST_2D + i;
 		}
 	}
 
-	chan = MSS_FindReplacableChannel( MSS_FIRST_2D, mss_num2DChannels, entnum, priority );
+	chan = MSS_FindReplacableChannel( entnum, priority, MSS_FIRST_2D, mss_num2DChannels );
 	if ( chan > 0 ) {
 		AIL_end_sample( MSS_2D_HANDLE( chan ) );
 		mss_channels[chan].paused = 0;
@@ -760,8 +795,10 @@ void MSS_Unpause3DChannel( int chan, int elapsed )
 /* ---- MSS_Is3DChannelFree  0x0044C580 ---- */
 qboolean MSS_Is3DChannelFree( int chan )
 {
-	return ( !mss_channels[chan].paused
-		&& AIL_3D_sample_status( MSS_3D_HANDLE( chan ) ) == SMP_DONE ) ? qtrue : qfalse;
+	if ( mss_channels[chan].paused ) {
+		return qfalse;
+	}
+	return AIL_3D_sample_status( MSS_3D_HANDLE( chan ) ) == SMP_DONE;
 }
 
 /* ---- MSS_FindFree3DChannel  0x0044C5B0 ---- */
@@ -770,13 +807,12 @@ int MSS_FindFree3DChannel( int entnum, int priority )
 	int i, chan;
 
 	for ( i = 0 ; i < mss_max3DChannels ; i++ ) {
-		if ( !mss_channels[i].paused
-			&& AIL_3D_sample_status( mss_3DHandles[i] ) == SMP_DONE ) {
+		if ( MSS_Is3DChannelFree( i ) ) {
 			return i;
 		}
 	}
 
-	chan = MSS_FindReplacableChannel( MSS_FIRST_3D, mss_max3DChannels, entnum, priority );
+	chan = MSS_FindReplacableChannel( entnum, priority, MSS_FIRST_3D, mss_max3DChannels );
 	if ( chan > 0 ) {
 		AIL_end_3D_sample( MSS_3D_HANDLE( chan ) );
 		mss_channels[chan].paused = 0;
@@ -829,98 +865,74 @@ int MSS_FindFreeStreamChannel( int entnum, int priority )
 	int i, chan;
 
 	for ( i = MSS_FIRST_FREE_STREAM ; i < mss_numStreamChannels ; i++ ) {
-		if ( !mss_streamHandles[i] ) {
-			return MSS_FIRST_STREAM + i;
-		}
-		if ( !mss_channels[ MSS_FIRST_STREAM + i ].paused
-			&& AIL_stream_status( mss_streamHandles[i] ) == SMP_DONE ) {
-			AIL_close_stream( mss_streamHandles[i] );
-			mss_streamHandles[i] = 0;
+		if ( MSS_IsStreamChannelFree( MSS_FIRST_STREAM + i ) ) {
 			return MSS_FIRST_STREAM + i;
 		}
 	}
 
-	chan = MSS_FindReplacableChannel( MSS_FIRST_STREAM + MSS_FIRST_FREE_STREAM,
-									  mss_numStreamChannels - MSS_FIRST_FREE_STREAM,
-									  entnum, priority );
+	chan = MSS_FindReplacableChannel( entnum, priority, MSS_FIRST_STREAM + MSS_FIRST_FREE_STREAM,
+									  mss_numStreamChannels - MSS_FIRST_FREE_STREAM );
 	if ( chan > 0 ) {
-		AIL_close_stream( MSS_STREAM_HANDLE( chan ) );
-		MSS_STREAM_HANDLE( chan ) = 0;
-		mss_channels[chan].paused = 0;
+		MSS_StopStreamChannel( chan );
 	}
 	return chan;
 }
 
 /* ---- MSS_StopEntityChannel  0x0044C7E0 ---- */
-int MSS_StopEntityChannel( int entnum, int aliasChan )
+void MSS_StopEntityChannel( int entnum, int aliasChan )
 {
-	int i, chan, h;
+	int i, chan;
 
 	for ( i = 0 ; i < mss_max3DChannels ; i++ ) {
 		if ( mss_channels[i].entnum == entnum && mss_channels[i].channel == aliasChan
-			&& ( mss_channels[i].paused
-				|| AIL_3D_sample_status( mss_3DHandles[i] ) != SMP_DONE ) ) {
-			AIL_end_3D_sample( mss_3DHandles[i] );
-			mss_channels[i].paused = 0;
+			&& !MSS_Is3DChannelFree( i ) ) {
+			MSS_Stop3DChannel( i );
 		}
 	}
 
 	for ( chan = MSS_FIRST_STREAM ; chan < MSS_FIRST_STREAM + mss_numStreamChannels ; chan++ ) {
-		if ( mss_channels[chan].entnum != entnum || mss_channels[chan].channel != aliasChan ) {
-			continue;
+		if ( mss_channels[chan].entnum == entnum && mss_channels[chan].channel == aliasChan
+			&& !MSS_IsStreamChannelFree( chan ) ) {
+			MSS_StopStreamChannel( chan );
 		}
-		h = MSS_STREAM_HANDLE( chan );
-		if ( !h ) {
-			continue;
-		}
-		AIL_close_stream( h );
-		if ( mss_channels[chan].paused || AIL_stream_status( h ) != SMP_DONE ) {
-			mss_channels[chan].paused = 0;
-		}
-		MSS_STREAM_HANDLE( chan ) = 0;
 	}
 
 	for ( chan = MSS_FIRST_2D ; chan < MSS_FIRST_2D + mss_num2DChannels ; chan++ ) {
 		if ( mss_channels[chan].entnum == entnum && mss_channels[chan].channel == aliasChan
-			&& ( mss_channels[chan].paused
-				|| AIL_sample_status( MSS_2D_HANDLE( chan ) ) != SMP_DONE ) ) {
-			AIL_end_sample( MSS_2D_HANDLE( chan ) );
-			mss_channels[chan].paused = 0;
+			&& !MSS_Is2DChannelFree( chan ) ) {
+			MSS_Stop2DChannel( chan );
 		}
 	}
-	return mss_num2DChannels + MSS_FIRST_2D;
 }
 
 /* ---- MSS_SampleType  0x0044C950 ---- CONFIRMED */
-int __cdecl MSS_SampleType(int a1, int a2, int a3)
+/* Maps a sound's (format, bits, channels) -- the Mac 1.3 parameter order -- to
+   a Miles DIG_F_* sample-type enum.
+   Format 17 is the ADPCM/compressed marker; otherwise the low bit follows
+   8-bit vs 16-bit and the +2 selects the stereo variants. */
+int __cdecl MSS_SampleType( int format, int bits, int channels )
 {
-  if ( a2 == 1 )
-  {
-    if ( a1 == 17 )
-      return 5;
-    else
-      return a3 > 8;
-  }
-  else if ( a1 == 17 )
-  {
-    return 7;
-  }
-  else
-  {
-    return (a3 > 8) + 2;
-  }
+	if ( channels == 1 ) {
+		if ( format == 17 ) {
+			return 5;
+		}
+		return bits > 8;
+	}
+	if ( format == 17 ) {
+		return 7;
+	}
+	return ( bits > 8 ) + 2;
 }
 
 /* ---- MSS_StartAlias2DSample  0x0044C980 ---- */
-int MSS_StartAlias2DSample( int *outChan, void *alias, void *alias2, float blend,
-                            int entnum, float volume, float pitch, int startMs,
-                            float startFraction )
+int MSS_StartAlias2DSample( void *alias, void *alias2, float blend, int entnum,
+                            float volume, float pitch, int startMs,
+                            float startFraction, int *outChan )
 {
 	int    chan, h, rate, totalMs, offsetMs;
 	int   *snd;
-	int    aliasChan = AL_CHANNEL( alias );
 
-	chan = MSS_FindFree2DChannel( entnum, aliasChan );
+	chan = MSS_FindFree2DChannel( entnum, AL_CHANNEL( alias ) );
 	if ( outChan ) {
 		*outChan = chan;
 	}
@@ -932,21 +944,20 @@ int MSS_StartAlias2DSample( int *outChan, void *alias, void *alias2, float blend
 	snd = AL_SOUND( alias );
 
 	AIL_init_sample( h );
-	AIL_set_sample_type( h, MSS_SampleType( SND_FORMAT( snd ), SND_CHANNELS( snd ),
-											SND_BITS( snd ) ), 0 );
+	AIL_set_sample_type( h, MSS_SampleType( SND_FORMAT( snd ), SND_BITS( snd ),
+											SND_CHANNELS( snd ) ), 0 );
 	AIL_set_sample_address( h, SND_DATA( snd ), SND_DATALEN( snd ) );
 	AIL_set_sample_adpcm_block_size( h, SND_BLOCKSIZE( snd ) );
 
-	rate = MSS_FTOL( (double)SND_RATE( snd ) * mss_timeScale * pitch );
+	rate = MSS_FTOL( MSS_I2F( SND_RATE( snd ) ) * mss_timeScale * pitch );
 	AIL_set_sample_playback_rate( h, rate );
 
 	AIL_set_sample_volume_pan( h,
-		mss_masterVolume * mss_channelFade[aliasChan][0] * volume, 0.5f );
+		mss_masterVolume * mss_channelFade[ AL_CHANNEL( alias ) ][0] * volume, 0.5f );
 	AIL_set_sample_loop_count( h, AL_LOOPING( alias ) == 0 );
 	AIL_set_sample_reverb_levels( h, 1.0f, mss_wetLevel );
 
-	totalMs = 0;
-	AIL_sample_ms_position( h, &totalMs, 0 );
+	AIL_sample_ms_position( h, &totalMs, 0 );   /* retail does not zero totalMs first */
 
 	if ( startFraction != 0.0f ) {
 		offsetMs = MSS_FTOL( (double)totalMs * startFraction );
@@ -956,10 +967,10 @@ int MSS_StartAlias2DSample( int *outChan, void *alias, void *alias2, float blend
 
 	if ( offsetMs ) {
 		AIL_set_sample_ms_position( h, offsetMs );
-		if ( !mss_paused || aliasChan == 1 ) {
+		if ( !mss_paused || AL_CHANNEL( alias ) == 1 ) {
 			AIL_resume_sample( h );
 		}
-	} else if ( !mss_paused || aliasChan == 1 ) {
+	} else if ( !mss_paused || AL_CHANNEL( alias ) == 1 ) {
 		AIL_start_sample( h );
 	}
 
@@ -967,23 +978,21 @@ int MSS_StartAlias2DSample( int *outChan, void *alias, void *alias2, float blend
 		totalMs = 0;
 	}
 
-	MSS_SetChannelInfo( 0, entnum, alias, chan, alias2, blend, volume, pitch,
+	MSS_SetChannelInfo( entnum, 0, alias, chan, alias2, blend, volume, pitch,
 						SND_RATE( snd ), totalMs, offsetMs );
 	return totalMs;
 }
 
 /* ---- MSS_StartAlias3DSample  0x0044CB90 ---- */
-int MSS_StartAlias3DSample( int *outChan, void *alias, const float *origin, void *alias2,
-                            float blend, int entnum, float volume, float pitch,
-                            int startMs, float startFraction )
+int MSS_StartAlias3DSample( void *alias, void *alias2, float blend, int entnum,
+                            const float *origin, float volume, float pitch,
+                            int startMs, float startFraction, int *outChan )
 {
 	int    chan, h, rate, totalMs, offsetMs;
 	int   *snd;
-	int    aliasChan = AL_CHANNEL( alias );
-	float  minDist, maxDist, dist, f, atten;
-	vec3_t d;
+	float  oneMinusBlend, minDist, maxDist, dist, atten, scaled;
 
-	chan = MSS_FindFree3DChannel( entnum, aliasChan );
+	chan = MSS_FindFree3DChannel( entnum, AL_CHANNEL( alias ) );
 	if ( outChan ) {
 		*outChan = chan;
 	}
@@ -994,28 +1003,36 @@ int MSS_StartAlias3DSample( int *outChan, void *alias, const float *origin, void
 	h   = MSS_3D_HANDLE( chan );
 	snd = AL_SOUND( alias );
 
-	minDist = ( 1.0f - blend ) * AL_MINDIST( alias ) + blend * AL_MINDIST( alias2 );
-	maxDist = ( 1.0f - blend ) * AL_MAXDIST( alias ) + blend * AL_MAXDIST( alias2 );
+	/* Retail rounds each step below to a float exactly where the stores
+	 * are (Distance is inlined from /Op com_math.c, so every float
+	 * assignment is stored): (1 - blend) at 0x0044CBDB, dist - minDist at
+	 * 0x0044CC69, the normalised distance at 0x0044CC94 and
+	 * atten * fade * volume at 0x0044CCD7. */
+	oneMinusBlend = 1.0f - blend;
+	minDist = oneMinusBlend * ((mssAlias_t *)alias)->distMin + blend * ((mssAlias_t *)alias2)->distMin;
+	maxDist = oneMinusBlend * ((mssAlias_t *)alias)->distMax + blend * ((mssAlias_t *)alias2)->distMax;
 
 	AIL_set_3D_sample_info( h, snd );
 
-	VectorSubtract( mss_listenerOrigin, origin, d );
-	dist = (float)sqrt( d[0] * d[0] + d[1] * d[1] + d[2] * d[2] );
-	if ( dist - minDist > 0.0f ) {
-		f = ( dist - minDist ) / ( maxDist - minDist );
-		atten = ( f < 1.0f ) ? 1.0f - f : 0.0f;
-	} else {
+	dist  = Distance( origin, mss_listenerOrigin );
+	atten = dist - minDist;
+	/* test ah,41h / jp at 0x0044CC79 and test ah,1 / jne at 0x0044CCA4:
+	 * a NaN atten takes the divide branch and then 1 - atten. */
+	if ( atten <= 0.0f ) {
 		atten = 1.0f;
+	} else {
+		atten = atten / ( maxDist - minDist );
+		atten = ( atten >= 1.0f ) ? 0.0f : 1.0f - atten;
 	}
+	scaled = atten * mss_channelFade[ AL_CHANNEL( alias ) ][0] * volume;
 
-	AIL_set_3D_sample_volume( h,
-		mss_masterVolume * ( atten * mss_channelFade[aliasChan][0] * volume ) );
+	AIL_set_3D_sample_volume( h, mss_masterVolume * scaled );
 	AIL_set_3D_sample_distances( h, maxDist, maxDist );
 
 	rate = MSS_FTOL( (float)AIL_3D_sample_playback_rate( h ) * mss_timeScale * pitch );
 	AIL_set_3D_sample_playback_rate( h, rate );
 
-	MSS_Set3DPosition( origin, h );
+	MSS_Set3DPosition( h, origin );
 	AIL_set_3D_sample_loop_count( h, AL_LOOPING( alias ) == 0 );
 	AIL_set_3D_sample_effects_level( h, mss_wetLevel );
 
@@ -1041,18 +1058,16 @@ int MSS_StartAlias3DSample( int *outChan, void *alias, const float *origin, void
 		totalMs = 0;
 	}
 
-	MSS_SetChannelInfo( origin, entnum, alias, chan, alias2, blend, volume, pitch,
+	MSS_SetChannelInfo( entnum, origin, alias, chan, alias2, blend, volume, pitch,
 						SND_RATE( snd ), totalMs, offsetMs );
 	return totalMs;
 }
 
 /* ---- MSS_StartAliasSample  0x0044CED0 ---- */
-int MSS_StartAliasSample( int startMs, int entnum, void *alias, void *alias2,
-                          int *outChan, float blend, const float *origin,
-                          float volume, float pitch )
+int MSS_StartAliasSample( void *alias, void *alias2, float blend, int entnum,
+                          const float *origin, float volume, float pitch,
+                          int startMs, int *outChan )
 {
-	int aliasChan;
-
 	if ( !AL_SOUND( alias ) ) {
 		Com_DPrintf(
 			"Tried to play sound '%s' from alias '%s', but it was not successfully loaded.\n",
@@ -1063,13 +1078,12 @@ int MSS_StartAliasSample( int startMs, int entnum, void *alias, void *alias2,
 		return 0;
 	}
 
-	aliasChan = AL_CHANNEL( alias );
-	if ( aliasChan == 1 || ( aliasChan > 5 && aliasChan <= 9 ) ) {
-		return MSS_StartAlias2DSample( outChan, alias, alias2, blend, entnum,
-									   volume, pitch, startMs, 0.0f );
+	if ( MSS_IsAliasChannel3D( AL_CHANNEL( alias ) ) ) {
+		return MSS_StartAlias3DSample( alias, alias2, blend, entnum, origin,
+									   volume, pitch, startMs, 0.0f, outChan );
 	}
-	return MSS_StartAlias3DSample( outChan, alias, origin, alias2, blend, entnum,
-								   volume, pitch, startMs, 0.0f );
+	return MSS_StartAlias2DSample( alias, alias2, blend, entnum,
+								   volume, pitch, startMs, 0.0f, outChan );
 }
 
 /* ---- MSS_StartAliasStreamOnChannel  0x0044CF50 ---- */
@@ -1080,7 +1094,6 @@ int MSS_StartAliasStreamOnChannel( void *alias, void *alias2, float blend, int e
 	const char *qpath;
 	const char *osPath;
 	int         h, rate, totalMs, offsetMs;
-	int         aliasChan;
 	float       pan;
 
 	if ( !AL_STREAMFOUND( alias ) ) {
@@ -1097,12 +1110,11 @@ int MSS_StartAliasStreamOnChannel( void *alias, void *alias2, float blend, int e
 
 	qpath = va( "sound/%s", AL_FILENAME( alias ) );
 	if ( MSS_CVAR( mss_q3fs )->integer ) {
-		osPath = qpath;
+		h = AIL_open_stream( mss_digitalDriver, qpath, 0 );
 	} else {
 		osPath = FS_ShortOSFilePath( qpath );
+		h = AIL_open_stream( mss_digitalDriver, osPath, 0 );
 	}
-
-	h = AIL_open_stream( mss_digitalDriver, osPath, 0 );
 	if ( !h ) {
 		Com_Printf( "Couldn't play stream '%s' from alias '%s' - %s\n",
 					qpath, AL_NAME( alias ), AIL_last_error() );
@@ -1110,17 +1122,15 @@ int MSS_StartAliasStreamOnChannel( void *alias, void *alias2, float blend, int e
 	}
 	MSS_STREAM_HANDLE( chan ) = h;
 
-	aliasChan = AL_CHANNEL( alias );
 	rate = AIL_stream_playback_rate( h );
 	AIL_set_stream_playback_rate( h,
-		MSS_FTOL( (double)rate * mss_timeScale * pitch ) );
+		MSS_FTOL( MSS_I2F( rate ) * mss_timeScale * pitch ) );
 	AIL_set_stream_volume_pan( h,
-		mss_masterVolume * mss_channelFade[aliasChan][0] * volume, 0.5f );
+		mss_masterVolume * mss_channelFade[ AL_CHANNEL( alias ) ][0] * volume, 0.5f );
 	AIL_set_stream_loop_count( h, AL_LOOPING( alias ) == 0 );
 	AIL_set_stream_reverb_levels( h, 1.0f, mss_wetLevel );
 
-	totalMs = 0;
-	AIL_stream_ms_position( h, &totalMs, 0 );
+	AIL_stream_ms_position( h, &totalMs, 0 );   /* retail does not zero totalMs first */
 
 	if ( startFraction != 0.0f ) {
 		offsetMs = MSS_FTOL( (double)totalMs * startFraction );
@@ -1130,10 +1140,10 @@ int MSS_StartAliasStreamOnChannel( void *alias, void *alias2, float blend, int e
 
 	if ( offsetMs ) {
 		AIL_set_stream_ms_position( h, offsetMs );
-		if ( !mss_paused || aliasChan == 1 ) {
+		if ( !mss_paused || AL_CHANNEL( alias ) == 1 ) {
 			AIL_pause_stream( h, 0 );
 		}
-	} else if ( !mss_paused || aliasChan == 1 ) {
+	} else if ( !mss_paused || AL_CHANNEL( alias ) == 1 ) {
 		AIL_start_stream( h );
 	}
 
@@ -1141,11 +1151,10 @@ int MSS_StartAliasStreamOnChannel( void *alias, void *alias2, float blend, int e
 		totalMs = 0;
 	}
 
-	MSS_STREAM_INFO( chan ).spatialized =
-		( aliasChan != 1 && ( aliasChan <= 5 || aliasChan > 9 ) ) ? 1 : 0;
+	MSS_STREAM_INFO( chan ).spatialized = MSS_IsAliasChannel3D( AL_CHANNEL( alias ) );
 	VectorCopy( origin, MSS_STREAM_INFO( chan ).origin );
 
-	MSS_SetChannelInfo( origin, entnum, alias, chan, alias2, blend, volume, pitch,
+	MSS_SetChannelInfo( entnum, origin, alias, chan, alias2, blend, volume, pitch,
 						rate, totalMs, offsetMs );
 
 	if ( MSS_STREAM_INFO( chan ).spatialized ) {
@@ -1156,9 +1165,9 @@ int MSS_StartAliasStreamOnChannel( void *alias, void *alias2, float blend, int e
 }
 
 /* ---- MSS_StartAliasStream  0x0044D200 ---- */
-int MSS_StartAliasStream( int *outChan, void *alias, int entnum, void *alias2,
-                          float blend, const float *origin, float volume, float pitch,
-                          int startMs, float startFraction )
+int MSS_StartAliasStream( void *alias, void *alias2, float blend, int entnum,
+                          const float *origin, float volume, float pitch,
+                          int startMs, float startFraction, int *outChan )
 {
 	int chan;
 
@@ -1177,27 +1186,21 @@ int MSS_StartAliasStream( int *outChan, void *alias, int entnum, void *alias2,
 int MSS_ContinueLoopingSound( void *alias, void *alias2, float blend, int entnum,
                               const float *origin, int *outChan )
 {
-	int           i, chan;
-	mssChannel_t *ch;
-	float         volume;
-	int           h;
-
-	volume = ( ( 1.0f - blend ) * AL_VOLMIN( alias )
-			 +          blend   * AL_VOLMIN( alias2 ) ) * 0.80000001f;
+	int i, chan;
 
 	for ( i = 0 ; i < mss_max3DChannels ; i++ ) {
-		ch = &mss_channels[i];
-		if ( ch->entnum == entnum
-			&& ( ch->paused || AIL_3D_sample_status( mss_3DHandles[i] ) != SMP_DONE )
-			&& AL_LOOPING( ch->alias )
-			&& AL_NAME( ch->alias )  == AL_NAME( alias )
-			&& AL_NAME( ch->alias2 ) == AL_NAME( alias2 ) ) {
-			ch->volume = volume;
+		if ( mss_channels[i].entnum == entnum
+			&& !MSS_Is3DChannelFree( i )
+			&& AL_LOOPING( mss_channels[i].alias )
+			&& AL_NAME( mss_channels[i].alias )  == AL_NAME( alias )
+			&& AL_NAME( mss_channels[i].alias2 ) == AL_NAME( alias2 ) ) {
+			mss_channels[i].volume = ( ( 1.0f - blend ) * ( (mssAlias_t *) alias )->volMin
+			                         + blend * ( (mssAlias_t *) alias2 )->volMin ) * 0.80000001f;
 			AIL_set_3D_sample_playback_rate( mss_3DHandles[i],
-				MSS_FTOL( (double)ch->baseRate * ch->pitch * mss_timeScale ) );
-			MSS_Set3DPosition( origin, mss_3DHandles[i] );
-			ch->touchTime = mss_loopFrameTime;
-			ch->blend     = blend;
+				MSS_FTOL( mss_channels[i].baseRate * mss_channels[i].pitch * mss_timeScale ) );
+			MSS_Set3DPosition( mss_3DHandles[i], origin );
+			mss_channels[i].touchTime = mss_loopFrameTime;
+			mss_channels[i].blend     = blend;
 			if ( outChan ) {
 				*outChan = i;
 			}
@@ -1206,17 +1209,17 @@ int MSS_ContinueLoopingSound( void *alias, void *alias2, float blend, int entnum
 	}
 
 	for ( chan = MSS_FIRST_2D ; chan < MSS_FIRST_2D + mss_num2DChannels ; chan++ ) {
-		ch = &mss_channels[chan];
-		if ( ch->entnum == entnum
-			&& ( ch->paused || AIL_sample_status( MSS_2D_HANDLE( chan ) ) != SMP_DONE )
-			&& AL_LOOPING( ch->alias )
-			&& AL_NAME( ch->alias )  == AL_NAME( alias )
-			&& AL_NAME( ch->alias2 ) == AL_NAME( alias2 ) ) {
-			ch->volume = volume;
+		if ( mss_channels[chan].entnum == entnum
+			&& !MSS_Is2DChannelFree( chan )
+			&& AL_LOOPING( mss_channels[chan].alias )
+			&& AL_NAME( mss_channels[chan].alias )  == AL_NAME( alias )
+			&& AL_NAME( mss_channels[chan].alias2 ) == AL_NAME( alias2 ) ) {
+			mss_channels[chan].volume = ( ( 1.0f - blend ) * ( (mssAlias_t *) alias )->volMin
+			                            + blend * ( (mssAlias_t *) alias2 )->volMin ) * 0.80000001f;
 			AIL_set_sample_playback_rate( MSS_2D_HANDLE( chan ),
-				MSS_FTOL( (double)ch->baseRate * ch->pitch * mss_timeScale ) );
-			ch->touchTime = mss_loopFrameTime;
-			ch->blend     = blend;
+				MSS_FTOL( mss_channels[chan].baseRate * mss_channels[chan].pitch * mss_timeScale ) );
+			mss_channels[chan].touchTime = mss_loopFrameTime;
+			mss_channels[chan].blend     = blend;
 			if ( outChan ) {
 				*outChan = chan;
 			}
@@ -1225,65 +1228,55 @@ int MSS_ContinueLoopingSound( void *alias, void *alias2, float blend, int entnum
 	}
 
 	for ( chan = MSS_FIRST_STREAM ; chan < MSS_FIRST_STREAM + mss_numStreamChannels ; chan++ ) {
-		ch = &mss_channels[chan];
-		h  = MSS_STREAM_HANDLE( chan );
-		if ( ch->entnum != entnum || !h ) {
-			continue;
+		if ( mss_channels[chan].entnum == entnum
+			&& !MSS_IsStreamChannelFree( chan )
+			&& AL_LOOPING( mss_channels[chan].alias )
+			&& AL_NAME( mss_channels[chan].alias )  == AL_NAME( alias )
+			&& AL_NAME( mss_channels[chan].alias2 ) == AL_NAME( alias2 ) ) {
+			mss_channels[chan].volume = ( ( 1.0f - blend ) * ( (mssAlias_t *) alias )->volMin
+			                            + blend * ( (mssAlias_t *) alias2 )->volMin ) * 0.80000001f;
+			AIL_set_stream_playback_rate( MSS_STREAM_HANDLE( chan ),
+				MSS_FTOL( mss_channels[chan].baseRate * mss_channels[chan].pitch * mss_timeScale ) );
+			VectorCopy( origin, MSS_STREAM_INFO( chan ).origin );
+			mss_channels[chan].touchTime = mss_loopFrameTime;
+			mss_channels[chan].blend     = blend;
+			if ( outChan ) {
+				*outChan = chan;
+			}
+			return 1;
 		}
-		if ( !ch->paused && AIL_stream_status( h ) == SMP_DONE ) {
-			AIL_close_stream( h );
-			MSS_STREAM_HANDLE( chan ) = 0;
-			continue;
-		}
-		if ( !AL_LOOPING( ch->alias )
-			|| AL_NAME( ch->alias )  != AL_NAME( alias )
-			|| AL_NAME( ch->alias2 ) != AL_NAME( alias2 ) ) {
-			continue;
-		}
-		ch->volume = volume;
-		AIL_set_stream_playback_rate( h,
-			MSS_FTOL( (double)ch->baseRate * ch->pitch * mss_timeScale ) );
-		VectorCopy( origin, MSS_STREAM_INFO( chan ).origin );
-		ch->touchTime = mss_loopFrameTime;
-		ch->blend     = blend;
-		if ( outChan ) {
-			*outChan = chan;
-		}
-		return 1;
 	}
 	return 0;
 }
 
 /* ---- MSS_ChoosePitchAndVolume  0x0044D5C0 ---- HIGH */
-int __cdecl MSS_ChoosePitchAndVolume(float *a1, float *a2, float a3, float *a4, float *a5)
+/* Blends the two aliases' volume/pitch ranges (blend 0 = alias, 1 = alias2),
+   then picks a random value inside each range.  0.000030517578f = 2^-15 =
+   1/32768 exactly and 0.80000001f = 0.8f: retail multiplies by the floats at
+   0x00568E98 (00 00 00 38) and 0x00568F18 (CD CC 4C 3F), fmul dword at
+   0x0044D624 / 0x0044D638 / 0x0044D651. */
+int __cdecl MSS_ChoosePitchAndVolume( mssAlias_t *alias, mssAlias_t *alias2, float blend,
+                                      float *outVolume, float *outPitch )
 {
-  double v5;
-  int result;
-  float v7;
-  float v8;
-  float v9;
-  float v10;
+	rfloat invBlend = (rfloat)1.0f - blend;
+	float  volMin   = invBlend * alias->volMin   + blend * alias2->volMin;
+	float  volMax   = invBlend * alias->volMax   + blend * alias2->volMax;
+	float  pitchMin = invBlend * alias->pitchMin + blend * alias2->pitchMin;
+	float  pitchMax = invBlend * alias->pitchMax + blend * alias2->pitchMax;
+	int    result;
 
-  v5 = 1.0 - a3;
-  v7 = v5 * a2[5] + a3 * a1[5];
-  v9 = v5 * a2[6] + a3 * a1[6];
-  v8 = v5 * a2[7] + a3 * a1[7];
-  v10 = v5 * a2[8] + a3 * a1[8];
-  *a4 = ((double)rand() * 0.000030517578 * (v9 - v7) + v7) * 0.80000001;
-  result = rand();
-  *a5 = (double)result * 0.000030517578 * (v10 - v8) + v8;
-  return result;
+	*outVolume = ( FCAST( MSS_I2F( rand() ) * 0.000030517578f ) * ( volMax - volMin ) + volMin ) * 0.80000001f;
+	result     = rand();
+	*outPitch  = FCAST( MSS_I2F( result ) * 0.000030517578f ) * ( pitchMax - pitchMin ) + pitchMin;
+	return result;
 }
 
 /* ---- MSS_PlaySoundAlias_Internal  0x0044D670 ---- */
-int __cdecl MSS_PlaySoundAlias_Internal( float *alias2, float *origin, int alias,
-                                         int blendBits, int entnum, int *outChan,
+int __cdecl MSS_PlaySoundAlias_Internal( void *alias, float *alias2, float blend,
+                                         int entnum, float *origin, int *outChan,
                                          int startMs )
 {
-	float  blend = *(float *)&blendBits;
 	float  volume, pitch;
-	int    aliasChan;
-	int    chan;
 
 	if ( !mss_digitalDriver ) {
 		return 0;
@@ -1292,40 +1285,50 @@ int __cdecl MSS_PlaySoundAlias_Internal( float *alias2, float *origin, int alias
 		*outChan = -1;
 	}
 
-	aliasChan = AL_CHANNEL( (void *)alias );
-	if ( aliasChan != 1 && ( aliasChan <= 5 || aliasChan > 9 ) ) {
-		float  maxDist;
+	if ( MSS_IsAliasChannel3D( AL_CHANNEL( alias ) ) ) {
+		float maxDist;
+#ifndef COD1_VC7
 		vec3_t d;
+#endif
 
-		maxDist = ( 1.0f - blend ) * AL_MAXDIST( (void *)alias )
-				+          blend   * alias2[10];
-		VectorSubtract( mss_listenerOrigin, origin, d );
-		if ( !( maxDist * maxDist >= d[0] * d[0] + d[1] * d[1] + d[2] * d[2] ) ) {
+		maxDist = ( 1.0f - blend ) * ( (mssAlias_t *) alias )->distMax
+				+          blend   * ( (mssAlias_t *) alias2 )->distMax;
+		/* Retail 0x0044D6C6-0x0044D717: DistanceSquared inlined (/Op stores of
+		 * the delta), then fcompp / test ah,5 / jnp culls only on an ordered
+		 * sum > maxDist^2, so a NaN compare keeps playing. */
+#ifdef COD1_VC7
+		if ( DistanceSquared( origin, mss_listenerOrigin ) > maxDist * maxDist ) {
 			return 0;
 		}
+#else
+		/* Modern MSVC rounds DistanceSquared's return to float; retail
+		 * compares the unrounded sum. */
+		VectorSubtract( mss_listenerOrigin, origin, d );
+		if ( maxDist * maxDist < d[2] * d[2] + d[1] * d[1] + d[0] * d[0] ) {
+			return 0;
+		}
+#endif
 	}
 
-	if ( MSS_ContinueLoopingSound( (void *)alias, alias2, blend, entnum, origin, outChan ) ) {
+	if ( MSS_ContinueLoopingSound( alias, alias2, blend, entnum, origin, outChan ) ) {
 		return 0;
 	}
 
-	if ( aliasChan ) {
-		MSS_StopEntityChannel( entnum, aliasChan );
+	if ( AL_CHANNEL( alias ) ) {
+		MSS_StopEntityChannel( entnum, AL_CHANNEL( alias ) );
 	}
 
-	MSS_ChoosePitchAndVolume( alias2, (float *)alias, blend, &volume, &pitch );
+	MSS_ChoosePitchAndVolume( (mssAlias_t *)alias, (mssAlias_t *)alias2, blend, &volume, &pitch );
 
-	if ( AL_TYPE( (void *)alias ) == AL_TYPE_SAMPLE ) {
-		return MSS_StartAliasSample( startMs, entnum, (void *)alias, alias2, outChan,
-									 blend, origin, volume, pitch );
+	switch ( AL_TYPE( alias ) ) {
+	case AL_TYPE_SAMPLE:
+		return MSS_StartAliasSample( alias, alias2, blend, entnum, origin,
+									 volume, pitch, startMs, outChan );
+	case AL_TYPE_STREAM:
+		return MSS_StartAliasStream( alias, alias2, blend, entnum, origin,
+									 volume, pitch, startMs, 0.0f, outChan );
 	}
-	if ( AL_TYPE( (void *)alias ) != AL_TYPE_STREAM ) {
-		return 0;
-	}
-	chan = 0;
-	(void)chan;
-	return MSS_StartAliasStream( outChan, (void *)alias, entnum, alias2, blend, origin,
-								 volume, pitch, startMs, 0.0f );
+	return 0;
 }
 
 /* ---- MSS_PlaySoundAlias  0x0044D7D0 ---- */
@@ -1334,80 +1337,82 @@ int __cdecl MSS_PlaySoundAlias( float *alias, int entnum, float *origin, int sta
 	if ( !alias ) {
 		return 0;
 	}
-	return MSS_PlaySoundAlias_Internal( alias, origin, (int)alias, 0, entnum, 0, startMs );
+	return MSS_PlaySoundAlias_Internal( alias, alias, 0.0f, entnum, origin, 0, startMs );
 }
 
 /* ---- MSS_ValidateSoundAliasBlend  0x0044D800 ---- HIGH */
-int __cdecl MSS_ValidateSoundAliasBlend(_DWORD *a1, _DWORD *a2, int a3)
+/* Two aliases may only be blended if their key fields match.  The pitch/volume
+   tests are plain !=: a NaN min/max counts as "not a single fixed value",
+   exactly as the shipped mixer does. */
+int __cdecl MSS_ValidateSoundAliasBlend( mssAlias_t *alias1, mssAlias_t *alias2, int reportErrors )
 {
-  char v4;
-
-  if ( a1 == a2 )
-    return 1;
-  if ( a1[1] != a2[1] )
-  {
-    if ( a3 )
-      Com_Error(ERR_DROP, &byte_55F9A0, *a1, *a2);
-    return 0;
-  }
-  v4 = *((_BYTE *)a1 + 52);
-  if ( v4 != *((_BYTE *)a2 + 52) )
-  {
-    if ( a3 )
-      Com_Error(ERR_DROP, &byte_55F938, *a1, *a2);
-    return 0;
-  }
-  if ( a1[12] != a2[12] )
-  {
-    if ( a3 )
-      Com_Error(ERR_DROP, &byte_55F8D0, *a1, *a2);
-    return 0;
-  }
-  if ( a1[11] != a2[11] )
-  {
-    if ( a3 )
-      Com_Error(ERR_DROP, &byte_55F870, *a1, *a2);
-    return 0;
-  }
-  if ( *((_BYTE *)a1 + 53) != *((_BYTE *)a2 + 53) )
-  {
-    if ( a3 )
-      Com_Error(ERR_DROP, &byte_55F810, *a1, *a2);
-    return 0;
-  }
-  if ( *((_BYTE *)a1 + 54) != *((_BYTE *)a2 + 54) )
-  {
-    if ( a3 )
-      Com_Error(ERR_DROP, &byte_55F7B0, *a1, *a2);
-    return 0;
-  }
-  if ( v4 )
-  {
-    if ( !((*((float *)a1 + 7) == *((float *)a1 + 8)) | __UNORDERED__(*((float *)a1 + 7), *((float *)a1 + 8)))
-      || !((*((float *)a2 + 7) == *((float *)a2 + 8)) | __UNORDERED__(*((float *)a2 + 7), *((float *)a2 + 8))) )
-    {
-      if ( a3 )
-        Com_Error(ERR_DROP, &byte_55F738, *a1, *a2);
-      return 0;
-    }
-    if ( !((*((float *)a1 + 5) == *((float *)a1 + 6)) | __UNORDERED__(*((float *)a1 + 5), *((float *)a1 + 6)))
-      || !((*((float *)a2 + 5) == *((float *)a2 + 6)) | __UNORDERED__(*((float *)a2 + 5), *((float *)a2 + 6))) )
-    {
-      if ( a3 )
-        Com_Error(ERR_DROP, &byte_55F6C0, *a1, *a2);
-      return 0;
-    }
-  }
-  return 1;
+	if ( alias1 == alias2 ) {
+		return 1;
+	}
+	if ( alias1->file != alias2->file ) {
+		if ( reportErrors ) {
+			Com_Error( ERR_DROP, "\x15tried to blend between sound aliases '%s' and '%s', but they don't use the same sound file\n", alias1->name, alias2->name );   /* 0x0055F9A0 */
+		}
+		return 0;
+	}
+	if ( alias1->loop != alias2->loop ) {
+		if ( reportErrors ) {
+			Com_Error( ERR_DROP, "\x15tried to blend between sound aliases '%s' and '%s', but they do not have the same looping status\n", alias1->name, alias2->name );   /* 0x0055F938 */
+		}
+		return 0;
+	}
+	if ( alias1->type != alias2->type ) {
+		if ( reportErrors ) {
+			Com_Error( ERR_DROP, "\x15tried to blend between sound aliases '%s' and '%s', but they are not both loaded or both streamed\n", alias1->name, alias2->name );   /* 0x0055F8D0 */
+		}
+		return 0;
+	}
+	if ( alias1->channel != alias2->channel ) {
+		if ( reportErrors ) {
+			Com_Error( ERR_DROP, "\x15tried to blend between sound aliases '%s' and '%s', but they don't use the same channel\n", alias1->name, alias2->name );   /* 0x0055F870 */
+		}
+		return 0;
+	}
+	if ( alias1->isMaster != alias2->isMaster ) {
+		if ( reportErrors ) {
+			Com_Error( ERR_DROP, "\x15tried to blend between sound aliases '%s' and '%s', but only one of them is a 'master' alias\n", alias1->name, alias2->name );   /* 0x0055F810 */
+		}
+		return 0;
+	}
+	if ( alias1->isSlave != alias2->isSlave ) {
+		if ( reportErrors ) {
+			Com_Error( ERR_DROP, "\x15tried to blend between sound aliases '%s' and '%s', but only one of them is a 'slave' alias\n", alias1->name, alias2->name );   /* 0x0055F7B0 */
+		}
+		return 0;
+	}
+	if ( alias1->loop
+	  && ( alias1->pitchMin != alias1->pitchMax
+	    || alias2->pitchMin != alias2->pitchMax ) ) {
+		if ( reportErrors ) {
+			Com_Error( ERR_DROP, "\x15tried to blend between sound aliases '%s' and '%s', but they are looping and at least one of them has a random pitch\n", alias1->name, alias2->name );   /* 0x0055F738 */
+		}
+		return 0;
+	}
+	if ( alias1->loop
+	  && ( alias1->volMin != alias1->volMax
+	    || alias2->volMin != alias2->volMax ) ) {
+		if ( reportErrors ) {
+			Com_Error( ERR_DROP, "\x15tried to blend between sound aliases '%s' and '%s', but they are looping and at least one of them has a random volume\n", alias1->name, alias2->name );   /* 0x0055F6C0 */
+		}
+		return 0;
+	}
+	return 1;
 }
 
 /* ---- MSS_PlayBlendedSoundAliases  0x0044D980 ---- CONFIRMED */
-int __cdecl MSS_PlayBlendedSoundAliases(float *a1, _DWORD *a2, int a3, int a4, float *a5, int a6)
+int __cdecl MSS_PlayBlendedSoundAliases( void *alias, float *alias2, int blendBits,
+                                         int entnum, float *origin, int startMs )
 {
-  if ( !a2 || !a1 )
-    return 0;
-  MSS_ValidateSoundAliasBlend(a2, a1, 1);
-  return MSS_PlaySoundAlias_Internal(a1, a5, (int)a2, a3, a4, 0, a6);
+	if ( !alias || !alias2 ) {
+		return 0;
+	}
+	MSS_ValidateSoundAliasBlend( (mssAlias_t *) alias, (mssAlias_t *) alias2, 1 );
+	return MSS_PlaySoundAlias_Internal( alias, alias2, *(float *)&blendBits, entnum, origin, 0, startMs );
 }
 
 /* ---- MSS_PlayLocalSoundAlias  0x0044D9C0 ---- VERIFIED */
@@ -1415,37 +1420,25 @@ int __cdecl MSS_PlayLocalSoundAlias( int source, int aliasName )
 {
 	float *alias;
 
-	if ( !aliasName ) {
-		return 0;
+	if ( aliasName ) {
+		alias = (float *)Com_PickSoundAlias( (const char *) aliasName, source );
+		if ( alias ) {
+			return MSS_PlaySoundAlias_Internal( alias, alias, 0.0f, mss_listenerEntnum,
+												mss_listenerOrigin, 0, 0 );
+		}
 	}
-	alias = (float *)Com_PickSoundAlias( (const char *) aliasName, source );
-	if ( !alias ) {
-		return 0;
-	}
-	return MSS_PlaySoundAlias_Internal( alias, mss_listenerOrigin, (int)alias, 0,
-										mss_listenerEntnum, 0, 0 );
+	return 0;
 }
 
 /* ---- MSS_StartBackground  0x0044DA00 ---- */
 static void *MSS_StartBackground( void *alias, int slot, int msec )
 {
-	int           chan = MSS_FIRST_STREAM + slot;
-	mssChannel_t *ch   = &mss_channels[chan];
-	int           paused;
-	int           aliasChan;
-	float         volume, pitch;
+	int   chan;
+	float volume, pitch;
 
-	paused = ( cl_paused->integer != 0 );
-	if ( paused != mss_paused ) {
-		if ( paused ) {
-			MSS_PauseSounds();
-		} else {
-			MSS_UnpauseSounds();
-		}
-	}
+	MSS_UpdatePause();
 
-	aliasChan = AL_CHANNEL( alias );
-	if ( aliasChan != 1 && ( aliasChan <= 5 || aliasChan > 9 ) ) {
+	if ( MSS_IsAliasChannel3D( AL_CHANNEL( alias ) ) ) {
 		Com_Error( ERR_DROP,
 			"\x15" "alias %s sound %s played as an ambient / music track uses a 3D channel type; should probably be channel 'local'\n",
 			AL_NAME( alias ), AL_FILENAME( alias ) );
@@ -1456,449 +1449,430 @@ static void *MSS_StartBackground( void *alias, int slot, int msec )
 			AL_NAME( alias ), AL_FILENAME( alias ) );
 	}
 
-	volume = ( (double)rand() * 0.000030517578
+	/* float 2^-15 at 0x0044DA85 / 0x0044DAB9, as in MSS_ChoosePitchAndVolume */
+	volume = ( FCAST( MSS_I2F( rand() ) * 0.000030517578f )
 			 * ( AL_VOLMAX( alias ) - AL_VOLMIN( alias ) ) + AL_VOLMIN( alias ) )
 			 * 0.80000001f;
-	pitch  = (double)rand() * 0.000030517578
+	pitch  = FCAST( MSS_I2F( rand() ) * 0.000030517578f )
 			 * ( AL_PITCHMAX( alias ) - AL_PITCHMIN( alias ) ) + AL_PITCHMIN( alias );
 
-	if ( MSS_STREAM_HANDLE( chan ) ) {
-		int wasLive = ( ch->paused
-			|| AIL_stream_status( MSS_STREAM_HANDLE( chan ) ) != SMP_DONE );
-		AIL_close_stream( MSS_STREAM_HANDLE( chan ) );
-		if ( wasLive ) {
-			ch->paused = 0;
-		}
-		MSS_STREAM_HANDLE( chan ) = 0;
+	chan = MSS_FIRST_STREAM + slot;
+	if ( !MSS_IsStreamChannelFree( chan ) ) {
+		MSS_StopStreamChannel( chan );
 	}
 
 	MSS_StartAliasStreamOnChannel( alias, alias, 0.0f, MSS_NO_ENTITY,
 								   mss_listenerOrigin, volume, pitch, 0, 0.0f, chan );
 
-	mss_bgFade[slot].target = ch->volume;
-	if ( msec <= 0 ) {
-		mss_bgFade[slot].rate = 0.0f;
+	mss_bgFade[slot].target = mss_channels[chan].volume;
+	if ( msec > 0 ) {
+		mss_bgFade[slot].rate = mss_channels[chan].volume / msec;
+		mss_channels[chan].volume = 0.0f;
 	} else {
-		mss_bgFade[slot].rate = ch->volume / (double)msec;
-		ch->volume = 0.0f;
+		mss_bgFade[slot].rate = 0.0f;
 	}
-	return &ch->volume;
+	return &mss_channels[chan].volume;
 }
 
 /* ---- MSS_StopBackground  0x0044DB90 ---- */
 void __cdecl MSS_StopBackground( int slot, int msec )
 {
-	int           chan = MSS_FIRST_STREAM + slot;
-	mssChannel_t *ch   = &mss_channels[chan];
-
-	if ( !MSS_STREAM_HANDLE( chan ) ) {
+	if ( MSS_IsStreamChannelFree( MSS_FIRST_STREAM + slot ) ) {
 		return;
 	}
-
-	if ( ch->paused || AIL_stream_status( MSS_STREAM_HANDLE( chan ) ) != SMP_DONE ) {
-		if ( msec ) {
-			if ( mss_bgFade[slot].target > 0.0f ) {
-				float rate = mss_bgFade[slot].target / (double)msec;
-				mss_bgFade[slot].target = 0.0f;
-				mss_bgFade[slot].rate   = -rate;
-			}
-		} else {
-			AIL_close_stream( MSS_STREAM_HANDLE( chan ) );
-			MSS_STREAM_HANDLE( chan ) = 0;
-			ch->paused = 0;
-		}
-	} else {
-		AIL_close_stream( MSS_STREAM_HANDLE( chan ) );
-		MSS_STREAM_HANDLE( chan ) = 0;
+	if ( !msec ) {
+		MSS_StopStreamChannel( MSS_FIRST_STREAM + slot );
+		return;
+	}
+	if ( mss_bgFade[slot].target > 0.0f ) {
+		mss_bgFade[slot].rate   = -mss_bgFade[slot].target / msec;
+		mss_bgFade[slot].target = 0.0f;
 	}
 }
 
 /* ---- MSS_PlayMusicAlias  0x0044DC40 ---- CONFIRMED */
-float *__cdecl MSS_PlayMusicAlias(float *a1)
+float *__cdecl MSS_PlayMusicAlias( float *alias )
 {
-  float *result;
+	float *result = (float *)mss_digitalDriver;
 
-  result = (float *)mss_digitalDriver;
-  if ( mss_digitalDriver )
-  {
-    if ( a1 )
-    {
-      result = (float *)MSS_IsStreamChannelFree(32);
-      if ( result )
-        return MSS_StartBackground(a1, 0, 0);
-    }
-  }
-  return result;
+	if ( mss_digitalDriver && alias ) {
+		result = (float *)MSS_IsStreamChannelFree( MSS_FIRST_STREAM );
+		if ( result ) {
+			return MSS_StartBackground( alias, 0, 0 );
+		}
+	}
+	return result;
 }
 
 /* ---- MSS_StopMusic  0x0044DC70 ---- CONFIRMED */
-void __cdecl MSS_StopMusic(int a1)
+void __cdecl MSS_StopMusic( int msec )
 {
-  MSS_StopBackground(0, a1);
+	MSS_StopBackground( 0, msec );
 }
 
 /* ---- MSS_PlayAmbientAlias  0x0044DC80 ---- */
-int __cdecl MSS_PlayAmbientAlias( int aliasArg, int msec )
+void __cdecl MSS_PlayAmbientAlias( mssAlias_t *alias, int msec )
 {
-	void         *alias = (void *)aliasArg;
-	int           slot, chan;
-	mssChannel_t *ch;
-	void         *cur;
-	float         volume;
+	int                  chan;
+	mssAlias_t          *cur;
+	mssBackgroundFade_t *fade;
+	float                volume;
 
 	if ( !mss_digitalDriver || !alias ) {
-		return 0;
+		return;
 	}
 
-	slot = mss_ambientSlot;
-	chan = MSS_FIRST_STREAM + slot;
-	ch   = &mss_channels[chan];
+	chan = MSS_FIRST_STREAM + mss_ambientSlot;
+	fade = &mss_bgFade[mss_ambientSlot];
 
 	if ( !MSS_IsStreamChannelFree( chan ) ) {
-		cur = ch->alias;
-		if ( AL_NAME( cur ) == AL_NAME( alias ) ) {
-			return 1;
+		cur = (mssAlias_t *) mss_channels[chan].alias;
+		if ( cur->name == alias->name ) {
+			return;
 		}
-		if ( AL_FILENAME( cur )  == AL_FILENAME( alias )
-			&& AL_LOOPING( cur )  == AL_LOOPING( alias )
-			&& AL_PITCHMIN( cur ) == AL_PITCHMIN( alias )
-			&& AL_PITCHMAX( cur ) == AL_PITCHMAX( alias )
-			&& AL_CHANNEL( cur )  == AL_CHANNEL( alias ) ) {
-			ch->alias  = alias;
-			ch->alias2 = alias;
-			volume = ( (double)rand() * 0.000030517578
-					 * ( AL_VOLMAX( alias ) - AL_VOLMIN( alias ) ) + AL_VOLMIN( alias ) )
+		if ( cur->file == alias->file
+			&& cur->loop == alias->loop
+			&& cur->pitchMin == alias->pitchMin
+			&& cur->pitchMax == alias->pitchMax
+			&& cur->channel == alias->channel ) {
+			mss_channels[chan].alias  = alias;
+			mss_channels[chan].alias2 = alias;
+			/* float 2^-15 at 0x0044DD1D, as in MSS_ChoosePitchAndVolume */
+			volume = ( FCAST( MSS_I2F( rand() ) * 0.000030517578f )
+					 * ( alias->volMax - alias->volMin ) + alias->volMin )
 					 * 0.80000001f;
 			if ( msec ) {
-				mss_bgFade[slot].rate = ( volume - mss_bgFade[slot].target ) / (double)msec;
+				fade->rate = ( volume - fade->target ) / msec;
 			} else {
-				mss_bgFade[slot].rate = 0.0f;
+				fade->rate = 0.0f;
 			}
-			mss_bgFade[slot].target = volume;
-			return 1;
+			fade->target = volume;
+			return;
 		}
 	}
 
 	MSS_StopBackground( mss_ambientSlot, msec );
 	mss_ambientSlot = 3 - mss_ambientSlot;
 	MSS_StartBackground( alias, mss_ambientSlot, msec );
-	return 1;
 }
 
 /* ---- MSS_BeginRawSamples  0x0044DD90 ---- CONFIRMED */
-int __cdecl MSS_BeginRawSamples(int a1, int a2, int a3)
+/* Allocates the streaming sample used by the raw-PCM feed (cinematics, VoIP).
+   mss_rawSampleHandle = sample handle, mss_rawSegmentSize = ring-buffer chunk size,
+   mss_rawRingBuffer = 32-chunk ring, mss_rawSampleTimePerByteMsec = milliseconds per byte. */
+int __cdecl MSS_BeginRawSamples( int rate, int width, int channels )
 {
-  int sample_handle;
-  int v6;
-  int v7;
-  int v8;
-  int result;
+	int sampleType;
+	int bufSize;
 
-  sample_handle = AIL_allocate_sample_handle(mss_digitalDriver);
-  dword_8E1B78 = sample_handle;
-  if ( !sample_handle )
-    Com_Error(ERR_DROP, &byte_55F5A8);
-  dword_8E1B7C = a2;
-  dword_8E1B80 = a1;
-  dword_8E1B84 = a3;
-  AIL_init_sample(sample_handle);
-  if ( a3 == 1 )
-    v6 = a1 != 1;
-  else
-    v6 = (a1 != 1) + 2;
-  AIL_set_sample_type(dword_8E1B78, v6, 0);
-  AIL_set_sample_playback_rate(dword_8E1B78, a2);
-  AIL_set_sample_volume_pan(dword_8E1B78, *(float *)&mss_masterVolume, 0.5f);
-  v7 = AIL_minimum_sample_buffer_size(mss_digitalDriver, a2, v6);
-  v8 = 0x2000;
-  dword_8E1BAC = 0x2000;
-  if ( v7 > 0x2000 )
-  {
-    v8 = v7;
-    dword_8E1BAC = v7;
-  }
-  dword_8E1B88 = Z_MallocInternal(32 * v8);
-  result = 0;
-  memset(byte_8E1B8C, 0, sizeof(byte_8E1B8C));
-  dword_8E1BB4 = 0;
-  dword_8E1BB8 = 0;
-  dword_8E1BB0 = 0;
-  dbl_8E1BC0 = 0.0;
-  dbl_8E1BC8 = 1000.0 / (double)(dword_8E1B7C * dword_8E1B80 * dword_8E1B84);
-  return result;
+	mss_rawSampleHandle = AIL_allocate_sample_handle( mss_digitalDriver );
+	if ( !mss_rawSampleHandle ) {
+		Com_Error( ERR_DROP, "\x15MILES 2D sound sample allocation failed on raw channel\n" );   /* 0x0055F5A8 */
+	}
+	mss_rawSampleRate = rate;
+	mss_rawSampleWidthBytes = width;
+	mss_rawChannelCount = channels;
+
+	AIL_init_sample( mss_rawSampleHandle );
+	if ( channels == 1 ) {
+		sampleType = ( width != 1 );
+	} else {
+		sampleType = ( width != 1 ) + 2;
+	}
+	AIL_set_sample_type( mss_rawSampleHandle, sampleType, 0 );
+	AIL_set_sample_playback_rate( mss_rawSampleHandle, rate );
+	AIL_set_sample_volume_pan( mss_rawSampleHandle, mss_masterVolume, 0.5f );
+
+	bufSize = AIL_minimum_sample_buffer_size( mss_digitalDriver, rate, sampleType );
+	mss_rawSegmentSize = 0x2000;
+	if ( bufSize > mss_rawSegmentSize ) {
+		mss_rawSegmentSize = bufSize;
+	}
+	mss_rawRingBuffer = Z_MallocInternal( 32 * mss_rawSegmentSize );
+
+	memset( mss_rawSegmentReady, 0, sizeof( mss_rawSegmentReady ) );
+	mss_rawReadSegmentIndex = 0;
+	mss_rawWriteSegmentIndex = 0;
+	mss_rawWriteSegmentOffset = 0;
+	mss_rawSampleTimeBaseMsec = 0.0;
+	mss_rawSampleTimePerByteMsec = (rfloat)1000.0f / ( mss_rawChannelCount * mss_rawSampleWidthBytes * mss_rawSampleRate );
+	return 0;
 }
 
 /* ---- MSS_EndRawSamples  0x0044DEC0 ---- CONFIRMED */
-void MSS_EndRawSamples()
+void MSS_EndRawSamples( void )
 {
-  if ( dword_8E1B78 )
-  {
-    AIL_end_sample(dword_8E1B78);
-    AIL_release_sample_handle(dword_8E1B78);
-    dword_8E1B78 = 0;
-    free(dword_8E1B88);
-  }
+	if ( mss_rawSampleHandle ) {
+		AIL_end_sample( mss_rawSampleHandle );
+		AIL_release_sample_handle( mss_rawSampleHandle );
+		mss_rawSampleHandle = 0;
+		free( mss_rawRingBuffer );
+	}
 }
 
 /* ---- MSS_RawSamplesTime  0x0044DF00 ---- CONFIRMED */
-int MSS_RawSamplesTime()
+int MSS_RawSamplesTime( void )
 {
-  __int64 v0;
-
-  LODWORD(v0) = dword_8E1B78;
-  if ( dword_8E1B78 )
-    return (unsigned __int64)((double)(unsigned int)AIL_sample_position(dword_8E1B78) * dbl_8E1BC8 + dbl_8E1BC0);
-  return v0;
+	/* Retail returns LODWORD(v0) with v0's low dword set to mss_rawSampleHandle in the
+	   no-sample path; since mss_rawSampleHandle is 0 there and the return is 32-bit,
+	   that path is just "return 0".  The (unsigned __int64) cast is the retail
+	   ftol and is kept so the float->int truncation matches exactly. */
+	if ( !mss_rawSampleHandle ) {
+		return 0;
+	}
+	return (unsigned __int64)( (double)(unsigned int)AIL_sample_position( mss_rawSampleHandle )
+	                           * mss_rawSampleTimePerByteMsec + mss_rawSampleTimeBaseMsec );
 }
 
 /* ---- MSS_UpdateRawSamples  0x0044DF40 ---- */
-int MSS_UpdateRawSamples( void )
+void MSS_UpdateRawSamples( void )
 {
 	int buf;
 
-	if ( !dword_8E1B78 ) {
-		return 0;
+	if ( !mss_rawSampleHandle ) {
+		return;
 	}
-	AIL_set_sample_volume_pan( dword_8E1B78, mss_masterVolume, 0.5f );
+	AIL_set_sample_volume_pan( mss_rawSampleHandle, mss_masterVolume, 0.5f );
 
-	if ( !byte_8E1B8C[ dword_8E1BB4 ] ) {
-		return 0;
+	if ( !mss_rawSegmentReady[ mss_rawReadSegmentIndex ] ) {
+		return;
 	}
-	buf = AIL_sample_buffer_ready( dword_8E1B78 );
+	buf = AIL_sample_buffer_ready( mss_rawSampleHandle );
 	if ( buf == -1 ) {
-		return 0;
+		return;
 	}
-	dbl_8E1BC0 = (double)dword_8E1BAC * dbl_8E1BC8 + dbl_8E1BC0;
-	AIL_load_sample_buffer( dword_8E1B78, buf,
-		(char *)dword_8E1B88 + dword_8E1BB4 * dword_8E1BAC, dword_8E1BAC );
-	byte_8E1B8C[ dword_8E1BB4 ] = 0;
-	dword_8E1BB4 = ( dword_8E1BB4 + 1 ) % 32;
-	return dword_8E1BB4;
+	mss_rawSampleTimeBaseMsec = (double)mss_rawSegmentSize * mss_rawSampleTimePerByteMsec + mss_rawSampleTimeBaseMsec;
+	AIL_load_sample_buffer( mss_rawSampleHandle, buf,
+		(char *)mss_rawRingBuffer + mss_rawReadSegmentIndex * mss_rawSegmentSize, mss_rawSegmentSize );
+	/* retail 0x0044DFC4 clears the flag with no bound check; written as a pointer store because
+	   the indexed form makes modern /GS add a range-check fast-fail for index >= 32 */
+	*( mss_rawSegmentReady + mss_rawReadSegmentIndex ) = 0;
+	mss_rawReadSegmentIndex = ( mss_rawReadSegmentIndex + 1 ) % 32;
 }
 
 /* ---- MSS_RawSamples  0x0044DFF0 ---- */
-int __cdecl MSS_RawSamples( int channels, int width, int rate, int samples, void *data )
+void __cdecl MSS_RawSamples( int samples, int rate, int width, int channels, void *data )
 {
 	int remaining, n;
 
 	if ( !mss_digitalDriver ) {
-		return 0;
+		return;
 	}
-	if ( !dword_8E1B78 ) {
-		MSS_BeginRawSamples( width, rate, channels );
-		if ( !dword_8E1B78 ) {
-			return 0;
+	if ( !mss_rawSampleHandle ) {
+		MSS_BeginRawSamples( rate, width, channels );
+		if ( !mss_rawSampleHandle ) {
+			return;
 		}
 	}
 
 	remaining = channels * width * samples;
 	while ( remaining ) {
-		while ( byte_8E1B8C[ dword_8E1BB8 ] ) {
+		while ( mss_rawSegmentReady[ mss_rawWriteSegmentIndex ] ) {
 			MSS_Update();
 		}
-		n = dword_8E1BAC - dword_8E1BB0;
+		n = mss_rawSegmentSize - mss_rawWriteSegmentOffset;
 		if ( n > remaining ) {
 			n = remaining;
 		}
-		Com_Memcpy( (char *)dword_8E1B88 + dword_8E1BAC * dword_8E1BB8 + dword_8E1BB0,
+		Com_Memcpy( (char *)mss_rawRingBuffer + mss_rawSegmentSize * mss_rawWriteSegmentIndex + mss_rawWriteSegmentOffset,
 					data, n );
 		data = (char *)data + n;
 		remaining -= n;
-		dword_8E1BB0 += n;
-		if ( dword_8E1BB0 == dword_8E1BAC ) {
-			dword_8E1BB0 = 0;
-			byte_8E1B8C[ dword_8E1BB8 ] = 1;
-			dword_8E1BB8 = ( dword_8E1BB8 + 1 ) % 32;
+		mss_rawWriteSegmentOffset += n;
+		if ( mss_rawWriteSegmentOffset == mss_rawSegmentSize ) {
+			mss_rawWriteSegmentOffset = 0;
+			mss_rawSegmentReady[ mss_rawWriteSegmentIndex ] = 1;
+			mss_rawWriteSegmentIndex = ( mss_rawWriteSegmentIndex + 1 ) % 32;
 		}
 	}
-	return dword_8E1B78;
 }
 
 /* ---- MSS_FadeAllSounds  0x0044E0F0 ---- CONFIRMED */
-void __cdecl MSS_FadeAllSounds(float a1, int a2)
+void __cdecl MSS_FadeAllSounds( float target, int msec )
 {
-  /* Retail 0x0044E0FE is a RAW DWORD copy: mss_globalFadeTarget is a float lvalue by macro, so converting instead of copying stores 1065353216.0f. */
-  LODWORD( mss_globalFadeTarget ) = LODWORD( a1 );
-  mss_globalFadeRate = a1 - mss_globalFadeCur;
-  if ( a2 )
-  {
-    mss_globalFadeRate = mss_globalFadeRate / (double)a2;
-  }
-  else if ( (a1 == 0.0) | __UNORDERED__(a1, 0.0) )
-  {
-    MSS_StopSounds(0);
-  }
+	mss_globalFadeTarget = target;
+	mss_globalFadeRate = target - mss_globalFadeCur;
+	if ( msec ) {
+		mss_globalFadeRate /= MSS_I2F( msec );
+	} else if ( target == 0.0f ) {
+		MSS_StopSounds( 0 );
+	}
 }
 
 /* ---- MSS_FadeSelectSounds  0x0044E140 ---- */
 int __cdecl MSS_FadeSelectSounds( float *targets, int msec )
 {
-	int i;
-
-	for ( i = 0 ; i < MSS_NUM_ALIAS_CHANNELS ; i++ ) {
-		float rate = targets[i] - mss_channelFade[i][0];
-
-		mss_channelFade[i][1] = targets[i];
-		if ( msec ) {
-			rate = rate / (double)msec;
-		}
-		mss_channelFade[i][2] = rate;
+	{ double rate;
+		mss_channelFade[0][1] = targets[0];
+		rate = (double)targets[0] - mss_channelFade[0][0];
+		mss_channelFade[0][2] = (float)rate;
+		if (msec) mss_channelFade[0][2] = (float)(rate / (double)msec);
+	}
+	{ double rate;
+		mss_channelFade[1][1] = targets[1];
+		rate = (double)targets[1] - mss_channelFade[1][0];
+		mss_channelFade[1][2] = (float)rate;
+		if (msec) mss_channelFade[1][2] = (float)(rate / (double)msec);
+	}
+	{ double rate;
+		mss_channelFade[2][1] = targets[2];
+		rate = (double)targets[2] - mss_channelFade[2][0];
+		mss_channelFade[2][2] = (float)rate;
+		if (msec) mss_channelFade[2][2] = (float)(rate / (double)msec);
+	}
+	{ double rate;
+		mss_channelFade[3][1] = targets[3];
+		rate = (double)targets[3] - mss_channelFade[3][0];
+		mss_channelFade[3][2] = (float)rate;
+		if (msec) mss_channelFade[3][2] = (float)(rate / (double)msec);
+	}
+	{ double rate;
+		mss_channelFade[4][1] = targets[4];
+		rate = (double)targets[4] - mss_channelFade[4][0];
+		mss_channelFade[4][2] = (float)rate;
+		if (msec) mss_channelFade[4][2] = (float)(rate / (double)msec);
+	}
+	{ double rate;
+		mss_channelFade[5][1] = targets[5];
+		rate = (double)targets[5] - mss_channelFade[5][0];
+		mss_channelFade[5][2] = (float)rate;
+		if (msec) mss_channelFade[5][2] = (float)(rate / (double)msec);
+	}
+	{ double rate;
+		mss_channelFade[6][1] = targets[6];
+		rate = (double)targets[6] - mss_channelFade[6][0];
+		mss_channelFade[6][2] = (float)rate;
+		if (msec) mss_channelFade[6][2] = (float)(rate / (double)msec);
+	}
+	{ double rate;
+		mss_channelFade[7][1] = targets[7];
+		rate = (double)targets[7] - mss_channelFade[7][0];
+		mss_channelFade[7][2] = (float)rate;
+		if (msec) mss_channelFade[7][2] = (float)(rate / (double)msec);
+	}
+	{ double rate;
+		mss_channelFade[8][1] = targets[8];
+		rate = (double)targets[8] - mss_channelFade[8][0];
+		mss_channelFade[8][2] = (float)rate;
+		if (msec) mss_channelFade[8][2] = (float)(rate / (double)msec);
+	}
+	{ double rate;
+		mss_channelFade[9][1] = targets[9];
+		rate = (double)targets[9] - mss_channelFade[9][0];
+		mss_channelFade[9][2] = (float)rate;
+		if (msec) mss_channelFade[9][2] = (float)(rate / (double)msec);
 	}
 	return (int)targets;
 }
 
 /* ---- MSS_PauseSounds  0x0044E2F0 ---- */
-int MSS_PauseSounds( void )
+void MSS_PauseSounds( void )
 {
-	int chan, i, h;
+	int chan, i;
 
 	if ( !mss_digitalDriver || mss_paused ) {
-		return mss_paused;
+		return;
 	}
 
 	for ( chan = MSS_FIRST_2D ; chan < MSS_FIRST_2D + mss_num2DChannels ; chan++ ) {
-		if ( ( mss_channels[chan].paused
-				|| AIL_sample_status( MSS_2D_HANDLE( chan ) ) != SMP_DONE )
+		if ( !MSS_Is2DChannelFree( chan )
 			&& AL_CHANNEL( mss_channels[chan].alias ) != 1 ) {
-			AIL_stop_sample( MSS_2D_HANDLE( chan ) );
-			mss_channels[chan].paused = 1;
+			MSS_Pause2DChannel( chan );
 		}
 	}
 
 	for ( i = 0 ; i < mss_max3DChannels ; i++ ) {
-		if ( mss_channels[i].paused
-			|| AIL_3D_sample_status( mss_3DHandles[i] ) != SMP_DONE ) {
-			AIL_stop_3D_sample( mss_3DHandles[i] );
-			mss_channels[i].paused = 1;
+		if ( !MSS_Is3DChannelFree( i ) ) {
+			MSS_Pause3DChannel( i );
 		}
 	}
 
 	for ( chan = MSS_FIRST_STREAM ; chan < MSS_FIRST_STREAM + mss_numStreamChannels ; chan++ ) {
-		h = MSS_STREAM_HANDLE( chan );
-		if ( !h ) {
-			continue;
-		}
-		if ( mss_channels[chan].paused || AIL_stream_status( h ) != SMP_DONE ) {
-			if ( AL_CHANNEL( mss_channels[chan].alias ) != 1 ) {
-				AIL_pause_stream( h, 1 );
-				mss_channels[chan].paused = 1;
-			}
-		} else {
-			AIL_close_stream( h );
-			MSS_STREAM_HANDLE( chan ) = 0;
+		if ( !MSS_IsStreamChannelFree( chan )
+			&& AL_CHANNEL( mss_channels[chan].alias ) != 1 ) {
+			MSS_PauseStreamChannel( chan );
 		}
 	}
 
 	mss_paused    = 1;
 	mss_pauseTime = mss_time;
-	return mss_time;
 }
 
 /* ---- MSS_UnpauseSounds  0x0044E470 ---- */
-int MSS_UnpauseSounds( void )
+void MSS_UnpauseSounds( void )
 {
-	int chan, i, h, elapsed;
+	int chan, i, elapsed;
 
 	if ( !mss_digitalDriver || !mss_paused ) {
-		return mss_paused;
+		return;
 	}
 	elapsed = mss_time - mss_pauseTime;
 
 	for ( chan = MSS_FIRST_2D ; chan < MSS_FIRST_2D + mss_num2DChannels ; chan++ ) {
-		if ( mss_channels[chan].paused ) {
-			AIL_resume_sample( MSS_2D_HANDLE( chan ) );
-			mss_channels[chan].endTime += elapsed;
-			mss_channels[chan].paused = 0;
+		if ( !MSS_Is2DChannelFree( chan ) && mss_channels[chan].paused ) {
+			MSS_Unpause2DChannel( chan, elapsed );
 		}
 	}
 
 	for ( i = 0 ; i < mss_max3DChannels ; i++ ) {
-		if ( mss_channels[i].paused ) {
-			AIL_resume_3D_sample( mss_3DHandles[i] );
-			mss_channels[i].endTime += elapsed;
-			mss_channels[i].paused = 0;
+		if ( !MSS_Is3DChannelFree( i ) && mss_channels[i].paused ) {
+			MSS_Unpause3DChannel( i, elapsed );
 		}
 	}
 
 	for ( chan = MSS_FIRST_STREAM ; chan < MSS_FIRST_STREAM + mss_numStreamChannels ; chan++ ) {
-		h = MSS_STREAM_HANDLE( chan );
-		if ( !h ) {
-			continue;
-		}
-		if ( mss_channels[chan].paused ) {
-			AIL_pause_stream( h, 0 );
-			mss_channels[chan].endTime += elapsed;
-			mss_channels[chan].paused = 0;
-		} else if ( AIL_stream_status( h ) == SMP_DONE ) {
-			AIL_close_stream( h );
-			MSS_STREAM_HANDLE( chan ) = 0;
+		if ( !MSS_IsStreamChannelFree( chan ) && mss_channels[chan].paused ) {
+			MSS_UnpauseStreamChannel( chan, elapsed );
 		}
 	}
 
 	mss_paused    = 0;
 	mss_pauseTime = 0;
-	return 0;
 }
 
 /* ---- MSS_UpdateLoopingSounds  0x0044E600 ---- */
-int __cdecl MSS_UpdateLoopingSounds( void )
+void __cdecl MSS_UpdateLoopingSounds( void )
 {
-	int chan, i, h;
+	int chan, i;
 
 	if ( !mss_digitalDriver || mss_paused ) {
-		return 0;
+		return;
 	}
 
 	for ( i = 0 ; i < mss_max3DChannels ; i++ ) {
-		if ( ( mss_channels[i].paused
-				|| AIL_3D_sample_status( mss_3DHandles[i] ) != SMP_DONE )
+		if ( !MSS_Is3DChannelFree( i )
 			&& AL_LOOPING( mss_channels[i].alias )
 			&& mss_channels[i].touchTime != mss_loopFrameTime ) {
-			AIL_end_3D_sample( mss_3DHandles[i] );
-			mss_channels[i].paused = 0;
+			MSS_Stop3DChannel( i );
 		}
 	}
 
 	for ( chan = MSS_FIRST_2D ; chan < MSS_FIRST_2D + mss_num2DChannels ; chan++ ) {
-		if ( ( mss_channels[chan].paused
-				|| AIL_sample_status( MSS_2D_HANDLE( chan ) ) != SMP_DONE )
+		if ( !MSS_Is2DChannelFree( chan )
 			&& AL_LOOPING( mss_channels[chan].alias )
 			&& mss_channels[chan].touchTime != mss_loopFrameTime ) {
-			AIL_end_sample( MSS_2D_HANDLE( chan ) );
-			mss_channels[chan].paused = 0;
+			MSS_Stop2DChannel( chan );
 		}
 	}
 
 	for ( chan = MSS_FIRST_STREAM ; chan < MSS_FIRST_STREAM + mss_numStreamChannels ; chan++ ) {
-		h = MSS_STREAM_HANDLE( chan );
-		if ( !h ) {
-			continue;
+		if ( !MSS_IsStreamChannelFree( chan )
+			&& AL_LOOPING( mss_channels[chan].alias )
+			&& mss_channels[chan].touchTime != mss_loopFrameTime ) {
+			MSS_StopStreamChannel( chan );
 		}
-		if ( mss_channels[chan].paused || AIL_stream_status( h ) != SMP_DONE ) {
-			if ( !AL_LOOPING( mss_channels[chan].alias )
-				|| mss_channels[chan].touchTime == mss_loopFrameTime ) {
-				continue;
-			}
-			AIL_close_stream( h );
-			mss_channels[chan].paused = 0;
-		} else {
-			AIL_close_stream( h );
-		}
-		MSS_STREAM_HANDLE( chan ) = 0;
 	}
 
 	mss_loopFrameTime = mss_time;
-	return mss_loopFrameTime;
 }
 
 /* ---- MSS_UpdateBackgroundVolume  0x0044E7A0 ---- */
-static int MSS_UpdateBackgroundVolume( int msec, int slot )
+static int MSS_UpdateBackgroundVolume( int slot, int msec )
 {
-	int           chan = MSS_FIRST_STREAM + slot;
-	mssChannel_t *ch   = &mss_channels[chan];
-	float         v;
+	int   chan = MSS_FIRST_STREAM + slot;
+	float v;
 
-	v = (double)msec * mss_bgFade[slot].rate + ch->volume;
+	v = msec * (rfloat)mss_bgFade[slot].rate + mss_channels[chan].volume;
 
 	if ( mss_bgFade[slot].rate > 0.0f ) {
 		if ( v > mss_bgFade[slot].target ) {
@@ -1909,20 +1883,20 @@ static int MSS_UpdateBackgroundVolume( int msec, int slot )
 		if ( v == 0.0f ) {
 			AIL_close_stream( MSS_STREAM_HANDLE( chan ) );
 			MSS_STREAM_HANDLE( chan ) = 0;
-			ch->paused = 0;
+			mss_channels[chan].paused = 0;
 			return 0;
 		}
 	}
 
-	ch->volume    = v;
-	ch->touchTime = mss_loopFrameTime;
+	mss_channels[chan].touchTime = mss_loopFrameTime;
+	mss_channels[chan].volume    = v;
 	return 1;
 }
 
 /* ---- MSS_UpdateVolume  0x0044E840 ---- */
 void MSS_UpdateVolume( float *fade, int msec )
 {
-	fade[0] = (double)msec * fade[2] + fade[0];
+	fade[0] = msec * fade[2] + fade[0];
 
 	if ( fade[2] < 0.0f ) {
 		if ( fade[0] < fade[1] ) {
@@ -1938,52 +1912,25 @@ void MSS_UpdateVolume( float *fade, int msec )
 /* ---- MSS_UpdateMasterVolumes  0x0044E890 ---- */
 void __cdecl MSS_UpdateMasterVolumes( int msec )
 {
-	cvar_t *volume = MSS_CVAR( mss_volume );
-	float   clamped;
-	int     i;
+	int i;
 
 	for ( i = 0 ; i < MSS_NUM_ALIAS_CHANNELS ; i++ ) {
-		mss_channelFade[i][0] = mss_channelFade[i][2] * (double)msec + mss_channelFade[i][0];
-		if ( mss_channelFade[i][2] < 0.0f ) {
-			if ( mss_channelFade[i][0] < mss_channelFade[i][1] ) {
-				mss_channelFade[i][0] = mss_channelFade[i][1];
-				mss_channelFade[i][2] = 0.0f;
-			}
-		} else if ( mss_channelFade[i][0] > mss_channelFade[i][1] ) {
-			mss_channelFade[i][0] = mss_channelFade[i][1];
-			mss_channelFade[i][2] = 0.0f;
-		}
+		MSS_UpdateVolume( mss_channelFade[i], msec );
 	}
 
 	if ( mss_globalFadeRate == 0.0f ) {
-		if ( !volume->modified ) {
+		if ( !MSS_CVAR( mss_volume )->modified ) {
 			return;
 		}
 	} else {
-		mss_globalFadeCur = (double)msec * mss_globalFadeRate + mss_globalFadeCur;
-		if ( mss_globalFadeRate < 0.0f ) {
-			if ( mss_globalFadeCur < mss_globalFadeTarget ) {
-				mss_globalFadeCur  = mss_globalFadeTarget;
-				mss_globalFadeRate = 0.0f;
-			}
-		} else if ( mss_globalFadeCur > mss_globalFadeTarget ) {
-			mss_globalFadeCur  = mss_globalFadeTarget;
-			mss_globalFadeRate = 0.0f;
-		}
+		MSS_UpdateVolume( mss_globalFade, msec );
 		if ( mss_globalFadeCur == 0.0f && mss_globalFadeRate == 0.0f ) {
 			MSS_StopSounds( 0 );
 		}
 	}
 
-	volume->modified = qfalse;
-	if ( volume->value > 1.0f ) {
-		clamped = 1.0f;
-	} else if ( volume->value >= 0.0f ) {
-		clamped = volume->value;
-	} else {
-		clamped = 0.0f;
-	}
-	mss_masterVolume = clamped * mss_globalFadeCur;
+	MSS_CVAR( mss_volume )->modified = qfalse;
+	mss_masterVolume = MSS_MAX( 0.0f, MSS_MIN( 1.0f, MSS_CVAR( mss_volume )->value ) ) * mss_globalFadeCur;
 }
 
 /* ---- MSS_AnyMasters  0x0044ED60 ---- */
@@ -1992,31 +1939,28 @@ int MSS_AnyMasters( void )
 	int chan, i, h;
 
 	for ( i = 0 ; i < mss_max3DChannels ; i++ ) {
-		if ( ( mss_channels[i].paused
-				|| AIL_3D_sample_status( mss_3DHandles[i] ) != SMP_DONE )
+		if ( ( !MSS_Is3DChannelFree( i ) )
 			&& AL_MASTER( mss_channels[i].alias ) ) {
 			return 1;
 		}
 	}
 
 	for ( chan = MSS_FIRST_STREAM ; chan < MSS_FIRST_STREAM + mss_numStreamChannels ; chan++ ) {
-		h = MSS_STREAM_HANDLE( chan );
-		if ( !h ) {
+		if ( !MSS_STREAM_HANDLE( chan ) ) {
 			continue;
 		}
-		if ( mss_channels[chan].paused || AIL_stream_status( h ) != SMP_DONE ) {
+		if ( mss_channels[chan].paused || AIL_stream_status( MSS_STREAM_HANDLE( chan ) ) != SMP_DONE ) {
 			if ( AL_MASTER( mss_channels[chan].alias ) ) {
 				return 1;
 			}
 		} else {
-			AIL_close_stream( h );
+			AIL_close_stream( MSS_STREAM_HANDLE( chan ) );
 			MSS_STREAM_HANDLE( chan ) = 0;
 		}
 	}
 
 	for ( chan = MSS_FIRST_2D ; chan < MSS_FIRST_2D + mss_num2DChannels ; chan++ ) {
-		if ( ( mss_channels[chan].paused
-				|| AIL_sample_status( MSS_2D_HANDLE( chan ) ) != SMP_DONE )
+		if ( ( !MSS_Is2DChannelFree( chan ) )
 			&& AL_MASTER( mss_channels[chan].alias ) ) {
 			return 1;
 		}
@@ -2025,133 +1969,149 @@ int MSS_AnyMasters( void )
 }
 
 /* ---- MSS_Update3DChannel  0x0044EEA0 ---- */
-static void MSS_Update3DChannel( int chan )
+static void MSS_Update3DChannel( int msec, int chan )
 {
-	mssChannel_t *ch = &mss_channels[chan];
-	int           h  = mss_3DHandles[chan];
-	vec3_t        origin, d;
-	float         minDist, maxDist, dist, f, atten, volume, ducked;
+	mssAlias_t *alias, *alias2;
+	int         h;
+	vec3_t      origin;
+#ifndef COD1_VC7
+	vec3_t      d;
+#endif
+	float       blend, volume, oneMinusBlend, minDist, maxDist, dist, ducked;
 
-	MSS_GetCurrent3DPosition( ch->entnum, origin, ch->localOrigin );
-	MSS_Set3DPosition( origin, h );
+	(void)msec;
 
-	minDist = ( 1.0f - ch->blend ) * AL_MINDIST( ch->alias )
-	        +          ch->blend   * AL_MINDIST( ch->alias2 );
+	alias  = mss_channels[chan].alias;
+	alias2 = mss_channels[chan].alias2;
+	blend  = mss_channels[chan].blend;
+	volume = mss_channels[chan].volume;
+	h      = mss_3DHandles[chan];
 
+	MSS_GetCurrent3DPosition( mss_channels[chan].entnum, mss_channels[chan].localOrigin, origin );
+	MSS_Set3DPosition( h, origin );
+
+	oneMinusBlend = 1.0f - blend;
+	minDist = oneMinusBlend * alias->distMin + blend * alias2->distMin;
+	maxDist = oneMinusBlend * alias->distMax + blend * alias2->distMax;
+
+	/* Retail 0x0044EF2E-0x0044EF77: Distance inlined from com_math.c (/Op),
+	 * so every float local goes through its slot. */
+#ifdef COD1_VC7
+	dist = Distance( origin, mss_listenerOrigin );
+#else
+	/* The double products are exact and the 53-bit z, y, x sum is what
+	 * retail passes to sqrt in st0. */
 	VectorSubtract( mss_listenerOrigin, origin, d );
-	dist = (float)sqrt( d[0] * d[0] + d[1] * d[1] + d[2] * d[2] );
-
-	if ( dist - minDist > 0.0f ) {
-		maxDist = ( 1.0f - ch->blend ) * AL_MAXDIST( ch->alias )
-		        +          ch->blend   * AL_MAXDIST( ch->alias2 );
-		f = ( dist - minDist ) / ( maxDist - minDist );
-		atten = ( f < 1.0f ) ? 1.0f - f : 0.0f;
+	dist = (float)sqrt( (double)d[2] * d[2] + (double)d[1] * d[1] + (double)d[0] * d[0] );
+#endif
+	dist = dist - minDist;
+	if ( dist <= 0.0f ) {
+		dist = 1.0f;
 	} else {
-		atten = 1.0f;
+		dist = dist / ( maxDist - minDist );
+		if ( dist >= 1.0f ) {
+			dist = 0.0f;
+		} else {
+			dist = 1.0f - dist;
+		}
 	}
 
-	volume = atten * ch->volume;
-	if ( mss_anyMasters && AL_DUCKS( ch->alias ) ) {
-		ducked = ( 1.0f - ch->blend ) * AL_DUCKVOL( ch->alias )
-		       +          ch->blend   * AL_DUCKVOL( ch->alias2 );
+	volume = dist * volume;
+	if ( mss_anyMasters && alias->isSlave ) {
+		ducked = oneMinusBlend * alias->slavePercent + blend * alias2->slavePercent;
 		if ( volume > ducked ) {
 			volume = ducked;
 		}
 	}
 
-	AIL_set_3D_sample_volume( h,
-		mss_masterVolume * ( volume * mss_channelFade[ AL_CHANNEL( ch->alias ) ][0] ) );
+	volume = volume * mss_channelFade[ alias->channel ][0];
+	AIL_set_3D_sample_volume( h, mss_masterVolume * volume );
 }
 
 /* ---- MSS_Update2DChannel  0x0044F070 ---- */
 static void MSS_Update2DChannel( int msec, int chan )
 {
-	mssChannel_t *ch = &mss_channels[chan];
-	float         volume = ch->volume;
-	float         ducked;
+	mssAlias_t *alias;
+	int         h;
+	float       volume, blend, ducked;
 
 	(void)msec;
 
-	if ( mss_anyMasters && AL_DUCKS( ch->alias ) ) {
-		ducked = ( 1.0f - ch->blend ) * AL_DUCKVOL( ch->alias )
-		       +          ch->blend   * AL_DUCKVOL( ch->alias2 );
+	alias  = mss_channels[chan].alias;
+	volume = mss_channels[chan].volume;
+	blend  = mss_channels[chan].blend;
+	h      = MSS_2D_HANDLE( chan );
+
+	if ( mss_anyMasters && alias->isSlave ) {
+		ducked = ( 1.0f - blend ) * alias->slavePercent
+		       +          blend   * ( (mssAlias_t *)mss_channels[chan].alias2 )->slavePercent;
 		if ( volume > ducked ) {
 			volume = ducked;
 		}
 	}
 
-	AIL_set_sample_volume_pan( MSS_2D_HANDLE( chan ),
-		volume * mss_channelFade[ AL_CHANNEL( ch->alias ) ][0] * mss_masterVolume,
-		0.5f );
+	volume = volume * mss_channelFade[ alias->channel ][0];
+	AIL_set_sample_volume_pan( h, volume * mss_masterVolume, 0.5f );
 }
 
 /* ---- MSS_UpdateStreamChannel  0x0044F100 ---- */
-static int MSS_UpdateStreamChannel( int msec, int chan )
+static void MSS_UpdateStreamChannel( int msec, int chan )
 {
-	mssChannel_t *ch;
-	int           h;
-	float         volume, pan, ducked;
+	mssAlias_t *alias, *alias2;
+	int         h;
+	float       volume, pan, blend, ducked;
 
 	if ( chan < MSS_FIRST_STREAM + MSS_NUM_BACKGROUND
-		&& !MSS_UpdateBackgroundVolume( msec, chan - MSS_FIRST_STREAM ) ) {
-		return 0;
+		&& !MSS_UpdateBackgroundVolume( chan - MSS_FIRST_STREAM, msec ) ) {
+		return;
 	}
 
-	ch     = &mss_channels[chan];
+	alias  = mss_channels[chan].alias;
+	alias2 = mss_channels[chan].alias2;
+	blend  = mss_channels[chan].blend;
+	volume = mss_channels[chan].volume;
 	h      = MSS_STREAM_HANDLE( chan );
-	volume = ch->volume;
 	pan    = 0.5f;
 
 	if ( MSS_STREAM_INFO( chan ).spatialized ) {
-		MSS_GetCurrent3DPosition( ch->entnum, MSS_STREAM_INFO( chan ).origin,
-								  ch->localOrigin );
+		MSS_GetCurrent3DPosition( mss_channels[chan].entnum, mss_channels[chan].localOrigin,
+								  MSS_STREAM_INFO( chan ).origin );
 		MSS_SpatializeStream( &volume, chan - MSS_FIRST_STREAM, &pan );
 	}
 
-	if ( mss_anyMasters && AL_DUCKS( ch->alias ) ) {
-		ducked = ( 1.0f - ch->blend ) * AL_DUCKVOL( ch->alias )
-		       +          ch->blend   * AL_DUCKVOL( ch->alias2 );
+	if ( mss_anyMasters && alias->isSlave ) {
+		ducked = ( 1.0f - blend ) * alias->slavePercent
+		       +          blend   * alias2->slavePercent;
 		if ( volume > ducked ) {
 			volume = ducked;
 		}
 	}
 
-	AIL_set_stream_volume_pan( h,
-		mss_masterVolume * ( volume * mss_channelFade[ AL_CHANNEL( ch->alias ) ][0] ),
-		pan );
-	return 1;
+	volume *= mss_channelFade[ alias->channel ][0];
+	AIL_set_stream_volume_pan( h, mss_masterVolume * volume, pan );
 }
 
 /* ---- MSS_UpdateAllChannels  0x0044F210 ---- */
 static void MSS_UpdateAllChannels( int msec )
 {
-	int chan, i, h;
+	int chan;
 
 	mss_anyMasters = MSS_AnyMasters();
 
-	for ( i = 0 ; i < mss_max3DChannels ; i++ ) {
-		if ( mss_channels[i].paused
-			|| AIL_3D_sample_status( mss_3DHandles[i] ) != SMP_DONE ) {
-			MSS_Update3DChannel( i );
+	for ( chan = 0 ; chan < mss_max3DChannels ; chan++ ) {
+		if ( !MSS_Is3DChannelFree( chan ) ) {
+			MSS_Update3DChannel( msec, chan );
 		}
 	}
 
 	for ( chan = MSS_FIRST_STREAM ; chan < MSS_FIRST_STREAM + mss_numStreamChannels ; chan++ ) {
-		h = MSS_STREAM_HANDLE( chan );
-		if ( !h ) {
-			continue;
-		}
-		if ( mss_channels[chan].paused || AIL_stream_status( h ) != SMP_DONE ) {
+		if ( !MSS_IsStreamChannelFree( chan ) ) {
 			MSS_UpdateStreamChannel( msec, chan );
-		} else {
-			AIL_close_stream( h );
-			MSS_STREAM_HANDLE( chan ) = 0;
 		}
 	}
 
 	for ( chan = MSS_FIRST_2D ; chan < MSS_FIRST_2D + mss_num2DChannels ; chan++ ) {
-		if ( mss_channels[chan].paused
-			|| AIL_sample_status( MSS_2D_HANDLE( chan ) ) != SMP_DONE ) {
+		if ( !MSS_Is2DChannelFree( chan ) ) {
 			MSS_Update2DChannel( msec, chan );
 		}
 	}
@@ -2171,7 +2131,7 @@ static const char * const mss_roomTypeNames[26] = {
 unsigned int __cdecl MSS_RoomTypeFromString( const char *name )
 {
 	unsigned int i;
-	unsigned int index;
+	int          index;
 
 	if ( *name < '0' || *name > '9' ) {
 		for ( i = 0 ; i < 26 ; i++ ) {
@@ -2181,7 +2141,7 @@ unsigned int __cdecl MSS_RoomTypeFromString( const char *name )
 		}
 	} else {
 		index = j__atol( name );
-		if ( index < 26 ) {
+		if ( index >= 0 && (unsigned int)index < 26 ) {
 			return index;
 		}
 	}
@@ -2194,99 +2154,71 @@ unsigned int __cdecl MSS_RoomTypeFromString( const char *name )
 }
 
 /* ---- MSS_SetEnvironmentEffects  0x0044F3C0 ---- CONFIRMED */
-int __cdecl MSS_SetEnvironmentEffects(const char *a1, float a2, int a3)
+void __cdecl MSS_SetEnvironmentEffects( const char *roomName, float target, int msec )
 {
-  int result;
-  unsigned int v4;
+	unsigned int roomType;
 
-  result = mss_digitalDriver;
-  if ( mss_digitalDriver )
-  {
-    v4 = MSS_RoomTypeFromString(a1);
-    AIL_set_digital_master_room_type(mss_digitalDriver, v4);
-    AIL_set_3D_room_type(mss_3DProvider, v4);
-    result = 1;
-    mss_roomType = v4;
-    /* Retail 0x0044F401 is a RAW DWORD copy, same as MSS_FadeAllSounds: mss_wetTarget is a float lvalue by macro. */
-    LODWORD( mss_wetTarget ) = LODWORD( a2 );
-    if ( a3 < 1 )
-      a3 = 1;
-    mss_wetRate = (a2 - *(float *)&mss_wetLevel) / (double)a3;
-  }
-  return result;
+	if ( !mss_digitalDriver ) {
+		return;
+	}
+
+	roomType = MSS_RoomTypeFromString( roomName );
+	AIL_set_digital_master_room_type( mss_digitalDriver, roomType );
+	AIL_set_3D_room_type( mss_3DProvider, roomType );
+	mss_roomType = roomType;
+
+	mss_wetTarget = target;
+
+	if ( msec < 1 ) {
+		msec = 1;
+	}
+	mss_wetRate = ( target - mss_wetLevel ) / (double)msec;
 }
 
 /* ---- MSS_UpdateRoomEffects  0x0044F430 ---- */
 void __cdecl MSS_UpdateRoomEffects( int msec )
 {
-	cvar_t *roomtype = MSS_CVAR( mss_roomtype );
-	cvar_t *wetlevel = MSS_CVAR( mss_wetlevel );
-	int     chan, i, h;
+	int     chan, i;
+	float   level;
 
-	if ( roomtype->modified || wetlevel->modified ) {
-		float wanted;
-
-		roomtype->modified = qfalse;
-		wetlevel->modified = qfalse;
-
-		if ( wetlevel->value > 1.0f ) {
-			wanted = 1.0f;
-		} else if ( wetlevel->value >= 0.0f ) {
-			wanted = wetlevel->value;
-		} else {
-			wanted = 0.0f;
-		}
-
-		if ( mss_digitalDriver ) {
-			unsigned int room = MSS_RoomTypeFromString( roomtype->string );
-
-			AIL_set_digital_master_room_type( mss_digitalDriver, room );
-			AIL_set_3D_room_type( mss_3DProvider, room );
-			mss_roomType  = room;
-			mss_wetTarget = wanted;
-			mss_wetRate   = wanted - mss_wetLevel;
-		}
+	if ( MSS_CVAR( mss_roomtype )->modified || MSS_CVAR( mss_wetlevel )->modified ) {
+		MSS_CVAR( mss_roomtype )->modified = qfalse;
+		MSS_CVAR( mss_wetlevel )->modified = qfalse;
+		MSS_SetEnvironmentEffects( MSS_CVAR( mss_roomtype )->string,
+			MSS_MAX( 0.0f, MSS_MIN( 1.0f, MSS_CVAR( mss_wetlevel )->value ) ), 0 );
 	}
 
-	if ( mss_wetRate == 0.0f ) {
-		return;
-	}
-
-	mss_wetLevel = (double)msec * mss_wetRate + mss_wetLevel;
-	if ( mss_wetRate < 0.0f ) {
-		if ( mss_wetLevel <= mss_wetTarget ) {
+	if ( mss_wetRate != 0.0f ) {
+		/* level stays on the x87 stack: retail stores it with fst and tests the
+		   unrounded value against the target (0x0044F51D-0x0044F531). */
+		level = msec * mss_wetRate + mss_wetLevel;
+		mss_wetLevel = level;
+		if ( mss_wetRate < 0.0f ) {
+			if ( level <= mss_wetTarget ) {
+				mss_wetLevel = mss_wetTarget;
+				mss_wetRate  = 0.0f;
+			}
+		} else if ( level >= mss_wetTarget ) {
 			mss_wetLevel = mss_wetTarget;
 			mss_wetRate  = 0.0f;
 		}
-	} else if ( mss_wetLevel >= mss_wetTarget ) {
-		mss_wetLevel = mss_wetTarget;
-		mss_wetRate  = 0.0f;
-	}
 
-	for ( i = 0 ; i < mss_max3DChannels ; i++ ) {
-		if ( mss_channels[i].paused
-			|| AIL_3D_sample_status( mss_3DHandles[i] ) != SMP_DONE ) {
-			AIL_set_3D_sample_effects_level( mss_3DHandles[i], mss_wetLevel );
+		for ( i = 0 ; i < mss_max3DChannels ; i++ ) {
+			if ( !MSS_Is3DChannelFree( i ) ) {
+				AIL_set_3D_sample_effects_level( mss_3DHandles[i], mss_wetLevel );
+			}
 		}
-	}
 
-	for ( chan = MSS_FIRST_2D ; chan < MSS_FIRST_2D + mss_num2DChannels ; chan++ ) {
-		if ( mss_channels[chan].paused
-			|| AIL_sample_status( MSS_2D_HANDLE( chan ) ) != SMP_DONE ) {
-			AIL_set_sample_reverb_levels( MSS_2D_HANDLE( chan ), 1.0f, mss_wetLevel );
+		for ( chan = MSS_FIRST_2D ; chan < MSS_FIRST_2D + mss_num2DChannels ; chan++ ) {
+			if ( !MSS_Is2DChannelFree( chan ) ) {
+				AIL_set_sample_reverb_levels( MSS_2D_HANDLE( chan ), 1.0f, mss_wetLevel );
+			}
 		}
-	}
 
-	for ( chan = MSS_FIRST_STREAM ; chan < MSS_FIRST_STREAM + mss_numStreamChannels ; chan++ ) {
-		h = MSS_STREAM_HANDLE( chan );
-		if ( !h ) {
-			continue;
-		}
-		if ( mss_channels[chan].paused || AIL_stream_status( h ) != SMP_DONE ) {
-			AIL_set_stream_reverb_levels( h, 1.0f, mss_wetLevel );
-		} else {
-			AIL_close_stream( h );
-			MSS_STREAM_HANDLE( chan ) = 0;
+		for ( chan = MSS_FIRST_STREAM ; chan < MSS_FIRST_STREAM + mss_numStreamChannels ; chan++ ) {
+			if ( !MSS_IsStreamChannelFree( chan ) ) {
+				AIL_set_stream_reverb_levels( MSS_STREAM_HANDLE( chan ), 1.0f, mss_wetLevel );
+			}
 		}
 	}
 }
@@ -2296,7 +2228,7 @@ void MSS_UpdateTimeScale( void )
 {
 	float scale = com_timescale->value;
 	float ratio;
-	int   chan, i, h;
+	int   chan, i, h, rate;
 
 	if ( scale <= 0.0f ) {
 		scale = 1.0f;
@@ -2309,72 +2241,61 @@ void MSS_UpdateTimeScale( void )
 	mss_timeScale = scale;
 
 	for ( i = 0 ; i < mss_max3DChannels ; i++ ) {
-		if ( mss_channels[i].paused
-			|| AIL_3D_sample_status( mss_3DHandles[i] ) != SMP_DONE ) {
+		if ( !MSS_Is3DChannelFree( i ) ) {
 			h = mss_3DHandles[i];
-			AIL_set_3D_sample_playback_rate( h,
-				MSS_FTOL( (double)AIL_3D_sample_playback_rate( h ) * ratio ) );
+			rate = AIL_3D_sample_playback_rate( h );
+			AIL_set_3D_sample_playback_rate( h, MSS_FTOL( ratio * rate ) );
 		}
 	}
 
 	for ( chan = MSS_FIRST_STREAM ; chan < MSS_FIRST_STREAM + mss_numStreamChannels ; chan++ ) {
-		h = MSS_STREAM_HANDLE( chan );
-		if ( !h ) {
-			continue;
-		}
-		if ( mss_channels[chan].paused || AIL_stream_status( h ) != SMP_DONE ) {
-			AIL_set_stream_playback_rate( h,
-				MSS_FTOL( (double)AIL_stream_playback_rate( h ) * ratio ) );
-		} else {
-			AIL_close_stream( h );
-			MSS_STREAM_HANDLE( chan ) = 0;
+		if ( !MSS_IsStreamChannelFree( chan ) ) {
+			h = MSS_STREAM_HANDLE( chan );
+			rate = AIL_stream_playback_rate( h );
+			AIL_set_stream_playback_rate( h, MSS_FTOL( ratio * rate ) );
 		}
 	}
 
 	for ( chan = MSS_FIRST_2D ; chan < MSS_FIRST_2D + mss_num2DChannels ; chan++ ) {
-		if ( mss_channels[chan].paused
-			|| AIL_sample_status( MSS_2D_HANDLE( chan ) ) != SMP_DONE ) {
+		if ( !MSS_Is2DChannelFree( chan ) ) {
 			h = MSS_2D_HANDLE( chan );
-			AIL_set_sample_playback_rate( h,
-				MSS_FTOL( (double)AIL_sample_playback_rate( h ) * ratio ) );
+			rate = AIL_sample_playback_rate( h );
+			AIL_set_sample_playback_rate( h, MSS_FTOL( ratio * rate ) );
 		}
 	}
 }
 
 /* ---- MSS_UpdatePause  0x0044F8F0 ---- */
-int MSS_UpdatePause( void )
+void MSS_UpdatePause( void )
 {
 	int paused = ( cl_paused->integer != 0 );
 
 	if ( paused == mss_paused ) {
-		return paused;
+		return;
 	}
 	if ( paused ) {
-		return MSS_PauseSounds();
+		MSS_PauseSounds();
+	} else {
+		MSS_UnpauseSounds();
 	}
-	return MSS_UnpauseSounds();
 }
 
 /* ---- MSS_Update  0x0044F920 ---- */
-int MSS_Update( void )
+void MSS_Update( void )
 {
 	int now, msec, paused;
 
 	if ( !mss_digitalDriver ) {
-		return 0;
+		return;
 	}
 	mss_cpuPercent = AIL_digital_CPU_percent( mss_digitalDriver );
 	if ( com_statmon->integer && mss_cpuPercent > 2 ) {
 		StatMon_Warning( 2, 3000, "gfx/2d/warning@soundcpu.jpg" );
 	}
 
-	if ( !sys_timeBaseInit ) {
-		sys_timeBase     = timeGetTime();
-		sys_timeBaseInit = 1;
-	}
-	now      = timeGetTime() - sys_timeBase;
-	msec     = now - mss_time;
-	mss_time = now;
+	now       = Sys_Milliseconds();
+	msec      = now - mss_time;
+	mss_time += msec;
 
 	paused = ( cl_paused->integer != 0 );
 	if ( paused != mss_paused ) {
@@ -2399,155 +2320,122 @@ int MSS_Update( void )
 		MSS_UpdateAllChannels( msec );
 	}
 
-	return MSS_UpdateRawSamples();
+	MSS_UpdateRawSamples();
 }
 
 /* ---- MSS_StopSounds  0x0044FA40 ---- */
-int __cdecl MSS_StopSounds( int flags )
+void __cdecl MSS_StopSounds( int flags )
 {
-	int chan, i, h;
+	int chan, i;
 
 	if ( !mss_digitalDriver ) {
-		return 0;
+		return;
 	}
 
 	if ( ( flags & 8 ) == 0 ) {
 		for ( chan = MSS_FIRST_2D ; chan < MSS_FIRST_2D + mss_num2DChannels ; chan++ ) {
-			if ( mss_channels[chan].paused
-				|| AIL_sample_status( MSS_2D_HANDLE( chan ) ) != SMP_DONE ) {
-				AIL_end_sample( MSS_2D_HANDLE( chan ) );
-				mss_channels[chan].paused = 0;
+			if ( !MSS_Is2DChannelFree( chan ) ) {
+				MSS_Stop2DChannel( chan );
 			}
 		}
 		for ( i = 0 ; i < mss_max3DChannels ; i++ ) {
-			if ( mss_channels[i].paused
-				|| AIL_3D_sample_status( mss_3DHandles[i] ) != SMP_DONE ) {
-				AIL_end_3D_sample( mss_3DHandles[i] );
-				mss_channels[i].paused = 0;
+			if ( !MSS_Is3DChannelFree( i ) ) {
+				MSS_Stop3DChannel( i );
 			}
 		}
 	}
 
 	for ( chan = MSS_FIRST_STREAM ; chan < MSS_FIRST_STREAM + mss_numStreamChannels ; chan++ ) {
-		h = MSS_STREAM_HANDLE( chan );
-		if ( !h ) {
-			continue;
+		if ( !MSS_IsStreamChannelFree( chan )
+			&& ( !( flags & 2 ) || chan != 32 )
+			&& ( !( flags & 4 ) || ( chan != 33 && chan != 34 ) ) ) {
+			MSS_StopStreamChannel( chan );
 		}
-		if ( mss_channels[chan].paused || AIL_stream_status( h ) != SMP_DONE ) {
-			if ( ( ( flags & 2 ) && chan == 32 )
-				|| ( ( flags & 4 ) && ( chan == 33 || chan == 34 ) ) ) {
-				continue;
-			}
-			AIL_close_stream( h );
-			mss_channels[chan].paused = 0;
-		} else {
-			AIL_close_stream( h );
-		}
-		MSS_STREAM_HANDLE( chan ) = 0;
 	}
 
 	if ( ( flags & 1 ) == 0 ) {
-		unsigned int room = MSS_RoomTypeFromString( "generic" );
-
-		AIL_set_digital_master_room_type( mss_digitalDriver, room );
-		AIL_set_3D_room_type( mss_3DProvider, room );
-		mss_roomType  = room;
-		mss_wetRate   = -mss_wetLevel;
-		mss_wetTarget = 0.0f;
+		MSS_SetEnvironmentEffects( "generic", 0.0f, 0 );
 	}
-	return mss_numStreamChannels + MSS_FIRST_STREAM;
 }
 
-/* ---- MSS_LoadSoundFile  0x0044FC10 ---- CONFIRMED */
-_DWORD *__cdecl MSS_LoadSoundFile(const char *a1)
-{
-  char *v2;
-  void *v3;
-  unsigned int v4;
-  _DWORD *v5;
-  unsigned int v6;
-  int v7;
-  int v8;
-  _DWORD *v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  void *Block;
-  int v15[31];
-  unsigned int retaddr;
+COD1_ASSERT_SIZE( AILSOUNDINFO, 36 );
+COD1_ASSERT_SIZE( AILMIXINFO, 120 );
 
-  v15[30] = retaddr ^ _security_cookie;
-  if ( !mss_digitalDriver )
-    return 0;
-  v2 = va("sound/%s", a1);
-  if ( FS_ReadFile(v2, &Block) >= 0 )
-  {
-    v3 = Block;
-    if ( AIL_WAV_info(Block, v15) )
-    {
-      v4 = v15[3];
-      if ( v15[3] <= (unsigned int)mss_driverRate && (v15[4] <= mss_driverBits || v15[0] == 17) && v15[5] <= mss_driverChannels )
-      {
-        v5 = Hunk_AllocAlignInternal((v15[2] + 39) & 0xFFFFFFFC, 32);
-        qmemcpy(v5, v15, 0x24u);
-        v5[1] = v5 + 9;
-        v5[8] = v5 + 9;
-        Com_Memcpy((int)(v5 + 9), (int *)v15[1], v15[2]);
-      }
-      else
-      {
-        v6 = v15[6];
-        v13 = v15[6];
-        if ( v15[3] > (unsigned int)mss_driverRate )
-        {
-          do
-          {
-            v4 >>= 1;
-            v6 >>= 1;
-          }
-          while ( v4 > mss_driverRate );
-          v13 = v6;
-        }
-        v11 = mss_driverBits;
-        if ( mss_driverBits >= v15[4] )
-          v11 = v15[4];
-        v12 = mss_driverChannels;
-        if ( mss_driverChannels >= v15[5] )
-          v12 = v15[5];
-        v7 = MSS_SampleType(v15[0], v12, v11);
-        v8 = AIL_size_processed_digital_audio(v4, v7, 1, v15);
-        v9 = Hunk_AllocAlignInternal((v8 + 39) & 0xFFFFFFFC, 32);
-        v10 = v15[0];
-        v5 = v9;
-        v9[4] = v11;
-        v9[6] = v13;
-        *v9 = v10;
-        v9 += 9;
-        v5[1] = v9;
-        v5[2] = v8;
-        v5[3] = v4;
-        v5[5] = v12;
-        v5[7] = v15[7];
-        v5[8] = v9;
-        AIL_process_digital_audio(v9, v8, v4, v7, 1, v15);
-        v3 = Block;
-      }
-      FS_FreeFile(v3);
-      return v5;
-    }
-    else
-    {
-      Com_Printf("Sound file '%s' is in an invalid or corrupted format\n", v2);
-      FS_FreeFile(v3);
-      return 0;
-    }
-  }
-  else
-  {
-    Com_Printf("^1Sound file '%s' not found\n", v2);
-    return 0;
-  }
+/* ---- MSS_LoadSoundFile  0x0044FC10 ---- CONFIRMED */
+/* Loads sound/<name>, parses its WAV header, and returns a hunk block holding
+   an AILSOUNDINFO header immediately followed by the (optionally resampled)
+   audio.  data_ptr and initial_ptr both point just past the 36-byte header. */
+AILSOUNDINFO *__cdecl MSS_LoadSoundFile( const char *name )
+{
+	char         *path;
+	void         *fileData;
+	AILMIXINFO    info;
+	AILSOUNDINFO *sound;
+
+	if ( !mss_digitalDriver ) {
+		return 0;
+	}
+
+	path = va( "sound/%s", name );
+	if ( FS_ReadFile( path, &fileData ) < 0 ) {
+		Com_Printf( "^1Sound file '%s' not found\n", path );
+		return 0;
+	}
+
+	if ( !AIL_WAV_info( fileData, &info.Info ) ) {
+		Com_Printf( "Sound file '%s' is in an invalid or corrupted format\n", path );
+		FS_FreeFile( fileData );
+		return 0;
+	}
+
+	if ( info.Info.rate <= (unsigned int)mss_driverRate
+		&& ( info.Info.bits <= mss_driverBits || info.Info.format == 17 )
+		&& (int)info.Info.channels <= mss_driverChannels ) {
+		/* already playable by the driver -- copy the header and samples verbatim */
+		sound = (AILSOUNDINFO *)Hunk_AllocAlignInternal( ( info.Info.data_len + 39 ) & 0xFFFFFFFC, 32 );
+		memcpy( sound, &info.Info, sizeof( info.Info ) );
+		sound->data_ptr    = (char *)sound + sizeof( AILSOUNDINFO );
+		sound->initial_ptr = (char *)sound + sizeof( AILSOUNDINFO );
+		Com_Memcpy( (int)( (char *)sound + sizeof( AILSOUNDINFO ) ),
+					(int *)info.Info.data_ptr, info.Info.data_len );
+	} else {
+		/* resample down to the driver's rate / bit depth / channel count */
+		unsigned int destRate    = info.Info.rate;
+		unsigned int destSamples = info.Info.samples;
+		int          destBits, destChannels;
+		int          destFormat, destSize;
+		void        *destData;
+
+		if ( info.Info.rate > (unsigned int)mss_driverRate ) {
+			do {
+				destRate    >>= 1;
+				destSamples >>= 1;
+			} while ( destRate > (unsigned int)mss_driverRate );
+		}
+		destBits = mss_driverBits < info.Info.bits ? mss_driverBits : info.Info.bits;
+		destChannels = mss_driverChannels < (int)info.Info.channels ? mss_driverChannels : info.Info.channels;
+
+		destFormat = MSS_SampleType( info.Info.format, destBits, destChannels );
+		destSize   = AIL_size_processed_digital_audio( destRate, destFormat, 1, &info );
+
+		sound = (AILSOUNDINFO *)Hunk_AllocAlignInternal( ( destSize + 39 ) & 0xFFFFFFFC, 32 );
+
+		sound->format      = info.Info.format;
+		destData           = (char *)sound + sizeof( AILSOUNDINFO );
+		sound->data_ptr    = destData;
+		sound->data_len    = destSize;
+		sound->rate        = destRate;
+		sound->bits        = destBits;
+		sound->channels    = destChannels;
+		sound->samples     = destSamples;
+		sound->block_size  = info.Info.block_size;
+		sound->initial_ptr = destData;
+
+		AIL_process_digital_audio( destData, destSize, destRate, destFormat, 1, &info );
+	}
+
+	FS_FreeFile( fileData );
+	return sound;
 }
 
 /* ---- MSS_UnloadSoundFile  0x0044FE10 ---- CONFIRMED */
@@ -2557,16 +2445,29 @@ void MSS_UnloadSoundFile()
 }
 
 /* ---- MSS_GetSoundFileSize  0x0044FE20 ---- CONFIRMED */
-int __cdecl MSS_GetSoundFileSize(int a1)
+int __cdecl MSS_GetSoundFileSize( int sound )
 {
-  return *(_DWORD *)(a1 + 8) + 36;
+	/* audio-data length plus the 36-byte AILSOUNDINFO header */
+	return SND_DATALEN( sound ) + 36;
 }
 
-/* MSS_ShutdownAtExit */
+/* MSS_ShutdownAtExit  0x00524F30 (IDA "AIL_shutdown()") */
 static void MSS_ShutdownAtExit( void )
 {
 	AIL_shutdown();
 }
+
+/* ---- MSS_auto_cleanup  0x00524F40 ----
+ * Retail's comes from RAD's mss32.lib (a separately compiled member,
+ * linked among the Miles import thunks), so it is never inlined into
+ * MSS_Init; mss32.h's AIL_startup() macro calls it. */
+#pragma auto_inline( off )
+int __cdecl MSS_auto_cleanup( void )
+{
+	atexit( MSS_ShutdownAtExit );
+	return 0;
+}
+#pragma auto_inline( on )
 
 /* MSS_InitFailed */
 static void MSS_InitFailed( void )
@@ -2576,21 +2477,20 @@ static void MSS_InitFailed( void )
 	}
 }
 
-/* MSS_ClearState */
+/* MSS_ClearState
+ * Retail zeroes the whole 0x1470-byte Miles state block 0x008E0760..0x008E1BD0
+ * with rep stosd (MSS_Shutdown 0x0045022B, MSS_Init failure paths 0x0044FFBF
+ * and 0x00450010).  mss_rawRingBuffer
+ * and mss_pendingRestore are dropped without being freed, as in retail.  The
+ * cvar pointers mss_q3fs, mss_volume, mss_roomtype and mss_wetlevel live
+ * outside the block and are kept. */
 static void MSS_ClearState( void )
 {
-	mss_digitalDriver     = 0;
-	mss_3DProvider        = 0;
-	mss_driverRate        = 0;
-	mss_driverBits        = 0;
-	mss_driverChannels    = 0;
-	mss_num2DChannels     = 0;
-	mss_max3DChannels     = 0;
-	mss_numStreamChannels = 0;
+	memset( &mss_state, 0, sizeof( mss_state ) );
 }
 
 /* ---- MSS_Init  0x0044FE60 ---- */
-int MSS_Init( void )
+void MSS_Init( void )
 {
 	cvar_t      *volume;
 	unsigned int now;
@@ -2606,11 +2506,10 @@ int MSS_Init( void )
 								(AIL_FILE_READ_CB) MSS_FileReadCallback );
 	}
 	AIL_set_redist_directory( "miles" );
-	atexit( MSS_ShutdownAtExit );
 
 	if ( !AIL_startup() ) {
 		MSS_InitFailed();
-		return 0;
+		return;
 	}
 
 	mss_errorOnMissing = (int)Cvar_Get( "mss_errorOnMissing", "1", 1 );
@@ -2627,14 +2526,14 @@ int MSS_Init( void )
 		AIL_shutdown();
 		MSS_ClearState();
 		MSS_InitFailed();
-		return 0;
+		return;
 	}
 
-	if ( !MSS_Init3DProvider( MSS_CVAR( mss_3d_provider )->string, (char *)1 ) ) {
+	if ( !MSS_Init3DProvider( MSS_CVAR( mss_3d_provider )->string, 1 ) ) {
 		AIL_shutdown();
 		MSS_ClearState();
 		MSS_InitFailed();
-		return 0;
+		return;
 	}
 
 	MSS_InitChannels();
@@ -2643,7 +2542,8 @@ int MSS_Init( void )
 	mss_globalFadeTarget = 1.0f;
 	mss_globalFadeRate   = 0.0f;
 
-	for ( i = 0 ; i < MSS_NUM_ALIAS_CHANNELS ; i++ ) {
+	/* sizeof bound (unsigned compare): retail indexes by byte offset and tests with jb */
+	for ( i = 0 ; i < sizeof( mss_channelFade ) / sizeof( mss_channelFade[0] ) ; i++ ) {
 		mss_channelFade[i][0] = 1.0f;
 		mss_channelFade[i][1] = 1.0f;
 		mss_channelFade[i][2] = 0.0f;
@@ -2658,32 +2558,31 @@ int MSS_Init( void )
 	mss_loopFrameTime = now;
 	mss_anyMasters    = 0;
 
+	/* max( 0, min( 1, mss_volume ) ) with min/max macros, as on the Mac build */
 	volume = MSS_CVAR( mss_volume );
-	if ( volume->value < 0.0f ) {
-		mss_masterVolume = 0.0f;
-	} else if ( volume->value > 1.0f ) {
-		mss_masterVolume = 1.0f;
-	} else {
-		mss_masterVolume = volume->value;
-	}
+	mss_masterVolume = MSS_MAX( 0.0f, MSS_MIN( 1.0f, volume->value ) );
 
 	Com_Printf( "------- Miles successfully initialized -------\n" );
-	return 1;
 }
 
 /* ---- MSS_Shutdown  0x00450130 ---- */
 void MSS_Shutdown( void )
 {
+	/* Retail frees without clearing the pointer (0x0045013D); only the
+	   block wipe at the end resets it, so with no driver it stays dangling. */
 	if ( mss_pendingRestore ) {
 		free( mss_pendingRestore );
-		mss_pendingRestore     = 0;
-		mss_pendingRestoreSize = 0;
 	}
 	if ( !mss_digitalDriver ) {
 		return;
 	}
 
 	MSS_StopSounds( 0 );
+
+	/* Retail inlines Com_UnloadSoundAliases for both alias sets here, the
+	   in-game set first (0x00450158) and then the menu set (0x004501BD). */
+	Com_UnloadSoundAliases( 1 );   /* SND_LOCALE_INGAME */
+	Com_UnloadSoundAliases( 0 );   /* SND_LOCALE_MENU   */
 
 	AIL_close_3D_provider( mss_3DProvider );
 	mss_3DProvider = 0;
@@ -2702,14 +2601,11 @@ void MSS_ErrorCleanup()
 }
 
 /* ---- MSS_SetDirectSoundHWND_m  0x00450260 ---- VERIFIED */
-int __cdecl MSS_SetDirectSoundHWND_m(void *this)
+void __cdecl MSS_SetDirectSoundHWND_m( void *hwnd )
 {
-  int result;
-
-  result = mss_digitalDriver;
-  if ( mss_digitalDriver )
-    AIL_set_DirectSound_HWND(mss_digitalDriver, this);
-  return result;
+	if ( mss_digitalDriver ) {
+		AIL_set_DirectSound_HWND( mss_digitalDriver, hwnd );
+	}
 }
 
 #define MSS_ERR_SAVE_OVERFLOW \
@@ -2720,88 +2616,62 @@ int __cdecl MSS_SetDirectSoundHWND_m(void *this)
 	"\x15" "sound state buffer size too big; probably due to an old or corrupt savegame\n"
 
 /* ---- MSS_Write  0x00450280 ---- CONFIRMED */
-int __cdecl MSS_Write(signed int a1, int a2, unsigned int a3, int a4, const void *a5)
+/* Parameter order from the Mac 1.3 calls (buffer, offset, size, src, count):
+   it decides where the MSS_Save*Channel callers evaluate the running offset. */
+int __cdecl MSS_Write( int base, int offset, signed int size, const void *src, unsigned int count )
 {
-  if ( (int)(a2 + a3) > a1 )
-    Com_Error(ERR_DROP, MSS_ERR_SAVE_OVERFLOW, a1);
-  qmemcpy((void *)(a4 + a2), a5, a3);
-  return a2 + a3;
+	if ( (int)( offset + count ) > size ) {
+		Com_Error( ERR_DROP, MSS_ERR_SAVE_OVERFLOW, size );
+	}
+	memcpy( (void *)( base + offset ), src, count );
+	return offset + count;
 }
 
 /* ---- MSS_Read  0x004502C0 ---- CONFIRMED */
-int __cdecl MSS_Read(signed int a1, int a2, unsigned int a3, int a4, void *a5)
+/* base precedes offset in retail's parameter list: VC7 orders the commutative
+   base + offset by declaration (lea esi,[base+offset]); the stack order of the
+   non-register arguments is unchanged. */
+int __cdecl MSS_Read( signed int size, int base, int offset, unsigned int count, void *dst )
 {
-  if ( (int)(a2 + a3) > a1 )
-    Com_Error(ERR_DROP, MSS_ERR_RESTORE_OVERFLOW);
-  qmemcpy(a5, (const void *)(a4 + a2), a3);
-  return a2 + a3;
+	if ( (int)( offset + count ) > size ) {
+		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
+	}
+	memcpy( dst, (const void *)( base + offset ), count );
+	return offset + count;
 }
 
 /* ---- MSS_SaveChanInfo  0x00450300 ---- HIGH */
-int __cdecl MSS_SaveChanInfo(int a1, int a2, int a3, int a4)
+/* Serializes the persistent part of a channel into the save buffer (27 bytes,
+   tightly packed / unaligned): entnum (word), channel (byte), endTime, volume,
+   blend, then localOrigin.  Bounds are re-checked before each field. */
+/* (buffer, offset, size, channel) as in the Mac 1.3 build, like MSS_Write. */
+static int MSS_SaveChanInfo( int base, int offset, int size, int chanPtr )
 {
-  int result;
-  _DWORD *v6;
-  _DWORD *v7;
+	const mssChannel_t *ch = (const mssChannel_t *)chanPtr;
 
-  if ( a4 + 2 > a3 )
-    Com_Error(ERR_DROP, MSS_ERR_SAVE_OVERFLOW, a3);
-  *(_WORD *)(a2 + a4) = *(_WORD *)a1;
-  if ( a4 + 3 > a3 )
-    Com_Error(ERR_DROP, MSS_ERR_SAVE_OVERFLOW, a3);
-  *(_BYTE *)(a2 + a4 + 2) = *(_BYTE *)(a1 + 4);
-  if ( a4 + 7 > a3 )
-    Com_Error(ERR_DROP, MSS_ERR_SAVE_OVERFLOW, a3);
-  *(_DWORD *)(a2 + a4 + 3) = *(_DWORD *)(a1 + 12);
-  if ( a4 + 11 > a3 )
-    Com_Error(ERR_DROP, MSS_ERR_SAVE_OVERFLOW, a3);
-  *(_DWORD *)(a2 + a4 + 7) = *(_DWORD *)(a1 + 16);
-  if ( a4 + 15 > a3 )
-    Com_Error(ERR_DROP, MSS_ERR_SAVE_OVERFLOW, a3);
-  *(_DWORD *)(a2 + a4 + 11) = *(_DWORD *)(a1 + 36);
-  result = a4 + 27;
-  if ( a4 + 27 > a3 )
-    Com_Error(ERR_DROP, MSS_ERR_SAVE_OVERFLOW, a3);
-  v6 = (_DWORD *)(a1 + 40);
-  v7 = (_DWORD *)(a4 + 15 + a2);
-  *v7 = *v6;
-  v7[1] = v6[1];
-  v7[2] = v6[2];
-  return result;
+	offset = MSS_Write( base, offset, size, &ch->entnum, 2 );
+	offset = MSS_Write( base, offset, size, &ch->channel, 1 );
+	offset = MSS_Write( base, offset, size, &ch->endTime, 4 );
+	offset = MSS_Write( base, offset, size, &ch->volume, 4 );
+	offset = MSS_Write( base, offset, size, &ch->blend, 4 );
+	return MSS_Write( base, offset, size, ch->localOrigin, 12 );
 }
 
 /* ---- MSS_RestoreChanInfo  0x00450410 ---- HIGH */
-int __cdecl MSS_RestoreChanInfo(_WORD *a1, int a2, int a3, int a4)
+/* Inverse of MSS_SaveChanInfo: zero-fills the channel, then reads back the
+   27-byte packed record.  Fields not saved (touchTime, rates, aliases, ...)
+   stay zero, which is why the whole struct is cleared first. */
+static int MSS_RestoreChanInfo( mssChannel_t *ch, int size, int base, int offset )
 {
-  int v5;
-  int result;
-  _DWORD *v7;
+	memset( ch, 0, sizeof( *ch ) );
 
-  memset(a1, 0, 0x38u);
-  if ( a4 + 2 > a2 )
-    Com_Error(ERR_DROP, MSS_ERR_RESTORE_OVERFLOW);
-  *a1 = *(_WORD *)(a4 + a3);
-  if ( a4 + 3 > a2 )
-    Com_Error(ERR_DROP, MSS_ERR_RESTORE_OVERFLOW);
-  *((_BYTE *)a1 + 4) = *(_BYTE *)(a4 + 2 + a3);
-  if ( a4 + 7 > a2 )
-    Com_Error(ERR_DROP, MSS_ERR_RESTORE_OVERFLOW);
-  *((_DWORD *)a1 + 3) = *(_DWORD *)(a4 + 3 + a3);
-  if ( a4 + 11 > a2 )
-    Com_Error(ERR_DROP, MSS_ERR_RESTORE_OVERFLOW);
-  v5 = a4 + 15;
-  *((_DWORD *)a1 + 4) = *(_DWORD *)(a4 + 7 + a3);
-  if ( a4 + 15 > a2 )
-    Com_Error(ERR_DROP, MSS_ERR_RESTORE_OVERFLOW);
-  result = a4 + 27;
-  *((_DWORD *)a1 + 9) = *(_DWORD *)(a4 + 11 + a3);
-  if ( a4 + 27 > a2 )
-    Com_Error(ERR_DROP, MSS_ERR_RESTORE_OVERFLOW);
-  v7 = a1 + 20;
-  *v7 = *(_DWORD *)(v5 + a3);
-  v7[1] = *(_DWORD *)(v5 + a3 + 4);
-  v7[2] = *(_DWORD *)(v5 + a3 + 8);
-  return result;
+	offset = MSS_Read( size, base, offset, 2, &ch->entnum );
+	offset = MSS_Read( size, base, offset, 1, &ch->channel );
+	offset = MSS_Read( size, base, offset, 4, &ch->endTime );
+	offset = MSS_Read( size, base, offset, 4, &ch->volume );
+	offset = MSS_Read( size, base, offset, 4, &ch->blend );
+	offset = MSS_Read( size, base, offset, 12, &ch->localOrigin );
+	return offset;
 }
 
 extern void *Com_GetSoundAlias( int source, int index );
@@ -2839,23 +2709,23 @@ typedef struct {
 /* ---- MSS_Save3DChannel  0x00450530 ---- VERIFIED */
 static int MSS_Save3DChannel( int chan, int base, int offset, int size )
 {
-	mssChannel_t *ch = &mss_channels[chan];
-	int           h  = MSS_3D_HANDLE( chan );
+	int           h;
 	int           aliasIndex, alias2Index;
 	unsigned int  sampleOffset, sampleLength;
 	int           rate;
 	float         vol;
 	mssSave3D_t   saved;
 
-	if ( !ch->paused && AIL_3D_sample_status( h ) == SMP_DONE ) {
+	if ( MSS_Is3DChannelFree( chan ) ) {
 		return offset;
 	}
 
-	aliasIndex = Com_SoundAliasIndex( ch->alias, MSS_ALIAS_SOURCE );
+	h = MSS_3D_HANDLE( chan );
+	aliasIndex = Com_SoundAliasIndex( mss_channels[chan].alias, MSS_ALIAS_SOURCE );
 	if ( !aliasIndex ) {
 		return offset;
 	}
-	alias2Index = Com_SoundAliasIndex( ch->alias2, MSS_ALIAS_SOURCE );
+	alias2Index = Com_SoundAliasIndex( mss_channels[chan].alias2, MSS_ALIAS_SOURCE );
 	if ( !alias2Index ) {
 		return offset;
 	}
@@ -2867,45 +2737,39 @@ static int MSS_Save3DChannel( int chan, int base, int offset, int size )
 		return offset;
 	}
 
-	saved.startFraction = (float) sampleOffset / (float) sampleLength;
-	saved.pitch         = ch->pitch;
+	/* Both unsigned ints are fild'ed straight into the divide, with no float
+	   store of either operand (0x0045061B-0x00450648). */
+	saved.startFraction = (float)( MSS_I2F( sampleOffset ) / MSS_I2F( sampleLength ) );
+	saved.pitch         = mss_channels[chan].pitch;
 
 	vol = AIL_3D_sample_volume( h );
-	if ( mss_masterVolume == 0.0f ) {
-		saved.volume = ch->volume;
-	} else {
+	if ( mss_masterVolume != 0.0f ) {
 		saved.volume = vol / mss_masterVolume;
+	} else {
+		saved.volume = mss_channels[chan].volume;
 	}
 
 	AIL_3D_position( h, &saved.position[0], &saved.position[1], &saved.position[2] );
 
-	offset = MSS_Write( size, offset, 2, base, &aliasIndex );
-	offset = MSS_Write( size, offset, 2, base, &alias2Index );
-	offset = MSS_SaveChanInfo( (int) ch, base, size, offset );
-	return MSS_Write( size, offset, sizeof( mssSave3D_t ), base, &saved );
+	offset = MSS_Write( base, offset, size, &aliasIndex, 2 );
+	offset = MSS_Write( base, offset, size, &alias2Index, 2 );
+	offset = MSS_SaveChanInfo( base, offset, size, (int) &mss_channels[chan] );
+	return MSS_Write( base, offset, size, &saved, sizeof( mssSave3D_t ) );
 }
 
 /* ---- MSS_Restore3DChannel  0x00450700 ---- VERIFIED */
-static int MSS_Restore3DChannel( int size, int base, int offset, int aliasIndex )
+static int MSS_Restore3DChannel( int base, int offset, int size, int aliasIndex )
 {
 	mssChannel_t ch;
 	mssSave3D_t  saved;
 	int          alias2Index;
 	void        *alias, *alias2;
-	int          chan = -1;
+	int          chan;
 
-	if ( offset + 2 > size ) {
-		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
-	}
-	alias2Index = *(unsigned short *)( base + offset );
-
-	offset = MSS_RestoreChanInfo( (_WORD *) &ch, size, base, offset + 2 );
-
-	if ( offset + (int) sizeof( saved ) > size ) {
-		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
-	}
-	memcpy( &saved, (const void *)( base + offset ), sizeof( saved ) );
-	offset += sizeof( saved );
+	alias2Index = 0;
+	offset = MSS_Read( size, base, offset, 2, &alias2Index );
+	offset = MSS_RestoreChanInfo( &ch, size, base, offset );
+	offset = MSS_Read( size, base, offset, sizeof(saved), &saved );
 
 	alias  = Com_GetSoundAlias( MSS_ALIAS_SOURCE, aliasIndex );
 	alias2 = Com_GetSoundAlias( MSS_ALIAS_SOURCE, alias2Index );
@@ -2914,11 +2778,11 @@ static int MSS_Restore3DChannel( int size, int base, int offset, int aliasIndex 
 		&& AL_TYPE( alias ) == MSS_TYPE_LOADED
 		&& AL_TYPE( alias2 ) == MSS_TYPE_LOADED
 		&& AL_SOUND( alias ) && AL_SOUND( alias2 ) == AL_SOUND( alias )
-		&& MSS_ValidateSoundAliasBlend( (_DWORD *) alias, (_DWORD *) alias2, 0 ) )
+		&& MSS_ValidateSoundAliasBlend( (mssAlias_t *) alias, (mssAlias_t *) alias2, 0 ) )
 	{
-		MSS_StartAlias3DSample( &chan, alias, saved.position, alias2, ch.blend,
-		                        ch.entnum, saved.volume, saved.pitch, 0,
-		                        saved.startFraction );
+		MSS_StartAlias3DSample( alias, alias2, ch.blend, ch.entnum, saved.position,
+		                        saved.volume, saved.pitch, 0,
+		                        saved.startFraction, &chan );
 		if ( chan >= 0 ) {
 			VectorCopy( ch.localOrigin, mss_channels[chan].localOrigin );
 		}
@@ -2929,21 +2793,21 @@ static int MSS_Restore3DChannel( int size, int base, int offset, int aliasIndex 
 /* ---- MSS_Save2DChannel  0x004508D0 ---- VERIFIED */
 static int MSS_Save2DChannel( int chan, int base, int offset, int size )
 {
-	mssChannel_t *ch = &mss_channels[chan];
-	int           h  = MSS_2D_HANDLE( chan );
+	int           h;
 	int           aliasIndex, alias2Index;
 	int           totalMs, currentMs, rate;
 	mssSave2D_t   saved;
 
-	if ( !ch->paused && AIL_sample_status( h ) == SMP_DONE ) {
+	if ( MSS_Is2DChannelFree( chan ) ) {
 		return offset;
 	}
 
-	aliasIndex = Com_SoundAliasIndex( ch->alias, MSS_ALIAS_SOURCE );
+	h = MSS_2D_HANDLE(chan);
+	aliasIndex = Com_SoundAliasIndex( mss_channels[chan].alias, MSS_ALIAS_SOURCE );
 	if ( !aliasIndex ) {
 		return offset;
 	}
-	alias2Index = Com_SoundAliasIndex( ch->alias2, MSS_ALIAS_SOURCE );
+	alias2Index = Com_SoundAliasIndex( mss_channels[chan].alias2, MSS_ALIAS_SOURCE );
 	if ( !alias2Index ) {
 		return offset;
 	}
@@ -2954,36 +2818,38 @@ static int MSS_Save2DChannel( int chan, int base, int offset, int size )
 		return offset;
 	}
 
-	saved.startFraction = (float) (unsigned int) currentMs
-	                    / (float) (unsigned int) totalMs;
-	saved.pitch         = ch->pitch;
+	/* fild / fild / fdivp with no float store of either operand
+	   (0x004509BC-0x004509F3). */
+	saved.startFraction = (float)( MSS_I2F( (unsigned int) currentMs )
+	                             / MSS_I2F( (unsigned int) totalMs ) );
+	saved.pitch         = mss_channels[chan].pitch;
 
 	AIL_sample_volume_pan( h, &saved.volume, &saved.pan );
-	if ( mss_masterVolume == 0.0f ) {
-		saved.volume = ch->volume;
-	} else {
+	if ( mss_masterVolume != 0.0f ) {
 		saved.volume = saved.volume / mss_masterVolume;
+	} else {
+		saved.volume = mss_channels[chan].volume;
 	}
 
-	offset = MSS_Write( size, offset, 2, base, &aliasIndex );
-	offset = MSS_Write( size, offset, 2, base, &alias2Index );
-	offset = MSS_SaveChanInfo( (int) ch, base, size, offset );
-	return MSS_Write( size, offset, sizeof( mssSave2D_t ), base, &saved );
+	offset = MSS_Write( base, offset, size, &aliasIndex, 2 );
+	offset = MSS_Write( base, offset, size, &alias2Index, 2 );
+	offset = MSS_SaveChanInfo( base, offset, size, (int) &mss_channels[chan] );
+	return MSS_Write( base, offset, size, &saved, sizeof( mssSave2D_t ) );
 }
 
 /* ---- MSS_Restore2DChannel  0x00450AA0 ---- VERIFIED */
-static int MSS_Restore2DChannel( int size, int base, int offset, int aliasIndex )
+static int MSS_Restore2DChannel( int base, int offset, int size, int aliasIndex )
 {
 	mssChannel_t ch;
 	mssSave2D_t  saved;
 	void        *alias, *alias2;
-	int          chan = -1;
+	int          chan;
 
 	if ( offset + 2 > size ) {
 		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
 	}
 
-	offset = MSS_RestoreChanInfo( (_WORD *) &ch, size, base, offset + 2 );
+	offset = MSS_RestoreChanInfo( &ch, size, base, offset + 2 );
 
 	if ( offset + (int) sizeof( saved ) > size ) {
 		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
@@ -2998,11 +2864,11 @@ static int MSS_Restore2DChannel( int size, int base, int offset, int aliasIndex 
 		&& AL_TYPE( alias ) == MSS_TYPE_LOADED
 		&& AL_TYPE( alias2 ) == MSS_TYPE_LOADED
 		&& AL_SOUND( alias ) && AL_SOUND( alias2 ) == AL_SOUND( alias )
-		&& MSS_ValidateSoundAliasBlend( (_DWORD *) alias, (_DWORD *) alias2, 0 ) )
+		&& MSS_ValidateSoundAliasBlend( (mssAlias_t *) alias, (mssAlias_t *) alias2, 0 ) )
 	{
-		MSS_StartAlias2DSample( &chan, alias, alias2, ch.blend, ch.entnum,
+		MSS_StartAlias2DSample( alias, alias2, ch.blend, ch.entnum,
 		                        saved.volume, saved.pitch, 0,
-		                        saved.startFraction );
+		                        saved.startFraction, &chan );
 		if ( chan >= 0 ) {
 			AIL_set_sample_volume_pan( MSS_2D_HANDLE( chan ),
 			                           mss_masterVolume * saved.volume,
@@ -3016,8 +2882,8 @@ static int MSS_Restore2DChannel( int size, int base, int offset, int aliasIndex 
 /* ---- MSS_SaveStreamChannel  0x00450C80 ---- VERIFIED */
 static int MSS_SaveStreamChannel( int chan, int base, int offset, int size )
 {
-	mssChannel_t   *ch;
 	int             h;
+	mssStreamInfo_t *info;
 	int             aliasIndex, alias2Index;
 	int             totalMs, currentMs, rate;
 	mssSaveStream_t saved;
@@ -3032,18 +2898,17 @@ static int MSS_SaveStreamChannel( int chan, int base, int offset, int size )
 		}
 		if ( MSS_IsStreamChannelFree( chan ) ) {
 			aliasIndex = 0;
-			return MSS_Write( size, offset, 2, base, &aliasIndex );
+			return MSS_Write( base, offset, size, &aliasIndex, 2 );
 		}
 	}
 
-	ch = &mss_channels[chan];
-	h  = MSS_STREAM_HANDLE( chan );
+	h = MSS_STREAM_HANDLE( chan );
 
-	aliasIndex = Com_SoundAliasIndex( ch->alias, MSS_ALIAS_SOURCE );
+	aliasIndex = Com_SoundAliasIndex( mss_channels[chan].alias, MSS_ALIAS_SOURCE );
 	if ( !aliasIndex ) {
 		return offset;
 	}
-	alias2Index = Com_SoundAliasIndex( ch->alias2, MSS_ALIAS_SOURCE );
+	alias2Index = Com_SoundAliasIndex( mss_channels[chan].alias2, MSS_ALIAS_SOURCE );
 	if ( !alias2Index ) {
 		return offset;
 	}
@@ -3052,32 +2917,35 @@ static int MSS_SaveStreamChannel( int chan, int base, int offset, int size )
 	if ( !totalMs ) {
 		return offset;
 	}
+	info = &MSS_STREAM_INFO( chan );
 
-	saved.startFraction = (float) (unsigned int) currentMs
-	                    / (float) (unsigned int) totalMs;
+	/* fild / fild / fdivp with no float store of either operand
+	   (0x00450D8E-0x00450DBA). */
+	saved.startFraction = (float)( MSS_I2F( (unsigned int)currentMs )
+	                             / MSS_I2F( (unsigned int)totalMs ) );
 
 	rate       = AIL_stream_playback_rate( h );
-	saved.rate = MSS_FTOL( (float) rate / mss_timeScale );
+	saved.rate = MSS_FTOL( (double) rate / mss_timeScale );   /* fild / fdiv, no float store: 0x00450DC8 */
 
-	saved.channelVolume = ch->volume;
+	saved.channelVolume = mss_channels[chan].volume;
 
 	AIL_stream_volume_pan( h, &saved.volume, &saved.pan );
-	if ( mss_masterVolume == 0.0f ) {
-		saved.volume = ch->volume;
-	} else {
+	if ( mss_masterVolume != 0.0f ) {
 		saved.volume = saved.volume / mss_masterVolume;
+	} else {
+		saved.volume = mss_channels[chan].volume;
 	}
 
-	VectorCopy( MSS_STREAM_INFO( chan ).origin, saved.origin );
+	VectorCopy( info->origin, saved.origin );
 
-	offset = MSS_Write( size, offset, 2, base, &aliasIndex );
-	offset = MSS_Write( size, offset, 2, base, &alias2Index );
-	offset = MSS_SaveChanInfo( (int) ch, base, size, offset );
-	return MSS_Write( size, offset, sizeof( mssSaveStream_t ), base, &saved );
+	offset = MSS_Write( base, offset, size, &aliasIndex, 2 );
+	offset = MSS_Write( base, offset, size, &alias2Index, 2 );
+	offset = MSS_SaveChanInfo( base, offset, size, (int) &mss_channels[chan] );
+	return MSS_Write( base, offset, size, &saved, sizeof( mssSaveStream_t ) );
 }
 
 /* ---- MSS_RestoreStreamChannel  0x00450EA0 ---- VERIFIED */
-static int MSS_RestoreStreamChannel( int size, int base, int offset,
+static int MSS_RestoreStreamChannel( int base, int offset, int size,
                                      int aliasIndex, int chan )
 {
 	mssChannel_t    ch;
@@ -3085,12 +2953,13 @@ static int MSS_RestoreStreamChannel( int size, int base, int offset,
 	void           *alias, *alias2;
 	int             duration;
 	int             h;
+	int             offsetMs;
 
 	if ( offset + 2 > size ) {
 		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
 	}
 
-	offset = MSS_RestoreChanInfo( (_WORD *) &ch, size, base, offset + 2 );
+	offset = MSS_RestoreChanInfo( &ch, size, base, offset + 2 );
 
 	if ( offset + (int) sizeof( saved ) > size ) {
 		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
@@ -3104,13 +2973,13 @@ static int MSS_RestoreStreamChannel( int size, int base, int offset,
 	if ( alias && alias2
 		&& AL_TYPE( alias ) == MSS_TYPE_STREAMED
 		&& AL_TYPE( alias2 ) == MSS_TYPE_STREAMED
-		&& MSS_ValidateSoundAliasBlend( (_DWORD *) alias, (_DWORD *) alias2, 0 ) )
+		&& MSS_ValidateSoundAliasBlend( (mssAlias_t *) alias, (mssAlias_t *) alias2, 0 ) )
 	{
 		if ( chan < 0 ) {
-			duration = MSS_StartAliasStream( &chan, alias, ch.entnum, alias2,
-			                                 ch.blend, saved.origin,
+			duration = MSS_StartAliasStream( alias, alias2, ch.blend, ch.entnum,
+			                                 saved.origin,
 			                                 saved.channelVolume, 1.0f, 0,
-			                                 saved.startFraction );
+			                                 saved.startFraction, &chan );
 		} else {
 			duration = MSS_StartAliasStreamOnChannel( alias, alias2, ch.blend,
 			                                          ch.entnum, saved.origin,
@@ -3122,13 +2991,15 @@ static int MSS_RestoreStreamChannel( int size, int base, int offset,
 		if ( chan >= 0 ) {
 			h = MSS_STREAM_HANDLE( chan );
 
-			mss_channels[chan].endTime -=
-				MSS_FTOL( (float) duration * saved.startFraction );
+			/* Both ints are fild'ed straight into the multiply, with no float
+			   store before it (0x0045105A, 0x004510A0). */
+			offsetMs = MSS_FTOL( MSS_I2F( duration ) * saved.startFraction );
+			mss_channels[chan].endTime -= offsetMs;
 
 			AIL_set_stream_volume_pan( h, mss_masterVolume * saved.volume,
 			                           saved.pan );
 			AIL_set_stream_playback_rate( h,
-				MSS_FTOL( (float) saved.rate * mss_channels[chan].pitch
+				MSS_FTOL( MSS_I2F( saved.rate ) * mss_channels[chan].pitch
 				          * mss_timeScale ) );
 
 			VectorCopy( ch.localOrigin, mss_channels[chan].localOrigin );
@@ -3144,49 +3015,39 @@ int MSS_Save( int size, int base )
 	int   i;
 	int   checksum;
 	short terminator = 0;
-	struct {
-		int   roomType;
-		float wetLevel;
-		float wetTarget;
-		float wetRate;
-	} roomEffects;   /* 0x008E0840..0x008E084F, one record in retail */
+
 
 	checksum = Com_SoundAliasChecksum( MSS_ALIAS_SOURCE );
 
-	offset = MSS_Write( size, 0, sizeof( checksum ), base, &checksum );
-	offset = MSS_Write( size, offset, sizeof( mss_channelFade ), base,
-	                    mss_channelFade );
+	offset = MSS_Write( base, 0, size, &checksum, sizeof( checksum ) );
+	offset = MSS_Write( base, offset, size, mss_channelFade, sizeof( mss_channelFade ) );
 
-	roomEffects.roomType  = mss_roomType;
-	roomEffects.wetLevel  = mss_wetLevel;
-	roomEffects.wetTarget = mss_wetTarget;
-	roomEffects.wetRate   = mss_wetRate;
-	offset = MSS_Write( size, offset, sizeof( roomEffects ), base, &roomEffects );
+	offset = MSS_Write( base, offset, size, &mss_roomType, 16 );
 
-	offset = MSS_Write( size, offset, sizeof( mss_bgFade[0] ), base, &mss_bgFade[0] );
-	offset = MSS_Write( size, offset, sizeof( mss_bgFade[3] ), base, &mss_bgFade[3] );
-	offset = MSS_Write( size, offset, sizeof( mss_bgFade[4] ), base, &mss_bgFade[4] );
+	offset = MSS_Write( base, offset, size, &mss_bgFade[0], sizeof( mss_bgFade[0] ) );
+	offset = MSS_Write( base, offset, size, &mss_bgFade[3], sizeof( mss_bgFade[3] ) );
+	offset = MSS_Write( base, offset, size, &mss_bgFade[4], sizeof( mss_bgFade[4] ) );
 
 	if ( mss_digitalDriver ) {
 		for ( i = 0; i < mss_max3DChannels; i++ ) {
 			offset = MSS_Save3DChannel( i, base, offset, size );
 		}
 	}
-	offset = MSS_Write( size, offset, 2, base, &terminator );
+	offset = MSS_Write( base, offset, size, &terminator, 2 );
 
 	if ( mss_digitalDriver ) {
 		for ( i = MSS_FIRST_2D; i < mss_num2DChannels + MSS_FIRST_2D; i++ ) {
 			offset = MSS_Save2DChannel( i, base, offset, size );
 		}
 	}
-	offset = MSS_Write( size, offset, 2, base, &terminator );
+	offset = MSS_Write( base, offset, size, &terminator, 2 );
 
 	if ( mss_digitalDriver ) {
 		for ( i = MSS_FIRST_STREAM; i < mss_numStreamChannels + MSS_FIRST_STREAM; i++ ) {
 			offset = MSS_SaveStreamChannel( i, base, offset, size );
 		}
 	}
-	return MSS_Write( size, offset, 2, base, &terminator );
+	return MSS_Write( base, offset, size, &terminator, 2 );
 }
 
 /* ---- MSS_Restore  0x00451330 ---- VERIFIED */
@@ -3195,105 +3056,66 @@ void MSS_Restore( int buffer, int size )
 	int offset;
 	int i;
 	int aliasIndex;
+	int checksum;
 
 	if ( !mss_digitalDriver ) {
 		return;
 	}
 
-	if ( size < 4 ) {
-		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
-	}
-	if ( *(int *) buffer != Com_SoundAliasChecksum( MSS_ALIAS_SOURCE ) ) {
+	offset = MSS_Read( size, buffer, 0, sizeof( checksum ), &checksum );
+	if ( checksum != Com_SoundAliasChecksum( MSS_ALIAS_SOURCE ) ) {
 		Com_Printf( "^3Couldn't restore sound state: sound aliases have changed since saving.\n" );
 		return;
 	}
 
-	if ( size < 4 + (int) sizeof( mss_channelFade ) ) {
-		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
-	}
-	memcpy( mss_channelFade, (const void *)( buffer + 4 ), sizeof( mss_channelFade ) );
-
-	if ( size < 140 ) {
-		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
-	}
-	mss_roomType  = *(int   *)( buffer + 124 );
-	mss_wetLevel  = *(float *)( buffer + 128 );
-	mss_wetTarget = *(float *)( buffer + 132 );
-	mss_wetRate   = *(float *)( buffer + 136 );
+	offset = MSS_Read( size, buffer, offset, sizeof(mss_channelFade), mss_channelFade );
+	offset = MSS_Read( size, buffer, offset, 16, &mss_roomType );
 
 	AIL_set_digital_master_room_type( mss_digitalDriver, mss_roomType );
 	AIL_set_3D_room_type( mss_3DProvider, mss_roomType );
 
-	if ( size < 148 ) {
-		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
-	}
-	mss_bgFade[0].target = *(float *)( buffer + 140 );
-	mss_bgFade[0].rate   = *(float *)( buffer + 144 );
-
-	if ( size < 156 ) {
-		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
-	}
-	mss_bgFade[3].target = *(float *)( buffer + 148 );
-	mss_bgFade[3].rate   = *(float *)( buffer + 152 );
-
-	if ( size < 164 ) {
-		Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
-	}
-	mss_bgFade[4].target = *(float *)( buffer + 156 );
-	mss_bgFade[4].rate   = *(float *)( buffer + 160 );
-
-	offset = 164;
+	offset = MSS_Read( size, buffer, offset, sizeof(mss_bgFade[0]), &mss_bgFade[0] );
+	offset = MSS_Read( size, buffer, offset, sizeof(mss_bgFade[3]), &mss_bgFade[3] );
+	offset = MSS_Read( size, buffer, offset, sizeof(mss_bgFade[4]), &mss_bgFade[4] );
 
 	for ( ;; ) {
-		if ( offset + 2 > size ) {
-			Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
-		}
-		aliasIndex = *(unsigned short *)( buffer + offset );
+		aliasIndex = 0;
+		offset = MSS_Read( size, buffer, offset, 2, &aliasIndex );
 		if ( !aliasIndex ) {
-			offset += 2;
 			break;
 		}
-		offset = MSS_Restore3DChannel( size, buffer, offset + 2, aliasIndex );
+		offset = MSS_Restore3DChannel( buffer, offset, size, aliasIndex );
 	}
 
 	for ( ;; ) {
-		if ( offset + 2 > size ) {
-			Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
-		}
-		aliasIndex = *(unsigned short *)( buffer + offset );
+		aliasIndex = 0;
+		offset = MSS_Read( size, buffer, offset, 2, &aliasIndex );
 		if ( !aliasIndex ) {
-			offset += 2;
 			break;
 		}
-		offset = MSS_Restore2DChannel( size, buffer, offset + 2, aliasIndex );
+		offset = MSS_Restore2DChannel( buffer, offset, size, aliasIndex );
 	}
 
 	for ( i = 0; i < MSS_NUM_BACKGROUND; i++ ) {
 		if ( i == 1 || i == 2 ) {
 			continue;
 		}
-		if ( offset + 2 > size ) {
-			Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
-		}
-		aliasIndex = *(unsigned short *)( buffer + offset );
-		offset += 2;
+		aliasIndex = 0;
+		offset = MSS_Read( size, buffer, offset, 2, &aliasIndex );
 		if ( !aliasIndex ) {
 			continue;
 		}
-		offset = MSS_RestoreStreamChannel( size, buffer, offset, aliasIndex,
+		offset = MSS_RestoreStreamChannel( buffer, offset, size, aliasIndex,
 		                                   MSS_FIRST_STREAM + i );
 	}
 
 	for ( ;; ) {
-		if ( offset + 2 > size ) {
-			Com_Error( ERR_DROP, MSS_ERR_RESTORE_OVERFLOW );
-		}
-		aliasIndex = *(unsigned short *)( buffer + offset );
+		aliasIndex = 0;
+		offset = MSS_Read( size, buffer, offset, 2, &aliasIndex );
 		if ( !aliasIndex ) {
-			offset += 2;
 			break;
 		}
-		offset = MSS_RestoreStreamChannel( size, buffer, offset + 2, aliasIndex, -1 );
+		offset = MSS_RestoreStreamChannel( buffer, offset, size, aliasIndex, -1 );
 	}
 
 	if ( offset != size ) {
@@ -3302,142 +3124,128 @@ void MSS_Restore( int buffer, int size )
 }
 
 /* ---- MSS_QueueRestore_m  0x004515F0 ---- VERIFIED */
-void __cdecl MSS_QueueRestore_m(int a1, int *a2)
+void __cdecl MSS_QueueRestore_m( int size, int *data )
 {
-  MSS_StopSounds(6);
-  if ( mss_pendingRestore )
-    free(mss_pendingRestore);
-  mss_pendingRestoreSize = a1;
-  mss_pendingRestore = Z_MallocInternal(a1);
-  Com_Memcpy((int)mss_pendingRestore, a2, a1);
+	MSS_StopSounds( 6 );
+	if ( mss_pendingRestore ) {
+		free( mss_pendingRestore );
+	}
+	mss_pendingRestoreSize = size;
+	mss_pendingRestore = Z_MallocInternal( size );
+	Com_Memcpy( (int)mss_pendingRestore, data, size );
 }
 
 /* ---- MSS_GetSoundOverlay2D  0x00451630 ---- */
 static int MSS_GetSoundOverlay2D( mssOverlay_t *buffer, int maxCount )
 {
-	int i, count, h, rate;
+	int i, h, rate, baseRate, chan;
 
-	count = maxCount;
-	if ( count > mss_num2DChannels ) {
-		count = mss_num2DChannels;
-	}
-	if ( count <= 0 || !buffer ) {
-		return count;
+	if ( maxCount > mss_num2DChannels ) {
+		maxCount = mss_num2DChannels;
 	}
 
-	for ( i = 0 ; i < count ; i++ ) {
-		mssChannel_t *ch = &mss_channels[ MSS_FIRST_2D + i ];
-
-		if ( !ch->paused && AIL_sample_status( mss_2DHandles[i] ) == SMP_DONE ) {
+	for ( i = 0 ; i < maxCount ; i++ ) {
+		chan = MSS_FIRST_2D + i;
+		if ( MSS_Is2DChannelFree( chan ) ) {
 			buffer[i].name = 0;
 			continue;
 		}
-		h = mss_2DHandles[i];
-		buffer[i].name = AL_FILENAME( ch->alias );
+		buffer[i].name = AL_FILENAME( mss_channels[chan].alias );
+		h = MSS_2D_HANDLE( chan );
 
 		rate = AIL_sample_playback_rate( h );
 		if ( !rate ) {
-			rate = ch->baseRate;
+			rate = mss_channels[chan].baseRate;
 		}
-		buffer[i].requested = ch->volume * 1.25f;
+		buffer[i].requested = mss_channels[chan].volume * 1.25f;
 		AIL_sample_volume_pan( h, &buffer[i].actual, 0 );
 		buffer[i].actual = buffer[i].actual * 1.25f;
 		if ( mss_masterVolume != 0.0f ) {
 			buffer[i].actual = buffer[i].actual / mss_masterVolume;
 		}
-		buffer[i].baseRate  = ch->baseRate;
-		buffer[i].rateScale = (float)rate / (float)ch->baseRate;
+		baseRate = mss_channels[chan].baseRate;
+		buffer[i].baseRate  = baseRate;
+		/* fild / fidiv, no float store of either int (0x004516F4-0x00451707). */
+		buffer[i].rateScale = (float)( (double)rate / (double)baseRate );
 	}
-	return count;
+	return maxCount;
 }
 
 /* ---- MSS_GetSoundOverlay3D  0x00451730 ---- */
 static int MSS_GetSoundOverlay3D( mssOverlay_t *buffer, int maxCount )
 {
-	int   i, count;
-	int   h, rate;
-	float x, y, z;
+	int    i, h, rate, baseRate;
+	vec3_t pos;
 
-	count = maxCount;
-	if ( count > mss_max3DChannels ) {
-		count = mss_max3DChannels;
-	}
-	if ( !buffer ) {
-		return count;
+	if ( maxCount > mss_max3DChannels ) {
+		maxCount = mss_max3DChannels;
 	}
 
-	for ( i = 0 ; i < count ; i++ ) {
-		mssChannel_t *ch = &mss_channels[i];
-
-		if ( !ch->paused && AIL_3D_sample_status( mss_3DHandles[i] ) == SMP_DONE ) {
+	for ( i = 0 ; i < maxCount ; i++ ) {
+		if ( MSS_Is3DChannelFree( i ) ) {
 			buffer[i].name = 0;
 			continue;
 		}
+		buffer[i].name = AL_FILENAME( mss_channels[i].alias );
 		h = mss_3DHandles[i];
-		buffer[i].name = AL_FILENAME( ch->alias );
 
 		AIL_3D_sample_length( h );
 		rate = AIL_3D_sample_playback_rate( h );
 		if ( !rate ) {
-			rate = ch->baseRate;
+			rate = mss_channels[i].baseRate;
 		}
-		AIL_3D_position( h, &x, &y, &z );
+		AIL_3D_position( h, &pos[0], &pos[1], &pos[2] );
+		/* Unused, but the LTCG-inlined /Op helper is why retail stores every
+		 * float in this loop (0x004517EA, 0x00451822-0x0045182D). */
+		Distance( pos, mss_listenerOrigin );
 
-		buffer[i].requested = ch->volume * 1.25f;
+		buffer[i].requested = mss_channels[i].volume * 1.25f;
 		buffer[i].actual    = AIL_3D_sample_volume( h ) * 1.25f;
 		if ( mss_masterVolume != 0.0f ) {
 			buffer[i].actual = buffer[i].actual / mss_masterVolume;
 		}
-		buffer[i].baseRate  = ch->baseRate;
-		buffer[i].rateScale = (float)rate / (float)ch->baseRate;
+		baseRate = mss_channels[i].baseRate;
+		buffer[i].baseRate  = baseRate;
+		buffer[i].rateScale = (float)rate / (float)baseRate;
 	}
-	return count;
+	return maxCount;
 }
 
 /* ---- MSS_GetSoundOverlayStream  0x00451860 ---- */
 static int MSS_GetSoundOverlayStream( mssOverlay_t *buffer, int maxCount )
 {
-	int i, count, h, rate;
+	int i, h, rate, baseRate, chan;
 
-	count = maxCount;
-	if ( count > mss_numStreamChannels ) {
-		count = mss_numStreamChannels;
-	}
-	if ( count <= 0 || !buffer ) {
-		return count;
+	if ( maxCount > mss_numStreamChannels ) {
+		maxCount = mss_numStreamChannels;
 	}
 
-	for ( i = 0 ; i < count ; i++ ) {
-		mssChannel_t *ch = &mss_channels[ MSS_FIRST_STREAM + i ];
-
-		h = mss_streamHandles[i];
-		if ( !h ) {
+	for ( i = 0 ; i < maxCount ; i++ ) {
+		chan = MSS_FIRST_STREAM + i;
+		if ( MSS_IsStreamChannelFree( chan ) ) {
 			buffer[i].name = 0;
 			continue;
 		}
-		if ( !ch->paused && AIL_stream_status( h ) == SMP_DONE ) {
-			AIL_close_stream( h );
-			mss_streamHandles[i] = 0;
-			buffer[i].name = 0;
-			continue;
-		}
-		buffer[i].name = AL_FILENAME( ch->alias );
+		buffer[i].name = AL_FILENAME( mss_channels[chan].alias );
+		h = MSS_STREAM_HANDLE( chan );
 
 		rate = AIL_stream_playback_rate( h );
-		buffer[i].requested = ch->volume * 1.25f;
+		buffer[i].requested = mss_channels[chan].volume * 1.25f;
 		AIL_stream_volume_pan( h, &buffer[i].actual, 0 );
 		buffer[i].actual = buffer[i].actual * 1.25f;
 		if ( mss_masterVolume != 0.0f ) {
 			buffer[i].actual = buffer[i].actual / mss_masterVolume;
 		}
-		buffer[i].baseRate  = ch->baseRate;
-		buffer[i].rateScale = (float)rate / (float)ch->baseRate;
+		baseRate = mss_channels[chan].baseRate;
+		buffer[i].baseRate  = baseRate;
+		/* fild / fidiv, no float store of either int (0x00451922-0x00451938). */
+		buffer[i].rateScale = (float)( (double)rate / (double)baseRate );
 	}
-	return count;
+	return maxCount;
 }
 
 /* ---- MSS_GetSoundOverlay  0x00451960 ---- VERIFIED */
-int __cdecl MSS_GetSoundOverlay( int *cpuOut, int maxCount, void *buffer, int which )
+int __cdecl MSS_GetSoundOverlay( int which, void *buffer, int maxCount, int *cpuOut )
 {
 	if ( !mss_digitalDriver ) {
 		return 0;
@@ -3445,14 +3253,14 @@ int __cdecl MSS_GetSoundOverlay( int *cpuOut, int maxCount, void *buffer, int wh
 	if ( cpuOut ) {
 		*cpuOut = mss_cpuPercent;
 	}
-	if ( which == 1 ) {
+	switch ( which ) {
+	case 1:
 		return MSS_GetSoundOverlay3D( buffer, maxCount );
-	}
-	if ( which == 2 ) {
+	case 2:
 		return MSS_GetSoundOverlayStream( buffer, maxCount );
-	}
-	if ( which == 3 ) {
+	case 3:
 		return MSS_GetSoundOverlay2D( buffer, maxCount );
+	default:
+		return 0;
 	}
-	return 0;
 }

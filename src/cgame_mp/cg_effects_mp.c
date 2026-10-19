@@ -1,59 +1,28 @@
-/*
- * cg_effects.c -- the impact-effect table loader.
- *
- * Call of Duty 1.1 multiplayer client game (cgame_mp_x86.dll, imagebase
- * 0x30000000).  RTCW's cgame/cg_effects.c has nothing in common with this file:
- * CoD moved every particle/smoke/spark local entity into the engine-side FX
- * system (traps 222..235), so all that is left on the cgame side is the startup
- * pass that reads fx/*.csv and turns "effect type x surface type" into the
- * handle tables cg_event.c and cg_weapons.c index.
- *
- * The CSV is three columns: effect type name, surface type name, effect file.
- * An empty third column is an explicit "no effect here" and is recorded by
- * poking a 1 into byte 1 of the (empty) name slot -- that marker is the only
- * thing that stops CG_RegisterImpactEffectsOfType reporting the row missing
- * (0x3001A6ED / 0x3001A515).
- *
- * Functions are in address order, which is the original file order.
- *
- * @fidelity: likely
- */
+// cg_effects.c -- loads the impact effect tables from fx/*.csv
+//
+// Each CSV row is: effect type, surface type, effect file.  An empty third
+// column means "no effect here" on purpose and is not reported as missing.
 
 #include <string.h>
 #include <stdlib.h>
 
 #include "cg_local.h"
 
-/*
- * 23 surface types: every one of the six footstep event blocks in
- * bg_misc.c's eventnames[] is 23 wide, and CG_RegisterImpactEffectsOfType
- * walks exactly 23 entries (0x3001A50A).
- */
-#define SURF_TYPE_NUM               23
-
-/* Nine effect types, the nine names CG_RegisterImpactEffects builds on its
-   stack at 0x3001A81B..0x3001A85B. */
 #define NUM_IMPACT_EFFECT_TYPES     9
 
-/* The third column is strcpy'd into a 64-byte slot and rejected at 63 chars
-   (0x3001A6CB / 0x3001A6DD). */
 #define MAX_EFFECT_FILENAME         64
 
-/* trap_FS_GetFileList's buffer and the pointer table qsort sorts; both are
-   CG_RegisterImpactEffects locals (0x10000 and 4096 entries, 0x3001A7FB /
-   0x3001A8D3). */
 #define MAX_EFFECT_FILE_TEXT        0x10000
 #define MAX_EFFECT_FILES            4096
 
-/* Owned by other units. */
-void        CG_Printf( const char *msg, ... );                  /* cg_main.c 0x300206F0 */
-void        CG_Error( const char *msg, ... );                   /* cg_main.c 0x30020750 */
+void        CG_Printf( const char *msg, ... );
+void        CG_Error( const char *msg, ... );
 
 /*
 ==============
-CG_RegisterImpactEffectsOfType     0x3001A500
+CG_RegisterImpactEffectsOfType
 
-Registers one effect type's 23 surface entries and returns how many rows the
+Registers one effect type's surface entries and returns how many rows the
 CSVs never supplied.
 ==============
 */
@@ -65,17 +34,16 @@ static int CG_RegisterImpactEffectsOfType( char ( *fileNames )[MAX_EFFECT_FILENA
 	missing = 0;
 
 	for ( i = 0 ; i < SURF_TYPE_NUM ; i++ ) {
-		if ( fileNames[i][0] ) {
-			effects[i] = trap_syscall_0xDE( fileNames[i] );
-		} else {
-			/* byte 1 is CG_ParseImpactEffects' "the file said blank on purpose"
-			   marker; without it the row was simply never listed. */
+		if ( !fileNames[i][0] ) {
+			// byte 1 set means the file left this entry blank on purpose
 			if ( !fileNames[i][1] ) {
 				CG_Printf( "no entry for effect type '%s' on surface type '%s'\n",
 						   effectType, trap_SurfaceTypeToName( i ) );
 				missing++;
 			}
 			effects[i] = 0;
+		} else {
+			effects[i] = trap_FX_RegisterEffect( fileNames[i] );
 		}
 	}
 
@@ -84,7 +52,7 @@ static int CG_RegisterImpactEffectsOfType( char ( *fileNames )[MAX_EFFECT_FILENA
 
 /*
 ==============
-CG_ParseImpactEffects     0x3001A570
+CG_ParseImpactEffects
 
 Returns NULL on success, or a va()'d error message for CG_Error.
 ==============
@@ -93,7 +61,6 @@ static const char *CG_ParseImpactEffects( const char *filename, char *data_p,
 										  int numEffectTypes, const char **effectTypes,
 										  char ( *fileNames )[SURF_TYPE_NUM][MAX_EFFECT_FILENAME] ) {
 	char    *token;
-	char    *name;
 	int     i;
 	int     surfaceType;
 
@@ -109,7 +76,7 @@ static const char *CG_ParseImpactEffects( const char *filename, char *data_p,
 		}
 
 		for ( i = 0 ; i < numEffectTypes ; i++ ) {
-			if ( !_stricmp( effectTypes[i], token ) ) {
+			if ( !stricmp( effectTypes[i], token ) ) {
 				break;
 			}
 		}
@@ -129,15 +96,14 @@ static const char *CG_ParseImpactEffects( const char *filename, char *data_p,
 
 		token = Com_ParseOnLine( &data_p );
 
-		name = fileNames[i][surfaceType];
-		name[MAX_EFFECT_FILENAME - 1] = 0;
-		strcpy( name, token );
-		if ( name[MAX_EFFECT_FILENAME - 1] ) {
+		fileNames[i][surfaceType][MAX_EFFECT_FILENAME - 1] = 0;
+		strcpy( fileNames[i][surfaceType], token );
+		if ( fileNames[i][surfaceType][MAX_EFFECT_FILENAME - 1] ) {
 			return va( "effect filename '%s' in third column of file '%s' is longer than %i characters",
 					   token, filename, MAX_EFFECT_FILENAME - 1 );
 		}
 		if ( !token[0] ) {
-			name[1] = 1;
+			fileNames[i][surfaceType][1] = 1;
 		}
 
 		Com_SkipRestOfLine( 0, &data_p );
@@ -146,22 +112,24 @@ static const char *CG_ParseImpactEffects( const char *filename, char *data_p,
 
 /*
 ==============
-compare_impact_files     0x3001A7C0
+compare_impact_files
 ==============
 */
 static int compare_impact_files( const void *a, const void *b ) {
-	return _stricmp( *(const char **)a, *(const char **)b );
+	const char *s1;
+	const char *s2;
+
+	s1 = *(const char **)a;
+	s2 = *(const char **)b;
+	return stricmp( s1, s2 );
 }
 
 /*
 ==============
-CG_RegisterImpactEffects     0x3001A7E0
+CG_RegisterImpactEffects
 ==============
 */
 void CG_RegisterImpactEffects( void ) {
-	/* Both tables are built on the stack every call (0x3001A81B / 0x3001A863).
-	   The nine destinations are cgs.media's nine 23-entry handle tables, which
-	   cg_local.h carries as one hole. */
 	const char  *effectTypes[NUM_IMPACT_EFFECT_TYPES] = {
 		"bullet_small_normal",
 		"bullet_small_reflect",
@@ -174,15 +142,15 @@ void CG_RegisterImpactEffects( void ) {
 		"molotov_explode_reflect"
 	};
 	int         *effects[NUM_IMPACT_EFFECT_TYPES] = {
-		(int *)&cgs.media.unknown_0x70C[0 * SURF_TYPE_NUM * 4],  /* cgs+0xA0F0 */
-		(int *)&cgs.media.unknown_0x70C[1 * SURF_TYPE_NUM * 4],  /* cgs+0xA14C */
-		(int *)&cgs.media.unknown_0x70C[2 * SURF_TYPE_NUM * 4],
-		(int *)&cgs.media.unknown_0x70C[3 * SURF_TYPE_NUM * 4],
-		(int *)&cgs.media.unknown_0x70C[4 * SURF_TYPE_NUM * 4],
-		(int *)&cgs.media.unknown_0x70C[5 * SURF_TYPE_NUM * 4],
-		(int *)&cgs.media.unknown_0x70C[6 * SURF_TYPE_NUM * 4],
-		(int *)&cgs.media.unknown_0x70C[7 * SURF_TYPE_NUM * 4],
-		(int *)&cgs.media.unknown_0x70C[8 * SURF_TYPE_NUM * 4]   /* cgs+0xA3D0 */
+		cgs.media.bulletSmallNormalEffects, 
+		cgs.media.bulletSmallReflectEffects,
+		cgs.media.bulletLargeNormalEffects,
+		cgs.media.bulletLargeReflectEffects,
+		cgs.media.grenadeBounceEffects,
+		cgs.media.grenadeExplodeEffects,
+		cgs.media.rocketExplodeEffects,
+		cgs.media.molotovExplodeNormalEffects,
+		cgs.media.molotovExplodeReflectEffects
 	};
 	char        fileNames[NUM_IMPACT_EFFECT_TYPES][SURF_TYPE_NUM][MAX_EFFECT_FILENAME];
 	char        *files[MAX_EFFECT_FILES];
@@ -200,7 +168,7 @@ void CG_RegisterImpactEffects( void ) {
 	numFiles = trap_FS_GetFileList( "fx", "csv", fileText, sizeof( fileText ) );
 	if ( !numFiles ) {
 		CG_Error( "No CSV files in the fx directory to identify impact effects\n" );
-	} else if ( numFiles > MAX_EFFECT_FILES ) {
+	} else if ( (unsigned)numFiles > MAX_EFFECT_FILES ) {
 		numFiles = MAX_EFFECT_FILES;
 	}
 
@@ -240,7 +208,7 @@ void CG_RegisterImpactEffects( void ) {
 	}
 
 	missing = 0;
-	for ( i = 0 ; i < NUM_IMPACT_EFFECT_TYPES ; i++ ) {
+	for ( i = 0 ; i < sizeof( effectTypes ) / sizeof( effectTypes[0] ) ; i++ ) {
 		missing += CG_RegisterImpactEffectsOfType( fileNames[i], effectTypes[i], effects[i] );
 	}
 

@@ -19,8 +19,12 @@
  * ("map/set<T> too long", "vector<T> too long", "invalid map/set<T> iterator")
  * and by calls to std::_String_base::_Xlen / _Xran.
  *
- * ONE GLOBAL: TheStringPackage at 0x01407450, constructed from the CRT
- * static-init table by 0x004AA830 and torn down at exit by 0x004AA910.
+ * TWO GLOBALS: TheStringPackage at 0x01407450, constructed from the CRT
+ * static-init table by 0x004AA830 and torn down at exit by 0x004AA910; and
+ * the std::vector<std::string> language list at 0x014074F4, right after it,
+ * which SE_GetNumLanguages rebuilds and which has its own CRT entry
+ * (0x0053C220, atexit 0x0053C2B0).  The tree runs both initializers from
+ * SE_StaticInit in stringed_unassigned.cpp.
  *
  * LAYOUTS:
  *
@@ -32,12 +36,13 @@
  *   map node         104 bytes: _Left +0, _Parent +4, _Right +8,
  *                     key std::string +12, CStringEdString value +40,
  *                     _Color +100, _Isnil +101.
- *   CStringEdPackage >=180 bytes: int +0; std::string +4/+32/+60/+88; int +116;
+ *   CStringEdPackage 164 bytes: int +0; std::string +4/+32/+60/+88; int +116;
  *                     std::map +120 (head +124, size +128);
  *                     int +132 "return the reference text, not the localized
  *                     one"; std::vector +136 (first +140, last +144, end +148);
- *                     std::map +152 (head +156, size +160);
- *                     std::vector +164 (first +168, last +172, end +176).
+ *                     std::map +152 (head +156, size +160).  The vector at
+ *                     +164 is the separate language-list global above; the
+ *                     package's constructor and destructor never touch it.
  *
  * ENTRY POINTS.  SE_GetString is the single gate: every SEH_ entry point in
  * stringed_hooks.cpp goes through it.
@@ -66,8 +71,15 @@
  * @fidelity: raw
  */
 
-#include "../qcommon/cod1_types.h"
+#ifdef __cplusplus
+/* retail built this unit as C++ with exceptions (/TP /GX); every name keeps C linkage */
+extern "C" {
+#endif
 
 
 /* ISO C requires a translation unit to contain at least one declaration. */
 typedef int stringed_interface_placeholder_t;
+
+#ifdef __cplusplus
+}
+#endif

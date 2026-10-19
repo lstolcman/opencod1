@@ -1,23 +1,5 @@
-/*
- * g_spawn_mp.c -- turning the map's entity string into gentity_t's, and the
- * script system's view of an entity's fields.
- *
- * The RTCW half (G_Spawn*, G_ParseSpawnVars, G_NewString, G_CallSpawn,
- * SP_worldspawn, G_SpawnEntitiesFromString) is game/g_spawn.c with CoD's
- * changes: spawn keys land in interned const strings rather than allocated
- * ones, the world entity is written directly, and the loop that used to take
- * a gentity_t now spawns its own.
- *
- * The Scr_* half has no RTCW ancestor.  fields[] below is both the spawn-key
- * table and the script field table: GScr_AddFieldsForEntity registers every
- * entry with the VM under the entity class, and the VM then indexes back into
- * it by that registration order.  A field number with 0xC000 set is a client
- * field and indexes clientFields[] (g_client_fields_mp.c) instead.
- *
- * Function order is binary order (0x200369E0 .. 0x20037E70).
- *
- * @fidelity: likely
- */
+// g_spawn_mp.c -- spawning entities from the map's entity string, and the
+// script system's view of entity fields
 
 #include <string.h>
 #include <stdlib.h>
@@ -26,48 +8,9 @@
 #include "bg_public.h"
 #include "g_local.h"
 
-/* q_shared.h carries this in the original tree. */
-#define MAX_TOKEN_CHARS         1024
-
-/* SP_worldspawn's configstrings; bg_public.h carries these in the original
- * tree.  CS_MODELS is the base G_ModelName indexes off. */
-#define CS_GAME_VERSION         2
-#define CS_MUSIC                3
-#define CS_MESSAGE              4
-#define CS_NORTHYAW             11
-#define CS_LEVEL_START_TIME     13
-#define CS_MOTD                 14
-
 #define GAME_VERSION            "cod"
 
-#define ENTITYNUM_WORLD         ( MAX_GENTITIES - 2 )
-
-/* A field number with both 0xC000 bits set is a client field; the remaining
- * bits index clientFields[]. */
-#define CLIENT_FIELD_MASK       0x0000C000
-#define CLIENT_FIELD_INDEX_MASK 0xFFFF3FFF
-
-/* Script object classes, in the order of the class map g_scr_main_mp.c hands
- * to Scr_SetClassMap ("entity", "hudelem"). */
-#define SCR_OBJECT_ENTITY       0
-#define SCR_OBJECT_HUDELEM      1
-
-/*
- * The field types fields[] and clientFields[] use.  F_VECTOR_Y takes a whole
- * vector from the script and keeps only its y; reading one gives { 0, v, 0 }.
- */
-typedef enum {
-	F_INT,
-	F_FLOAT,
-	F_CSTRING,              /* char[] stored in place */
-	F_STRING,               /* const string id, an unsigned short */
-	F_VECTOR,
-	F_ENTITY,               /* gentity_t * in memory */
-	F_VECTOR_Y,
-	F_OBJECT,               /* script object id, an unsigned short */
-	F_MODEL,                /* model index, a byte */
-	F_IGNORE
-} fieldtype_t;
+// keep: the case order of the fieldtype_t switches matches original codegen
 
 typedef void ( *fieldSet_t )( gentity_t *ent, int fieldnum );
 
@@ -75,41 +18,21 @@ typedef struct {
 	const char *name;
 	int ofs;
 	fieldtype_t type;
-	fieldSet_t setter;      /* NULL falls through to Scr_SetGenericField */
+	fieldSet_t setter;      // NULL uses Scr_SetGenericField
 } field_t;
 
-/*
- * clientFields[] lives in g_client_fields_mp.c (0x20055C00) and carries one
- * more slot than fields[]: the client half has a getter as well as a setter,
- * and both take the gclient_t twice.
- */
-typedef struct clientField_s clientField_t;
-typedef void ( *clientFieldFunc_t )( gclient_t *client, gclient_t *self, const clientField_t *field );
-
-struct clientField_s {
-	const char *name;
-	int ofs;
-	fieldtype_t type;
-	clientFieldFunc_t setter;
-	clientFieldFunc_t getter;
-};
-
-extern clientField_t clientFields[];             /* 0x20055C00 */
+extern clientField_t clientFields[];
 
 typedef struct {
 	const char *name;
 	void ( *spawn )( gentity_t *ent );
 } spawn_t;
 
-#define FOFS( x ) ( (int)&( ( (gentity_t *)0 )->x ) )
 
-/* Defined below, where the binary has it. */
+// keep: original function order
 static unsigned short G_NewString( const char *string );
 
-/*
- * The key and value G_ParseEntityField is working on, so GScr_FieldError can
- * name the pair that failed.  0x20089F38 / 0x20089F34.
- */
+// the key / value pair G_ParseEntityField is working on, for GScr_FieldError
 static const char *fieldKey;
 static const char *fieldValue;
 
@@ -162,12 +85,12 @@ static void Scr_ReadOnlyField( gentity_t *ent, int fieldnum ) {
 	Scr_Error( "Tried to set a read only entity field" );
 }
 
-/*
- * The spawn keys, and the entity fields the script system sees, in one table.
- * A field's number is its index here, so the order is part of the ABI between
- * the module and a compiled .gsc.
- */
-static field_t fields[] = {
+//
+// fields are needed for spawning from the entity string
+// and are also the entity fields the script system sees;
+// a field's number is its index here
+//
+static const field_t fields[] = {
 	{"classname", FOFS( classname ), F_STRING, Scr_ReadOnlyField},
 	{"origin", FOFS( r.currentOrigin ), F_VECTOR, Scr_SetOrigin},
 	{"model", FOFS( model ), F_MODEL, Scr_ReadOnlyField},
@@ -206,17 +129,57 @@ static field_t fields[] = {
 	{NULL, 0, F_INT, NULL}
 };
 
+// keep: original data layout
+static spawn_t spawns[] = {
+	// info entities don't do anything at all, but provide positional
+	// information for things controlled by other processes
+	{"info_null", SP_info_null},
+	{"info_notnull", SP_info_notnull},
+	{"func_door", SP_func_door},
+	{"func_static", SP_func_static},
+	{"func_rotating", SP_func_rotating},
+	{"func_bobbing", SP_func_bobbing},
+	{"func_pendulum", SP_func_pendulum},
+	{"func_group", SP_info_null},
+	{"func_door_rotating", SP_func_door_rotating},
+	// Triggers are brush objects that cause an effect when contacted
+	// by a living player, usually involving firing targets.
+	{"trigger_multiple", SP_trigger_multiple},
+	{"trigger_hurt", SP_trigger_hurt},
+	{"trigger_once", SP_trigger_once},
+	{"target_location", SP_target_location},
+	{"mp_target_location", SP_target_location},
+	{"light", SP_light},
+	{"misc_teleporter_dest", SP_misc_teleporter_dest},
+	{"misc_model", SP_misc_model},
+	{"misc_mg42", SP_turret},
+	{"misc_turret", SP_turret},
+	{"misc_spawner", SP_misc_spawner},
+	{"corona", SP_corona},
+	{"trigger_use", trigger_use},
+	{"trigger_damage", SP_trigger_damage},
+	{"trigger_lookat", SP_trigger_lookat},
+	{"script_brushmodel", SP_script_brushmodel},
+	{"script_model", SP_script_model},
+	{"script_origin", SP_script_origin},
+
+	{NULL, NULL}
+};
+
 /*
- * While the map is being spawned there is no script thread to blame, so the
- * failure is fatal and names the key/value pair instead.  `ent` is carried for
- * the caller's benefit; the classname comes back out of the spawn vars.
- */
+===============
+GScr_FieldError
+
+While the map is being spawned there is no script thread to blame, so the
+failure is fatal and names the key / value pair instead.
+===============
+*/
 void GScr_FieldError( gentity_t *ent, const char *error ) {
 	char *classname;
 
 	if ( level.spawningMapEntities ) {
 		G_SpawnString( "classname", "", &classname );
-		Com_Error( 1, va( "\x15" "classname '%s', key '%s', value '%s': %s",
+		Com_Error( ERR_DROP, va( "\x15" "classname '%s', key '%s', value '%s': %s",
 						  classname, fieldKey, fieldValue, error ) );
 	}
 
@@ -224,36 +187,51 @@ void GScr_FieldError( gentity_t *ent, const char *error ) {
 }
 
 /*
- * A spawn key that is not in fields[] may still be a field some .gsc declared;
- * set it on the entity's script object if the VM knows it.
- */
+===============
+G_SetEntityScriptVariable
+
+A spawn key that is not in fields[] may still be a field some script
+declared; set it on the entity's script object if the VM knows it.
+===============
+*/
 static void G_SetEntityScriptVariable( const char *key, const char *value, gentity_t *ent ) {
 	unsigned short fieldnum;
 	int type;
+	float f;
 
 	fieldnum = Scr_FindField( key, &type );
 	if ( !fieldnum ) {
 		return;
 	}
 
-	if ( type == 1 ) {
+	switch ( type ) {
+	case VAR_STRING:
 		Scr_AddString( value );
-	} else if ( type == 4 ) {
-		Scr_AddFloat( (float)atof( value ) );
-	} else if ( type == 5 ) {
+		break;
+	case VAR_FLOAT:
+		f = (float)atof( value );
+		Scr_AddFloat( f );
+		break;
+	case VAR_INTEGER:
 		Scr_AddInt( atoi( value ) );
-	} else {
+		break;
+	default:
 		return;
 	}
 
-	Scr_SetDynamicEntityField( ent->s.number, SCR_OBJECT_ENTITY, fieldnum );
+	Scr_SetDynamicEntityField( ent->s.number, SCR_CLASS_ENTITY, fieldnum );
 }
 
 /*
- * Takes a key/value pair and sets the appropriate field on the given entity.
- */
+===============
+G_ParseEntityField
+
+Takes a key/value pair and sets the binary values
+in a gentity
+===============
+*/
 static void G_ParseEntityField( const char *key, const char *value, gentity_t *ent ) {
-	field_t *f;
+	const field_t *f;
 	byte *b;
 	float v[3];
 
@@ -262,16 +240,10 @@ static void G_ParseEntityField( const char *key, const char *value, gentity_t *e
 
 	for ( f = fields ; f->name ; f++ ) {
 		if ( !Q_stricmp( f->name, key ) ) {
-			/* found it */
+			// found it
 			b = (byte *)ent;
 
 			switch ( f->type ) {
-			case F_INT:
-				*(int *)( b + f->ofs ) = atoi( value );
-				break;
-			case F_FLOAT:
-				*(float *)( b + f->ofs ) = (float)atof( value );
-				break;
 			case F_STRING:
 				Scr_SetString( (unsigned short *)( b + f->ofs ), 0 );
 				*(unsigned short *)( b + f->ofs ) = G_NewString( value );
@@ -281,6 +253,12 @@ static void G_ParseEntityField( const char *key, const char *value, gentity_t *e
 				( (float *)( b + f->ofs ) )[0] = v[0];
 				( (float *)( b + f->ofs ) )[1] = v[1];
 				( (float *)( b + f->ofs ) )[2] = v[2];
+				break;
+			case F_INT:
+				*(int *)( b + f->ofs ) = atoi( value );
+				break;
+			case F_FLOAT:
+				*(float *)( b + f->ofs ) = (float)atof( value );
 				break;
 			case F_MODEL:
 				if ( *value == '*' ) {
@@ -311,14 +289,10 @@ void G_ParseEntityFields( gentity_t *ent ) {
 }
 
 void G_DuplicateEntityFields( gentity_t *dest, gentity_t *source ) {
-	field_t *f;
+	const field_t *f;
 
 	for ( f = fields ; f->name ; f++ ) {
 		switch ( f->type ) {
-		case F_INT:
-		case F_FLOAT:
-			*(int *)( (byte *)dest + f->ofs ) = *(int *)( (byte *)source + f->ofs );
-			break;
 		case F_STRING:
 			Scr_SetString( (unsigned short *)( (byte *)dest + f->ofs ),
 						   *(unsigned short *)( (byte *)source + f->ofs ) );
@@ -327,6 +301,12 @@ void G_DuplicateEntityFields( gentity_t *dest, gentity_t *source ) {
 			( (float *)( (byte *)dest + f->ofs ) )[0] = ( (float *)( (byte *)source + f->ofs ) )[0];
 			( (float *)( (byte *)dest + f->ofs ) )[1] = ( (float *)( (byte *)source + f->ofs ) )[1];
 			( (float *)( (byte *)dest + f->ofs ) )[2] = ( (float *)( (byte *)source + f->ofs ) )[2];
+			break;
+		case F_INT:
+			*(int *)( (byte *)dest + f->ofs ) = *(int *)( (byte *)source + f->ofs );
+			break;
+		case F_FLOAT:
+			*(float *)( (byte *)dest + f->ofs ) = *(float *)( (byte *)source + f->ofs );
 			break;
 		case F_MODEL:
 			*( (byte *)dest + f->ofs ) = *( (byte *)source + f->ofs );
@@ -338,46 +318,17 @@ void G_DuplicateEntityFields( gentity_t *dest, gentity_t *source ) {
 }
 
 void G_DuplicateScriptFields( gentity_t *dest, gentity_t *source ) {
-	Scr_CopyEntityNum( source->s.number, dest->s.number, SCR_OBJECT_ENTITY );
+	Scr_CopyEntityNum( source->s.number, dest->s.number, SCR_CLASS_ENTITY );
 }
 
-static spawn_t spawns[] = {
-	{"info_null", SP_info_null},
-	{"info_notnull", SP_info_notnull},
-	{"func_door", SP_func_door},
-	{"func_static", SP_func_static},
-	{"func_rotating", SP_func_rotating},
-	{"func_bobbing", SP_func_bobbing},
-	{"func_pendulum", SP_func_pendulum},
-	{"func_group", SP_info_null},
-	{"func_door_rotating", SP_func_door_rotating},
-	{"trigger_multiple", SP_trigger_multiple},
-	{"trigger_hurt", SP_trigger_hurt},
-	{"trigger_once", SP_trigger_once},
-	{"target_location", SP_target_location},
-	{"mp_target_location", SP_target_location},
-	{"light", SP_light},
-	{"misc_teleporter_dest", SP_misc_teleporter_dest},
-	{"misc_model", SP_misc_model},
-	{"misc_mg42", SP_turret},
-	{"misc_turret", SP_turret},
-	{"misc_spawner", SP_misc_spawner},
-	{"corona", SP_corona},
-	{"trigger_use", trigger_use},
-	{"trigger_damage", SP_trigger_damage},
-	{"trigger_lookat", SP_trigger_lookat},
-	{"script_brushmodel", SP_script_brushmodel},
-	{"script_model", SP_script_model},
-	{"script_origin", SP_script_origin},
-
-	{NULL, NULL}
-};
-
 /*
- * Finds the spawn function for the current spawn vars and calls it, spawning
- * the entity on the way.  Unlike RTCW's, this one is silent about a classname
- * with no spawn function -- the entity is simply left as parsed.
- */
+===============
+G_CallSpawn
+
+Spawns an entity for the current spawn vars, then finds its spawn
+function and calls it.  An entity without one is left as parsed.
+===============
+*/
 void G_CallSpawn( void ) {
 	spawn_t *s;
 	gitem_t *item;
@@ -390,7 +341,7 @@ void G_CallSpawn( void ) {
 		return;
 	}
 
-	/* check item spawn functions */
+	// check item spawn functions
 	for ( item = bg_itemlist + 1 ; item->classname ; item++ ) {
 		if ( !strcmp( item->classname, classname ) ) {
 			ent = G_Spawn();
@@ -400,7 +351,7 @@ void G_CallSpawn( void ) {
 		}
 	}
 
-	/* check normal spawn functions */
+	// check normal spawn functions
 	for ( s = spawns ; s->name ; s++ ) {
 		if ( !strcmp( s->name, classname ) ) {
 			ent = G_Spawn();
@@ -415,9 +366,13 @@ void G_CallSpawn( void ) {
 }
 
 /*
- * The same dispatch for an entity that already exists and already has its
- * fields -- what GScr_Spawn (0x2002FE40) builds.
- */
+===============
+G_CallSpawnEntity
+
+Finds the spawn function for the entity and calls it,
+returning qfalse if not found
+===============
+*/
 qboolean G_CallSpawnEntity( gentity_t *ent ) {
 	spawn_t *s;
 	gitem_t *item;
@@ -449,10 +404,13 @@ qboolean G_CallSpawnEntity( gentity_t *ent ) {
 }
 
 /*
- * Builds a copy of the string, translating \n to real linefeeds, and interns
- * it.  RTCW allocated the result off the level hunk; CoD hands it to the
- * script string list and keeps only the id.
- */
+=============
+G_NewString
+
+Builds a copy of the string, translating \n to real linefeeds
+so message texts can be multi-line, and returns it as a script string
+=============
+*/
 static unsigned short G_NewString( const char *string ) {
 	char newb[65536];
 	char *new_p;
@@ -465,34 +423,37 @@ static unsigned short G_NewString( const char *string ) {
 
 	new_p = newb;
 
-	/* turn \n into a real linefeed */
+	// turn \n into a real linefeed
 	for ( i = 0 ; i < l ; i++ ) {
 		if ( string[i] == '\\' && i < l - 1 ) {
 			i++;
 			if ( string[i] == 'n' ) {
-				*new_p = '\n';
+				*new_p++ = '\n';
 			} else {
-				*new_p = '\\';
+				*new_p++ = '\\';
 			}
 		} else {
-			*new_p = string[i];
+			*new_p++ = string[i];
 		}
-		new_p++;
 	}
 
 	return SL_GetString( newb, 0 );
 }
 
 /*
- * Registers fields[] with the VM under the entity class.  The index handed to
- * Scr_AddClassField is the entry's index in fields[], which is what the VM
- * gives back as a field number.
- */
-void GScr_AddFieldsForEntity( void ) {
-	field_t *f;
-	int i;
+===============
+GScr_AddFieldsForEntity
 
-	for ( i = 0, f = fields ; f->name ; f++, i++ ) {
+Registers fields[], then the client fields, with the script entity class
+===============
+*/
+void GScr_AddFieldsForEntity( void ) {
+	const field_t *f;
+	unsigned short classnum;
+
+	classnum = g_scr_data.classMap[SCR_CLASS_ENTITY].classnum;
+
+	for ( f = fields ; f->name ; f++ ) {
 		switch ( f->type ) {
 		case F_INT:
 		case F_FLOAT:
@@ -502,14 +463,14 @@ void GScr_AddFieldsForEntity( void ) {
 		case F_ENTITY:
 		case F_OBJECT:
 		case F_MODEL:
-			Scr_AddClassField( g_scr_data.classMap[SCR_CLASS_ENTITY].classnum, f->name, (unsigned short)i );
+			Scr_AddClassField( classnum, f->name, (unsigned short)( f - fields ) );
 			break;
 		default:
 			break;
 		}
 	}
 
-	GScr_AddFieldsForClient( g_scr_data.classMap[SCR_CLASS_ENTITY].classnum );
+	GScr_AddFieldsForClient( classnum );
 }
 
 void GScr_AddFieldsForRadiant( void ) {
@@ -518,8 +479,7 @@ void GScr_AddFieldsForRadiant( void ) {
 
 void Scr_SetEntityField( int entnum, unsigned int fieldnum ) {
 	gentity_t *ent;
-	clientField_t *cf;
-	field_t *f;
+	const field_t *f;
 
 	ent = &g_entities[entnum];
 
@@ -527,12 +487,7 @@ void Scr_SetEntityField( int entnum, unsigned int fieldnum ) {
 		if ( !ent->client ) {
 			GScr_FieldError( ent, "field must be applied to a player" );
 		}
-		cf = &clientFields[fieldnum & CLIENT_FIELD_INDEX_MASK];
-		if ( cf->setter ) {
-			cf->setter( ent->client, ent->client, cf );
-			return;
-		}
-		Scr_SetGenericField( ent->client, cf->type, cf->ofs );
+		Scr_SetClientField( ent->client, fieldnum & CLIENT_FIELD_INDEX_MASK );
 		return;
 	}
 
@@ -545,33 +500,30 @@ void Scr_SetEntityField( int entnum, unsigned int fieldnum ) {
 }
 
 void Scr_SetGenericField( void *base, int type, int ofs ) {
-	byte *slot;
 	vec3_t value;
 
-	slot = (byte *)base + ofs;
-
 	switch ( type ) {
-	case F_INT:
-		*(int *)slot = Scr_GetInt( 0 );
-		break;
-	case F_FLOAT:
-		*(float *)slot = Scr_GetFloat( 0 );
-		break;
 	case F_STRING:
-		Scr_SetString( (unsigned short *)slot, Scr_GetConstString( 0 ) );
+		Scr_SetString( (unsigned short *)( (byte *)base + ofs ), Scr_GetConstString( 0 ) );
 		break;
 	case F_VECTOR:
 		Scr_GetVector( 0, value );
-		( (float *)slot )[0] = value[0];
-		( (float *)slot )[1] = value[1];
-		( (float *)slot )[2] = value[2];
+		( (float *)( (byte *)base + ofs ) )[0] = value[0];
+		( (float *)( (byte *)base + ofs ) )[1] = value[1];
+		( (float *)( (byte *)base + ofs ) )[2] = value[2];
 		break;
-	case F_ENTITY:
-		*(gentity_t **)slot = Scr_GetEntity( 0 );
+	case F_INT:
+		*(int *)( (byte *)base + ofs ) = Scr_GetInt( 0 );
+		break;
+	case F_FLOAT:
+		*(float *)( (byte *)base + ofs ) = Scr_GetFloat( 0 );
 		break;
 	case F_VECTOR_Y:
 		Scr_GetVector( 0, value );
-		*(float *)slot = value[1];
+		*(float *)( (byte *)base + ofs ) = value[1];
+		break;
+	case F_ENTITY:
+		*(gentity_t **)( (byte *)base + ofs ) = Scr_GetEntity( 0 );
 		break;
 	default:
 		break;
@@ -579,23 +531,19 @@ void Scr_SetGenericField( void *base, int type, int ofs ) {
 }
 
 void Scr_SetObjectField( int classnum, int objectNum, int fieldnum ) {
-	if ( classnum == SCR_OBJECT_ENTITY ) {
+	switch ( classnum ) {
+	case SCR_CLASS_ENTITY:
 		Scr_SetEntityField( objectNum, fieldnum );
-	} else if ( classnum == SCR_OBJECT_HUDELEM ) {
+		break;
+	case SCR_CLASS_HUDELEM:
 		Scr_SetHudElemField( objectNum, fieldnum );
+		break;
 	}
 }
 
-/*
- * Scr_GetEntityField (0x20037430) has no exit of its own: its two exits are
- * `jmp` tail calls into Scr_GetGenericField, which the linker laid out
- * immediately after it.  g_client_fields_mp.c and
- * g_hud_mp.c tail-call the same entry (0x200374C0).
- */
 void Scr_GetEntityField( int entnum, unsigned int fieldnum ) {
 	gentity_t *ent;
-	clientField_t *cf;
-	field_t *f;
+	const field_t *f;
 
 	ent = &g_entities[entnum];
 
@@ -603,12 +551,7 @@ void Scr_GetEntityField( int entnum, unsigned int fieldnum ) {
 		if ( !ent->client ) {
 			GScr_FieldError( ent, "field must be applied to a player" );
 		}
-		cf = &clientFields[fieldnum & CLIENT_FIELD_INDEX_MASK];
-		if ( cf->getter ) {
-			cf->getter( ent->client, ent->client, cf );
-			return;
-		}
-		Scr_GetGenericField( ent->client, cf->type, cf->ofs );
+		Scr_GetClientField( ent->client, fieldnum & CLIENT_FIELD_INDEX_MASK );
 		return;
 	}
 
@@ -617,52 +560,49 @@ void Scr_GetEntityField( int entnum, unsigned int fieldnum ) {
 }
 
 void Scr_GetGenericField( void *base, int type, int ofs ) {
-	byte *slot;
 	unsigned short id;
-	gentity_t *ent;
+	float f;
 	vec3_t value;
 
-	slot = (byte *)base + ofs;
-
 	switch ( type ) {
-	case F_INT:
-		Scr_AddInt( *(int *)slot );
-		break;
-	case F_FLOAT:
-		Scr_AddFloat( *(float *)slot );
-		break;
-	case F_CSTRING:
-		Scr_AddString( (const char *)slot );
-		break;
 	case F_STRING:
-		id = *(unsigned short *)slot;
+		id = *(unsigned short *)( (byte *)base + ofs );
 		if ( id ) {
 			Scr_AddConstString( id );
 		}
 		break;
-	case F_VECTOR:
-		Scr_AddVector( (const float *)slot );
+	case F_CSTRING:
+		Scr_AddString( (const char *)( (byte *)base + ofs ) );
 		break;
-	case F_ENTITY:
-		ent = *(gentity_t **)slot;
-		if ( ent ) {
-			Scr_AddEntity( ent );
-		}
+	case F_VECTOR:
+		Scr_AddVector( (const float *)( (byte *)base + ofs ) );
+		break;
+	case F_INT:
+		Scr_AddInt( *(int *)( (byte *)base + ofs ) );
+		break;
+	case F_FLOAT:
+		f = *(float *)( (byte *)base + ofs );
+		Scr_AddFloat( f );
 		break;
 	case F_VECTOR_Y:
 		value[0] = 0;
-		value[1] = *(float *)slot;
+		value[1] = *(float *)( (byte *)base + ofs );
 		value[2] = 0;
 		Scr_AddVector( value );
 		break;
+	case F_ENTITY:
+		if ( *(gentity_t **)( (byte *)base + ofs ) ) {
+			Scr_AddEntity( *(gentity_t **)( (byte *)base + ofs ) );
+		}
+		break;
 	case F_OBJECT:
-		id = *(unsigned short *)slot;
+		id = *(unsigned short *)( (byte *)base + ofs );
 		if ( id ) {
 			Scr_AddObject( id );
 		}
 		break;
 	case F_MODEL:
-		Scr_AddString( G_ModelName( *slot ) );
+		Scr_AddString( G_ModelName( *( (byte *)base + ofs ) ) );
 		break;
 	default:
 		break;
@@ -670,15 +610,18 @@ void Scr_GetGenericField( void *base, int type, int ofs ) {
 }
 
 void Scr_GetObjectField( int classnum, int objectNum, int fieldnum ) {
-	if ( classnum == SCR_OBJECT_ENTITY ) {
+	switch ( classnum ) {
+	case SCR_CLASS_ENTITY:
 		Scr_GetEntityField( objectNum, fieldnum );
-	} else if ( classnum == SCR_OBJECT_HUDELEM ) {
+		break;
+	case SCR_CLASS_HUDELEM:
 		Scr_GetHudElemField( objectNum, fieldnum );
+		break;
 	}
 }
 
 void Scr_FreeEntityConstStrings( gentity_t *ent ) {
-	field_t *f;
+	const field_t *f;
 	int i;
 
 	for ( f = fields ; f->name ; f++ ) {
@@ -695,11 +638,11 @@ void Scr_FreeEntityConstStrings( gentity_t *ent ) {
 
 void Scr_FreeEntity( gentity_t *ent ) {
 	Scr_FreeEntityConstStrings( ent );
-	Scr_FreeEntityNum( ent->s.number, SCR_OBJECT_ENTITY );
+	Scr_FreeEntityNum( ent->s.number, SCR_CLASS_ENTITY );
 }
 
 void Scr_AddEntity( gentity_t *ent ) {
-	Scr_AddEntityNum( ent->s.number, SCR_OBJECT_ENTITY );
+	Scr_AddEntityNum( ent->s.number, SCR_CLASS_ENTITY );
 }
 
 gentity_t *Scr_GetEntity( unsigned int num ) {
@@ -707,7 +650,7 @@ gentity_t *Scr_GetEntity( unsigned int num ) {
 	int classnum;
 
 	entnum = Scr_GetEntityNum( num, &classnum );
-	if ( classnum == SCR_OBJECT_ENTITY && entnum < MAX_GENTITIES ) {
+	if ( classnum == SCR_CLASS_ENTITY && entnum < MAX_GENTITIES ) {
 		return &g_entities[entnum];
 	}
 
@@ -717,11 +660,11 @@ gentity_t *Scr_GetEntity( unsigned int num ) {
 
 void Scr_FreeHudElem( g_hudelem_t *elem ) {
 	Scr_FreeHudElemConstStrings( elem );
-	Scr_FreeEntityNum( elem - g_hudelems, SCR_OBJECT_HUDELEM );
+	Scr_FreeEntityNum( elem - g_hudelems, SCR_CLASS_HUDELEM );
 }
 
 void Scr_AddHudElem( g_hudelem_t *elem ) {
-	Scr_AddEntityNum( elem - g_hudelems, SCR_OBJECT_HUDELEM );
+	Scr_AddEntityNum( elem - g_hudelems, SCR_CLASS_HUDELEM );
 }
 
 g_hudelem_t *Scr_GetHudElem( unsigned int num ) {
@@ -729,8 +672,8 @@ g_hudelem_t *Scr_GetHudElem( unsigned int num ) {
 	int classnum;
 
 	elemnum = Scr_GetEntityNum( num, &classnum );
-	/* the same 1024 bound the entity path uses */
-	if ( classnum == SCR_OBJECT_HUDELEM && elemnum < MAX_GENTITIES ) {
+	// hudelems share the entity bound
+	if ( classnum == SCR_CLASS_HUDELEM && elemnum < MAX_GENTITIES ) {
 		return &g_hudelems[elemnum];
 	}
 
@@ -739,26 +682,33 @@ g_hudelem_t *Scr_GetHudElem( unsigned int num ) {
 }
 
 unsigned short Scr_ExecEntThread( gentity_t *ent, int handle, unsigned int paramcount ) {
-	return Scr_ExecEntThreadNum( ent->s.number, SCR_OBJECT_ENTITY, handle, paramcount );
+	int entnum;
+
+	entnum = ent->s.number;     // keep: matches original codegen
+	return Scr_ExecEntThreadNum( entnum, SCR_CLASS_ENTITY, handle, paramcount );
 }
 
 void Scr_AddExecEntThread( gentity_t *ent, int handle, unsigned int paramcount ) {
-	Scr_AddExecEntThreadNum( ent->s.number, SCR_OBJECT_ENTITY, handle, paramcount );
+	Scr_AddExecEntThreadNum( ent->s.number, SCR_CLASS_ENTITY, handle, paramcount );
 }
 
 void Scr_Notify( gentity_t *ent, unsigned short event, unsigned int paramcount ) {
-	Scr_NotifyNum( ent->s.number, SCR_OBJECT_ENTITY, event, paramcount );
+	Scr_NotifyNum( ent->s.number, SCR_CLASS_ENTITY, event, paramcount );
 }
 
 /*
- * getent( <value>, <key> ) -- the one entity whose string field <key> is
- * <value>.  Only F_STRING fields can be searched.
- */
-void Scr_getent( void ) {
+===============
+Scr_GetEnt
+
+getent( <value>, <key> ): the one entity whose string field <key> is
+<value>.  Only F_STRING fields can be searched.
+===============
+*/
+void Scr_GetEnt( void ) {
 	unsigned short name;
 	const char *key;
 	int fieldnum;
-	field_t *f;
+	const field_t *f;
 	gentity_t *ent, *found;
 	int i;
 
@@ -798,14 +748,18 @@ void Scr_getent( void ) {
 }
 
 /*
- * getentarray() -- every entity in use; getentarray( <value>, <key> ) -- every
- * entity whose string field <key> is <value>.
- */
+===============
+Scr_GetEntArray
+
+getentarray(): every entity in use.
+getentarray( <value>, <key> ): every entity whose string field <key> is <value>.
+===============
+*/
 void Scr_GetEntArray( void ) {
 	unsigned short name;
 	const char *key;
 	int fieldnum;
-	field_t *f;
+	const field_t *f;
 	gentity_t *ent;
 	int i;
 
@@ -850,13 +804,26 @@ void Scr_GetEntArray( void ) {
 }
 
 void GScr_SetDynamicEntityField( gentity_t *ent, int fieldnum ) {
-	Scr_SetDynamicEntityField( ent->s.number, SCR_OBJECT_ENTITY, fieldnum );
+	Scr_SetDynamicEntityField( ent->s.number, SCR_CLASS_ENTITY, fieldnum );
 }
 
+/*
+===================
+G_SpawnGEntityFromSpawnVars
+
+Spawn an entity and fill in all of the level fields from
+level.spawnVars[], then call the class specfic spawn function
+===================
+*/
 void G_SpawnGEntityFromSpawnVars( void ) {
 	G_CallSpawn();
 }
 
+/*
+====================
+G_AddSpawnVarToken
+====================
+*/
 static char *G_AddSpawnVarToken( const char *string ) {
 	int l;
 	char *dest;
@@ -875,9 +842,15 @@ static char *G_AddSpawnVarToken( const char *string ) {
 }
 
 /*
- * Parses a brace bounded set of key / value pairs out of the entity string
- * into level.spawnVars[].
- */
+====================
+G_ParseSpawnVars
+
+Parses a brace bounded set of key / value pairs out of the
+level's entity strings into level.spawnVars[]
+
+This does not actually spawn an entity.
+====================
+*/
 qboolean G_ParseSpawnVars( void ) {
 	char keyname[MAX_TOKEN_CHARS];
 	char com_token[MAX_TOKEN_CHARS];
@@ -885,18 +858,18 @@ qboolean G_ParseSpawnVars( void ) {
 	level.numSpawnVars = 0;
 	level.numSpawnVarChars = 0;
 
-	/* parse the opening brace */
+	// parse the opening brace
 	if ( !trap_GetEntityToken( com_token, sizeof( com_token ) ) ) {
-		/* end of spawn string */
+		// end of spawn string
 		return qfalse;
 	}
 	if ( com_token[0] != '{' ) {
 		G_Error( "G_ParseSpawnVars: found %s when expecting {", com_token );
 	}
 
-	/* go through all the key / value pairs */
+	// go through all the key / value pairs
 	while ( 1 ) {
-		/* parse key */
+		// parse key
 		if ( !trap_GetEntityToken( keyname, sizeof( keyname ) ) ) {
 			G_Error( "G_ParseSpawnVars: EOF without closing brace" );
 		}
@@ -905,7 +878,7 @@ qboolean G_ParseSpawnVars( void ) {
 			break;
 		}
 
-		/* parse value */
+		// parse value
 		if ( !trap_GetEntityToken( com_token, sizeof( com_token ) ) ) {
 			G_Error( "G_ParseSpawnVars: EOF without closing brace" );
 		}
@@ -924,10 +897,14 @@ qboolean G_ParseSpawnVars( void ) {
 	return qtrue;
 }
 
-/*
- * Every map should have exactly one worldspawn.  It is not an entity the game
- * runs, but it carries the level-wide configstrings and cvars.
- */
+/*QUAKED worldspawn (0 0 0) ?
+
+Every map should have exactly one worldspawn.
+"ambienttrack"  Music track
+"gravity"   800 is default gravity
+"message" Text to print during connection process
+"northyaw"  Direction of north for the compass
+*/
 void SP_worldspawn( void ) {
 	char *s;
 
@@ -936,7 +913,7 @@ void SP_worldspawn( void ) {
 		G_Error( "SP_worldspawn: The first entity isn't 'worldspawn'" );
 	}
 
-	/* make some data visible to connecting client */
+	// make some data visible to connecting client
 	trap_SetConfigstring( CS_GAME_VERSION, GAME_VERSION );
 
 	trap_SetConfigstring( CS_LEVEL_START_TIME, va( "%i", level.startTime ) );
@@ -949,9 +926,9 @@ void SP_worldspawn( void ) {
 	}
 
 	G_SpawnString( "message", "", &s );
-	trap_SetConfigstring( CS_MESSAGE, s );              /* map specific message */
+	trap_SetConfigstring( CS_MESSAGE, s );              // map specific message
 
-	trap_SetConfigstring( CS_MOTD, g_motd.string );     /* message of the day */
+	trap_SetConfigstring( CS_MOTD, g_motd.string );     // message of the day
 
 	G_SpawnString( "gravity", "800", &s );
 	trap_Cvar_Set( "g_gravity", s );
@@ -965,7 +942,7 @@ void SP_worldspawn( void ) {
 
 	G_SpawnString( "spawnflags", "0", &s );
 	g_entities[ENTITYNUM_WORLD].spawnflags = atoi( s );
-	*(int *)g_entities[ENTITYNUM_WORLD].unknown_0x154 = g_entities[ENTITYNUM_WORLD].spawnflags;
+	g_entities[ENTITYNUM_WORLD].worldflags = g_entities[ENTITYNUM_WORLD].spawnflags;
 
 	g_entities[ENTITYNUM_WORLD].s.number = ENTITYNUM_WORLD;
 	Scr_SetString( &g_entities[ENTITYNUM_WORLD].classname, scr_const.worldspawn );
@@ -973,25 +950,29 @@ void SP_worldspawn( void ) {
 }
 
 /*
- * Parses textual entity definitions out of an entstring and spawns gentities.
- */
+==============
+G_SpawnEntitiesFromString
+
+Parses textual entity definitions out of an entstring and spawns gentities.
+==============
+*/
 void G_SpawnEntitiesFromString( void ) {
-	/* allow calls to G_Spawn*() */
+	// allow calls to G_Spawn*()
 	level.spawningMapEntities = qtrue;
 	level.numSpawnVars = 0;
 
-	/* the worldspawn is not an actual entity, but it still
-	   has a "spawn" function to perform any global setup
-	   needed by a level (setting configstrings or cvars, etc) */
+	// the worldspawn is not an actual entity, but it still
+	// has a "spawn" function to perform any global setup
+	// needed by a level (setting configstrings or cvars, etc)
 	if ( !G_ParseSpawnVars() ) {
 		G_Error( "SpawnEntities: no entities" );
 	}
 	SP_worldspawn();
 
-	/* parse ents */
+	// parse ents
 	while ( G_ParseSpawnVars() ) {
 		G_CallSpawn();
 	}
 
-	level.spawningMapEntities = qfalse;         /* any future calls to G_Spawn*() will be errors */
+	level.spawningMapEntities = qfalse;         // any future calls to G_Spawn*() will be errors
 }

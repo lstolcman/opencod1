@@ -11,7 +11,7 @@
 
 #include "qcommon.h"
 
-extern int (*Material_RegisterHandle)();   /* 0x01432874, indirect call target */
+#include "../client_mp/cl_refapi.h"   /* re_RegisterShaderNoMip */
 
 #define MAX_STATMONITOR_ENTRIES 64
 
@@ -24,14 +24,14 @@ void StatMon_Warning( int type, int duration, const char *materialName ) {
 		return;
 	}
 
-	if ( type < 0 || type >= MAX_STATMONITOR_ENTRIES ) {
+	if ( type < 0 || (unsigned)type >= MAX_STATMONITOR_ENTRIES ) {
 		Com_Error( ERR_DROP, "\x15" "StatMon_UpdateEntry: invalid entry '%i'\n", type );
 	}
 
 	stats[type].endtime = Sys_Milliseconds() + duration;
 
 	if ( !stats[type].material && cls_rendererStarted ) {
-		stats[type].material = Material_RegisterHandle( materialName, 1 );
+		stats[type].material = re_RegisterShaderNoMip( materialName, 1 );
 	}
 
 	if ( type >= statCount ) {

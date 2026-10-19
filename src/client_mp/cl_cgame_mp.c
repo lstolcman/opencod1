@@ -4,8 +4,8 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
 #include "cl_records.h"
+#include "cl_local.h"
 #include "../botlib/l_script.h"
 #include <string.h>
 #include "cl_refapi.h"
@@ -13,68 +13,21 @@
 #include "cl_conwindows.h"
 #include "../universal/com_sndalias.h"
 
-extern int (*Material_RegisterHandle)();   /* 0x01432874, indirect call target */
-extern int (*cgame_RestoreExportTable)();   /* 0x014328C0, indirect call target */
-extern int (*cgame_SaveExportTable)();   /* 0x014328BC, indirect call target */
-extern int (*dword_1432868)();   /* 0x01432868, indirect call target */
-extern int (*dword_143286C)();   /* 0x0143286C, indirect call target */
-extern int (*dword_1432878)();   /* 0x01432878, indirect call target */
-extern int (*dword_1432880)();   /* 0x01432880, indirect call target */
-extern int (*dword_1432888)();   /* 0x01432888, indirect call target */
-extern int (*dword_14328A0)();   /* 0x014328A0, indirect call target */
-extern int (*dword_14328A4)();   /* 0x014328A4, indirect call target */
-extern int (*dword_14328A8)();   /* 0x014328A8, indirect call target */
-extern int (*dword_14328AC)();   /* 0x014328AC, indirect call target */
-extern int (*dword_14328B4)();   /* 0x014328B4, indirect call target */
-extern int (*dword_14328B8)();   /* 0x014328B8, indirect call target */
-extern int (*dword_14328C4)();   /* 0x014328C4, indirect call target */
-extern int (*dword_14328C8)();   /* 0x014328C8, indirect call target */
-extern int (*dword_14328D4)();   /* 0x014328D4, indirect call target */
-extern int (*dword_14328D8)();   /* 0x014328D8, indirect call target */
-extern int (*dword_14328DC)();   /* 0x014328DC, indirect call target */
-extern int (*dword_14328F4)();   /* 0x014328F4, indirect call target */
-extern int (*dword_14328F8)();   /* 0x014328F8, indirect call target */
-extern int (*dword_14328FC)();   /* 0x014328FC, indirect call target */
-extern int (*dword_1432900)();   /* 0x01432900, indirect call target */
-extern int (*dword_1432904)();   /* 0x01432904, indirect call target */
-extern int (*dword_1432908)();   /* 0x01432908, indirect call target */
-extern int (*dword_143290C)();   /* 0x0143290C, indirect call target */
-extern int (*dword_143292C)();   /* 0x0143292C, indirect call target */
-extern int (*dword_1432930)();   /* 0x01432930, indirect call target */
-extern int (*dword_1432934)();   /* 0x01432934, indirect call target */
-extern int (*dword_1432940)();   /* 0x01432940, indirect call target */
-extern int (*re_DrawStretchPic)();   /* 0x014328D0, indirect call target */
-extern int (*re_RegisterShader)();   /* 0x01432870, indirect call target */
-extern int (*re_SetColor)();   /* 0x014328CC, indirect call target */
 
 vm_t    *cgvm = NULL;               /* retail 0x01617348 */
 
-/* 0x015CA590, 160 bytes. Storage is cl_refstorage.c. TODO: cod1_globals.h declares it `char *` (132 bytes); a glconfig_t declaration there is a C2371. */
-extern glconfig_t cls_glconfig;
-
-/* 0x01432898. Indirect call target -- the cgame DLL entry point. */
-extern int (*cgvm_dllEntry)();
+/* 0x015CA590, 160 bytes: cls.glconfig (cls is defined in cl_main_mp.c). */
 
 extern signed __int32 cl_serverTime;   /* 0x01434A64, 4 bytes */
-extern int clc_clientNum;   /* 0x015CE860, 12 bytes */
 extern signed __int32 sys_sysMBValue;   /* 0x008E3B40, 4 bytes */
-extern int clc_serverMessageSequence;   /* 0x015DE99C, 4 bytes */
 extern int theFxHelper;   /* 0x01407508, 21788 bytes */
-extern unsigned int dword_14075A0[5409];   /* 0x014075A0, 21636 bytes */
-extern void *dword_1432894;   /* 0x01432894, 4 bytes */
-extern int dword_143A980;   /* 0x0143A980, 8 bytes */
-extern int dword_143A984;   /* 0x0143A984, 4 bytes */
+extern unsigned int theFxScheduler[5409];   /* 0x014075A0, 21636 bytes */
+extern int cgameMaxPitchSpeedStorage;   /* 0x0143A980, 8 bytes */
+extern int cgameMaxYawSpeedStorage;   /* 0x0143A984, 4 bytes */
 extern int hunk_lowTempMark;   /* 0x008931C0, 4 bytes */
 extern int scrMemTree_allocBuckets;   /* 0x008E6310, script/scr_memorytree.cpp:81 */
-#define dword_8E6310            ( (char *)&scrMemTree_allocBuckets )
-extern int cls_keyCatchers;   /* 0x0155F2C4, 4 bytes */
-extern signed __int32 cls_state;   /* 0x0155F2C0, 4 bytes */
 extern int cmd_argc;   /* 0x008930F0, 172 bytes */
-extern int con_prevChannel;   /* 0x0142EF50, 4 bytes */
-extern void *dword_143287C;   /* 0x0143287C, 28 bytes */
-extern void *dword_143289C;   /* 0x0143289C, 32 bytes */
-extern void *dword_14328F0;   /* 0x014328F0, 84 bytes */
-extern signed __int32 cm_numSubModels;   /* 0x01617520, 4 bytes */
+extern int CM_NumInlineModels( void );   /* qcommon/cm_load.c, reads cm.numSubModels */
 extern int com_hunkMeminfoRunningTotal;   /* 0x0163A204, 4 bytes */
 extern int hunk_totalSize;   /* 0x0089319C, 4 bytes */
 extern int hunk_highTemp;   /* 0x008931B0, 4 bytes */
@@ -82,19 +35,15 @@ extern void *scrAnimPub_trees[258];   /* 0x008E5AD8, 1032 bytes */
 extern int xanim_numDeferredNotifies;   /* 0x00A9C638, 24 bytes */
 extern int xanim_activePoolSlot;   /* 0x00A9CC58, 4 bytes */
 extern unsigned char xanim_deferredNotifies[1536];   /* 0x00A9C650, 1536 bytes */
-extern const char Source[4];   /* 0x005682F8, 4 bytes */
-extern char byte_57C910[8192];   /* 0x0057C910, 8192 bytes */
+char cl_bigConfigString[8192];   /* 0x0057C910, 8192 bytes */
 extern cvar_t *cl_noprint;   /* 0x0161731C, 4 bytes */
 extern int con_boldgamemessagetime;   /* 0x0140EF2C, 4 bytes */
-extern signed __int32 con_current;   /* 0x0142EF44, 4 bytes */
-extern signed __int32 con_display;   /* 0x0142EF48, 4 bytes */
 extern int con_gamemessagetime;   /* 0x0140EF30, 16 bytes */
-extern int con_initialized;   /* 0x0140EF40, 4 bytes */
-extern signed __int32 con_linewidth;   /* 0x0142EF54, 4 bytes */
-extern __int16 con_text[65536];   /* 0x0140EF44, 131072 bytes */
-extern int con_totallines;   /* 0x0142EF58, 8 bytes */
 extern int hunk_temp_permanent;   /* 0x008931C4, 4 bytes */
 extern int hunk_temp_temp;   /* 0x008931C8, 8 bytes */
+extern int hunk_low_permanent;   /* 0x008931C4, the counter (com_memory_core.c) */
+extern int hunk_low_temp;   /* 0x008931C8, the counter (com_memory_core.c) */
+extern int Hunk_MemoryRemaining( void );   /* com_memory.c; case 89 */
 extern float cgameClientLerpOrigin_x;   /* 0x0143A988, 4 bytes */
 extern float cgameClientLerpOrigin_y;   /* 0x0143A98C, 4 bytes */
 extern float cgameClientLerpOrigin_z;   /* 0x0143A990, 4 bytes */
@@ -104,13 +53,9 @@ extern int cgameUserAim_z;   /* 0x0143A99C, 1556 bytes */
 extern signed __int32 cgameUserCmdInShellshock;   /* 0x0143A978, 4 bytes */
 extern int cl_gameState_stringOffsets[1];   /* 0x01434A7C, 4 bytes */
 extern cvar_t *cl_showServerCommands;   /* 0x0143294C, 8 bytes */
-extern int clc_demoplaying;   /* 0x015EF004, 4 bytes */
-extern int clc_serverCommandSequence;   /* 0x015DE9A0, 8 bytes */
-extern char clc_serverCommands[65536];   /* 0x015DE9A8, 65536 bytes */
-extern int clc_lastExecutedServerCommand;   /* 0x015DE9A4, 4 bytes */
 
-extern unsigned char byte_14B9134[491520];   /* 0x014B9134, 491520 bytes */
-extern unsigned char byte_1531134[188676];   /* 0x01531134, 188676 bytes */
+extern unsigned char cl_parseEntitiesStorage[491520];   /* 0x014B9134, 491520 bytes */
+extern unsigned char cl_parseClientsStorage[188676];   /* 0x01531134, 188676 bytes */
 extern float cgameSensitivity;   /* 0x0143A97C, 12 bytes */
 extern signed __int32 cgameUserCmdValue;   /* 0x0143A974, 4 bytes */
 extern int cl_cmdNumber;   /* 0x0143AFB0, 388 bytes */
@@ -119,7 +64,7 @@ extern int cl_parseEntitiesNum;   /* 0x0143A940, 4 bytes */
 extern char cl_snap_messageNum[4];   /* 0x01432970, 4 bytes */
 extern int cl_snap_serverTime;   /* 0x0143296C, 4 bytes */
 extern int cl_snapshots[67584];   /* 0x0143B134, 270336 bytes */
-extern unsigned char stru_143A9B0[1536];   /* 0x0143A9B0, 1536 bytes */
+extern unsigned char cl_cmdsStorage[1536];   /* 0x0143A9B0, 1536 bytes */
 
 extern int CIN_DrawCinematic();
 extern int CIN_PlayCinematic();
@@ -130,6 +75,9 @@ extern void CL_AddConsoleInfoColor( int base, const float *rgb );
 extern void CL_AddDeathMessageText( const char *txt, int color );
 
 extern int CL_AddReliableCommand();
+void CL_DeathMessagePrint( const char *attacker, int channel, const float *attackerColor,
+                           const char *victim, const float *victimColor, const char *iconName,
+                           float iconWidth, float iconHeight, const float *iconColor, int duration );
 extern int CL_ConsolePrint_AddLine( byte *txt, int channel, int duration,
                                     int width, int color );
 extern int CL_GetServerIPAddress();
@@ -158,12 +106,11 @@ extern int *Com_FindSoundAlias( const char *name, int source );
 extern void Com_FreeWeaponInfoMemory( int owner, int iSource );
 extern void *Com_GetSoundAlias( int source, int index );
 extern void *Com_GetWeaponInfoMemory( int size, int *pPrevOwner, int owner );
-extern int Com_InitDObj();
 qboolean Com_LoadCvarsFromBuffer( const char **cvarNames, int cvarCount,
                                   char *text, const char *filename );
 qboolean Com_SaveCvarsToBuffer( const char **cvarNames, int cvarCount,
                                 char *buffer, int bufferSize );
-extern int Com_LoadSoundAliasFile( const char *csvPath, const char *sourceName,
+extern int Com_LoadSoundAliasFile( const char *sourceName, const char *csvPath,
                                    int count, int source );
 extern int Com_LoadSoundAliasSounds();
 extern void Com_MakeSoundAliasesPermanent( int count, int source );
@@ -181,19 +128,21 @@ extern void Con_DrawMiniConsole( int yStart, int charset, float alpha );
 extern void Con_DrawNotify( int charset, float alpha, int orientation, int yStart );
 extern void Con_DrawSay( int y );
 extern void Con_DrawSubtitles( int charset, float alpha, int orientation, int yStart );
-extern void Con_Linefeed( int duration, int channel );
+extern void Con_Linefeed( int channel, int duration );
 /* Retail takes no arguments (call at 0x00401DAD). */
 extern void Con_OneTimeInit( void );
 extern void DObjCalcAnim( int dobj, int partBits );
 extern void DObjCalcSkel( int partBits, int dobj );
-extern int DObjCreate();
+/* xanim/dobj.cpp 0x00481EA0 */
+void DObjCreate( const void *models, unsigned short modelCount, void *tree,
+                 void *dobj, unsigned short scrNotifyId );
 extern int DObjDumpInfo();
 extern int DObjFree();
 extern int FS_ListFilteredFiles();
 extern int Hunk_AllocAlignInternal();
 extern int Hunk_AllocLowAlignInternal();
 extern int Hunk_AllocXAnimPrecache();
-extern int Key_GetBindingBuf();
+extern void Key_GetBindingBuf( int keynum, char *buf, int buflen );
 extern int Key_GetKey( const char *binding );
 extern int Key_IsDown( int keynum );
 extern void Key_KeynumToStringBuf( int keynum, char *buf, int buflen );
@@ -201,8 +150,8 @@ extern void Key_SetBinding( int keynum, const char *binding );
 extern int Key_SetCatcher();
 extern int MSS_FadeAllSounds();
 extern int MSS_FadeSelectSounds();
-extern int MSS_GetSoundOverlay( int *cpuOut, int maxCount, void *buffer, int which );
-extern int MSS_PlayAmbientAlias();
+extern int MSS_GetSoundOverlay( int which, void *buffer, int maxCount, int *cpuOut );
+extern void MSS_PlayAmbientAlias();
 extern int MSS_PlayBlendedSoundAliases();
 extern int MSS_PlayMusicAlias();
 extern int MSS_PlaySoundAlias();
@@ -210,7 +159,7 @@ extern int MSS_SetEnvironmentEffects( const char *roomType, float wetTarget, int
 extern int MSS_SetListener();
 extern int MSS_StopBackground();
 extern int MSS_StopSounds();
-extern int MSS_UpdateLoopingSounds();
+extern void MSS_UpdateLoopingSounds();
 extern float Q_acos( float c );
 extern int SCR_UpdateScreen();
 extern int SEH_PrintStrlen();
@@ -219,10 +168,10 @@ extern char *SEH_SafeTranslateString( const char *key );
 extern int SEH_StringEd_GetString();
 extern int Scr_NearHook();
 extern int Sys_SnapVector();
-extern int XAnimLoadFileData_m();
+/* xanim/dobj.cpp 0x00483F80 */
+void XAnimSetLeafNode( const char *animName, void *tree, unsigned short index );
 extern int XAnimPrecacheAnimTree_m();
 extern int XModelExists();
-extern int j__atol( const char *s );
 extern int FastRound( float f );
 extern int DObjGetHierarchyBits();
 extern int DObjBuildPartCollisionTable();
@@ -230,53 +179,58 @@ int DObjMarkRotTransIndex( void *dobj, const unsigned char *partBits, int boneIn
 int DObjMarkControlRotTransIndex( void *dobj, const unsigned char *partBits, int boneIndex );
 extern int DObjGetBoneIndex();
 extern int DObjGetBoneName();
-extern int XAnimSetParentNode();
+/* xanim/dobj.cpp 0x00483FC0 */
+unsigned short *XAnimSetParentNode( unsigned short childCount, unsigned short flags, void *tree,
+                                    unsigned short index, int unused,
+                                    unsigned short firstChildIndex );
 extern int XAnimAllocTree();
 extern int XAnimAllocRuntimeTree();
-extern double XAnimGetTime( int nodeIndex, void *tree );
-extern double XAnimGetWeight( int nodeIndex, void *tree );
+extern float XAnimGetTime( void *tree, int nodeIndex );
+extern float XAnimGetWeight( void *tree, int nodeIndex );
 extern int XAnimHasTime();
-extern int XAnimGetAnimName();
+extern const char *XAnimGetAnimName( const void *sourceTree, int nodeIndex );
 void DObjUpdateClientInfo_m( void *dobj, float dtime );
 extern int DObjDisplayAnim();
 extern int XAnimGetRelDelta_m();
 extern int XAnimGetAbsDelta_m();
-extern int XAnimGetRelDeltaForTime_m( int a1, int a2, void *a3, float *a4, float a5, float a6 );
-extern int XAnimGetAbsDeltaForTime_m( int a1, int a2, float *a3, void *a4, float a5 );
+extern int XAnimGetRelDeltaForTime_m( int sourceTree, int node, void *posDelta, float *dirDelta, float time0, float time1 );
+extern void XAnimGetAbsDeltaForTime_m( const void *sourceTree, int node, float *posDelta, float *dirDelta, float time );
 extern int XAnimClearAnimNode_m( void *tree, int node, float blend );
 extern int XAnimClearAnim_m( int node, void *tree, float blend );
 void XAnimClearAnimChildSubtrees_m( void *tree, int nodeIndex, float blendTime );
-extern int XAnimSetAnimKnob_m( void *a1, int a2, float a3, int a4, float a5,
-					   short a6, int a7, int a8 );
-extern int XAnimSetAnimKnobAll_m( int a1, void *a2, int a3, float a4, int a5, float a6,
-					   short a7, int a8, int a9 );
-extern void XAnimClearAnimChildren_m( int *a1, int nodeIndex, float weight );
-extern int XAnimSetTime_m();
-extern int XAnimSetAnimInternalLimited_m( int a1, short a2, int a3, int a4, float a5, int a6,
-					   float a7, int a8 );
-extern int XAnimSetAnimRate_m( int a1, int a2, float a3 );
-extern int XAnimIsLooped_m();
-extern int XAnimSetAnimKnobInternal_m( short a1, void *a2, int a3, float a4, int a5, float a6,
-					   int a7, int a8 );
+extern int XAnimSetAnimKnob_m( void *tree, int node, float weight, int blendTime, float rate,
+					   short notifyName, int notifyType, int animFlags );
+extern int XAnimSetAnimKnobAll_m( int node, void *tree, int stopNode, float weight, int blendTime, float rate,
+					   short notifyName, int notifyType, int animFlags );
+extern void XAnimClearAnimChildren_m( int *tree, int nodeIndex, float weight );
+extern void XAnimSetTime_m( void *tree, int node, float time );
+extern int XAnimSetAnimInternalLimited_m( int notifyType, short notifyName, int tree, int node, float weight, int blendTime,
+					   float rate, int animFlags );
+extern int XAnimSetAnimRate_m( int tree, int node, float rate );
+extern int XAnimIsLooped_m(const void *source, int node);
+extern int XAnimSetAnimKnobInternal_m( void *tree, int node, float weight, float blendTime, float rate,
+					   short notifyName, int notifyType, int animFlags );
 extern int XAnimCopyTree();
-extern int CFxScheduler__RegisterEffect();
-extern int CFxScheduler__PlayEffect_id_simple_m();
-extern int CFxScheduler__PlayEffect_name_bolt_m();
-extern int CFxScheduler__PlayEffect_id_axis();
-extern int CFxScheduler__PlayEffect_name_simple_m();
-extern int CFxScheduler__PlayEffect_name_m();
-extern void CFxScheduler__AddScheduledEffects( _DWORD *self );
+extern int __cdecl FX_RegisterEffect( char *name );
+extern void __stdcall CFxScheduler__PlayEffect_id_simple_m( int effectId, float *origin, void *self );
+extern void __stdcall CFxScheduler__PlayEffect_name_bolt_m( char *name, void *self, float *origin, int *axis, int *bolt );
+extern void __stdcall CFxScheduler__PlayEffect_id_axis(void *self, int id, float *origin, void *axis, void *bolt);
+extern void __stdcall CFxScheduler__PlayEffect_name_simple_m( char *name, void *self, float *origin );
+extern void __stdcall CFxScheduler__PlayEffect_name_m( int *direction, char *name, void *self, float *origin );
+extern void CFxScheduler__AddScheduledEffects( unsigned int *self );
 extern int SFxHelper__AdjustTime();
-extern void SFxHelper__AdjustCamera( int self, int view, float zfar );
+extern void __stdcall SFxHelper__AdjustCamera( int self, int view, float zfar );
 extern int FX_Free();
 extern int FX_Init();
 extern int  __cdecl FX_GetBoneIndex( int entnum, const char *boneName );
 extern void __cdecl FX_PlayEffectID( int *axis, int effectID, float *origin );
-/* SE_GetString 0x004ABF00, stringed/stringed_strtable.c. */
+/* SE_GetString 0x004ABF00, stringed/stringed_unassigned.cpp. */
 extern char *SE_GetString( const char *key, int wantReference );
 
 static char cl_mapnameBsp[64];
 
+void CL_GetGameState( void *gs );
+void CL_GetGlconfig_cgame( glconfig_t *config );
 void CL_FirstSnapshot( void );
 void CL_AdjustTimeDelta( void );
 void CL_SetCGameTime( void );
@@ -293,8 +247,7 @@ qboolean CL_GetUserCmd( int cmdNumber, byte *ucmd )
 		return qfalse;
 	}
 
-	Com_Memcpy( ucmd, &stru_143A9B0[ UCMD_SIZE * ( cmdNumber & CMD_MASK ) ],
-	            UCMD_SIZE );
+	*(usercmd_t *)ucmd = ( (usercmd_t *)cl_cmdsStorage )[ cmdNumber & CMD_MASK ];
 
 	return qtrue;
 }
@@ -305,17 +258,28 @@ int __cdecl CL_GetCurrentCmdNumber()
   return cl_cmdNumber;
 }
 
+/*
+ * Typed views over the client-active blobs.  The byte-array storage stays
+ * the storage of record (as do the SNAP_, ES_ and CS_ offset macros); these
+ * casts only put a cl_local.h C type over the same memory so the marshalling
+ * code can say clSnap->numEntities instead of *(int *)(clSnap + SNAP_NUMENTITIES).
+ * Duplicated file-locally with cl_parse_mp.c (separate translation units).
+ */
+#define cl_parseEntities    ( (entityState_t *)cl_parseEntitiesStorage )  /* cl.parseEntities[2048]  (cl+0x867D4) */
+#define cl_parseClients     ( (clientState_t *)cl_parseClientsStorage )  /* cl.parseClients[2048]   (cl+0xFE7D4) */
+#define cl_snapshotRing     ( (clSnapshot_t  *)cl_snapshots )  /* cl.snapshots[32]        (cl+0x87D4)  */
+
 /* ---- CL_GetCurrentSnapshotNumber  0x00401100 ----  VERIFIED */
 void CL_GetCurrentSnapshotNumber( int *snapshotNumber, int *serverTime )
 {
-  *snapshotNumber = *(_DWORD *)cl_snap_messageNum;
+  *snapshotNumber = *(int *)cl_snap_messageNum;
   *serverTime = cl_snap_serverTime;
 }
 
 /* ---- CL_GetSnapshot  0x00401120 ----  VERIFIED */
-qboolean CL_GetSnapshot( int snapshotNumber, byte *snapshot )
+qboolean CL_GetSnapshot( int snapshotNumber, snapshot_t *snapshot )
 {
-	const byte *clSnap;
+	const clSnapshot_t *clSnap;
 	int   count;
 	int   i;
 
@@ -328,29 +292,27 @@ qboolean CL_GetSnapshot( int snapshotNumber, byte *snapshot )
 		return qfalse;
 	}
 
-	clSnap = (const byte *)cl_snapshots + SNAP_SIZE * ( snapshotNumber & 31 );
+	clSnap = &cl_snapshotRing[ snapshotNumber & 31 ];
 
-	if ( !*(const int *)( clSnap + SNAP_VALID ) ) {
+	if ( !clSnap->valid ) {
 		return qfalse;
 	}
 
-	if ( cl_parseEntitiesNum
-	     - *(const int *)( clSnap + SNAP_PARSEENTITIESNUM ) >= 0x800 ) {
+	if ( cl_parseEntitiesNum - clSnap->parseEntitiesNum >= 0x800 ) {
 		return qfalse;
 	}
-	if ( cl_parseClientsNum
-	     - *(const int *)( clSnap + SNAP_PARSECLIENTSNUM ) >= 0x800 ) {
+	if ( cl_parseClientsNum - clSnap->parseClientsNum >= 0x800 ) {
 		return qfalse;
 	}
 
-	*(int *)( snapshot + SNAP_OUT_SNAPFLAGS )   = *(const int *)( clSnap + SNAP_SNAPFLAGS );
-	*(int *)( snapshot + SNAP_OUT_CMDSEQUENCE ) = *(const int *)( clSnap + SNAP_SERVERCOMMANDNUM );
-	*(int *)( snapshot + SNAP_OUT_PING )        = *(const int *)( clSnap + SNAP_PING );
-	*(int *)( snapshot + SNAP_OUT_SERVERTIME )  = *(const int *)( clSnap + SNAP_SERVERTIME );
+	snapshot->snapFlags             = clSnap->snapFlags;
+	snapshot->serverCommandSequence = clSnap->serverCommandNum;
+	snapshot->ping                  = clSnap->ping;
+	snapshot->serverTime            = clSnap->serverTime;
 
-	Com_Memcpy( snapshot + SNAP_OUT_PS, clSnap + SNAP_PS, 0x834 * 4 );
+	memcpy( snapshot->ps, clSnap->ps, sizeof( snapshot->ps ) );
 
-	count = *(const int *)( clSnap + SNAP_NUMENTITIES );
+	count = clSnap->numEntities;
 	if ( count > MAX_ENTITIES_IN_SNAPSHOT ) {
 		if ( com_statmon->integer ) {
 			StatMon_Warning( 8, 3000, "gfx/2d/warning@snapshotents.jpg" );
@@ -360,26 +322,22 @@ qboolean CL_GetSnapshot( int snapshotNumber, byte *snapshot )
 		}
 		count = MAX_ENTITIES_IN_SNAPSHOT;
 	}
-	*(int *)( snapshot + SNAP_OUT_NUMENTITIES ) = count;
+	snapshot->numEntities = count;
 
 	for ( i = 0; i < count; i++ ) {
-		Com_Memcpy( snapshot + SNAP_OUT_ENTITIES + ES_SIZE * i,
-		            &byte_14B9134[ ES_SIZE *
-		                ( ( *(const int *)( clSnap + SNAP_PARSEENTITIESNUM ) + i ) & 0x7FF ) ],
-		            ES_SIZE );
+		snapshot->entities[i] =
+		    cl_parseEntities[ ( clSnap->parseEntitiesNum + i ) & 0x7FF ];
 	}
 
-	count = *(const int *)( clSnap + SNAP_NUMCLIENTS );
+	count = clSnap->numClients;
 	if ( count > MAX_CLIENTS_IN_SNAPSHOT ) {
 		count = MAX_CLIENTS_IN_SNAPSHOT;
 	}
-	*(int *)( snapshot + SNAP_OUT_NUMCLIENTS ) = count;
+	snapshot->numClients = count;
 
 	for ( i = 0; i < count; i++ ) {
-		Com_Memcpy( snapshot + SNAP_OUT_CLIENTS + CS_SIZE * i,
-		            &byte_1531134[ CS_SIZE *
-		                ( ( *(const int *)( clSnap + SNAP_PARSECLIENTSNUM ) + i ) & 0x7FF ) ],
-		            CS_SIZE );
+		snapshot->clients[i] =
+		    cl_parseClients[ ( clSnap->parseClientsNum + i ) & 0x7FF ];
 	}
 
 	return qtrue;
@@ -423,15 +381,15 @@ void __cdecl CL_AddCgameCommand(const char *cmdName)
 /* ---- CL_ConfigstringModified  0x00401330 ----  VERIFIED */
 void CL_ConfigstringModified( void )
 {
-	const char *old;
-	const char *s;
-	const char *dup;
+	const char  *old;
+	const char  *s;
+	const char  *dup;
 	int         index;
 	int         i;
 	int         len;
-	byte        oldGameState[GS_SIZE];
+	gameState_t oldGs;
 
-	index = j__atol( Cmd_Argv( 1 ) );
+	index = atoi( Cmd_Argv( 1 ) );
 	if ( index < 0 || index >= MAX_CONFIGSTRINGS ) {
 		Com_Error( ERR_DROP, "\x15" "configstring > MAX_CONFIGSTRINGS" );
 	}
@@ -443,8 +401,8 @@ void CL_ConfigstringModified( void )
 		return;
 	}
 
-	Com_Memcpy( oldGameState, cl_gameState_stringOffsets, GS_SIZE );
-	Com_Memset( cl_gameState_stringOffsets, 0, GS_SIZE );
+	oldGs = *(gameState_t *)cl_gameState_stringOffsets;
+	memset( cl_gameState_stringOffsets, 0, sizeof( gameState_t ) );
 
 	cl_gameState_dataCount = 1;
 
@@ -452,8 +410,7 @@ void CL_ConfigstringModified( void )
 		if ( i == index ) {
 			dup = s;
 		} else {
-			dup = (const char *)oldGameState + GS_STRINGDATA
-			    + ((const int *)oldGameState)[ i ];
+			dup = oldGs.stringData + oldGs.stringOffsets[ i ];
 		}
 
 		if ( !dup[0] ) {
@@ -467,8 +424,7 @@ void CL_ConfigstringModified( void )
 		}
 
 		cl_gameState_stringOffsets[ i ] = cl_gameState_dataCount;
-		Com_Memcpy( &cl_gameState_stringData[ cl_gameState_dataCount ],
-		            dup, len + 1 );
+		memcpy( &cl_gameState_stringData[ cl_gameState_dataCount ], dup, len + 1 );
 		cl_gameState_dataCount += len + 1;
 	}
 
@@ -517,6 +473,44 @@ rescan:
 
 	switch ( cmd[0] ) {
 
+	case 'w':
+		if ( Cmd_Argc() >= 2 ) {
+			Com_Error( ERR_SERVERDISCONNECT,
+			           va( SEH_SafeTranslateString( "EXE_SERVERDISCONNECTREASON" ),
+			               SEH_SafeTranslateString( Cmd_Argv( 1 ) ) ) );
+		} else {
+			Com_Error( ERR_SERVERDISCONNECT, "EXE_SERVER_DISCONNECTED" );
+		}
+		/* Com_Error does not return; retail falls through into 'x' */
+	case 'x':
+		Com_sprintf( cl_bigConfigString, 0x2000, "d %s \"%s",
+		             Cmd_Argv( 1 ), Cmd_Argv( 2 ) );
+		return qfalse;
+
+	case 'y':
+		Cmd_TokenizeString2( s, 3 );
+		arg = Cmd_Argv( 2 );
+		if ( strlen( cl_bigConfigString ) + strlen( arg ) >= 0x2000 ) {
+			Com_Error( ERR_DROP, "\x15" "bcs exceeded BIG_INFO_STRING" );
+		}
+		strcat( cl_bigConfigString, arg );
+		break;
+
+	case 'z':
+		Cmd_TokenizeString2( s, 3 );
+		arg = Cmd_Argv( 2 );
+		if ( strlen( cl_bigConfigString ) + strlen( arg ) + 1 >= 0x2000 ) {
+			Com_Error( ERR_DROP, "\x15" "bcs exceeded BIG_INFO_STRING" );
+		}
+		strcat( cl_bigConfigString, arg );
+		/* Retail 0x00401678 copies the word at 0x005682F8 (bytes 22 00, a
+		   lone double quote plus NUL) onto the end of the string, closing
+		   the quote opened by the 'x' case.  The tree's Source global is
+		   zero-filled, so the literal is used here. */
+		strcat( cl_bigConfigString, "\"" );
+		s = cl_bigConfigString;
+		goto rescan;
+
 	case 'd':
 		Cmd_TokenizeString2( s, 3 );
 		CL_ConfigstringModified();
@@ -526,48 +520,15 @@ rescan:
 	case 'n':
 		Con_ClearNotify();
 		Con_ClearSubtitles();
-		Com_Memset( stru_143A9B0, 0, UCMD_SIZE * CMD_BACKUP );
-		dword_14328C8();
+		memset( cl_cmdsStorage, 0, UCMD_SIZE * CMD_BACKUP );
+		re_ClearFlares();
 		return qtrue;
-
-	case 'w':
-		if ( Cmd_Argc() >= 2 ) {
-			Com_Error( ERR_SERVERDISCONNECT,
-			           va( SEH_SafeTranslateString( "EXE_SERVERDISCONNECTREASON" ),
-			               SEH_SafeTranslateString( Cmd_Argv( 1 ) ) ) );
-		} else {
-			Com_Error( ERR_SERVERDISCONNECT, "EXE_SERVER_DISCONNECTED" );
-		}
-		return qtrue;
-
-	case 'x':
-		Com_sprintf( byte_57C910, 0x2000, "d %s \"%s",
-		             Cmd_Argv( 1 ), Cmd_Argv( 2 ) );
-		return qfalse;
-
-	case 'y':
-		Cmd_TokenizeString2( s, 3 );
-		arg = Cmd_Argv( 2 );
-		if ( strlen( byte_57C910 ) + strlen( arg ) >= 0x2000 ) {
-			Com_Error( ERR_DROP, "\x15" "bcs exceeded BIG_INFO_STRING" );
-		}
-		strcat( byte_57C910, arg );
-		return qfalse;
-
-	case 'z':
-		Cmd_TokenizeString2( s, 3 );
-		arg = Cmd_Argv( 2 );
-		if ( strlen( byte_57C910 ) + strlen( arg ) + 1 >= 0x2000 ) {
-			Com_Error( ERR_DROP, "\x15" "bcs exceeded BIG_INFO_STRING" );
-		}
-		strcat( byte_57C910, arg );
-		strcat( byte_57C910, Source );      /* a lone quote, 0x005682F8 */
-		s = byte_57C910;
-		goto rescan;
 
 	default:
 		return qtrue;
 	}
+
+	return qfalse;
 }
 
 /* ---- CL_SetExpectedHunkUsage  0x00401840 ----  VERIFIED */
@@ -588,7 +549,7 @@ void CL_SetExpectedHunkUsage( const char *mapname ) {
 
 		buftrav = buf;
 		while ( ( token = Com_Parse( &buftrav ) ) != 0 && token[0] ) {
-			if ( !Q_stricmp( token, mapname ) ) {
+			if ( !Q_strcasecmp( token, (char *)mapname ) ) {
 				token = Com_Parse( &buftrav );
 				if ( token && token[0] ) {
 					Cvar_Set2( "com_expectedhunkusage", token, qtrue );
@@ -615,50 +576,13 @@ void CL_CM_LoadMap( const char *mapname ) {
 	CM_LoadMap( mapname, qtrue, &checksum );
 }
 
-#if 0
-void __cdecl CL_ShutdownCGame()
-{
-  int *v0;
-
-  cls_keyCatchers &= ~8u;
-  if ( cgvm )
-  {
-    VM_Call(cgvm, 1);
-    v0 = (int *)cgvm;
-    if ( *(_DWORD *)&cgvm->gap0[136] )
-    {
-      if ( !FreeLibrary(*(HMODULE *)&cgvm->gap0[136]) )
-        Com_Error(ERR_FATAL, "\x15Sys_UnloadDll FreeLibrary failed");
-    }
-    Com_Memset(v0, 0, 0x90u);
-    currentVM = 0;
-    cgvm = 0;
-    if ( snd_aliasLoaded_ui )
-    {
-      Com_UnloadSoundAliasSounds(1);
-      if ( Block )
-      {
-        if ( !snd_aliasList_uiOwned )
-          free(Block);
-        Block = 0;
-        dword_893DE8 = 0;
-        memset(&unk_8935D8, 0, 0x400u);
-      }
-      snd_aliasLoaded_ui = 0;
-      if ( !LOBYTE(snd_aliasLoaded[0]) )
-        Cmd_RemoveCommand("snd_list");
-    }
-  }
-}
-#endif
-
 /* ---- CL_DObjInvalidateSkels  0x00401B00 ----  VERIFIED */
 void CL_DObjInvalidateSkels( void )
 {
   if ( !++com_skelTimeStamp )
     com_skelTimeStamp = 1;
   if ( s_hunkData )
-    *(_DWORD *)hunk_temp_temp = *(_DWORD *)hunk_temp_permanent;
+    hunk_low_temp = hunk_low_permanent;   /* retail hunk_lowTemp = hunk_lowUsed, read directly */
 }
 
 /* ---- CL_DObjCalcAnim  0x00401B30 ----  VERIFIED */
@@ -668,10 +592,18 @@ void CL_DObjCalcAnim( int dobj, int partBits )
 }
 
 /* ---- FloatAsInt_0  0x00401B40 ----  [CONFIRMED] */
-int __cdecl FloatAsInt_0(int val)
-{
-  return val;
+int FloatAsInt_0( float f ) {
+	int temp;
+
+	*(float *)&temp = f;
+
+	return temp;
 }
+
+static qboolean CL_DObjSkelExists( int dobj, int timeStamp );
+
+/* xanim/dobj.cpp 0x00481720 */
+int DObjSkelIsBoneUpToDate( void *dobj, int boneIndex );
 
 /* ---- CL_DObjCreateSkelForBone  0x00401B50 ----  VERIFIED */
 qboolean CL_DObjCreateSkelForBone( int dobj, int boneIndex )
@@ -680,23 +612,12 @@ qboolean CL_DObjCreateSkelForBone( int dobj, int boneIndex )
   int  *p;
   int   i;
 
-  if ( *(_DWORD *)( dobj + 8 ) == com_skelTimeStamp )
-  {
-    skel = *(_DWORD *)( dobj + 4 );
-    if ( skel )
-      return ( ( ( (byte *)skel )[ 0x20 + ( boneIndex >> 3 ) ]
-                 & ( 1 << ( boneIndex & 7 ) ) ) != 0 );
-  }
-  else
-  {
-    *(_DWORD *)( dobj + 8 ) = com_skelTimeStamp;
-    *(_WORD *)( dobj + 16 ) = 0;
-    *(_DWORD *)( dobj + 4 ) = 0;
-  }
+  if ( CL_DObjSkelExists( dobj, com_skelTimeStamp ) )
+    return DObjSkelIsBoneUpToDate( (void *)dobj, boneIndex );
 
-  skel = (int)Hunk_AllocateTempMemoryInternal(
-                96 * *(unsigned __int8 *)( dobj + 23 ) + 48 );
-  *(_DWORD *)( dobj + 4 ) = skel;
+  i = 96 * *(unsigned __int8 *)( dobj + 23 ) + 48;
+  skel = (int)Hunk_AllocateTempMemoryInternal( i );
+  *(unsigned int *)( dobj + 4 ) = skel;
 
   /* three parallel four-word masks at +0x00, +0x10 and +0x20 */
   p = (int *)( skel + 32 );
@@ -710,40 +631,46 @@ qboolean CL_DObjCreateSkelForBone( int dobj, int boneIndex )
   return qfalse;
 }
 
+/* ---- CL_DObjSkelExists  no-address (inlined) ---- */
+static qboolean CL_DObjSkelExists( int dobj, int timeStamp )
+{
+  if ( *(unsigned int *)( dobj + 8 ) == timeStamp )
+    return *(unsigned int *)( dobj + 4 ) != 0;
+  *(unsigned int *)( dobj + 8 ) = timeStamp;
+  *(unsigned short *)( dobj + 16 ) = 0;
+  *(unsigned int *)( dobj + 4 ) = 0;
+  return qfalse;
+}
+
+/* ---- CL_DObjSkelAreBonesUpToDate  no-address ----
+ * retail tail-calls dobj.obj's copy (0x00481740, missing from xanim/dobj.cpp) */
+qboolean CL_DObjSkelAreBonesUpToDate( int dobj, const int *partBits )
+{
+  int   skel;
+  int   i;
+
+  skel = *(unsigned int *)( dobj + 4 );
+  for ( i = 0; i < 4; i++ )
+  {
+    if ( partBits[i] & ~( (const int *)( skel + 32 ) )[i] )
+      return qfalse;
+  }
+  return qtrue;
+}
+
 /* ---- CL_DObjCreateSkelForBones  0x00401BE0 ----  VERIFIED */
 qboolean CL_DObjCreateSkelForBones( int dobj, int partBits )
 {
-  const int *want;
-  const int *have;
   int   skel;
   int  *p;
   int   i;
 
-  if ( *(_DWORD *)( dobj + 8 ) == com_skelTimeStamp )
-  {
-    skel = *(_DWORD *)( dobj + 4 );
-    if ( skel )
-    {
-      want = (const int *)partBits;
-      have = (const int *)( skel + 32 );
-      for ( i = 0; i < 4; i++ )
-      {
-        if ( want[i] & ~have[i] )
-          return qfalse;
-      }
-      return qtrue;
-    }
-  }
-  else
-  {
-    *(_DWORD *)( dobj + 8 ) = com_skelTimeStamp;
-    *(_WORD *)( dobj + 16 ) = 0;
-    *(_DWORD *)( dobj + 4 ) = 0;
-  }
+  if ( CL_DObjSkelExists( dobj, com_skelTimeStamp ) )
+    return CL_DObjSkelAreBonesUpToDate( dobj, (const int *)partBits );
 
   skel = (int)Hunk_AllocateTempMemoryInternal(
                 96 * *(unsigned __int8 *)( dobj + 23 ) + 48 );
-  *(_DWORD *)( dobj + 4 ) = skel;
+  *(unsigned int *)( dobj + 4 ) = skel;
 
   p = (int *)( skel + 32 );
   for ( i = 4; i; i-- )
@@ -769,7 +696,7 @@ typedef struct {
 	int         b;
 } cl_surfacetype_t;
 
-extern cl_surfacetype_t dword_571790[24];
+extern cl_surfacetype_t cl_surfaceParmsByType[24];
 
 #define CL_SURFACETYPE_FIRST    1       /* table[1] == "bark" 0x005717A0 */
 #define CL_SURFACETYPE_LIMIT    23      /* table[23] == the bound 0x00571900 */
@@ -782,9 +709,10 @@ int CL_SurfaceTypeFromName( const char *name ) {
 		return 0;
 	}
 
-	for ( i = CL_SURFACETYPE_FIRST ; i < CL_SURFACETYPE_LIMIT ; i++ ) {
-		if ( !_stricmp( name, dword_571790[i].name ) ) {
-			return ( dword_571790[i].surfaceBits >> 20 ) & 0x1F;
+	/* 0-based index from table[1]: retail starts edi at 0 (0x00401C75) */
+	for ( i = 0 ; i < CL_SURFACETYPE_LIMIT - CL_SURFACETYPE_FIRST ; i++ ) {
+		if ( !_stricmp( name, cl_surfaceParmsByType[CL_SURFACETYPE_FIRST + i].name ) ) {
+			return ( cl_surfaceParmsByType[CL_SURFACETYPE_FIRST + i].surfaceBits >> 20 ) & 0x1F;
 		}
 	}
 
@@ -797,7 +725,7 @@ const char *CL_SurfaceTypeToName( int type ) {
 		return "default";
 	}
 
-	return dword_571790[type].name;
+	return cl_surfaceParmsByType[type].name;
 }
 
 /* ---- Hunk_AllocXAnimClientCreate  0x00401CE0 ----  [CONFIRMED] */
@@ -817,415 +745,155 @@ extern cvar_t *cl_languagewarnings;           /* 0x01617350 */
 extern cvar_t *cl_languagewarningsaserrors;   /* 0x01432844 */
 
 /* ---- CL_SubtitlePrint  0x00401D00 ----  VERIFIED */
-void CL_SubtitlePrint( const char *text, int duration, int channel ) {
-	byte    *out;
-	int     msec;
+void CL_SubtitlePrint( const char *text, int duration, int pixelWidth ) {
+	const char *out;
 
 	if ( cl_languagetranslate && cl_languagetranslate->integer
 		 && text[0] && text[1] ) {
-		out = (byte *)SE_GetString( text, 0 );
+		out = SE_GetString( text, 0 );
 	} else {
-		out = (byte *)text;
+		out = text;
 	}
 
 	if ( !out ) {
 		if ( cl_languagewarnings->integer ) {
 			if ( cl_languagewarningsaserrors->integer ) {
 				Com_Error( 7, "Could not translate subtitle text: \"%s\"", text );
+			} else {
+				Com_Printf( "^3WARNING: Could not translate subtitle text: \"%s\"\n",
+							text );
 			}
-			Com_Printf( "^3WARNING: Could not translate subtitle text: \"%s\"\n",
-						text );
-			out = (byte *)va( "^1UNLOCALIZED(^7%s^1)^7", text );
+			out = va( "^1UNLOCALIZED(^7%s^1)^7", text );
 		} else {
-			out = (byte *)text;
+			out = text;
 		}
 	}
 
-	if ( cl_noprint && cl_noprint->integer ) {
-		return;
-	}
-
-	if ( con_initialized == qfalse ) {
-		Con_OneTimeInit();
-	}
-
-	msec = duration;
-	if ( !duration ) {
-		msec = 5000;
-	} else if ( duration < 0 ) {
-		msec = 0;
-	}
-
-	CL_ConsolePrint_AddLine( out, 3, msec, channel, 7 );
+	CL_ConsolePrint( 3, out, duration, pixelWidth );
 }
 
 /* ---- CL_CgameSystemCalls  0x00401DF0 ----  VERIFIED */
-int __cdecl CL_CgameSystemCalls(int *args)
+int __cdecl CL_CgameSystemCalls( int *args )
 {
-  int v1;
-  int v2;
-  int v3;
-  int v4;
-  char *v5;
-  int v6;
-  int v7;
-  char *v8;
-  unsigned int v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  char *v14;
-  int v15;
-  int v16;
-  char *v17;
-  unsigned int v18;
-  int v19;
-  int v20;
-  int v21;
-  int v22;
-  char *v23;
-  int v24;
-  int v25;
-  double v26;
-  char *v27;
-  __int64 v28;
-  const char *v29;
-  char *v30;
-  char v31;
-  unsigned int v32;
-  char **v33;
-  const char *v34;
-  char **v35;
-  int v36;
-  int v37;
-  char *v38;
-  char **v39;
-  _DWORD *SoundAlias;
-  _DWORD *v41;
-  signed __int32 v42;
-  int *v43;
-  double v44;
-  double v45;
-  char *v46;
-  const char *v47;
-  const char *v48;
-  float *v49;
-  int *v50;
-  int v51;
-  int msgtime;
-  int v53;
-  int v54;
-  int v55;
-  int v56;
-  int v57;
-  float v58;
-  int v59;
-  float v60;
-  int v61;
-  float v62;
-  int numfiles;
-  int source;
-  int duration;
-  int width;
-  char *txt;
-  float v73;
-  char String1[4];
-  char filename[64];
-  char Destination[4100];
-  unsigned int v77;
+  int   numfiles;
+  int   source;
+  char  filename[64];
 
   switch ( *args )
   {
     case 0:
-      Com_Printf("%s", (const char *)args[1]);
-      goto LABEL_326;
+      Com_Printf( "%s", (const char *)args[1] );
+      return 0;
     case 1:
-      Com_Error(ERR_DROP, "\x15%s", (const char *)args[1]);
-    case 2:
-      v4 = args[2];
-      v5 = (char *)args[1];
-      width = v4;
-      if ( cl_noprint && cl_noprint->integer )
-        goto LABEL_326;
-      if ( con_initialized == qfalse )
-        Con_OneTimeInit();
-      v58 = *(float *)(con_gamemessagetime + 28) * 1000.0;
-      v6 = FastRound(v58);
-      duration = v6;
-      if ( v6 < 0 )
-      {
-        v6 = 0;
-        *(float *)&duration = 0.0;
-      }
-      source = 7;
-      if ( strstr(v5, "\n") )
-      {
-        v8 = strstr(v5, "\n");
-        do
-        {
-          if ( *v5 == 10 )
-          {
-            Con_Linefeed(duration, 1);      /* 0x00401EDC: eax=edi, edx=1 */
-            ++v5;
-          }
-          else
-          {
-            v9 = v8 - v5 + 1;
-            if ( v9 >= 0x1000 )
-            {
-              Com_Printf("Text line too long. Clipping to fit\n");
-              v9 = 4096;
-            }
-            strncpy(Destination, v5, v9 - 1);
-            v10 = duration;
-            v59 = source;
-            v55 = width;
-            v53 = duration;
-            filename[v9 + 63] = 0;
-            source = CL_ConsolePrint_AddLine((byte *)Destination, 1, v53, v55, v59);
-            v6 = duration;
-            v5 = v8;
-            if ( *v8 == 10 )
-              v5 = v8 + 1;
-          }
-          if ( !strstr(v5, "\n") )
-          {
-            CL_ConsolePrint_AddLine((byte *)v5, 1, v6, width, source);
-            goto LABEL_326;
-          }
-          if ( !v5 )
-            break;
-          if ( !*v5 )
-            break;
-          v8 = strstr(v5, "\n");
-        }
-        while ( v8 );
-      }
-      else
-      {
-        CL_ConsolePrint_AddLine((byte *)v5, 1, v6, v4, 7);
-      }
-      goto LABEL_326;
-    case 3:
-      v13 = args[2];
-      v14 = (char *)args[1];
-      width = v13;
-      if ( cl_noprint && cl_noprint->integer )
-        goto LABEL_326;
-      if ( con_initialized == qfalse )
-        Con_OneTimeInit();
-      v60 = *(float *)(con_boldgamemessagetime + 28) * 1000.0;
-      v15 = FastRound(v60);
-      duration = v15;
-      if ( v15 < 0 )
-      {
-        v15 = 0;
-        *(float *)&duration = 0.0;
-      }
-      source = 7;
-      if ( strstr(v14, "\n") )
-      {
-        v17 = strstr(v14, "\n");
-        do
-        {
-          if ( *v14 == 10 )
-          {
-            Con_Linefeed(duration, 2);      /* 0x0040204C: eax=edi, edx=2 */
-            ++v14;
-          }
-          else
-          {
-            v18 = v17 - v14 + 1;
-            if ( v18 >= 0x1000 )
-            {
-              Com_Printf("Text line too long. Clipping to fit\n");
-              v18 = 4096;
-            }
-            strncpy(Destination, v14, v18 - 1);
-            v19 = source;
-            v61 = source;
-            v56 = width;
-            v54 = duration;
-            filename[v18 + 63] = 0;
-            source = CL_ConsolePrint_AddLine((byte *)Destination, 2, v54, v56, v61);
-            v15 = duration;
-            v14 = v17;
-            if ( *v17 == 10 )
-              v14 = v17 + 1;
-          }
-          if ( !strstr(v14, "\n") )
-          {
-            CL_ConsolePrint_AddLine((byte *)v14, 2, v15, width, source);
-            goto LABEL_326;
-          }
-          if ( !v14 )
-            break;
-          if ( !*v14 )
-            break;
-          v17 = strstr(v14, "\n");
-        }
-        while ( v17 );
-      }
-      else
-      {
-        CL_ConsolePrint_AddLine((byte *)v14, 2, v15, v13, 7);
-      }
-      goto LABEL_326;
-    case 4:
-      v21 = args[7];
-      v22 = args[6];
-      v23 = (char *)args[1];
-      source = args[8];
-      txt = (char *)args[5];
-      width = args[2];
-      v73 = *(float *)&v21;
-      v24 = args[4];
-      duration = v22;
-      v25 = args[3];
-      *(_DWORD *)String1 = v24;
-      numfiles = v25;
-      if ( !cl_noprint || !cl_noprint->integer )
-      {
-        if ( con_initialized == qfalse )
-          Con_OneTimeInit();
-        /* retail keeps this in EBX for the whole block */
-        v62 = *(float *)(con_gamemessagetime + 28) * 1000.0;
-        msgtime = FastRound(v62);
-        if ( msgtime < 0 )
-          msgtime = 0;
-        if ( con_display > 0 )
-          Con_Linefeed(msgtime, con_prevChannel);   /* 0x004021B4 */
-        if ( *v23 )
-        {
-          /* 0x004021C6: esi = args[2], eax = 10 */
-          CL_AddConsoleInfoColor(10, (const float *)width);
-          CL_AddDeathMessageText(v23, 7);
-          CL_AddDeathMessageText(" ", 7);
-        }
-        /* 0x004021EF: esi = args[8], eax = 13 */
-        CL_AddConsoleInfoColor(13, (const float *)source);
-        v26 = v73 * 32.0;
-        con_text[con_display + con_linewidth * (con_current % con_totallines)] = (unsigned __int64)(*(float *)&duration
-                                                                                                  * 32.0)
-                                                                               | 0x1000;
-        ++con_display;
-        v27 = txt;
-        con_text[con_display + con_linewidth * (con_current % con_totallines)] = (unsigned __int64)v26 | 0x1100;
-        ++con_display;
-        CL_AddDeathMessageText(v27, 18);
-        CL_AddDeathMessageText(" ", 7);
-        /* 0x0040229E: esi = args[4], eax = 10 */
-        CL_AddConsoleInfoColor(10, (const float *)*(_DWORD *)String1);
-        CL_AddDeathMessageText((char *)numfiles, 7);
-        Con_Linefeed(msgtime, 1);                   /* 0x004022BD */
-        con_prevChannel = 1;
-      }
-      goto LABEL_326;
+      Com_Error( ERR_DROP, "\x15%s", (const char *)args[1] );
+    case 2:   /* CG_MESSAGE_PRINT, channel 1 (game message) */
+      CL_ConsolePrint( 1, (const char *)args[1], 0, args[2] );
+      return 0;
+    case 3:   /* CG_MESSAGE_PRINT, channel 2 (bold game message) */
+      CL_ConsolePrint( 2, (const char *)args[1], 0, args[2] );
+      return 0;
+    case 4:   /* obituary: two-color death-message line */
+      CL_DeathMessagePrint( (const char *)args[1], 1, (const float *)args[2],
+                            (const char *)args[3], (const float *)args[4],
+                            (const char *)args[5], *(float *)&args[6],
+                            *(float *)&args[7], (const float *)args[8], 0 );
+      return 0;
     case 5:
-      CL_SubtitlePrint((const char *)args[1], args[2], args[3]);
-      goto LABEL_326;
+      CL_SubtitlePrint( (const char *)args[1], args[2], args[3] );
+      return 0;
     case 6:
-      LODWORD(v28) = Sys_Milliseconds();
-      return v28;
+      return Sys_Milliseconds();
     case 7:
-      Cvar_Register((vmCvar_t *)args[1], (const char *)args[2], (const char *)args[3], args[4]);
-      goto LABEL_326;
+      Cvar_Register( (vmCvar_t *)args[1], (const char *)args[2], (const char *)args[3], args[4] );
+      return 0;
     case 8:
-      Cvar_Update((vmCvar_t *)args[1]);
-      goto LABEL_326;
+      Cvar_Update( (vmCvar_t *)args[1] );
+      return 0;
     case 9:
-      Cvar_Set2((const char *)args[1], (const char *)args[2], qtrue);
-      goto LABEL_326;
+      Cvar_Set2( (const char *)args[1], (const char *)args[2], qtrue );
+      return 0;
     case 10:
-      Cvar_VMSet((const char *)args[2], (vmCvar_t *)args[1]);
-      goto LABEL_326;
+      Cvar_VMSet( (vmCvar_t *)args[1], (const char *)args[2] );
+      return 0;
     case 11:
-      Cvar_VariableStringBuffer((const char *)args[1], (char *)args[2], args[3]);
-      goto LABEL_326;
+      Cvar_VariableStringBuffer( (const char *)args[1], (char *)args[2], args[3] );
+      return 0;
     case 12:
-      LODWORD(v28) = cmd_argc;
-      return v28;
+      return cmd_argc;
     case 13:
-      Cmd_ArgvBuffer(args[1], (char *)args[2], args[3]);
-      goto LABEL_326;
+      Cmd_ArgvBuffer( args[1], (char *)args[2], args[3] );
+      return 0;
     case 14:
-      Cmd_ArgsBuffer((char *)args[1], args[2]);
-      goto LABEL_326;
+      Cmd_ArgsBuffer( (char *)args[1], args[2] );
+      return 0;
     case 15:
-      LODWORD(v28) = FS_FOpenFileByMode((const char *)args[1], (fileHandle_t *)args[2], (fsMode_t)args[3]);
-      return v28;
+      return FS_FOpenFileByMode( (const char *)args[1], (fileHandle_t *)args[2], (fsMode_t)args[3] );
     case 16:
-      LODWORD(v28) = FS_Read((void *)args[1], args[2], args[3]);
-      return v28;
+      return FS_Read( (void *)args[1], args[2], args[3] );
     case 17:
-      LODWORD(v28) = FS_Write((const void *)args[1], args[2], args[3]);
-      return v28;
+      return FS_Write( (const void *)args[1], args[2], args[3] );
     case 18:
-      FS_FCloseFile(args[1]);
-      goto LABEL_326;
-    case 19:
-      /* case 19: retail loads args[1] into EAX and pushes args[2..4] (0x00402444). */
-      LODWORD(v28) = FS_GetFileList((const char *)args[1], (const char *)args[2],
-                                    (char *)args[3], args[4]);
-      return v28;
+      FS_FCloseFile( args[1] );
+      return 0;
+    case 19:   /* retail loads args[1] into EAX and pushes args[2..4], 0x00402444 */
+      return FS_GetFileList( (const char *)args[1], (const char *)args[2],
+                             (char *)args[3], args[4] );
     case 20:
-      return Com_SaveCvarsToBuffer((const char **)args[1], args[2],
-                                   (char *)args[3], args[4]);
+      return Com_SaveCvarsToBuffer( (const char **)args[1], args[2],
+                                    (char *)args[3], args[4] );
     case 21:
-      return Com_LoadCvarsFromBuffer((const char **)args[1], args[2],
-                                     (char *)args[3], (const char *)args[4]);
+      return Com_LoadCvarsFromBuffer( (const char **)args[1], args[2],
+                                      (char *)args[3], (const char *)args[4] );
     case 22:
-      Cbuf_AddText((const char *)args[1]);   /* text@<eax>, 0x004024CD */
-      goto LABEL_326;
+      Cbuf_AddText( (const char *)args[1] );   /* text@<eax>, 0x004024CD */
+      return 0;
     case 23:
-      Cmd_AddCommand((const char *)args[1], 0);
-      goto LABEL_326;
+      Cmd_AddCommand( (const char *)args[1], 0 );
+      return 0;
+    case 101:
+      Cmd_RemoveCommand( (const char *)args[1] );
+      return 0;
     case 24:
-      CL_AddReliableCommand((const char *)args[1]);
-      goto LABEL_326;
-    case 25:
-/* case 25 is one instruction in retail (0x0040250F is the call). SCR_UpdateScreen takes no arguments. */
+      CL_AddReliableCommand( (const char *)args[1] );
+      return 0;
+    case 25:   /* one instruction in retail (0x0040250F); SCR_UpdateScreen takes no arguments */
       SCR_UpdateScreen();
-      goto LABEL_326;
-    /* cases 26-30: yStart/y is args[1], loaded into ECX (EDI for case 30) at the retail sites. */
+      return 0;
+    /* cases 26-30: yStart/y is args[1], live-in via ECX (EDI for case 30) at the retail sites */
     case 26:
-      Con_DrawNotify(args[2], *((float *)args + 3), args[4], args[1]);
-      goto LABEL_326;
+      Con_DrawNotify( args[2], *(float *)&args[3], args[4], args[1] );
+      return 0;
     case 27:
-      Con_DrawBoldMessages(args[2], *((float *)args + 3), args[4], args[1]);
-      goto LABEL_326;
+      Con_DrawBoldMessages( args[2], *(float *)&args[3], args[4], args[1] );
+      return 0;
     case 28:
-      Con_DrawMiniConsole(args[1], args[2], *((float *)args + 3));
-      goto LABEL_326;
+      Con_DrawMiniConsole( args[1], args[2], *(float *)&args[3] );
+      return 0;
     case 29:
-      Con_DrawSubtitles(args[2], *((float *)args + 3), args[4], args[1]);
-      goto LABEL_326;
+      Con_DrawSubtitles( args[2], *(float *)&args[3], args[4], args[1] );
+      return 0;
     case 30:
-      Con_DrawSay(args[1]);
-      goto LABEL_326;
+      Con_DrawSay( args[1] );
+      return 0;
     case 31:
-      CL_CM_LoadMap((const char *)args[1]);   /* mapname@<esi>, 0x00402587 */
-      goto LABEL_326;
+      CL_CM_LoadMap( (const char *)args[1] );   /* mapname@<esi>, 0x00402587 */
+      return 0;
     case 32:
-      LODWORD(v28) = cm_numSubModels;
-      return v28;
+      return CM_NumInlineModels();
     case 33:
-      LODWORD(v28) = CM_InlineModel(args[1]);   /* index@<esi>, 0x004025AF */
-      return v28;
+      return CM_InlineModel( args[1] );   /* index@<esi>, 0x004025AF */
     case 35:
-      LODWORD(v28) = CM_TempBoxModel((const float *)args[1], (const float *)args[2],
-                                     args[3], qfalse);
-      return v28;
+      return CM_TempBoxModel( (const float *)args[1], (const float *)args[2],
+                              args[3], qfalse );
+    case 42:   /* case 35 with capsule = 1 (0x004025FD pushes 1) */
+      return CM_TempBoxModel( (const float *)args[1], (const float *)args[2],
+                              args[3], qtrue );
     case 36:
-      LODWORD(v28) = CM_PointContents((const float *)args[1], args[2]);
-      return v28;
-    case 37:
-/* p@<ecx>=args[1], model@<stack>=args[2], origin@<eax>=args[3], angles@<edx>=args[4] -- 0x00402642. */
-      LODWORD(v28) = CM_TransformedPointContents((const float *)args[1], args[2],
-                                                 (const float *)args[3],
-                                                 (const float *)args[4]);
-      return v28;
+      return CM_PointContents( (const float *)args[1], args[2] );
+    case 37:   /* p@<ecx>=args[1], model=args[2], origin@<eax>=args[3], angles@<edx>=args[4], 0x00402642 */
+      return CM_TransformedPointContents( (const float *)args[1], args[2],
+                                          (const float *)args[3],
+                                          (const float *)args[4] );
     case 38:
       CM_BoxTrace(
         (trace_t *)args[1],
@@ -1235,19 +903,8 @@ int __cdecl CL_CgameSystemCalls(int *args)
         (const float *)args[5],
         args[6],
         args[7],
-        qfalse);
-      goto LABEL_326;
-    case 40:
-      CM_BoxTrace(
-        (trace_t *)args[1],
-        (const float *)args[2],
-        (const float *)args[3],
-        (const float *)args[4],
-        (const float *)args[5],
-        args[6],
-        args[7],
-        qtrue);
-      goto LABEL_326;
+        qfalse );
+      return 0;
     case 39:
       CM_TransformedBoxTraceExternal(
         (trace_t *)args[1],
@@ -1259,8 +916,19 @@ int __cdecl CL_CgameSystemCalls(int *args)
         args[7],
         (const float *)args[8],
         (const float *)args[9],
-        qfalse);
-      goto LABEL_326;
+        qfalse );
+      return 0;
+    case 40:
+      CM_BoxTrace(
+        (trace_t *)args[1],
+        (const float *)args[2],
+        (const float *)args[3],
+        (const float *)args[4],
+        (const float *)args[5],
+        args[6],
+        args[7],
+        qtrue );
+      return 0;
     case 41:
       CM_TransformedBoxTraceExternal(
         (trace_t *)args[1],
@@ -1272,61 +940,96 @@ int __cdecl CL_CgameSystemCalls(int *args)
         args[7],
         (const float *)args[8],
         (const float *)args[9],
-        qtrue);
-      goto LABEL_326;
-    case 42:
-/* case 42 is case 35 with capsule = 1 (0x004025FD pushes 1). */
-      LODWORD(v28) = CM_TempBoxModel((const float *)args[1], (const float *)args[2],
-                                     args[3], qtrue);
-      return v28;
+        qtrue );
+      return 0;
     case 43:
-      LODWORD(v28) = dword_14328F8(
-                       args[1],
-                       args[2],
-                       args[3],
-                       args[4],
-                       args[5],
-                       args[6],
-                       args[7],
-                       args[8],
-                       args[9],
-                       args[10]);
-      return v28;
+      return re_LerpTag(
+               args[1], args[2], args[3], args[4], args[5],
+               args[6], args[7], args[8], args[9], args[10] );
+    case 209:
+      MSS_SetListener( (int *)args[3], (int *)args[2], args[1] );
+      return 0;
+    case 210:
+      MSS_UpdateLoopingSounds();
+      return 0;
+    case 211:
+      MSS_StopSounds( args[1] );
+      return 0;
+    case 212:
+      MSS_PlayMusicAlias( (float *)args[1] );
+      return 0;
+    case 213:
+      MSS_StopBackground( 0, args[1] );
+      return 0;
+    case 214:
+      MSS_PlayAmbientAlias( args[1], args[2] );
+      return 0;
+    case 215:
+      MSS_FadeAllSounds( args[1], args[2] );
+      return 0;
+    case 216:
+      MSS_FadeSelectSounds( (float *)args[1], args[2] );
+      return 0;
+    case 217:
+      MSS_SetEnvironmentEffects( (const char *)args[1], *(float *)&args[2], args[3] );
+      return 0;
+    case 218:
+      return MSS_GetSoundOverlay( args[1], (void *)args[2], args[3], (int *)args[4] );
+    case 190:
+      Com_LoadSoundAliases( (const char *)args[1], 1 );
+      return 0;
+    case 191:
+    {
+      const char *name = (const char *)args[1];
+      int *alias = (int *)Com_FindSoundAlias( name, 1 );
+      if ( !alias )
+        return 0;
+      return *alias;
+    }
+    case 192:
+      return (int)Com_PickSoundAlias( (const char *)args[1], 1 );
+    case 193:
+      return (int)Com_GetSoundAlias( 1, args[1] );
+    case 194:
+      return MSS_PlaySoundAlias( (float *)args[1], args[2], (float *)args[3], args[4] );
+    case 195:
+      MSS_PlayBlendedSoundAliases( (int *)args[1], (float *)args[2], args[3], args[4], (float *)args[5], args[6] );
+      return 0;
+    case 196:
+      return CL_SurfaceTypeFromName( (const char *)args[1] );
+    case 197:
+      return (int)CL_SurfaceTypeToName( args[1] );
     case 44:
-      dword_1432878(args[1], 0);
-      goto LABEL_326;
+      re_LoadWorldMap( args[1], 0 );
+      return 0;
     case 45:
-      LODWORD(v28) = dword_143286C(args[1], args[2]);
-      return v28;
+      return re_RegisterModel( args[1], args[2] );
     case 46:
-      ((void (__cdecl *)())dword_143287C)();
-      goto LABEL_326;
+      ( (void (__cdecl *)())re_FinishLoadingModels )();
+      return 0;
     case 47:
-      dword_1432880(args[1]);
-      goto LABEL_326;
-    case 48:
-      LODWORD(v28) = re_RegisterShader(args[1], args[2]);
-      return v28;
+      re_SetIgnorePrecacheErrors( args[1] );
+      return 0;
     case 49:
-      LODWORD(v28) = dword_1432888(args[1], args[2]);
-      return v28;
+      return re_GetShaderFromModel( args[1], args[2] );
     case 50:
-      LODWORD(v28) = dword_1432868(args[1]);
-      return v28;
+      return re_GetXModelByHandle( args[1] );
+    case 48:
+      return re_RegisterShader( args[1], args[2] );
     case 51:
-      dword_1432908(args[1], args[2], args[3], args[4]);
-      goto LABEL_141;
+      re_RegisterFont( args[1], args[2], args[3], args[4] );
+      /* fall through: retail registers the font and then returns case 88's value */
+    case 88:
+      return re_RegisterShaderNoMip( args[1], args[2] );
     case 52:
-      LODWORD(v28) = dword_143292C(args[1], args[2], args[3], 0, args[4]);
-      return v28;
+      return re_Text_Width( args[1], args[2], args[3], 0, args[4] );
     case 53:
-      LODWORD(v28) = dword_1432930(args[1], args[2]);
-      return v28;
+      return re_Text_Height( args[1], args[2] );
     case 54:
-      dword_1432934(args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9]);
-      goto LABEL_326;
+      re_Text_Paint( args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9] );
+      return 0;
     case 55:
-      dword_1432940(
+      ( (void (*)( int, int, int, int, int, int, int, char, int, int, int ))re_Text_PaintWithCursor )(
         args[1],
         args[2],
         args[3],
@@ -1334,768 +1037,545 @@ int __cdecl CL_CgameSystemCalls(int *args)
         args[5],
         args[6],
         args[7],
-        *((unsigned __int8 *)args + 32),
+        (char) args[8],
         0,
         args[9],
-        args[10]);
-      goto LABEL_326;
+        args[10] );
+      return 0;
     case 56:
-      LODWORD(v28) = SEH_StringEd_GetString((const char *)args[1]);
-      return v28;
+      return SEH_StringEd_GetString( (const char *)args[1] );
     case 57:
-      LODWORD(v28) = SEH_LocalizeTextMessage((char *)args[1], (const char *)args[2], 0);
-      return v28;
+      return SEH_LocalizeTextMessage( (char *)args[1], (const char *)args[2], 0 );
     case 58:
-      LODWORD(v28) = SEH_PrintStrlen((char *)args[1]);
-      return v28;
+      return SEH_PrintStrlen( (char *)args[1] );
     case 59:
-      LODWORD(v28) = SEH_ReadCharFromString((unsigned __int8 **)args[1], (_DWORD *)args[2]);
-      return v28;
+      return SEH_ReadCharFromString( (unsigned char **)args[1], (int *)args[2] );
     case 60:
-      ((void (__cdecl *)())dword_143289C)();
-      goto LABEL_326;
+      ( (void (__cdecl *)())re_ClearScene )();
+      return 0;
     case 61:
-      dword_14328A0(args[1], 0);
-      goto LABEL_326;
-    case 62:
-      LODWORD(v28) = dword_143290C(args[1], args[2]);
-      return v28;
-    case 63:
-      LODWORD(v28) = com_hunkMeminfoRunningTotal;
-      return v28;
+      re_AddRefEntityToScene( args[1], 0 );
+      return 0;
     case 64:
-      dword_14328A4(args[1], args[2], args[3]);
-      goto LABEL_326;
+      re_AddPolyToScene( args[1], args[2], args[3] );
+      return 0;
     case 65:
-      dword_14328A8(args[1], args[2], args[3], args[4]);
-      goto LABEL_326;
+      re_AddPolysToScene( args[1], args[2], args[3], args[4] );
+      return 0;
     case 66:
-      dword_14328AC(args[1], args[2], args[3], args[4], args[5]);
-      goto LABEL_326;
+      re_AddLightToScene( args[1], args[2], args[3], args[4], args[5] );
+      return 0;
     case 67:
-      dword_14328B4(args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
-      goto LABEL_326;
+      re_AddCoronaToScene( args[1], args[2], args[3], args[4], args[5], args[6], args[7] );
+      return 0;
     case 68:
-      dword_14328B8(args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
-      goto LABEL_326;
+      re_SetFog( args[1], args[2], args[3], args[4], args[5], args[6], args[7] );
+      return 0;
     case 69:
-      dword_14328C4(args[1]);
-      goto LABEL_326;
+      re_RenderScene( args[1] );
+      return 0;
     case 70:
-      ((void (__cdecl *)())dword_14328F0)();
-      goto LABEL_326;
+      ( (void (__cdecl *)())re_SaveScreen )();
+      return 0;
     case 71:
-      dword_14328F4(args[1]);
-      goto LABEL_326;
+      re_BlendSavedScreen( args[1] );
+      return 0;
     case 72:
-      re_SetColor(args[1]);
-      goto LABEL_326;
+      re_SetColor( args[1] );
+      return 0;
     case 73:
-      re_DrawStretchPic(args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9]);
-      goto LABEL_326;
+      re_DrawStretchPic( args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9] );
+      return 0;
     case 74:
-      dword_14328D4(args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11]);
-      goto LABEL_326;
+      re_StretchPicGradient( args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11] );
+      return 0;
     case 75:
-      dword_14328D8(args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10]);
-      goto LABEL_326;
+      re_StretchPicRotate( args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10] );
+      return 0;
     case 76:
-      dword_14328DC(args[1], args[2], args[3]);
-      goto LABEL_326;
+      re_DrawQuadPic( args[1], args[2], args[3] );
+      return 0;
     case 77:
-      dword_14328FC(args[1], args[2], args[3]);
-      goto LABEL_326;
+      re_ModelBounds( args[1], args[2], args[3] );
+      return 0;
     case 78:
-      qmemcpy((void *)args[1], &cls_glconfig, 0xA0u);
-      goto LABEL_326;
+      CL_GetGlconfig_cgame( (glconfig_t *)args[1] );
+      return 0;
     case 79:
-      qmemcpy((void *)args[1], cl_gameState_stringOffsets, 0x5E84u);
-      goto LABEL_326;
+      CL_GetGameState( (void *)args[1] );
+      return 0;
     case 80:
-      v41 = (_DWORD *)args[2];
-      *(_DWORD *)args[1] = *(_DWORD *)cl_snap_messageNum;
-      *v41 = cl_snap_serverTime;
-      goto LABEL_326;
+      CL_GetCurrentSnapshotNumber( (int *)args[1], (int *)args[2] );
+      return 0;
     case 81:
-      LODWORD(v28) = CL_GetSnapshot(args[1], (byte *)args[2]);   /* snapshotNumber@<eax>, 0x00402F71 */
-      return v28;
+      return CL_GetSnapshot( args[1], (snapshot_t *)args[2] );   /* snapshotNumber@<eax>, 0x00402F71 */
     case 82:
-      LODWORD(v28) = CL_GetServerCommand(args[1]);   /* @<eax>, 0x00402F96 */
-      return v28;
+      return CL_GetServerCommand( args[1] );   /* @<eax>, 0x00402F96 */
     case 83:
-      LODWORD(v28) = cl_cmdNumber;
-      return v28;
+      return cl_cmdNumber;
     case 84:
-      LODWORD(v28) = CL_GetUserCmd(args[1], (byte *)args[2]);   /* cmdNumber@<eax>, 0x00402FCF */
-      return v28;
+      return CL_GetUserCmd( args[1], (byte *)args[2] );   /* cmdNumber@<eax>, 0x00402FCF */
     case 85:
-      v42 = args[1];
-      cgameSensitivity = *((float *)args + 2);
-      cgameUserCmdValue = v42;
-      goto LABEL_326;
+      CL_SetUserCmdValue( args[1], *(float *)&args[2] );
+      return 0;
     case 86:
-      v43 = (int *)args[1];
-      cgameUserAim_x = *v43;
-      cgameUserAim_y = v43[1];
-      cgameUserAim_z = v43[2];
-      goto LABEL_326;
+    {
+      const int *aim = (const int *)args[1];
+      cgameUserAim_x = aim[0];
+      cgameUserAim_y = aim[1];
+      cgameUserAim_z = aim[2];
+      return 0;
+    }
     case 87:
       cgameUserCmdInShellshock = args[1];
-      goto LABEL_326;
-    case 88:
-LABEL_141:
-      LODWORD(v28) = Material_RegisterHandle(args[1], args[2]);
-      return v28;
-    case 89:
-      LODWORD(v28) = *(_DWORD *)hunk_totalSize - *(_DWORD *)hunk_highTemp - *(_DWORD *)hunk_temp_temp;
-      return v28;
+      return 0;
+    case 208:
+      CL_SetClientLerpOrigin( *(float *)&args[1], *(float *)&args[2], *(float *)&args[3] );
+      return 0;
+    case 89:   /* hunk total - high temp - low temp, as in CL_UISystemCalls */
+      return Hunk_MemoryRemaining();
     case 90:
-      LODWORD(v28) = Key_IsDown(args[1]);   /* @<eax>, 0x00403084 */
-      return v28;
+      return Key_IsDown( args[1] );   /* @<eax>, 0x00403084 */
     case 91:
-      LODWORD(v28) = cls_keyCatchers;
-      return v28;
+      return cls_keyCatchers;
     case 92:
-      Key_SetCatcher(args[1]);
-      goto LABEL_326;
+      Key_SetCatcher( args[1] );
+      return 0;
     case 93:
-      LODWORD(v28) = Key_GetKey((const char *)args[1]);   /* binding@<ebx>, 0x004030CA */
-      return v28;
-    case 94:
-      LODWORD(v28) = PC_AddGlobalDefine(0, (const char *)args[1]);
-      return v28;
-    case 95:
-      LODWORD(v28) = PC_LoadSourceHandle((const char *)args[1]);
-      return v28;
-    case 96:
-      LODWORD(v28) = PC_FreeSourceHandle(args[1]);
-      return v28;
-    case 97:
-      LODWORD(v28) = PC_ReadTokenHandle(args[1], (pc_token_t *)args[2]);
-      return v28;
-    case 98:
-      LODWORD(v28) = PC_SourceFileAndLine(args[1], (char *)args[2], (int *)args[3]);
-      return v28;
-    case 99:
-      LODWORD(v28) = Com_RealTime((int *)args[1]);
-      return v28;
-    case 100:
-      Sys_SnapVector((float *)args[1]);
-      goto LABEL_326;
-    case 101:
-      Cmd_RemoveCommand((const char *)args[1]);
-      goto LABEL_326;
-    case 102:
-      LODWORD(v28) = CIN_PlayCinematic((const char *)args[1], args[2], args[3], args[4], args[5], args[6]);
-      return v28;
-    case 103:
-      LODWORD(v28) = CIN_StopCinematic(args[1]);   /* handle@<ecx>, 0x004033A0 */
-      return v28;
-    case 104:
-      LODWORD(v28) = CIN_RunCinematic(args[1]);
-      return v28;
-    case 105:
-      CIN_DrawCinematic(args[1]);
-      goto LABEL_326;
-    case 106:
-/* retail loads eax=args[1] and edx=args[3] and pushes args[2], args[4], args[5]; EDX is y. Q3's order is (handle,x,y,w,h). */
-      CIN_SetExtents(args[1], args[2], args[3], args[4], args[5]);
-      goto LABEL_326;
-    case 107:
-      dword_1432900(args[1]);
-      goto LABEL_326;
-    case 108:
-      LODWORD(v28) = dword_1432904(args[1], args[2], args[3], args[4], args[5], args[6]);
-      return v28;
-    case 109:
-      v46 = (char *)args[1];
-      LOBYTE(v2) = *((_BYTE *)args + 8);
-      BYTE1(v2) = v2;
-      HIDWORD(v28) = args[3];
-      LODWORD(v28) = v2 << 16;
-      LOWORD(v28) = v2;
-      memset32(v46, v28, HIDWORD(v28) >> 2);
-      memset(&v46[4 * (HIDWORD(v28) >> 2)], v2, BYTE4(v28) & 3);
-      LODWORD(v28) = v46;
-      return v28;
+      return Key_GetKey( (const char *)args[1] );   /* binding@<ebx>, 0x004030CA */
+    case 109:   /* inlined memset(dst, fillByte, count) returning dst */
+      return (int)memset( (void *)args[1], args[2], args[3] );
     case 110:
-      LODWORD(v28) = args[1];
-      qmemcpy((void *)v28, (const void *)args[2], args[3]);
-      return v28;
+      return (int)memcpy( (void *)args[1], (const void *)args[2], args[3] );
     case 111:
-      LODWORD(v28) = strncpy((char *)args[1], (const char *)args[2], args[3]);
-      return v28;
+      return (int)strncpy( (char *)args[1], (const char *)args[2], args[3] );
     case 112:
-      *(float *)&numfiles = sin(*((float *)args + 1));
-      LODWORD(v28) = numfiles;
-      return v28;
+    {
+      float r = sin( *(float *)&args[1] );
+      return *(int *)&r;
+    }
     case 113:
-      *(float *)&numfiles = cos(*((float *)args + 1));
-      LODWORD(v28) = numfiles;
-      return v28;
+    {
+      float r = cos( *(float *)&args[1] );
+      return *(int *)&r;
+    }
     case 114:
-      *(float *)&numfiles = atan2(*((float *)args + 1), *((float *)args + 2));
-      LODWORD(v28) = numfiles;
-      return v28;
+    {
+      float r = atan2( *(float *)&args[1], *(float *)&args[2] );
+      return *(int *)&r;
+    }
     case 115:
-      *(float *)&numfiles = sqrt(*((float *)args + 1));
-      LODWORD(v28) = numfiles;
-      return v28;
+    {
+      float r = sqrt( *(float *)&args[1] );
+      return *(int *)&r;
+    }
     case 116:
-      *(float *)&numfiles = floor(*((float *)args + 1));
-      LODWORD(v28) = numfiles;
-      return v28;
+    {
+      float r = floor( *(float *)&args[1] );
+      return *(int *)&r;
+    }
     case 117:
-      *(float *)&numfiles = ceil(*((float *)args + 1));
-      LODWORD(v28) = numfiles;
-      return v28;
-    case 118:
-      Com_Printf("%s%i\n", (const char *)args[1], args[2]);
-      goto LABEL_326;
-    case 119:
-      Com_Printf("%s%f\n", (const char *)args[1], *((float *)args + 2));
-      goto LABEL_326;
+    {
+      float r = ceil( *(float *)&args[1] );
+      return *(int *)&r;
+    }
     case 120:
-      *(float *)&numfiles = Q_acos(*((float *)args + 1));
-      LODWORD(v28) = numfiles;
-      return v28;
+    {
+      float r = Q_acos( *(float *)&args[1] );
+      return *(int *)&r;
+    }
+    case 94:
+      return PC_AddGlobalDefine( (const char *)args[1] );
+    case 95:
+      return PC_LoadSourceHandle( (const char *)args[1] );
+    case 96:
+      return PC_FreeSourceHandle( args[1] );
+    case 97:
+      return PC_ReadTokenHandle( args[1], (pc_token_t *)args[2] );
+    case 98:
+      return PC_SourceFileAndLine( args[1], (char *)args[2], (int *)args[3] );
+    case 99:
+      return Com_RealTime( (int *)args[1] );
+    case 100:
+      Sys_SnapVector( (float *)args[1] );
+      return 0;
+    case 102:
+      return CIN_PlayCinematic( (const char *)args[1], args[2], args[3], args[4], args[5], args[6] );
+    case 103:
+      return CIN_StopCinematic( args[1] );   /* handle@<ecx>, 0x004033A0 */
+    case 104:
+      return CIN_RunCinematic( args[1] );
+    case 105:
+      CIN_DrawCinematic( args[1] );
+      return 0;
+    case 106:   /* retail: eax=args[1] handle, edx=args[3] y; stack args[2]=x, args[4]=w, args[5]=h */
+      CIN_SetExtents( args[1], args[2], args[3], args[4], args[5] );
+      return 0;
+    case 107:
+      re_TrackStatistics( args[1] );
+      return 0;
+    case 108:
+      return re_PickShader( args[1], args[2], args[3], args[4], args[5], args[6] );
+    case 118:
+      Com_Printf( "%s%i\n", (const char *)args[1], args[2] );
+      return 0;
+    case 119:
+      Com_Printf( "%s%f\n", (const char *)args[1], *(float *)&args[2] );
+      return 0;
+    case 62:
+      return re_GetEntityToken( args[1], args[2] );
+    case 63:
+      return com_hunkMeminfoRunningTotal;
     case 121:
-      LODWORD(v28) = VM_Call(uivm, 15, args[1], 5);
-      return v28;
+      return VM_Call( uivm, 15, args[1], 5 );
     case 122:
-      if ( cls_state != 6 )
-        goto LABEL_216;
-      if ( clc_demoplaying )
-        goto LABEL_216;
-      v47 = (const char *)args[1];
-      if ( !v47 )
-        goto LABEL_216;
-      if ( !Q_stricmp("UIMENU_WM_QUICKMESSAGE", v47) )
+    {
+      const char *menu;
+
+      if ( cls_state == 6 && !clc_demoplaying )
       {
-        VM_Call(uivm, 7, 8);
-LABEL_216:
-        LODWORD(v28) = 1;
-        return v28;
+        menu = (const char *)args[1];
+        if ( menu )
+        {
+          if ( !Q_stricmp( menu, "UIMENU_WM_QUICKMESSAGE" ) )
+          {
+            VM_Call( uivm, 7, 8 );
+          }
+          else if ( !Q_stricmp( menu, "UIMENU_WM_AUTOUPDATE" ) )
+          {
+            VM_Call( uivm, 7, 9 );
+          }
+          /* Q_stricmpn is (s1@<edx>, s2@<ecx>, n@<eax>), no stack args, 0x00403562 */
+          else if ( !Q_stricmpn( menu, "UIMENU_SCRIPT_POPUP", 19 ) )
+          {
+            if ( !Q_stricmp( menu, "UIMENU_SCRIPT_POPUP_NO_MOUSE" ) )
+              return VM_Call( uivm, 7, 11 );
+            return VM_Call( uivm, 7, 10 );
+          }
+        }
       }
-      if ( !Q_stricmp("UIMENU_WM_AUTOUPDATE", v47) )
-      {
-        VM_Call(uivm, 7, 9);
-        goto LABEL_216;
-      }
-/* 0x00403562: eax=0x13, ecx="UIMENU_SCRIPT_POPUP", edx=esi. Q_stricmpn is (s1@<edx>, s2@<ecx>, n@<eax>) with NO stack arguments. */
-      if ( Q_stricmpn(v47, "UIMENU_SCRIPT_POPUP", 19) )
-        goto LABEL_216;
-      if ( Q_stricmp("UIMENU_SCRIPT_POPUP_NO_MOUSE", v47) )
-        LODWORD(v28) = VM_Call(uivm, 7, 10);
-      else
-        LODWORD(v28) = VM_Call(uivm, 7, 11);
-      return v28;
+      return 1;
+    }
     case 123:
-      v48 = (const char *)args[1];
-      if ( v48
-        && (!Q_stricmp("UIMENU_SCRIPT_POPUP_NO_MOUSE", v48) && VM_Call(uivm, 8) == 10
-         || !Q_stricmp("UIMENU_SCRIPT_POPUP", (const char *)args[1]) && VM_Call(uivm, 8) == 10) )
+      if ( args[1]
+        && ( ( !Q_stricmp( (const char *)args[1], "UIMENU_SCRIPT_POPUP_NO_MOUSE" ) && VM_Call( uivm, 8 ) == 10 )
+          || ( !Q_stricmp( (const char *)args[1], "UIMENU_SCRIPT_POPUP" ) && VM_Call( uivm, 8 ) == 10 ) ) )
       {
-        goto LABEL_231;
+        VM_Call( uivm, 3, 27, 1 );
       }
-      goto LABEL_326;
+      return 0;
     case 124:
-      if ( VM_Call(uivm, 8) == 1 )
-        goto LABEL_326;
-      VM_Call(uivm, 3, 27, 1);
-      VM_Call(uivm, 3, 27, 1);
-LABEL_231:
-      VM_Call(uivm, 3, 27, 1);
-      goto LABEL_326;
+      if ( VM_Call( uivm, 8 ) == 1 )
+        return 0;
+      VM_Call( uivm, 3, 27, 1 );
+      VM_Call( uivm, 3, 27, 1 );
+      VM_Call( uivm, 3, 27, 1 );
+      return 0;
     case 125:
-      LODWORD(v28) = VM_Call(uivm, 9, args[1]);
-      return v28;
+      return VM_Call( uivm, 9, args[1] );
     case 126:
-      LODWORD(v28) = VM_Call(uivm, 10, args[1]);
-      return v28;
-    case 127:
-/* 0x004036D1 is the whole case: no arguments, and the returned pointer is the trap's result. */
-      LODWORD(v28) = CL_GetServerIPAddress();
-      return v28;
+      return VM_Call( uivm, 10, args[1] );
+    case 127:   /* no arguments; the returned pointer is the trap result, 0x004036D1 */
+      return CL_GetServerIPAddress();
+    case 219:
+      Key_GetBindingBuf( args[1], (char *)args[2], args[3] );
+      return 0;
+    case 220:
+      Key_SetBinding( args[1], (const char *)args[2] );
+      return 0;
+    case 221:
+      Key_KeynumToStringBuf( args[1], (char *)args[2], args[3] );
+      return 0;
     case 128:
-      XAnimPrecacheAnimTree_m((int *)args[1], (int (__cdecl *)(int))Hunk_AllocXAnimPrecache);
-      goto LABEL_326;
+      XAnimPrecacheAnimTree_m( (int *)args[1], (int (__cdecl *)(int))Hunk_AllocXAnimPrecache );
+      return 0;
     case 129:
-      LODWORD(v28) = XAnimAllocTree(args[2], args[1], (int (__cdecl *)(int))Hunk_AllocXAnimClientCreate);
-      return v28;
+      return XAnimAllocTree( args[2], args[1], (int (__cdecl *)(int))Hunk_AllocXAnimClientCreate );
     case 130:
-      XAnimLoadFileData_m(args[3], args[1], *((_WORD *)args + 4));
-      goto LABEL_326;
+      XAnimSetLeafNode( (const char *)args[3], (void *)args[1], (unsigned short)args[2] );
+      return 0;
     case 131:
-      LODWORD(v28) = XAnimAllocRuntimeTree(args[1], (int (__cdecl *)(int))Hunk_AllocXAnimClientCreateTree);
-      return v28;
+      return XAnimAllocRuntimeTree( args[1], (int (__cdecl *)(int))Hunk_AllocXAnimClientCreateTree );
     case 132:
       XAnimSetParentNode(
-        *((_WORD *)args + 10),
-        *((_WORD *)args + 12),
-        args[1],
-        *((_WORD *)args + 4),
+        *( (unsigned short *)args + 10 ),
+        *( (unsigned short *)args + 12 ),
+        (void *)args[1],
+        *( (unsigned short *)args + 4 ),
         args[3],
-        *((_WORD *)args + 8));
-      goto LABEL_326;
+        *( (unsigned short *)args + 8 ) );
+      return 0;
     case 133:
-      DObjFree(1u, args[1]);
-      goto LABEL_326;
+      DObjFree( 1, args[1] );
+      return 0;
     case 134:
-      XAnimClearAnimNode_m((_DWORD *)args[1], args[2], *((float *)args + 3));
-      goto LABEL_326;
+      XAnimClearAnimNode_m( (int *)args[1], args[2], *(float *)&args[3] );
+      return 0;
     case 135:
-      XAnimClearAnim_m(args[2], (_DWORD *)args[1], *((float *)args + 3));
-      goto LABEL_326;
+      XAnimClearAnim_m( args[2], (int *)args[1], *(float *)&args[3] );
+      return 0;
     case 136:
-      XAnimClearAnimChildSubtrees_m((void *)args[1], args[2], *((float *)args + 3));
-      goto LABEL_326;
+      XAnimClearAnimChildSubtrees_m( (void *)args[1], args[2], *(float *)&args[3] );
+      return 0;
     case 137:
       XAnimSetAnimKnob_m(
-        (_DWORD *)args[1],
+        (int *)args[1],
         args[2],
-        *((float *)args + 3),
+        *(float *)&args[3],
         args[4],
-        *((float *)args + 5),
-        *((_WORD *)args + 12),
+        *(float *)&args[5],
+        *( (unsigned short *)args + 12 ),
         0,
-        args[7]);
-      goto LABEL_326;
+        args[7] );
+      return 0;
     case 138:
-      LODWORD(v28) = XAnimSetAnimKnobAll_m(
-                       args[2],
-                       (_DWORD *)args[1],
-                       args[3],
-                       *((float *)args + 4),
-                       args[5],
-                       *((float *)args + 6),
-                       *((_WORD *)args + 14),
-                       0,
-                       args[8]);
-      return v28;
-    case 139:
-      /* nodeIndex (args[2]) is live-in via ECX in retail. */
-      XAnimClearAnimChildren_m((_DWORD *)args[1], args[2], *((float *)args + 3));
-      goto LABEL_326;
+      return XAnimSetAnimKnobAll_m(
+               args[2],
+               (int *)args[1],
+               args[3],
+               *(float *)&args[4],
+               args[5],
+               *(float *)&args[6],
+               *( (unsigned short *)args + 14 ),
+               0,
+               args[8] );
+    case 139:   /* nodeIndex (args[2]) is live-in via ECX in retail */
+      XAnimClearAnimChildren_m( (int *)args[1], args[2], *(float *)&args[3] );
+      return 0;
     case 140:
       XAnimSetAnimInternalLimited_m(
-        *((_WORD *)args + 12),
+        *( (unsigned short *)args + 12 ),
         0,
         args[1],
         args[2],
-        *((float *)args + 3),
+        *(float *)&args[3],
         args[4],
-        *((float *)args + 5),
-        args[7]);
-      goto LABEL_326;
+        *(float *)&args[5],
+        args[7] );
+      return 0;
     case 141:
       XAnimSetAnimKnobInternal_m(
-        0,
-        (_DWORD *)args[1],
+        (int *)args[1],
         args[2],
-        *((float *)args + 3),
-        args[4],
-        *((float *)args + 5),
-        *((_WORD *)args + 12),
-        args[7]);
-      goto LABEL_326;
+        *(float *)&args[3],
+        *(float *)&args[4],
+        *(float *)&args[5],
+        0,
+        *( (unsigned short *)args + 12 ),
+        args[7] );
+      return 0;
     case 142:
-      XAnimSetAnimRate_m(args[1], args[2], *((float *)args + 3));
-      goto LABEL_326;
+      XAnimSetAnimRate_m( args[1], args[2], *(float *)&args[3] );
+      return 0;
     case 143:
-      LODWORD(v28) = XAnimIsLooped_m(args[2], scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]]);
-      return v28;
+      return XAnimIsLooped_m((const void *)(scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]] ), args[2]);
     case 144:
-      LODWORD(v28) = XAnimIsLooped_m(args[2], args[1]);
-      return v28;
+      return XAnimIsLooped_m((const void *)(args[1] ), args[2]);
     case 145:
-      XAnimSetTime_m((int *)args[2], args[1], args[3]);
-      goto LABEL_326;
+      XAnimSetTime_m( (void *)args[1], args[2], *(float *)&args[3] );
+      return 0;
     case 146:
-      *(float *)&numfiles = XAnimGetTime(args[2], args[1]);
-      LODWORD(v28) = numfiles;
-      return v28;
+    {
+      float t = XAnimGetTime( args[1], args[2] );
+      return *(int *)&t;
+    }
     case 147:
-      *(float *)&numfiles = XAnimGetWeight(args[2], args[1]);
-      LODWORD(v28) = numfiles;
-      return v28;
+    {
+      float w = XAnimGetWeight( args[1], args[2] );
+      return *(int *)&w;
+    }
     case 148:
-      CL_DObjInvalidateSkels();   /* 0x004039E3 sets nothing; no arguments */
-      goto LABEL_326;
+      CL_DObjInvalidateSkels();   /* 0x004039E3; no arguments */
+      return 0;
     case 149:
-      DObjUpdateClientInfo_m((void *)args[1], *((float *)args + 2));
-      goto LABEL_326;
+      DObjUpdateClientInfo_m( (void *)args[1], *(float *)&args[2] );
+      return 0;
     case 150:
-      LODWORD(v28) = xanim_numDeferredNotifies;
-      *(_DWORD *)args[1] = &xanim_deferredNotifies;
-      return v28;
+      *(int *)args[1] = (int)xanim_deferredNotifies;
+      return xanim_numDeferredNotifies;
     case 151:
-      DObjCalcAnim(args[1], args[2]);   /* dobj@<eax>, partBits@<edx>, 0x00403A25 */
-      goto LABEL_326;
+      DObjCalcAnim( args[1], args[2] );   /* dobj@<eax>, partBits@<edx>, 0x00403A25 */
+      return 0;
     case 152:
-      DObjDisplayAnim((int **)args[1]);
-      goto LABEL_326;
+      DObjDisplayAnim( (int **)args[1] );
+      return 0;
     case 153:
-      XAnimGetRelDelta_m(args[5], args[2], (int *)args[4], (float *)args[3], (_DWORD *)args[1]);
-      goto LABEL_326;
+      XAnimGetRelDelta_m( (int *)args[1], args[2], (float *)args[3], (int *)args[4], args[5] );
+      return 0;
     case 154:
-      XAnimGetAbsDelta_m(args[2], (_DWORD *)args[1], (_DWORD *)args[4], (float *)args[3]);
-      goto LABEL_326;
+      XAnimGetAbsDelta_m( (int *)args[1], args[2], (float *)args[3], (int *)args[4] );
+      return 0;
     case 155:
       XAnimGetRelDeltaForTime_m(
-        args[2],
         scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]],
-        (_DWORD *)args[4],
+        args[2],
+        (int *)args[4],
         (float *)args[3],
-        *((float *)args + 5),
-        *((float *)args + 6));
-      goto LABEL_326;
+        *(float *)&args[5],
+        *(float *)&args[6] );
+      return 0;
     case 156:
-      XAnimGetAbsDeltaForTime_m(
-        args[2],
-        scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]],
-        (float *)args[3],
-        (_DWORD *)args[4],
-        *((float *)args + 5));
-      goto LABEL_326;
+      XAnimGetAbsDeltaForTime_m((const void*)scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]], args[2], (float*)(int *)args[4], (float*)(float *)args[3],
+        *(float *)&args[5] );
+      return 0;
     case 157:
-      LODWORD(v28) = (*(unsigned __int8 *)(args[2] + args[1] + 80) << 6) + *(_DWORD *)(args[1] + 4) + 48;
-      return v28;
+      return ( *(unsigned char *)( args[2] + args[1] + 80 ) << 6 ) + *(int *)( args[1] + 4 ) + 48;
     case 158:
-      LODWORD(v28) = (*(unsigned __int8 *)(args[1] + 23) << 6) + *(_DWORD *)(args[1] + 4) + 48;
-      return v28;
+      return ( *(unsigned char *)( args[1] + 23 ) << 6 ) + *(int *)( args[1] + 4 ) + 48;
     case 159:
-      LODWORD(v28) = DObjMarkRotTransIndex((void *)args[1], (const unsigned char *)args[2], args[3]);
-      return v28;
+      return DObjMarkRotTransIndex( (void *)args[1], (const unsigned char *)args[2], args[3] );
     case 160:
-      LODWORD(v28) = DObjMarkControlRotTransIndex((void *)args[1], (const unsigned char *)args[2], args[3]);
-      return v28;
+      return DObjMarkControlRotTransIndex( (void *)args[1], (const unsigned char *)args[2], args[3] );
     case 161:
-      LODWORD(v28) = XAnimGetAnimName(args[2], scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]]);
-      return v28;
+      return (int)XAnimGetAnimName( (const void*)scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]], args[2] );
     case 162:
-      LODWORD(v28) = (int)Com_GetClientDObj(args[1]);   /* handle@<eax>, 0x00403BB3 */
-      return v28;
+      return (int)Com_GetClientDObj( args[1] );   /* handle@<eax>, 0x00403BB3 */
     case 163:
-      DObjCreate(0, args[4], args[1], *((_WORD *)args + 4), (_DWORD *)args[3]);
-      goto LABEL_326;
+      DObjCreate( (const void *)args[1], *( (unsigned short *)args + 4 ), (void *)args[3], (void *)args[4], 0 );
+      return 0;
     case 164:
-      Com_ClientDObjCreate((void *)args[1], (unsigned __int16)args[2],
-                            (void *)args[3], args[4], 0);
-      goto LABEL_326;
+      Com_ClientDObjCreate( (void *)args[1], (unsigned short)args[2],
+                            (void *)args[3], args[4], 0 );
+      return 0;
     case 165:
-      Com_SafeClientDObjFree(args[1], args[2]);
-      goto LABEL_326;
+      Com_SafeClientDObjFree( args[1], args[2] );
+      return 0;
     case 166:
-    case 177:
-      LODWORD(v28) = *(_DWORD *)args[1];
-      return v28;
+      return *(int *)args[1];
     case 167:
-      LODWORD(v28) = 96 * *(unsigned __int8 *)(args[1] + 23) + 48;
-      return v28;
+      return 96 * *(unsigned char *)( args[1] + 23 ) + 48;
     case 168:
-      LODWORD(v28) = CL_DObjCreateSkelForBone(args[1], args[2]);
-      return v28;
+      return CL_DObjCreateSkelForBone( args[1], args[2] );
     case 169:
-      LODWORD(v28) = CL_DObjCreateSkelForBones(args[1], args[2]);
-      return v28;
+      return CL_DObjCreateSkelForBones( args[1], args[2] );
     case 170:
-      DObjGetHierarchyBits(args[2], args[1], (_DWORD *)args[3]);
-      goto LABEL_326;
+      DObjGetHierarchyBits( args[2], args[1], (int *)args[3] );
+      return 0;
     case 171:
-      DObjCalcSkel(args[2], args[1]);   /* partBits@<eax>, dobj@<stack>, 0x00403CA5 */
-      goto LABEL_326;
+      DObjCalcSkel( args[2], args[1] );   /* partBits@<eax>, dobj@<stack>, 0x00403CA5 */
+      return 0;
     case 172:
-      LODWORD(v28) = XModelExists((int *)args[1]);
-      return v28;
+      return XModelExists( (int *)args[1] );
     case 173:
-      LODWORD(v28) = *(unsigned __int8 *)(args[1] + 23);
-      return v28;
+      return *(unsigned char *)( args[1] + 23 );
     case 174:
-      LODWORD(v28) = DObjGetBoneIndex((const char *)args[2], args[1]);
-      return v28;
+      return DObjGetBoneIndex( (const char *)args[2], args[1] );
     case 175:
-      LODWORD(v28) = DObjGetBoneName(args[1], args[2]);
-      return v28;
+      return DObjGetBoneName( args[1], args[2] );
     case 176:
-      DObjBuildPartCollisionTable((_DWORD *)args[2], args[1]);
-      goto LABEL_326;
+      DObjBuildPartCollisionTable( (int *)args[2], args[1] );
+      return 0;
+    case 177:
+      return *(int *)args[1];
     case 178:
-      LODWORD(v28) = *(_WORD *)((int)scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]] + 8 * args[2] + 8) == 0;
-      return v28;
+      return *(unsigned short *)( (int)scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]] + 8 * args[2] + 8 ) == 0;
     case 179:
-      v49 = *(float **)(*(_DWORD *)(args[1] + 8 * args[2] + 12) + 4);
-      return (unsigned __int64)((double)*(unsigned __int16 *)v49 / v49[1] * 1000.0);
+    {
+      float *v = *(float **)( *(int *)( args[1] + 8 * args[2] + 12 ) + 4 );
+      return (int)( (rfloat)*(unsigned short *)v / v[1] * 1000.0f );
+    }
     case 180:
-      LODWORD(v28) = XAnimHasTime(args[2], args[1]);
-      return v28;
+      return XAnimHasTime( args[1], args[2] );
     case 181:
-      LODWORD(v28) = *(unsigned __int16 *)((int)scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]] + 8 * args[2] + 8);
-      return v28;
+      return *(unsigned short *)( (int)scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]] + 8 * args[2] + 8 );
     case 182:
-      LODWORD(v28) = args[3] + *(unsigned __int16 *)((int)scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]] + 8 * args[2] + 14);
-      return v28;
+      return args[3] + *(unsigned short *)( (int)scrAnimPub_trees[128 * xanim_activePoolSlot + args[1]] + 8 * args[2] + 14 );
     case 183:
-      LODWORD(v28) = *(_DWORD *)(args[1] + 4);
-      return v28;
+      return *(int *)( args[1] + 4 );
     case 184:
-      XAnimCopyTree(args[1], args[2]);
-      goto LABEL_326;
+      XAnimCopyTree( args[1], args[2] );
+      return 0;
     case 185:
       if ( com_developer->integer )
-        DObjDumpInfo((void *)args[1]);
-      goto LABEL_326;
+        DObjDumpInfo( (void *)args[1] );
+      return 0;
     case 186:
-      StatMon_Warning(args[1], args[2], (const char *)args[3]);
-      goto LABEL_326;
-    case 187:
-      /* StatMon_GetStatsArray inlined in retail at 0x00403ED6 -- it is four instructions, so the compiler pasted it. `stats` is its private array and is not declared outside statmonitor.c. */
+      StatMon_Warning( args[1], args[2], (const char *)args[3] );
+      return 0;
+    case 187:   /* StatMon_GetStatsArray inlined in retail (0x00403ED6); its stats array is private to statmonitor.c */
       StatMon_GetStatsArray( (const statmonitor_t **)args[1], (int *)args[2] );
-      goto LABEL_326;
+      return 0;
     case 188:
-      LODWORD(v28) = Z_MallocInternal(args[1]);
-      return v28;
+      return Z_MallocInternal( args[1] );
     case 189:
-      free((void *)args[1]);
-      goto LABEL_326;
-    case 190:
-      v29 = (const char *)args[1];
-      source = 0;
-      /* The locale-1-aliases-locale-2 fast path of Com_LoadSoundAliases (0x00433EA6..0x00433EEE), inlined. 0x00893DF4 is the localized set name; `snd_subtitleStr` is a misnomer. */
-      if ( !_stricmp(snd_aliasLocalizedName, v29) )
-      {
-        snd_aliasTable[SND_LOCALE_INGAME]      = snd_aliasTable[SND_LOCALE_LOCALIZED];
-        snd_aliasTableCount[SND_LOCALE_INGAME] = snd_aliasTableCount[SND_LOCALE_LOCALIZED];
-        Com_Memcpy(snd_aliasHashTable[SND_LOCALE_INGAME],
-                   snd_aliasHashTable[SND_LOCALE_LOCALIZED],
-                   SND_ALIAS_HASH_SLICE_BYTES);
-      }
-      else
-      {
-        if ( !_strnicmp(v29, "maps/", 5u) )
-        {
-          v30 = (char *)(v29 + 5);
-          do
-          {
-            v31 = *v30;
-            v30[filename - (v29 + 5)] = *v30;
-            ++v30;
-          }
-          while ( v31 );
-          v32 = strlen(filename);
-          if ( !_stricmp(&String1[v32], ".bsp") )
-            String1[v32] = 0;
-        }
-        else
-        {
-          strcpy(filename, v29);
-        }
-        strlwr(filename);
-        v33 = FS_ListFilteredFiles("soundaliases", "csv", 0, &numfiles);
-        v34 = (const char *)numfiles;
-        v35 = v33;
-        if ( !numfiles )                /* 0x004028EC is `test edi,edi` */
-        {
-          Com_Printf("WARNING: can't find any sound alias files (soundaliases/*.csv)\n");
-          goto LABEL_326;
-        }
-        v36 = 0;
-        hunk_lowTempMark = *(_DWORD *)hunk_temp_temp;
-        if ( numfiles > 0 )
-        {
-          do
-          {
-            snd_currentFile = v35[v36];
-            source = Com_LoadSoundAliasFile(
-                         va("soundaliases/%s", snd_currentFile),
-                         filename, source, 1 );
-            ++v36;
-          }
-          while ( v36 < (int)v34 );
-          if ( source )
-            Com_MakeSoundAliasesPermanent(source, 1);
-        }
-        *(_DWORD *)hunk_temp_temp = hunk_lowTempMark;
-        if ( v35 )
-        {
-          v38 = *v35;
-          if ( *v35 )
-          {
-            v39 = v35;
-            do
-            {
-              free(v38);
-              v38 = v39[1];
-              ++v39;
-            }
-            while ( v38 );
-          }
-          free(v35);
-        }
-      }
-      if ( !snd_aliasSetLoaded[SND_LOCALE_INGAME] && !snd_aliasSetLoaded[SND_LOCALE_MENU] )
-        Cmd_AddCommand("snd_list", Com_SoundList_f);
-      snd_aliasSetLoaded[SND_LOCALE_INGAME] = 1;
-      Com_LoadSoundAliasSounds(1);
-LABEL_326:
-      LODWORD(v28) = 0;
-      return v28;
-    case 191:
-      SoundAlias = (_DWORD *)Com_FindSoundAlias((const char *)args[1], 1);
-      if ( !SoundAlias )
-        goto LABEL_326;
-      LODWORD(v28) = *SoundAlias;
-      return v28;
-    case 192:
-      LODWORD(v28) = (int)Com_PickSoundAlias((const char *)args[1], 1);
-      return v28;
-    case 193:
-      LODWORD(v28) = (int)Com_GetSoundAlias(1, args[1]);
-      return v28;
-    case 194:
-      LODWORD(v28) = MSS_PlaySoundAlias((float *)args[1], args[2], (float *)args[3], args[4]);
-      return v28;
-    case 195:
-      MSS_PlayBlendedSoundAliases((float *)args[2], (_DWORD *)args[1], args[3], args[4], (float *)args[5], args[6]);
-      goto LABEL_326;
-    case 196:
-      LODWORD(v28) = CL_SurfaceTypeFromName((const char *)args[1]);
-      return v28;
-    case 197:
-      LODWORD(v28) = (int)CL_SurfaceTypeToName(args[1]);
-      return v28;
-    /* CG_ADD_DEBUG_LINE -- CL_CgameSystemCalls case 198, retail 0x00403F22 */
-
-    case 198:
+      free( (void *)args[1] );
+      return 0;
+    case 198:   /* CG_ADD_DEBUG_LINE, retail 0x00403F22 */
       CL_AddDebugLine(
         (const float *)args[1], (const float *)args[2], (const float *)args[3],
         args[4], args[5], 0 );
-      goto LABEL_326;
-    case 199:
-/* 0x00403F42: edx=args[1] size, esi=args[2] pPrevOwner, edi=2 owner. */
-      LODWORD(v28) = (int)Com_GetWeaponInfoMemory(args[1], (int *)args[2], 2);
-      return v28;
+      return 0;
+    case 199:   /* 0x00403F42: edx=args[1] size, esi=args[2] pPrevOwner, edi=2 owner */
+      return (int)Com_GetWeaponInfoMemory( args[1], (int *)args[2], 2 );
     case 200:
-      Com_FreeWeaponInfoMemory(2, args[1]);
-      goto LABEL_326;
+      Com_FreeWeaponInfoMemory( 2, args[1] );
+      return 0;
     case 201:
-      LODWORD(v28) = Hunk_AllocAlignInternal(args[1], 32);
-      return v28;
+      return Hunk_AllocAlignInternal( args[1], 32 );
     case 202:
-      LODWORD(v28) = Hunk_AllocLowAlignInternal(args[1], 32);
-      return v28;
+      return Hunk_AllocLowAlignInternal( args[1], 32 );
     case 203:
-      LODWORD(v28) = Hunk_AllocAlignInternal(args[1], args[2]);
-      return v28;
+      return Hunk_AllocAlignInternal( args[1], args[2] );
     case 204:
-      LODWORD(v28) = Hunk_AllocLowAlignInternal(args[1], args[2]);
-      return v28;
+      return Hunk_AllocLowAlignInternal( args[1], args[2] );
     case 205:
     case 206:
-      goto LABEL_326;
+      return 0;
     case 207:
-      LODWORD(v28) = *(_DWORD *)dword_8E6310;
-      return v28;
-    case 208:
-      v44 = *((float *)args + 3);
-      v45 = *((float *)args + 2);
-      LODWORD(cgameClientLerpOrigin_x) = args[1];
-      cgameClientLerpOrigin_y = v45;
-      cgameClientLerpOrigin_z = v44;
-      goto LABEL_326;
-    case 209:
-      MSS_SetListener((int *)args[3], (int *)args[2], args[1]);
-      goto LABEL_326;
-    case 210:
-      MSS_UpdateLoopingSounds();
-      goto LABEL_326;
-    case 211:
-      MSS_StopSounds(args[1]);
-      goto LABEL_326;
-    case 212:
-      MSS_PlayMusicAlias((float *)args[1]);
-      goto LABEL_326;
-    case 213:
-      MSS_StopBackground(0, args[1]);
-      goto LABEL_326;
-    case 214:
-      MSS_PlayAmbientAlias(args[1], args[2]);
-      goto LABEL_326;
-    case 215:
-      MSS_FadeAllSounds(args[1], args[2]);
-      goto LABEL_326;
-    case 216:
-      MSS_FadeSelectSounds((float *)args[1], args[2]);
-      goto LABEL_326;
-    case 217:
-      MSS_SetEnvironmentEffects((const char *)args[1], *(float *)&args[2], args[3]);
-      goto LABEL_326;
-    case 218:
-      LODWORD(v28) = MSS_GetSoundOverlay((int *)args[4], args[3], (void *)args[2], args[1]);
-      return v28;
-    case 219:
-      Key_GetBindingBuf(args[1], args[3], (char *)args[2]);
-      goto LABEL_326;
-    case 220:
-      Key_SetBinding(args[1], (const char *)args[2]);
-      goto LABEL_326;
-    case 221:
-      Key_KeynumToStringBuf( args[1], (char *)args[2], args[3] );
-      goto LABEL_326;
+      return scrMemTree_allocBuckets;
     case 222:
-      LODWORD(v28) = CFxScheduler__RegisterEffect(dword_14075A0, (char *)args[1], 0);
-      return v28;
+      return FX_RegisterEffect( (char *)args[1] );
     case 223:
-      LODWORD(v28) = FX_GetBoneIndex(args[1], (const char *)args[2]);
-      return v28;
+      return FX_GetBoneIndex( args[1], (const char *)args[2] );
     case 224:
-      CFxScheduler__PlayEffect_name_simple_m((char *)args[1], dword_14075A0, (float *)args[2]);
-      goto LABEL_326;
+      CFxScheduler__PlayEffect_name_simple_m( (char *)args[1], theFxScheduler, (float *)args[2] );
+      return 0;
     case 225:
-      CFxScheduler__PlayEffect_name_m((int *)args[3], (char *)args[1], dword_14075A0, (float *)args[2]);
-      goto LABEL_326;
+      CFxScheduler__PlayEffect_name_m( (int *)args[3], (char *)args[1], theFxScheduler, (float *)args[2] );
+      return 0;
     case 226:
-      CFxScheduler__PlayEffect_name_bolt_m((char *)args[1], dword_14075A0, (float *)args[2], (int *)args[3], (int *)args[4]);
-      goto LABEL_326;
+      CFxScheduler__PlayEffect_name_bolt_m( (char *)args[1], theFxScheduler, (float *)args[2], (int *)args[3], (int *)args[4] );
+      return 0;
     case 227:
-      CFxScheduler__PlayEffect_id_simple_m((float *)args[2], args[1], dword_14075A0);
-      goto LABEL_326;
+      CFxScheduler__PlayEffect_id_simple_m( args[1], (float *)args[2], theFxScheduler );
+      return 0;
     case 228:
-      FX_PlayEffectID((int *)args[3], args[1], (float *)args[2]);
-      goto LABEL_326;
+      FX_PlayEffectID( (int *)args[3], args[1], (float *)args[2] );
+      return 0;
     case 229:
-      CFxScheduler__PlayEffect_id_axis(dword_14075A0, args[1], (float *)args[2], (int *)args[3], (int *)args[4]);
-      goto LABEL_326;
+      CFxScheduler__PlayEffect_id_axis( theFxScheduler, args[1], (float *)args[2], (int *)args[3], (int *)args[4] );
+      return 0;
     case 230:
-      CFxScheduler__AddScheduledEffects((_DWORD *)dword_14075A0);
-      goto LABEL_326;
+      CFxScheduler__AddScheduledEffects( (unsigned int *)theFxScheduler );
+      return 0;
     case 231:
-      LODWORD(v28) = FX_Init();
-      return v28;
+      return FX_Init();
     case 232:
-      LODWORD(v28) = (unsigned __int8)FX_Free(1);
-      return v28;
+      return (unsigned char)FX_Free( 1 );
     case 233:
-      LODWORD(v28) = (unsigned __int8)FX_Free(0);
-      return v28;
+      return (unsigned char)FX_Free( 0 );
     case 234:
-      SFxHelper__AdjustTime(&theFxHelper, args[1]);
-      goto LABEL_326;
+      SFxHelper__AdjustTime( &theFxHelper, args[1] );
+      return 0;
     case 235:
-      *(float *)&numfiles = ((double (__cdecl *)())dword_1432894)();
-      SFxHelper__AdjustCamera((int)&theFxHelper, args[1], *(float *)&numfiles);
-      goto LABEL_326;
+    {
+      float zfar = ( (double (__cdecl *)())re_GetFarPlaneDist )();
+      SFxHelper__AdjustCamera( (int)&theFxHelper, args[1], zfar );
+      return 0;
+    }
     case 240:
-      dword_143A980 = args[1];
-      dword_143A984 = args[2];
-      goto LABEL_326;
+      cgameMaxPitchSpeedStorage = args[1];
+      cgameMaxYawSpeedStorage = args[2];
+      return 0;
     case 241:
-      if ( cls_state == 6 )                     /* retail 0x004041B6 cmp cls_state, 6 */
+      if ( cls_state == 6 )   /* retail 0x004041B6 cmp cls_state, 6 */
         CL_FirstSnapshot();
-      goto LABEL_326;
+      return 0;
     default:
-      Com_Error(ERR_DROP, "\x15" "Bad cgame system trap: %i", *args);
+      Com_Error( ERR_DROP, "\x15" "Bad cgame system trap: %i", *args );
   }
+
+  return 0;
 }
 
 /* ---- CL_UpdateLevelHunkUsage  0x004045C0 ----  VERIFIED */
@@ -2126,10 +1606,10 @@ void CL_UpdateLevelHunkUsage( void ) {
 		outbuf[0] = '\0';
 
 		while ( ( token = Com_Parse( &buftrav ) ) != 0 && token[0] ) {
-			if ( !Q_stricmp( token, cl_mapnameBsp ) ) {
+			if ( !Q_strcasecmp( token, cl_mapnameBsp ) ) {
 				token = Com_Parse( &buftrav );
 				if ( token && token[0] ) {
-					if ( atol( token ) == memusage ) {
+					if ( atoi( token ) == memusage ) {
 						free( buf );
 						free( outbuf );
 						return;
@@ -2219,93 +1699,32 @@ void CL_InitCGame( void )
 	msec = Sys_Milliseconds() - start;
 	Com_Printf( "CL_InitCGame: %5.2f seconds\n", (double)msec * 0.001 );
 
-	/* retail: unguarded `call ds:[0x01432898]` */
-	if ( cgvm_dllEntry ) {
-		cgvm_dllEntry();
-	}
+	re_EndRegistration();
 
 	if ( sys_sysMBValue > 100663296 ) {   /* 0x6000000 */
 		Com_TouchMemory();
 	}
 
 	memset( (void *)con_notifyWindow, 0, 4 * con_gamemessagelines );
-	memset( (void *)dword_142EFD0, 0, 4 * con_gamemessagelines );
-	dword_142EFD8 = 0;
-	memset( (void *)con_boldWindow, 0, 4 * dword_142F060 );
-	memset( (void *)dword_142F054, 0, 4 * dword_142F060 );
-	dword_142F05C = 0;
-	memset( (void *)con_subtitleWindow, 0, 4 * dword_142F0E4 );
-	memset( (void *)dword_142F0D8, 0, 4 * dword_142F0E4 );
-	dword_142F0E0 = 0;
+	memset( (void *)con_notifyWindowEndTimes, 0, 4 * con_gamemessagelines );
+	con_notifyWindowIndex = 0;
+	memset( (void *)con_boldWindow, 0, 4 * con_boldWindowSize );
+	memset( (void *)con_boldWindowEndTimes, 0, 4 * con_boldWindowSize );
+	con_boldWindowIndex = 0;
+	memset( (void *)con_subtitleWindow, 0, 4 * con_subtitleWindowSize );
+	memset( (void *)con_subtitleWindowEndTimes, 0, 4 * con_subtitleWindowSize );
+	con_subtitleWindowIndex = 0;
 
 	CL_UpdateLevelHunkUsage();
 }
-#if 0
-void __cdecl CL_InitCGame(const char *systemInfo, const char *mapKey)
-{
-  unsigned __int32 v2;
-  char *v3;
-  int *v4;
-  vm_s *v5;
-  int (__cdecl *v6)(int *);
-  const char *ArgList_4;
-  int v8;
-
-  if ( !sys_timeBaseInit )
-  {
-    sys_timeBase = timeGetTime();
-    sys_timeBaseInit = 1;
-  }
-  v2 = timeGetTime() - sys_timeBase;
-  if ( !com_sv_running->integer )
-    Com_InitDObj();
-  xanim_activePoolSlot = 0;
-  Con_Close();
-  v3 = Info_ValueForKey(systemInfo, mapKey);
-  /* Com_sprintf is __usercall(dest@<edi>, size@<esi>, fmt, ...); retail sets
-     esi = 0x40 and edi = 0x0143A900. */
-  Com_sprintf((char *)&cl_mapname, 64, "maps/mp/%s.bsp", v3);
-  cgvm = VM_Create((const char *)CL_CgameSystemCalls, v6);
-  if ( !cgvm )
-    Com_Error(ERR_DROP, "\x15VM_Create on cgame failed");
-  *(_DWORD *)cls_state = 4;
-  v4 = Scr_NearHook(0);
-  VM_Call(v5, 16, v4);
-  VM_Call(cgvm, 0, clc_serverMessageSequence, clc_lastExecutedServerCommand, clc_clientNum);
-  *(_DWORD *)cls_state = 5;
-  if ( !sys_timeBaseInit )
-  {
-    sys_timeBase = timeGetTime();
-    sys_timeBaseInit = 1;
-  }
-  v8 = timeGetTime() - sys_timeBase - v2;
-  Com_Printf("CL_InitCGame: %5.2f seconds\n", (double)v8 * 0.001);
-  cgvm_dllEntry();
-  /* Retail 0x004B4A1C is `cmp sys_sysMBValue, 6000000h`, a compare of the value. */
-  if ( sys_sysMBValue > 100663296 )       /* 0x6000000 */
-    Com_TouchMemory();
-  memset((void *)con_notifyWindow, 0, 4 * con_gamemessagelines);
-  memset((void *)dword_142EFD0, 0, 4 * con_gamemessagelines);
-  dword_142EFD8 = 0;
-  memset((void *)con_boldWindow, 0, 4 * dword_142F060);
-  memset((void *)dword_142F054, 0, 4 * dword_142F060);
-  dword_142F05C = 0;
-  memset((void *)con_subtitleWindow, 0, 4 * dword_142F0E4);
-  memset((void *)dword_142F0D8, 0, 4 * dword_142F0E4);
-  dword_142F0E0 = 0;
-  CL_UpdateLevelHunkUsage();
-}
-#endif
 
 /* ---- CL_GameCommand  0x00404BA0 ----  [CONFIRMED] */
-int __cdecl CL_GameCommand()
-{
-  int result;
+qboolean CL_GameCommand( void ) {
+	if ( !cgvm ) {
+		return qfalse;
+	}
 
-  result = (int)cgvm;
-  if ( cgvm )
-    return VM_Call(cgvm, 2);
-  return result;
+	return VM_Call( cgvm, CG_CONSOLE_COMMAND );
 }
 
 /* ---- CL_CGameRendering  0x00404BC0 ----  [CONFIRMED] */
@@ -2319,14 +1738,8 @@ extern int cl_serverTimeDelta;          /* cl.serverTimeDelta 0x01434A70 */
 extern int cl_oldServerTime;            /* cl.oldServerTime 0x01434A68 */
 extern int cl_oldFrameServerTime;               /* cl.oldFrameServerTime 0x01434A6C */
 extern int cl_extrapolatedSnapshot;     /* cl.extrapolatedSnapshot 0x01434A74 */
-extern int cls_realtime;                /* cls.realtime 0x0155F3E0 */
 extern int cl_snap_valid;               /* cl.snap.valid 0x01432964 */
 extern unsigned char cl_snap_snapFlags[4];  /* cl.snap.snapFlags 0x01432968 */
-extern char cls_servername[256];        /* cls.servername 0x0155F2CC */
-extern int clc_firstDemoFrameSkipped;               /* clc.firstDemoFrameSkipped 0x015EF00C */
-extern char clc_timeDemoFrames[12];          /* clc.timeDemoFrames 0x015EF014 */
-extern int clc_timeDemoStart;               /* clc.timeDemoStart 0x015EF018 */
-extern int clc_timeDemoBaseTime;               /* clc.timeDemoBaseTime 0x015EF01C */
 extern cvar_t *activeAction;            /* cl_activeAction 0x0155F24C */
 extern cvar_t *cl_freezeDemo;           /* 0x015F7074 */
 extern cvar_t *cl_paused;               /* 0x0163A22C */
@@ -2478,8 +1891,8 @@ void CL_SetCGameTime( void ) {
 		if ( !clc_timeDemoStart ) {
 			clc_timeDemoStart = Sys_Milliseconds();
 		}
-		( *(int *)clc_timeDemoFrames )++;
-		cl_serverTime = clc_timeDemoBaseTime + *(int *)clc_timeDemoFrames * 50;
+		( clc_timeDemoFrames )++;
+		cl_serverTime = clc_timeDemoBaseTime + clc_timeDemoFrames * 50;
 	}
 
 	while ( cl_serverTime >= cl_snap_serverTime ) {
@@ -2523,37 +1936,40 @@ int CL_DrawString(int x, int y, const char *text, int shadow, int charWidth, int
 }
 
 /* ---- CL_SaveCgameState  0x00404F80 ----  VERIFIED */
-int CL_SaveCgameState( int size, void *buffer )
+int CL_SaveCgameState( void *buffer, int size )
 {
   int used;
 
-  used = cgame_SaveExportTable( buffer, size );
+  used = re_SaveFogState( buffer, size );
   return used + VM_Call( cgvm, 17, (char *)buffer + used, size - used );
 }
 
 /* ---- CL_RestoreCgameState  0x00404FB0 ----  VERIFIED */
-int CL_RestoreCgameState( int size, void *buffer )
+int CL_RestoreCgameState( void *buffer, int size )
 {
   int used;
 
-  used = cgame_RestoreExportTable( buffer, size );
+  used = re_RestoreFogState( buffer, size );
   return used + VM_Call( cgvm, 18, (char *)buffer + used, size - used );
 }
 
-/* 0x015CA590, 160 bytes. Storage is client_mp/cl_refstorage.c:122. */
+/* 0x015CA590, 160 bytes: cls.glconfig (cls is defined in cl_main_mp.c). */
 
 extern int cl_gameState_stringOffsets[];
 
-/* ---- nullsub_8  0x00401030 ----  VERIFIED */
-void nullsub_8( void ) {
+/* ---- CL_UnusedStub1  0x00401030 ----  VERIFIED */
+/* retail 0x00401030, IDA nullsub_8: bare retn, no xrefs. game/cgame/ui carry the same unnamed pair of empty stubs + float identity (G_/CG_/UI_UnusedStub*, *_UnusedFloatIdentity): name lost, descriptive name. */
+void CL_UnusedStub1( void ) {
 }
 
-/* ---- nullsub_9  0x00401040 ----  VERIFIED */
-void nullsub_9( void ) {
+/* ---- CL_UnusedStub2  0x00401040 ----  VERIFIED */
+/* retail 0x00401040, IDA nullsub_9: bare retn, no xrefs. game/cgame/ui carry the same unnamed pair of empty stubs + float identity (G_/CG_/UI_UnusedStub*, *_UnusedFloatIdentity): name lost, descriptive name. */
+void CL_UnusedStub2( void ) {
 }
 
-/* ---- sub_401050  0x00401050 ----  VERIFIED */
-float sub_401050( float f ) {
+/* ---- CL_UnusedFloatIdentity  0x00401050 ----  VERIFIED */
+/* retail 0x00401050, IDA sub_401050: fld [esp+4]; retn, no xrefs; same trio as G_/CG_/UI_UnusedFloatIdentity in the DLLs: descriptive name. */
+float CL_UnusedFloatIdentity( float f ) {
 	return f;
 }
 

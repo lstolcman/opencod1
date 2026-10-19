@@ -16,64 +16,6 @@
 #include <string.h>
 #include <ctype.h>
 
-/* ---- FS_ExtractFromPakFile  0x0043ACA0 ---- VERIFIED */
-int FS_ExtractFromPakFile( const char *osPath, int unused, const char *qpath ) {
-	void        *fsData;
-	int fsLen;
-	FILE        *f;
-	int diskLen;
-	byte        *diskData;
-	int i;
-	qboolean different;
-	fileHandle_t out;
-
-	fsLen = FS_ReadFile( qpath, &fsData );
-	if ( fsLen == -1 ) {
-		return 0;
-	}
-
-	different = qtrue;
-
-	f = fopen( osPath, "rb" );
-	if ( f ) {
-		fseek( f, 0, SEEK_END );
-		diskLen = ftell( f );
-		fseek( f, 0, SEEK_SET );
-
-		if ( diskLen > 0 ) {
-			diskData = Z_MallocInternal( diskLen );
-			fread( diskData, 1, diskLen, f );
-
-			if ( diskLen == fsLen ) {
-				for ( i = 0 ; i < diskLen ; i++ ) {
-					if ( diskData[i] != ( (byte *)fsData )[i] ) {
-						break;
-					}
-				}
-				if ( i == diskLen ) {
-					different = qfalse;
-				}
-			}
-
-			free( diskData );
-		}
-		fclose( f );
-	}
-
-	if ( different ) {
-		out = FS_FOpenFileWrite( qpath );
-		if ( !out ) {
-			Com_Printf( "Failed to open %s\n", qpath );
-			return 0;
-		}
-		FS_Write( fsData, fsLen, out );
-		FS_FCloseFile( out );
-	}
-
-	FS_FreeFile( fsData );
-	return 1;
-}
-
 /* ---- FS_Read2  0x0043ADD0 ---- VERIFIED */
 int FS_Read2( void *buffer, int len, fileHandle_t f ) {
 	if ( !f ) {
@@ -111,6 +53,8 @@ extern char **FS_ListFilteredFiles( const char *path, const char *extension, cha
 extern void FS_SortFileList( char **filelist, int numfiles );
 extern void FS_ConvertPath( char *s );
 extern int  FS_FOpenFileRead_Internal( const char *qpath, fileHandle_t *file, qboolean uniqueFILE, int filter_flag );
+extern qboolean FS_UseSearchPath( searchpath_t *sp );
+extern qboolean FS_TouchFile( const char *qpath );
 
 /* ---- FS_Dir_f  0x0043B4A0 ---- VERIFIED */
 void FS_Dir_f( void ) {
@@ -178,19 +122,13 @@ void FS_NewDir_f( void ) {
 
 /* ---- FS_TouchFile_f  0x0043B660 ---- VERIFIED */
 void FS_TouchFile_f( void ) {
-	fileHandle_t	f;
-
 	if ( Cmd_Argc() != 2 ) {
 		Com_Printf( "Usage: touchFile <file>\n" );
 		return;
 	}
 
-	fs_loadingMode = 1;
-
-	FS_FOpenFileRead_Internal( Cmd_Argv( 1 ), &f, qfalse, 0 );
-	if ( f ) {
-		FS_FCloseFile( f );
-	}
+	/* cmd_argv[1], not Cmd_Argv( 1 ): the folded inline copy allocates eax/ecx/edx differently */
+	FS_TouchFile( cmd_argv[1] );
 }
 
 
@@ -210,12 +148,11 @@ static char fs_loadedPakNames[BIG_INFO_STRING];             /* 0x008B7C48 */
 static char fs_loadedPakChecksums[BIG_INFO_STRING];         /* 0x008B9C48 */
 static char fs_buf[1024];                                   /* 0x008AF848 */
 
-static int fs_numServerReferencedPaks;
-static int fs_serverReferencedPaks[MAX_SEARCH_PATHS];
-static char *fs_serverReferencedPakNames[MAX_SEARCH_PATHS];
-
-static int fs_checksumFeed;
-static int fs_fakeChkSum;
+/* fs_numServerReferencedPaks (0x016358C4), fs_serverReferencedPaks[]
+ * (0x01629760), fs_serverReferencedPakNames[] (0x0162D780), fs_checksumFeed
+ * (0x0162D768) and fs_fakeChkSum (0x01631788) are the single retail globals
+ * defined in universal/com_files.c and declared extern in files_local.h.
+ * No file-local copies here: a static redefinition would hide them. */
 
 extern char *fs_serverPakNames[];
 
@@ -242,7 +179,8 @@ qboolean FS_SV_FileExists( const char *file ) {
 	FILE *f;
 
 	FS_BuildOSPath3( fs_homepath->string, file, "", testpath, 0 );
-	testpath[strlen( testpath ) - 1] = '\0';
+	/* retail 0x0043A779 stores with no bound check; pointer form keeps modern /GS from adding a range-check fast-fail */
+	*( testpath + strlen( testpath ) - 1 ) = '\0';
 
 	f = fopen( testpath, "rb" );
 	if ( f ) {
@@ -258,9 +196,10 @@ fileHandle_t FS_SV_FOpenFileWrite( const char *filename ) {
 	fileHandle_t f;
 
 	FS_BuildOSPath3( fs_homepath->string, filename, "", ospath, 0 );
-	ospath[strlen( ospath ) - 1] = '\0';
+	/* retail 0x0043A839 stores with no bound check; pointer form keeps modern /GS from adding a range-check fast-fail */
+	*( ospath + strlen( ospath ) - 1 ) = '\0';
 
-	f = FS_HandleForFile();
+	f = FS_HandleForFile( 0 );
 	fsh[f].zipFile = qfalse;
 
 	if ( fs_debug->integer ) {
@@ -274,8 +213,7 @@ fileHandle_t FS_SV_FOpenFileWrite( const char *filename ) {
 	Com_DPrintf( "writing to: %s\n", ospath );
 	fsh[f].handleFiles.file.o = fopen( ospath, "wb" );
 
-	strncpy( fsh[f].name, filename, sizeof( fsh[f].name ) - 1 );
-	fsh[f].name[sizeof( fsh[f].name ) - 1] = '\0';
+	Q_strncpyz( fsh[f].name, filename, sizeof( fsh[f].name ) );
 
 	fsh[f].handleSync = qfalse;
 
@@ -290,14 +228,15 @@ int FS_SV_FOpenFileRead( const char *filename, fileHandle_t *fp ) {
 	char ospath[MAX_OSPATH];
 	fileHandle_t f;
 
-	f = FS_HandleForFile();
+	f = FS_HandleForFile( 0 );
 	fsh[f].zipFile = qfalse;
 
-	strncpy( fsh[f].name, filename, sizeof( fsh[f].name ) - 1 );
-	fsh[f].name[sizeof( fsh[f].name ) - 1] = '\0';
+	Q_strncpyz( fsh[f].name, filename, sizeof( fsh[f].name ) );
 
 	FS_BuildOSPath3( fs_homepath->string, filename, "", ospath, 0 );
-	ospath[strlen( ospath ) - 1] = '\0';
+	/* retail 0x0043A98F (and 0x0043AA2F, 0x0043AAB7 below) stores with no bound check; pointer
+	   form keeps modern /GS from adding a range-check fast-fail */
+	*( ospath + strlen( ospath ) - 1 ) = '\0';
 
 	if ( fs_debug->integer ) {
 		Com_Printf( "FS_SV_FOpenFileRead (fs_homepath): %s\n", ospath );
@@ -307,10 +246,9 @@ int FS_SV_FOpenFileRead( const char *filename, fileHandle_t *fp ) {
 	fsh[f].handleSync = qfalse;
 
 	if ( !fsh[f].handleFiles.file.o ) {
-		if ( !fs_homepath->string || !fs_basepath->string
-			 || Q_stricmpn( fs_homepath->string, fs_basepath->string, 99999 ) ) {
+		if ( Q_stricmp( fs_homepath->string, fs_basepath->string ) ) {
 			FS_BuildOSPath3( fs_basepath->string, filename, "", ospath, 0 );
-			ospath[strlen( ospath ) - 1] = '\0';
+			*( ospath + strlen( ospath ) - 1 ) = '\0';
 
 			if ( fs_debug->integer ) {
 				Com_Printf( "FS_SV_FOpenFileRead (fs_basepath): %s\n", ospath );
@@ -327,7 +265,7 @@ int FS_SV_FOpenFileRead( const char *filename, fileHandle_t *fp ) {
 
 	if ( !fsh[f].handleFiles.file.o ) {
 		FS_BuildOSPath3( fs_cdpath->string, filename, "", ospath, 0 );
-		ospath[strlen( ospath ) - 1] = '\0';
+		*( ospath + strlen( ospath ) - 1 ) = '\0';
 
 		if ( fs_debug->integer ) {
 			Com_Printf( "FS_SV_FOpenFileRead (fs_cdpath) : %s\n", ospath );
@@ -355,8 +293,9 @@ void FS_SV_Rename( const char *from, const char *to ) {
 
 	FS_BuildOSPath3( fs_homepath->string, from, "", from_ospath, 0 );
 	FS_BuildOSPath3( fs_homepath->string, to, "", to_ospath, 0 );
-	from_ospath[strlen( from_ospath ) - 1] = '\0';
-	to_ospath[strlen( to_ospath ) - 1] = '\0';
+	/* retail 0x0043AB9C / 0x0043ABB9 store with no bound check; pointer form keeps /GS range check out */
+	*( from_ospath + strlen( from_ospath ) - 1 ) = '\0';
+	*( to_ospath + strlen( to_ospath ) - 1 ) = '\0';
 
 	if ( fs_debug->integer ) {
 		Com_Printf( "FS_SV_Rename: %s --> %s\n", from_ospath, to_ospath );
@@ -376,7 +315,8 @@ char *FS_ShiftStr( const char *string, int shift ) {
 	for ( i = 0 ; i < l ; i++ ) {
 		fs_buf[i] = (char) ( string[i] + shift );
 	}
-	fs_buf[i] = '\0';
+	/* retail 0x0043AC86 stores with no bound check; pointer form keeps /GS range check out */
+	*( fs_buf + i ) = '\0';
 
 	return fs_buf;
 }
@@ -464,21 +404,22 @@ int FS_FileIsInPAK( const char *filename, int *pChecksum ) {
 			hash = FS_HashFileName( filename, search->pack->hashSize );
 		}
 
-		if ( search->pack ) {
-			pak = search->pack;
-
-			if ( pak->hashTable[hash] && FS_PakIsPure( pak ) ) {
-				pakFile = pak->hashTable[hash];
-				do {
-					if ( !FS_FilenameCompare( pakFile->name, filename ) ) {
-						if ( pChecksum ) {
-							*pChecksum = pak->pure_checksum;
-						}
-						return 1;
-					}
-					pakFile = pakFile->next;
-				} while ( pakFile );
+		if ( search->pack && search->pack->hashTable[hash] ) {
+			if ( !FS_PakIsPure( search->pack ) ) {
+				continue;
 			}
+
+			pak = search->pack;
+			pakFile = pak->hashTable[hash];
+			do {
+				if ( !FS_FilenameCompare( pakFile->name, filename ) ) {
+					if ( pChecksum ) {
+						*pChecksum = pak->pure_checksum;
+					}
+					return 1;
+				}
+				pakFile = pakFile->next;
+			} while ( pakFile );
 		}
 	}
 
@@ -543,18 +484,6 @@ char **Sys_ConcatenateFileLists( char **list0, char **list1, char **list2 ) {
 	return cat;
 }
 
-static void FS_FreeSysFileList( char **list ) {
-	char **p;
-
-	if ( !list ) {
-		return;
-	}
-	for ( p = list ; *p ; p++ ) {
-		free( *p );
-	}
-	free( list );
-}
-
 /* ---- FS_GetModList  0x0043B030 ---- VERIFIED */
 int FS_GetModList( char *listbuf, int bufsize ) {
 	int nMods, i, j, nTotal, nLen, nPaks, nPotential, nDescLen;
@@ -588,19 +517,17 @@ int FS_GetModList( char *listbuf, int bufsize ) {
 		if ( i != 0 ) {
 			bDrop = qfalse;
 			for ( j = 0 ; j < i ; j++ ) {
-				if ( pFiles[j] && name && !Q_stricmpn( pFiles[j], name, 99999 ) ) {
+				if ( Q_stricmp( pFiles[j], name ) == 0 ) {
 					bDrop = qtrue;
 					break;
 				}
 			}
-			if ( bDrop ) {
-				continue;
-			}
-		} else if ( bDrop ) {
+		}
+		if ( bDrop ) {
 			continue;
 		}
 
-		if ( name && !Q_stricmpn( name, "main", 99999 ) ) {
+		if ( !Q_stricmp( name, "main" ) ) {
 			continue;
 		}
 		if ( !Q_stricmpn( name, ".", 1 ) ) {
@@ -610,19 +537,19 @@ int FS_GetModList( char *listbuf, int bufsize ) {
 		FS_BuildOSPath3( fs_basepath->string, name, "", fs_path, 0 );
 		nPaks = 0;
 		pPaks = Sys_ListFiles( fs_path, ".pk3", NULL, &nPaks, qfalse );
-		FS_FreeSysFileList( pPaks );
+		Sys_FreeFileList( pPaks );
 
 		if ( nPaks <= 0 ) {
 			FS_BuildOSPath3( fs_cdpath->string, name, "", fs_path, 0 );
 			nPaks = 0;
 			pPaks = Sys_ListFiles( fs_path, ".pk3", NULL, &nPaks, qfalse );
-			FS_FreeSysFileList( pPaks );
+			Sys_FreeFileList( pPaks );
 		}
 		if ( nPaks <= 0 ) {
 			FS_BuildOSPath3( fs_homepath->string, name, "", fs_path, 0 );
 			nPaks = 0;
 			pPaks = Sys_ListFiles( fs_path, ".pk3", NULL, &nPaks, qfalse );
-			FS_FreeSysFileList( pPaks );
+			Sys_FreeFileList( pPaks );
 		}
 		if ( nPaks <= 0 ) {
 			continue;
@@ -641,7 +568,8 @@ int FS_GetModList( char *listbuf, int bufsize ) {
 			Com_Memset( descPath, 0, sizeof( descPath ) );
 			nDescLen = fread( descPath, 1, 48, file );
 			if ( nDescLen >= 0 ) {
-				descPath[nDescLen] = '\0';
+				/* retail 0x0043B39A stores with no bound check; pointer form keeps modern /GS from adding a range-check fast-fail */
+				*( descPath + nDescLen ) = '\0';
 			}
 			FS_FCloseFile( descHandle );
 		} else {
@@ -649,18 +577,19 @@ int FS_GetModList( char *listbuf, int bufsize ) {
 		}
 		nDescLen = strlen( descPath ) + 1;
 
-		if ( nTotal + nLen + nDescLen + 2 >= bufsize ) {
+		if ( nTotal + nLen + 1 + nDescLen + 1 < bufsize ) {
+			strcpy( listbuf, name );
+			listbuf += nLen;
+			strcpy( listbuf, descPath );
+			listbuf += nDescLen;
+			nTotal += nLen + nDescLen;
+			nMods++;
+		} else {
 			break;
 		}
-
-		strcpy( listbuf, name );
-		strcpy( listbuf + nLen, descPath );
-		listbuf += nLen + nDescLen;
-		nTotal += nLen + nDescLen;
-		nMods++;
 	}
 
-	FS_FreeSysFileList( pFiles );
+	Sys_FreeFileList( pFiles );
 
 	return nMods;
 }
@@ -693,15 +622,14 @@ qboolean FS_idPak( const char *pak, const char *base ) {
 	}
 
 	strcpy( teststr, pak );
-	teststr[( p - pak ) + 10] = '\0';
+	/* retail 0x0043B785 stores with no bound check; pointer form keeps /GS range check out */
+	*( teststr + ( p - pak ) + 10 ) = '\0';
 	if ( FS_FilenameCompare( teststr, va( "%s/localized_", base ) ) ) {
 		return qfalse;
 	}
 
 	strcpy( teststr, p + 10 );
-	for ( i = 0 ; teststr[i] ; i++ ) {
-		teststr[i] = (char) tolower( teststr[i] );
-	}
+	Q_strlwr( teststr );
 
 	for ( i = 0 ; i < NUM_ID_PAKS ; i++ ) {
 		if ( strstr( teststr, va( "_pak%d", i ) ) ) {
@@ -789,11 +717,11 @@ void FS_SetRestrictions( void ) {
 	Cvar_Set2( "fs_restrict", "1", qtrue );
 	Com_Printf( "\nRunning in restricted demo mode.\n\n" );
 
-	Com_Printf( "FS_SetRestrictions: demomain restart skipped -- FS_Startup is static in universal/com_files.c\n" );
+	FS_Shutdown( qfalse );
+	FS_Startup( "demomain" );
 
 	for ( sp = fs_searchpaths ; sp ; sp = sp->next ) {
-		if ( sp->localized && ( fs_ignoreLocalized->integer
-								|| sp->language != cl_language->integer ) ) {
+		if ( !FS_UseSearchPath( sp ) ) {
 			continue;
 		}
 		if ( sp->pack ) {
@@ -878,8 +806,8 @@ const char *FS_ReferencedPakChecksums( void ) {
 		if ( !search->pack ) {
 			continue;
 		}
-		if (
-			 Q_stricmpn( search->pack->pakGamename, "main", 4 ) || 1 ) {
+		/* retail tests the address of referenced (always true), so Q_stricmpn never runs */
+		if ( search->pack->referenced || Q_stricmpn( search->pack->pakGamename, "main", 4 ) ) {
 			Q_strcat( fs_referencedPakChecksums, sizeof( fs_referencedPakChecksums ),
 					  va( "%i ", search->pack->checksum ) );
 		}
@@ -898,7 +826,8 @@ const char *FS_ReferencedPakNames( void ) {
 		if ( !search->pack ) {
 			continue;
 		}
-		if ( Q_stricmpn( search->pack->pakGamename, "main", 4 ) || 1 ) {
+		/* retail tests the address of referenced (always true), so Q_stricmpn never runs */
+		if ( search->pack->referenced || Q_stricmpn( search->pack->pakGamename, "main", 4 ) ) {
 			if ( fs_referencedPakNames[0] ) {
 				Q_strcat( fs_referencedPakNames, sizeof( fs_referencedPakNames ), " " );
 			}
@@ -926,10 +855,12 @@ const char *FS_ReferencedPakPureChecksums( void ) {
 
 	for ( nFlags = 2 ; nFlags >= 0 ; nFlags-- ) {
 		if ( nFlags == 0 ) {
+			/* retail 0x0043C090/0x0043C0A9 store with no bound check; pointer form keeps modern /GS
+			   from adding a range-check fast-fail */
 			l = strlen( fs_referencedPakPureChecksums );
-			fs_referencedPakPureChecksums[l + 1] = '\0';
+			*( fs_referencedPakPureChecksums + l + 1 ) = '\0';
 			l = strlen( fs_referencedPakPureChecksums );
-			fs_referencedPakPureChecksums[l + 2] = '\0';
+			*( fs_referencedPakPureChecksums + l + 2 ) = '\0';
 			fs_referencedPakPureChecksums[strlen( fs_referencedPakPureChecksums )] = '@';
 			fs_referencedPakPureChecksums[strlen( fs_referencedPakPureChecksums )] = ' ';
 		}
@@ -938,7 +869,7 @@ const char *FS_ReferencedPakPureChecksums( void ) {
 			if ( !search->pack || search->localized ) {
 				continue;
 			}
-			if ( !( (const byte *) &search->pack->referenced )[nFlags] ) {
+			if ( !search->pack->referenced[nFlags] ) {
 				continue;
 			}
 
@@ -969,71 +900,60 @@ const char *FS_ReferencedPakPureChecksums( void ) {
 
 /* ---- FS_PureServerSetLoadedPaks  0x0043C290 ---- VERIFIED */
 void FS_PureServerSetLoadedPaks( const char *pakSums, const char *pakNames ) {
-	int i, j, c, d, len;
+	int i, j, c, d;
 	int newPaks[MAX_SEARCH_PATHS];
 	char *newPakNames[MAX_SEARCH_PATHS];
-	const char *s;
-	char *p;
 
 	Cmd_TokenizeString2( pakSums, 0 );
+	/* the clamp re-reads Cmd_Argc(): retail keeps the argc load apart from c */
 	c = Cmd_Argc();
-	if ( c > MAX_SEARCH_PATHS ) {
+	if ( Cmd_Argc() > MAX_SEARCH_PATHS ) {
 		c = MAX_SEARCH_PATHS;
 	}
 	for ( i = 0 ; i < c ; i++ ) {
-		s = ( i < Cmd_Argc() ) ? Cmd_Argv( i ) : "";
-		newPaks[i] = atoi( s );
+		newPaks[i] = atoi( Cmd_Argv( i ) );
 	}
 
 	Cmd_TokenizeString2( pakNames, 0 );
 	d = Cmd_Argc();
-	if ( d > MAX_SEARCH_PATHS ) {
+	if ( Cmd_Argc() > MAX_SEARCH_PATHS ) {
 		d = MAX_SEARCH_PATHS;
 	}
 	for ( i = 0 ; i < d ; i++ ) {
-		s = ( i < Cmd_Argc() ) ? Cmd_Argv( i ) : "";
-		len = strlen( s ) + 1;
-		p = malloc( len );
-		if ( !p ) {
-			Sys_OutOfMemoryError();
-		}
-		Com_Memset( p, 0, len );
-		strcpy( p, s );
-		newPakNames[i] = p;
+		newPakNames[i] = CopyStringInternal( Cmd_Argv( i ) );
 	}
 
 	if ( c != d ) {
 		Com_Error( ERR_DROP, "pak sum/name mismatch" );
 	}
 
-	if ( c == fs_numServerPaks && c > 0 ) {
+	if ( c == fs_numServerPaks ) {
 		for ( i = 0 ; i < c ; i++ ) {
-			for ( j = 0 ; j < fs_numServerPaks ; j++ ) {
-				if ( newPaks[i] == fs_serverPaks[j]
-					 && newPakNames[i] && fs_serverPakNames[j]
-					 && !Q_stricmp( newPakNames[i], fs_serverPakNames[j] ) ) {
-					break;
-				}
-			}
-			if ( j >= fs_numServerPaks ) {
+			/* bound test inside the body: retail's j loop is not rotated */
+			for ( j = 0 ; ; j++ ) {
+				if ( j >= fs_numServerPaks ) {
 #ifndef DEDICATED
-				MSS_StopSounds( 8 );
+					MSS_StopSounds( 8 );
 #endif
 
-				for ( j = 0 ; j < fs_numServerPaks ; j++ ) {
-					if ( fs_serverPakNames[j] ) {
-						free( fs_serverPakNames[j] );
+					for ( j = 0 ; j < fs_numServerPaks ; j++ ) {
+						if ( fs_serverPakNames[j] ) {
+							free( fs_serverPakNames[j] );
+						}
+						fs_serverPakNames[j] = NULL;
 					}
-					fs_serverPakNames[j] = NULL;
-				}
 
-				fs_numServerPaks = c;
-				if ( c ) {
-					Com_DPrintf( "Connected to a pure server.\n" );
-					Com_Memcpy( fs_serverPaks, newPaks, 4 * fs_numServerPaks );
-					Com_Memcpy( fs_serverPakNames, newPakNames, 4 * fs_numServerPaks );
+					fs_numServerPaks = c;
+					if ( fs_numServerPaks ) {
+						Com_DPrintf( "Connected to a pure server.\n" );
+						Com_Memcpy( fs_serverPaks, newPaks, 4 * fs_numServerPaks );
+						Com_Memcpy( fs_serverPakNames, newPakNames, 4 * fs_numServerPaks );
+					}
+					return;
 				}
-				return;
+				if ( newPaks[i] == fs_serverPaks[j] && !Q_stricmp( newPakNames[i], fs_serverPakNames[j] ) ) {
+					break;
+				}
 			}
 		}
 	}
@@ -1045,62 +965,37 @@ void FS_PureServerSetLoadedPaks( const char *pakSums, const char *pakNames ) {
 
 /* ---- FS_PureServerSetReferencedPaks  0x0043C530 ---- VERIFIED */
 void FS_PureServerSetReferencedPaks( const char *pakSums, const char *pakNames ) {
-	int i, c, d, len;
-	const char *s;
-	char *p;
+	int i, c, d;
 
 	Cmd_TokenizeString2( pakSums, 0 );
+	/* the clamp re-reads Cmd_Argc(): retail keeps the argc load apart from c */
 	c = Cmd_Argc();
-	if ( c > MAX_SEARCH_PATHS ) {
+	if ( Cmd_Argc() > MAX_SEARCH_PATHS ) {
 		c = MAX_SEARCH_PATHS;
 	}
 
-	for ( i = 0 ; i < fs_numServerReferencedPaks ; i++ ) {
-		if ( fs_serverReferencedPakNames[i] ) {
-			free( fs_serverReferencedPakNames[i] );
-		}
-		fs_serverReferencedPakNames[i] = NULL;
-	}
-	fs_numServerReferencedPaks = 0;
+	FS_ShutdownServerReferencedPaks();
 
 	for ( i = 0 ; i < c ; i++ ) {
-		s = ( i < Cmd_Argc() ) ? Cmd_Argv( i ) : "";
-		fs_serverReferencedPaks[i] = atoi( s );
+		fs_serverReferencedPaks[i] = atoi( Cmd_Argv( i ) );
 	}
 
-	if ( !pakNames || !*pakNames ) {
-		if ( c ) {
+	if ( pakNames && *pakNames ) {
+		Cmd_TokenizeString2( pakNames, 0 );
+		d = Cmd_Argc();
+		if ( d > MAX_SEARCH_PATHS ) {
+			d = MAX_SEARCH_PATHS;
+		}
+
+		if ( c != d ) {
 			Com_Error( ERR_DROP, "pak sum/name mismatch" );
 		}
-		fs_numServerReferencedPaks = c;
-		return;
-	}
 
-	Cmd_TokenizeString2( pakNames, 0 );
-	d = Cmd_Argc();
-	if ( d > MAX_SEARCH_PATHS ) {
-		d = MAX_SEARCH_PATHS;
-	}
-
-	if ( c != d ) {
-		Com_Error( ERR_DROP, "pak sum/name mismatch" );
-	}
-
-	if ( d <= 0 ) {
-		fs_numServerReferencedPaks = c;
-		return;
-	}
-
-	for ( i = 0 ; i < d ; i++ ) {
-		s = ( i < Cmd_Argc() ) ? Cmd_Argv( i ) : "";
-		len = strlen( s ) + 1;
-		p = malloc( len );
-		if ( !p ) {
-			Sys_OutOfMemoryError();
+		for ( i = 0 ; i < d ; i++ ) {
+			fs_serverReferencedPakNames[i] = CopyStringInternal( Cmd_Argv( i ) );
 		}
-		Com_Memset( p, 0, len );
-		strcpy( p, s );
-		fs_serverReferencedPakNames[i] = p;
+	} else if ( c ) {
+		Com_Error( ERR_DROP, "pak sum/name mismatch" );
 	}
 
 	fs_numServerReferencedPaks = c;

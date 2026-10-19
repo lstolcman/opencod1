@@ -1,21 +1,4 @@
-/*
- * @fidelity: likely
- *
- * g_cmds_mp.c -- the client command unit of the CoD 1.1 multiplayer game
- * module (game_mp_x86.dll, imagebase 0x20000000).
- *
- * RTCW's game/g_cmds.c is the ancestor and most of the file is that text with
- * CoD's localized server commands substituted for RTCW's "print" strings: the
- * scoreboard message, the cheat commands, the spectator follow cycle, the
- * say/tell/voice family, callvote/vote (which in RTCW MP already doubles as
- * the complaint handler) and ClientCommand's if-chain.  Cmd_Activate_f and
- * Cmd_MenuResponse_f are CoD's own.
- *
- * The \x14 and \x15 bytes inside the message strings are the localization
- * system's field separators, exactly as they sit in .rdata.
- *
- * Function order is binary order (0x2001D150 .. 0x2001FB60).
- */
+// g_cmds_mp.c -- client commands
 
 #include <ctype.h>
 #include <stdio.h>
@@ -24,64 +7,8 @@
 
 #include "g_local.h"
 
-/*
- * sess.voteCount is read exactly once in the whole module -- Cmd_CallVote_f
- * 0x2001EBB9, `>= MAX_VOTE_COUNT` -- and never written, so the cap is dead.
- * sess.complaints is incremented and tested against g_complaintlimit by
- * Cmd_Vote_f (0x2001F454 / 0x2001F45B / 0x2001F463); it is NOT a teamVoteCount.
- */
-
-/* playerState_t.stats[] indices; g_items_mp.c and g_client_fields_mp.c define
-   the same two locally until q_shared.h carries the enum. */
-#define STAT_HEALTH             0
-#define STAT_MAX_HEALTH         2
-
-#ifndef FL_NOTARGET
-#define FL_NOTARGET             0x00000002      /* Cmd_Notarget_f 0x2001DD40 */
-#endif
-
-#ifndef EXEC_APPEND
-#define EXEC_APPEND             2
-#endif
-
-/* Configstrings this unit writes.  CS_FOGVARS: G_setfog (0x2001D638); the
-   vote block: Cmd_CallVote_f (0x2001F25E..0x2001F2A7); CS_SCRIPTMENUS:
-   Cmd_MenuResponse_f (0x2001FAE2), and 1180 + 32 lands
-   exactly on the hint-string block that precedes CS_LOCALIZED_STRINGS 1244. */
-#define CS_FOGVARS              12
-#define CS_VOTE_TIME            15
-#define CS_VOTE_STRING          16
-#define CS_VOTE_YES             17
-#define CS_VOTE_NO              18
-#define CS_SCRIPTMENUS          1180
-#define CS_SCRIPTMENUS_COUNT    32
-
-/* playerState_t.pm_flags: PMF_FOLLOW is RTCW's bit unchanged.  0x20 is the
-   aim-down-sight flag (bg_pmove.c); StopFollowing drops both
-   (0x2001E0BD `and eax, 0FFFEFFDFh`). */
-#define PMF_FOLLOW              0x00010000
-#define PMF_ADS                 0x00000020
-
-/* playerState_t.eFlags.  EF_VOTED is RTCW's bit (Cmd_CallVote_f 0x2001F243,
-   Cmd_Vote_f 0x2001F568).  The 0xC000 pair StopFollowing clears and
-   Cmd_Activate_f tests has no recovered name. */
-#define EF_VOTED                0x00020000
-#define EF_ACTIVATE_MASK        0x0000C000
-
-/* entityState_t.eType values Cmd_Activate_f dispatches on. */
-#define ET_TRIGGER              3
-#define ET_TURRET               11
-
-/* The content mask StopFollowing's chase-camera trace uses (0x2001DF97).  It
-   is bg_pmove.c's MASK_PLAYERSOLID minus CONTENTS_BODY, 0x80 and 0x100 -- the
-   same value BG_CheckProneValid uses; no MASK_* name is recovered, so this
-   one is inferred. */
+// what the camera collides with when a spectator stops following
 #define MASK_SPECTATOR_CAMERA   0x00810011
-
-/* RTCW's chat modes and colour codes, unchanged. */
-#define SAY_ALL                 0
-#define SAY_TEAM                1
-#define SAY_TELL                2
 
 #define Q_COLOR_ESCAPE          '^'
 #define COLOR_GREEN             '2'
@@ -92,21 +19,13 @@
 
 #define MAX_SAY_TEXT            150
 
-/* RTCW's cap on how many votes one client may call in a map. */
-#define MAX_VOTE_COUNT          3
+#define MAX_VOTE_COUNT          3       // votes a client may call per map
 
-/* RTCW's VOTE_TIME.  CoD folds it into the store, so level.voteTime holds the
-   absolute deadline rather than the moment the vote started -- which is why
-   CheckVote (g_main_mp.c) tests `level.time - level.voteTime >= 0` with no
-   constant of its own (0x2001F1EF/0x2001F1FC). */
-#define VOTE_TIME               30000
+#define VOTE_TIME               30000   // 30 seconds before vote times out
 
-/* G_Voice's spam window (0x2001E8AD) and its per-chat charge (0x2001E8F2). */
+// voice chat spam protection
 #define VOICE_CHAT_SQUELCH_MAX  30000
 #define VOICE_CHAT_SQUELCH_SPAN 34000
-
-/* Q_stricmp is Q3's `Q_stricmpn( s1, s2, 99999 )`; the retail build inlines it
-   everywhere, so the two spellings below are the same call. */
 
 /*
 ==================
@@ -160,6 +79,8 @@ void DeathmatchScoreboardMessage( gentity_t *ent ) {
 /*
 ==================
 Cmd_Score_f
+
+Request current scoreboard information
 ==================
 */
 void Cmd_Score_f( gentity_t *ent ) {
@@ -172,7 +93,7 @@ CheatsOk
 ==================
 */
 qboolean CheatsOk( gentity_t *ent ) {
-	if ( !sv_cheats.integer ) {
+	if ( !g_cheats.integer ) {
 		trap_SendServerCommand( ent - g_entities, 0, va( "e \"GAME_CHEATSNOTENABLED\"" ) );
 		return qfalse;
 	}
@@ -190,7 +111,7 @@ ConcatArgs
 */
 char *ConcatArgs( int start ) {
 	int i, c, tlen;
-	static char line[MAX_STRING_CHARS];      /* 0x20089308 */
+	static char line[MAX_STRING_CHARS];
 	int len;
 	char arg[MAX_STRING_CHARS];
 
@@ -211,7 +132,8 @@ char *ConcatArgs( int start ) {
 		}
 	}
 
-	line[len] = 0;
+	// keep: matches original codegen
+	*( line + len ) = 0;
 
 	return line;
 }
@@ -291,26 +213,24 @@ int ClientNumberFromString( gentity_t *to, char *s ) {
 ==================
 G_setfog
 
-The fog configstring is Scr_SetFog's "%g %g %g %g %g %g %.0f": near distance,
-far distance, a third scalar, red, green, blue and the transition time in
-milliseconds.  Only the far distance and that third scalar are read back here.
-The retail build keeps the seven values in separate stack slots, not the array
-spelled below.
+The fog string is near distance, far distance, density, red, green, blue
+and transition time in milliseconds.  Sets the distance at which the fog
+becomes opaque.
 ==================
 */
 void G_setfog( const char *fogString ) {
-	float values[7];
+	float fogNear, fogFar, fogScalar, fogTime;
+	vec3_t fogColor;
 
 	trap_SetConfigstring( CS_FOGVARS, fogString );
 
 	level.fogOpaqueDist = 3.402823466e+38F;
 	level.fogOpaqueDistSq = 3.402823466e+38F;
 
-	if ( sscanf( fogString, "%f %f %f %f %f %f %f",
-				 &values[0], &values[1], &values[2], &values[3],
-				 &values[4], &values[5], &values[6] ) == 7
-		 && values[2] >= 1.0 ) {
-		level.fogOpaqueDist = values[1] * 0.828f;
+	if ( sscanf( fogString, "%f %f %f %f %f %f %f", &fogNear, &fogFar, &fogScalar,
+				 &fogColor[0], &fogColor[1], &fogColor[2], &fogTime ) == 7
+		 && fogScalar >= 1.0f ) {
+		level.fogOpaqueDist = fogFar * 0.828f;
 		level.fogOpaqueDistSq = level.fogOpaqueDist * level.fogOpaqueDist;
 	}
 }
@@ -338,6 +258,7 @@ void Cmd_Give_f( gentity_t *ent ) {
 	qboolean give_all;
 	gentity_t   *it_ent;
 	int amount;
+	const char  *classname;
 
 	if ( !CheatsOk( ent ) ) {
 		return;
@@ -405,7 +326,7 @@ void Cmd_Give_f( gentity_t *ent ) {
 		return;
 	}
 
-	// spawn a dropped item of that name and let the pickup code have it
+	// spawn a specific item right on the player
 	it = BG_FindItem( name );
 	if ( !it ) {
 		return;
@@ -415,7 +336,10 @@ void Cmd_Give_f( gentity_t *ent ) {
 
 	it_ent = G_Spawn();
 	VectorCopy( ent->r.currentOrigin, it_ent->r.currentOrigin );
-	G_SetConstString( &it_ent->classname, it->classname );
+	// keep: matches original codegen
+	classname = it->classname;
+	Scr_SetString( &it_ent->classname, 0 );
+	it_ent->classname = SL_GetString( classname, 0 );
 	G_SpawnItem( it_ent, it );
 
 	it_ent->active = qtrue;
@@ -433,7 +357,7 @@ void Cmd_Give_f( gentity_t *ent ) {
 ==================
 Cmd_Take_f
 
-The inverse of Cmd_Give_f; CoD's own.
+Take items from a client
 ==================
 */
 void Cmd_Take_f( gentity_t *ent ) {
@@ -532,6 +456,10 @@ void Cmd_Take_f( gentity_t *ent ) {
 /*
 ==================
 Cmd_God_f
+
+Sets client to godmode
+
+argv(0) god
 ==================
 */
 void Cmd_God_f( gentity_t *ent ) {
@@ -554,6 +482,10 @@ void Cmd_God_f( gentity_t *ent ) {
 /*
 ==================
 Cmd_Notarget_f
+
+Sets client to notarget
+
+argv(0) notarget
 ==================
 */
 void Cmd_Notarget_f( gentity_t *ent ) {
@@ -576,6 +508,8 @@ void Cmd_Notarget_f( gentity_t *ent ) {
 /*
 ==================
 Cmd_Noclip_f
+
+argv(0) noclip
 ==================
 */
 void Cmd_Noclip_f( gentity_t *ent ) {
@@ -598,6 +532,8 @@ void Cmd_Noclip_f( gentity_t *ent ) {
 /*
 ==================
 Cmd_UFO_f
+
+argv(0) ufo
 ==================
 */
 void Cmd_UFO_f( gentity_t *ent ) {
@@ -629,7 +565,7 @@ void Cmd_Kill_f( gentity_t *ent ) {
 	ent->flags &= ~FL_GODMODE;
 	ent->health = 0;
 	ent->client->ps.stats[STAT_HEALTH] = 0;
-	player_die( ent, ent, ent, 100000, MOD_SUICIDE, 0, NULL, 0 );
+	player_die( ent, ent, ent, 100000, MOD_SUICIDE, 0, NULL, HITLOC_NONE );
 }
 
 /*
@@ -637,11 +573,12 @@ void Cmd_Kill_f( gentity_t *ent ) {
 StopFollowing
 
 If the client being followed leaves the game, or you just want to drop
-to free floating spectator mode.  CoD drops the camera behind and above
-the followed player instead of RTCW's plain flag clear.
+to free floating spectator mode.  The camera is dropped behind and above
+the player that was being followed.
 =================
 */
 void StopFollowing( gentity_t *ent ) {
+	gclient_t *client;
 	vec3_t origin;
 	vec3_t angles;
 	vec3_t end;
@@ -649,49 +586,54 @@ void StopFollowing( gentity_t *ent ) {
 	vec3_t mins, maxs;
 	trace_t trace;
 
-	ent->client->sess.forceSpectatorClient = -1;
-	ent->client->spectatorClient = -1;
+	client = ent->client;
+	client->sess.forceSpectatorClient = -1;
+	client->spectatorClient = -1;
 
-	if ( !( ent->client->ps.pm_flags & PMF_FOLLOW ) ) {
+	if ( !( client->ps.pm_flags & PMF_FOLLOW ) ) {
 		return;
 	}
 
-	VectorCopy( ent->client->ps.viewangles, angles );
+	VectorCopy( client->ps.viewangles, angles );
 	AngleVectors( angles, forward, NULL, up );
-	angles[0] = angles[0] + 15.0f;
+	angles[PITCH] = angles[PITCH] + 15.0f;
 
-	VectorCopy( ent->client->ps.origin, origin );
-	origin[2] = origin[2] + ent->client->ps.viewHeightCurrent;
-	AddLeanToPosition( origin, ent->client->ps.viewangles[1],
+	VectorCopy( client->ps.origin, origin );
+	origin[2] = origin[2] + client->ps.viewHeightCurrent;
+	AddLeanToPosition( origin, ent->client->ps.viewangles[YAW],
 					   ent->client->ps.leanf, 16.0, 20.0 );
+
+	end[0] = origin[0] - forward[0] * 40.0f;
+	end[1] = origin[1] - forward[1] * 40.0f;
+	end[2] = origin[2] - forward[2] * 40.0f;
 
 	mins[0] = -8.0;  mins[1] = -8.0;  mins[2] = -8.0;
 	maxs[0] = 8.0;   maxs[1] = 8.0;   maxs[2] = 8.0;
 
-	end[0] = ( origin[0] - forward[0] * 40.0f ) + up[0] * 10.0f;
-	end[1] = ( origin[1] - forward[1] * 40.0f ) + up[1] * 10.0f;
-	end[2] = ( origin[2] - forward[2] * 40.0f ) + up[2] * 10.0f;
+	end[0] = end[0] + up[0] * 10.0f;
+	end[1] = end[1] + up[1] * 10.0f;
+	end[2] = end[2] + up[2] * 10.0f;
 
 	trap_TraceCapsule( &trace, origin, mins, maxs, end, ENTITYNUM_NONE,
 					   MASK_SPECTATOR_CAMERA );
 	VectorCopy( trace.endpos, origin );
 
-	ent->client->ps.viewlocked = 0;
-	ent->client->ps.viewlocked_entNum = ENTITYNUM_NONE;
-	ent->client->ps.gunfx = 0;
-	ent->client->ps.fWeaponPosFrac = 0;
-	ent->client->ps.clientNum = ent - g_entities;
-	ent->client->ps.pm_flags &= ~( PMF_FOLLOW | PMF_ADS );
-	ent->client->ps.eFlags &= ~EF_ACTIVATE_MASK;
+	client->ps.viewlocked = 0;
+	client->ps.viewlocked_entNum = ENTITYNUM_NONE;
+	client->ps.gunfx = 0;
+	client->ps.fWeaponPosFrac = 0;
+	client->ps.clientNum = ent - g_entities;
+	client->ps.eFlags &= ~EF_TURRET_ACTIVE;
+	client->ps.pm_flags &= ~( PMF_FOLLOW | PMF_ADS );
 
 	G_SetOrigin( ent, origin );
-	VectorCopy( origin, ent->client->ps.origin );
+	VectorCopy( origin, client->ps.origin );
 
 	SetClientViewAngle( ent, angles );
 
-	ent->client->ps.shellshockIndex = 0;
-	ent->client->ps.shellshockTime = 0;
-	ent->client->ps.shellshockDuration = 0;
+	client->ps.shellshockIndex = 0;
+	client->ps.shellshockTime = 0;
+	client->ps.shellshockDuration = 0;
 }
 
 /*
@@ -704,7 +646,6 @@ qboolean Cmd_FollowCycle_f( gentity_t *ent, int dir ) {
 	int original;
 	playerState_t ps;
 
-	// if they are playing a following spectator, back it up first
 	if ( dir != 1 && dir != -1 ) {
 		G_Error( "Cmd_FollowCycle_f: bad dir %i", dir );
 	}
@@ -727,13 +668,17 @@ qboolean Cmd_FollowCycle_f( gentity_t *ent, int dir ) {
 			clientnum = level.maxclients - 1;
 		}
 
-		if ( trap_GetArchivedClientInfo( clientnum, &ent->client->sess.archiveTime, &ps ) ) {
-			ent->client->spectatorClient = clientnum;
-			ent->client->sess.sessionState = STATE_SPECTATOR;
-			return qtrue;
+		if ( !trap_GetArchivedPlayerState( clientnum, &ent->client->sess.archiveTime, &ps ) ) {
+			continue;
 		}
+
+		// this is good, we can use it
+		ent->client->spectatorClient = clientnum;
+		ent->client->sess.sessionState = STATE_SPECTATOR;
+		return qtrue;
 	} while ( clientnum != original );
 
+	// leave it where it was
 	return qfalse;
 }
 
@@ -771,7 +716,7 @@ void G_SayTo( gentity_t *ent, gentity_t *other, int mode, int color,
 		return;
 	}
 
-	// the dead and the spectating do not reach the living
+	// the dead and spectators can't chat to the living
 	if ( !G_IsPlaying( ent ) && G_IsPlaying( other ) ) {
 		return;
 	}
@@ -800,6 +745,7 @@ void G_Say( gentity_t *ent, gentity_t *target, int mode, const char *chatText ) 
 	char prefix[64];
 	char location[64];
 	char text2[128];
+	// don't let text be too long for malicious reasons
 	char text[MAX_SAY_TEXT];
 	const char  *teamName;
 
@@ -815,10 +761,10 @@ void G_Say( gentity_t *ent, gentity_t *target, int mode, const char *chatText ) 
 
 	if ( ent->client->sess.sessionTeam == TEAM_SPECTATOR ) {
 		Com_sprintf( prefix, sizeof( prefix ), "\x15(\x14GAME_SPECTATOR\x15)" );
-	} else if ( ent->health > 0 ) {
-		Com_sprintf( prefix, sizeof( prefix ), "\x15" );
-	} else {
+	} else if ( ent->health <= 0 ) {
 		Com_sprintf( prefix, sizeof( prefix ), "\x15(\x14GAME_DEAD\x15)" );
+	} else {
+		Com_sprintf( prefix, sizeof( prefix ), "\x15" );
 	}
 
 	switch ( mode ) {
@@ -866,7 +812,7 @@ void G_Say( gentity_t *ent, gentity_t *target, int mode, const char *chatText ) 
 	}
 
 	// echo the text to the console
-	if ( dedicated.integer ) {
+	if ( g_dedicated.integer ) {
 		G_Printf( "%s%s\n", text2, text );
 	}
 
@@ -1013,7 +959,7 @@ void G_Voice( gentity_t *ent, gentity_t *target, int mode, const char *id,
 	}
 
 	// echo the text to the console
-	if ( dedicated.integer ) {
+	if ( g_dedicated.integer ) {
 		G_Printf( "voice: %s %s\n", ent->client->sess.name, id );
 	}
 
@@ -1049,8 +995,7 @@ void Cmd_Voice_f( gentity_t *ent, int mode, qboolean arg0, qboolean voiceonly ) 
 ==================
 Cmd_GameCommand_f
 
-Q3's quick-order command, with the localized string ids in place of the
-English orders -- including Q3's off-by-one bound test.
+Send one of the quick team orders to a player
 ==================
 */
 static const char *gc_orders[] = {
@@ -1076,6 +1021,7 @@ static void Cmd_GameCommand_f( gentity_t *ent ) {
 	if ( player < 0 || player >= MAX_CLIENTS ) {
 		return;
 	}
+	// keep: original bound test
 	if ( order < 0 || order > sizeof( gc_orders ) / sizeof( char * ) ) {
 		return;
 	}
@@ -1136,10 +1082,14 @@ void Cmd_CallVote_f( gentity_t *ent ) {
 		return;
 	}
 
-	if ( Q_stricmp( arg1, "map_restart" ) && Q_stricmp( arg1, "map_rotate" )
-		 && Q_stricmp( arg1, "typemap" ) && Q_stricmp( arg1, "map" )
-		 && Q_stricmp( arg1, "g_gametype" ) && Q_stricmp( arg1, "kick" )
-		 && Q_stricmp( arg1, "clientkick" ) ) {
+	if ( !Q_stricmp( arg1, "map_restart" ) ) {
+	} else if ( !Q_stricmp( arg1, "map_rotate" ) ) {
+	} else if ( !Q_stricmp( arg1, "typemap" ) ) {
+	} else if ( !Q_stricmp( arg1, "map" ) ) {
+	} else if ( !Q_stricmp( arg1, "g_gametype" ) ) {
+	} else if ( !Q_stricmp( arg1, "kick" ) ) {
+	} else if ( !Q_stricmp( arg1, "clientkick" ) ) {
+	} else {
 		trap_SendServerCommand( ent - g_entities, 0, "e \"GAME_INVALIDVOTESTRING\"" );
 		trap_SendServerCommand( ent - g_entities, 0,
 								"e \"GAME_VOTECOMMANDSARE\x15 map_restart, map_rotate, "
@@ -1174,21 +1124,26 @@ void Cmd_CallVote_f( gentity_t *ent ) {
 			return;
 		}
 
-		if ( !arg2[0] ) {
-			Com_sprintf( level.voteString, sizeof( level.voteString ), "map %s", arg3 );
-			Com_sprintf( level.voteDisplayString, sizeof( level.voteDisplayString ),
-						 "GAME_VOTE_MAP\x15%s", arg3 );
-		} else if ( !arg3[0] ) {
+		if ( arg3[0] ) {
+			if ( arg2[0] ) {
+				Com_sprintf( level.voteString, sizeof( level.voteString ),
+							 "g_gametype %s; map %s", arg2, arg3 );
+			} else {
+				Com_sprintf( level.voteString, sizeof( level.voteString ), "map %s", arg3 );
+			}
+			if ( arg2[0] ) {
+				Com_sprintf( level.voteDisplayString, sizeof( level.voteDisplayString ),
+							 "GAME_VOTE_GAMETYPE\x14%s\x15 - \x14GAME_VOTE_MAP\x15%s",
+							 Scr_GetGameTypeNameForScript( arg2 ), arg3 );
+			} else {
+				Com_sprintf( level.voteDisplayString, sizeof( level.voteDisplayString ),
+							 "GAME_VOTE_MAP\x15%s", arg3 );
+			}
+		} else {
 			Com_sprintf( level.voteString, sizeof( level.voteString ),
 						 "g_gametype %s; map_restart", arg2 );
 			Com_sprintf( level.voteDisplayString, sizeof( level.voteDisplayString ),
-						 "GAME_VOTE_GAMETYPE\x14%s", Scr_IsValidGameType( arg2 ) );
-		} else {
-			Com_sprintf( level.voteString, sizeof( level.voteString ),
-						 "g_gametype %s; map %s", arg2, arg3 );
-			Com_sprintf( level.voteDisplayString, sizeof( level.voteDisplayString ),
-						 "GAME_VOTE_GAMETYPE\x14%s\x15 - \x14GAME_VOTE_MAP\x15%s",
-						 Scr_IsValidGameType( arg2 ), arg3 );
+						 "GAME_VOTE_GAMETYPE\x14%s", Scr_GetGameTypeNameForScript( arg2 ) );
 		}
 	} else if ( !Q_stricmp( arg1, "g_gametype" ) ) {
 		if ( !Scr_IsValidGameType( arg2 ) ) {
@@ -1198,7 +1153,7 @@ void Cmd_CallVote_f( gentity_t *ent ) {
 		Com_sprintf( level.voteString, sizeof( level.voteString ),
 					 "%s %s; map_restart", arg1, arg2 );
 		Com_sprintf( level.voteDisplayString, sizeof( level.voteDisplayString ),
-					 "GAME_VOTE_GAMETYPE\x14%s", Scr_IsValidGameType( arg2 ) );
+					 "GAME_VOTE_GAMETYPE\x14%s", Scr_GetGameTypeNameForScript( arg2 ) );
 	} else if ( !Q_stricmp( arg1, "map_restart" ) ) {
 		Com_sprintf( level.voteString, sizeof( level.voteString ), "%s", arg1 );
 		Com_sprintf( level.voteDisplayString, sizeof( level.voteDisplayString ),
@@ -1211,11 +1166,7 @@ void Cmd_CallVote_f( gentity_t *ent ) {
 		Com_sprintf( level.voteString, sizeof( level.voteString ), "%s %s", arg1, arg2 );
 		Com_sprintf( level.voteDisplayString, sizeof( level.voteDisplayString ),
 					 "GAME_VOTE_MAP\x15%s", arg2 );
-	} else if ( Q_stricmp( arg1, "kick" ) && Q_stricmp( arg1, "clientkick" ) ) {
-		Com_sprintf( level.voteString, sizeof( level.voteString ), "%s \"%s\"", arg1, arg2 );
-		Com_sprintf( level.voteDisplayString, sizeof( level.voteDisplayString ),
-					 "\x15%s", level.voteString );
-	} else {
+	} else if ( !Q_stricmp( arg1, "kick" ) || !Q_stricmp( arg1, "clientkick" ) ) {
 		clientNum = MAX_CLIENTS;
 
 		if ( !Q_stricmp( arg1, "kick" ) ) {
@@ -1226,26 +1177,19 @@ void Cmd_CallVote_f( gentity_t *ent ) {
 				}
 				Q_strncpyz( cleanName, level.clients[i].sess.name, sizeof( cleanName ) );
 				Q_CleanStr( cleanName );
-				if ( !Q_stricmp( arg2, cleanName ) ) {
+				if ( !Q_stricmp( cleanName, arg2 ) ) {
 					clientNum = i;
 				}
 			}
 		} else {
 			clientNum = atoi( arg2 );
-			if ( !clientNum && Q_stricmp( arg2, "0" ) ) {
-				trap_SendServerCommand( ent - g_entities, 0, "e \"GAME_CLIENTNOTONSERVER\"" );
-				return;
+			if ( ( clientNum || !Q_stricmp( arg2, "0" ) ) && clientNum >= 0 && clientNum < MAX_CLIENTS
+				 && level.clients[clientNum].sess.connected == CON_CONNECTED ) {
+				Q_strncpyz( cleanName, level.clients[clientNum].sess.name, sizeof( cleanName ) );
+				Q_CleanStr( cleanName );
+			} else {
+				clientNum = MAX_CLIENTS;
 			}
-			if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
-				trap_SendServerCommand( ent - g_entities, 0, "e \"GAME_CLIENTNOTONSERVER\"" );
-				return;
-			}
-			if ( level.clients[clientNum].sess.connected != CON_CONNECTED ) {
-				trap_SendServerCommand( ent - g_entities, 0, "e \"GAME_CLIENTNOTONSERVER\"" );
-				return;
-			}
-			Q_strncpyz( cleanName, level.clients[clientNum].sess.name, sizeof( cleanName ) );
-			Q_CleanStr( cleanName );
 		}
 
 		if ( clientNum == MAX_CLIENTS ) {
@@ -1258,13 +1202,17 @@ void Cmd_CallVote_f( gentity_t *ent ) {
 		Com_sprintf( level.voteDisplayString, sizeof( level.voteDisplayString ),
 					 "GAME_VOTE_KICK\x15(%i)%s", clientNum,
 					 level.clients[clientNum].sess.name );
+	} else {
+		Com_sprintf( level.voteString, sizeof( level.voteString ), "%s \"%s\"", arg1, arg2 );
+		Com_sprintf( level.voteDisplayString, sizeof( level.voteDisplayString ),
+					 "\x15%s", level.voteString );
 	}
 
 	trap_SendServerCommand( -1, 0,
 							va( "e \"GAME_CALLEDAVOTE\x15%s\"", ent->client->sess.name ) );
 
-	// start the voting, the caller automatically votes yes.  level.voteTime is
-	// the deadline, not the start.
+	// start the voting, the caller automatically votes yes
+	// voteTime is the time the vote ends, not when it started
 	level.voteTime = level.time + VOTE_TIME;
 	level.voteYes = 1;
 	level.voteNo = 0;
@@ -1289,7 +1237,7 @@ void Cmd_Vote_f( gentity_t *ent ) {
 	char msg[64];
 	int num;
 
-	// complaints supercede voting (and share the command)
+	// Complaints supercede voting (and share command)
 	if ( ent->client->sess.complaintEndTime > level.time ) {
 		gclient_t *cl = g_entities[ ent->client->sess.complaintClient ].client;
 
@@ -1304,16 +1252,15 @@ void Cmd_Vote_f( gentity_t *ent ) {
 			return;
 		}
 
-		// reset this ent's complaintEndTime so they can't send multiple complaints
+		// Reset this ent's complaintEndTime so they can't send multiple complaints
 		ent->client->sess.complaintEndTime = -1;
 		ent->client->sess.complaintClient = -1;
 
 		trap_Argv( 1, msg, sizeof( msg ) );
 
-		/* the msg[1] on the second and third tests is the ancestor's typo,
-		   reproduced here because the binary reproduces it. */
+		// keep: msg[1] in the second and third tests is the original behavior
 		if ( msg[0] == 'y' || msg[1] == 'Y' || msg[1] == '1' ) {
-			// increase their complaint counter
+			// Increase their complaint counter
 			cl->sess.complaints++;
 
 			num = g_complaintlimit.integer - cl->sess.complaints;
@@ -1335,7 +1282,7 @@ void Cmd_Vote_f( gentity_t *ent ) {
 		return;
 	}
 
-	// reset this ent's complaintEndTime so they can't send multiple complaints
+	// Reset this ent's complaintEndTime so they can't send multiple complaints
 	ent->client->sess.complaintEndTime = -1;
 	ent->client->sess.complaintClient = -1;
 
@@ -1380,7 +1327,7 @@ void Cmd_SetViewpos_f( gentity_t *ent ) {
 	char buffer[MAX_STRING_CHARS];
 	int i;
 
-	if ( !sv_cheats.integer ) {
+	if ( !g_cheats.integer ) {
 		trap_SendServerCommand( ent - g_entities, 0, va( "e \"GAME_CHEATSNOTENABLED\"" ) );
 		return;
 	}
@@ -1390,8 +1337,7 @@ void Cmd_SetViewpos_f( gentity_t *ent ) {
 		return;
 	}
 
-	angles[0] = 0;
-	angles[2] = 0;
+	VectorClear( angles );
 
 	for ( i = 0 ; i < 3 ; i++ ) {
 		trap_Argv( i + 1, buffer, sizeof( buffer ) );
@@ -1399,7 +1345,7 @@ void Cmd_SetViewpos_f( gentity_t *ent ) {
 	}
 
 	trap_Argv( 4, buffer, sizeof( buffer ) );
-	angles[1] = atof( buffer );
+	angles[YAW] = atof( buffer );
 
 	TeleportPlayer( ent, origin, angles );
 }
@@ -1408,19 +1354,23 @@ void Cmd_SetViewpos_f( gentity_t *ent ) {
 =================
 Cmd_Activate_f
 
-CoD's "use" key.  ClientThink_real calls it, not ClientCommand.
+Use whatever the player is looking at.  Called from ClientThink_real
+when the activate button is pressed, not from ClientCommand.
 =================
 */
 qboolean Cmd_Activate_f( gentity_t *ent ) {
 	gentity_t   *other;
-	int entNum;
+	unsigned short entNum;
+	qboolean found;
+
+	found = qtrue;
 
 	if ( !Scr_IsSystemActive( qtrue ) ) {
 		return qfalse;
 	}
 
 	if ( ent->active ) {
-		ent->active = ( ent->client->ps.eFlags & EF_ACTIVATE_MASK ) ? 2 : 0;
+		ent->active = ( ent->client->ps.eFlags & EF_TURRET_ACTIVE ) ? 2 : 0;
 		return qtrue;
 	}
 
@@ -1432,73 +1382,57 @@ qboolean Cmd_Activate_f( gentity_t *ent ) {
 	}
 	other = &g_entities[entNum];
 
-	if ( !other->classname ) {
-		return qtrue;
-	}
-
-	if ( other->classname == scr_const.func_door
-		 || other->classname == scr_const.func_door_rotating ) {
-		G_TryDoor( other, ent, ent );
-		return qtrue;
-	}
-
-	if ( other->classname == scr_const.trigger_use ) {
-		Scr_AddEntityNum( ent->s.number, 0 );
-		Scr_NotifyNum( other->s.number, 0, scr_const.trigger, 1 );
-		other->use( other, ent, ent );
-		return qtrue;
-	}
-
-	if ( other->s.eType == ET_TRIGGER ) {
-		Scr_AddEntityNum( ent->s.number, 0 );
-		Scr_NotifyNum( other->s.number, 0, scr_const.touch, 1 );
-		if ( !other->touch ) {
-			return qfalse;
+	if ( other->classname ) {
+		if ( other->classname == scr_const.func_door
+			 || other->classname == scr_const.func_door_rotating ) {
+			G_TryDoor( other, ent, ent );
+		} else if ( other->classname == scr_const.trigger_use ) {
+			Scr_AddEntityNum( ent->s.number, SCR_CLASS_ENTITY );
+			Scr_NotifyNum( other->s.number, SCR_CLASS_ENTITY, scr_const.trigger, 1 );
+			other->use( other, ent, ent );
+		} else if ( other->s.eType == ET_ITEM ) {
+			Scr_AddEntityNum( ent->s.number, SCR_CLASS_ENTITY );
+			Scr_NotifyNum( other->s.number, SCR_CLASS_ENTITY, scr_const.touch, 1 );
+			if ( other->touch ) {
+				other->active = qtrue;
+				other->touch( other, ent, 0 );
+			} else {
+				found = qfalse;
+			}
+		} else if ( other->s.eType == ET_TURRET ) {
+			if ( !G_IsTurretUsable( other, ent ) ) {
+				return qfalse;
+			}
+			other->use( other, ent, ent );
+		} else if ( other->classname == scr_const.misc_flak && !other->active ) {
+			if ( !infront( other, ent ) ) {
+				if ( !level.clients[ ent->s.clientNum ].ps.grenadeTimeLeft ) {
+					other->active = qtrue;
+					ent->active = qtrue;
+					other->r.ownerNum = ent->s.number;
+					VectorCopy( other->r.currentAngles, other->TargetAngles );
+				} else {
+					found = qfalse;
+				}
+			} else {
+				found = qfalse;
+			}
+		} else if ( other->classname == scr_const.script_brushmodel ) {
+			Scr_AddEntityNum( ent->s.number, SCR_CLASS_ENTITY );
+			Scr_NotifyNum( other->s.number, SCR_CLASS_ENTITY, scr_const.trigger, 1 );
+			if ( other->use ) {
+				other->use( other, ent, ent );
+			} else {
+				found = qfalse;
+			}
+		} else if ( other->classname == scr_const.team_WOLF_checkpoint ) {
+			if ( other->count != ent->client->sess.sessionTeam ) {
+				other->health++;
+			}
 		}
-		other->active = qtrue;
-		other->touch( other, ent, 0 );
-		return qtrue;
 	}
 
-	if ( other->s.eType == ET_TURRET ) {
-		if ( !G_IsTurretUsable( other, ent ) ) {
-			return qfalse;
-		}
-		other->use( other, ent, ent );
-		return qtrue;
-	}
-
-	if ( other->classname == scr_const.misc_flak && !other->active ) {
-		if ( infront( ent, other ) ) {
-			return qfalse;
-		}
-		if ( level.clients[ ent->s.clientNum ].ps.grenadeTimeLeft ) {
-			return qfalse;
-		}
-		other->active = qtrue;
-		ent->active = qtrue;
-		other->r.ownerNum = ent->s.number;
-		VectorCopy( other->r.currentAngles, other->TargetAngles );
-		return qtrue;
-	}
-
-	if ( other->classname == scr_const.script_brushmodel ) {
-		Scr_AddEntityNum( ent->s.number, 0 );
-		Scr_NotifyNum( other->s.number, 0, scr_const.trigger, 1 );
-		if ( !other->use ) {
-			return qfalse;
-		}
-		other->use( other, ent, ent );
-		return qtrue;
-	}
-
-	if ( other->classname == scr_const.team_WOLF_checkpoint
-		 && other->count != ent->client->sess.sessionTeam ) {
-		other->health++;
-		return qtrue;
-	}
-
-	return qtrue;
+	return found;
 }
 
 /*
@@ -1507,7 +1441,7 @@ Cmd_EntityCount_f
 =================
 */
 void Cmd_EntityCount_f( gentity_t *ent ) {
-	if ( sv_cheats.integer ) {
+	if ( g_cheats.integer ) {
 		G_Printf( "entity count = %i\n", level.num_entities );
 	}
 }
@@ -1515,6 +1449,8 @@ void Cmd_EntityCount_f( gentity_t *ent ) {
 /*
 =================
 Cmd_MenuResponse_f
+
+Pass a menu response on to the player's script as a "menuresponse" notify
 =================
 */
 void Cmd_MenuResponse_f( gentity_t *ent ) {
@@ -1523,7 +1459,10 @@ void Cmd_MenuResponse_f( gentity_t *ent ) {
 	char arg[MAX_STRING_CHARS];
 	int menuIndex;
 
-	if ( trap_Argc() == 4 ) {
+	if ( trap_Argc() != 4 ) {
+		menu[0] = 0;
+		strcpy( response, "bad" );
+	} else {
 		trap_Argv( 1, arg, sizeof( arg ) );
 		if ( atoi( arg ) != trap_Cvar_VariableIntegerValue( "sv_serverId" ) ) {
 			return;
@@ -1531,19 +1470,16 @@ void Cmd_MenuResponse_f( gentity_t *ent ) {
 
 		trap_Argv( 2, menu, sizeof( menu ) );
 		menuIndex = atoi( menu );
-		if ( menuIndex >= 0 && menuIndex < CS_SCRIPTMENUS_COUNT ) {
-			trap_GetConfigstring( menuIndex + CS_SCRIPTMENUS, menu, sizeof( menu ) );
+		if ( menuIndex >= 0 && menuIndex < CS_MENUS_COUNT ) {
+			trap_GetConfigstring( menuIndex + CS_MENUS, menu, sizeof( menu ) );
 		}
 
 		trap_Argv( 3, response, sizeof( response ) );
-	} else {
-		menu[0] = 0;
-		strcpy( response, "bad" );
 	}
 
 	Scr_AddString( response );
 	Scr_AddString( menu );
-	Scr_NotifyNum( ent->s.number, 0, scr_const.menuresponse, 2 );
+	Scr_NotifyNum( ent->s.number, SCR_CLASS_ENTITY, scr_const.menuresponse, 2 );
 }
 
 /*
@@ -1562,35 +1498,20 @@ void ClientCommand( int clientNum ) {
 
 	trap_Argv( 0, cmd, sizeof( cmd ) );
 
-	/* LTCG inlines Cmd_Say_f / Cmd_Voice_f into the four chat cases with
-	   arg0 = qfalse, so the arg-count gate and the ConcatArgs( 1 ) show up
-	   here rather than in a call. */
 	if ( Q_stricmp( cmd, "say" ) == 0 ) {
-		if ( trap_Argc() < 2 ) {
-			return;
-		}
-		G_Say( ent, NULL, SAY_ALL, ConcatArgs( 1 ) );
+		Cmd_Say_f( ent, SAY_ALL, qfalse );
 		return;
 	}
 	if ( Q_stricmp( cmd, "say_team" ) == 0 ) {
-		if ( trap_Argc() < 2 ) {
-			return;
-		}
-		G_Say( ent, NULL, SAY_TEAM, ConcatArgs( 1 ) );
+		Cmd_Say_f( ent, SAY_TEAM, qfalse );
 		return;
 	}
 	if ( Q_stricmp( cmd, "vsay" ) == 0 ) {
-		if ( trap_Argc() < 2 ) {
-			return;
-		}
-		G_Voice( ent, NULL, SAY_ALL, ConcatArgs( 1 ), qfalse );
+		Cmd_Voice_f( ent, SAY_ALL, qfalse, qfalse );
 		return;
 	}
 	if ( Q_stricmp( cmd, "vsay_team" ) == 0 ) {
-		if ( trap_Argc() < 2 ) {
-			return;
-		}
-		G_Voice( ent, NULL, SAY_TEAM, ConcatArgs( 1 ), qfalse );
+		Cmd_Voice_f( ent, SAY_TEAM, qfalse, qfalse );
 		return;
 	}
 	if ( Q_stricmp( cmd, "tell" ) == 0 ) {

@@ -1,37 +1,64 @@
 /*
  * @fidelity: likely
  * @fidelity-default: unreviewed
+ *
+ * tr_dpvs.c -- CoD's DPVS (deferred PVS) world visibility.  Unlike RTCW's
+ * cluster PVS + R_RecursiveWorldNode, CoD1 walks a cell/portal graph: the
+ * camera cell floods outward through portals (R_RecursivePortalWalk), each
+ * visited cell installs its silhouette occluders (R_AddCellOccluders), submits
+ * its owned world geometry (R_AddCellSurfaces / R_AddCellCullGroups) and links
+ * the per-view brush/xmodel entities into the cells they touch
+ * (R_FilterModelsIntoCells).  Boxes are rejected against the view frustum, the
+ * near/far clip planes and the active occluders by the inlined box-vs-plane
+ * tests factored below as R_CullBoxDPVS / R_CullBoxDPVSStrict.
+ *
+ * The DPVS working state (view origin, near/far/frustum planes, occluder and
+ * active-plane banks, per-view counters) lives in standalone globals reached by
+ * name; only the pointer-passed world data (cells, portals, occluders, the
+ * per-cell AABB tree, cull groups, entity/model links, coronas, surfaces) is
+ * given C types here.  Retyping a pointer never moves storage, so every field
+ * offset is pinned with an assert.
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "tr_records.h"
 #include "tr_gl_types.h"
 #include "tr_tess.h"
 #include "tr_dpvsplane.h"
+#include "tr_local.h"
+/* ---- renderer-owned globals ---- */
+/* retail's one DPVS state block, 0x011CC100..0x011CC22B (layout in tr_dpvsplane.h).
+ * Being one address-taken object keeps its stores ordered against loads through
+ * pointers as in retail (R_AddSkySurfacesDPVS, R_AddCellSurfaces). */
+dpvsGlob_t dpvsGlob;   /* 0x011CC100 */
+
+#define dpvs_cullDist                     dpvsGlob.cullDist
+#define dpvs_cellEntityLinks              dpvsGlob.cellEntityLinks
+#define dpvs_cellEntityLinkCount          dpvsGlob.cellEntityLinkCount
+#define dpvs_transformMatrixInverse       dpvsGlob.transformMatrixInverse
+#define dpvs_transformMatrixTransposed    dpvsGlob.transformMatrixTransposed[0]
+#define dpvs_transformMatrixTransposed01  dpvsGlob.transformMatrixTransposed[1]
+#define dpvs_transformMatrixTransposed02  dpvsGlob.transformMatrixTransposed[2]
+#define dpvs_transformMatrixTransposed03  dpvsGlob.transformMatrixTransposed[3]
+#define dpvs_transformMatrixTransposed10  dpvsGlob.transformMatrixTransposed[4]
+#define dpvs_transformMatrixTransposed11  dpvsGlob.transformMatrixTransposed[5]
+#define dpvs_transformMatrixTransposed12  dpvsGlob.transformMatrixTransposed[6]
+#define dpvs_transformMatrixTransposed13  dpvsGlob.transformMatrixTransposed[7]
+#define dpvs_transformMatrixTransposed20  dpvsGlob.transformMatrixTransposed[8]
+#define dpvs_transformMatrixTransposed21  dpvsGlob.transformMatrixTransposed[9]
+#define dpvs_transformMatrixTransposed22  dpvsGlob.transformMatrixTransposed[10]
+#define dpvs_transformMatrixTransposed23  dpvsGlob.transformMatrixTransposed[11]
+#define dpvs_transformMatrixTransposed30  dpvsGlob.transformMatrixTransposed[12]
+#define dpvs_transformMatrixTransposed31  dpvsGlob.transformMatrixTransposed[13]
+#define dpvs_transformMatrixTransposed32  dpvsGlob.transformMatrixTransposed[14]
+#define dpvs_transformMatrixTransposed33  dpvsGlob.transformMatrixTransposed[15]
 
 
-#define outsideMapEnts             ((cvar_t *)(outsideMapEnts))
-#define r_cullBModels              ((cvar_t *)(r_cullBModels))
-#define r_cullXModels              ((cvar_t *)(r_cullXModels))
-#define r_drawBModels              ((cvar_t *)(r_drawBModels))
-#define r_drawSModels              ((cvar_t *)(r_drawSModels))
-#define r_drawXModels              ((cvar_t *)(r_drawXModels))
-#define r_drawentities             ((cvar_t *)(r_drawentities))
-#define r_drawworld                ((cvar_t *)(r_drawworld))
-#define r_lockpvs                  ((cvar_t *)(r_lockpvs))
-#define r_portalbevels             ((cvar_t *)(r_portalbevels))
-#define r_showCullBModels          ((cvar_t *)(r_showCullBModels))
-#define r_showCullSModels          ((cvar_t *)(r_showCullSModels))
-#define r_showCullXModels          ((cvar_t *)(r_showCullXModels))
-#define r_showaabbtrees            ((cvar_t *)(r_showaabbtrees))
-#define r_showportals              ((cvar_t *)(r_showportals))
-#define r_singlecell               ((cvar_t *)(r_singlecell))
-#define r_zfar                     ((cvar_t *)(r_zfar))
+
 
 
 void AddPointToBounds( const float *point, float *mins, float *maxs );
+void ClearBounds( float *mins, float *maxs );
 extern int BoxOnPlaneSide();
 extern int ExpandBounds();
 extern int RE_AddRefEntityToScene();
@@ -40,2907 +67,1857 @@ extern int R_AddDebugLine();
 extern int R_AddDebugPolygon();
 extern int R_AddDrawSurf();
 void VectorNormalizeFast( float *v );
-extern int MatrixInverse44();
+extern float *MatrixInverse44(const float in[16], float out[16]);
 
 
+/* ------------------------------------------------------------------------- *
+ *  Constants.
+ * ------------------------------------------------------------------------- */
+#define TR_FRUSTUM_PLANES            4       /* view-frustum plane count */
+#define DPVS_PLANE_BIAS              0.001f  /* R_SetPlaneSidesDPVS distance bias */
+
+/* corner-select byte offsets baked into dpvsPlane_t::sideOffsets: mins.xyz sit
+ * at 0/4/8 of the [mins|maxs] bounds pair, maxs.xyz at 12/16/20. */
+#define DPVS_OFF_MINS_X   0
+#define DPVS_OFF_MINS_Y   4
+#define DPVS_OFF_MINS_Z   8
+#define DPVS_OFF_MAXS_X   12
+#define DPVS_OFF_MAXS_Y   16
+#define DPVS_OFF_MAXS_Z   20
+
+#define DPVS_MAX_OCCLUDERS           1024    /* dpvs_occluders[] capacity */
+#define DPVS_MAX_OCCLUDER_PLANES     6144    /* dpvs_activePlanes[] capacity */
+#define DPVS_MAX_CELL_ENTITY_LINKS   4096    /* dpvs_cellEntityLinks[] capacity */
+
+/* refEntity_t::reType values distinguished by the DPVS entity filter (CoD:
+ * brush model = 0, xmodel = 1). */
+#define DPVS_RT_BRUSH_MODEL          0
+#define DPVS_RT_XMODEL               1
+#define DPVS_RT_SPRITE               4       /* built for each corona */
+
+#define DPVS_ENTITYNUM_WORLD         1022
+#define DPVS_ENTITY_SORT_SHIFT       8       /* shiftedEntityNumber = num << 8 */
+
+/* r_showCull* modes */
+#define DPVS_SHOWCULL_BOUNDS         1
+#define DPVS_SHOWCULL_CELL_LINKS     2
+
+
+/* ------------------------------------------------------------------------- *
+ *  DPVS plane (from tr_dpvsplane.h) -- normal + distance + 3 corner-select
+ *  byte offsets (+ an unused cameraSide byte).  Pinned here since the header
+ *  carries no asserts.
+ * ------------------------------------------------------------------------- */
+COD1_ASSERT_SIZE(dpvsPlane_t, 0x14);
+ASSERT_OFF(dpvsPlane_t, distance, 0x0c);
+ASSERT_OFF(dpvsPlane_t, sideOffsets, 0x10);
+ASSERT_OFF(dpvsPlane_t, cameraSide, 0x13);
+
+
+/* ------------------------------------------------------------------------- *
+ *  File-local world structures reached through the pointer-passed cell graph.
+ *  msurface_t / srfLit_t / cplane_t / mnode_t / trRefEntity_t come from
+ *  tr_local.h; the types below are this unit's view of the cell / portal /
+ *  occluder / AABB-tree / cull-group / link records those cells own.
+ * ------------------------------------------------------------------------- */
+
+/* dpvsCullGroup_t (0x24) -- authored bounds over a run of world surfaces */
 typedef struct {
-    float         normal[3];   /* +0x00 */
-    float         dist;        /* +0x0C */
-    unsigned char sides[3];    /* +0x10  0-or-12, 4-or-16, 8-or-20 */
-    unsigned char pad;         /* +0x13 */
-} tr_dpvsPlane_t;
+	vec3_t      mins;             /* +0x00 */
+	vec3_t      maxs;             /* +0x0c */
+	msurface_t *surfaces;         /* +0x18  stride 0x0c */
+	int         surfaceCount;     /* +0x1c */
+	int         viewCount;        /* +0x20  submitted-this-view stamp */
+} dpvsCullGroup_t;
+COD1_ASSERT_SIZE(dpvsCullGroup_t, 0x24);
+ASSERT_OFF(dpvsCullGroup_t, surfaces, 0x18);
+ASSERT_OFF(dpvsCullGroup_t, surfaceCount, 0x1c);
+ASSERT_OFF(dpvsCullGroup_t, viewCount, 0x20);
 
+/* dpvsAabbTree_t (0x28) -- per-cell surface bounds tree.  Internal records own
+ * a contiguous child array; leaf records own 0x0c-byte world-surface entries. */
+typedef struct dpvsAabbTree_s dpvsAabbTree_t;
+struct dpvsAabbTree_s {
+	vec3_t          mins;         /* +0x00 */
+	vec3_t          maxs;         /* +0x0c */
+	msurface_t     *surfaces;     /* +0x18  stride 0x0c */
+	int             surfaceCount; /* +0x1c */
+	dpvsAabbTree_t *children;     /* +0x20  stride 0x28 */
+	int             childCount;   /* +0x24 */
+};
+COD1_ASSERT_SIZE(dpvsAabbTree_t, 0x28);
+ASSERT_OFF(dpvsAabbTree_t, surfaces, 0x18);
+ASSERT_OFF(dpvsAabbTree_t, surfaceCount, 0x1c);
+ASSERT_OFF(dpvsAabbTree_t, children, 0x20);
+ASSERT_OFF(dpvsAabbTree_t, childCount, 0x24);
+
+/* dpvsPortal_t (0x24) -- one outgoing portal: its plane, target cell and the
+ * winding vertices flooded through it. */
+typedef struct dpvsCell_s dpvsCell_t;
 typedef struct {
-    float         normal[3];   /* +0x00 */
-    float         dist;        /* +0x0C */
-    unsigned char type;        /* +0x10 */
-    unsigned char signbits;    /* +0x11 */
-    unsigned char pad[2];      /* +0x12 */
-} tr_cplane_t;
+	dpvsPlane_t  plane;           /* +0x00  normal/dist + side offsets */
+	dpvsCell_t  *cell;            /* +0x14  target cell */
+	vec3_t      *vertices;        /* +0x18 */
+	int          vertexCount;     /* +0x1c */
+	int          recursionActive; /* +0x20  cycle guard while walking */
+} dpvsPortal_t;
+COD1_ASSERT_SIZE(dpvsPortal_t, 0x24);
+ASSERT_OFF(dpvsPortal_t, cell, 0x14);
+ASSERT_OFF(dpvsPortal_t, vertices, 0x18);
+ASSERT_OFF(dpvsPortal_t, vertexCount, 0x1c);
+ASSERT_OFF(dpvsPortal_t, recursionActive, 0x20);
 
-#define tr_frustum            ((const tr_cplane_t *)(const void *)tr_viewParms_frustum)
-#define tr_dpvsFrustumPlanes  ((tr_dpvsPlane_t *)(void *)dpvs_frustumPlanes)
-#define TR_FRUSTUM_PLANES     4
+/* dpvsOccluderEdge_t (0x10) -- runtime occluder edge: its two bounding planes
+ * and two endpoints, used to build silhouette planes. */
+typedef struct {
+	dpvsPlane_t *planes[2];       /* +0x00 */
+	vec3_t      *vertices[2];     /* +0x08 */
+} dpvsOccluderEdge_t;
+COD1_ASSERT_SIZE(dpvsOccluderEdge_t, 0x10);
+ASSERT_OFF(dpvsOccluderEdge_t, vertices, 0x08);
+
+/* dpvsOccluder_t (0x24) -- runtime occluder brush.  The first six fields own
+ * the authored plane/edge/vertex spans; DPVS owns the cull limit and the
+ * per-walk active-plane range. */
+typedef struct {
+	dpvsPlane_t        *planes;          /* +0x00 */
+	int                 planeCount;      /* +0x04 */
+	int                 edgeCount;       /* +0x08 */
+	dpvsOccluderEdge_t *edges;           /* +0x0c */
+	int                 vertexCount;     /* +0x10 */
+	vec3_t             *vertices;        /* +0x14 */
+	int                 cullPlaneLimit;  /* +0x18  INT_MAX, lowered to first culling plane */
+	int                 activePlaneCount;/* +0x1c */
+	dpvsPlane_t        *activePlanes;    /* +0x20  into dpvs_activePlanes bank */
+} dpvsOccluder_t;
+COD1_ASSERT_SIZE(dpvsOccluder_t, 0x24);
+ASSERT_OFF(dpvsOccluder_t, edges, 0x0c);
+ASSERT_OFF(dpvsOccluder_t, vertices, 0x14);
+ASSERT_OFF(dpvsOccluder_t, cullPlaneLimit, 0x18);
+ASSERT_OFF(dpvsOccluder_t, activePlaneCount, 0x1c);
+ASSERT_OFF(dpvsOccluder_t, activePlanes, 0x20);
+
+/* dpvsCellModelLink_t (0x08) -- per-cell membership link for a static model */
+typedef struct dpvsCellModelLink_s dpvsCellModelLink_t;
+struct dpvsCellModelLink_s {
+	void                *model;   /* +0x00  dpvsStaticModel_t */
+	dpvsCellModelLink_t *next;    /* +0x04 */
+};
+COD1_ASSERT_SIZE(dpvsCellModelLink_t, 0x08);
+
+/* dpvsCellEntityLink_t (0x20) -- transient per-view brush/xmodel entity link */
+typedef struct dpvsCellEntityLink_s dpvsCellEntityLink_t;
+struct dpvsCellEntityLink_s {
+	trRefEntity_t        *entity; /* +0x00 */
+	vec3_t                mins;   /* +0x04 */
+	vec3_t                maxs;   /* +0x10 */
+	dpvsCellEntityLink_t *next;   /* +0x1c */
+};
+COD1_ASSERT_SIZE(dpvsCellEntityLink_t, 0x20);
+ASSERT_OFF(dpvsCellEntityLink_t, mins, 0x04);
+ASSERT_OFF(dpvsCellEntityLink_t, maxs, 0x10);
+ASSERT_OFF(dpvsCellEntityLink_t, next, 0x1c);
+
+/* dpvsCell_t (0x40) -- one world cell (addressed by mnode_t::cellIndex) */
+struct dpvsCell_s {
+	vec3_t                mins;           /* +0x00 */
+	vec3_t                maxs;           /* +0x0c */
+	dpvsAabbTree_t       *aabbTree;       /* +0x18 */
+	dpvsPortal_t         *portals;        /* +0x1c  stride 0x24 */
+	int                   portalCount;    /* +0x20 */
+	dpvsCullGroup_t     **cullGroups;     /* +0x24 */
+	int                   cullGroupCount; /* +0x28 */
+	dpvsOccluder_t      **occluders;      /* +0x2c */
+	int                   occluderCount;  /* +0x30 */
+	int                   markViewCount;  /* +0x34  (unused here) */
+	dpvsCellModelLink_t  *modelLinks;     /* +0x38 */
+	dpvsCellEntityLink_t *entityLinks;    /* +0x3c */
+};
+COD1_ASSERT_SIZE(dpvsCell_t, 0x40);
+ASSERT_OFF(dpvsCell_t, aabbTree, 0x18);
+ASSERT_OFF(dpvsCell_t, portals, 0x1c);
+ASSERT_OFF(dpvsCell_t, portalCount, 0x20);
+ASSERT_OFF(dpvsCell_t, cullGroups, 0x24);
+ASSERT_OFF(dpvsCell_t, cullGroupCount, 0x28);
+ASSERT_OFF(dpvsCell_t, occluders, 0x2c);
+ASSERT_OFF(dpvsCell_t, occluderCount, 0x30);
+ASSERT_OFF(dpvsCell_t, modelLinks, 0x38);
+ASSERT_OFF(dpvsCell_t, entityLinks, 0x3c);
+
+/* dpvsStaticModel_t -- a loaded static-model instance linked into cells.  Its
+ * leading refEntity_t (0x9c) is submitted directly to the scene; the trailing
+ * bounds + view stamp are read by the cull path.  Only the touched offsets are
+ * named (the full record is larger and not needed here). */
+typedef struct {
+	refEntity_t e;                /* +0x000  submitted to RE_AddRefEntityToScene */
+	vec3_t      mins;             /* +0x09c */
+	vec3_t      maxs;             /* +0x0a8 */
+	int         viewCount;        /* +0x0b4  submitted-this-view stamp */
+} dpvsStaticModel_t;
+ASSERT_OFF(dpvsStaticModel_t, mins, 0x9c);
+ASSERT_OFF(dpvsStaticModel_t, maxs, 0xa8);
+ASSERT_OFF(dpvsStaticModel_t, viewCount, 0xb4);
+
+/* dpvsCorona_t (0x20) -- map-authored corona/flare (tr.world->coronas) */
+typedef struct {
+	shader_t *shader;             /* +0x00 */
+	vec3_t    origin;             /* +0x04 */
+	float     scale;              /* +0x10  sprite radius */
+	float     zCutoff;            /* +0x14  reject below this view-dir z */
+	float     zFadeOut;           /* +0x18  alpha fade start */
+	byte      color[4];           /* +0x1c  RGBA */
+} dpvsCorona_t;
+COD1_ASSERT_SIZE(dpvsCorona_t, 0x20);
+ASSERT_OFF(dpvsCorona_t, scale, 0x10);
+ASSERT_OFF(dpvsCorona_t, zCutoff, 0x14);
+ASSERT_OFF(dpvsCorona_t, zFadeOut, 0x18);
+ASSERT_OFF(dpvsCorona_t, color, 0x1c);
 
 
-/* ---- R_SetPlaneSidesDPVS  0x004E1620 ----  VERIFIED */
+/* tr.world blobs reached through the tr_world pointer (as in tr_world.c) */
+#define DPVS_WORLD_NODES           (*(mnode_t          **)(tr_world + 152))
+#define DPVS_WORLD_SKYSURF_COUNT   (*(int               *)(tr_world + 164))
+#define DPVS_WORLD_SKYSURFS        (*(msurface_t      ***)(tr_world + 168))
+#define DPVS_WORLD_CORONAS         (*(dpvsCorona_t     **)(tr_world + 192))
+#define DPVS_WORLD_CORONA_COUNT    (*(int               *)(tr_world + 196))
+#define DPVS_WORLD_CELL_COUNT      (*(int               *)(tr_world + 288))
+#define DPVS_WORLD_CELLS           (*(dpvsCell_t       **)(tr_world + 292))
+#define DPVS_WORLD_CULLGROUP_COUNT (*(int               *)(tr_world + 324))
+#define DPVS_WORLD_CULLGROUPS      (*(dpvsCullGroup_t  **)(tr_world + 328))
+
+/* mnode_t sentinels used to walk the BSP (contents at +0x00, cellIndex at +0x08) */
+#define DPVS_NODE_INTERNAL   (-2)   /* cellIndex value for a decision node */
+#define DPVS_NODE_NO_CELL    (-1)   /* leaf/node with no cell */
+
+/* the DPVS view-frustum plane bank (retail dpvs_frustumPlanes, 4 x dpvsPlane_t) */
+#define dpvs_frustumPlanesTyped   ((dpvsPlane_t *)(void *)dpvs_frustumPlanes)
+
+
+/* ------------------------------------------------------------------------- *
+ *  Box-vs-plane visibility tests.
+ *
+ *  The retail compiler inlines these into every DPVS box test (surfaces, AABB
+ *  tree nodes, cull groups, static models, coronas, filtered entities); they
+ *  are factored here so each caller reads clearly.  VC7 inlines the two cull
+ *  tests only when forced (retail also kept out-of-line copies of them at
+ *  0x4E1360 / 0x4E14C0, mirrored in tr_debug.c).  A plane's precomputed
+ *  sideOffsets[] pick, per component, whether the box's mins or maxs value is
+ *  the corner farthest along +normal.  All three tests thread the shared
+ *  dpvs_cullPlaneLimit / per-occluder cullPlaneLimit state exactly as the
+ *  inlined originals do.
+ *
+ *  x87 term order matters: retail sums the caller-supplied frustum/portal
+ *  planes as (x+y)+z (e.g. 0x4E30C0, 0x4E3240, 0x4E3390) but the near, far,
+ *  sky-far and occluder planes as (z+y)+x (e.g. 0x4E30F7, 0x4E3199), and it
+ *  compares the unrounded x87 sum straight against the float distance (no
+ *  float temporary), so each order gets its own helper below.
+ * ------------------------------------------------------------------------- */
+
+/* the box corner farthest along +normal is wholly behind the plane
+ * (z,y,x order: near/far/occluder planes) */
+static int R_BoxBehindPlane( const vec3_t *bounds, const dpvsPlane_t *plane )
+{
+	const char *b = (const char *)bounds;
+	/* the corner loads as locals (like R_BoxInFrontOfPlane): this load-then-multiply
+	   order is what the inlined copies in R_CullModels / R_AddCullGroupDPVS use */
+	float z = *(const float *)( b + plane->sideOffsets[2] );
+	float y = *(const float *)( b + plane->sideOffsets[1] );
+	float x = *(const float *)( b + plane->sideOffsets[0] );
+	return z * plane->normal[2] + y * plane->normal[1] + x * plane->normal[0] < plane->distance;
+}
+
+/* the box corner nearest along +normal is wholly in front of the plane
+ * (z,y,x order: occluder planes).  The opposite corner is retail's
+ * b+1Ch/14h/0Ch minus the side offset. */
+static int R_BoxInFrontOfPlane( const vec3_t *bounds, const dpvsPlane_t *plane )
+{
+ const char *b = (const char *)bounds;
+ float z = *(const float *)(b - plane->sideOffsets[2] + DPVS_OFF_MAXS_Z + DPVS_OFF_MINS_Z);
+ float y = *(const float *)(b - plane->sideOffsets[1] + DPVS_OFF_MAXS_Y + DPVS_OFF_MINS_Y);
+ float x = *(const float *)(b - plane->sideOffsets[0] + DPVS_OFF_MAXS_X);
+ return z * plane->normal[2] + y * plane->normal[1] + x * plane->normal[0] > plane->distance;
+}
+
+/* R_BoxBehindPlane in x,y,z order: the caller-supplied planes[] loops */
+static int R_BoxBehindPlaneXYZ( const vec3_t *bounds, const dpvsPlane_t *plane )
+{
+	const char *b = (const char *)bounds;
+	return *(const float *)( b + plane->sideOffsets[0] ) * plane->normal[0]
+	     + *(const float *)( b + plane->sideOffsets[1] ) * plane->normal[1]
+	     + *(const float *)( b + plane->sideOffsets[2] ) * plane->normal[2] < plane->distance;
+}
+
+/* R_BoxInFrontOfPlane in x,y,z order: the caller-supplied planes[] loops.
+ * The opposite corner is retail's b+0Ch/14h/1Ch minus the side offset. */
+static int R_BoxInFrontOfPlaneXYZ( const vec3_t *bounds, const dpvsPlane_t *plane )
+{
+	const char *b = (const char *)bounds;
+	float x = *(const float *)( b + DPVS_OFF_MAXS_X - plane->sideOffsets[0] );
+	float y = *(const float *)( b + DPVS_OFF_MAXS_Y + DPVS_OFF_MINS_Y - plane->sideOffsets[1] );
+	float z = *(const float *)( b + DPVS_OFF_MAXS_Z + DPVS_OFF_MINS_Z - plane->sideOffsets[2] );
+	return x * plane->normal[0] + y * plane->normal[1] + z * plane->normal[2] > plane->distance;
+}
+
+/* cull a box behind any frustum plane (only while planeIndex is still fresh),
+ * the near/far plane, or wholly inside an active occluder. */
+static __forceinline int R_CullBoxDPVS( const vec3_t *bounds, const dpvsPlane_t *planes, int planeCount, int planeIndex )
+{
+	int i;
+	int j;
+
+	if ( planeIndex < dpvs_cullPlaneLimit )
+	{
+		dpvs_cullPlaneLimit = 0x7FFFFFFF;
+		for ( i = 0; i < planeCount; ++i )
+		{
+			if ( R_BoxBehindPlaneXYZ( bounds, &planes[i] ) )
+				return 1;
+		}
+	}
+
+	if ( R_BoxBehindPlane( bounds, (const dpvsPlane_t *)dpvs_activeNearPlane ) )
+		return 1;
+	if ( dpvs_activeFarPlane && R_BoxBehindPlane( bounds, (const dpvsPlane_t *)dpvs_activeFarPlane ) )
+		return 1;
+
+	/* retail re-reads dpvs_occluders[i] after each store and tests the plane
+	 * count at the top of the inner loop (behind every plane -> occluded) */
+	for ( i = 0; i < dpvs_occluderCount; ++i )
+	{
+		if ( planeIndex >= ((dpvsOccluder_t **)dpvs_occluders)[i]->cullPlaneLimit )
+			continue;
+		((dpvsOccluder_t **)dpvs_occluders)[i]->cullPlaneLimit = 0x7FFFFFFF;
+		for ( j = 0; ; ++j )
+		{
+			if ( j >= ((dpvsOccluder_t **)dpvs_occluders)[i]->activePlaneCount )
+				return 1;
+			if ( !R_BoxBehindPlane( bounds, &((dpvsOccluder_t **)dpvs_occluders)[i]->activePlanes[j] ) )
+				break;
+		}
+	}
+	return 0;
+}
+
+/* stricter classifier: reports a box that is NOT wholly in front of every
+ * frustum plane, or that is wholly behind every active plane of some occluder,
+ * recording the earliest reusable plane position.  A false result means the box
+ * is fully in front and unoccluded, so a whole subtree may be accepted. */
+static __forceinline int R_CullBoxDPVSStrict( const vec3_t *bounds, const dpvsPlane_t *planes, int planeCount, int planeIndex )
+{
+	int i;
+	int j;
+
+	if ( planeIndex < dpvs_cullPlaneLimit )
+	{
+		for ( i = 0; i < planeCount; ++i )
+		{
+			if ( !R_BoxInFrontOfPlaneXYZ( bounds, &planes[i] ) )
+				return 1;
+		}
+		dpvs_cullPlaneLimit = planeIndex + 1;
+	}
+
+	for ( i = 0; i < dpvs_occluderCount; ++i )
+	{
+		if ( planeIndex >= ((dpvsOccluder_t **)dpvs_occluders)[i]->cullPlaneLimit )
+			continue;
+		for ( j = 0; ; ++j )
+		{
+			if ( j >= ((dpvsOccluder_t **)dpvs_occluders)[i]->activePlaneCount )
+				return 1;
+			if ( R_BoxInFrontOfPlane( bounds, &((dpvsOccluder_t **)dpvs_occluders)[i]->activePlanes[j] ) )
+				break;
+		}
+		((dpvsOccluder_t **)dpvs_occluders)[i]->cullPlaneLimit = planeIndex + 1;
+	}
+	return 0;
+}
+
+
+/* ---- R_SetPlaneSidesDPVS  0x004E1620 ----  VERIFIED
+ * Bias a DPVS plane back by 0.001 and precompute the byte offset that selects
+ * the box corner farthest along each normal component.  The corner test uses
+ * the sign of the raw normal bits (an int compare of the float word). */
 int __cdecl R_SetPlaneSidesDPVS(int result)
 {
-  int v1;
-  char v2;
-  char v3;
+  dpvsPlane_t *plane = (dpvsPlane_t *)result;
 
-  v1 = *(_DWORD *)(result + 4);
-  v2 = (*(int *)result <= 0) - 1;
-  *(float *)(result + 12) = *(float *)(result + 12) - 0.001;
-  *(_BYTE *)(result + 16) = v2 & 0xC;
-  v3 = *(int *)(result + 8) <= 0 ? 0 : 0xC;
-  *(_BYTE *)(result + 17) = v1 <= 0 ? 4 : 16;
-  *(_BYTE *)(result + 18) = v3 + 8;
+  plane->distance -= DPVS_PLANE_BIAS;
+  plane->sideOffsets[0] = *(int *)&plane->normal[0] > 0 ? DPVS_OFF_MAXS_X : DPVS_OFF_MINS_X;
+  plane->sideOffsets[1] = *(int *)&plane->normal[1] > 0 ? DPVS_OFF_MAXS_Y : DPVS_OFF_MINS_Y;
+  plane->sideOffsets[2] = *(int *)&plane->normal[2] > 0 ? DPVS_OFF_MAXS_Z : DPVS_OFF_MINS_Z;
   return result;
 }
 
-/* ---- RE_GetFarPlaneDist  0x004E1670 ----  VERIFIED */
+/* ---- RE_GetFarPlaneDist  0x004E1670 ----  VERIFIED
+ * An explicit r_zfar wins; otherwise the current linear world fog supplies its
+ * end distance, and the renderer's cull distance is the lower bound. */
 double RE_GetFarPlaneDist()
 {
-  double result;
+  float result;
 
   result = r_zfar->value;
-  if ( (result == 0.0) | __UNORDERED__(result, 0.0) )
+  if ( result == 0.0f )
   {
-    if ( glfogNum > 0 )
-    {
-      if ( dword_16C4C70 )
-      {
-        if ( dword_16C4C40 == 9729 )
-          result = flt_16C4C64;
-      }
-    }
+    if ( glfogNum > 0 && tr_fogCurrent_registered && tr_fogCurrent_mode == 9729 )   /* fog registered + GL_LINEAR */
+      result = tr_fogCurrent_end;
   }
-  if ( (result < dpvs_cullDist) | __UNORDERED__(result, dpvs_cullDist) )
+  if ( result < dpvs_cullDist )
     return dpvs_cullDist;
   return result;
 }
 
-
-/* ---- R_CullDlightsForBox  0x004E16D0 ----  VERIFIED */
-int __cdecl R_CullDlightsForBox(int a1, float *a2, float *a3)
+/* ---- R_CullDlightsForBox  0x004E16D0 ----  VERIFIED
+ * Keep only the dlight bits whose light sphere overlaps the box. */
+int __cdecl R_CullDlightsForBox(int dlightBits, float *mins, float *maxs)
 {
-  int v3;
-  int v4;
-  int v5;
-  float *v6;
+  int      result = 0;
+  int      bit;
+  dlight_t *light;
 
-  v3 = a1;
-  v4 = 0;
-  v5 = 1;
-  if ( a1 )
+  for ( bit = 1, light = (dlight_t *)tr_refdef_dlights; dlightBits; bit *= 2, ++light )
   {
-    v6 = (float *)(tr_refdef_dlights + 116);
-    do
-    {
-      if ( (v5 & v3) != 0 )
-      {
-        v3 &= ~v5;
-        if ( *v6 + v6[1] > *a3
-          && v6[1] - *v6 < *a2
-          && *v6 + v6[2] > a3[1]
-          && v6[2] - *v6 < a2[1]
-          && *v6 + v6[3] > a3[2]
-          && v6[3] - *v6 < a2[2] )
-        {
-          v4 |= v5;
-        }
-      }
-      v5 *= 2;
-      v6 += 34;
-    }
-    while ( v3 );
+    if ( !(dlightBits & bit) )
+      continue;
+    dlightBits &= ~bit;
+    if ( light->radius + light->transformedPosition[0] <= mins[0]
+      || light->transformedPosition[0] - light->radius >= maxs[0]
+      || light->radius + light->transformedPosition[1] <= mins[1]
+      || light->transformedPosition[1] - light->radius >= maxs[1]
+      || light->radius + light->transformedPosition[2] <= mins[2]
+      || light->transformedPosition[2] - light->radius >= maxs[2] )
+      continue;
+    result |= bit;
   }
-  return v4;
+  return result;
 }
 
-/* ---- R_AddWorldSurfaceNoCull  0x004E1760 ----  VERIFIED */
-int __cdecl R_AddWorldSurfaceNoCull(BOOL a1, _DWORD *a2)
+/* ---- R_AddWorldSurfaceNoCull  0x004E1760 ----  VERIFIED
+ * Stamp a world/model surface visible this view and hand it to R_AddDrawSurf.
+ * Model surfaces (type < SF_INDEXED_FIRST) carry no dlights and use the global
+ * storage class; indexed world surfaces carry their culled dlight mask and
+ * their own storage mode. */
+int __cdecl R_AddWorldSurfaceNoCull(int dlightBits, msurface_t *surf)
 {
-  int v2;
-  int v3;
+  srfLit_t *data;
 
-  v2 = a2[2];
-  *a2 = tr_viewCount;
-  if ( *(int *)v2 < 24 )
+  data = (srfLit_t *)surf->data;
+  surf->viewCount = tr_viewCount;
+  if ( data->surfaceType >= SF_INDEXED_FIRST )
   {
-    if ( a1 )
-      a1 = 0;
-    return R_AddDrawSurf(storageClass, a2[1], v2, a1, 0, 0);
-  }
-  else
-  {
-    if ( a1 )
+    if ( dlightBits )
     {
-      v3 = R_CullDlightsForBox(a1, (float *)(v2 + 24), (float *)(v2 + 12));
-      *(_DWORD *)(v2 + 8) = v3;
-      a1 = v3 != 0;
+      dlightBits = R_CullDlightsForBox(dlightBits, data->boundsMin, data->boundsMax);
+      data->dlightBits = dlightBits;
+      dlightBits = dlightBits != 0;
     }
-    return R_AddDrawSurf(*(_DWORD *)(v2 + 4), a2[1], a2[2], a1, 0, 0);
+    return R_AddDrawSurf(data->storageMode, surf->shader, surf->data, dlightBits, 0, 0);
   }
+  if ( dlightBits )
+    dlightBits = 0;
+  return R_AddDrawSurf(storageClass, surf->shader, data, dlightBits, 0, 0);
 }
 
 /* ---- R_AllocClipPlanes  0x004E17D0 ----  VERIFIED */
-int __cdecl R_AllocClipPlanes(int a1)
+int __cdecl R_AllocClipPlanes(int planeCount)
 {
-  return ri_Hunk_AllocateTempMemory(20 * a1);
+  return ri.Hunk_AllocateTempMemory(20 * planeCount);   /* 20 == sizeof(dpvsPlane_t) */
 }
 
 /* ---- R_FreeClipPlanes  0x004E17F0 ----  VERIFIED */
-int __cdecl R_FreeClipPlanes(int a1)
+void __cdecl R_FreeClipPlanes(int planes)
 {
-  return ri_Hunk_FreeTempMemory(a1);
+  ri.Hunk_FreeTempMemory(planes);
 }
 
-/* ---- R_FrustumClipPlanes  0x004E1800 ----  VERIFIED */
-int R_FrustumClipPlanes()
+/* ---- R_FrustumClipPlanes  0x004E1800 ----  VERIFIED
+ * Copy the four view-frustum planes into the DPVS frustum bank, biasing each
+ * and precomputing its corner offsets. */
+void R_FrustumClipPlanes()
 {
   int i;
 
   for ( i = 0; i < TR_FRUSTUM_PLANES; ++i )
   {
-    tr_dpvsPlane_t       *dst = &tr_dpvsFrustumPlanes[i];
-    const tr_cplane_t    *src = &tr_frustum[i];
-
-    *(int *)&dst->normal[0] = *(const int *)&src->normal[0];
-    *(int *)&dst->normal[1] = *(const int *)&src->normal[1];
-    *(int *)&dst->normal[2] = *(const int *)&src->normal[2];
-    *(int *)&dst->dist      = *(const int *)&src->dist;
-
-    dst->dist = dst->dist - 0.001f;
-
-    dst->sides[0] = (unsigned char)(*(const int *)&dst->normal[0] <= 0 ?  0 : 12);
-    dst->sides[1] = (unsigned char)(*(const int *)&dst->normal[1] <= 0 ?  4 : 16);
-    dst->sides[2] = (unsigned char)(*(const int *)&dst->normal[2] <= 0 ?  8 : 20);
+    dpvs_frustumPlanesTyped[i].normal[0] = trView.frustum[i].normal[0];
+    dpvs_frustumPlanesTyped[i].normal[1] = trView.frustum[i].normal[1];
+    dpvs_frustumPlanesTyped[i].normal[2] = trView.frustum[i].normal[2];
+    dpvs_frustumPlanesTyped[i].distance  = trView.frustum[i].dist;
+    R_SetPlaneSidesDPVS((int)&dpvs_frustumPlanesTyped[i]);
   }
-  return TR_FRUSTUM_PLANES * 20;
 }
 
-/* ---- R_SetupTransformMatrix  0x004E18A0 ----  VERIFIED */
-int R_SetupTransformMatrix()
+/* ---- R_SetupTransformMatrix  0x004E18A0 ----  VERIFIED
+ * Build world.modelMatrix * projectionMatrix, invert it (kept for portal
+ * unprojection), and store its transpose across the 16 int-typed matrix
+ * globals used by R_PortalClipPlanesInternal. */
+void R_SetupTransformMatrix()
 {
-  int i;
-  float *v1;
-  float *v2;
-  double v3;
-  int result;
-  float v5[16]; // [esp+0h] [ebp-40h] BYREF -- retail's single 64-byte matrix
+  int          row;
+  int          col;
+  const float *world = trView.world.modelMatrix;
+  const float *proj  = trView.projectionMatrix;
+  float        combined[16];   /* retail's single 64-byte matrix, row-major */
+#ifdef COD1_VC7
+  int          k;
+  float       *out;
 
-  for ( i = 0; i < 16; i += 4 )
+  /* the k loop keeps VC7 from unrolling the row loop (retail walks it by pointer) */
+  for ( col = 0; col < 4; ++col )
   {
-    v1 = &tr_viewParms_world_modelMatrix[2];
-    v2 = &v5[i / 4u];
-    do
+    for ( row = 0; row < 4; ++row )
     {
-      v3 = v1[1];
-      v1 += 4;
-      v2 += 4;
-      *(v2 - 4) = v3 * tr_viewParms_projectionMatrix[i / 4u + 12]
-                + *(v1 - 6) * tr_viewParms_projectionMatrix[i / 4u]
-                + *(v1 - 5) * tr_viewParms_projectionMatrix[i / 4u + 4]
-                + tr_viewParms_projectionMatrix[i / 4u + 8] * *(v1 - 4);
+      out = &combined[4 * row + col];
+      *out = 0;
+      for ( k = 0; k < 4; ++k )
+        *out += world[4 * row + k] * proj[4 * k + col];
     }
-    while ( (int)v1 < (int)&flt_16C5450 );
   }
-  MatrixInverse44(dpvs_transformMatrixInverse, v5);
-  dpvs_transformMatrixTransposed = LODWORD(v5[0]);
-  dword_11CC19C = LODWORD(v5[4]);
-  dword_11CC1A0 = LODWORD(v5[8]);
-  dword_11CC1A4 = LODWORD(v5[12]);
-  dword_11CC1A8 = LODWORD(v5[1]);
-  dword_11CC1AC = LODWORD(v5[5]);
-  dword_11CC1B0 = LODWORD(v5[9]);
-  dword_11CC1B4 = LODWORD(v5[13]);
-  dword_11CC1B8 = LODWORD(v5[2]);
-  dword_11CC1BC = LODWORD(v5[6]);
-  dword_11CC1C0 = LODWORD(v5[10]);
-  dword_11CC1C4 = LODWORD(v5[14]);
-  dword_11CC1C8 = LODWORD(v5[3]);
-  result = LODWORD(v5[15]); /* retail 0x4E1995 reads var_4, i.e. m[15] */
-  dword_11CC1CC = LODWORD(v5[7]);
-  dword_11CC1D0 = LODWORD(v5[11]);
-  dword_11CC1D4 = LODWORD(v5[15]); /* 0x4E19A5 */
-  return result;
+#else
+  for ( col = 0; col < 4; ++col )
+  {
+    for ( row = 0; row < 4; ++row )
+    {
+      combined[4 * row + col] =
+          world[4 * row + 3] * proj[12 + col]
+        + world[4 * row + 0] * proj[col]
+        + world[4 * row + 1] * proj[4 + col]
+        + proj[8 + col] * world[4 * row + 2];
+    }
+  }
+#endif
+
+  MatrixInverse44(combined, dpvs_transformMatrixInverse);
+
+  *(float *)&dpvs_transformMatrixTransposed = combined[0];
+  *(float *)&dpvs_transformMatrixTransposed01 = combined[4];
+  *(float *)&dpvs_transformMatrixTransposed02 = combined[8];
+  *(float *)&dpvs_transformMatrixTransposed03 = combined[12];
+  *(float *)&dpvs_transformMatrixTransposed10 = combined[1];
+  *(float *)&dpvs_transformMatrixTransposed11 = combined[5];
+  *(float *)&dpvs_transformMatrixTransposed12 = combined[9];
+  *(float *)&dpvs_transformMatrixTransposed13 = combined[13];
+  *(float *)&dpvs_transformMatrixTransposed20 = combined[2];
+  *(float *)&dpvs_transformMatrixTransposed21 = combined[6];
+  *(float *)&dpvs_transformMatrixTransposed22 = combined[10];
+  *(float *)&dpvs_transformMatrixTransposed23 = combined[14];
+  *(float *)&dpvs_transformMatrixTransposed30 = combined[3];
+  *(float *)&dpvs_transformMatrixTransposed31 = combined[7];
+  *(float *)&dpvs_transformMatrixTransposed32 = combined[11];
+  *(float *)&dpvs_transformMatrixTransposed33 = combined[15];
 }
 
-/* ---- R_PortalClipPlanesInternal  0x004E19B0 ----  VERIFIED */
-int __cdecl R_PortalClipPlanesInternal(_DWORD *a1, int a2, int a3)
+/* ---- R_PortalClipPlanesInternal  0x004E19B0 ----  VERIFIED
+ * Turn a clipped portal winding into a set of view-origin clip planes.  Each
+ * winding edge contributes one plane through the view origin; when
+ * r_portalbevels is positive, the winding's projected screen rectangle adds up
+ * to four bevel planes (each rejected if any edge normal exceeds the configured
+ * dot threshold).  Returns the temp-memory plane array; *outPlaneCount receives
+ * the count.  (The retail body unrolls the vertex projection and edge loops
+ * four-wide; collapsed here to plain loops, but the unrolled lanes do NOT use
+ * identical x87 term orders, so the loops below reproduce each lane's order:
+ * projection groups (y+z)+x vs remainder (z+x)+y; edge-plane distance lane 0
+ * of each group (z+x)+y vs everything else (z+y)+x.  Every vertex is projected
+ * into the screen rectangle -- retail has no clip-space w test.)  The
+ * caller also passes the portal's target cell, which retail never reads. */
+dpvsPlane_t *__cdecl R_PortalClipPlanesInternal(int *outPlaneCount, int vertexCount, vec3_t *vertices, dpvsCell_t *cell)
 {
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  float *v8;
-  float *v9;
-  int v10;
-  float v11;
-  float v12;
-  int v13;
-  float *v14;
-  int v15;
-  int v16;
-  int v17;
-  float *v18;
-  int v19;
-  double v20;
-  int v21;
-  int v22;
-  int v23;
-  int v24;
-  int v25;
-  float *v26;
-  int v27;
-  int v28;
-  bool v29; // zf
-  bool v30; // sf
-  float v31;
-  int v32;
-  int v33;
-  int v34;
-  float *v35;
-  double v36;
-  float v37;
-  float v38;
-  float v39;
-  double v40;
-  float v41;
-  float v42;
-  float v43;
-  double v44;
-  float v45;
-  float v46;
-  float v47;
-  double v48;
-  float v49;
-  float v50;
-  float v51;
-  float *v52;
-  int v53;
-  int v54;
-  double v55;
-  float v56;
-  float v57;
-  float v58;
-  int result;
-  float v60;
-  float v61;
-  float v62;
-  float v63;
-  float v64;
-  float v65;
-  float v66;
-  float v67;
-  float v68;
-  float v69;
-  float v70;
-  float v71;
-  float v72;
-  float v73;
-  float v74;
-  float v75;
-  unsigned int v76;
-  float v77;
-  float v78;
-  int v79;
-  float v80;
-  float v81;
-  float v82;
-  float v83;
-  float v84;
-  float v85;
-  float v86;
-  float v87;
-  float v88;
-  float v89;
-  float v90;
-  float v91;
-  float v92;
-  float v93;
-  float v94;
-  float v95;
-  float v96;
-  float v97;
-  int v98;
-  float v99;
-  float v100;
-  float v101;
-  float v102;
-  float v103;
-  float portalPts[15];      /* [ebp-6048h]  4 portal corners + closing copy */
-  float relPts[3075];       /* [ebp-600Ch]  winding points - r_viewOrigin   */
-  float edgeNormals[3072];  /* [ebp-3000h]  one plane normal per edge       */
+  const float *inv = dpvsGlob.transformMatrixInverse;
+  int          unrolled = vertexCount & ~3;   
+  int          planeCount;
+  int          i;
+  int          k;
+  int          c;
+  dpvsPlane_t *outPlanes;
+  const float *wvp = (const float *)dpvsGlob.transformMatrixTransposed;
+  float        bevelCorners[5][3];   
+  float        relVerts[1025][3];    
+  float        edgeNormals[1024][3]; 
 
-  v3 = a2;
-  if ( r_portalbevels->value <= 0.0 )
+
+
+  if ( r_portalbevels->value > 0.0f )
   {
-    v98 = ri_Hunk_AllocateTempMemory(20 * a2);
-  }
-  else
-  {
-    *(float *)&v4 = 1.0;
-    *(float *)&v5 = -1.0;
-    v6 = 0;
-    v98 = ri_Hunk_AllocateTempMemory(4 * (5 * a2 + 20));
-    v77 = 1.0;
-    v82 = 1.0;
-    v90 = -1.0;
-    v93 = -1.0;
-    if ( a2 >= 4 )
+    float minX = 1.0f;
+    float minY = 1.0f;
+    float maxX = -1.0f;
+    float maxY = -1.0f;
+    outPlanes = (dpvsPlane_t *)ri.Hunk_AllocateTempMemory(20 * (vertexCount + 4));
+
+    
+
+    for ( i = 0; i < vertexCount; ++i )
     {
-      v7 = 3;
-      v8 = (float *)(a3 + 4);
-      do
+      const float *v = vertices[i];
+      float clipW, invW, px, py;
+
+      if ( i < unrolled )
       {
-        v60 = *(float *)&dword_11CC1CC * *v8
-            + *(float *)&dword_11CC1D0 * v8[1]
-            + *(float *)&dword_11CC1C8 * *(v8 - 1)
-            + *(float *)&dword_11CC1D4;
-        v61 = 1.0 / v60;
-        v84 = (*(float *)&dword_11CC19C * *v8
-             + *(float *)&dword_11CC1A0 * v8[1]
-             + *(float *)&dpvs_transformMatrixTransposed * *(v8 - 1)
-             + *(float *)&dword_11CC1A4)
-            * v61;
-        v62 = (*(float *)&dword_11CC1AC * *v8
-             + *(float *)&dword_11CC1B0 * v8[1]
-             + *(float *)&dword_11CC1A8 * *(v8 - 1)
-             + *(float *)&dword_11CC1B4)
-            * v61;
-        if ( v77 > (double)v84 )
-          v77 = v84;
-        if ( (v90 < (double)v84) | __UNORDERED__(v90, v84) )
-          v90 = v84;
-        if ( v82 > (double)v62 )
-          v82 = v62;
-        if ( (v93 < (double)v62) | __UNORDERED__(v93, v62) )
-        {
-          *(float *)&v5 = v62;
-          v93 = v62;
-        }
-        v63 = *(float *)&dword_11CC1D0 * v8[4]
-            + *(float *)&dword_11CC1CC * v8[3]
-            + *(float *)&dword_11CC1C8 * v8[2]
-            + *(float *)&dword_11CC1D4;
-        v64 = 1.0 / v63;
-        v85 = (*(float *)&dword_11CC1A0 * v8[4]
-             + *(float *)&dword_11CC19C * v8[3]
-             + *(float *)&dpvs_transformMatrixTransposed * v8[2]
-             + *(float *)&dword_11CC1A4)
-            * v64;
-        v65 = (*(float *)&dword_11CC1B0 * v8[4]
-             + *(float *)&dword_11CC1AC * v8[3]
-             + *(float *)&dword_11CC1A8 * v8[2]
-             + *(float *)&dword_11CC1B4)
-            * v64;
-        if ( v77 > (double)v85 )
-          v77 = v85;
-        if ( (v90 < (double)v85) | __UNORDERED__(v90, v85) )
-          v90 = v85;
-        if ( v82 > (double)v65 )
-          v82 = v65;
-        if ( (v93 < (double)v65) | __UNORDERED__(v93, v65) )
-        {
-          *(float *)&v5 = v65;
-          v93 = v65;
-        }
-        v66 = *(float *)&dword_11CC1D0 * v8[7]
-            + *(float *)&dword_11CC1CC * v8[6]
-            + *(float *)&dword_11CC1C8 * v8[5]
-            + *(float *)&dword_11CC1D4;
-        v67 = 1.0 / v66;
-        v86 = (*(float *)&dword_11CC1A0 * v8[7]
-             + *(float *)&dword_11CC19C * v8[6]
-             + *(float *)&dpvs_transformMatrixTransposed * v8[5]
-             + *(float *)&dword_11CC1A4)
-            * v67;
-        v68 = (*(float *)&dword_11CC1B0 * v8[7]
-             + *(float *)&dword_11CC1AC * v8[6]
-             + *(float *)&dword_11CC1A8 * v8[5]
-             + *(float *)&dword_11CC1B4)
-            * v67;
-        if ( v77 > (double)v86 )
-          v77 = v86;
-        if ( (v90 < (double)v86) | __UNORDERED__(v90, v86) )
-          v90 = v86;
-        if ( v82 > (double)v68 )
-          v82 = v68;
-        if ( (v93 < (double)v68) | __UNORDERED__(v93, v68) )
-        {
-          *(float *)&v5 = v68;
-          v93 = v68;
-        }
-        v69 = *(float *)&dword_11CC1D0 * v8[10]
-            + *(float *)&dword_11CC1CC * v8[9]
-            + *(float *)&dword_11CC1C8 * v8[8]
-            + *(float *)&dword_11CC1D4;
-        v70 = 1.0 / v69;
-        v87 = (*(float *)&dword_11CC1A0 * v8[10]
-             + *(float *)&dword_11CC19C * v8[9]
-             + *(float *)&dpvs_transformMatrixTransposed * v8[8]
-             + *(float *)&dword_11CC1A4)
-            * v70;
-        v71 = (*(float *)&dword_11CC1B0 * v8[10]
-             + *(float *)&dword_11CC1AC * v8[9]
-             + *(float *)&dword_11CC1A8 * v8[8]
-             + *(float *)&dword_11CC1B4)
-            * v70;
-        if ( v77 > (double)v87 )
-          v77 = v87;
-        if ( (v90 < (double)v87) | __UNORDERED__(v90, v87) )
-          v90 = v87;
-        if ( v82 > (double)v71 )
-          v82 = v71;
-        if ( (v93 < (double)v71) | __UNORDERED__(v93, v71) )
-        {
-          *(float *)&v5 = v71;
-          v93 = v71;
-        }
-        v7 += 4;
-        v6 += 4;
-        v8 += 12;
-      }
-      while ( v7 < a2 );
-      *(float *)&v4 = v82;
-    }
-    if ( v6 < a2 )
-    {
-      v9 = (float *)(a3 + 12 * v6 + 4);
-      v10 = a2 - v6;
-      do
-      {
-        v72 = *(float *)&dword_11CC1D0 * v9[1]
-            + *(float *)&dword_11CC1C8 * *(v9 - 1)
-            + *(float *)&dword_11CC1CC * *v9
-            + *(float *)&dword_11CC1D4;
-        v73 = 1.0 / v72;
-        v88 = (*(float *)&dword_11CC1A0 * v9[1]
-             + *(float *)&dpvs_transformMatrixTransposed * *(v9 - 1)
-             + *(float *)&dword_11CC19C * *v9
-             + *(float *)&dword_11CC1A4)
-            * v73;
-        v74 = (*(float *)&dword_11CC1B0 * v9[1]
-             + *(float *)&dword_11CC1A8 * *(v9 - 1)
-             + *(float *)&dword_11CC1AC * *v9
-             + *(float *)&dword_11CC1B4)
-            * v73;
-        if ( v77 > (double)v88 )
-          v77 = v88;
-        if ( (v90 < (double)v88) | __UNORDERED__(v90, v88) )
-          v90 = v88;
-        if ( v82 > (double)v74 )
-        {
-          *(float *)&v4 = v74;
-          v82 = v74;
-        }
-        if ( (v93 < (double)v74) | __UNORDERED__(v93, v74) )
-        {
-          *(float *)&v5 = v74;
-          v93 = v74;
-        }
-        v9 += 3;
-        --v10;
-      }
-      while ( v10 );
-    }
-    v11 = v77;
-    v12 = v90;
-    v13 = 0;
-    v14 = &portalPts[1];
-    do
-    {
-      v78 = v11;
-      if ( v13 >= 2 )
-        v78 = v12;
-      if ( v13 == 1 || (v83 = *(float *)&v5, v13 == 2) )
-        v83 = *(float *)&v4;
-      ++v13;
-      v14 += 3;
-      v91 = dpvs_transformMatrixInverse[4] * v83 + dpvs_transformMatrixInverse[0] * v78 + dpvs_transformMatrixInverse[12];
-      v94 = dpvs_transformMatrixInverse[5] * v83 + dpvs_transformMatrixInverse[1] * v78 + dpvs_transformMatrixInverse[13];
-      v95 = dpvs_transformMatrixInverse[6] * v83 + dpvs_transformMatrixInverse[2] * v78 + dpvs_transformMatrixInverse[14];
-      v96 = dpvs_transformMatrixInverse[7] * v83 + dpvs_transformMatrixInverse[3] * v78 + dpvs_transformMatrixInverse[15];
-      v75 = 1.0 / v96;
-      *(v14 - 4) = v91 * v75;
-      *(v14 - 3) = v94 * v75;
-      *(v14 - 2) = v95 * v75;
-    }
-    while ( v13 < 4 );
-    portalPts[12] = portalPts[0];
-    portalPts[13] = portalPts[1];
-    portalPts[14] = portalPts[2];
-  }
-  v15 = 0;
-  v16 = 0;
-  v79 = 0;
-  if ( a2 > 0 )
-  {
-    v17 = a3 + 8;
-    v18 = &relPts[1];
-    v19 = a2;
-    v16 = a2;
-    do
-    {
-      v18 += 3;
-      v20 = *(float *)(v17 - 8) - *(float *)&dpvs_viewOrigin;
-      v17 += 12;
-      --v19;
-      *(v18 - 4) = v20;
-      *(v18 - 3) = *(float *)(v17 - 16) - *(float *)&dword_11CC104;
-      *(float *)((char *)relPts + (v17 - a3 - 12)) = *(float *)(v17 - 12) - *(float *)&dword_11CC108;
-    }
-    while ( v19 );
-  }
-  v21 = 12 * v16;
-  *(float *)((char *)relPts + v21) = relPts[0];
-  *(float *)((char *)&relPts[1] + v21) = relPts[1];
-  *(float *)((char *)&relPts[2] + v21) = relPts[2];
-  if ( a2 > 0 )
-  {
-    v22 = 0;
-    v23 = a2;
-    do
-    {
-      edgeNormals[v22]     = relPts[4 + v22] * relPts[2 + v22]
-                           - relPts[5 + v22] * relPts[1 + v22];
-      edgeNormals[v22 + 1] = relPts[5 + v22] * relPts[v22]
-                           - relPts[2 + v22] * relPts[3 + v22];
-      edgeNormals[v22 + 2] = relPts[1 + v22] * relPts[3 + v22]
-                           - relPts[4 + v22] * relPts[v22];
-      VectorNormalizeFast(&edgeNormals[v22]);
-      v22 += 3;
-      --v23;
-    }
-    while ( v23 );
-  }
-  if ( r_portalbevels->value > 0.0 )
-  {
-    v24 = v98 + 4;
-    v76 = 0;
-    relPts[0] = portalPts[0] - *(float *)&dpvs_viewOrigin;
-    relPts[12] = relPts[0];
-    relPts[1] = portalPts[1] - *(float *)&dword_11CC104;
-    relPts[13] = relPts[1];
-    relPts[2] = portalPts[2] - *(float *)&dword_11CC108;
-    relPts[14] = relPts[2];
-    relPts[3] = portalPts[3] - *(float *)&dpvs_viewOrigin;
-    relPts[4] = portalPts[4] - *(float *)&dword_11CC104;
-    relPts[5] = portalPts[5] - *(float *)&dword_11CC108;
-    relPts[6] = portalPts[6] - *(float *)&dpvs_viewOrigin;
-    relPts[7] = portalPts[7] - *(float *)&dword_11CC104;
-    relPts[8] = portalPts[8] - *(float *)&dword_11CC108;
-    relPts[9] = portalPts[9] - *(float *)&dpvs_viewOrigin;
-    relPts[10] = portalPts[10] - *(float *)&dword_11CC104;
-    relPts[11] = portalPts[11] - *(float *)&dword_11CC108;
-    do
-    {
-      *(float *)(v24 - 4) = relPts[v76 / 4 + 4] * relPts[v76 / 4 + 2]
-                          - relPts[v76 / 4 + 1] * relPts[v76 / 4 + 5];
-      *(float *)v24 = relPts[v76 / 4] * relPts[v76 / 4 + 5]
-                    - relPts[v76 / 4 + 3] * relPts[v76 / 4 + 2];
-      *(float *)(v24 + 4) = relPts[v76 / 4 + 1] * relPts[v76 / 4 + 3]
-                          - relPts[v76 / 4] * relPts[v76 / 4 + 4];
-      VectorNormalizeFast((float *)(v24 - 4));
-      v25 = 0;
-      if ( v3 <= 0 )
-      {
-LABEL_70:
-        if ( r_showportals->integer )
-        {
-          R_AddDebugLine((float *)((char *)portalPts + v76), &portalPts[v76 / 4 + 3], acceptedBevelDebugColor);
-          v3 = a2;
-          v15 = v79;
-        }
-        *(float *)(v24 + 8) = *(float *)&dword_11CC104 * *(float *)v24
-                            + *(float *)&dword_11CC108 * *(float *)(v24 + 4)
-                            + *(float *)&dpvs_viewOrigin * *(float *)(v24 - 4);
-        v27 = *(_DWORD *)(v24 - 4);
-        v28 = *(_DWORD *)(v24 + 4);
-        v29 = v27 == 0;
-        v30 = v27 < 0;
-        v31 = *(float *)v24;
-        *(float *)(v24 + 8) = *(float *)(v24 + 8) - 0.001;
-        ++v15;
-        *(_BYTE *)(v24 + 12) = v30 || v29 ? 0 : 0xC;
-        *(_BYTE *)(v24 + 13) = SLODWORD(v31) <= 0 ? 4 : 16;
-        *(_BYTE *)(v24 + 14) = v28 <= 0 ? 8 : 20;
-        v79 = v15;
-        v24 += 20;
+        clipW = wvp[13] * v[1] + wvp[14] * v[2] + wvp[12] * v[0] + wvp[15];
+        invW  = 1.0f / clipW;
+        px = ( wvp[1] * v[1] + wvp[2] * v[2] + wvp[0] * v[0] + wvp[3] ) * invW;
+        py = ( wvp[5] * v[1] + wvp[6] * v[2] + wvp[4] * v[0] + wvp[7] ) * invW;
       }
       else
       {
-        v26 = &edgeNormals[1];
-        while ( *(v26 - 1) * *(float *)(v24 - 4) + v26[1] * *(float *)(v24 + 4) + *v26 * *(float *)v24 <= r_portalbevels->value )
-        {
-          ++v25;
-          v26 += 3;
-          if ( v25 >= v3 )
-            goto LABEL_70;
-        }
-        if ( (r_showportals->integer & 2) != 0 )
-        {
-          R_AddDebugLine((float *)((char *)portalPts + v76), &portalPts[v76 / 4 + 3], rejectedBevelDebugColor);
-          v3 = a2;
-          v15 = v79;
-        }
+        clipW = wvp[14] * v[2] + wvp[12] * v[0] + wvp[13] * v[1] + wvp[15];
+        invW  = 1.0f / clipW;
+        px = ( wvp[2] * v[2] + wvp[0] * v[0] + wvp[1] * v[1] + wvp[3] ) * invW;
+        py = ( wvp[6] * v[2] + wvp[4] * v[0] + wvp[5] * v[1] + wvp[7] ) * invW;
       }
-      v76 += 12;
+
+      if ( minX > px )
+        minX = px;
+      if ( maxX < px )
+        maxX = px;
+      if ( minY > py )
+        minY = py;
+      if ( maxY < py )
+        maxY = py;
     }
-    while ( (int)v76 < 48 );
-  }
-  v32 = 0;
-  if ( v3 >= 4 )
-  {
-    v33 = 3;
-    v34 = v98 + 20 * v15;
-    v35 = &edgeNormals[1];
-    do
+
+    for ( k = 0; k < 4; ++k )
     {
-      v36 = *v35 * *v35 + v35[1] * v35[1] + *(v35 - 1) * *(v35 - 1);
-      if ( !((v36 == 0.0) | __UNORDERED__(v36, 0.0)) )
-      {
-        v37 = *(v35 - 1);
-        *(float *)v34 = v37;
-        v89 = v37;
-        v38 = *v35;
-        *(float *)(v34 + 4) = *v35;
-        v100 = v38;
-        v39 = v35[1];
-        *(float *)(v34 + 8) = v39;
-        *(float *)(v34 + 12) = v39 * *(float *)&dword_11CC108
-                             + v89 * *(float *)&dpvs_viewOrigin
-                             + v100 * *(float *)&dword_11CC104;
-        LOBYTE(v39) = (*(int *)v34 <= 0) - 1;
-        *(float *)(v34 + 12) = *(float *)(v34 + 12) - 0.001;
-        *(_BYTE *)(v34 + 16) = LOBYTE(v39) & 0xC;
-        *(_BYTE *)(v34 + 17) = *(int *)(v34 + 4) <= 0 ? 4 : 16;
-        *(_BYTE *)(v34 + 18) = *(int *)(v34 + 8) <= 0 ? 8 : 20;
-        ++v15;
-        v34 += 20;
-      }
-      v40 = v35[4] * v35[4] + v35[3] * v35[3] + v35[2] * v35[2];
-      if ( !((v40 == 0.0) | __UNORDERED__(v40, 0.0)) )
-      {
-        v41 = v35[2];
-        *(float *)v34 = v41;
-        v101 = v41;
-        v42 = v35[3];
-        *(float *)(v34 + 4) = v42;
-        v99 = v42;
-        v43 = v35[4];
-        *(float *)(v34 + 8) = v43;
-        *(float *)(v34 + 12) = v43 * *(float *)&dword_11CC108
-                             + v99 * *(float *)&dword_11CC104
-                             + v101 * *(float *)&dpvs_viewOrigin;
-        LOBYTE(v43) = (*(int *)v34 <= 0) - 1;
-        *(float *)(v34 + 12) = *(float *)(v34 + 12) - 0.001;
-        *(_BYTE *)(v34 + 16) = LOBYTE(v43) & 0xC;
-        *(_BYTE *)(v34 + 17) = *(int *)(v34 + 4) <= 0 ? 4 : 16;
-        *(_BYTE *)(v34 + 18) = *(int *)(v34 + 8) <= 0 ? 8 : 20;
-        ++v15;
-        v34 += 20;
-      }
-      v44 = v35[7] * v35[7] + v35[6] * v35[6] + v35[5] * v35[5];
-      if ( !((v44 == 0.0) | __UNORDERED__(v44, 0.0)) )
-      {
-        v45 = v35[5];
-        *(float *)v34 = v45;
-        v102 = v45;
-        v46 = v35[6];
-        *(float *)(v34 + 4) = v46;
-        v103 = v46;
-        v47 = v35[7];
-        *(float *)(v34 + 8) = v47;
-        *(float *)(v34 + 12) = v47 * *(float *)&dword_11CC108
-                             + v103 * *(float *)&dword_11CC104
-                             + v102 * *(float *)&dpvs_viewOrigin;
-        LOBYTE(v47) = (*(int *)v34 <= 0) - 1;
-        *(float *)(v34 + 12) = *(float *)(v34 + 12) - 0.001;
-        *(_BYTE *)(v34 + 16) = LOBYTE(v47) & 0xC;
-        *(_BYTE *)(v34 + 17) = *(int *)(v34 + 4) <= 0 ? 4 : 16;
-        *(_BYTE *)(v34 + 18) = *(int *)(v34 + 8) <= 0 ? 8 : 20;
-        ++v15;
-        v34 += 20;
-      }
-      v48 = v35[10] * v35[10] + v35[9] * v35[9] + v35[8] * v35[8];
-      if ( !((v48 == 0.0) | __UNORDERED__(v48, 0.0)) )
-      {
-        v49 = v35[8];
-        *(float *)v34 = v49;
-        v80 = v49;
-        v50 = v35[9];
-        *(float *)(v34 + 4) = v50;
-        v92 = v50;
-        v51 = v35[10];
-        *(float *)(v34 + 8) = v51;
-        *(float *)(v34 + 12) = v51 * *(float *)&dword_11CC108
-                             + v92 * *(float *)&dword_11CC104
-                             + v80 * *(float *)&dpvs_viewOrigin;
-        LOBYTE(v51) = (*(int *)v34 <= 0) - 1;
-        *(float *)(v34 + 12) = *(float *)(v34 + 12) - 0.001;
-        *(_BYTE *)(v34 + 16) = LOBYTE(v51) & 0xC;
-        *(_BYTE *)(v34 + 17) = *(int *)(v34 + 4) <= 0 ? 4 : 16;
-        *(_BYTE *)(v34 + 18) = *(int *)(v34 + 8) <= 0 ? 8 : 20;
-        ++v15;
-        v34 += 20;
-      }
-      v33 += 4;
-      v32 += 4;
-      v35 += 12;
+      float px = k < 2 ? minX : maxX;
+      float py = ( k == 1 || k == 2 ) ? minY : maxY;
+      float h[4];
+      float invW;
+
+      for ( c = 0; c < 4; ++c )
+        h[c] = inv[4 + c] * py + inv[c] * px + inv[12 + c];
+      invW = 1.0f / h[3];
+      bevelCorners[k][0] = h[0] * invW;
+      bevelCorners[k][1] = h[1] * invW;
+      bevelCorners[k][2] = h[2] * invW;
     }
-    while ( v33 < v3 );
+    bevelCorners[4][0] = bevelCorners[0][0];
+    bevelCorners[4][1] = bevelCorners[0][1];
+    bevelCorners[4][2] = bevelCorners[0][2];
   }
-  if ( v32 >= v3 )
-  {
-    result = v98;
-    *a1 = v15;
-  }
+
   else
+    outPlanes = (dpvsPlane_t *)ri.Hunk_AllocateTempMemory(20 * vertexCount);
+
+  for ( i = 0; i < vertexCount; ++i )
   {
-    v52 = &edgeNormals[3 * v32 + 1];
-    v53 = v98 + 20 * v15 + 4;
-    v54 = v3 - v32;
-    do
+    relVerts[i][0] = vertices[i][0] - (*(float *)&dpvs_viewOrigin);
+    relVerts[i][1] = vertices[i][1] - (*(float *)&dpvs_viewOriginY);
+    relVerts[i][2] = vertices[i][2] - (*(float *)&dpvs_viewOriginZ);
+  }
+  relVerts[vertexCount][0] = relVerts[0][0];
+  relVerts[vertexCount][1] = relVerts[0][1];
+  relVerts[vertexCount][2] = relVerts[0][2];
+
+  for ( i = 0; i < vertexCount; ++i )
+  {
+    const float *cur = relVerts[i];
+    const float *nxt = relVerts[i + 1];
+
+    edgeNormals[i][0] = nxt[1] * cur[2] - nxt[2] * cur[1];
+    edgeNormals[i][1] = nxt[2] * cur[0] - nxt[0] * cur[2];
+    edgeNormals[i][2] = nxt[0] * cur[1] - nxt[1] * cur[0];
+    VectorNormalizeFast( edgeNormals[i] );
+  }
+
+  planeCount = 0;
+
+  if ( r_portalbevels->value > 0.0f )
+  {
+    float relBevel[5][3];
+
+    for ( k = 0; k <= 4; ++k )
     {
-      v55 = *v52 * *v52 + v52[1] * v52[1] + *(v52 - 1) * *(v52 - 1);
-      if ( !((v55 == 0.0) | __UNORDERED__(v55, 0.0)) )
-      {
-        v56 = *(v52 - 1);
-        *(float *)(v53 - 4) = v56;
-        v97 = v56;
-        v57 = *v52;
-        *(float *)v53 = *v52;
-        v81 = v57;
-        v58 = v52[1];
-        *(float *)(v53 + 4) = v58;
-        *(float *)(v53 + 8) = v81 * *(float *)&dword_11CC104
-                            + *(float *)&dword_11CC108 * v58
-                            + v97 * *(float *)&dpvs_viewOrigin;
-        LOBYTE(v58) = (*(int *)(v53 - 4) <= 0) - 1;
-        *(float *)(v53 + 8) = *(float *)(v53 + 8) - 0.001;
-        *(_BYTE *)(v53 + 12) = LOBYTE(v58) & 0xC;
-        *(_BYTE *)(v53 + 13) = *(int *)v53 <= 0 ? 4 : 16;
-        *(_BYTE *)(v53 + 14) = *(int *)(v53 + 4) <= 0 ? 8 : 20;
-        ++v15;
-        v53 += 20;
-      }
-      v52 += 3;
-      --v54;
+      relBevel[k][0] = bevelCorners[k][0] - (*(float *)&dpvs_viewOrigin);
+      relBevel[k][1] = bevelCorners[k][1] - (*(float *)&dpvs_viewOriginY);
+      relBevel[k][2] = bevelCorners[k][2] - (*(float *)&dpvs_viewOriginZ);
     }
-    while ( v54 );
-    *a1 = v15;
-    return v98;
-  }
-  return result;
-}
 
-
-/* ---- R_CullOccluderByPlane  0x004E2810 ----  VERIFIED */
-int __cdecl R_CullOccluderByPlane(int a1, float *a2)
-{
-  int v2;
-  int v3;
-  float *i;
-
-  v2 = *(_DWORD *)(a1 + 16);
-  v3 = 0;
-  if ( v2 <= 0 )
-    return 1;
-  for ( i = *(float **)(a1 + 20); i[1] * a2[1] + i[2] * a2[2] + *i * *a2 <= a2[3]; i += 3 )
-  {
-    if ( ++v3 >= v2 )
-      return 1;
-  }
-  return 0;
-}
-
-/* ---- R_AddCellOccluders  0x004E2860 ----  [HIGH] */
-void __cdecl R_AddCellOccluders(int a1, float *a2, int a3)
-{
-  int v3;
-  int v4;
-  _DWORD *v5;
-  int v6;
-  float *v7;
-  int j;
-  int v9;
-  float *v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  unsigned __int8 v17;
-  int v18;
-  float *v19;
-  double v20;
-  float *v21;
-  double v22;
-  float *v23;
-  int v24;
-  int v25;
-  int v26;
-  int k;
-  int i;
-  float v29;
-  float v30;
-  float v31;
-  float v32;
-  float v33;
-  float v34;
-
-  v3 = 0;
-  v4 = a1;
-  dpvs_occluderCount = 0;
-  dpvs_activePlaneCount = 0;
-  for ( i = 0; v3 < *(_DWORD *)(v4 + 48); i = v3 )
-  {
-    v5 = *(_DWORD **)(*(_DWORD *)(v4 + 44) + 4 * v3);
-    v6 = 0;
-    if ( (int)v5[4] > 0 )
+    for ( k = 0; k < 4; ++k )
     {
-      v7 = (float *)v5[5];
-      while ( v7[1] * *(float *)(dpvs_activeNearPlane + 4)
-            + v7[2] * *(float *)(dpvs_activeNearPlane + 8)
-            + *(float *)dpvs_activeNearPlane * *v7 <= *(float *)(dpvs_activeNearPlane + 12) )
+      const float *cur = relBevel[k];
+      const float *nxt = relBevel[k + 1];
+      float        n[3];
+      int          rejected = 0;
+
+      n[0] = nxt[1] * cur[2] - nxt[2] * cur[1];
+      n[1] = nxt[2] * cur[0] - nxt[0] * cur[2];
+      n[2] = nxt[0] * cur[1] - nxt[1] * cur[0];
+      VectorNormalizeFast( n );
+
+      for ( i = 0; i < vertexCount; ++i )
       {
-        ++v6;
-        v7 += 3;
-        if ( v6 >= v5[4] )
-          goto LABEL_28;
-      }
-      for ( j = a3; j; a2 += 5 )
-      {
-        v9 = 0;
-        v10 = (float *)v5[5];
-        while ( v10[2] * a2[2] + v10[1] * a2[1] + *a2 * *v10 <= a2[3] )
+        
+        if ( edgeNormals[i][0] * n[0] + edgeNormals[i][2] * n[2] + edgeNormals[i][1] * n[1] > r_portalbevels->value )
         {
-          ++v9;
-          v10 += 3;
-          if ( v9 >= v5[4] )
-            goto LABEL_27;
-        }
-        a3 = --j;
-      }
-      if ( dpvs_occluderCount == 1024 )
-        ri_Error(1, "\x15" "Too many active occluder brushes");
-      *(_DWORD *)(dpvs_occluders + 4 * dpvs_occluderCount++) = v5;
-      v5[6] = 0x7FFFFFFF;
-      v5[7] = dpvs_activePlaneCount;
-      v5[8] = dpvs_activePlanes + 20 * dpvs_activePlaneCount;
-      v11 = 0;
-      for ( k = 0; k < v5[1]; ++k )
-      {
-        *(_BYTE *)(*v5 + v11 + 19) = 0;
-        v12 = *v5 + v11;
-        if ( *(float *)&dword_11CC108 * *(float *)(v12 + 8)
-           + *(float *)&dword_11CC104 * *(float *)(v12 + 4)
-           + *(float *)&dpvs_viewOrigin * *(float *)v12 > *(float *)(v12 + 12) )
-        {
-          *(_BYTE *)(v12 + 19) = 1;
-          v13 = dpvs_activePlaneCount;
-          if ( dpvs_activePlaneCount == 6144 )
-          {
-            ri_Error(1, "\x15" "Too many active occluder faces");
-            v13 = dpvs_activePlaneCount;
-          }
-          qmemcpy((void *)(dpvs_activePlanes + 20 * v13), (const void *)(v11 + *v5), 0x14u);
-          ++dpvs_activePlaneCount;
-        }
-        v11 += 20;
-      }
-      v14 = 0;
-      if ( (int)v5[2] > 0 )
-      {
-        v15 = 0;
-        do
-        {
-          v16 = v5[3];
-          v17 = *(_BYTE *)(*(_DWORD *)(v16 + v15) + 19);
-          if ( v17 != *(_BYTE *)(*(_DWORD *)(v16 + v15 + 4) + 19) )
-          {
-            v18 = v17;
-            v19 = *(float **)(v16 + 4 * ((v17 == 0) + 4 * v14) + 8);
-            v29 = *v19 - *(float *)&dpvs_viewOrigin;
-            v30 = v19[1] - *(float *)&dword_11CC104;
-            v20 = v19[2];
-            v21 = *(float **)(v16 + 4 * (v18 + 4 * v14) + 8);
-            v31 = v20 - *(float *)&dword_11CC108;
-            v32 = *v21 - *(float *)&dpvs_viewOrigin;
-            v33 = v21[1] - *(float *)&dword_11CC104;
-            v22 = v21[2];
-            v23 = (float *)(dpvs_activePlanes + 20 * dpvs_activePlaneCount);
-            v34 = v22 - *(float *)&dword_11CC108;
-            *v23 = v33 * v31 - v34 * v30;
-            v23[1] = v34 * v29 - v32 * v31;
-            v23[2] = v32 * v30 - v33 * v29;
-            VectorNormalizeFast((float *)(dpvs_activePlanes + 20 * dpvs_activePlaneCount));
-            *(float *)(dpvs_activePlanes + 20 * dpvs_activePlaneCount + 12) = *(float *)&dword_11CC108
-                                                                * *(float *)(dpvs_activePlanes + 20 * dpvs_activePlaneCount + 8)
-                                                                + *(float *)&dword_11CC104
-                                                                * *(float *)(dpvs_activePlanes + 20 * dpvs_activePlaneCount + 4)
-                                                                + *(float *)&dpvs_viewOrigin
-                                                                * *(float *)(dpvs_activePlanes + 20 * dpvs_activePlaneCount);
-            v24 = dpvs_activePlanes + 20 * dpvs_activePlaneCount;
-            v25 = *(_DWORD *)(v24 + 4);
-            *(_BYTE *)(v24 + 16) = *(int *)v24 <= 0 ? 0 : 0xC;
-            v26 = *(_DWORD *)(v24 + 8);
-            *(float *)(v24 + 12) = *(float *)(v24 + 12) - 0.001;
-            *(_BYTE *)(v24 + 17) = v25 <= 0 ? 4 : 16;
-            *(_BYTE *)(v24 + 18) = v26 <= 0 ? 8 : 20;
-            ++dpvs_activePlaneCount;
-          }
-          ++v14;
-          v15 += 16;
-        }
-        while ( v14 < v5[2] );
-      }
-      v5[7] = dpvs_activePlaneCount - v5[7];
-LABEL_27:
-      v4 = a1;
-      v3 = i;
-    }
-LABEL_28:
-    ++v3;
-  }
-}
-
-/* ---- R_CellForCamera  0x004E2BE0 ----  VERIFIED */
-int R_CellForCamera()
-{
-  _DWORD *v0;
-
-  if ( !tr_world )
-    ri_Error(1, "\x15" "R_CellForCamera: bad model");
-  v0 = *(_DWORD **)(tr_world + 152);
-  while ( *v0 == -1 )
-  {
-    if ( *(float *)&dword_11CC108 * *(float *)(v0[3] + 8)
-       + *(float *)&dword_11CC104 * *(float *)(v0[3] + 4)
-       + *(float *)&dpvs_viewOrigin * *(float *)v0[3]
-       - *(float *)(v0[3] + 12) <= 0.0 )
-      v0 = (_DWORD *)v0[5];
-    else
-      v0 = (_DWORD *)v0[4];
-  }
-  return v0[2];
-}
-
-/* ---- R_PortalBehindAnyPlane  0x004E2C60 ----  VERIFIED */
-int __cdecl R_PortalBehindAnyPlane(int a1, float *a2, int a3)
-{
-  int v3;
-  float *v5;
-  int i;
-
-  v3 = a3;
-  if ( a3 )
-  {
-    while ( 2 )
-    {
-      v5 = *(float **)(a1 + 24);
-      for ( i = *(_DWORD *)(a1 + 28); ; --i )
-      {
-        if ( !i )
-          return 1;
-        if ( v5[2] * a2[2] + v5[1] * a2[1] + *v5 * *a2 > a2[3] )
+          rejected = 1;
           break;
-        v5 += 3;
+        }
       }
-      --v3;
-      a2 += 5;
-      if ( v3 )
+
+      if ( rejected )
+      {
+        if ( (r_showportals->integer & 2) != 0 )
+          R_AddDebugLine( bevelCorners[k], bevelCorners[k + 1], rejectedBevelDebugColor );
         continue;
-      break;
+      }
+
+      if ( r_showportals->integer )
+        R_AddDebugLine( bevelCorners[k], bevelCorners[k + 1], acceptedBevelDebugColor );
+
+      {
+        dpvsPlane_t *plane = &outPlanes[planeCount++];
+        plane->normal[0] = n[0];
+        plane->normal[1] = n[1];
+        plane->normal[2] = n[2];
+        plane->distance = (*(float *)&dpvs_viewOriginZ) * plane->normal[2]
+                        + (*(float *)&dpvs_viewOriginY) * plane->normal[1]
+                        + (*(float *)&dpvs_viewOrigin) * plane->normal[0];
+        R_SetPlaneSidesDPVS( (int)plane );
+      }
     }
   }
-  return 0;
+
+  for ( i = 0; i < vertexCount; ++i )
+  {
+    dpvsPlane_t *plane;
+
+    
+
+
+    if ( edgeNormals[i][1] * edgeNormals[i][1]
+       + edgeNormals[i][2] * edgeNormals[i][2]
+       + edgeNormals[i][0] * edgeNormals[i][0] == 0.0f )
+      continue;
+
+    plane = &outPlanes[planeCount++];
+    plane->normal[0] = edgeNormals[i][0];
+    plane->normal[1] = edgeNormals[i][1];
+    plane->normal[2] = edgeNormals[i][2];
+    
+
+    if ( i < unrolled && (i & 3) == 0 )
+      plane->distance = (*(float *)&dpvs_viewOriginZ) * plane->normal[2]
+                      + (*(float *)&dpvs_viewOrigin) * plane->normal[0]
+                      + (*(float *)&dpvs_viewOriginY) * plane->normal[1];
+    else
+      plane->distance = (*(float *)&dpvs_viewOriginZ) * plane->normal[2]
+                      + (*(float *)&dpvs_viewOriginY) * plane->normal[1]
+                      + (*(float *)&dpvs_viewOrigin) * plane->normal[0];
+    R_SetPlaneSidesDPVS( (int)plane );
+  }
+
+  *outPlaneCount = planeCount;
+  return outPlanes;
 }
 
-/* ---- R_PortalBehindAllPlanes  0x004E2CC0 ----  VERIFIED */
-int __cdecl R_PortalBehindAllPlanes(int a1, float *a2, int a3)
+
+/* occluder camera-side markers stored in dpvsPlane_t::cameraSide */
+#define DPVS_CAMERA_BEHIND     0
+#define DPVS_CAMERA_IN_FRONT   1
+
+/* ---- R_CullOccluderByPlane  0x004E2810 ----  VERIFIED
+ * True when every occluder vertex lies on or behind the plane (the occluder is
+ * wholly clipped away by it). */
+int __cdecl R_CullOccluderByPlane(int occluderPtr, float *plane)
 {
-  int v3;
-  int v5;
-  float *v6;
+  dpvsOccluder_t *occ = (dpvsOccluder_t *)occluderPtr;
+  int             i;
 
-  v3 = a3;
-  if ( !a3 )
-    return 1;
-  while ( 1 )
+  for ( i = 0; i < occ->vertexCount; ++i )
   {
-    v5 = *(_DWORD *)(a1 + 28);
-    v6 = *(float **)(a1 + 24);
-    if ( v5 )
-      break;
-LABEL_5:
-    --v3;
-    a2 += 5;
-    if ( !v3 )
-      return 1;
-  }
-  while ( v6[2] * a2[2] + v6[1] * a2[1] + *v6 * *a2 <= a2[3] )
-  {
-    --v5;
-    v6 += 3;
-    if ( !v5 )
-      goto LABEL_5;
-  }
-  return 0;
-}
-
-/* ---- R_ChopPortalWinding  0x004E2D20 ----  VERIFIED */
-float *__cdecl R_ChopPortalWinding(const float *plane, int a1, int *a2, float *a3)
-{
-  const float *v4;
-  int v5;
-  int v6;
-  int v7;
-  float *v8;
-  double v9;
-  double v10;
-  float *result;
-  int v15;
-  float *v16;
-  int v17;
-  int v18;
-  float *v19;
-  int v20;
-  int v21;
-  double v22;
-  float *v23;
-  _DWORD v24[1025];
-  float v25[1025];
-
-  v4 = plane;
-  v5 = 0;
-  v6 = 0;
-  v7 = 0;
-  if ( *a2 <= 0 )
-    goto LABEL_9;
-  v8 = (float *)(a1 + 4);
-  do
-  {
-    v9 = v8[1];
-    v24[v7] = 2;
-    v10 = v9 * v4[2] + *(v8 - 1) * *v4 + v4[1] * *v8 - v4[3];
-    v25[v7] = v10;
-    if ( v10 < -0.001 )
-    {
-      v24[v7] = 1;
-      ++v6;
-    }
-    else if ( v10 > 0.001 )
-    {
-      v24[v7] = 0;
-      ++v5;
-    }
-    ++v7;
-    v8 += 3;
-  }
-  while ( v7 < *a2 );
-  if ( !v5 )
-  {
-LABEL_9:
-    *a2 = 0;
-    return 0;
-  }
-  if ( !v6 )
-    return (float *)a1;
-  v15 = v24[0];
-  v25[v7] = v25[0];
-  v16 = a3;
-  v17 = 0;
-  v18 = 0;
-  v24[v7] = v15;
-  v19 = (float *)(a1 + 8);
-  while ( 1 )
-  {
-    v20 = v24[v18];
-    if ( v20 != 2 )
-      break;
-    *v16 = *(v19 - 2);
-    v16[1] = *(v19 - 1);
-    v16[2] = *v19;
-    ++v17;
-    v16 += 3;
-LABEL_20:
-    ++v18;
-    v19 += 3;
-    if ( v18 >= *a2 )
-      goto LABEL_21;
-  }
-  if ( !v20 )
-  {
-    *v16 = *(v19 - 2);
-    v16[1] = *(v19 - 1);
-    v16[2] = *v19;
-    ++v17;
-    v16 += 3;
-  }
-  v21 = v24[v18 + 1];
-  if ( v21 == 2 )
-    goto LABEL_20;
-  if ( v21 == v20 )
-    goto LABEL_20;
-  ++v17;
-  v22 = v25[v18] / (v25[v18] - v25[v18 + 1]);
-  v16 += 3;
-  v23 = (float *)(a1 + 12 * ((v18 + 1) % *a2));
-  *(v16 - 3) = (*v23 - *(v19 - 2)) * v22 + *(v19 - 2);
-  *(v16 - 2) = (v23[1] - *(v19 - 1)) * v22 + *(v19 - 1);
-  *(v16 - 1) = (v23[2] - *v19) * v22 + *v19;
-  if ( v17 != 1024 )
-    goto LABEL_20;
-LABEL_21:
-  result = a3;
-  *a2 = v17;
-  return result;
-}
-
-/* ---- R_PortalClipPlanes  0x004E2EE0 ----  VERIFIED */
-char *__cdecl R_PortalClipPlanes(int *a1, int a2, int a3, int a4, char *a5)
-{
-  float *v7;
-  double v8;
-  char *result;
-  char *v10;
-  int v11;
-  char v12[24576]; // [esp+14h] [ebp-6000h] BYREF
-
-  *a1 = *(_DWORD *)(a3 + 28);
-  /* 0x004E2EFF: mov ecx, [esp+arg_4] -- the plane is a4 */
-  v7 = R_ChopPortalWinding((const float *)a4, *(_DWORD *)(a3 + 24), a1, (float *)v12);
-  if ( !*a1 )
-    return 0;
-  v8 = *(float *)(a3 + 12)
-     - (*(float *)&dword_11CC108 * *(float *)(a3 + 8)
-      + *(float *)&dword_11CC104 * *(float *)(a3 + 4)
-      + *(float *)&dpvs_viewOrigin * *(float *)a3);
-  if ( (v8 < 1.0) | __UNORDERED__(v8, 1.0) )
-  {
-    *a1 = a2;
-    result = (char *)ri_Hunk_AllocateTempMemory(20 * a2);
-    qmemcpy(result, a5, 20 * a2);
-    return result;
-  }
-  if ( dpvs_activeFarPlane )
-  {
-    /* 0x004E2F87: mov ecx, dpvs_activeFarPlane -- the plane is the global itself */
-    v7 = R_ChopPortalWinding(
-           (const float *)dpvs_activeFarPlane,
-           (int)v7,
-           a1,
-           (float *)&v12[12288 * (v7 == (float *)v12)]);
-    if ( !*a1 )
+    const float *v = occ->vertices[i];
+    if ( v[2]*plane[2] + v[1]*plane[1] + v[0]*plane[0] > plane[3] )
       return 0;
   }
-  v11 = 0;
-  if ( a2 > 0 )
+  return 1;
+}
+
+/* ---- R_AddCellOccluders  0x004E2860 ----  [HIGH]
+ * Install the cell's visible occluders for this portal step: reject occluders
+ * fully behind the active near plane or clipped by the incoming planes, then
+ * copy each camera-facing authored face plane and build one silhouette plane
+ * (through the view origin) per edge that separates opposite camera sides. */
+void __cdecl R_AddCellOccluders(int cellPtr, float *planes, int planeCount)
+{
+  dpvsCell_t        *cell = (dpvsCell_t *)cellPtr;
+  int                occIdx;
+
+
+  dpvsGlob.occluderCount = 0;
+  dpvs_activePlaneCount = 0;
+
+  for ( occIdx = 0; occIdx < cell->occluderCount; ++occIdx )
   {
-    v10 = a5;
-    do
+    
+
+    dpvsOccluder_t *occ = cell->occluders[occIdx];
+    int             clipped;
+    int             planeIdx;
+    int             vi;
+    int             edgeIdx;
+
+    
     {
-      /* 0x004E2FEC: mov ecx, ebx -- v10 is the clip plane */
-      v7 = R_ChopPortalWinding(
-             (const float *)v10,
-             (int)v7,
-             a1,
-             (float *)&v12[12288 * (v7 == (float *)v12)]);
-      if ( !*a1 )
+      const dpvsPlane_t *plane = (const dpvsPlane_t *)dpvs_activeNearPlane;
+      int culled = 1;
+
+      for ( vi = 0; vi < occ->vertexCount; ++vi )
+      {
+        const float *v = occ->vertices[vi];
+        if ( v[2]*plane->normal[2] + v[1]*plane->normal[1] + v[0]*plane->normal[0] > plane->distance )
+        {
+          culled = 0;
+          break;
+        }
+      }
+      if ( culled )
+        continue;
+    }
+
+    clipped = 0;
+    while ( planeCount )
+    {
+      if ( R_CullOccluderByPlane((int)occ, planes) )
+      {
+        clipped = 1;
+        break;
+      }
+      --planeCount;
+      planes += 5;   
+    }
+    if ( clipped )
+      continue;
+
+    if ( dpvsGlob.occluderCount == 1024 )
+      ri.Error(1, "\x15" "Too many active occluder brushes");
+    ((dpvsOccluder_t **)dpvsGlob.occluders)[dpvsGlob.occluderCount++] = occ;
+
+    occ->cullPlaneLimit = 0x7FFFFFFF;
+    occ->activePlaneCount = dpvs_activePlaneCount;   
+    occ->activePlanes = &((dpvsPlane_t *)dpvs_activePlanes)[dpvs_activePlaneCount];
+
+    
+    /* occ->planes is re-read after every store, as retail */
+    for ( planeIdx = 0; planeIdx < occ->planeCount; ++planeIdx )
+    {
+      occ->planes[planeIdx].cameraSide = 0;
+      if ( (*(float *)&dpvs_viewOriginY)*occ->planes[planeIdx].normal[1]
+         + (*(float *)&dpvs_viewOriginZ)*occ->planes[planeIdx].normal[2]
+         + (*(float *)&dpvs_viewOrigin)*occ->planes[planeIdx].normal[0] > occ->planes[planeIdx].distance )
+      {
+        occ->planes[planeIdx].cameraSide = 1;
+        if ( dpvs_activePlaneCount == 6144 )
+          ri.Error(1, "\x15" "Too many active occluder faces");
+        ((dpvsPlane_t *)dpvs_activePlanes)[dpvs_activePlaneCount] = occ->planes[planeIdx];
+        ++dpvs_activePlaneCount;
+      }
+    }
+
+    
+    for ( edgeIdx = 0; edgeIdx < occ->edgeCount; ++edgeIdx )
+    {
+      unsigned char       cameraSide = occ->edges[edgeIdx].planes[0]->cameraSide;
+      const float        *firstVertex;
+      const float        *secondVertex;
+      float               first[3];
+      float               second[3];
+
+      if ( cameraSide == occ->edges[edgeIdx].planes[1]->cameraSide )
+        continue;
+
+      firstVertex  = (const float *)occ->edges[edgeIdx].vertices[cameraSide == 0 ? 1 : 0];
+      secondVertex = (const float *)occ->edges[edgeIdx].vertices[cameraSide];
+      first[0]  = firstVertex[0]  - (*(float *)&dpvs_viewOrigin);
+      first[1]  = firstVertex[1]  - (*(float *)&dpvs_viewOriginY);
+      first[2]  = firstVertex[2]  - (*(float *)&dpvs_viewOriginZ);
+      second[0] = secondVertex[0] - (*(float *)&dpvs_viewOrigin);
+      second[1] = secondVertex[1] - (*(float *)&dpvs_viewOriginY);
+      second[2] = secondVertex[2] - (*(float *)&dpvs_viewOriginZ);
+
+      /* the new plane is re-read through the bank after every store, as retail */
+      CrossProduct( second, first, ((dpvsPlane_t *)dpvs_activePlanes)[dpvs_activePlaneCount].normal );
+      VectorNormalizeFast( ((dpvsPlane_t *)dpvs_activePlanes)[dpvs_activePlaneCount].normal );
+      ((dpvsPlane_t *)dpvs_activePlanes)[dpvs_activePlaneCount].distance =
+          (*(float *)&dpvs_viewOriginZ)*((dpvsPlane_t *)dpvs_activePlanes)[dpvs_activePlaneCount].normal[2]
+        + (*(float *)&dpvs_viewOriginY)*((dpvsPlane_t *)dpvs_activePlanes)[dpvs_activePlaneCount].normal[1]
+        + (*(float *)&dpvs_viewOrigin)*((dpvsPlane_t *)dpvs_activePlanes)[dpvs_activePlaneCount].normal[0];
+      R_SetPlaneSidesDPVS( (int)&((dpvsPlane_t *)dpvs_activePlanes)[dpvs_activePlaneCount] );
+      ++dpvs_activePlaneCount;
+    }
+
+    occ->activePlaneCount = dpvs_activePlaneCount - occ->activePlaneCount;
+  }
+}
+
+/* ---- R_CellForCamera  0x004E2BE0 ----  VERIFIED
+ * Descend the world BSP from the root by the view origin; nonpositive and
+ * unordered plane distances take the back child.  Returns the terminal cell. */
+int R_CellForCamera()
+{
+  mnode_t *node;
+
+  if ( !tr_world )
+    ri.Error(1, "\x15" "R_CellForCamera: bad model");
+
+  node = DPVS_WORLD_NODES;
+  while ( node->contents == NODE_INTERNAL )
+  {
+    const cplane_t *plane = node->u.node.plane;
+    /* retail tests the unrounded x87 value: fcomp 0.0 / test ah,41h / jne
+     * children[1] (0x4E2C34-0x4E2C46), so only d > 0 (ordered) goes front */
+    rfloat          d = *(float *)&dpvs_viewOriginY*plane->normal[1]
+                      + *(float *)&dpvs_viewOriginZ*plane->normal[2]
+                      + *(float *)&dpvs_viewOrigin*plane->normal[0]
+                      - plane->dist;
+    node = d > 0.0f ? node->u.node.children[0] : node->u.node.children[1];
+  }
+  return node->cellIndex;
+}
+
+/* ---- R_PortalBehindAnyPlane  0x004E2C60 ----  VERIFIED
+ * True when some supplied plane has no portal vertex strictly in front. */
+int __cdecl R_PortalBehindAnyPlane(int portalPtr, float *planes, int planeCount)
+{
+  dpvsPortal_t *portal = (dpvsPortal_t *)portalPtr;
+
+  /* retail counts both loops down to zero (dec/test/jne, 0x4E2C76 and
+   * 0x4E2C9E), so a negative count keeps going instead of ending the loop */
+  for ( ; planeCount; --planeCount, planes += 5 )
+  {
+    const float *v = portal->vertices[0];
+    unsigned     i;
+    for ( i = (unsigned)portal->vertexCount; ; --i, v += 3 )
+    {
+      if ( !i )
+        return 1;
+      if ( v[2]*planes[2] + v[1]*planes[1] + v[0]*planes[0] > planes[3] )
+        break;
+    }
+  }
+  return 0;
+}
+
+/* ---- R_PortalBehindAllPlanes  0x004E2CC0 ----  VERIFIED
+ * True when every portal vertex is non-front-facing for every supplied plane. */
+int __cdecl R_PortalBehindAllPlanes(int portalPtr, float *planes, int planeCount)
+{
+  dpvsPortal_t *portal = (dpvsPortal_t *)portalPtr;
+
+  /* count-down loops as in retail (0x4E2CFE and 0x4E2D06), see above */
+  for ( ; planeCount; --planeCount, planes += 5 )
+  {
+    const float *v = portal->vertices[0];
+    unsigned     i;
+    for ( i = (unsigned)portal->vertexCount; i; --i, v += 3 )
+    {
+      if ( v[2]*planes[2] + v[1]*planes[1] + v[0]*planes[0] > planes[3] )
         return 0;
-      v10 += 20;
     }
-    while ( ++v11 < a2 );
   }
-  if ( r_showportals->integer )
-    R_AddDebugPolygon(dword_540568, *a1, v7);
-  return (char *)R_PortalClipPlanesInternal(a1, *a1, (int)v7);
+  return 1;
 }
 
-/* ---- R_AddTrianglesSurface  0x004E3070 ----  [HIGH] */
-void __cdecl R_AddTrianglesSurface(int a1, _DWORD *a2, BOOL a3, int a4, int a5)
+/* ---- R_ChopPortalWinding  0x004E2D20 ----  VERIFIED
+ * Clip a winding against one plane, keeping the front side.  Returns the input
+ * unchanged when nothing is behind, NULL (with *vertexCount cleared) when
+ * nothing is in front, else the clipped winding in outVertices.  An ON vertex
+ * is copied but never splits an edge. */
+float *__cdecl R_ChopPortalWinding(const dpvsPlane_t *plane, vec3_t *inVertices, int *vertexCount, vec3_t *outVertices)
 {
-  int v5;
-  float *v6;
-  int v7;
-  int v8;
-  double v9;
-  double v10;
-  double v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  double v20;
-  int v21;
+  int          sides[1025];
+  float        dists[1025];
+  int          frontCount = 0;
+  int          backCount = 0;
+  int          outCount;
+  int          i;
+  const float *v;
+  const float *p1;
+  const float *p2;
+  rfloat       frac;
 
-  if ( *a2 != tr_viewCount )
+  for ( i = 0; i < *vertexCount; ++i )
   {
-    v5 = a2[2];
-    v21 = v5;
-    v6 = (float *)(v5 + 12);
-    if ( a5 >= dpvs_cullPlaneLimit || (v7 = 0, dpvs_cullPlaneLimit = 0x7FFFFFFF, a1 <= 0) )
+    /* retail classifies the unrounded x87 value and only fst's a float copy
+     * into dists[] (0x4E2D6C-0x4E2D90) */
+    rfloat d;
+
+    v = inVertices[i];
+    sides[i] = 2;   /* ON */
+    d = plane->normal[2]*v[2] + plane->normal[0]*v[0] + plane->normal[1]*v[1];
+    d -= plane->distance;
+    dists[i] = (float)d;
+    if ( d < -DPVS_PLANE_BIAS )
     {
-LABEL_7:
-      v10 = *(float *)((char *)v6 + *(unsigned __int8 *)(dpvs_activeNearPlane + 18)) * *(float *)(dpvs_activeNearPlane + 8)
-          + *(float *)((char *)v6 + *(unsigned __int8 *)(dpvs_activeNearPlane + 17)) * *(float *)(dpvs_activeNearPlane + 4)
-          + *(float *)((char *)v6 + *(unsigned __int8 *)(dpvs_activeNearPlane + 16)) * *(float *)dpvs_activeNearPlane;
-      if ( !((v10 < *(float *)(dpvs_activeNearPlane + 12)) | __UNORDERED__(v10, *(float *)(dpvs_activeNearPlane + 12))) )
-      {
-        if ( !dpvs_activeFarPlane
-          || (v11 = *(float *)((char *)v6 + *(unsigned __int8 *)(dpvs_activeFarPlane + 18)) * *(float *)(dpvs_activeFarPlane + 8)
-                  + *(float *)((char *)v6 + *(unsigned __int8 *)(dpvs_activeFarPlane + 17)) * *(float *)(dpvs_activeFarPlane + 4)
-                  + *(float *)((char *)v6 + *(unsigned __int8 *)(dpvs_activeFarPlane + 16)) * *(float *)dpvs_activeFarPlane,
-              !((v11 < *(float *)(dpvs_activeFarPlane + 12)) | __UNORDERED__(v11, *(float *)(dpvs_activeFarPlane + 12)))) )
-        {
-          v12 = 0;
-          if ( dpvs_occluderCount <= 0 )
-          {
-LABEL_18:
-            if ( (r_showaabbtrees->integer & 2) != 0 )
-              R_AddDebugBox(dword_541840, (float *)(v5 + 24), v6);
-            R_AddWorldSurfaceNoCull(a3, a2);
-          }
-          else
-          {
-            while ( 1 )
-            {
-              v13 = *(_DWORD *)(dpvs_occluders + 4 * v12);
-              if ( a5 < *(_DWORD *)(v13 + 24) )
-                break;
-LABEL_16:
-              if ( ++v12 >= dpvs_occluderCount )
-              {
-                v5 = v21;
-                goto LABEL_18;
-              }
-            }
-            *(_DWORD *)(v13 + 24) = 0x7FFFFFFF;
-            v14 = *(_DWORD *)(dpvs_occluders + 4 * v12);
-            v15 = 0;
-            v16 = 0;
-            while ( v15 < *(_DWORD *)(v14 + 28) )
-            {
-              v17 = *(_DWORD *)(v14 + 32);
-              v18 = *(unsigned __int8 *)(v17 + v16 + 18);
-              v19 = v16 + v17;
-              v20 = *(float *)((char *)v6 + v18) * *(float *)(v19 + 8)
-                  + *(float *)((char *)v6 + *(unsigned __int8 *)(v19 + 17)) * *(float *)(v19 + 4)
-                  + *(float *)((char *)v6 + *(unsigned __int8 *)(v19 + 16)) * *(float *)v19;
-              if ( !((v20 < *(float *)(v19 + 12)) | __UNORDERED__(v20, *(float *)(v19 + 12))) )
-                goto LABEL_16;
-              ++v15;
-              v16 += 20;
-            }
-          }
-        }
-      }
+      sides[i] = 1;   /* BACK */
+      ++backCount;
     }
-    else
+    else if ( d > DPVS_PLANE_BIAS )
     {
-      v8 = a4 + 8;
-      while ( 1 )
-      {
-        v9 = *(float *)((char *)v6 + *(unsigned __int8 *)(v8 + 8)) * *(float *)(v8 - 8)
-           + *(float *)((char *)v6 + *(unsigned __int8 *)(v8 + 9)) * *(float *)(v8 - 4)
-           + *(float *)((char *)v6 + *(unsigned __int8 *)(v8 + 10)) * *(float *)v8;
-        if ( (v9 < *(float *)(v8 + 4)) | __UNORDERED__(v9, *(float *)(v8 + 4)) )
-          break;
-        ++v7;
-        v8 += 20;
-        if ( v7 >= a1 )
-          goto LABEL_7;
-      }
+      sides[i] = 0;   /* FRONT */
+      ++frontCount;
     }
   }
-}
 
-
-/* ---- R_AddAABBTreeSurfaces_r  0x004E3210 ----  VERIFIED */
-void __cdecl R_AddAABBTreeSurfaces_r(int a1, int a2, int a3, int a4, int a5)
-{
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  double v9;
-  double v10;
-  double v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  double v20;
-  int v21;
-  int v22;
-  int v23;
-  _DWORD *v24;
-  int v25;
-  int v26;
-  int v27;
-  int v28;
-  int v29;
-  int v30;
-  int v31;
-  int v32;
-  int v33;
-  int v34;
-  int v35;
-  int v36;
-  int v37;
-  int v38;
-  int v39;
-  int v40;
-
-  v5 = a5;
-  v6 = a3;
-  if ( a5 >= dpvs_cullPlaneLimit || (v7 = 0, dpvs_cullPlaneLimit = 0x7FFFFFFF, a3 <= 0) )
+  if ( !frontCount )
   {
-LABEL_6:
-    v10 = *(float *)(*(unsigned __int8 *)(dpvs_activeNearPlane + 18) + a1) * *(float *)(dpvs_activeNearPlane + 8)
-        + *(float *)(*(unsigned __int8 *)(dpvs_activeNearPlane + 17) + a1) * *(float *)(dpvs_activeNearPlane + 4)
-        + *(float *)(*(unsigned __int8 *)(dpvs_activeNearPlane + 16) + a1) * *(float *)dpvs_activeNearPlane;
-    if ( (v10 < *(float *)(dpvs_activeNearPlane + 12)) | __UNORDERED__(v10, *(float *)(dpvs_activeNearPlane + 12)) )
-      return;
-    if ( dpvs_activeFarPlane )
-    {
-      v11 = *(float *)(*(unsigned __int8 *)(dpvs_activeFarPlane + 18) + a1) * *(float *)(dpvs_activeFarPlane + 8)
-          + *(float *)(*(unsigned __int8 *)(dpvs_activeFarPlane + 17) + a1) * *(float *)(dpvs_activeFarPlane + 4)
-          + *(float *)(*(unsigned __int8 *)(dpvs_activeFarPlane + 16) + a1) * *(float *)dpvs_activeFarPlane;
-      if ( (v11 < *(float *)(dpvs_activeFarPlane + 12)) | __UNORDERED__(v11, *(float *)(dpvs_activeFarPlane + 12)) )
-        return;
-    }
-    v12 = 0;
-    if ( dpvs_occluderCount > 0 )
-    {
-      while ( 1 )
-      {
-        v13 = *(_DWORD *)(dpvs_occluders + 4 * v12);
-        if ( v5 < *(_DWORD *)(v13 + 24) )
-          break;
-LABEL_16:
-        if ( ++v12 >= dpvs_occluderCount )
-          goto LABEL_17;
-      }
-      *(_DWORD *)(v13 + 24) = 0x7FFFFFFF;
-      v14 = *(_DWORD *)(dpvs_occluders + 4 * v12);
-      v15 = 0;
-      v16 = 0;
-      while ( v15 < *(_DWORD *)(v14 + 28) )
-      {
-        v17 = *(_DWORD *)(v14 + 32);
-        v18 = *(unsigned __int8 *)(v17 + v16 + 18);
-        v19 = v16 + v17;
-        v20 = *(float *)(a1 + v18) * *(float *)(v19 + 8)
-            + *(float *)(a1 + *(unsigned __int8 *)(v19 + 17)) * *(float *)(v19 + 4)
-            + *(float *)(a1 + *(unsigned __int8 *)(v19 + 16)) * *(float *)v19;
-        if ( !((v20 < *(float *)(v19 + 12)) | __UNORDERED__(v20, *(float *)(v19 + 12))) )
-        {
-          v5 = a5;
-          v6 = a3;
-          goto LABEL_16;
-        }
-        ++v15;
-        v16 += 20;
-      }
-      return;
-    }
-LABEL_17:
-    if ( a4 )
-      a4 = R_CullDlightsForBox(a4, (float *)(a1 + 12), (float *)a1);
-    if ( v5 < dpvs_cullPlaneLimit )
-    {
-      v21 = 0;
-      if ( v6 > 0 )
-      {
-        v22 = a2 + 8;
-        while ( *(float *)(a1 - *(unsigned __int8 *)(v22 + 9) + 20) * *(float *)(v22 - 4)
-              + *(float *)(a1 - *(unsigned __int8 *)(v22 + 8) + 12) * *(float *)(v22 - 8)
-              + *(float *)(a1 - *(unsigned __int8 *)(v22 + 10) + 28) * *(float *)v22 > *(float *)(v22 + 4) )
-        {
-          ++v21;
-          v22 += 20;
-          if ( v21 >= v6 )
-            goto LABEL_24;
-        }
-LABEL_41:
-        v33 = *(_DWORD *)(a1 + 36);
-        if ( v33 )
-        {
-          v34 = 0;
-          if ( v33 > 0 )
-          {
-            v35 = v5 + 1;
-            v36 = 0;
-            do
-            {
-              R_AddAABBTreeSurfaces_r(v36 + *(_DWORD *)(a1 + 32), a2, a3, a4, v35);
-              ++v34;
-              v36 += 40;
-            }
-            while ( v34 < *(_DWORD *)(a1 + 36) );
-          }
-        }
-        else
-        {
-          if ( r_showaabbtrees->integer )
-            R_AddDebugBox(clippedLeafDebugColor, (float *)(a1 + 12), (float *)a1);
-          v37 = 0;
-          if ( *(int *)(a1 + 28) > 0 )
-          {
-            v38 = v5 + 1;
-            v39 = 0;
-            do
-            {
-              R_AddTrianglesSurface(a3, (_DWORD *)(v39 + *(_DWORD *)(a1 + 24)), a4, a2, v38);
-              ++v37;
-              v39 += 12;
-            }
-            while ( v37 < *(_DWORD *)(a1 + 28) );
-          }
-        }
-        return;
-      }
-LABEL_24:
-      dpvs_cullPlaneLimit = v5 + 1;
-    }
-    v23 = 0;
-    v40 = 0;
-    if ( dpvs_occluderCount <= 0 )
-    {
-LABEL_33:
-      if ( r_showaabbtrees->integer )
-        R_AddDebugBox(dword_541870, (float *)(a1 + 12), (float *)a1);
-      v30 = 0;
-      if ( *(int *)(a1 + 28) > 0 )
-      {
-        v31 = 0;
-        do
-        {
-          v32 = *(_DWORD *)(a1 + 24);
-          if ( *(_DWORD *)(v31 + v32) != tr_viewCount )
-            R_AddWorldSurfaceNoCull(a4, (_DWORD *)(v31 + v32));
-          ++v30;
-          v31 += 12;
-        }
-        while ( v30 < *(_DWORD *)(a1 + 28) );
-      }
-      return;
-    }
-    while ( 1 )
-    {
-      v24 = *(_DWORD **)(dpvs_occluders + 4 * v23);
-      if ( v5 < v24[6] )
-        break;
-LABEL_32:
-      v40 = ++v23;
-      if ( v23 >= dpvs_occluderCount )
-        goto LABEL_33;
-    }
-    v25 = 0;
-    v26 = 0;
-    while ( v25 < v24[7] )
-    {
-      v27 = v24[8];
-      v28 = *(unsigned __int8 *)(v27 + v26 + 18);
-      v29 = v26 + v27;
-      v5 = a5;
-      if ( *(float *)(a1 - v28 + 28) * *(float *)(v29 + 8)
-         + *(float *)(a1 - *(unsigned __int8 *)(v29 + 17) + 20) * *(float *)(v29 + 4)
-         + *(float *)(a1 - *(unsigned __int8 *)(v29 + 16) + 12) * *(float *)v29 > *(float *)(v29 + 12) )
-      {
-        v24[6] = a5 + 1;
-        v23 = v40;
-        goto LABEL_32;
-      }
-      ++v25;
-      v26 += 20;
-    }
-    goto LABEL_41;
-  }
-  v8 = a2 + 8;
-  while ( 1 )
-  {
-    v9 = *(float *)(*(unsigned __int8 *)(v8 + 8) + a1) * *(float *)(v8 - 8)
-       + *(float *)(*(unsigned __int8 *)(v8 + 9) + a1) * *(float *)(v8 - 4)
-       + *(float *)(*(unsigned __int8 *)(v8 + 10) + a1) * *(float *)v8;
-    if ( (v9 < *(float *)(v8 + 4)) | __UNORDERED__(v9, *(float *)(v8 + 4)) )
-      break;
-    ++v7;
-    v8 += 20;
-    if ( v7 >= a3 )
-      goto LABEL_6;
-  }
-}
-
-
-/* ---- R_CullModels  0x004E3560 ----  [HIGH] */
-void __cdecl R_CullModels(int a1, int a2, int a3)
-{
-  _DWORD *v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  double v9;
-  double v10;
-  double v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  double v20;
-
-  v3 = *(_DWORD **)(a1 + 60);
-  v4 = a3;
-  if ( v3 )
-  {
-    v5 = dpvs_activeNearPlane;
-    v6 = dpvs_activeFarPlane;
-    do
-    {
-      if ( *(_DWORD *)(*v3 + 692) )
-      {
-        if ( dpvs_cullPlaneLimit <= 0 || (v7 = 0, dpvs_cullPlaneLimit = 0x7FFFFFFF, v4 <= 0) )
-        {
-LABEL_9:
-          v10 = *(float *)((char *)v3 + *(unsigned __int8 *)(v5 + 18) + 4) * *(float *)(v5 + 8)
-              + *(float *)((char *)v3 + *(unsigned __int8 *)(v5 + 17) + 4) * *(float *)(v5 + 4)
-              + *(float *)((char *)v3 + *(unsigned __int8 *)(v5 + 16) + 4) * *(float *)v5;
-          if ( !((v10 < *(float *)(v5 + 12)) | __UNORDERED__(v10, *(float *)(v5 + 12))) )
-          {
-            if ( !v6
-              || (v11 = *(float *)((char *)v3 + *(unsigned __int8 *)(v6 + 18) + 4) * *(float *)(v6 + 8)
-                      + *(float *)((char *)v3 + *(unsigned __int8 *)(v6 + 17) + 4) * *(float *)(v6 + 4)
-                      + *(float *)((char *)v3 + *(unsigned __int8 *)(v6 + 16) + 4) * *(float *)v6,
-                  !((v11 < *(float *)(v6 + 12)) | __UNORDERED__(v11, *(float *)(v6 + 12)))) )
-            {
-              v12 = 0;
-              if ( dpvs_occluderCount <= 0 )
-              {
-LABEL_20:
-                *(_DWORD *)(*v3 + 692) = 0;
-              }
-              else
-              {
-                while ( 1 )
-                {
-                  v13 = *(_DWORD *)(dpvs_occluders + 4 * v12);
-                  if ( *(int *)(v13 + 24) > 0 )
-                    break;
-LABEL_18:
-                  if ( ++v12 >= dpvs_occluderCount )
-                  {
-                    v4 = a3;
-                    goto LABEL_20;
-                  }
-                }
-                *(_DWORD *)(v13 + 24) = 0x7FFFFFFF;
-                v14 = *(_DWORD *)(dpvs_occluders + 4 * v12);
-                v15 = 0;
-                v16 = 0;
-                while ( v15 < *(_DWORD *)(v14 + 28) )
-                {
-                  v17 = *(_DWORD *)(v14 + 32);
-                  v18 = *(unsigned __int8 *)(v17 + v16 + 18);
-                  v19 = v16 + v17;
-                  v20 = *(float *)((char *)v3 + v18 + 4) * *(float *)(v19 + 8)
-                      + *(float *)((char *)v3 + *(unsigned __int8 *)(v19 + 17) + 4) * *(float *)(v19 + 4)
-                      + *(float *)((char *)v3 + *(unsigned __int8 *)(v19 + 16) + 4) * *(float *)v19;
-                  if ( !((v20 < *(float *)(v19 + 12)) | __UNORDERED__(v20, *(float *)(v19 + 12))) )
-                    goto LABEL_18;
-                  ++v15;
-                  v16 += 20;
-                }
-                v4 = a3;
-              }
-              v6 = dpvs_activeFarPlane;
-              v5 = dpvs_activeNearPlane;
-            }
-          }
-        }
-        else
-        {
-          v8 = a2 + 8;
-          while ( 1 )
-          {
-            v9 = *(float *)((char *)v3 + *(unsigned __int8 *)(v8 + 8) + 4) * *(float *)(v8 - 8)
-               + *(float *)((char *)v3 + *(unsigned __int8 *)(v8 + 9) + 4) * *(float *)(v8 - 4)
-               + *(float *)((char *)v3 + *(unsigned __int8 *)(v8 + 10) + 4) * *(float *)v8;
-            if ( (v9 < *(float *)(v8 + 4)) | __UNORDERED__(v9, *(float *)(v8 + 4)) )
-              break;
-            ++v7;
-            v8 += 20;
-            if ( v7 >= v4 )
-              goto LABEL_9;
-          }
-        }
-      }
-      v3 = (_DWORD *)v3[7];
-    }
-    while ( v3 );
-  }
-}
-
-/* ---- R_XModelWorldBounds  0x004E3700 ----  [HIGH] */
-int __cdecl R_XModelWorldBounds(float *a1, int a2, float *a3)
-{
-  double v3;
-  double v4;
-  long double v5;
-  int v6;
-  double v7;
-  double v8;
-  int result;
-  float v10;
-  float v11;
-  float v12;
-  float v13;
-  float v14;
-  float v15;
-
-  v3 = *(float *)(a2 + 28) * *(float *)(a2 + 28)
-     + *(float *)(a2 + 32) * *(float *)(a2 + 32)
-     + *(float *)(a2 + 36) * *(float *)(a2 + 36);
-  v10 = v3;
-  v4 = v3;
-  v12 = *(float *)(a2 + 40) * *(float *)(a2 + 40)
-      + *(float *)(a2 + 44) * *(float *)(a2 + 44)
-      + *(float *)(a2 + 48) * *(float *)(a2 + 48);
-  v14 = *(float *)(a2 + 52) * *(float *)(a2 + 52)
-      + *(float *)(a2 + 56) * *(float *)(a2 + 56)
-      + *(float *)(a2 + 60) * *(float *)(a2 + 60);
-  if ( (v10 < (double)v12) | __UNORDERED__(v10, v12) )
-    v4 = v12;
-  if ( (v4 < v14) | __UNORDERED__(v4, v14) )
-    v4 = v14;
-  v5 = sqrt(v4);
-  v6 = *(_DWORD *)(*(_DWORD *)(*(_DWORD *)(a2 + 144) + 24) + 4);
-  v15 = *(float *)(v6 + 84);
-  v11 = *(float *)(v6 + 88);
-  v13 = *(float *)(v6 + 92);
-  v7 = *(float *)(v6 + 76);
-  v8 = *(float *)(v6 + 80);
-  result = *(int *)(v6 + 96);
-  *a3 = v7 * v5 + *(float *)(a2 + 68);
-  a3[1] = v8 * v5 + *(float *)(a2 + 72);
-  a3[2] = v15 * v5 + *(float *)(a2 + 76);
-  *a1 = v11 * v5 + *(float *)(a2 + 68);
-  a1[1] = v13 * v5 + *(float *)(a2 + 72);
-  a1[2] = *(float *)&result * v5 + *(float *)(a2 + 76);
-  return result;
-}
-
-/* ---- R_BModelWorldBounds  0x004E3810 ----  [HIGH] */
-void __cdecl R_BModelWorldBounds(int a1, int a2, float *a3)
-{
-  float *v3;
-  int v5;
-  int v6;
-  double v7;
-  float v8;
-  float v9;
-  double v10;
-  float v11[3]; // [esp+Ch] [ebp-18h] BYREF  -- retail vec3_t
-  float v14;
-  float v15;
-  float v16;
-
-  v3 = a3;
-  v5 = *(_DWORD *)(tr_models[*(_DWORD *)(a2 + 8)] + 76);
-  a3[2] = 262144.0;
-  a3[1] = 262144.0;
-  *a3 = 262144.0;
-  *(_DWORD *)(a1 + 8) = -931135488;
-  *(_DWORD *)(a1 + 4) = -931135488;
-  *(_DWORD *)a1 = -931135488;
-  v6 = 0;
-  while ( 1 )
-  {
-    v14 = *(float *)(v5 + 12 * (v6 & 1));
-    v7 = v14 * *(float *)(a2 + 28);
-    v15 = *(float *)(v5 + 12 * ((v6 >> 1) & 1) + 4);
-    v8 = *(float *)(v5 + 12 * ((v6 >> 2) & 1) + 8);
-    v11[0] = *(float *)(a2 + 68);
-    v9 = *(float *)(a2 + 76);
-    v16 = v8;
-    v11[0] = v7 + v11[0];
-    v11[1] = *(float *)(a2 + 72);
-    v10 = v14 * *(float *)(a2 + 32);
-    v11[2] = v9;
-    v11[1] = v10 + v11[1];
-    v11[2] = v14 * *(float *)(a2 + 36) + v9;
-    v11[0] = v15 * *(float *)(a2 + 40) + v11[0];
-    v11[1] = v15 * *(float *)(a2 + 44) + v11[1];
-    v11[2] = v15 * *(float *)(a2 + 48) + v11[2];
-    v11[0] = v8 * *(float *)(a2 + 52) + v11[0];
-    v11[1] = v8 * *(float *)(a2 + 56) + v11[1];
-    v11[2] = v8 * *(float *)(a2 + 60) + v11[2];
-    AddPointToBounds(v11, v3, (float *)a1);
-    if ( ++v6 >= 8 )
-      break;
-    v3 = a3;
-  }
-}
-
-/* ---- R_AddModelToCell  0x004E3940 ----  VERIFIED */
-void __cdecl R_AddModelToCell(int a1, int a2, int a3, int a4)
-{
-  int v5;
-  _DWORD *v6;
-
-  if ( dpvs_cellEntityLinkCount == 4096 )
-  {
-    ri_Printf(1, "^1Max xmodel refs (%i) exceeded\n", 4096);
-  }
-  else
-  {
-    v5 = *(_DWORD *)(a3 + 60);
-    if ( v5 )
-    {
-      while ( *(_DWORD *)v5 != a4 )
-      {
-        v5 = *(_DWORD *)(v5 + 28);
-        if ( !v5 )
-          goto LABEL_6;
-      }
-      ExpandBounds((float *)a2, (float *)(v5 + 4), (float *)a1, (float *)(v5 + 16));
-    }
-    else
-    {
-LABEL_6:
-      v6 = (_DWORD *)(dpvs_cellEntityLinks + 32 * dpvs_cellEntityLinkCount++);
-      *v6 = a4;
-      v6[1] = *(_DWORD *)a2;
-      v6[2] = *(_DWORD *)(a2 + 4);
-      v6[3] = *(_DWORD *)(a2 + 8);
-      v6[4] = *(_DWORD *)a1;
-      v6[5] = *(_DWORD *)(a1 + 4);
-      v6[6] = *(_DWORD *)(a1 + 8);
-      v6[7] = *(_DWORD *)(a3 + 60);
-      *(_DWORD *)(a3 + 60) = v6;
-    }
-  }
-}
-
-/* ---- R_FilterModelIntoCells_r  0x004E39D0 ----  VERIFIED */
-int __cdecl R_FilterModelIntoCells_r(_DWORD *a1, int a2, _DWORD *a3, _DWORD *a4)
-{
-  _DWORD *v4;
-  int v5;
-  int v6;
-  int v8;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  _DWORD v16[3]; // [esp+10h] [ebp-18h] BYREF
-  _DWORD v17[3]; // [esp+1Ch] [ebp-Ch] BYREF
-
-  v4 = a1;
-  if ( a1[2] == -2 )
-  {
-    while ( 1 )
-    {
-      v5 = BoxOnPlaneSide((int)a3, (int)a4, v4[3]);
-      if ( v5 == 3 )
-        break;
-      v4 = (_DWORD *)v4[v5 + 3];
-      if ( v4[2] != -2 )
-        goto LABEL_4;
-    }
-    v8 = v4[3];
-    if ( *(_BYTE *)(v8 + 16) >= 3u )
-    {
-      v15 = R_FilterModelIntoCells_r((_DWORD *)v4[4], a2, a3, a4);
-      v13 = R_FilterModelIntoCells_r((_DWORD *)v4[5], a2, a3, a4);
-    }
-    else
-    {
-      v9 = a3[1];
-      v16[0] = *a3;
-      v10 = a3[2];
-      v16[1] = v9;
-      v16[2] = v10;
-      v16[*(unsigned __int8 *)(v8 + 16)] = *(_DWORD *)(v8 + 12);
-      v11 = a4[1];
-      v17[0] = *a4;
-      v12 = a4[2];
-      v17[1] = v11;
-      v17[2] = v12;
-      v17[*(unsigned __int8 *)(v8 + 16)] = *(_DWORD *)(v8 + 12);
-      v13 = R_FilterModelIntoCells_r((_DWORD *)v4[5], a2, a3, v17);
-      v14 = *(unsigned __int8 *)(v4[3] + 16);
-      v15 = v13;
-      if ( !((*(float *)&v16[v14] < (double)*(float *)&a4[v14]) | __UNORDERED__(*(float *)&v16[v14], *(float *)&a4[v14])) )
-        return v15;
-      v15 = R_FilterModelIntoCells_r((_DWORD *)v4[4], a2, v16, a4);
-    }
-    if ( v15 == v13 )
-      return v15;
-    return -2;
-  }
-  else
-  {
-LABEL_4:
-    v6 = v4[2];
-    if ( v6 >= 0 )
-      R_AddModelToCell((int)a4, (int)a3, *(_DWORD *)(tr_world + 292) + (v6 << 6), a2);
-    return v4[2];
-  }
-}
-
-/* ---- R_XModelIsHuge  0x004E3B20 ----  VERIFIED */
-BOOL __fastcall R_XModelIsHuge(int a1, int a2)
-{
-  int dxBig;
-  int dyBig;
-
-  dxBig = *(float *)a1 - *(float *)a2 > 1536.0;
-  dyBig = *(float *)(a1 + 4) - *(float *)(a2 + 4) > 1536.0;
-
-  if ( dxBig && dyBig )
-    return 1;
-  if ( !dxBig && !dyBig )
+    *vertexCount = 0;
     return 0;
-  return *(float *)(a1 + 8) - *(float *)(a2 + 8) > 1536.0;
+  }
+  if ( !backCount )
+    return (float *)inVertices;
+
+  sides[i] = sides[0];
+  dists[i] = dists[0];
+
+  outCount = 0;
+  for ( i = 0; i < *vertexCount; ++i )
+  {
+    p1 = inVertices[i];
+    if ( sides[i] == 2 )   /* ON: copy, no split */
+    {
+      VectorCopy(p1, outVertices[outCount]);
+      ++outCount;
+      continue;
+    }
+    if ( sides[i] == 0 )   /* FRONT: copy */
+    {
+      VectorCopy(p1, outVertices[outCount]);
+      ++outCount;
+    }
+    if ( sides[i + 1] == 2 || sides[i + 1] == sides[i] )
+      continue;
+
+    /* the edge crosses the plane -- emit the intersection point; retail keeps
+     * frac on the x87 stack (0x4E2E57-0x4E2EB1) */
+    p2 = inVertices[(i + 1) % *vertexCount];
+    frac = dists[i] / (dists[i] - dists[i + 1]);
+    outVertices[outCount][0] = (p2[0] - p1[0])*frac + p1[0];
+    outVertices[outCount][1] = (p2[1] - p1[1])*frac + p1[1];
+    outVertices[outCount][2] = (p2[2] - p1[2])*frac + p1[2];
+    ++outCount;
+    if ( outCount == 1024 )
+      break;
+  }
+
+  *vertexCount = outCount;
+  return (float *)outVertices;
 }
 
-/* ---- R_FilterModelsIntoCells  0x004E3B70 ----  VERIFIED */
-int __cdecl R_FilterModelsIntoCells(int a1, int a2)
+/* ---- R_PortalClipPlanes  0x004E2EE0 ----  VERIFIED
+ * Clip the portal winding by its source plane, the far plane and every
+ * incoming plane, then convert the survivors into a tighter view-origin plane
+ * set.  Portals within one unit of the camera skip clipping and reuse a copy of
+ * the incoming planes. */
+char *__cdecl R_PortalClipPlanes(int planeCount, int *outPlaneCount, dpvsPortal_t *portal, int sourcePlane, char *planes)   /* planeCount first: retail's ecx = outPlaneCount, edx = planeCount */
 {
-  int v2;
-  int v3;
-  int result;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  double v11;
-  double v12;
-  double v13;
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  int v20;
-  int v21;
-  double v22;
-  int v23_xBig;
-  int v25_yBig;
-  cvar_t *v28;
-  bool v29; // zf
-  int v30;
-  int v31;
-  double v32;
-  double v33;
-  double v34;
-  int v35;
-  int v36;
-  int v37;
-  int v38;
-  int v39;
-  int v40;
-  int v41;
-  double v42;
-  bool v43; // cc
-  int v44;
-  int v45;
-  int v46;
-  int v47;
-  float v48[6]; /* retail: mins[3] [esp+18h] then maxs[3] [esp+24h] */
-  float *const v49 = v48 + 3;
+  vec3_t        windings[2][1024];   /* two 1024-vertex ping-pong banks */
+  float        *verts;
+  char         *result;
+  int           i;
 
-  v2 = 0;
-  if ( !r_cullBModels->integer || (v46 = 1, !r_drawBModels->integer) )
-    v46 = 0;
-  if ( !r_cullXModels->integer || (v45 = 1, !r_drawXModels->integer) )
-    v45 = 0;
-  v3 = tr_world;
-  result = 0;
-  if ( *(int *)(tr_world + 288) > 0 )
+  *outPlaneCount = portal->vertexCount;
+  verts = (float *)portal->vertices;
+  verts = R_ChopPortalWinding((const dpvsPlane_t *)sourcePlane, (vec3_t *)verts, outPlaneCount, windings[0]);
+  if ( !*outPlaneCount )
+    return 0;
+
+  if ( portal->plane.distance
+     - ( *(float *)&dpvs_viewOrigin*portal->plane.normal[0]
+       + ( *(float *)&dpvs_viewOriginY*portal->plane.normal[1]
+         + *(float *)&dpvs_viewOriginZ*portal->plane.normal[2] ) ) < 1.0f )
   {
-    v5 = 0;
-    do
-    {
-      *(_DWORD *)(*(_DWORD *)(v3 + 292) + v5 + 60) = 0;
-      v3 = tr_world;
-      ++result;
-      v5 += 64;
-    }
-    while ( result < *(_DWORD *)(tr_world + 288) );
+    *outPlaneCount = planeCount;
+    result = (char *)R_AllocClipPlanes(planeCount);
+    memcpy(result, planes, 20 * planeCount);
+    return result;
   }
-  dpvs_cellEntityLinkCount = 0;
-  v47 = 0;
-  if ( tr_refdef_num_entities > 0 )
-  {
-    v6 = 0;
-    v44 = 0;
-    while ( 1 )
-    {
-      *(_DWORD *)(v6 + tr_refdef_entities + 692) = 0;
-      v7 = *(_DWORD *)(v6 + tr_refdef_entities);
-      if ( v7 )
-      {
-        if ( v7 == 1 && v45 )
-        {
-          *(_DWORD *)(v6 + tr_refdef_entities + 692) = 2;
-          v8 = tr_refdef_entities;
-          R_XModelWorldBounds(v49, v6 + tr_refdef_entities, v48);
-          if ( dpvs_cullPlaneLimit <= 0 || (v9 = 0, dpvs_cullPlaneLimit = 0x7FFFFFFF, a2 <= 0) )
-          {
-LABEL_21:
-            v12 = *(float *)((char *)v48 + *(unsigned __int8 *)(dpvs_activeNearPlane + 18)) * *(float *)(dpvs_activeNearPlane + 8)
-                + *(float *)((char *)v48 + *(unsigned __int8 *)(dpvs_activeNearPlane + 17)) * *(float *)(dpvs_activeNearPlane + 4)
-                + *(float *)((char *)v48 + *(unsigned __int8 *)(dpvs_activeNearPlane + 16)) * *(float *)dpvs_activeNearPlane;
-            if ( !((v12 < *(float *)(dpvs_activeNearPlane + 12)) | __UNORDERED__(v12, *(float *)(dpvs_activeNearPlane + 12))) )
-            {
-              if ( !dpvs_activeFarPlane
-                || (v13 = *(float *)((char *)v48 + *(unsigned __int8 *)(dpvs_activeFarPlane + 18))
-                        * *(float *)(dpvs_activeFarPlane + 8)
-                        + *(float *)((char *)v48 + *(unsigned __int8 *)(dpvs_activeFarPlane + 17))
-                        * *(float *)(dpvs_activeFarPlane + 4)
-                        + *(float *)((char *)v48 + *(unsigned __int8 *)(dpvs_activeFarPlane + 16)) * *(float *)dpvs_activeFarPlane,
-                    !((v13 < *(float *)(dpvs_activeFarPlane + 12)) | __UNORDERED__(v13, *(float *)(dpvs_activeFarPlane + 12)))) )
-              {
-                v14 = 0;
-                if ( dpvs_occluderCount > 0 )
-                {
-                  while ( 1 )
-                  {
-                    v15 = *(_DWORD *)(dpvs_occluders + 4 * v14);
-                    if ( *(int *)(v15 + 24) > 0 )
-                      break;
-LABEL_30:
-                    if ( ++v14 >= dpvs_occluderCount )
-                    {
-                      v6 = v44;
-                      v8 = tr_refdef_entities;
-                      goto LABEL_32;
-                    }
-                  }
-                  *(_DWORD *)(v15 + 24) = 0x7FFFFFFF;
-                  v16 = *(_DWORD *)(dpvs_occluders + 4 * v14);
-                  v17 = 0;
-                  v18 = 0;
-                  while ( v17 < *(_DWORD *)(v16 + 28) )
-                  {
-                    v19 = *(_DWORD *)(v16 + 32);
-                    v20 = *(unsigned __int8 *)(v19 + v18 + 18);
-                    v21 = v18 + v19;
-                    v22 = *(float *)((char *)v48 + v20) * *(float *)(v21 + 8)
-                        + *(float *)((char *)v48 + *(unsigned __int8 *)(v21 + 17)) * *(float *)(v21 + 4)
-                        + *(float *)((char *)v48 + *(unsigned __int8 *)(v21 + 16)) * *(float *)v21;
-                    if ( !((v22 < *(float *)(v21 + 12)) | __UNORDERED__(v22, *(float *)(v21 + 12))) )
-                      goto LABEL_30;
-                    ++v17;
-                    v18 += 20;
-                  }
-LABEL_63:
-                  v6 = v44;
-                  goto LABEL_64;
-                }
-LABEL_32:
-                v23_xBig = v49[0] - v48[0] > 1536.0;
-                v25_yBig = v49[1] - v48[1] > 1536.0;
-                if ( !v23_xBig )
-                {
-                  if ( v25_yBig )
-                    goto LABEL_36;
-                }
-                else
-                {
-                  if ( v25_yBig )
-                    goto LABEL_37;
-LABEL_36:
-                  if ( v49[2] - v48[2] > 1536.0 )
-                  {
-LABEL_37:
-                    v28 = r_showCullXModels;
-                    *(_DWORD *)(v6 + v8 + 692) = 0;
-                    v29 = v28->integer == 1;
-LABEL_61:
-                    if ( v29 )
-                      R_AddDebugBox(modelBoundsDebugColor, v49, v48);
-                    goto LABEL_64;
-                  }
-                }
-                if ( R_FilterModelIntoCells_r(*(_DWORD **)(tr_world + 152), v6 + v8, v48, v49) == -1 )
-                  *(_DWORD *)(v6 + tr_refdef_entities + 692) = 0;
-                v29 = r_showCullXModels->integer == 1;
-                goto LABEL_61;
-              }
-            }
-          }
-          else
-          {
-            v10 = a1 + 8;
-            while ( 1 )
-            {
-              v11 = *(float *)((char *)v48 + *(unsigned __int8 *)(v10 + 8)) * *(float *)(v10 - 8)
-                  + *(float *)((char *)v48 + *(unsigned __int8 *)(v10 + 9)) * *(float *)(v10 - 4)
-                  + *(float *)((char *)v48 + *(unsigned __int8 *)(v10 + 10)) * *(float *)v10;
-              if ( (v11 < *(float *)(v10 + 4)) | __UNORDERED__(v11, *(float *)(v10 + 4)) )
-                break;
-              ++v9;
-              v10 += 20;
-              if ( v9 >= a2 )
-                goto LABEL_21;
-            }
-          }
-        }
-      }
-      else
-      {
-        if ( !v46 )
-          goto LABEL_64;
-        *(_DWORD *)(v6 + tr_refdef_entities + 692) = 2;
-        R_BModelWorldBounds((int)v49, v6 + tr_refdef_entities, v48);
-        if ( dpvs_cullPlaneLimit <= 0 || (v30 = 0, dpvs_cullPlaneLimit = 0x7FFFFFFF, a2 <= 0) )
-        {
-LABEL_47:
-          v33 = *(float *)((char *)v48 + *(unsigned __int8 *)(dpvs_activeNearPlane + 18)) * *(float *)(dpvs_activeNearPlane + 8)
-              + *(float *)((char *)v48 + *(unsigned __int8 *)(dpvs_activeNearPlane + 17)) * *(float *)(dpvs_activeNearPlane + 4)
-              + *(float *)((char *)v48 + *(unsigned __int8 *)(dpvs_activeNearPlane + 16)) * *(float *)dpvs_activeNearPlane;
-          if ( !((v33 < *(float *)(dpvs_activeNearPlane + 12)) | __UNORDERED__(v33, *(float *)(dpvs_activeNearPlane + 12))) )
-          {
-            if ( !dpvs_activeFarPlane
-              || (v34 = *(float *)((char *)v48 + *(unsigned __int8 *)(dpvs_activeFarPlane + 18))
-                      * *(float *)(dpvs_activeFarPlane + 8)
-                      + *(float *)((char *)v48 + *(unsigned __int8 *)(dpvs_activeFarPlane + 17))
-                      * *(float *)(dpvs_activeFarPlane + 4)
-                      + *(float *)((char *)v48 + *(unsigned __int8 *)(dpvs_activeFarPlane + 16)) * *(float *)dpvs_activeFarPlane,
-                  !((v34 < *(float *)(dpvs_activeFarPlane + 12)) | __UNORDERED__(v34, *(float *)(dpvs_activeFarPlane + 12)))) )
-            {
-              v35 = 0;
-              if ( dpvs_occluderCount > 0 )
-              {
-                while ( 1 )
-                {
-                  v36 = *(_DWORD *)(dpvs_occluders + 4 * v35);
-                  if ( *(int *)(v36 + 24) > 0 )
-                    break;
-LABEL_56:
-                  ++v35;
-                  v2 = 0;
-                  if ( v35 >= dpvs_occluderCount )
-                  {
-                    v6 = v44;
-                    goto LABEL_58;
-                  }
-                }
-                *(_DWORD *)(v36 + 24) = 0x7FFFFFFF;
-                v37 = *(_DWORD *)(dpvs_occluders + 4 * v35);
-                v38 = 0;
-                while ( v2 < *(_DWORD *)(v37 + 28) )
-                {
-                  v39 = *(_DWORD *)(v37 + 32);
-                  v40 = *(unsigned __int8 *)(v39 + v38 + 18);
-                  v41 = v38 + v39;
-                  v42 = *(float *)((char *)v48 + v40) * *(float *)(v41 + 8)
-                      + *(float *)((char *)v48 + *(unsigned __int8 *)(v41 + 17)) * *(float *)(v41 + 4)
-                      + *(float *)((char *)v48 + *(unsigned __int8 *)(v41 + 16)) * *(float *)v41;
-                  if ( !((v42 < *(float *)(v41 + 12)) | __UNORDERED__(v42, *(float *)(v41 + 12))) )
-                    goto LABEL_56;
-                  ++v2;
-                  v38 += 20;
-                }
-                goto LABEL_63;
-              }
-LABEL_58:
-              if ( R_FilterModelIntoCells_r(*(_DWORD **)(tr_world + 152), v6 + tr_refdef_entities, v48, v49) == -1 )
-                *(_DWORD *)(v6 + tr_refdef_entities + 692) = 0;
-              v29 = r_showCullBModels->integer == 1;
-              goto LABEL_61;
-            }
-          }
-        }
-        else
-        {
-          v31 = a1 + 8;
-          while ( 1 )
-          {
-            v32 = *(float *)((char *)v48 + *(unsigned __int8 *)(v31 + 8)) * *(float *)(v31 - 8)
-                + *(float *)((char *)v48 + *(unsigned __int8 *)(v31 + 9)) * *(float *)(v31 - 4)
-                + *(float *)((char *)v48 + *(unsigned __int8 *)(v31 + 10)) * *(float *)v31;
-            if ( (v32 < *(float *)(v31 + 4)) | __UNORDERED__(v32, *(float *)(v31 + 4)) )
-              break;
-            ++v30;
-            v31 += 20;
-            if ( v30 >= a2 )
-              goto LABEL_47;
-          }
-        }
-      }
-LABEL_64:
-      result = v47 + 1;
-      v6 += 696;
-      v43 = ++v47 < tr_refdef_num_entities;
-      v44 = v6;
-      if ( !v43 )
-        return result;
-      v2 = 0;
-    }
-  }
-  return result;
-}
 
-
-/* ---- R_AddCellSurfaces  0x004E4080 ----  VERIFIED */
-void __cdecl R_AddCellSurfaces(int a1, int a2, int a3, int a4)
-{
-  _DWORD *v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-
-  dpvs_cullPlaneLimit = 0x7FFFFFFF;
-  v4 = *(_DWORD **)(a1 + 24);
-  v5 = v4[9];
-  v6 = 0;
-  if ( v5 )
-  {
-    if ( v5 > 0 )
-    {
-      v7 = 0;
-      do
-      {
-        R_AddAABBTreeSurfaces_r(v7 + v4[8], a2, a3, a4, 0);
-        v4 = *(_DWORD **)(a1 + 24);
-        ++v6;
-        v7 += 40;
-      }
-      while ( v6 < v4[9] );
-    }
-  }
-  else if ( (int)v4[7] > 0 )
-  {
-    v8 = 0;
-    do
-    {
-      R_AddTrianglesSurface(a3, (_DWORD *)(v8 + v4[6]), a4, a2, 0);
-      v4 = *(_DWORD **)(a1 + 24);
-      ++v6;
-      v8 += 12;
-    }
-    while ( v6 < v4[7] );
-  }
-  if ( r_drawentities->integer )
-    R_CullModels(a1, a2, a3);
-}
-
-
-/* ---- R_AddCullGroupDPVS  0x004E4120 ----  VERIFIED */
-void __cdecl R_AddCullGroupDPVS(int a1, int a2, int a3, BOOL a4)
-{
-  int v5;
-  int v6;
-  double v7;
-  double v8;
-  double v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  double v18;
-  _DWORD *v19;
-  int i;
-
-  if ( dpvs_cullPlaneLimit <= 0 || (v5 = 0, dpvs_cullPlaneLimit = 0x7FFFFFFF, a1 <= 0) )
-  {
-LABEL_6:
-    v8 = *(float *)(*(unsigned __int8 *)(dpvs_activeNearPlane + 18) + a2) * *(float *)(dpvs_activeNearPlane + 8)
-       + *(float *)(*(unsigned __int8 *)(dpvs_activeNearPlane + 17) + a2) * *(float *)(dpvs_activeNearPlane + 4)
-       + *(float *)(*(unsigned __int8 *)(dpvs_activeNearPlane + 16) + a2) * *(float *)dpvs_activeNearPlane;
-    if ( !((v8 < *(float *)(dpvs_activeNearPlane + 12)) | __UNORDERED__(v8, *(float *)(dpvs_activeNearPlane + 12))) )
-    {
-      if ( !dpvs_activeFarPlane
-        || (v9 = *(float *)(*(unsigned __int8 *)(dpvs_activeFarPlane + 18) + a2) * *(float *)(dpvs_activeFarPlane + 8)
-               + *(float *)(*(unsigned __int8 *)(dpvs_activeFarPlane + 17) + a2) * *(float *)(dpvs_activeFarPlane + 4)
-               + *(float *)(*(unsigned __int8 *)(dpvs_activeFarPlane + 16) + a2) * *(float *)dpvs_activeFarPlane,
-            !((v9 < *(float *)(dpvs_activeFarPlane + 12)) | __UNORDERED__(v9, *(float *)(dpvs_activeFarPlane + 12)))) )
-      {
-        v10 = 0;
-        if ( dpvs_occluderCount <= 0 )
-        {
-LABEL_16:
-          if ( (r_showportals->integer & 1) != 0 )
-            R_AddDebugBox(cullGroupDebugColor, (float *)(a2 + 12), (float *)a2);
-          v19 = *(_DWORD **)(a2 + 24);
-          *(_DWORD *)(a2 + 32) = tr_viewCount;
-          for ( i = *(_DWORD *)(a2 + 28); i; --i )
-          {
-            R_AddWorldSurfaceNoCull(a4, v19);
-            v19 += 3;
-          }
-        }
-        else
-        {
-          while ( 1 )
-          {
-            v11 = *(_DWORD *)(dpvs_occluders + 4 * v10);
-            if ( *(int *)(v11 + 24) > 0 )
-              break;
-LABEL_15:
-            if ( ++v10 >= dpvs_occluderCount )
-              goto LABEL_16;
-          }
-          *(_DWORD *)(v11 + 24) = 0x7FFFFFFF;
-          v12 = *(_DWORD *)(dpvs_occluders + 4 * v10);
-          v13 = 0;
-          v14 = 0;
-          while ( v13 < *(_DWORD *)(v12 + 28) )
-          {
-            v15 = *(_DWORD *)(v12 + 32);
-            v16 = *(unsigned __int8 *)(v15 + v14 + 18);
-            v17 = v14 + v15;
-            v18 = *(float *)(a2 + v16) * *(float *)(v17 + 8)
-                + *(float *)(a2 + *(unsigned __int8 *)(v17 + 17)) * *(float *)(v17 + 4)
-                + *(float *)(a2 + *(unsigned __int8 *)(v17 + 16)) * *(float *)v17;
-            if ( !((v18 < *(float *)(v17 + 12)) | __UNORDERED__(v18, *(float *)(v17 + 12))) )
-              goto LABEL_15;
-            ++v13;
-            v14 += 20;
-          }
-        }
-      }
-    }
-  }
-  else
-  {
-    v6 = a3 + 8;
-    while ( 1 )
-    {
-      v7 = *(float *)(*(unsigned __int8 *)(v6 + 8) + a2) * *(float *)(v6 - 8)
-         + *(float *)(*(unsigned __int8 *)(v6 + 9) + a2) * *(float *)(v6 - 4)
-         + *(float *)(*(unsigned __int8 *)(v6 + 10) + a2) * *(float *)v6;
-      if ( (v7 < *(float *)(v6 + 4)) | __UNORDERED__(v7, *(float *)(v6 + 4)) )
-        break;
-      ++v5;
-      v6 += 20;
-      if ( v5 >= a1 )
-        goto LABEL_6;
-    }
-  }
-}
-
-
-/* ---- R_AddStaticModelDPVS  0x004E42B0 ----  VERIFIED */
-void __cdecl R_AddStaticModelDPVS(int a1, int a2, int a3)
-{
-  int v3;
-  float *v4;
-  int v5;
-  int v6;
-  double v7;
-  double v8;
-  double v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  double v18;
-
-  v3 = a3;
-  v4 = (float *)(a3 + 156);
-  if ( dpvs_cullPlaneLimit <= 0 || (v5 = 0, dpvs_cullPlaneLimit = 0x7FFFFFFF, a1 <= 0) )
-  {
-LABEL_6:
-    v8 = *(float *)((char *)v4 + *(unsigned __int8 *)(dpvs_activeNearPlane + 18)) * *(float *)(dpvs_activeNearPlane + 8)
-       + *(float *)((char *)v4 + *(unsigned __int8 *)(dpvs_activeNearPlane + 17)) * *(float *)(dpvs_activeNearPlane + 4)
-       + *(float *)((char *)v4 + *(unsigned __int8 *)(dpvs_activeNearPlane + 16)) * *(float *)dpvs_activeNearPlane;
-    if ( !((v8 < *(float *)(dpvs_activeNearPlane + 12)) | __UNORDERED__(v8, *(float *)(dpvs_activeNearPlane + 12))) )
-    {
-      if ( !dpvs_activeFarPlane
-        || (v9 = *(float *)((char *)v4 + *(unsigned __int8 *)(dpvs_activeFarPlane + 18)) * *(float *)(dpvs_activeFarPlane + 8)
-               + *(float *)((char *)v4 + *(unsigned __int8 *)(dpvs_activeFarPlane + 17)) * *(float *)(dpvs_activeFarPlane + 4)
-               + *(float *)((char *)v4 + *(unsigned __int8 *)(dpvs_activeFarPlane + 16)) * *(float *)dpvs_activeFarPlane,
-            !((v9 < *(float *)(dpvs_activeFarPlane + 12)) | __UNORDERED__(v9, *(float *)(dpvs_activeFarPlane + 12)))) )
-      {
-        v10 = 0;
-        if ( dpvs_occluderCount <= 0 )
-        {
-LABEL_17:
-          if ( r_showCullSModels->integer )
-            R_AddDebugBox(staticModelDebugColor, (float *)(v3 + 168), v4);
-          *(_DWORD *)(v3 + 180) = tr_viewCount;
-          RE_AddRefEntityToScene((int *)v3, v3);
-        }
-        else
-        {
-          while ( 1 )
-          {
-            v11 = *(_DWORD *)(dpvs_occluders + 4 * v10);
-            if ( *(int *)(v11 + 24) > 0 )
-              break;
-LABEL_16:
-            if ( ++v10 >= dpvs_occluderCount )
-              goto LABEL_17;
-          }
-          *(_DWORD *)(v11 + 24) = 0x7FFFFFFF;
-          v12 = *(_DWORD *)(dpvs_occluders + 4 * v10);
-          v13 = 0;
-          v14 = 0;
-          while ( v13 < *(_DWORD *)(v12 + 28) )
-          {
-            v15 = *(_DWORD *)(v12 + 32);
-            v16 = *(unsigned __int8 *)(v15 + v14 + 18);
-            v17 = v14 + v15;
-            v18 = *(float *)((char *)v4 + v16) * *(float *)(v17 + 8)
-                + *(float *)((char *)v4 + *(unsigned __int8 *)(v17 + 17)) * *(float *)(v17 + 4)
-                + *(float *)((char *)v4 + *(unsigned __int8 *)(v17 + 16)) * *(float *)v17;
-            if ( !((v18 < *(float *)(v17 + 12)) | __UNORDERED__(v18, *(float *)(v17 + 12))) )
-            {
-              v3 = a3;
-              goto LABEL_16;
-            }
-            ++v13;
-            v14 += 20;
-          }
-        }
-      }
-    }
-  }
-  else
-  {
-    v6 = a2 + 8;
-    while ( 1 )
-    {
-      v7 = *(float *)((char *)v4 + *(unsigned __int8 *)(v6 + 8)) * *(float *)(v6 - 8)
-         + *(float *)((char *)v4 + *(unsigned __int8 *)(v6 + 9)) * *(float *)(v6 - 4)
-         + *(float *)((char *)v4 + *(unsigned __int8 *)(v6 + 10)) * *(float *)v6;
-      if ( (v7 < *(float *)(v6 + 4)) | __UNORDERED__(v7, *(float *)(v6 + 4)) )
-        break;
-      ++v5;
-      v6 += 20;
-      if ( v5 >= a1 )
-        goto LABEL_6;
-    }
-  }
-}
-
-
-/* ---- R_AddCellCullGroups  0x004E4440 ----  VERIFIED */
-void __cdecl R_AddCellCullGroups(int a1, BOOL a2, int a3, int a4)
-{
-  int v4;
-  int *v5;
-  int *i;
-  int v7;
-
-  v4 = a3;
-  v5 = *(int **)(a3 + 36);
-  if ( *(_DWORD *)(a3 + 40) )
-  {
-    v7 = *(_DWORD *)(a3 + 40);
-    do
-    {
-      if ( *(_DWORD *)(*v5 + 32) != tr_viewCount )
-        R_AddCullGroupDPVS(a1, *v5, a4, a2);
-      ++v5;
-      --v7;
-    }
-    while ( v7 );
-    v4 = a3;
-  }
-  if ( r_drawSModels->integer )
-  {
-    for ( i = *(int **)(v4 + 56); i; i = (int *)i[1] )
-    {
-      if ( *(_DWORD *)(*i + 180) != tr_viewCount )
-        R_AddStaticModelDPVS(a1, a4, *i);
-    }
-  }
-}
-
-
-/* ---- R_RecursivePortalWalk  0x004E44D0 ----  VERIFIED */
-void __cdecl R_RecursivePortalWalk(int a1, int a2, float *a3, int a4, int a5)
-{
-  int v5;
-  int v6;
-  float *v7;
-  int v8;
-  int v9;
-  int v10; // [esp+10h] [ebp-4h] BYREF
-  int v11;
-
-
-  R_AddCellOccluders(a1, a3, a4);
-  R_AddCellSurfaces(a1, (int)a3, a4, a5);
-  R_AddCellCullGroups(a4, a5, a1, (int)a3);
-  v5 = *(_DWORD *)(a1 + 28);
-  if ( *(_DWORD *)(a1 + 32) )
-  {
-    v11 = *(_DWORD *)(a1 + 32);
-    do
-    {
-      if ( !*(_DWORD *)(v5 + 32)
-        && *(float *)&dword_11CC108 * *(float *)(v5 + 8)
-         + *(float *)&dword_11CC104 * *(float *)(v5 + 4)
-         + *(float *)&dpvs_viewOrigin * *(float *)v5 <= *(float *)(v5 + 12)
-        && !R_PortalBehindAnyPlane(v5, a3, a4) )
-      {
-        v6 = 0;
-        if ( dpvs_occluderCount <= 0 )
-        {
-LABEL_9:
-          v7 = (float *)R_PortalClipPlanes(&v10, a4, v5, a2, (char *)a3);
-          if ( v10 )
-          {
-            v9 = v10;
-            v8 = *(_DWORD *)(v5 + 20);
-            *(_DWORD *)(v5 + 32) = 1;
-            R_RecursivePortalWalk(v8, v5, v7, v9, a5);
-            ri_Hunk_FreeTempMemory(v7);
-            *(_DWORD *)(v5 + 32) = 0;
-          }
-        }
-        else
-        {
-          while ( !R_PortalBehindAllPlanes(
-                     v5,
-                     *(float **)(*(_DWORD *)(dpvs_occluders + 4 * v6) + 32),
-                     *(_DWORD *)(*(_DWORD *)(dpvs_occluders + 4 * v6) + 28)) )
-          {
-            if ( ++v6 >= dpvs_occluderCount )
-              goto LABEL_9;
-          }
-        }
-      }
-      v5 += 36;
-      --v11;
-    }
-    while ( v11 );
-  }
-}
-
-/* ---- R_SetupDPVS  0x004E4610 ----  VERIFIED */
-void R_SetupDPVS()
-{
-  double FarPlaneDist;
-  double v1;
-
-  if ( dpvs_initialSetup || !r_lockpvs->integer )
-  {
-    dpvs_initialSetup = 0;
-    R_FrustumClipPlanes();
-    dpvs_viewOrigin = LODWORD(tr_viewParms_originX);
-    dpvs_nearPlane = tr_viewParms_axis00;
-    dword_11CC108 = LODWORD(tr_viewParms_originZ);
-    dword_11CC104 = LODWORD(tr_viewParms_originY);
-    dword_11CC164 = tr_viewParms_axis02;
-    dword_11CC160 = tr_viewParms_axis01;
-    byte_11CC16C = tr_viewParms_axis00 <= 0 ? 0 : 0xC;
-    byte_11CC16D = tr_viewParms_axis01 <= 0 ? 4 : 16;
-    byte_11CC16E = tr_viewParms_axis02 <= 0 ? 8 : 20;
-    dpvs_activeNearPlane = (int)&tr_viewParms_portalPlane;
-    flt_11CC168 = *(float *)&tr_viewParms_axis02 * tr_viewParms_originZ
-                + *(float *)&tr_viewParms_axis01 * tr_viewParms_originY
-                + *(float *)&tr_viewParms_axis00 * tr_viewParms_originX
-                - 0.1
-                - 0.001;
-    if ( !tr_viewParms_isMirror )
-      dpvs_activeNearPlane = (int)&dpvs_nearPlane;
-    FarPlaneDist = RE_GetFarPlaneDist();
-    if ( FarPlaneDist <= 0.0 )
-    {
-      dpvs_activeFarPlane = 0;
-    }
-    else
-    {
-      dpvs_activeFarPlane = (int)&dpvs_farPlane;
-      dpvs_farPlane = *(float *)&tr_viewParms_axis00 * -1.0;
-      flt_11CC174 = *(float *)&tr_viewParms_axis01 * -1.0;
-      v1 = *(float *)&tr_viewParms_axis02 * -1.0;
-      flt_11CC178 = v1;
-      byte_11CC180 = SLODWORD(dpvs_farPlane) <= 0 ? 0 : 0xC;
-      byte_11CC181 = SLODWORD(flt_11CC174) <= 0 ? 4 : 16;
-      byte_11CC182 = SLODWORD(flt_11CC178) <= 0 ? 8 : 20;
-      flt_11CC17C = v1 * tr_viewParms_originZ + flt_11CC174 * tr_viewParms_originY + dpvs_farPlane * tr_viewParms_originX - FarPlaneDist - 0.001;
-    }
-    if ( r_portalbevels->value > 0.0 )
-      R_SetupTransformMatrix();
-  }
-}
-
-
-/* ---- R_AddCoronas  0x004E4800 ----  [HIGH] */
-int __cdecl R_AddCoronas(int a1, int a2)
-{
-  int result;
-  bool v3; // cc
-  int v4;
-  int v5;
-  float *v6;
-  double v7;
-  int v8;
-  int v9;
-  double v10;
-  double v11;
-  double v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  int v20;
-  double v21;
-  int v22;
-  int v23;
-  char v24;
-  double v25;
-  double v26;
-  unsigned __int64 v27; // rax
-  int v28;
-  int v29;
-  float v30[3]; // [esp+8h] [ebp-CCh] BYREF -- ONE vec3_t in retail
-  int v33;
-  float v34[6];
-  int v35;
-  int v36[40]; // [esp+34h] [ebp-A0h] BYREF
-  unsigned int retaddr;
-
-  v36[39] = retaddr ^ _security_cookie;
-  result = 0;
-  memset(v36, 0, 0x9Cu);
-  v3 = *(int *)(tr_world + 196) <= 0;
-  v36[0] = 4;
-  v33 = 0;
-  if ( !v3 )
-  {
-    v4 = dpvs_activeFarPlane;
-    v5 = dpvs_activeNearPlane;
-    v29 = 0;
-    do
-    {
-      v6 = (float *)(*(_DWORD *)(tr_world + 192) + v29);
-      v30[0] = tr_refdef_vieworgX - v6[1];
-      v30[1] = tr_refdef_vieworgY - v6[2];
-      v30[2] = tr_refdef_vieworgZ - v6[3];
-      VectorNormalize(v30);
-      if ( v30[2] < (double)v6[5] )
-      {
-        v7 = v6[4] * 1.7320508;
-        v34[0] = v6[1] - v7;
-        v34[1] = v6[2] - v7;
-        v34[2] = v6[3] - v7;
-        v34[3] = v7 + v6[1];
-        v34[4] = v7 + v6[2];
-        v34[5] = v7 + v6[3];
-        if ( dpvs_cullPlaneLimit <= 0 || (v8 = 0, dpvs_cullPlaneLimit = 0x7FFFFFFF, a2 <= 0) )
-        {
-LABEL_9:
-          v11 = *(float *)((char *)v34 + *(unsigned __int8 *)(v5 + 18)) * *(float *)(v5 + 8)
-              + *(float *)((char *)v34 + *(unsigned __int8 *)(v5 + 17)) * *(float *)(v5 + 4)
-              + *(float *)((char *)v34 + *(unsigned __int8 *)(v5 + 16)) * *(float *)v5;
-          if ( !((v11 < *(float *)(v5 + 12)) | __UNORDERED__(v11, *(float *)(v5 + 12))) )
-          {
-            if ( !v4
-              || (v12 = *(float *)((char *)v34 + *(unsigned __int8 *)(v4 + 18)) * *(float *)(v4 + 8)
-                      + *(float *)((char *)v34 + *(unsigned __int8 *)(v4 + 17)) * *(float *)(v4 + 4)
-                      + *(float *)((char *)v34 + *(unsigned __int8 *)(v4 + 16)) * *(float *)v4,
-                  !((v12 < *(float *)(v4 + 12)) | __UNORDERED__(v12, *(float *)(v4 + 12)))) )
-            {
-              v13 = 0;
-              if ( dpvs_occluderCount <= 0 )
-              {
-LABEL_19:
-                v22 = v29 + *(_DWORD *)(tr_world + 192);
-                v23 = *(_DWORD *)(*(_DWORD *)v22 + 68);
-                v24 = *(_BYTE *)(v22 + 28);
-                *(float *)&v36[17] = v30[0] * 16.0 + *(float *)(v22 + 4);
-                LOBYTE(v36[27]) = v24;
-                BYTE2(v36[27]) = *(_BYTE *)(v22 + 30);
-                v36[26] = v23;
-                v25 = v30[1] * 16.0 + *(float *)(v22 + 8);
-                BYTE1(v36[27]) = *(_BYTE *)(v22 + 29);
-                *(float *)&v36[18] = v25;
-                *(float *)&v36[19] = v30[2] * 16.0 + *(float *)(v22 + 12);
-                v36[31] = *(int *)(v22 + 16);
-                v36[25] = v36[31];
-                if ( v30[2] <= (double)*(float *)(v22 + 24) )
-                {
-                  LOBYTE(v27) = *(_BYTE *)(v22 + 31);
-                }
-                else
-                {
-                  v26 = *(float *)(v22 + 20) - v30[2];
-                  v35 = *(unsigned __int8 *)(v22 + 31);
-                  v27 = (unsigned __int64)(v26 * (double)v35 / (*(float *)(v22 + 20) - *(float *)(v22 + 24)));
-                }
-                HIBYTE(v36[27]) = v27;
-                RE_AddRefEntityToScene(v36, 0);
-              }
-              else
-              {
-                while ( 1 )
-                {
-                  v14 = *(_DWORD *)(dpvs_occluders + 4 * v13);
-                  if ( *(int *)(v14 + 24) > 0 )
-                    break;
-LABEL_18:
-                  if ( ++v13 >= dpvs_occluderCount )
-                    goto LABEL_19;
-                }
-                *(_DWORD *)(v14 + 24) = 0x7FFFFFFF;
-                v15 = *(_DWORD *)(dpvs_occluders + 4 * v13);
-                v16 = 0;
-                v17 = 0;
-                while ( v16 < *(_DWORD *)(v15 + 28) )
-                {
-                  v18 = *(_DWORD *)(v15 + 32);
-                  v19 = *(unsigned __int8 *)(v18 + v17 + 18);
-                  v20 = v17 + v18;
-                  v21 = *(float *)((char *)v34 + v19) * *(float *)(v20 + 8)
-                      + *(float *)((char *)v34 + *(unsigned __int8 *)(v20 + 17)) * *(float *)(v20 + 4)
-                      + *(float *)((char *)v34 + *(unsigned __int8 *)(v20 + 16)) * *(float *)v20;
-                  if ( !((v21 < *(float *)(v20 + 12)) | __UNORDERED__(v21, *(float *)(v20 + 12))) )
-                    goto LABEL_18;
-                  ++v16;
-                  v17 += 20;
-                }
-              }
-              v4 = dpvs_activeFarPlane;
-              v5 = dpvs_activeNearPlane;
-            }
-          }
-        }
-        else
-        {
-          v9 = a1 + 8;
-          while ( 1 )
-          {
-            v10 = *(float *)((char *)v34 + *(unsigned __int8 *)(v9 + 8)) * *(float *)(v9 - 8)
-                + *(float *)((char *)v34 + *(unsigned __int8 *)(v9 + 9)) * *(float *)(v9 - 4)
-                + *(float *)((char *)v34 + *(unsigned __int8 *)(v9 + 10)) * *(float *)v9;
-            if ( (v10 < *(float *)(v9 + 4)) | __UNORDERED__(v10, *(float *)(v9 + 4)) )
-              break;
-            ++v8;
-            v9 += 20;
-            if ( v8 >= a2 )
-              goto LABEL_9;
-          }
-        }
-      }
-      v29 += 32;
-      v28 = *(_DWORD *)(tr_world + 196);
-      result = ++v33;
-    }
-    while ( v33 < v28 );
-  }
-  return result;
-}
-
-/* ---- R_AddSkySurfacesDPVS  0x004E4B70 ----  [HIGH] */
-int R_AddSkySurfacesDPVS()
-{
-  int v0;
-  int v1;
-  int result;
-  int i;
-  _DWORD *v4;
-  double v5;
-
-  v0 = dpvs_activeFarPlane;
   if ( dpvs_activeFarPlane )
   {
-    v1 = tr_world;
-    dpvs_activeFarPlane = 0;
-    result = *(_DWORD *)(tr_world + 164);
-    for ( i = 0; i < result; ++i )
-    {
-      v4 = *(_DWORD **)(*(_DWORD *)(v1 + 168) + 4 * i);
-      if ( *v4 != tr_viewCount )
-      {
-        v5 = *(float *)(*(unsigned __int8 *)(v0 + 18) + v4[2] + 12) * *(float *)(v0 + 8)
-           + *(float *)(*(unsigned __int8 *)(v0 + 17) + v4[2] + 12) * *(float *)(v0 + 4)
-           + *(float *)(*(unsigned __int8 *)(v0 + 16) + v4[2] + 12) * *(float *)v0;
-        if ( (v5 < *(float *)(v0 + 12)) | __UNORDERED__(v5, *(float *)(v0 + 12)) )
-        {
-          R_AddTrianglesSurface(4, v4, 0, (int)&dpvs_frustumPlanes, 0);
-          v1 = tr_world;
-        }
-      }
-      result = *(_DWORD *)(v1 + 164);
-    }
+    verts = R_ChopPortalWinding((const dpvsPlane_t *)dpvs_activeFarPlane, (vec3_t *)verts, outPlaneCount,
+                                windings[verts == (float *)windings[0]]);
+    if ( !*outPlaneCount )
+      return 0;
   }
-  return result;
+
+  for ( i = 0; i < planeCount; ++i )
+  {
+    verts = R_ChopPortalWinding(&((const dpvsPlane_t *)planes)[i], (vec3_t *)verts, outPlaneCount,
+                                windings[verts == (float *)windings[0]]);
+    if ( !*outPlaneCount )
+      return 0;
+  }
+
+  if ( r_showportals->integer )
+    R_AddDebugPolygon(colorDebugPortal, *outPlaneCount, verts);
+
+  return (char *)R_PortalClipPlanesInternal(outPlaneCount, *outPlaneCount, (vec3_t *)verts, portal->cell);
 }
 
-/* ---- R_AddWorldSurfacesDPVS  0x004E4C10 ----  VERIFIED */
-cvar_t *R_AddWorldSurfacesDPVS()
-{
-  cvar_t *result;
-  int v1;
-  int v2;
-  int v3;
-  int v4;
-  int v5;
-  _DWORD *v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  float *v13;
-  int v14;
-  _DWORD *v15;
-  int v16;
-  char v17[0x1000];  // [esp+8h] [ebp-3F000h] BYREF   -- occluders
-  char v18[0x1E000]; // [esp+1008h] [ebp-3E000h] BYREF -- active planes
-  char v19[0x20000]; // [esp+1F008h] [ebp-20000h] BYREF -- cell entity links
 
-  result = r_drawworld;
-  v1 = 0;
-  if ( r_drawworld->integer )
+/* ---- R_AddTrianglesSurface  0x004E3070 ----  [HIGH]
+ * Cull one world surface's bounds and, if visible, hand it to the draw list. */
+void __cdecl R_AddTrianglesSurface(int planeCount, msurface_t *surf, int dlightBits, dpvsPlane_t *planes, int planeIndex)
+{
+  srfLit_t *data;
+
+  if ( surf->viewCount == tr_viewCount )
+    return;
+
+  data = (srfLit_t *)surf->data;
+  if ( R_CullBoxDPVS((const vec3_t *)&data->boundsMin, planes, planeCount, planeIndex) )
+    return;
+
+  if ( (r_showaabbtrees->integer & 2) != 0 )
+    R_AddDebugBox( data->boundsMin, data->boundsMax,colorDebugGreen);
+
+  R_AddWorldSurfaceNoCull(dlightBits, surf);
+}
+
+/* ---- R_AddAABBTreeSurfaces_r  0x004E3210 ----  VERIFIED
+ * Descend a cell's surface AABB tree.  A subtree wholly in front of every plane
+ * and unoccluded is submitted without descending; a partially visible internal
+ * node recurses; a partially visible leaf submits per surface. */
+void __cdecl R_AddAABBTreeSurfaces_r(dpvsAabbTree_t *tree, dpvsPlane_t *planes, int planeCount, int dlightBits, int planeIndex)
+{
+  int i;
+
+  if ( R_CullBoxDPVS((const vec3_t *)&tree->mins, planes, planeCount, planeIndex) )
+    return;
+
+  if ( dlightBits )
+    dlightBits = R_CullDlightsForBox(dlightBits, tree->mins, tree->maxs);
+
+  /* Mac 1.3 order: the partially visible case first, the fully visible
+     (no-cull) submit in the else branch */
+  if ( R_CullBoxDPVSStrict((const vec3_t *)&tree->mins, planes, planeCount, planeIndex) )
   {
-    if ( (tr_refdef_rdflags & 1) == 0 )
+    if ( tree->childCount )
     {
-      dpvs_occluders = (int)&v17;
-      dpvs_activePlanes = (int)&v18;
-      dpvs_cellEntityLinks = (int)&v19;
-      dpvs_occluderCount = 0;
-      tr_currentEntityNumber = 1022;
-      tr_shiftedEntityNumber = 261632;
-      v2 = (1 << tr_refdef_num_dlights) - 1;
-      R_SetupDPVS();
-      R_FilterModelsIntoCells((int)dpvs_frustumPlanes, 4);
-      R_AddCoronas((int)dpvs_frustumPlanes, 4);
-      v3 = R_CellForCamera();
-      if ( v3 < 0 )
+      for ( i = 0; i < tree->childCount; ++i )
+        R_AddAABBTreeSurfaces_r(&tree->children[i], planes, planeCount, dlightBits, planeIndex + 1);
+    }
+    else
+    {
+      if ( r_showaabbtrees->integer )
+        R_AddDebugBox( tree->mins, tree->maxs,clippedLeafDebugColor);
+      for ( i = 0; i < tree->surfaceCount; ++i )
+        R_AddTrianglesSurface(planeCount, &tree->surfaces[i], dlightBits, planes, planeIndex + 1);
+    }
+  }
+  else
+  {
+    if ( r_showaabbtrees->integer )
+      R_AddDebugBox( tree->mins, tree->maxs,colorDebugYellow);
+    for ( i = 0; i < tree->surfaceCount; ++i )
+    {
+      if ( tree->surfaces[i].viewCount != tr_viewCount )
+        R_AddWorldSurfaceNoCull(dlightBits, &tree->surfaces[i]);
+    }
+  }
+}
+
+
+/* ---- R_CullModels  0x004E3560 ----  [HIGH]
+ * Admit any brush/xmodel entity linked into this cell that survives the box
+ * test; an entity already admitted by another cell is left alone. */
+void __cdecl R_CullModels(int cellPtr, int planesPtr, int planeCount)
+{
+  dpvsCell_t           *cell = (dpvsCell_t *)cellPtr;
+  dpvsPlane_t          *planes = (dpvsPlane_t *)planesPtr;
+  dpvsCellEntityLink_t *link;
+
+  for ( link = cell->entityLinks; link; link = link->next )
+  {
+    if ( link->entity->cullState == CULL_IN )
+      continue;
+    if ( !R_CullBoxDPVS((const vec3_t *)link->mins, planes, planeCount, 0) )
+      link->entity->cullState = CULL_IN;
+  }
+}
+
+/* ---- R_XModelWorldBounds  0x004E3700 ----  [HIGH]
+ * World-space AABB for an xmodel entity: the first DObj model's authored bounds
+ * scaled by the largest entity-axis length. */
+void __cdecl R_XModelWorldBounds(float *outMins, int entityPtr, float *outMaxs)
+{
+  trRefEntity_t *ent = (trRefEntity_t *)entityPtr;
+  float          axisLenSq[3];
+  rfloat         maxLenSq;
+  rfloat         scale;
+  const float   *modelInfo;
+  vec3_t         mins;
+  vec3_t         maxs;
+
+  /* retail keeps axis 0's squared length unrounded on the x87 stack as the
+   * starting maximum (0x4E371C fst dword + 0x4E3720 fstp st(3)); only its
+   * float copy is used in the first comparison (0x4E376C).  Axes 1 and 2 are
+   * stored as floats.  VC7 forwards the unrounded value into maxLenSq; the
+   * modern build computes it in double (products of floats are exact). */
+#ifdef COD1_VC7
+  axisLenSq[0] = ent->e.axis[0][0]*ent->e.axis[0][0]
+               + ent->e.axis[0][1]*ent->e.axis[0][1]
+               + ent->e.axis[0][2]*ent->e.axis[0][2];
+  maxLenSq = axisLenSq[0];
+#else
+  maxLenSq = (double)ent->e.axis[0][0]*ent->e.axis[0][0]
+           + (double)ent->e.axis[0][1]*ent->e.axis[0][1]
+           + (double)ent->e.axis[0][2]*ent->e.axis[0][2];
+  axisLenSq[0] = (float)maxLenSq;
+#endif
+  axisLenSq[1] = ent->e.axis[1][0]*ent->e.axis[1][0]
+               + ent->e.axis[1][1]*ent->e.axis[1][1]
+               + ent->e.axis[1][2]*ent->e.axis[1][2];
+  axisLenSq[2] = ent->e.axis[2][0]*ent->e.axis[2][0]
+               + ent->e.axis[2][1]*ent->e.axis[2][1]
+               + ent->e.axis[2][2]*ent->e.axis[2][2];
+  if ( axisLenSq[0] < axisLenSq[1] )
+    maxLenSq = axisLenSq[1];
+  if ( maxLenSq < axisLenSq[2] )
+    maxLenSq = axisLenSq[2];
+  scale = sqrt(maxLenSq);
+
+  /* entity->e.dobj->models[0]->info -- kept as raw offsets (XModel internals) */
+  modelInfo = *(const float **)(*(int *)(*(int *)(entityPtr + 144) + 24) + 4);
+  VectorCopy(&modelInfo[19], mins);   /* +0x4c */
+  VectorCopy(&modelInfo[22], maxs);   /* +0x58 */
+
+  VectorMA(ent->e.origin, scale, mins, outMins);
+  VectorMA(ent->e.origin, scale, maxs, outMaxs);
+}
+
+/* ---- R_BModelWorldBounds  0x004E3810 ----  [HIGH]
+ * World-space AABB for a brush-model entity: its 8 local corners transformed by
+ * the entity axis/origin and merged. */
+void __cdecl R_BModelWorldBounds( trRefEntity_t *ent, float *mins, float *maxs )
+{
+  bmodel_t *bmodel = ((model_t *)tr_models[ent->e.hModel])->bmodel;
+  int       i;
+  vec3_t    local;
+  vec3_t    world;
+
+  ClearBounds( mins, maxs );
+  for ( i = 0; i < 8; i++ )
+  {
+    local[0] = bmodel->bounds[i & 1][0];
+    local[1] = bmodel->bounds[(i >> 1) & 1][1];
+    local[2] = bmodel->bounds[(i >> 2) & 1][2];
+    VectorCopy( ent->e.origin, world );
+    VectorMA( world, local[0], ent->e.axis[0], world );
+    VectorMA( world, local[1], ent->e.axis[1], world );
+    VectorMA( world, local[2], ent->e.axis[2], world );
+    AddPointToBounds( world, mins, maxs );
+  }
+}
+
+/* ---- R_AddModelToCell  0x004E3940 ----  VERIFIED
+ * Link an entity into a cell (merging bounds on a repeat visit), from the
+ * caller-owned link scratch bank. */
+void __cdecl R_AddModelToCell(int cellPtr, int minsPtr, int maxsPtr, int entityPtr)
+{
+  dpvsCell_t           *cell = (dpvsCell_t *)cellPtr;
+  float                *mins = (float *)minsPtr;
+  float                *maxs = (float *)maxsPtr;
+  trRefEntity_t        *entity = (trRefEntity_t *)entityPtr;
+  dpvsCellEntityLink_t *link;
+
+  if ( dpvs_cellEntityLinkCount == DPVS_MAX_CELL_ENTITY_LINKS )
+  {
+    ri.Printf(1, "^1Max xmodel refs (%i) exceeded\n", DPVS_MAX_CELL_ENTITY_LINKS);
+    return;
+  }
+
+  for ( link = cell->entityLinks; link; link = link->next )
+  {
+    if ( link->entity == entity )
+    {
+      ExpandBounds(mins, link->mins, maxs, link->maxs);
+      return;
+    }
+  }
+
+  link = &((dpvsCellEntityLink_t *)dpvs_cellEntityLinks)[dpvs_cellEntityLinkCount];
+  ++dpvs_cellEntityLinkCount;
+  link->entity = entity;
+  link->mins[0] = mins[0];
+  link->mins[1] = mins[1];
+  link->mins[2] = mins[2];
+  link->maxs[0] = maxs[0];
+  link->maxs[1] = maxs[1];
+  link->maxs[2] = maxs[2];
+  link->next = cell->entityLinks;
+  cell->entityLinks = link;
+}
+
+/* ---- R_FilterModelIntoCells_r  0x004E39D0 ----  VERIFIED
+ * Recurse the world BSP, linking the entity into every cell its box reaches.
+ * Returns the common terminal cell index, or the internal sentinel when
+ * branches disagree, or the no-cell sentinel for a box outside all cells. */
+int __cdecl R_FilterModelIntoCells_r(unsigned int *nodePtr, int entity, unsigned int *minsPtr, unsigned int *maxsPtr)
+{
+  mnode_t *node = (mnode_t *)nodePtr;
+  float   *mins = (float *)minsPtr;
+  float   *maxs = (float *)maxsPtr;
+  const cplane_t *plane;
+  int      side;
+  int      firstCell;
+  int      secondCell;
+  float    frontMins[3];
+  float    backMaxs[3];
+
+  /* retail re-reads node->plane (and its type) after every call */
+  while ( node->cellIndex == DPVS_NODE_INTERNAL )
+  {
+    side = BoxOnPlaneSide((int)mins, (int)maxs, (int)node->u.node.plane);
+    if ( side == 3 )
+    {
+      plane = node->u.node.plane;
+      if ( plane->type < 3 )
       {
-        v6 = (_DWORD *)tr_world;
-        v7 = *(_DWORD *)(tr_world + 288);
-        if ( outsideMapEnts->integer )
-        {
-          v16 = 0;
-          if ( v7 > 0 )
-          {
-            v8 = 0;
-            do
-            {
-              R_AddCellSurfaces(v8 + v6[73], (int)dpvs_frustumPlanes, 4, v2);
-              R_AddCellCullGroups(4, v2, v8 + *(_DWORD *)(tr_world + 292), (int)dpvs_frustumPlanes);
-              v6 = (_DWORD *)tr_world;
-              v8 += 64;
-              ++v16;
-            }
-            while ( v16 < *(_DWORD *)(tr_world + 288) );
-          }
-        }
+        frontMins[0] = mins[0];
+        frontMins[1] = mins[1];
+        frontMins[2] = mins[2];
+        frontMins[plane->type] = plane->dist;
+        backMaxs[0] = maxs[0];
+        backMaxs[1] = maxs[1];
+        backMaxs[2] = maxs[2];
+        backMaxs[plane->type] = plane->dist;
+
+        secondCell = firstCell = R_FilterModelIntoCells_r((unsigned int *)node->u.node.children[1], entity, minsPtr, (unsigned int *)backMaxs);
+        if ( frontMins[node->u.node.plane->type] < maxs[node->u.node.plane->type] )
+          firstCell = R_FilterModelIntoCells_r((unsigned int *)node->u.node.children[0], entity, (unsigned int *)frontMins, maxsPtr);
+      }
+      else
+      {
+        firstCell = R_FilterModelIntoCells_r((unsigned int *)node->u.node.children[0], entity, minsPtr, maxsPtr);
+        secondCell = R_FilterModelIntoCells_r((unsigned int *)node->u.node.children[1], entity, minsPtr, maxsPtr);
+      }
+      return firstCell == secondCell ? firstCell : DPVS_NODE_INTERNAL;
+    }
+    node = node->u.node.children[side - 1];
+  }
+
+  if ( node->cellIndex >= 0 )
+    R_AddModelToCell((int)&DPVS_WORLD_CELLS[node->cellIndex], (int)mins, (int)maxs, entity);
+  return node->cellIndex;
+}
+
+/* ---- R_XModelIsHuge  0x004E3B20 ----  VERIFIED
+ * True when at least two world-bounds dimensions exceed 1536 units.  This
+ * x-split (x: y || z, else y && z) form matches retail both out of line and
+ * where VC7 inlines it into R_FilterModelsIntoCells. */
+int __fastcall R_XModelIsHuge(int minsPtr, int maxsPtr)
+{
+  float *mins = (float *)minsPtr;
+  float *maxs = (float *)maxsPtr;
+
+  if ( maxs[0] - mins[0] > 1536.0f )
+  {
+    if ( maxs[1] - mins[1] > 1536.0f || maxs[2] - mins[2] > 1536.0f )
+      return 1;
+    return 0;
+  }
+  if ( maxs[1] - mins[1] > 1536.0f && maxs[2] - mins[2] > 1536.0f )
+    return 1;
+  return 0;
+}
+
+/* ---- R_FilterModelsIntoCells  0x004E3B70 ----  VERIFIED
+ * Per-view pass: clear each cell's entity list, then for each enabled brush /
+ * xmodel entity build its world bounds, reject it against the DPVS planes, and
+ * either leave it globally visible (huge / outside all cells) or link it into
+ * the cells it touches for per-cell culling. */
+void __cdecl R_FilterModelsIntoCells(int planesPtr, int planeCount)
+{
+  dpvsPlane_t *planes = (dpvsPlane_t *)planesPtr;
+  int          filterBrush = r_cullBModels->integer && r_drawBModels->integer;
+  int          filterX = r_cullXModels->integer && r_drawXModels->integer;
+  int          i;
+
+  for ( i = 0; i < DPVS_WORLD_CELL_COUNT; ++i )
+  {
+    DPVS_WORLD_CELLS[i].entityLinks = 0;
+  }
+  dpvs_cellEntityLinkCount = 0;
+
+  /* brush and xmodel entities each run their own inlined DPVS cull, as retail */
+  for ( i = 0; i < tr_refdef_num_entities; ++i )
+  {
+    /* no cached entity pointer: retail re-reads tr_refdef_entities for every access */
+#define entity ( &((trRefEntity_t *)tr_refdef_entities)[i] )
+    float          bounds[6];
+    float         *mins = bounds;
+    float         *maxs = bounds + 3;
+
+    entity->cullState = CULL_IN;
+    switch ( entity->e.reType )
+    {
+    case DPVS_RT_BRUSH_MODEL:
+      if ( !filterBrush )
+        break;
+      entity->cullState = CULL_OUT;
+      R_BModelWorldBounds(entity, mins, maxs);
+      if ( R_CullBoxDPVS((const vec3_t *)mins, planes, planeCount, 0) )
+        break;
+      if ( R_FilterModelIntoCells_r((unsigned int *)DPVS_WORLD_NODES, (int)entity, (unsigned int *)mins, (unsigned int *)maxs) == DPVS_NODE_NO_CELL )
+        entity->cullState = CULL_IN;
+      if ( r_showCullBModels->integer == DPVS_SHOWCULL_BOUNDS )
+        R_AddDebugBox( mins, maxs,modelBoundsDebugColor);
+      break;
+    case DPVS_RT_XMODEL:
+      if ( !filterX )
+        break;
+      entity->cullState = CULL_OUT;
+      R_XModelWorldBounds(mins, (int)entity, maxs);
+      if ( R_CullBoxDPVS((const vec3_t *)mins, planes, planeCount, 0) )
+        break;
+      if ( R_XModelIsHuge((int)mins, (int)maxs) )
+        entity->cullState = CULL_IN;
+      else if ( R_FilterModelIntoCells_r((unsigned int *)DPVS_WORLD_NODES, (int)entity, (unsigned int *)mins, (unsigned int *)maxs) == DPVS_NODE_NO_CELL )
+        entity->cullState = CULL_IN;
+      if ( r_showCullXModels->integer == DPVS_SHOWCULL_BOUNDS )
+        R_AddDebugBox( mins, maxs,modelBoundsDebugColor);
+      break;
+    }
+#undef entity
+  }
+}
+
+
+/* ---- R_AddCellSurfaces  0x004E4080 ----  VERIFIED
+ * Submit a cell's owned world geometry: descend its AABB tree when it has
+ * children, else submit its contiguous surface span; then cull the cell's
+ * linked entities. */
+void __cdecl R_AddCellSurfaces(int cellPtr, int planes, int planeCount, int dlightBits)
+{
+  dpvsCell_t *cell = (dpvsCell_t *)cellPtr;
+  int         i;
+
+  /* retail re-reads cell->aabbTree after every call */
+  dpvs_cullPlaneLimit = 0x7FFFFFFF;
+  if ( cell->aabbTree->childCount )
+  {
+    for ( i = 0; i < cell->aabbTree->childCount; ++i )
+      R_AddAABBTreeSurfaces_r(&cell->aabbTree->children[i], (dpvsPlane_t *)planes, planeCount, dlightBits, 0);
+  }
+  else
+  {
+    for ( i = 0; i < cell->aabbTree->surfaceCount; ++i )
+      R_AddTrianglesSurface(planeCount, &cell->aabbTree->surfaces[i], dlightBits, (dpvsPlane_t *)planes, 0);
+  }
+
+  if ( r_drawentities->integer )
+    R_CullModels(cellPtr, planes, planeCount);
+}
+
+/* ---- R_AddCullGroupDPVS  0x004E4120 ----  VERIFIED
+ * Cull one cull group's bounds; if visible, stamp it and submit its surfaces
+ * (retail counts the surfaces down to zero, dec/jne at 0x4E42A0). */
+void __cdecl R_AddCullGroupDPVS(dpvsCullGroup_t *group, dpvsPlane_t *planes, int planeCount, int dlightBits)
+{
+  msurface_t *surf;
+  int         count;
+
+  if ( R_CullBoxDPVS((const vec3_t *)&group->mins, planes, planeCount, 0) )
+    return;
+
+  if ( (r_showportals->integer & 1) != 0 )
+    R_AddDebugBox( group->mins, group->maxs,cullGroupDebugColor);
+
+  group->viewCount = tr_viewCount;
+  for ( surf = group->surfaces, count = group->surfaceCount; count; --count, ++surf )
+    R_AddWorldSurfaceNoCull(dlightBits, surf);
+}
+
+/* ---- R_AddStaticModelDPVS  0x004E42B0 ----  VERIFIED
+ * Cull a static model's bounds; if visible, stamp it and add it to the scene.
+ * The caller also passes its dlight bits, which retail never reads. */
+void __cdecl R_AddStaticModelDPVS(int planes, int planeCount, int modelPtr, int dlightBits)
+{
+  dpvsStaticModel_t *model = (dpvsStaticModel_t *)modelPtr;
+
+  if ( R_CullBoxDPVS((const vec3_t *)&model->mins, (dpvsPlane_t *)planes, planeCount, 0) )
+    return;
+
+  if ( r_showCullSModels->integer )
+    R_AddDebugBox( model->mins, model->maxs,staticModelDebugColor);
+
+  model->viewCount = tr_viewCount;
+  RE_AddRefEntityToScene(&model->e, model);
+}
+
+/* ---- R_AddCellCullGroups  0x004E4440 ----  VERIFIED
+ * Submit the cell's cull groups and (when enabled) its linked static models,
+ * each stamped so it is added at most once per view.  Retail counts the
+ * cull groups down to zero (dec/jne at 0x4E4480). */
+void __cdecl R_AddCellCullGroups(int cellPtr, int planes, int planeCount, int dlightBits)
+{
+  dpvsCell_t          *cell = (dpvsCell_t *)cellPtr;
+  dpvsCullGroup_t    **groups;
+  dpvsCellModelLink_t *link;
+  int                  count;
+
+  for ( count = cell->cullGroupCount, groups = cell->cullGroups; count; --count, ++groups )
+  {
+    if ( (*groups)->viewCount != tr_viewCount )
+      R_AddCullGroupDPVS(*groups, (dpvsPlane_t *)planes, planeCount, dlightBits);
+  }
+
+  if ( r_drawSModels->integer )
+  {
+    for ( link = cell->modelLinks; link; link = link->next )
+    {
+      dpvsStaticModel_t *model = (dpvsStaticModel_t *)link->model;
+      if ( model->viewCount != tr_viewCount )
+        R_AddStaticModelDPVS(planes, planeCount, (int)model, dlightBits);
+    }
+  }
+}
+
+/* ---- R_RecursivePortalWalk  0x004E44D0 ----  VERIFIED
+ * Install this cell's occluders and submit its geometry, then flood through
+ * each outgoing portal that faces the camera, is not clipped away, and is not
+ * occluded.  The per-portal recursion flag prevents cycles. */
+void __cdecl R_RecursivePortalWalk(int cellPtr, int sourcePortal, float *planes, int planeCount, int dlightBits)
+{
+  dpvsCell_t   *cell = (dpvsCell_t *)cellPtr;
+  dpvsPortal_t *portal;
+  int           portalCount;
+  float        *clippedPlanes;
+  int           clippedCount;
+  int           occluded;
+  int           o;
+
+  R_AddCellOccluders(cellPtr, planes, planeCount);
+  R_AddCellSurfaces(cellPtr, (int)planes, planeCount, dlightBits);
+  R_AddCellCullGroups(cellPtr, (int)planes, planeCount, dlightBits);
+
+  portal = cell->portals;
+  for ( portalCount = cell->portalCount; portalCount; --portalCount, ++portal )
+  {
+    if ( portal->recursionActive )
+      continue;
+
+    /* retail compares the unrounded x87 sum (0x4E452B-0x4E4549) */
+    if ( *(float *)&dpvs_viewOrigin*portal->plane.normal[0]
+       + ( *(float *)&dpvs_viewOriginY*portal->plane.normal[1]
+         + *(float *)&dpvs_viewOriginZ*portal->plane.normal[2] ) > portal->plane.distance )
+      continue;
+
+    if ( R_PortalBehindAnyPlane((int)portal, planes, planeCount) )
+      continue;
+
+    occluded = 0;
+    for ( o = 0; o < dpvs_occluderCount; ++o )
+    {
+      dpvsOccluder_t *occ = ((dpvsOccluder_t **)dpvs_occluders)[o];
+      if ( R_PortalBehindAllPlanes((int)portal, (float *)occ->activePlanes, occ->activePlaneCount) )
+      {
+        occluded = 1;
+        break;
+      }
+    }
+    if ( occluded )
+      continue;
+
+    clippedPlanes = (float *)R_PortalClipPlanes(planeCount, &clippedCount, portal, sourcePortal, (char *)planes);
+    if ( clippedCount )
+    {
+      portal->recursionActive = 1;
+      R_RecursivePortalWalk((int)portal->cell, (int)portal, clippedPlanes, clippedCount, dlightBits);
+      ri.Hunk_FreeTempMemory((int)clippedPlanes);
+      portal->recursionActive = 0;
+    }
+  }
+}
+
+/* ---- R_SetupDPVS  0x004E4610 ----  VERIFIED
+ * Rebuild the DPVS planes for the current view (unless the PVS is locked after
+ * the first setup).  The near plane sits 0.1 units behind the view origin, or
+ * is the portal plane for mirror views; a positive far distance adds the
+ * opposing far plane. */
+void R_SetupDPVS()
+{
+  rfloat farDist;
+
+  if ( !dpvs_initialSetup && r_lockpvs->integer )
+    return;
+
+  dpvs_initialSetup = 0;
+  R_FrustumClipPlanes();
+
+  *(float *)&dpvs_viewOrigin = tr_viewParms_originX;
+  *(float *)&dpvs_viewOriginY = tr_viewParms_originY;
+  *(float *)&dpvs_viewOriginZ = tr_viewParms_originZ;
+
+  dpvs_nearPlaneNormalZ = tr_viewParms_axis02;
+  dpvs_nearPlane = tr_viewParms_axis00;
+  dpvs_nearPlaneNormalY = tr_viewParms_axis01;
+#ifdef COD1_VC7
+  dpvs_nearPlaneDistance = dpvs_nearPlaneRec.normal[2] * tr_viewParms_originZ
+              + dpvs_nearPlaneRec.normal[1] * tr_viewParms_originY
+              + dpvs_nearPlaneRec.normal[0] * tr_viewParms_originX
+              - 0.1f;
+  R_SetPlaneSidesDPVS((int)&dpvs_nearPlaneRec);
+#else
+  dpvs_nearPlaneSideOffsetX = tr_viewParms_axis00 <= 0 ? 0 : 0xC;
+  dpvs_nearPlaneSideOffsetY = tr_viewParms_axis01 <= 0 ? 4 : 16;
+  dpvs_nearPlaneSideOffsetZ = tr_viewParms_axis02 <= 0 ? 8 : 20;
+  dpvs_nearPlaneDistance = *(float *)&tr_viewParms_axis02 * tr_viewParms_originZ
+              + *(float *)&tr_viewParms_axis01 * tr_viewParms_originY
+              + *(float *)&tr_viewParms_axis00 * tr_viewParms_originX
+              - (double)0.1f              /* retail fsub flt_568FAC (float 0.1) */
+              - (double)DPVS_PLANE_BIAS;  /* retail fsub flt_568E6C (float 0.001) */
+#endif
+
+  dpvs_activeNearPlane = (int)&tr_viewParms_portalPlane;
+  if ( !tr_viewParms_isMirror )
+    dpvs_activeNearPlane = (int)&dpvs_nearPlane;
+
+  /* retail: fcom 0.0f / test ah,41h / jne no-far-plane (0x4E470F-0x4E471A),
+   * so an unordered distance also leaves the far plane off */
+  farDist = RE_GetFarPlaneDist();
+  if ( farDist > 0.0f )
+  {
+    dpvs_activeFarPlane = (int)&dpvs_farPlane;
+    dpvs_farPlane = *(float *)&tr_viewParms_axis00 * -1.0f;
+    dpvs_farPlaneNormalY = *(float *)&tr_viewParms_axis01 * -1.0f;
+    dpvs_farPlaneNormalZ = *(float *)&tr_viewParms_axis02 * -1.0f;
+#ifdef COD1_VC7
+    dpvs_farPlaneDistance = dpvs_farPlaneNormalZ * tr_viewParms_originZ
+                + dpvs_farPlaneNormalY * tr_viewParms_originY
+                + dpvs_farPlane * tr_viewParms_originX
+                - farDist;
+    R_SetPlaneSidesDPVS((int)&dpvs_farPlaneRec);
+#else
+    dpvs_farPlaneSideOffsetX = *(int *)&dpvs_farPlane <= 0 ? 0 : 0xC;
+    dpvs_farPlaneSideOffsetY = *(int *)&dpvs_farPlaneNormalY <= 0 ? 4 : 16;
+    dpvs_farPlaneSideOffsetZ = *(int *)&dpvs_farPlaneNormalZ <= 0 ? 8 : 20;
+    dpvs_farPlaneDistance = dpvs_farPlaneNormalZ * tr_viewParms_originZ
+                + dpvs_farPlaneNormalY * tr_viewParms_originY
+                + dpvs_farPlane * tr_viewParms_originX
+                - farDist
+                - (double)DPVS_PLANE_BIAS;  /* retail fsub flt_568E6C (float 0.001) */
+#endif
+  }
+  else
+  {
+    dpvs_activeFarPlane = 0;
+  }
+
+  if ( r_portalbevels->value > 0.0f )
+    R_SetupTransformMatrix();
+}
+
+/* sprite refEntity built for each corona (overlays refEntity_t's first 0xa0
+ * bytes; only the fields the corona sets are named). */
+typedef struct {
+  int   reType;              /* +0x00  RT_SPRITE */
+  int   renderfx;            /* +0x04 */
+  int   hModel;              /* +0x08 */
+  float lightingOrigin[3];   /* +0x0c */
+  float shadowPlane;         /* +0x18 */
+  float axis[3][3];          /* +0x1c */
+  int   nonNormalizedAxes;   /* +0x40 */
+  float origin[3];           /* +0x44 */
+  int   frame;               /* +0x50 */
+  float oldorigin[3];        /* +0x54 */
+  int   oldframe;            /* +0x60 */
+  float radius2;             /* +0x64  sprite vertical radius = scale */
+  int   customShader;        /* +0x68  corona shader index */
+  byte  shaderRGBA[4];       /* +0x6c */
+  float shaderTexCoord[2];   /* +0x70 */
+  float shaderTime;          /* +0x78 */
+  float radius;              /* +0x7c  sprite radius = scale */
+  float rotation;            /* +0x80 */
+  float fireRiseDir[3];      /* +0x84 */
+  void *dobj;                /* +0x90 */
+  void *owner;               /* +0x94 */
+  void *staticModel;         /* +0x98 */
+} dpvsCoronaEntity_t;
+ASSERT_OFF(dpvsCoronaEntity_t, origin, 0x44);
+ASSERT_OFF(dpvsCoronaEntity_t, radius2, 0x64);
+ASSERT_OFF(dpvsCoronaEntity_t, customShader, 0x68);
+ASSERT_OFF(dpvsCoronaEntity_t, shaderRGBA, 0x6c);
+ASSERT_OFF(dpvsCoronaEntity_t, radius, 0x7c);
+COD1_ASSERT_SIZE(dpvsCoronaEntity_t, 0x9c);
+
+/* ---- R_AddCoronas  0x004E4800 ----  [HIGH]
+ * Turn each authored corona into a camera-facing sprite (shifted 16 units
+ * toward the camera) whose conservative sqrt(3) cube passes the DPVS box test;
+ * the optional vertical fade is applied to its alpha.  Every field is read
+ * through tr.world->coronas[i] (CORONA), with no cached element pointer:
+ * retail recomputes the element address after the inlined box cull. */
+#define CORONA ((*(dpvsCorona_t **)(tr_world + 192))[i])
+void __cdecl R_AddCoronas(int planesPtr, int planeCount)
+{
+  dpvsPlane_t       *planes = (dpvsPlane_t *)planesPtr;
+  dpvsCoronaEntity_t entity;
+  int                i;
+
+  memset(&entity, 0, 0x9c);
+  entity.reType = 4;
+
+  for ( i = 0; i < (*(int *)(tr_world + 196)); ++i )
+  {
+    float         viewDir[3];
+    float         bounds[6];
+
+    viewDir[0] = (*(float *)(((char *)(void *)&tr_registered) + 0x0910)) - CORONA.origin[0];
+    viewDir[1] = (*(float *)(((char *)(void *)&tr_registered) + 0x0914)) - CORONA.origin[1];
+    viewDir[2] = (*(float *)(((char *)(void *)&tr_registered) + 0x0918)) - CORONA.origin[2];
+    VectorNormalize(viewDir);
+
+    if ( !(viewDir[2] >= CORONA.zCutoff) )
+    {
+      float scaledRadius = CORONA.scale * 1.7320508f;
+
+      bounds[0] = CORONA.origin[0] - scaledRadius;
+      bounds[1] = CORONA.origin[1] - scaledRadius;
+      bounds[2] = CORONA.origin[2] - scaledRadius;
+      bounds[3] = CORONA.origin[0] + scaledRadius;
+      bounds[4] = CORONA.origin[1] + scaledRadius;
+      bounds[5] = CORONA.origin[2] + scaledRadius;
+
+      if ( !R_CullBoxDPVS((const vec3_t *)bounds, planes, planeCount, 0) )
+      {
+        entity.customShader = CORONA.shader->index;
+        entity.origin[0] = viewDir[0]*16.0f + CORONA.origin[0];
+        entity.origin[1] = viewDir[1]*16.0f + CORONA.origin[1];
+        entity.origin[2] = viewDir[2]*16.0f + CORONA.origin[2];
+        entity.shaderRGBA[0] = CORONA.color[0];
+        entity.shaderRGBA[1] = CORONA.color[1];
+        entity.shaderRGBA[2] = CORONA.color[2];
+        entity.radius2 = entity.radius = CORONA.scale;
+
+        if ( viewDir[2] > CORONA.zFadeOut )
+          entity.shaderRGBA[3] = (byte)(int)(CORONA.color[3] * (CORONA.zCutoff - viewDir[2]) / (CORONA.zCutoff - CORONA.zFadeOut));
         else
+          entity.shaderRGBA[3] = CORONA.color[3];
+
+        RE_AddRefEntityToScene(&entity, 0);
+      }
+    }
+  }
+}
+#undef CORONA
+
+/* ---- R_AddSkySurfacesDPVS  0x004E4B70 ----  [HIGH]
+ * Select sky surfaces behind the far plane, disable the far plane, and submit
+ * them so their ordinary DPVS test cannot reject them for distance. */
+void R_AddSkySurfacesDPVS()
+{
+  dpvsPlane_t *farPlane = (dpvsPlane_t *)dpvs_activeFarPlane;
+  int          i;
+
+  if ( farPlane )
+  {
+    dpvs_activeFarPlane = 0;
+    for ( i = 0; i < DPVS_WORLD_SKYSURF_COUNT; ++i )
+    {
+      msurface_t *surf = DPVS_WORLD_SKYSURFS[i];
+      if ( surf->viewCount != tr_viewCount )
+      {
+        srfLit_t *data = (srfLit_t *)surf->data;
+        if ( R_BoxBehindPlane((const vec3_t *)&data->boundsMin, farPlane) )
+          R_AddTrianglesSurface(4, surf, 0, dpvs_frustumPlanesTyped, 0);
+      }
+    }
+  }
+}
+
+/* ---- R_AddWorldSurfacesDPVS  0x004E4C10 ----  VERIFIED
+ * DPVS entry point.  Points the occluder / active-plane / entity-link banks at
+ * frame-local scratch, filters entities and coronas into cells, then either
+ * portal-walks from the camera cell or, when the camera is outside the BSP,
+ * submits every cell by the two outsideMapEnts modes. */
+void R_AddWorldSurfacesDPVS()
+{
+  dpvsOccluder_t *occluderBank[1024];       
+  dpvsPlane_t activePlaneBank[6144];   
+  dpvsCellEntityLink_t entityLinkBank[4096];    
+
+  if ( !r_drawworld->integer )
+    return;
+  if ( ((*(int *)(((char *)(void *)&tr_registered) + 0x0944)) & 1) != 0 )   
+    return;
+
+  dpvsGlob.occluders = (int)&occluderBank;
+  dpvs_activePlanes = (int)&activePlaneBank;
+  dpvsGlob.cellEntityLinks = (int)&entityLinkBank;
+  dpvsGlob.occluderCount = 0;
+  tr_currentEntityNumber = 1022;
+  tr_shiftedEntityNumber = 1022 << 8;
+
+  {
+    int dlightBits = (1 << (*(int *)(((char *)(void *)&tr_registered) + 0x0A54))) - 1;
+    int cameraCell;
+    int i;
+
+    R_SetupDPVS();
+    R_FilterModelsIntoCells((int)dpvs_frustumPlanes, 4);
+    R_AddCoronas((int)dpvs_frustumPlanes, 4);
+
+    cameraCell = R_CellForCamera();
+    if ( cameraCell >= 0 )
+    {
+      dpvsCell_t *cell = &(*(dpvsCell_t **)(tr_world + 292))[cameraCell];
+      if ( r_singlecell->integer )
+      {
+        dpvs_activeFarPlane = 0;
+        R_AddCellSurfaces((int)cell, (int)dpvs_frustumPlanes, 4, dlightBits);
+        R_AddCellCullGroups((int)cell, (int)dpvs_frustumPlanes, 4, dlightBits);
+      }
+      else
+      {
+        R_RecursivePortalWalk((int)cell, (int)&(*(int *)&dpvs_nearPlaneRec.normal[0]), (float *)dpvs_frustumPlanes, 4, dlightBits);
+      }
+    }
+    else
+    {
+      if ( outsideMapEnts->integer )
+      {
+        for ( i = 0; i < (*(int *)(tr_world + 288)); ++i )
         {
-          if ( v7 > 0 )
-          {
-            v9 = 0;
-            do
-            {
-              R_AddCellSurfaces(v9 + v6[73], (int)dpvs_frustumPlanes, 4, v2);
-              v6 = (_DWORD *)tr_world;
-              ++v1;
-              v9 += 64;
-            }
-            while ( v1 < *(_DWORD *)(tr_world + 288) );
-            v1 = 0;
-          }
-          v10 = 0;
-          if ( (int)v6[81] > 0 )
-          {
-            do
-            {
-              R_AddCullGroupDPVS(4, v1 + v6[82], (int)dpvs_frustumPlanes, v2);
-              v6 = (_DWORD *)tr_world;
-              ++v10;
-              v1 += 36;
-            }
-            while ( v10 < *(_DWORD *)(tr_world + 324) );
-          }
+          R_AddCellSurfaces((int)&(*(dpvsCell_t **)(tr_world + 292))[i], (int)dpvs_frustumPlanes, 4, dlightBits);
+          R_AddCellCullGroups((int)&(*(dpvsCell_t **)(tr_world + 292))[i], (int)dpvs_frustumPlanes, 4, dlightBits);
         }
       }
       else
       {
-        v4 = *(_DWORD *)(tr_world + 292) + (v3 << 6);
-        v5 = v4;
-        if ( r_singlecell->integer )
-        {
-          dpvs_activeFarPlane = 0;
-          R_AddCellSurfaces(v4, (int)dpvs_frustumPlanes, 4, v2);
-          R_AddCellCullGroups(4, v2, v5, (int)dpvs_frustumPlanes);
-        }
-        else
-        {
-          R_RecursivePortalWalk(v4, (int)&dpvs_nearPlane, (float *)dpvs_frustumPlanes, 4, v2);
-        }
+        for ( i = 0; i < (*(int *)(tr_world + 288)); ++i )
+          R_AddCellSurfaces((int)&(*(dpvsCell_t **)(tr_world + 292))[i], (int)dpvs_frustumPlanes, 4, dlightBits);
+        for ( i = 0; i < (*(int *)(tr_world + 324)); ++i )
+          R_AddCullGroupDPVS(&(*(dpvsCullGroup_t **)(tr_world + 328))[i], ((dpvsPlane_t *)(void *)dpvs_frustumPlanes), 4, dlightBits);
       }
-      R_AddSkySurfacesDPVS();
-      result = r_showCullXModels;
-      if ( r_showCullXModels->integer == 2 || r_showCullBModels->integer == 2 )
+    }
+
+    R_AddSkySurfacesDPVS();
+
+    if ( r_showCullXModels->integer == 2
+      || r_showCullBModels->integer == 2 )
+    {
+      for ( i = 0; i < (*(int *)(tr_world + 288)); ++i )
       {
-        result = (cvar_t *)tr_world;
-        v11 = 0;
-        if ( *(int *)(tr_world + 288) > 0 )
+        dpvsCellEntityLink_t *link;
+        for ( link = (*(dpvsCell_t **)(tr_world + 292))[i].entityLinks; link; link = link->next )
         {
-          v12 = 0;
-          do
-          {
-            v13 = *(float **)(*(int *)(tr_world + 292) + v12 + 60);
-            if ( v13 )
-            {
-              do
-              {
-                v14 = **(_DWORD **)v13;
-                if ( (v14 != 1 || r_showCullXModels->integer == 2) && (v14 || r_showCullBModels->integer == 2) )
-                {
-                  v15 = dword_541840;
-                  if ( *(_DWORD *)(*(_DWORD *)v13 + 692) )
-                    v15 = dword_541830;
-                  R_AddDebugBox(v15, v13 + 4, v13 + 1);
-                }
-                v13 = (float *)*((_DWORD *)v13 + 7);
-              }
-              while ( v13 );
-              result = (cvar_t *)tr_world;
-            }
-            ++v11;
-            v12 += 64;
-          }
-          while ( v11 < *(int *)(tr_world + 288) );
+          if ( (link->entity->e.reType != 1 || r_showCullXModels->integer == 2)
+            && (link->entity->e.reType != 0 || r_showCullBModels->integer == 2) )
+            R_AddDebugBox( link->mins, link->maxs, link->entity->cullState == CULL_IN ? colorDebugGreen : colorDebugRed );
         }
       }
     }
   }
-  return result;
 }
 
-
 /* ---- RE_SetFarPlaneDist  0x004E4EB0 ----  VERIFIED */
-void __cdecl RE_SetFarPlaneDist(float a1)
+void __cdecl RE_SetFarPlaneDist(float dist)
 {
-  if ( !(a1 <= 0.0) )
-    dpvs_cullDist = a1;
+  if ( dist <= 0.0f )
+    dpvs_cullDist = 0.0f;
   else
-    dpvs_cullDist = 0.0;
+    dpvs_cullDist = dist;
 }
 
 

@@ -1,33 +1,10 @@
 /*
- * ui_main_mp.c -- user interface main.
- *
- * ui_mp_x86.dll (CoD 1.1, imagebase 0x40000000), unit ui/ui_main.c:
- * 0x400076A0 .. 0x4000ED76, 110 functions in address order.  RTCW's
- * ui/ui_main.c is the ancestor text; every function that descends from it is
- * that text, adjusted where the binary says so.  What CoD changed, in short:
- *
- *   - Text_Paint/Text_Width and the rest of RTCW's font code are gone from
- *     this unit; the renderer draws text (trap_R_Text_Paint) and every owner
- *     draw carries a `font` beside `scale`, exactly as ui_shared.h's
- *     ownerDrawItem slot does.  UI_GetFontInfo picks the fontInfo_t.
- *   - Every trap_R_RegisterShaderNoMip / trap_R_RegisterFont call carries an
- *     imageTrack; UI_ParseMenu, Asset_Parse, Load_Menu, Load_ScriptMenu and
- *     UI_LoadMenus pass it down, _UI_Init and UI_Load hand in the literal 2.
- *   - Menus load per language: Load_Menu/Load_ScriptMenu try
- *     <dir><language>/<file> first (trap_GetLanguagename), then the plain path.
- *   - Game types come from maps/mp/gametypes/*.gsc (UI_GetGameTypesList),
- *     not gameinfo.txt; gtEnum is the display name read from the matching
- *     .txt, a string.
- *   - Strings are localized through UI_SafeTranslateString / the SE_ traps;
- *     the EXE_* references are the retail ones.
- *   - The bot, skirmish, team-arena, savegame, limbo and PunkBuster code of
- *     RTCW is absent.
- *
- * Global names are RTCW's where the symbol survived; unnamed cells are
- * resolved to uiInfo members through the offsets in ui_local.h.
- *
- * @fidelity: likely
- */
+=======================================================================
+
+USER INTERFACE MAIN
+
+=======================================================================
+*/
 
 #include <string.h>
 #include <stdio.h>
@@ -37,11 +14,7 @@
 
 #include "ui_local.h"
 
-/*
- * menudef.h in the original tree.  Only the ids this unit dispatches on;
- * the values are RTCW's (UI_OwnerDraw's switch 0x400094E7, UI_FeederCount's
- * compares 0x4000C5B0).
- */
+// owner draw ids, feeders and display flags from menudef.h
 #define UI_HANDICAP                 200
 #define UI_GAMETYPE                 205
 #define UI_MAPPREVIEW               206
@@ -83,7 +56,13 @@
 #define ITEM_TEXTSTYLE_SHADOWED     3
 #define ITEM_TEXTSTYLE_SHADOWEDMORE 6
 
-/* ui_shared.h's asset paths, CoD's "ui/assets" (AssetCache 0x400077F0). */
+// menu font indexes
+#define UI_FONT_DEFAULT             0
+#define UI_FONT_BIG                 2
+#define UI_FONT_SMALL               3
+#define UI_FONT_BOLD                4
+#define UI_FONT_CONSOLE             5
+
 #define ASSET_GRADIENTBAR           "ui/assets/gradientbar2.tga"
 #define ASSET_SCROLLBAR             "ui/assets/scrollbar.tga"
 #define ASSET_SCROLLBAR_ARROWDOWN   "ui/assets/scrollbar_arrow_dwn_a.tga"
@@ -94,7 +73,6 @@
 #define ASSET_SLIDER_BAR            "ui/assets/slider2.tga"
 #define ASSET_SLIDER_THUMB          "ui/assets/sliderbutt_1.tga"
 
-/* q_shared.h's; universal/q_shared.h does not carry them. */
 #define SCREEN_WIDTH                640
 #define SCREEN_HEIGHT               480
 #define MAX_INFO_VALUE              1024
@@ -107,25 +85,16 @@
 #define CIN_loop                    2
 #define CIN_silent                  8
 
-/* CoD's Com_Error level for a missing localized string (0x4000EC54);
-   above q_shared.h's errorParm_t. */
+// error level for a missing localized string
 #define ERR_LOCALIZATION            7
-
-/*
- * ui_shared.h keeps the DC's glconfig as an opaque 160-byte range, but this
- * unit fills it (_UI_Init 0x4000D331) and reads it (UI_DrawGLInfo
- * 0x400091EA); the layout is ui_public.h's glconfig_t.
- */
-#define UI_GLCONFIG                 ( *(glconfig_t *)uiInfo.uiDC.glconfig )
 
 typedef struct {
 	const char *description;
 	const char *basedir;
 } serverFilter_t;
 
-uiInfo_t uiInfo;                                    /* 0x401C3CE0 */
+uiInfo_t uiInfo;
 
-/* 0x40036AA8: the twelve EXE_MONTH_ABV_* references UI_StartServerRefresh translates */
 static const char *MonthAbbrev[] = {
 	"EXE_MONTH_ABV_JANUARY", "EXE_MONTH_ABV_FEBRUARY", "EXE_MONTH_ABV_MARCH",
 	"EXE_MONTH_ABV_APRIL", "EXE_MONTH_ABV_MAY", "EXE_MONTH_ABV_JUN",
@@ -133,20 +102,167 @@ static const char *MonthAbbrev[] = {
 	"EXE_MONTH_ABV_OCTOBER", "EXE_MONTH_ABV_NOVEMBER", "EXE_MONTH_ABV_DECEMBER"
 };
 
-/* 0x40036AD8 */
+// keep: the NULL is reachable through ui_netSource 3, but is not counted
 static const char *netSources[] = {
 	"EXE_LOCAL",
 	"EXE_INTERNET",
-	"EXE_FAVORITES"
+	"EXE_FAVORITES",
+	NULL
 };
-static const int numNetSources = sizeof( netSources ) / sizeof( const char* );
+static const int numNetSources = sizeof( netSources ) / sizeof( const char* ) - 1;
 
-/* 0x4002D700 */
+// keep: one filter, though the clamps let index 1 through
 static const serverFilter_t serverFilters[] = {
 	{"EXE_ALL", "" }
 };
 
 static const int numServerFilters = sizeof( serverFilters ) / sizeof( serverFilter_t );
+
+// keep: definition order matches the original data layout
+vmCvar_t ui_arenasFile;
+vmCvar_t ui_allowVote;
+vmCvar_t ui_brass;
+vmCvar_t ui_marks;
+
+vmCvar_t ui_server1;
+vmCvar_t ui_server2;
+vmCvar_t ui_server3;
+vmCvar_t ui_server4;
+vmCvar_t ui_server5;
+vmCvar_t ui_server6;
+vmCvar_t ui_server7;
+vmCvar_t ui_server8;
+vmCvar_t ui_server9;
+vmCvar_t ui_server10;
+vmCvar_t ui_server11;
+vmCvar_t ui_server12;
+vmCvar_t ui_server13;
+vmCvar_t ui_server14;
+vmCvar_t ui_server15;
+vmCvar_t ui_server16;
+
+vmCvar_t ui_dedicated;
+vmCvar_t ui_smallFont;
+vmCvar_t ui_bigFont;
+vmCvar_t ui_extraBigFont;
+vmCvar_t ui_cdkeychecked;
+
+vmCvar_t ui_selectedPlayer;
+vmCvar_t ui_netSource;
+vmCvar_t ui_menuFiles;
+vmCvar_t ui_gameType;
+vmCvar_t ui_joinGameType;
+vmCvar_t ui_netGameType;
+vmCvar_t ui_netGameTypeName;
+
+vmCvar_t ui_newScriptMenu;
+vmCvar_t ui_newScriptMenuIndex;
+vmCvar_t ui_scriptMenu;
+vmCvar_t ui_scriptMenuIndex;
+vmCvar_t ui_scriptMenuAllowResponse;
+vmCvar_t ui_waitingScriptMenu;
+vmCvar_t ui_waitingScriptMenuIndex;
+vmCvar_t ui_waitingScriptMenuNoMouse;
+
+// NERVE - SMF - cvars for multiplayer
+vmCvar_t ui_mapIndex;
+vmCvar_t ui_currentMap;
+vmCvar_t ui_currentNetMap;
+
+vmCvar_t ui_browserMaster;
+vmCvar_t ui_browserGameType;
+vmCvar_t ui_browserSortKey;
+vmCvar_t ui_browserShowFull;
+vmCvar_t ui_browserShowEmpty;
+vmCvar_t ui_browserShowPassword;
+vmCvar_t ui_browserShowNoPassword;
+
+vmCvar_t ui_serverStatusTimeOut;
+
+vmCvar_t ui_cmd;
+
+vmCvar_t ui_isSpectator;
+// -NERVE - SMF
+
+vmCvar_t ui_hudAlpha;
+
+vmCvar_t ui_languagewarnings;
+vmCvar_t ui_languagewarningsaserrors;
+
+cvarTable_t cvarTable[] = {
+	{ &ui_arenasFile, "g_arenasFile", "", CVAR_INIT | CVAR_ROM },
+
+	{ &ui_allowVote, "g_allowvote", "1", CVAR_ARCHIVE },
+
+	{ &ui_brass, "cg_brass", "1", CVAR_ARCHIVE },
+	{ &ui_marks, "cg_marks", "1", CVAR_ARCHIVE },
+
+	{ &ui_server1, "server1", "", CVAR_ARCHIVE },
+	{ &ui_server2, "server2", "", CVAR_ARCHIVE },
+	{ &ui_server3, "server3", "", CVAR_ARCHIVE },
+	{ &ui_server4, "server4", "", CVAR_ARCHIVE },
+	{ &ui_server5, "server5", "", CVAR_ARCHIVE },
+	{ &ui_server6, "server6", "", CVAR_ARCHIVE },
+	{ &ui_server7, "server7", "", CVAR_ARCHIVE },
+	{ &ui_server8, "server8", "", CVAR_ARCHIVE },
+	{ &ui_server9, "server9", "", CVAR_ARCHIVE },
+	{ &ui_server10, "server10", "", CVAR_ARCHIVE },
+	{ &ui_server11, "server11", "", CVAR_ARCHIVE },
+	{ &ui_server12, "server12", "", CVAR_ARCHIVE },
+	{ &ui_server13, "server13", "", CVAR_ARCHIVE },
+	{ &ui_server14, "server14", "", CVAR_ARCHIVE },
+	{ &ui_server15, "server15", "", CVAR_ARCHIVE },
+	{ &ui_server16, "server16", "", CVAR_ARCHIVE },
+
+	{ &ui_dedicated, "ui_dedicated", "0", CVAR_ARCHIVE },
+	{ &ui_smallFont, "ui_smallFont", "0.25", CVAR_ARCHIVE},
+	{ &ui_bigFont, "ui_bigFont", "0.4", CVAR_ARCHIVE},
+	{ &ui_extraBigFont, "ui_extraBigFont", "0.55", CVAR_ARCHIVE},
+	{ &ui_cdkeychecked, "ui_cdkeychecked", "0", CVAR_ROM },
+	{ &ui_selectedPlayer, "cg_selectedPlayer", "0", CVAR_ARCHIVE},
+	{ &ui_netSource, "ui_netSource", "0", CVAR_ARCHIVE },
+	{ &ui_menuFiles, "ui_menuFiles", "ui_mp/menus.txt", 0 },
+	{ &ui_gameType, "ui_gametype", "3", CVAR_ARCHIVE },
+	{ &ui_joinGameType, "ui_joinGametype", "0", CVAR_ARCHIVE },
+	{ &ui_netGameType, "ui_netGametype", "0", CVAR_ARCHIVE },                 // NERVE - SMF - hardwired for now
+	{ &ui_netGameTypeName, "ui_netGametypeName", "", CVAR_ARCHIVE },
+
+	{ &ui_newScriptMenu, "ui_newScriptMenu", "", CVAR_ROM },
+	{ &ui_newScriptMenuIndex, "ui_newScriptMenuIndex", "-1", CVAR_ROM },
+	{ &ui_scriptMenu, "ui_scriptMenu", "", CVAR_ROM },
+	{ &ui_scriptMenuIndex, "ui_scriptMenuIndex", "-1", CVAR_ROM },
+	{ &ui_scriptMenuAllowResponse, "ui_scriptMenuAllowResponse", "1", CVAR_ROM },
+	{ &ui_waitingScriptMenu, "ui_waitingScriptMenu", "", CVAR_ROM },
+	{ &ui_waitingScriptMenuIndex, "ui_waitingScriptMenuIndex", "-1", CVAR_ROM },
+	{ &ui_waitingScriptMenuNoMouse, "ui_waitingScriptMenuNoMouse", "0", CVAR_ROM },
+
+	// NERVE - SMF - multiplayer cvars
+	{ &ui_mapIndex, "ui_mapIndex", "0", CVAR_ARCHIVE },
+	{ &ui_currentMap, "ui_currentMap", "0", CVAR_ARCHIVE },
+	{ &ui_currentNetMap, "ui_currentNetMap", "0", CVAR_ARCHIVE },
+
+	{ &ui_browserMaster, "ui_browserMaster", "0", CVAR_ARCHIVE },
+	{ &ui_browserGameType, "ui_browserGameType", "0", CVAR_ARCHIVE },
+	{ &ui_browserSortKey, "ui_browserSortKey", "4", CVAR_ARCHIVE },
+	{ &ui_browserShowFull, "ui_browserShowFull", "1", CVAR_ARCHIVE },
+	{ &ui_browserShowEmpty, "ui_browserShowEmpty", "1", CVAR_ARCHIVE },
+	{ &ui_browserShowPassword, "ui_browserShowPassword", "1", CVAR_ARCHIVE },
+	{ &ui_browserShowNoPassword, "ui_browserShowNoPassword", "1", CVAR_ARCHIVE },
+
+	{ &ui_serverStatusTimeOut, "ui_serverStatusTimeOut", "7000", CVAR_ARCHIVE},
+
+	{ &ui_cmd, "ui_cmd", "", 0 },
+
+	{ &ui_isSpectator, "ui_isSpectator", "1", 0 },
+	// -NERVE - SMF
+
+	{ &ui_hudAlpha, "cg_hudAlpha", "1.0", CVAR_ARCHIVE },
+
+	{ &ui_languagewarnings, "cl_languagewarnings", "0", 0 },
+	{ &ui_languagewarningsaserrors, "cl_languagewarningsaserrors", "0", 0 }
+};
+
+int cvarTableSize = sizeof( cvarTable ) / sizeof( cvarTable[0] );
 
 static void UI_StartServerRefresh( qboolean full );
 static void UI_StopServerRefresh( void );
@@ -168,8 +284,6 @@ void        UI_LoadMenus( const char *menuFile, qboolean reset, int imageTrack )
 void        UI_GetGameTypesList( void );
 void        UI_VerifyLanguage( void );
 
-extern displayContextDef_t *DC;
-
 /*
 ================
 vmMain
@@ -178,8 +292,12 @@ This is the only way control passes into the module.
 This must be the very first function compiled into the .qvm file
 ================
 */
-vmCvar_t ui_new;                                    /* 0x401EF960, never registered */
-vmCvar_t ui_serverFilterType;                       /* 0x401C0DA0, never registered: RTCW's table row is gone */
+vmCvar_t ui_new;                                    // never registered
+vmCvar_t ui_serverFilterType;                       // never registered
+// keep: unused, part of the original data layout
+vmCvar_t ui_debug;
+vmCvar_t ui_initialized;
+vmCvar_t ui_playerType;
 
 void _UI_Init( void );
 void _UI_Shutdown( void );
@@ -190,7 +308,6 @@ qboolean _UI_IsFullscreen( void );
 qboolean _UI_SetActiveMenu( uiMenuCommand_t menu );
 uiMenuCommand_t _UI_GetActiveMenu( void );
 
-/* ---- vmMain  0x400076A0 ---- */
 int vmMain( int command, int arg0, int arg1, int arg2, int arg3, int arg4, int arg5, int arg6, int arg7, int arg8, int arg9, int arg10, int arg11  ) {
 	switch ( command ) {
 	case UI_GETAPIVERSION:
@@ -220,7 +337,7 @@ int vmMain( int command, int arg0, int arg1, int arg2, int arg3, int arg4, int a
 		return _UI_IsFullscreen();
 
 	case UI_SET_ACTIVE_MENU:
-		/* returns what _UI_SetActiveMenu answers (0x40007713..0x4000771A), not RTCW's 0 */
+		// qtrue if a menu was opened
 		return _UI_SetActiveMenu( arg0 );
 
 	case UI_GET_ACTIVE_MENU:
@@ -248,7 +365,7 @@ int vmMain( int command, int arg0, int arg1, int arg2, int arg3, int arg4, int a
 		return Load_ScriptMenu( (const char *)arg0, arg1 );
 
 	case UI_GET_FONT_INFO:
-		/* the engine sends the scale as a percentage (0x40007782 fild/fmul 0.01) */
+		// the scale is sent as a percentage
 		return (int)UI_GetFontInfo( arg0, arg1 * 0.01f );
 	}
 
@@ -256,7 +373,6 @@ int vmMain( int command, int arg0, int arg1, int arg2, int arg3, int arg4, int a
 }
 
 
-/* ---- AssetCache  0x400077F0 -- the nine ui/assets registrations, imageTrack 2 ---- */
 void AssetCache( void ) {
 	//if (Assets.textFont == NULL) {
 	//}
@@ -273,7 +389,6 @@ void AssetCache( void ) {
 	uiInfo.uiDC.Assets.sliderThumb = trap_R_RegisterShaderNoMip( ASSET_SLIDER_THUMB, 2 );
 }
 
-/* ---- _UI_DrawSides  0x40007890 ---- */
 void _UI_DrawSides( float x, float y, float w, float h, float size ) {
 	UI_AdjustFrom640( &x, &y, &w, &h );
 	size *= uiInfo.uiDC.xscale;
@@ -281,7 +396,6 @@ void _UI_DrawSides( float x, float y, float w, float h, float size ) {
 	trap_R_DrawStretchPic( x + w - size, y, size, h, 0, 0, 0, 0, uiInfo.uiDC.whiteShader );
 }
 
-/* ---- _UI_DrawTopBottom  0x40007910 ---- */
 void _UI_DrawTopBottom( float x, float y, float w, float h, float size ) {
 	UI_AdjustFrom640( &x, &y, &w, &h );
 	size *= uiInfo.uiDC.yscale;
@@ -290,7 +404,7 @@ void _UI_DrawTopBottom( float x, float y, float w, float h, float size ) {
 }
 /*
 ================
-UI_DrawRect  0x40007990
+UI_DrawRect
 
 Coordinates are 640*480 virtual values
 =================
@@ -306,7 +420,7 @@ void _UI_DrawRect( float x, float y, float width, float height, float size, cons
 
 /*
 ================
-UI_GetFontInfo  0x400079E0
+UI_GetFontInfo
 
 The renderer's font for a menu font index at a text scale.  2, 3 and 5 are
 the big, small and console fonts outright; 4 (bold) and the rest pick by the
@@ -316,25 +430,26 @@ scaled size against ui_smallFont / ui_bigFont / ui_extraBigFont.
 fontInfo_t *UI_GetFontInfo( int font, float scale ) {
 	float scaledSize;
 
-	switch ( font ) {
-	case 2:
+	if ( font == UI_FONT_BIG ) {
 		return &uiInfo.uiDC.Assets.bigFont;
-	case 3:
+	}
+	if ( font == UI_FONT_SMALL ) {
 		return &uiInfo.uiDC.Assets.smallFont;
-	case 5:
+	}
+	if ( font == UI_FONT_CONSOLE ) {
 		return &uiInfo.uiDC.Assets.consoleFont;
 	}
 
 	scaledSize = uiInfo.uiDC.yscale * scale;
 
-	if ( font == 4 ) {
+	if ( font == UI_FONT_BOLD ) {
 		if ( scaledSize <= ui_smallFont.value ) {
 			return &uiInfo.uiDC.Assets.smallFont;
 		}
-		if ( scaledSize < ui_bigFont.value ) {
-			return &uiInfo.uiDC.Assets.textFont;
+		if ( scaledSize >= ui_bigFont.value ) {
+			return &uiInfo.uiDC.Assets.boldFont;
 		}
-		return &uiInfo.uiDC.Assets.boldFont;
+		return &uiInfo.uiDC.Assets.textFont;
 	}
 
 	if ( scaledSize <= ui_smallFont.value ) {
@@ -350,12 +465,10 @@ fontInfo_t *UI_GetFontInfo( int font, float scale ) {
 }
 
 // NERVE - SMF
-/* ---- Text_SetActiveFont  0x40007A70 ---- */
 void Text_SetActiveFont( int font ) {
 	uiInfo.activeFont = font;
 }
 
-/* ---- UI_ShowPostGame  0x40007A80 -- RTCW's, less cg_cameraOrbit ---- */
 void UI_ShowPostGame( qboolean newHigh ) {
 	trap_Cvar_Set( "cg_thirdPerson", "0" );
 	trap_Cvar_Set( "sv_killserver", "1" );
@@ -368,7 +481,6 @@ _UI_Refresh
 =================
 */
 
-/* ---- UI_DrawCenteredPic  0x40007AC0 -- no caller survives in the DLL ---- */
 void UI_DrawCenteredPic( qhandle_t image, int w, int h ) {
 	int x, y;
 	x = ( SCREEN_WIDTH - w ) / 2;
@@ -377,10 +489,9 @@ void UI_DrawCenteredPic( qhandle_t image, int w, int h ) {
 }
 
 #define UI_FPS_FRAMES   4
-/* ---- _UI_Refresh  0x40007B20 ---- */
 void _UI_Refresh( int realtime ) {
-	static int index;                       /* 0x4005A980 */
-	static int previousTimes[UI_FPS_FRAMES]; /* 0x4005B190 */
+	static int index;
+	static int previousTimes[UI_FPS_FRAMES];
 
 	//if ( !( trap_Key_GetCatcher() & KEYCATCH_UI ) ) {
 	//	return;
@@ -437,7 +548,7 @@ void _UI_Refresh( int realtime ) {
 
 /*
 =================
-_UI_Shutdown  0x40007C20
+_UI_Shutdown
 =================
 */
 void _UI_Shutdown( void ) {
@@ -445,13 +556,12 @@ void _UI_Shutdown( void ) {
 	trap_LAN_SaveCachedServers();
 }
 
-char *defaultMenu = NULL;                           /* 0x401BF420 */
+char *defaultMenu = NULL;
 
-/* ---- getMenuBuffer  0x40007C30 -- RTCW's GetMenuBuffer ---- */
 char *getMenuBuffer( const char *filename ) {
 	int len;
 	fileHandle_t f;
-	static char buf[MAX_MENUFILE];                  /* 0x40052960 */
+	static char buf[MAX_MENUFILE];
 
 	len = trap_FS_FOpenFile( filename, &f, FS_READ );
 	if ( !f ) {
@@ -465,14 +575,14 @@ char *getMenuBuffer( const char *filename ) {
 	}
 
 	trap_FS_Read( buf, len, f );
-	buf[len] = 0;
+	// keep: pointer store, not buf[len]
+	*( buf + len ) = 0;
 	trap_FS_FCloseFile( f );
 	//COM_Compress(buf);
 	return buf;
 
 }
 
-/* ---- Asset_Parse  0x40007CC0 -- RTCW's plus extraBigFont/boldFont/consoleFont/fadeInAmount and the imageTrack ---- */
 qboolean Asset_Parse( int handle, int imageTrack ) {
 	pc_token_t token;
 	const char *tempStr;
@@ -660,7 +770,6 @@ qboolean Asset_Parse( int handle, int imageTrack ) {
 	return qfalse;
 }
 
-/* ---- Font_Report  0x400081E0 ---- */
 void Font_Report( void ) {
 	int i;
 	Com_Printf( "Font Info\n" );
@@ -670,14 +779,12 @@ void Font_Report( void ) {
 	}
 }
 
-/* ---- UI_Report  0x40008230 ---- */
 void UI_Report( void ) {
 	String_Report();
 	//Font_Report();
 
 }
 
-/* ---- UI_ParseMenu  0x40008240 -- RTCW's plus the imageTrack handed to Asset_Parse and Menu_New ---- */
 qboolean UI_ParseMenu( const char *menuFile, int imageTrack ) {
 	int handle;
 	pc_token_t token;
@@ -728,10 +835,10 @@ qboolean UI_ParseMenu( const char *menuFile, int imageTrack ) {
 
 /*
 ===============
-Load_ScriptMenu  0x40008330
+Load_ScriptMenu
 
-vmMain's UI_LOAD_SCRIPT_MENU: ui_mp/scriptmenus/<name>.menu, the language
-subdirectory first when cl_language is set.  The engine passes imageTrack 5.
+Loads ui_mp/scriptmenus/<menuname>.menu, from the language subdirectory
+first when cl_language is set.
 ===============
 */
 qboolean Load_ScriptMenu( const char *menuname, int imageTrack ) {
@@ -745,6 +852,7 @@ qboolean Load_ScriptMenu( const char *menuname, int imageTrack ) {
 	cl_language = atoi( UI_Cvar_VariableString( "cl_language" ) );
 
 	if ( cl_language ) {
+		const char *s;
 		const char *filename;
 		char out[256];
 
@@ -752,7 +860,9 @@ qboolean Load_ScriptMenu( const char *menuname, int imageTrack ) {
 
 		filename = Com_SkipPath( menuFile );
 
-		if ( UI_ParseMenu( va( "%s%s", va( "%s%s/", out, trap_GetLanguagename( cl_language ) ), filename ), imageTrack ) ) {
+		s = va( "%s%s/", out, trap_GetLanguagename( cl_language ) );
+
+		if ( UI_ParseMenu( va( "%s%s", s, filename ), imageTrack ) ) {
 			return qtrue;
 		}
 	}
@@ -763,7 +873,6 @@ qboolean Load_ScriptMenu( const char *menuname, int imageTrack ) {
 	return qfalse;
 }
 
-/* ---- Load_Menu  0x40008480 -- RTCW's, the language directory from trap_GetLanguagename ---- */
 qboolean Load_Menu( int handle, int imageTrack ) {
 	pc_token_t token;
 	int cl_language;    // NERVE - SMF
@@ -793,6 +902,7 @@ qboolean Load_Menu( int handle, int imageTrack ) {
 		cl_language = atoi( UI_Cvar_VariableString( "cl_language" ) );
 
 		if ( cl_language ) {
+			const char *s;
 			const char *filename;
 			char out[256];
 
@@ -800,7 +910,9 @@ qboolean Load_Menu( int handle, int imageTrack ) {
 
 			filename = Com_SkipPath( token.string );
 
-			if ( UI_ParseMenu( va( "%s%s", va( "%s%s/", out, trap_GetLanguagename( cl_language ) ), filename ), imageTrack ) ) {
+			s = va( "%s%s/", out, trap_GetLanguagename( cl_language ) );
+
+			if ( UI_ParseMenu( va( "%s%s", s, filename ), imageTrack ) ) {
 				continue;
 			}
 		}
@@ -808,10 +920,9 @@ qboolean Load_Menu( int handle, int imageTrack ) {
 
 		UI_ParseMenu( token.string, imageTrack );
 	}
-	return qfalse;
+	// keep: no return after the loop
 }
 
-/* ---- UI_LoadMenus  0x400085B0 ---- */
 void UI_LoadMenus( const char *menuFile, qboolean reset, int imageTrack ) {
 	pc_token_t token;
 	int handle;
@@ -860,7 +971,6 @@ void UI_LoadMenus( const char *menuFile, qboolean reset, int imageTrack ) {
 	trap_PC_FreeSource( handle );
 }
 
-/* ---- UI_Load  0x400086C0 -- UI_GetGameTypesList for RTCW's gameinfo.txt, Menus_OpenByName for ActivateByName ---- */
 void UI_Load( void ) {
 	char lastName[1024];
 	menuDef_t *menu = Menu_GetFocused();
@@ -883,10 +993,9 @@ void UI_Load( void ) {
 
 }
 
-static const char *handicapValues[] = {"None","95","90","85","80","75","70","65","60","55","50","45","40","35","30","25","20","15","10","5",NULL};  /* 0x40036E70 */
+static const char *handicapValues[] = {"None","95","90","85","80","75","70","65","60","55","50","45","40","35","30","25","20","15","10","5",NULL};
 //static int numHandicaps = sizeof(handicapValues) / sizeof(const char*); // TTimo: unused
 
-/* ---- UI_DrawHandicap  0x40008760 ---- */
 static void UI_DrawHandicap( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
 	int i, h;
 
@@ -897,18 +1006,16 @@ static void UI_DrawHandicap( rectDef_t *rect, int font, float scale, vec4_t colo
 }
 
 // ui_gameType assumes gametype 0 is -1 ALL and will not show
-/* ---- UI_DrawGameType  0x400087D0 -- gtEnum is the display name; "All" when it is empty ---- */
 static void UI_DrawGameType( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
 	const char *s = uiInfo.gameTypes[ui_gameType.integer].gtEnum;
 
-	if ( *s ) {
-		trap_R_Text_Paint( rect->x, rect->y, font, scale, color, s, 0, 0, textStyle );
-	} else {
+	if ( !*s ) {
 		trap_R_Text_Paint( rect->x, rect->y, font, scale, color, "All", 0, 0, textStyle );
+	} else {
+		trap_R_Text_Paint( rect->x, rect->y, font, scale, color, s, 0, 0, textStyle );
 	}
 }
 
-/* ---- UI_DrawNetGameType  0x40008820 ---- */
 static void UI_DrawNetGameType( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
 	const char *s;
 
@@ -918,15 +1025,14 @@ static void UI_DrawNetGameType( rectDef_t *rect, int font, float scale, vec4_t c
 		trap_Cvar_Set( "ui_netGameTypeName", uiInfo.gameTypes[0].gameType );
 	}
 	s = uiInfo.gameTypes[ui_netGameType.integer].gtEnum;
-	if ( *s ) {
-		s = UI_SafeTranslateString( s );
-	} else {
+	if ( !*s ) {
 		s = UI_SafeTranslateString( "EXE_ALL" );
+	} else {
+		s = UI_SafeTranslateString( s );
 	}
 	trap_R_Text_Paint( rect->x, rect->y, font, scale, color, s, 0, 0, textStyle );
 }
 
-/* ---- UI_DrawJoinGameType  0x400088B0 ---- */
 static void UI_DrawJoinGameType( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
 	const char *s;
 
@@ -935,15 +1041,13 @@ static void UI_DrawJoinGameType( rectDef_t *rect, int font, float scale, vec4_t 
 		trap_Cvar_Set( "ui_joinGameType", "0" );
 	}
 	s = uiInfo.joinGameTypes[ui_joinGameType.integer].gtEnum;
-	if ( *s ) {
-		s = UI_SafeTranslateString( s );
+	if ( !*s ) {
+		trap_R_Text_Paint( rect->x, rect->y, font, scale, color, UI_SafeTranslateString( "EXE_ALL" ), 0, 0, textStyle );
 	} else {
-		s = UI_SafeTranslateString( "EXE_ALL" );
+		trap_R_Text_Paint( rect->x, rect->y, font, scale, color, UI_SafeTranslateString( s ), 0, 0, textStyle );
 	}
-	trap_R_Text_Paint( rect->x, rect->y, font, scale, color, s, 0, 0, textStyle );
 }
 
-/* ---- UI_DrawPreviewCinematic  0x40008930 ---- */
 static void UI_DrawPreviewCinematic( rectDef_t *rect, float scale, vec4_t color ) {
 	if ( uiInfo.previewMovie > -2 ) {
 		uiInfo.previewMovie = trap_CIN_PlayCinematic( va( "%s.roq", uiInfo.movieList[uiInfo.movieIndex] ), 0, 0, 0, 0, ( CIN_loop | CIN_silent ) );
@@ -958,7 +1062,6 @@ static void UI_DrawPreviewCinematic( rectDef_t *rect, float scale, vec4_t color 
 
 }
 
-/* ---- UI_DrawMapPreview  0x400089E0 ---- */
 static void UI_DrawMapPreview( rectDef_t *rect, float scale, vec4_t color, qboolean net ) {
 	int map = ( net ) ? ui_currentNetMap.integer : ui_currentMap.integer;
 	if ( map < 0 || map > uiInfo.mapCount ) {
@@ -983,7 +1086,6 @@ static void UI_DrawMapPreview( rectDef_t *rect, float scale, vec4_t color, qbool
 	}
 }
 
-/* ---- UI_DrawMapCinematic  0x40008AA0 -- RTCW's, the cinematic half gone: always the preview ---- */
 static void UI_DrawMapCinematic( rectDef_t *rect, float scale, vec4_t color, qboolean net ) {
 
 	int map = ( net ) ? ui_currentNetMap.integer : ui_currentMap.integer;
@@ -1001,18 +1103,17 @@ static void UI_DrawMapCinematic( rectDef_t *rect, float scale, vec4_t color, qbo
 	UI_DrawMapPreview( rect, scale, color, net );
 }
 
-/* ---- UI_DrawNetSource  0x40008B00 ----
-   The literal at 0x4002F058 is "EXE_NETSOURCE\x14%s" (0x4002F034 is the
-   SERVERFILTER twin): key, then the \x14 that SE_LocalizeMessage substitutes
-   the tail into "Source:     %s". */
+// "\x14" separates the localization key from its argument
 static void UI_DrawNetSource( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
+	const char *s;
+
 	if ( ui_netSource.integer < 0 || ui_netSource.integer > numNetSources /*uiInfo.numGameTypes*/ ) {        // NERVE - SMF - possible bug
 		ui_netSource.integer = 0;
 	}
-	trap_R_Text_Paint( rect->x, rect->y, font, scale, color, trap_SE_LocalizeMessage( va( "EXE_NETSOURCE\x14%s", netSources[ui_netSource.integer] ), "net source" ), 0, 0, textStyle );
+	s = trap_SE_LocalizeMessage( va( "EXE_NETSOURCE\x14%s", netSources[ui_netSource.integer] ), "net source" );
+	trap_R_Text_Paint( rect->x, rect->y, font, scale, color, s, 0, 0, textStyle );
 }
 
-/* ---- UI_DrawNetMapPreview  0x40008B60 ---- */
 static void UI_DrawNetMapPreview( rectDef_t *rect, float scale, vec4_t color ) {
 
 	if ( uiInfo.serverStatus.currentServerPreview > 0 ) {
@@ -1022,7 +1123,6 @@ static void UI_DrawNetMapPreview( rectDef_t *rect, float scale, vec4_t color ) {
 	}
 }
 
-/* ---- UI_DrawNetMapCinematic  0x40008BB0 ---- */
 static void UI_DrawNetMapCinematic( rectDef_t *rect, float scale, vec4_t color ) {
 	if ( ui_currentNetMap.integer < 0 || ui_currentNetMap.integer > uiInfo.mapCount ) {
 		ui_currentNetMap.integer = 0;
@@ -1038,42 +1138,41 @@ static void UI_DrawNetMapCinematic( rectDef_t *rect, float scale, vec4_t color )
 	}
 }
 
-/* ---- UI_DrawNetFilter  0x40008C50 ---- */
 static void UI_DrawNetFilter( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
+	const char *s;
+
 	if ( ui_serverFilterType.integer < 0 || ui_serverFilterType.integer > numServerFilters ) {
 		ui_serverFilterType.integer = 0;
 	}
-	trap_R_Text_Paint( rect->x, rect->y, font, scale, color, trap_SE_LocalizeMessage( va( "EXE_SERVERFILTER\x14%s", serverFilters[ui_serverFilterType.integer].description ), "server filter" ), 0, 0, textStyle );
+	s = trap_SE_LocalizeMessage( va( "EXE_SERVERFILTER\x14%s", serverFilters[ui_serverFilterType.integer].description ), "server filter" );
+	trap_R_Text_Paint( rect->x, rect->y, font, scale, color, s, 0, 0, textStyle );
 }
 
-/* ---- UI_GetMapDisplayName  0x40008CB0 -- vmMain's UI_GET_MAP_DISPLAY_NAME ---- */
 const char *UI_GetMapDisplayName( const char *mapname ) {
 	int i;
 
 	for ( i = 0; i < uiInfo.mapCount; i++ ) {
-		if ( !Q_stricmp( uiInfo.mapList[i].mapLoadName, mapname ) ) {
+		if ( !Q_stricmp( mapname, uiInfo.mapList[i].mapLoadName ) ) {
 			return uiInfo.mapList[i].mapName;
 		}
 	}
 	return mapname;
 }
 
-/* ---- UI_GetGameTypeDisplayName  0x40008D00 -- vmMain's UI_GET_GAME_TYPE_DISPLAY_NAME ---- */
 const char *UI_GetGameTypeDisplayName( const char *gametype ) {
 	int i;
 
 	for ( i = 0; i < uiInfo.numGameTypes; i++ ) {
-		if ( !Q_stricmp( uiInfo.gameTypes[i].gameType, gametype ) ) {
+		if ( !Q_stricmp( gametype, uiInfo.gameTypes[i].gameType ) ) {
 			return uiInfo.gameTypes[i].gtEnum;
 		}
 	}
 	return gametype;
 }
 
-/* ---- UI_OwnerDrawWidth  0x40008D40 ---- */
 static int UI_OwnerDrawWidth( int ownerDraw, int font, float scale ) {
 	int i, h;
-	const char *s = NULL;
+	const char *s = NULL; // TTimo: init
 
 	switch ( ownerDraw ) {
 	case UI_HANDICAP:
@@ -1116,7 +1215,11 @@ static int UI_OwnerDrawWidth( int ownerDraw, int font, float scale ) {
 	return 0;
 }
 
-/* ---- UI_BuildPlayerList  0x40008ED0 -- names from trap_GetClientName, no team bookkeeping ---- */
+/*
+===============
+UI_BuildPlayerList
+===============
+*/
 static void UI_BuildPlayerList( void ) {
 	uiClientState_t cs;
 	int n, count;
@@ -1137,7 +1240,6 @@ static void UI_BuildPlayerList( void ) {
 	}
 }
 
-/* ---- UI_DrawServerRefreshDate  0x40008FB0 ---- */
 static void UI_DrawServerRefreshDate( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
 	int serverCount;            // NERVE - SMF
 //#ifdef MISSIONPACK
@@ -1163,7 +1265,6 @@ static void UI_DrawServerRefreshDate( rectDef_t *rect, int font, float scale, ve
 //#endif	// #ifdef MISSIONPACK
 }
 
-/* ---- UI_DrawKeyBindStatus  0x40009180 ---- */
 static void UI_DrawKeyBindStatus( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
 	//int ofs = 0; // TTimo: unused
 	if ( Display_KeyBindPending() ) {
@@ -1173,24 +1274,25 @@ static void UI_DrawKeyBindStatus( rectDef_t *rect, int font, float scale, vec4_t
 	}
 }
 
-/* ---- UI_DrawGLInfo  0x400091C0 -- 256 lines in three columns, limits 80/36, float y ---- */
 static void UI_DrawGLInfo( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
 	char * eptr;
 	char buff[4096];
 	const char *lines[256];
-	float y;
+	float y, bottom;
 	int numLines, i;
 
-	trap_R_Text_Paint( rect->x + 2, rect->y, font, scale, color, va( "VENDOR: %s", UI_GLCONFIG.vendor_string ), 0, 80, textStyle );
-	trap_R_Text_Paint( rect->x + 2, rect->y + 15, font, scale, color, va( "VERSION: %s: %s", UI_GLCONFIG.version_string,UI_GLCONFIG.renderer_string ), 0, 80, textStyle );
-	trap_R_Text_Paint( rect->x + 2, rect->y + 30, font, scale, color, va( "PIXELFORMAT: color(%d-bits) Z(%d-bits) stencil(%d-bits)", UI_GLCONFIG.colorBits, UI_GLCONFIG.depthBits, UI_GLCONFIG.stencilBits ), 0, 80, textStyle );
+	trap_R_Text_Paint( rect->x + 2, rect->y, font, scale, color, va( "VENDOR: %s", uiInfo.uiDC.glconfig.vendor_string ), 0, 80, textStyle );
+	trap_R_Text_Paint( rect->x + 2, rect->y + 15, font, scale, color, va( "VERSION: %s: %s", uiInfo.uiDC.glconfig.version_string,uiInfo.uiDC.glconfig.renderer_string ), 0, 80, textStyle );
+	trap_R_Text_Paint( rect->x + 2, rect->y + 30, font, scale, color, va( "PIXELFORMAT: color(%d-bits) Z(%d-bits) stencil(%d-bits)", uiInfo.uiDC.glconfig.colorBits, uiInfo.uiDC.glconfig.depthBits, uiInfo.uiDC.glconfig.stencilBits ), 0, 80, textStyle );
 
 	// build null terminated extension strings
-	Q_strncpyz( buff, UI_GLCONFIG.extensions_string, 4096 );
+	Q_strncpyz( buff, uiInfo.uiDC.glconfig.extensions_string, 4096 );
 	eptr = buff;
 	y = rect->y + 45;
+	// keep: float compare
+	bottom = rect->h + rect->y;
 	numLines = 0;
-	while ( y < rect->y + rect->h && *eptr && numLines < 256 )
+	while ( y < bottom && *eptr && numLines < 256 )
 	{
 		while ( *eptr && *eptr == ' ' )
 			*eptr++ = '\0';
@@ -1208,9 +1310,10 @@ static void UI_DrawGLInfo( rectDef_t *rect, int font, float scale, vec4_t color,
 	while ( i < numLines ) {
 		trap_R_Text_Paint( rect->x + 2, y, font, scale, color, lines[i++], 0, 36, textStyle );
 		if ( i < numLines ) {
-			trap_R_Text_Paint( rect->x + rect->w / 3, y, font, scale, color, lines[i++], 0, 36, textStyle );
+			// keep: multiply by 1/3, not divide by 3
+			trap_R_Text_Paint( rect->x + rect->w * 0.33333334f, y, font, scale, color, lines[i++], 0, 36, textStyle );
 			if ( i < numLines ) {
-				trap_R_Text_Paint( rect->x + ( rect->w / 3 ) * 2, y, font, scale, color, lines[i++], 0, 36, textStyle );
+				trap_R_Text_Paint( rect->x + ( rect->w * 0.33333334f ) * 2, y, font, scale, color, lines[i++], 0, 36, textStyle );
 			}
 		}
 		y += 10;
@@ -1224,7 +1327,6 @@ static void UI_DrawGLInfo( rectDef_t *rect, int font, float scale, vec4_t color,
 
 // FIXME: table drive
 //
-/* ---- UI_OwnerDraw  0x400094A0 -- the DC's ownerDrawItem; font sits between special and scale ---- */
 static void UI_OwnerDraw( float x, float y, float w, float h, float text_x, float text_y, int ownerDraw, int ownerDrawFlags, int align, float special, int font, float scale, vec4_t color, qhandle_t shader, int textStyle ) {
 	rectDef_t rect;
 
@@ -1284,21 +1386,20 @@ static void UI_OwnerDraw( float x, float y, float w, float h, float text_x, floa
 	}
 }
 
-/* ---- UI_OwnerDrawVisible  0x40009780 -- FFA is g_gametype "dm"; the team-game flags are gone ---- */
 static qboolean UI_OwnerDrawVisible( int flags ) {
 	qboolean vis = qtrue;
 
 	while ( flags ) {
 
 		if ( flags & UI_SHOW_FFA ) {
-			if ( Q_stricmp( "dm", UI_Cvar_VariableString( "g_gametype" ) ) != 0 ) {
+			if ( Q_stricmp( UI_Cvar_VariableString( "g_gametype" ), "dm" ) != 0 ) {
 				vis = qfalse;
 			}
 			flags &= ~UI_SHOW_FFA;
 		}
 
 		if ( flags & UI_SHOW_NOTFFA ) {
-			if ( Q_stricmp( "dm", UI_Cvar_VariableString( "g_gametype" ) ) == 0 ) {
+			if ( Q_stricmp( UI_Cvar_VariableString( "g_gametype" ), "dm" ) == 0 ) {
 				vis = qfalse;
 			}
 			flags &= ~UI_SHOW_NOTFFA;
@@ -1347,9 +1448,7 @@ static qboolean UI_OwnerDrawVisible( int flags ) {
 				if ( uiInfo.soundHighScore ) {
 					if ( trap_Cvar_VariableValue( "sv_killserver" ) == 0 ) {
 						// wait on server to go down before playing sound
-						/* RTCW's handle, pushed whole to a trap that now takes an alias
-						   name (0x400098A4); nothing in this DLL ever assigns it, so the
-						   engine sees NULL and MSS_PlayLocalSoundAlias returns early. */
+						// keep: newHighScoreSound is never set, so nothing plays
 						trap_S_StartLocalSound( (const char *)uiInfo.newHighScoreSound );
 						uiInfo.soundHighScore = qfalse;
 					}
@@ -1375,7 +1474,6 @@ static qboolean UI_OwnerDrawVisible( int flags ) {
 	return vis;
 }
 
-/* ---- UI_Handicap_HandleKey  0x40009900 ---- */
 static qboolean UI_Handicap_HandleKey( int flags, float *special, int key ) {
 	if ( key == K_MOUSE1 || key == K_MOUSE2 || key == K_ENTER || key == K_KP_ENTER ) {
 		int h;
@@ -1396,7 +1494,6 @@ static qboolean UI_Handicap_HandleKey( int flags, float *special, int key ) {
 	return qfalse;
 }
 
-/* ---- UI_GameType_HandleKey  0x40009990 ---- */
 static qboolean UI_GameType_HandleKey( int flags, float *special, int key, qboolean resetMap ) {
 //#ifdef MISSIONPACK
 	if ( key == K_MOUSE1 || key == K_MOUSE2 || key == K_ENTER || key == K_KP_ENTER ) {
@@ -1430,7 +1527,6 @@ static qboolean UI_GameType_HandleKey( int flags, float *special, int key, qbool
 	return qfalse;
 }
 
-/* ---- UI_NetGameType_HandleKey  0x40009A60 ---- */
 static qboolean UI_NetGameType_HandleKey( int flags, float *special, int key ) {
 //#ifdef MISSIONPACK
 	if ( key == K_MOUSE1 || key == K_MOUSE2 || key == K_ENTER || key == K_KP_ENTER ) {
@@ -1459,7 +1555,6 @@ static qboolean UI_NetGameType_HandleKey( int flags, float *special, int key ) {
 	return qfalse;
 }
 
-/* ---- UI_JoinGameType_HandleKey  0x40009B10 ---- */
 static qboolean UI_JoinGameType_HandleKey( int flags, float *special, int key ) {
 //#ifdef MISSIONPACK
 	if ( key == K_MOUSE1 || key == K_MOUSE2 || key == K_ENTER || key == K_KP_ENTER ) {
@@ -1484,7 +1579,6 @@ static qboolean UI_JoinGameType_HandleKey( int flags, float *special, int key ) 
 	return qfalse;
 }
 
-/* ---- UI_NetSource_HandleKey  0x40009B90 ---- */
 static qboolean UI_NetSource_HandleKey( int flags, float *special, int key ) {
 //#ifdef MISSIONPACK
 	if ( key == K_MOUSE1 || key == K_MOUSE2 || key == K_ENTER || key == K_KP_ENTER ) {
@@ -1512,7 +1606,6 @@ static qboolean UI_NetSource_HandleKey( int flags, float *special, int key ) {
 	return qfalse;
 }
 
-/* ---- UI_NetFilter_HandleKey  0x40009C30 ---- */
 static qboolean UI_NetFilter_HandleKey( int flags, float *special, int key ) {
 //#ifdef MISSIONPACK
 	if ( key == K_MOUSE1 || key == K_MOUSE2 || key == K_ENTER || key == K_KP_ENTER ) {
@@ -1535,7 +1628,6 @@ static qboolean UI_NetFilter_HandleKey( int flags, float *special, int key ) {
 	return qfalse;
 }
 
-/* ---- UI_OwnerDrawHandleKey  0x40009C90 ---- */
 static qboolean UI_OwnerDrawHandleKey( int ownerDraw, int flags, float *special, int key ) {
 	switch ( ownerDraw ) {
 	case UI_HANDICAP:
@@ -1564,14 +1656,13 @@ static qboolean UI_OwnerDrawHandleKey( int ownerDraw, int flags, float *special,
 }
 
 
-/* ---- UI_GetValue  0x40009DA0 ---- */
 static float UI_GetValue( int ownerDraw, int type ) {
 	return 0;
 }
 
 /*
 =================
-UI_ServersQsortCompare  0x40009DB0
+UI_ServersQsortCompare
 =================
 */
 static int QDECL UI_ServersQsortCompare( const void *arg1, const void *arg2 ) {
@@ -1585,7 +1676,7 @@ static int QDECL UI_ServersQsortCompare( const void *arg1, const void *arg2 ) {
 
 /*
 =================
-UI_ServersSort  0x40009DE0
+UI_ServersSort
 =================
 */
 void UI_ServersSort( int column, qboolean force ) {
@@ -1604,7 +1695,7 @@ void UI_ServersSort( int column, qboolean force ) {
 
 /*
 ===============
-UI_LoadMods  0x40009E10
+UI_LoadMods
 ===============
 */
 static void UI_LoadMods( void ) {
@@ -1635,7 +1726,7 @@ static void UI_LoadMods( void ) {
 
 /*
 ===============
-UI_LoadMovies  0x40009EF0
+UI_LoadMovies
 ===============
 */
 static void UI_LoadMovies( void ) {
@@ -1652,7 +1743,7 @@ static void UI_LoadMovies( void ) {
 		moviename = movielist;
 		for ( i = 0; i < uiInfo.movieCount; i++ ) {
 			len = strlen( moviename );
-			if ( !Q_stricmp( ".roq", moviename +  len - 4 ) ) {
+			if ( !Q_stricmp( moviename +  len - 4, ".roq" ) ) {
 				moviename[len - 4] = '\0';
 			}
 			Q_strupr( moviename );
@@ -1667,7 +1758,7 @@ static void UI_LoadMovies( void ) {
 
 /*
 ===============
-UI_LoadDemos  0x40009FC0
+UI_LoadDemos
 ===============
 */
 static void UI_LoadDemos( void ) {
@@ -1701,15 +1792,10 @@ static void UI_LoadDemos( void ) {
 }
 
 
-/*
- * 0x4000A100: one `retn`, between UI_LoadDemos and WM_setItemPic -- where
- * RTCW keeps UI_SetNextMap / UI_StartSkirmish / WM_getWeaponIndex /
- * WM_getWeaponAnim.  Unnamed in the Mac symbols.
- */
-void nullsub_5( void ) {
+// unused
+void UI_UnusedStub1( void ) {
 }
 
-/* ---- WM_setItemPic  0x4000A110 -- imageTrack 2 ---- */
 void WM_setItemPic( char *name, const char *shader ) {
 	menuDef_t *menu = Menu_GetFocused();
 	itemDef_t *item;
@@ -1720,7 +1806,6 @@ void WM_setItemPic( char *name, const char *shader ) {
 	}
 }
 
-/* ---- WM_setVisibility  0x4000A140 ---- */
 void WM_setVisibility( char *name, qboolean show ) {
 	menuDef_t *menu = Menu_GetFocused();
 	itemDef_t *item;
@@ -1735,7 +1820,6 @@ void WM_setVisibility( char *name, qboolean show ) {
 	}
 }
 
-/* ---- UI_CheckExecKey  0x4000A170 ---- */
 qboolean UI_CheckExecKey( int key ) {
 	menuDef_t *menu = Menu_GetFocused();
 
@@ -1763,7 +1847,7 @@ qboolean UI_CheckExecKey( int key ) {
 
 /*
 ==============
-UI_Update  0x4000A1E0 -- RTCW's less ui_glCustom
+UI_Update
 ==============
 */
 static void UI_Update( const char *name ) {
@@ -1822,7 +1906,7 @@ static void UI_Update( const char *name ) {
 
 /*
 ==============
-UI_VerifyLanguage  0x4000A3B0
+UI_VerifyLanguage
 
 Lets the engine veto ui_language (trap_VerifyLanguageSelection) and flags
 ui_languagechanged when it differs from cl_language.
@@ -1844,19 +1928,18 @@ void UI_VerifyLanguage( void ) {
 		trap_Cvar_Set( "ui_language", ui_language );
 	}
 
-	if ( atoi( ui_language ) == atoi( cl_language ) ) {
-		trap_Cvar_Set( "ui_languagechanged", "0" );
-	} else {
+	if ( atoi( ui_language ) != atoi( cl_language ) ) {
 		trap_Cvar_Set( "ui_languagechanged", "1" );
+	} else {
+		trap_Cvar_Set( "ui_languagechanged", "0" );
 	}
 }
 
 /*
 ==============
-UI_AddServerToFavoritesList  0x4000A4A0
+UI_AddServerToFavoritesList
 
-The favorites half of RTCW's addFavorite/createFavorite scripts, shared and
-reporting through ui_favorite_message.
+Adds a server to the favorites, reporting the result in ui_favorite_message.
 ==============
 */
 static void UI_AddServerToFavoritesList( const char *name, const char *addr ) {
@@ -1892,7 +1975,11 @@ static void UI_AddServerToFavoritesList( const char *name, const char *addr ) {
 	}
 }
 
-/* ---- UI_RunMenuScript  0x4000A5F0 -- the DC's runScript; the script names are the retail set ---- */
+/*
+==============
+UI_RunMenuScript
+==============
+*/
 static void UI_RunMenuScript( char **args ) {
 	const char *name, *name2;
 	char buff[1024];
@@ -2199,13 +2286,12 @@ static void UI_RunMenuScript( char **args ) {
 	}
 }
 
-/* ---- UI_GetTeamColor  0x4000B500 ---- */
 static void UI_GetTeamColor( vec4_t *color ) {
 }
 
 /*
 ==================
-UI_SelectCurrentGameType  0x4000B510
+UI_SelectCurrentGameType
 
 Points ui_netGameType at the g_gametype the server is running.
 ==================
@@ -2216,7 +2302,7 @@ static void UI_SelectCurrentGameType( void ) {
 
 	trap_Cvar_VariableStringBuffer( "g_gametype", gametype, sizeof( gametype ) );
 	for ( i = 0; i < uiInfo.numGameTypes; i++ ) {
-		if ( !Q_stricmp( uiInfo.gameTypes[i].gameType, gametype ) ) {
+		if ( !Q_stricmp( gametype, uiInfo.gameTypes[i].gameType ) ) {
 			trap_Cvar_Set( "ui_netGameType", va( "%d", i ) );
 			trap_Cvar_Set( "ui_netGameTypeName", uiInfo.gameTypes[i].gameType );
 			return;
@@ -2226,7 +2312,7 @@ static void UI_SelectCurrentGameType( void ) {
 
 /*
 ==================
-UI_MapCountByGameType  0x4000B5C0 -- RTCW's, always ui_netGameType
+UI_MapCountByGameType
 ==================
 */
 static int UI_MapCountByGameType( void ) {
@@ -2246,7 +2332,7 @@ static int UI_MapCountByGameType( void ) {
 
 /*
 ==================
-UI_SelectCurrentMap  0x4000B610
+UI_SelectCurrentMap
 
 In game, moves the map feeder onto the map the server is running.
 ==================
@@ -2271,7 +2357,7 @@ static void UI_SelectCurrentMap( void ) {
 	c = 0;
 	for ( i = 0; i < uiInfo.mapCount; i++ ) {
 		if ( uiInfo.mapList[i].active ) {
-			if ( !Q_stricmp( uiInfo.mapList[i].mapName, mapname ) ) {
+			if ( !Q_stricmp( mapname, uiInfo.mapList[i].mapName ) ) {
 				Menu_SetFeederSelection( NULL, FEEDER_ALLMAPS, c, NULL );
 				return;
 			}
@@ -2282,7 +2368,7 @@ static void UI_SelectCurrentMap( void ) {
 
 /*
 ==================
-UI_InsertServerIntoDisplayList  0x4000B6F0
+UI_InsertServerIntoDisplayList
 ==================
 */
 static void UI_InsertServerIntoDisplayList( int num, int position ) {
@@ -2301,7 +2387,7 @@ static void UI_InsertServerIntoDisplayList( int num, int position ) {
 
 /*
 ==================
-UI_RemoveServerFromDisplayList  0x4000B730
+UI_RemoveServerFromDisplayList
 ==================
 */
 static void UI_RemoveServerFromDisplayList( int num ) {
@@ -2320,7 +2406,7 @@ static void UI_RemoveServerFromDisplayList( int num ) {
 
 /*
 ==================
-UI_BinaryServerInsertion  0x4000B780
+UI_BinaryServerInsertion
 ==================
 */
 static void UI_BinaryServerInsertion( int num ) {
@@ -2359,19 +2445,14 @@ static void UI_BinaryServerInsertion( int num ) {
 
 /*
 ==================
-UI_BuildServerDisplayList  0x4000B800
-
-RTCW's with CoD's filters: the 000.000.000.000 placeholder, show empty /
-full / password / no-password, the join gametype by name, the mod filter.
-trap_ClearDisplayedServers is ui_public.h's name for LAN_MarkServerVisible,
-trap_LAN_ServerIsDirty its name for LAN_ServerIsVisible.
+UI_BuildServerDisplayList
 ==================
 */
 static void UI_BuildServerDisplayList( qboolean force ) {
 	int i, count, clients, maxClients, ping, len;
 	char info[MAX_STRING_CHARS];
 	//qboolean startRefresh = qtrue; // TTimo: unused
-	static int numinvisible;                        /* 0x4005B18C */
+	static int numinvisible;
 
 	if ( !( force || uiInfo.uiDC.realTime > uiInfo.serverStatus.nextDisplayRefresh ) ) {
 		return;
@@ -2463,7 +2544,7 @@ static void UI_BuildServerDisplayList( qboolean force ) {
 			}
 
 			if ( uiInfo.joinGameTypes[ui_joinGameType.integer].gtEnum[0] ) {
-				if ( Q_stricmp( uiInfo.joinGameTypes[ui_joinGameType.integer].gameType, Info_ValueForKey( info, "gametype" ) ) != 0 ) {
+				if ( Q_stricmp( Info_ValueForKey( info, "gametype" ), uiInfo.joinGameTypes[ui_joinGameType.integer].gameType ) != 0 ) {
 					trap_ClearDisplayedServers( ui_netSource.integer, i, qfalse );
 					continue;
 				}
@@ -2492,14 +2573,13 @@ static void UI_BuildServerDisplayList( qboolean force ) {
 	uiInfo.serverStatus.refreshtime = uiInfo.uiDC.realTime;
 }
 
-/* CoD adds the third member: a 1 turns the value into @EXE_YES / @EXE_NO. */
+// isBoolean values are shown as yes / no
 typedef struct
 {
 	char *name, *altName;
 	int isBoolean;
 } serverStatusCvar_t;
 
-/* 0x40036EC8 */
 serverStatusCvar_t serverStatusCvars[] = {
 	{"sv_hostname", "@EXE_SV_INFO_SERVERNAME", 0},
 	{"address", "@EXE_SV_INFO_ADDRESS", 0},
@@ -2522,7 +2602,7 @@ serverStatusCvar_t serverStatusCvars[] = {
 
 /*
 ==================
-UI_SortServerStatusInfo  0x4000BBB0
+UI_SortServerStatusInfo
 ==================
 */
 static void UI_SortServerStatusInfo( serverStatusInfo_t *info ) {
@@ -2565,7 +2645,7 @@ static void UI_SortServerStatusInfo( serverStatusInfo_t *info ) {
 
 /*
 ==================
-UI_GetServerStatusInfo  0x4000BCC0 -- RTCW's, less the URL cvars
+UI_GetServerStatusInfo
 ==================
 */
 static int UI_GetServerStatusInfo( const char *serverAddress, serverStatusInfo_t *info ) {
@@ -2676,7 +2756,7 @@ static int UI_GetServerStatusInfo( const char *serverAddress, serverStatusInfo_t
 
 /*
 ==================
-stristr  0x4000BFD0
+stristr
 ==================
 */
 static char *stristr( char *str, char *charset ) {
@@ -2698,11 +2778,11 @@ static char *stristr( char *str, char *charset ) {
 
 /*
 ==================
-UI_BuildFindPlayerList  0x4000C040
+UI_BuildFindPlayerList
 ==================
 */
 static void UI_BuildFindPlayerList( qboolean force ) {
-	static int numFound, numTimeOuts;               /* 0x4005B188, 0x4005B1A0 */
+	static int numFound, numTimeOuts;
 	int i, j, resend;
 	serverStatusInfo_t info;
 	char name[MAX_NAME_LENGTH + 2];
@@ -2830,7 +2910,7 @@ static void UI_BuildFindPlayerList( qboolean force ) {
 
 /*
 ==================
-UI_BuildServerStatus  0x4000C500 -- RTCW's, less the URL buttons
+UI_BuildServerStatus
 ==================
 */
 static void UI_BuildServerStatus( qboolean force ) {
@@ -2861,7 +2941,7 @@ static void UI_BuildServerStatus( qboolean force ) {
 
 /*
 ==================
-UI_FeederCount  0x4000C5B0 -- no FEEDER_TEAM_LIST count in CoD
+UI_FeederCount
 ==================
 */
 static int UI_FeederCount( float feederID ) {
@@ -2891,7 +2971,6 @@ static int UI_FeederCount( float feederID ) {
 	return 0;
 }
 
-/* ---- UI_SelectedMap  0x4000C6C0 ---- */
 static const char *UI_SelectedMap( int index, int *actual ) {
 	int i, c;
 	c = 0;
@@ -2909,7 +2988,6 @@ static const char *UI_SelectedMap( int index, int *actual ) {
 	return "";
 }
 
-/* ---- UI_UpdatePendingPings  0x4000C710 ---- */
 static void UI_UpdatePendingPings( void ) {
 	trap_LAN_ResetPings( ui_netSource.integer );
 	uiInfo.serverStatus.refreshActive = qtrue;
@@ -2917,18 +2995,16 @@ static void UI_UpdatePendingPings( void ) {
 }
 
 // NERVE - SMF
-/* ---- UI_FeederAddItem  0x4000C740 ---- */
 static void UI_FeederAddItem( float feederID, const char *name, int index ) {
 
 }
 // -NERVE - SMF
 
 //----(SA)	added (whoops, this got nuked in a check-in...)
-/* ---- UI_FileText  0x4000C750 ---- */
 static const char *UI_FileText( const char *fileName ) {
 	int len;
 	fileHandle_t f;
-	static char buf[MAX_MENUDEFFILE];               /* 0x40051160 */
+	static char buf[MAX_MENUDEFFILE];
 
 //	return "flubber";
 
@@ -2938,19 +3014,19 @@ static const char *UI_FileText( const char *fileName ) {
 	}
 
 	trap_FS_Read( buf, len, f );
-	buf[len] = 0;
+	// keep: pointer store, not buf[len]
+	*( buf + len ) = 0;
 	trap_FS_FCloseFile( f );
 	return &buf[0];
 }
 //----(SA)	end
 
 
-/* ---- UI_FeederItemText  0x4000C7A0 -- CoD's server columns (password/host/map/clients/game/ping) and the @-translated status lines ---- */
 static const char *UI_FeederItemText( float feederID, int index, int column, qhandle_t *handle ) {
-	static char info[MAX_STRING_CHARS];             /* 0x40050D60 */
-	static char clientBuff[32];                     /* 0x4005A960 */
-	static int lastColumn = -1;                     /* 0x40036F94 */
-	static int lastTime = 0;                        /* 0x401BF424 */
+	static char info[MAX_STRING_CHARS];
+	static char clientBuff[32];
+	static int lastColumn = -1;
+	static int lastTime = 0;
 	*handle = -1;
 	if ( feederID == FEEDER_HEADS ) {
 		if ( index >= 0 && index < uiInfo.characterCount ) {
@@ -3043,7 +3119,6 @@ static const char *UI_FeederItemText( float feederID, int index, int column, qha
 }
 
 
-/* ---- UI_FeederItemImage  0x4000CB70 -- imageTrack 2 ---- */
 static qhandle_t UI_FeederItemImage( float feederID, int index ) {
 	if ( feederID == FEEDER_HEADS ) {
 		if ( index >= 0 && index < uiInfo.characterCount ) {
@@ -3068,9 +3143,8 @@ static qhandle_t UI_FeederItemImage( float feederID, int index ) {
 	return 0;
 }
 
-/* ---- UI_FeederSelection  0x4000CC40 -- RTCW's without the map/server cinematics ---- */
 static void UI_FeederSelection( float feederID, int index ) {
-	static char info[MAX_STRING_CHARS];             /* 0x40052160 */
+	static char info[MAX_STRING_CHARS];
 	if ( feederID == FEEDER_HEADS ) {
 		if ( index >= 0 && index < uiInfo.characterCount ) {
 			trap_Cvar_Set( "team_model", uiInfo.characterList[index].female ? "janet" : "james" );
@@ -3140,11 +3214,11 @@ static void UI_FeederSelection( float feederID, int index ) {
 
 /*
 ===============
-UI_GetGameTypesList  0x4000CF80
+UI_GetGameTypesList
 
-CoD's replacement for UI_ParseGameInfo: one game type per
-maps/mp/gametypes/*.gsc (files starting with '_' skipped), its display name
-the first token of the matching .txt.  joinGameTypes gets "All" first.
+One game type per maps/mp/gametypes/*.gsc (files starting with '_' are
+skipped), named by the first token of the matching .txt.  joinGameTypes gets
+"All" first.
 ===============
 */
 void UI_GetGameTypesList( void ) {
@@ -3164,9 +3238,11 @@ void UI_GetGameTypesList( void ) {
 
 	numdirs = trap_FS_GetFileList( "maps/mp/gametypes", "gsc", dirlist, sizeof( dirlist ) );
 	dirptr = dirlist;
-	for ( i = 0; i < numdirs; i++, dirptr += dirlen + 1 ) {
+	// keep: dirptr is advanced in the body
+	for ( i = 0; i < numdirs; i++ ) {
 		dirlen = strlen( dirptr );
 		if ( dirptr[0] == '_' ) {
+			dirptr += dirlen + 1;
 			continue;
 		}
 		if ( !Q_stricmp( dirptr + dirlen - 4, ".gsc" ) ) {
@@ -3182,15 +3258,18 @@ void UI_GetGameTypesList( void ) {
 		uiInfo.joinGameTypes[uiInfo.numJoinGameTypes].gameType = uiInfo.gameTypes[uiInfo.numGameTypes].gameType;
 
 		buf = getMenuBuffer( va( "maps/mp/gametypes/%s.txt", dirptr ) );
-		if ( buf ) {
-			uiInfo.gameTypes[uiInfo.numGameTypes].gtEnum = String_Alloc( Com_Parse( &buf ) );
-		} else {
+		// keep: statement order matches original codegen
+		if ( !buf ) {
 			uiInfo.gameTypes[uiInfo.numGameTypes].gtEnum = uiInfo.gameTypes[uiInfo.numGameTypes].gameType;
+			uiInfo.joinGameTypes[uiInfo.numJoinGameTypes].gtEnum = uiInfo.gameTypes[uiInfo.numGameTypes].gtEnum;
+		} else {
+			uiInfo.gameTypes[uiInfo.numGameTypes].gtEnum = String_Alloc( Com_Parse( &buf ) );
+			uiInfo.joinGameTypes[uiInfo.numJoinGameTypes].gtEnum = uiInfo.gameTypes[uiInfo.numGameTypes].gtEnum;
 		}
-		uiInfo.joinGameTypes[uiInfo.numJoinGameTypes].gtEnum = uiInfo.gameTypes[uiInfo.numGameTypes].gtEnum;
 
 		uiInfo.numGameTypes++;
 		uiInfo.numJoinGameTypes++;
+		dirptr += dirlen + 1;
 	}
 
 	if ( !uiInfo.numGameTypes ) {
@@ -3198,7 +3277,6 @@ void UI_GetGameTypesList( void ) {
 	}
 }
 
-/* ---- UI_Pause  0x4000D1A0 ---- */
 static void UI_Pause( qboolean b ) {
 	if ( b ) {
 		// pause the game and set the ui keycatcher
@@ -3219,12 +3297,10 @@ static int UI_OwnerDraw_Width(int ownerDraw) {
 }
 */
 
-/* ---- UI_PlayCinematic  0x4000D1F0 ---- */
 static int UI_PlayCinematic( const char *name, float x, float y, float w, float h ) {
 	return trap_CIN_PlayCinematic( name, x, y, w, h, ( CIN_loop | CIN_silent ) );
 }
 
-/* ---- UI_StopCinematic  0x4000D240 ---- */
 static void UI_StopCinematic( int handle ) {
 	if ( handle >= 0 ) {
 		trap_CIN_StopCinematic( handle );
@@ -3244,23 +3320,18 @@ static void UI_StopCinematic( int handle ) {
 	}
 }
 
-/* ---- UI_DrawCinematic  0x4000D2B0 ---- */
 static void UI_DrawCinematic( int handle, float x, float y, float w, float h ) {
 	trap_CIN_SetExtents( handle, x, y, w, h );
 	trap_CIN_DrawCinematic( handle );
 }
 
-/* ---- UI_RunCinematicFrame  0x4000D300 ---- */
 static void UI_RunCinematicFrame( int handle ) {
 	trap_CIN_RunCinematic( handle );
 }
 
 /*
 =================
-_UI_Init  0x4000D310
-
-Fills the DC by slot in ui_shared.h's order.  RTCW's inGameLoad parameter
-is gone: vmMain's UI_INIT case sets nothing up before the call.
+UI_Init
 =================
 */
 void _UI_Init( void ) {
@@ -3275,14 +3346,14 @@ void _UI_Init( void ) {
 	trap_Cvar_Set( "ui_menuFiles", "ui_mp/menus.txt" ); // NERVE - SMF - we need to hardwire for wolfMP
 
 	// cache redundant calulations
-	trap_GetGlconfig( &UI_GLCONFIG );
+	trap_GetGlconfig( &uiInfo.uiDC.glconfig );
 
 	// for 640x480 virtualized screen
-	uiInfo.uiDC.yscale = UI_GLCONFIG.vidHeight * ( 1.0f / 480.0f );
-	uiInfo.uiDC.xscale = UI_GLCONFIG.vidWidth * ( 1.0f / 640.0f );
-	if ( UI_GLCONFIG.vidWidth * 480 > UI_GLCONFIG.vidHeight * 640 ) {
+	uiInfo.uiDC.yscale = uiInfo.uiDC.glconfig.vidHeight * ( 1.0f / 480.0f );
+	uiInfo.uiDC.xscale = uiInfo.uiDC.glconfig.vidWidth * ( 1.0f / 640.0f );
+	if ( uiInfo.uiDC.glconfig.vidWidth * 480 > uiInfo.uiDC.glconfig.vidHeight * 640 ) {
 		// wide screen
-		uiInfo.uiDC.bias = 0.5f * ( UI_GLCONFIG.vidWidth - ( UI_GLCONFIG.vidHeight * ( 640.0f / 480.0f ) ) );
+		uiInfo.uiDC.bias = 0.5f * ( uiInfo.uiDC.glconfig.vidWidth - ( uiInfo.uiDC.glconfig.vidHeight * ( 640.0f / 480.0f ) ) );
 	} else {
 		// no wide screen
 		uiInfo.uiDC.bias = 0;
@@ -3344,8 +3415,6 @@ void _UI_Init( void ) {
 	uiInfo.uiDC.stopCinematic = &UI_StopCinematic;
 	uiInfo.uiDC.drawCinematic = &UI_DrawCinematic;
 	uiInfo.uiDC.runCinematicFrame = &UI_RunCinematicFrame;
-	/* +0xA4 <- trap 0x64, +0xA8 <- trap 0x65 (0x4000D5C0, 0x4000D5CA): ui_shared.h's
-	   slot names are the semantic ones, the wrappers keep RTCW's names */
 	uiInfo.uiDC.getAutoUpdate = &trap_CheckAutoUpdate;            // DHM - Nerve
 	uiInfo.uiDC.runningGame = &trap_GetAutoUpdate;                // DHM - Nerve
 
@@ -3397,11 +3466,11 @@ void _UI_Init( void ) {
 
 /*
 =================
-UI_KeyEvent  0x4000D6F0
+UI_KeyEvent
 =================
 */
 void _UI_KeyEvent( int key, qboolean down ) {
-	static qboolean bypassKeyClear = qfalse;        /* 0x401BF428 */
+	static qboolean bypassKeyClear = qfalse;
 
 	if ( Menu_Count() > 0 ) {
 		menuDef_t *menu = Menu_GetFocused();
@@ -3436,7 +3505,7 @@ void _UI_KeyEvent( int key, qboolean down ) {
 
 /*
 =================
-UI_MouseEvent  0x4000D790
+UI_MouseEvent
 =================
 */
 void _UI_MouseEvent( int dx, int dy ) {
@@ -3465,9 +3534,8 @@ void _UI_MouseEvent( int dx, int dy ) {
 
 
 //----(SA)	added
-static uiMenuCommand_t menutype = UIMENU_NONE;      /* 0x401BF42C */
+static uiMenuCommand_t menutype = UIMENU_NONE;
 
-/* ---- _UI_GetActiveMenu  0x4000D800 ---- */
 uiMenuCommand_t _UI_GetActiveMenu( void ) {
 	return menutype;
 }
@@ -3475,11 +3543,11 @@ uiMenuCommand_t _UI_GetActiveMenu( void ) {
 
 /*
 =================
-_UI_SetActiveMenu  0x4000D810
+_UI_SetActiveMenu
 
-Answers qtrue for every menu it opened (each case ends `mov eax, 1`),
-qfalse otherwise; vmMain hands that back.  The two script popups do not
-replace menutype on entry and refuse to open over a focused non-popup menu.
+Returns qtrue when a menu was opened.  The script popups will not open over
+a focused menu that is not itself a popup.
+keep: case order matches original codegen
 =================
 */
 qboolean _UI_SetActiveMenu( uiMenuCommand_t menu ) {
@@ -3510,11 +3578,9 @@ qboolean _UI_SetActiveMenu( uiMenuCommand_t menu ) {
 			}
 			return qtrue;
 
-		case UIMENU_INGAME:
+		case UIMENU_TEAM:
 			trap_Key_SetCatcher( KEYCATCH_UI );
-			Menus_CloseAll();
-			trap_Cvar_VariableStringBuffer( "g_scriptMainMenu", buf, sizeof( buf ) );
-			Menus_OpenByName( buf );
+			Menus_OpenByName( "team" );
 			return qtrue;
 
 		case UIMENU_NEED_CD:
@@ -3527,9 +3593,11 @@ qboolean _UI_SetActiveMenu( uiMenuCommand_t menu ) {
 			Menus_OpenByName( "badcd" );
 			return qtrue;
 
-		case UIMENU_TEAM:
+		case UIMENU_INGAME:
 			trap_Key_SetCatcher( KEYCATCH_UI );
-			Menus_OpenByName( "team" );
+			Menus_CloseAll();
+			trap_Cvar_VariableStringBuffer( "g_scriptMainMenu", buf, sizeof( buf ) );
+			Menus_OpenByName( buf );
 			return qtrue;
 
 			// NERVE - SMF
@@ -3556,7 +3624,7 @@ qboolean _UI_SetActiveMenu( uiMenuCommand_t menu ) {
 			}
 
 			trap_Cvar_VariableStringBuffer( "ui_newScriptMenu", buf, sizeof( buf ) );
-			if ( !focused || Q_stricmp( buf, focused->window.name ) ) {
+			if ( !focused || Q_stricmp( focused->window.name, buf ) ) {
 				menutype = UIMENU_SCRIPT_POPUP;
 				if ( menu == UIMENU_SCRIPT_POPUP_NO_MOUSE ) {
 					DC->cursorx = 639;
@@ -3585,12 +3653,10 @@ qboolean _UI_SetActiveMenu( uiMenuCommand_t menu ) {
 	return qfalse;
 }
 
-/* ---- _UI_IsFullscreen  0x4000DC00 ---- */
 qboolean _UI_IsFullscreen( void ) {
 	return UI_IsFullscreen();
 }
 
-/* ---- UI_ReadableSize  0x4000DC10 -- the units are EXE_* references ---- */
 static void UI_ReadableSize( char *buf, int bufsize, int value ) {
 	if ( value > 1024 * 1024 * 1024 ) { // gigs
 		Com_sprintf( buf, bufsize, "%d", value / ( 1024 * 1024 * 1024 ) );
@@ -3608,7 +3674,6 @@ static void UI_ReadableSize( char *buf, int bufsize, int value ) {
 }
 
 // Assumes time is in sec
-/* ---- UI_PrintTime  0x4000DD90 ---- */
 static void UI_PrintTime( char *buf, int bufsize, int time ) {
 	//time /= 1000;  // change to seconds
 
@@ -3621,7 +3686,6 @@ static void UI_PrintTime( char *buf, int bufsize, int time ) {
 	}
 }
 
-/* ---- Text_PaintCenter  0x4000DE50 ---- */
 void Text_PaintCenter( float x, float y, int font, float scale, const vec4_t color, const char *text, float adjust ) {
 	int len = trap_R_Text_Width( text, font, scale, 0 );
 	trap_R_Text_Paint( x - len / 2, y, font, scale, color, text, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE );
@@ -3630,21 +3694,18 @@ void Text_PaintCenter( float x, float y, int font, float scale, const vec4_t col
 #define ESTIMATES 80
 /*
 =================
-UI_DisplayDownloadInfo  0x4000DEA0
-
-RTCW's, with CoD's progress bar (three nested fills, black under red) and
-the EXE_* captions in colorLtGrey at x 24/192/264/200.
+UI_DisplayDownloadInfo
 =================
 */
 static void UI_DisplayDownloadInfo( const char *downloadName, float centerPoint, float yStart, int font, float scale ) {
-	static char dlText[]    = "EXE_DOWNLOADING";    /* 0x40036F98 */
-	static char etaText[]   = "EXE_EST_TIME_LEFT";  /* 0x40036FA8 */
-	static char xferText[]  = "EXE_TRANS_RATE";     /* 0x40036FBC */
+	static char dlText[]    = "EXE_DOWNLOADING";
+	static char etaText[]   = "EXE_EST_TIME_LEFT";
+	static char xferText[]  = "EXE_TRANS_RATE";
 	static int tleEstimates[ESTIMATES] = { 60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,
 										   60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,
 										   60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,
-										   60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60 };  /* 0x40036FD0 */
-	static int tleIndex = 0;                        /* 0x401BF430 */
+										   60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60,60 };
+	static int tleIndex = 0;
 
 	int downloadSize, downloadCount, downloadTime;
 	char dlSizeBuf[64], totalSizeBuf[64], xferRateBuf[64], dlTimeBuf[64];
@@ -3660,14 +3721,15 @@ static void UI_DisplayDownloadInfo( const char *downloadName, float centerPoint,
 	// Background
 	VectorCopy( colorBlack, color );
 	color[3] = 0.2f;
-	UI_FillRect( 0, yStart + 184, 640, 85, color );
-	UI_FillRect( 0, yStart + 185, 640, 83, color );
-	UI_FillRect( 0, yStart + 186, 640, 81, color );
+	UI_FillRect( 0, yStart + 184, SCREEN_WIDTH, 85, color );
+	UI_FillRect( 0, yStart + 185, SCREEN_WIDTH, 83, color );
+	UI_FillRect( 0, yStart + 186, SCREEN_WIDTH, 81, color );
 
 	if ( downloadSize > 0 ) {
 		VectorCopy( colorRed, color );
 		color[3] = 0.15f;
-		width = (float)downloadCount / downloadSize * 640;
+		// keep: float arithmetic matches original codegen
+		width = FCAST( (double)downloadCount ) / downloadSize * 640.0f;
 		UI_FillRect( 0, yStart + 184, width + 2, 85, color );
 		UI_FillRect( 0, yStart + 185, width + 1, 83, color );
 		UI_FillRect( 0, yStart + 186, width, 81, color );
@@ -3678,7 +3740,7 @@ static void UI_DisplayDownloadInfo( const char *downloadName, float centerPoint,
 	trap_R_Text_Paint( 24, yStart + 235, font, scale, colorLtGrey, UI_SafeTranslateString( etaText ), 0, 64, ITEM_TEXTSTYLE_SHADOWED );
 	trap_R_Text_Paint( 24, yStart + 260, font, scale, colorLtGrey, UI_SafeTranslateString( xferText ), 0, 64, ITEM_TEXTSTYLE_SHADOWED );
 
-	// the name is shown past its first eight characters (0x4000E13A)
+	// the name is shown past its first eight characters
 	if ( downloadSize > 0 ) {
 		s = va( "%s (%d%%)", downloadName + 8, downloadCount * 100 / downloadSize );
 	} else {
@@ -3692,7 +3754,8 @@ static void UI_DisplayDownloadInfo( const char *downloadName, float centerPoint,
 
 	if ( downloadCount < 4096 || !downloadTime ) {
 		Text_PaintCenter( centerPoint, yStart + 235, font, scale, colorLtGrey, UI_SafeTranslateString( "EXE_ESTIMATING" ), 0 );
-		Text_PaintCenter( centerPoint, yStart + 340, font, scale, colorLtGrey, va( "(%s %s %s %s)", dlSizeBuf, UI_SafeTranslateString( "EXE_OF" ), totalSizeBuf, UI_SafeTranslateString( "EXE_COPIED" ) ), 0 );
+		s = va( "(%s %s %s %s)", dlSizeBuf, UI_SafeTranslateString( "EXE_OF" ), totalSizeBuf, UI_SafeTranslateString( "EXE_COPIED" ) );
+		Text_PaintCenter( centerPoint, yStart + 340, font, scale, colorLtGrey, s, 0 );
 	} else {
 		if ( ( uiInfo.uiDC.realTime - downloadTime ) / 1000 ) {
 			xferRate = downloadCount / ( ( uiInfo.uiDC.realTime - downloadTime ) / 1000 );
@@ -3721,13 +3784,16 @@ static void UI_DisplayDownloadInfo( const char *downloadName, float centerPoint,
 			UI_PrintTime( dlTimeBuf, sizeof dlTimeBuf, timeleft );
 
 			trap_R_Text_Paint( 264, yStart + 235, font, scale, colorLtGrey, dlTimeBuf, 0, 0, ITEM_TEXTSTYLE_SHADOWED );
-			Text_PaintCenter( centerPoint, yStart + 320, font, scale, colorLtGrey, va( "(%s %s %s %s)", dlSizeBuf, UI_SafeTranslateString( "EXE_OF" ), totalSizeBuf, UI_SafeTranslateString( "EXE_COPIED" ) ), 0 );
+			s = va( "(%s %s %s %s)", dlSizeBuf, UI_SafeTranslateString( "EXE_OF" ), totalSizeBuf, UI_SafeTranslateString( "EXE_COPIED" ) );
+			Text_PaintCenter( centerPoint, yStart + 320, font, scale, colorLtGrey, s, 0 );
 		} else {
 			Text_PaintCenter( centerPoint, yStart + 235, font, scale, colorLtGrey, UI_SafeTranslateString( "EXE_ESTIMATING" ), 0 );
 			if ( downloadSize ) {
-				Text_PaintCenter( centerPoint, yStart + 320, font, scale, colorLtGrey, va( "(%s %s %s %s)", dlSizeBuf, UI_SafeTranslateString( "EXE_OF" ), totalSizeBuf, UI_SafeTranslateString( "EXE_COPIED" ) ), 0 );
+				s = va( "(%s %s %s %s)", dlSizeBuf, UI_SafeTranslateString( "EXE_OF" ), totalSizeBuf, UI_SafeTranslateString( "EXE_COPIED" ) );
+				Text_PaintCenter( centerPoint, yStart + 320, font, scale, colorLtGrey, s, 0 );
 			} else {
-				Text_PaintCenter( centerPoint, yStart + 320, font, scale, colorLtGrey, va( "(%s %s)", dlSizeBuf, UI_SafeTranslateString( "EXE_COPIED" ) ), 0 );
+				s = va( "(%s %s)", dlSizeBuf, UI_SafeTranslateString( "EXE_COPIED" ) );
+				Text_PaintCenter( centerPoint, yStart + 320, font, scale, colorLtGrey, s, 0 );
 			}
 		}
 
@@ -3739,7 +3805,7 @@ static void UI_DisplayDownloadInfo( const char *downloadName, float centerPoint,
 
 /*
 ========================
-UI_DrawConnectScreen  0x4000E4E0
+UI_DrawConnectScreen
 
 This will also be overlaid on the cgame info screen during loading
 to prevent it from blinking away too rapidly on local or lan games.
@@ -3761,39 +3827,40 @@ void UI_DrawConnectScreen( qboolean overlay ) {
 	if ( !overlay && menu ) {
 		Menu_Paint( menu, qtrue );
 	} else {
-		UI_FillRect( 0, 0, 640, 96, colorBlack );	// 0x4000E53A: retail fills 640 x 96, not the full screen
+		UI_FillRect( 0, 0, SCREEN_WIDTH, 96, colorBlack );
 	}
 
 	// see what information we should display
 	trap_GetClientState( &cstate );
 
-	if ( cstate.connState >= CA_LOADING ) {
-		if ( Q_stricmp( cstate.servername, "Auto-Updater" ) ) {
-			info[0] = '\0';
-			if ( trap_GetConfigString( CS_SERVERINFO, info, sizeof( info ) ) ) {
-				Text_PaintCenter( 320, 55, 0, 0.5, colorWhite, UI_SafeTranslateString( UI_GetGameTypeDisplayName( Info_ValueForKey( info, "g_gametype" ) ) ), 0 );
-				Text_PaintCenter( 320, 85, 0, 0.5, colorWhite, va( "%s", Info_ValueForKey( info, "mapname" ) ), 0 );
-			}
-		}
-	} else if ( !Q_stricmp( cstate.servername,"localhost" ) ) {
-		Text_PaintCenter( 320, 55, 0, 0.5, colorWhite, va( "%s - %s", UI_SafeTranslateString( "EXE_COD_MULTIPLAYER" ), "1.1" ), 0 );
-	} else {
-		if ( !Q_stricmp( cstate.servername, "Auto-Updater" ) ) {
-			trap_Cvar_VariableStringBuffer( "cl_downloadName", downloadName, sizeof( downloadName ) );
-			if ( *downloadName ) {
-				trap_Cvar_VariableStringBuffer( "cl_updateversion", downloadName, sizeof( downloadName ) );
-				strcpy( text, va( UI_SafeTranslateString( "EXE_DOWNLOADINGUPDATE" ), downloadName ) );
+	if ( cstate.connState < CA_LOADING ) {
+		if ( !Q_stricmp( cstate.servername,"localhost" ) ) {
+			Text_PaintCenter( 320, 55, UI_FONT_DEFAULT, 0.5, colorWhite, va( "%s - %s", UI_SafeTranslateString( "EXE_COD_MULTIPLAYER" ), "1.1" ), 0 );
+		} else {
+			if ( !Q_stricmp( cstate.servername, "Auto-Updater" ) ) {
+				trap_Cvar_VariableStringBuffer( "cl_downloadName", downloadName, sizeof( downloadName ) );
+				if ( *downloadName ) {
+					trap_Cvar_VariableStringBuffer( "cl_updateversion", downloadName, sizeof( downloadName ) );
+					strcpy( text, va( UI_SafeTranslateString( "EXE_DOWNLOADINGUPDATE" ), downloadName ) );
+				} else {
+					strcpy( text, va( UI_SafeTranslateString( "EXE_CONNECTINGTO" ), cstate.servername ) );
+				}
 			} else {
 				strcpy( text, va( UI_SafeTranslateString( "EXE_CONNECTINGTO" ), cstate.servername ) );
 			}
-		} else {
-			strcpy( text, va( UI_SafeTranslateString( "EXE_CONNECTINGTO" ), cstate.servername ) );
+			Text_PaintCenter( 320, 55, UI_FONT_DEFAULT, 0.5, colorWhite, text, 0 );
 		}
-		Text_PaintCenter( 320, 55, 0, 0.5, colorWhite, text, 0 );
+	} else if ( Q_stricmp( cstate.servername, "Auto-Updater" ) ) {
+		info[0] = '\0';
+		if ( trap_GetConfigString( CS_SERVERINFO, info, sizeof( info ) ) ) {
+			s = UI_SafeTranslateString( UI_GetGameTypeDisplayName( Info_ValueForKey( info, "g_gametype" ) ) );
+			Text_PaintCenter( 320, 55, UI_FONT_DEFAULT, 0.5, colorWhite, s, 0 );
+			Text_PaintCenter( 320, 85, UI_FONT_DEFAULT, 0.5, colorWhite, va( "%s", Info_ValueForKey( info, "mapname" ) ), 0 );
+		}
 	}
 
 	// display global MOTD at bottom
-	Text_PaintCenter( 320, 460, 0, 0.5, colorWhite, Info_ValueForKey( cstate.updateInfoString, "motd" ), 0 );
+	Text_PaintCenter( 320, 460, UI_FONT_DEFAULT, 0.5, colorWhite, Info_ValueForKey( cstate.updateInfoString, "motd" ), 0 );
 
 	// print any server info (server full, bad version, etc)
 	// DHM - Nerve :: This now accepts strings up to 256 chars long, and will break them up into multiple lines.
@@ -3818,9 +3885,10 @@ void UI_DrawConnectScreen( qboolean overlay ) {
 
 			// if out of temp buffer room OR end of string OR it is time to linebreak & we've found a space
 			if ( ( index >= 58 ) || ( i == ( len - 1 ) ) || ( neednewline && s[i] == ' ' ) ) {
-				ps[index + 1] = '\0';
+				// keep: pointer store, not buf[len]
+				*( ps + index + 1 ) = '\0';
 
-				Text_PaintCenter( 320, yPrint, 0, 0.5, colorYellow, ps, 0 );
+				Text_PaintCenter( 320, yPrint, UI_FONT_DEFAULT, 0.5, colorYellow, ps, 0 );
 
 				neednewline = qfalse;
 				yPrint += 22;       // next line
@@ -3840,7 +3908,7 @@ void UI_DrawConnectScreen( qboolean overlay ) {
 	case CA_CONNECTED:
 		trap_Cvar_VariableStringBuffer( "cl_downloadName", downloadName, sizeof( downloadName ) );
 		if ( *downloadName ) {
-			UI_DisplayDownloadInfo( downloadName, 320, 55, 0, 0.5 );
+			UI_DisplayDownloadInfo( downloadName, 320, 55, UI_FONT_DEFAULT, 0.5 );
 			return;
 		}
 		s = UI_SafeTranslateString( "EXE_AWAITINGGAMESTATE" );
@@ -3851,7 +3919,7 @@ void UI_DrawConnectScreen( qboolean overlay ) {
 
 
 	if ( s && Q_stricmp( cstate.servername,"localhost" ) ) {
-		Text_PaintCenter( 320, 85, 0, 0.5, colorWhite, s, 0 );
+		Text_PaintCenter( 320, 85, UI_FONT_DEFAULT, 0.5, colorWhite, s, 0 );
 	}
 
 	// password required / connection rejected information goes here
@@ -3864,156 +3932,12 @@ cvars
 ================
 */
 
-vmCvar_t ui_arenasFile;
-vmCvar_t ui_allowVote;
-vmCvar_t ui_brass;
-vmCvar_t ui_marks;
 
-vmCvar_t ui_server1;
-vmCvar_t ui_server2;
-vmCvar_t ui_server3;
-vmCvar_t ui_server4;
-vmCvar_t ui_server5;
-vmCvar_t ui_server6;
-vmCvar_t ui_server7;
-vmCvar_t ui_server8;
-vmCvar_t ui_server9;
-vmCvar_t ui_server10;
-vmCvar_t ui_server11;
-vmCvar_t ui_server12;
-vmCvar_t ui_server13;
-vmCvar_t ui_server14;
-vmCvar_t ui_server15;
-vmCvar_t ui_server16;
-
-vmCvar_t ui_dedicated;
-vmCvar_t ui_smallFont;
-vmCvar_t ui_bigFont;
-vmCvar_t ui_extraBigFont;
-vmCvar_t ui_cdkeychecked;
-
-vmCvar_t ui_selectedPlayer;
-vmCvar_t ui_netSource;
-vmCvar_t ui_menuFiles;
-vmCvar_t ui_gameType;
-vmCvar_t ui_joinGameType;
-vmCvar_t ui_netGameType;
-vmCvar_t ui_netGameTypeName;
-
-vmCvar_t ui_newScriptMenu;
-vmCvar_t ui_newScriptMenuIndex;
-vmCvar_t ui_scriptMenu;
-vmCvar_t ui_scriptMenuIndex;
-vmCvar_t ui_scriptMenuAllowResponse;
-vmCvar_t ui_waitingScriptMenu;
-vmCvar_t ui_waitingScriptMenuIndex;
-vmCvar_t ui_waitingScriptMenuNoMouse;
-
-// NERVE - SMF - cvars for multiplayer
-vmCvar_t ui_mapIndex;
-vmCvar_t ui_currentMap;
-vmCvar_t ui_currentNetMap;
-
-vmCvar_t ui_browserMaster;
-vmCvar_t ui_browserGameType;
-vmCvar_t ui_browserSortKey;
-vmCvar_t ui_browserShowFull;
-vmCvar_t ui_browserShowEmpty;
-vmCvar_t ui_browserShowPassword;
-vmCvar_t ui_browserShowNoPassword;
-
-vmCvar_t ui_serverStatusTimeOut;
-
-vmCvar_t ui_cmd;
-
-vmCvar_t ui_isSpectator;
-// -NERVE - SMF
-
-vmCvar_t ui_hudAlpha;
-
-vmCvar_t cl_languagewarnings;
-vmCvar_t cl_languagewarningsaserrors;
-
-/* 0x40036AE8, 56 rows */
-cvarTable_t cvarTable[] = {
-	{ &ui_arenasFile, "g_arenasFile", "", CVAR_INIT | CVAR_ROM },
-
-	{ &ui_allowVote, "g_allowvote", "1", CVAR_ARCHIVE },
-
-	{ &ui_brass, "cg_brass", "1", CVAR_ARCHIVE },
-	{ &ui_marks, "cg_marks", "1", CVAR_ARCHIVE },
-
-	{ &ui_server1, "server1", "", CVAR_ARCHIVE },
-	{ &ui_server2, "server2", "", CVAR_ARCHIVE },
-	{ &ui_server3, "server3", "", CVAR_ARCHIVE },
-	{ &ui_server4, "server4", "", CVAR_ARCHIVE },
-	{ &ui_server5, "server5", "", CVAR_ARCHIVE },
-	{ &ui_server6, "server6", "", CVAR_ARCHIVE },
-	{ &ui_server7, "server7", "", CVAR_ARCHIVE },
-	{ &ui_server8, "server8", "", CVAR_ARCHIVE },
-	{ &ui_server9, "server9", "", CVAR_ARCHIVE },
-	{ &ui_server10, "server10", "", CVAR_ARCHIVE },
-	{ &ui_server11, "server11", "", CVAR_ARCHIVE },
-	{ &ui_server12, "server12", "", CVAR_ARCHIVE },
-	{ &ui_server13, "server13", "", CVAR_ARCHIVE },
-	{ &ui_server14, "server14", "", CVAR_ARCHIVE },
-	{ &ui_server15, "server15", "", CVAR_ARCHIVE },
-	{ &ui_server16, "server16", "", CVAR_ARCHIVE },
-
-	{ &ui_dedicated, "ui_dedicated", "0", CVAR_ARCHIVE },
-	{ &ui_smallFont, "ui_smallFont", "0.25", CVAR_ARCHIVE},
-	{ &ui_bigFont, "ui_bigFont", "0.4", CVAR_ARCHIVE},
-	{ &ui_extraBigFont, "ui_extraBigFont", "0.55", CVAR_ARCHIVE},
-	{ &ui_cdkeychecked, "ui_cdkeychecked", "0", CVAR_ROM },
-	{ &ui_selectedPlayer, "cg_selectedPlayer", "0", CVAR_ARCHIVE},
-	{ &ui_netSource, "ui_netSource", "0", CVAR_ARCHIVE },
-	{ &ui_menuFiles, "ui_menuFiles", "ui_mp/menus.txt", 0 },
-	{ &ui_gameType, "ui_gametype", "3", CVAR_ARCHIVE },
-	{ &ui_joinGameType, "ui_joinGametype", "0", CVAR_ARCHIVE },
-	{ &ui_netGameType, "ui_netGametype", "0", CVAR_ARCHIVE },                 // NERVE - SMF - hardwired for now
-	{ &ui_netGameTypeName, "ui_netGametypeName", "", CVAR_ARCHIVE },
-
-	{ &ui_newScriptMenu, "ui_newScriptMenu", "", CVAR_ROM },
-	{ &ui_newScriptMenuIndex, "ui_newScriptMenuIndex", "-1", CVAR_ROM },
-	{ &ui_scriptMenu, "ui_scriptMenu", "", CVAR_ROM },
-	{ &ui_scriptMenuIndex, "ui_scriptMenuIndex", "-1", CVAR_ROM },
-	{ &ui_scriptMenuAllowResponse, "ui_scriptMenuAllowResponse", "1", CVAR_ROM },
-	{ &ui_waitingScriptMenu, "ui_waitingScriptMenu", "", CVAR_ROM },
-	{ &ui_waitingScriptMenuIndex, "ui_waitingScriptMenuIndex", "-1", CVAR_ROM },
-	{ &ui_waitingScriptMenuNoMouse, "ui_waitingScriptMenuNoMouse", "0", CVAR_ROM },
-
-	// NERVE - SMF - multiplayer cvars
-	{ &ui_mapIndex, "ui_mapIndex", "0", CVAR_ARCHIVE },
-	{ &ui_currentMap, "ui_currentMap", "0", CVAR_ARCHIVE },
-	{ &ui_currentNetMap, "ui_currentNetMap", "0", CVAR_ARCHIVE },
-
-	{ &ui_browserMaster, "ui_browserMaster", "0", CVAR_ARCHIVE },
-	{ &ui_browserGameType, "ui_browserGameType", "0", CVAR_ARCHIVE },
-	{ &ui_browserSortKey, "ui_browserSortKey", "4", CVAR_ARCHIVE },
-	{ &ui_browserShowFull, "ui_browserShowFull", "1", CVAR_ARCHIVE },
-	{ &ui_browserShowEmpty, "ui_browserShowEmpty", "1", CVAR_ARCHIVE },
-	{ &ui_browserShowPassword, "ui_browserShowPassword", "1", CVAR_ARCHIVE },
-	{ &ui_browserShowNoPassword, "ui_browserShowNoPassword", "1", CVAR_ARCHIVE },
-
-	{ &ui_serverStatusTimeOut, "ui_serverStatusTimeOut", "7000", CVAR_ARCHIVE},
-
-	{ &ui_cmd, "ui_cmd", "", 0 },
-
-	{ &ui_isSpectator, "ui_isSpectator", "1", 0 },
-	// -NERVE - SMF
-
-	{ &ui_hudAlpha, "cg_hudAlpha", "1.0", CVAR_ARCHIVE },
-
-	{ &cl_languagewarnings, "cl_languagewarnings", "0", 0 },
-	{ &cl_languagewarningsaserrors, "cl_languagewarningsaserrors", "0", 0 }
-};
-
-int cvarTableSize = sizeof( cvarTable ) / sizeof( cvarTable[0] );  /* 0x40036E68 */
 
 
 /*
 =================
-UI_RegisterCvars  0x4000E940
+UI_RegisterCvars
 =================
 */
 void UI_RegisterCvars( void ) {
@@ -4027,7 +3951,7 @@ void UI_RegisterCvars( void ) {
 
 /*
 =================
-UI_UpdateCvars  0x4000E980
+UI_UpdateCvars
 =================
 */
 void UI_UpdateCvars( void ) {
@@ -4042,7 +3966,7 @@ void UI_UpdateCvars( void ) {
 // NERVE - SMF
 /*
 =================
-ArenaServers_StopRefresh  0x4000E9B0
+ArenaServers_StopRefresh
 =================
 */
 static void UI_StopServerRefresh( void ) {
@@ -4067,7 +3991,7 @@ static void UI_StopServerRefresh( void ) {
 
 /*
 =================
-UI_DoServerRefresh  0x4000EA00
+UI_DoServerRefresh
 =================
 */
 static void UI_DoServerRefresh( void ) {
@@ -4109,7 +4033,7 @@ static void UI_DoServerRefresh( void ) {
 
 /*
 =================
-UI_StartServerRefresh  0x4000EA90
+UI_StartServerRefresh
 =================
 */
 static void UI_StartServerRefresh( qboolean full ) {
@@ -4152,9 +4076,8 @@ static void UI_StartServerRefresh( qboolean full ) {
 }
 // -NERVE - SMF
 
-/* ---- UI_ConfigString  0x4000EC00 -- the DC's configString ---- */
 const char *UI_ConfigString( int index ) {
-	static char buff[MAX_STRING_CHARS];             /* 0x4005AD88 */
+	static char buff[MAX_STRING_CHARS];
 
 	trap_GetConfigString( index, buff, sizeof( buff ) );
 	return buff;
@@ -4162,14 +4085,14 @@ const char *UI_ConfigString( int index ) {
 
 /*
 =================
-UI_SafeTranslateString  0x4000EC20
+UI_SafeTranslateString
 
 The DC's safeTranslateString: the reference's translation, or the reference
-itself (marked ^1UNLOCALIZED when cl_languagewarnings is on).
+itself (marked ^1UNLOCALIZED when ui_languagewarnings is on).
 =================
 */
 const char *UI_SafeTranslateString( const char *reference ) {
-	static char buffer[1024];                       /* 0x40052560 */
+	static char buffer[1024];
 	const char *s;
 
 	s = trap_SE_TranslateReference( reference );
@@ -4177,8 +4100,8 @@ const char *UI_SafeTranslateString( const char *reference ) {
 		return s;
 	}
 
-	if ( cl_languagewarnings.integer ) {
-		if ( cl_languagewarningsaserrors.integer ) {
+	if ( ui_languagewarnings.integer ) {
+		if ( ui_languagewarningsaserrors.integer ) {
 			Com_Error( ERR_LOCALIZATION, "Could not translate ui string \"%s\"", reference );
 		} else {
 			Com_Printf( "^3WARNING: Could not translate ui string \"%s\"\n", reference );
@@ -4193,22 +4116,24 @@ const char *UI_SafeTranslateString( const char *reference ) {
 	return buffer;
 }
 
-/*
- * The unit's tail: four functions the Mac symbols do not name.  0x4000ED20
- * and 0x4000ED30 are one `retn` each; 0x4000ED40 returns its float argument
- * on the FPU stack; 0x4000ED50 truncates its float argument less 0.5 - 2^-30
- * to an int.  Nothing in the DLL calls any of them.
- */
-void nullsub_6( void ) {
+// unused
+void UI_UnusedStub2( void ) {
 }
 
-void nullsub_7( void ) {
+void UI_UnusedStub3( void ) {
 }
 
-float sub_4000ED40( float a1 ) {
-	return a1;
+float UI_UnusedFloatIdentity( float value ) {
+	return value;
 }
 
-int sub_4000ED50( float a1 ) {
-	return (int)( a1 - 0.4999999990686774 );
+int UI_FloorToInt( float f ) {
+	double  bias = 0.4999999990686774;	// 0.5 - 2^-30
+	int     i;
+
+	__asm fld f
+	__asm fsub bias
+	__asm fistp i
+
+	return i;
 }

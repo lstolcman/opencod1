@@ -4,12 +4,16 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "tr_records.h"
 #include "tr_gl_types.h"
 #include "tr_orientation.h"   /* backEnd.or 0x016D8DA8 -- one object, not 16 shards */
 #include "tr_tess.h"
+#include "tr_local.h"
+/* ---- renderer-owned globals ---- */
+int facing[16384];                      /* 0x011EECE0 */
+int edgeDefs[524288];                   /* 0x011FECE0 */
+int shadow_numEdgeDefs[8194];   /* 0x013FECE0 */
+
 
 extern int GL_Bind();
 extern int GL_State();
@@ -17,445 +21,365 @@ extern int RB_BeginImmediateMode();
 extern int RB_glVertex3f();
 extern int R_FogOn();
 
-/* ---- R_AddEdgeDef  0x00512990 ----  [HIGH] */
-int __cdecl R_AddEdgeDef(int a1, int a2, int a3)
-{
-  int v3;
-  int result;
 
-  v3 = dword_13FECE0[a1];
-  if ( v3 != 32 )
+/* ------------------------------------------------------------------------- *
+ *  Shadow-volume scratch tables (facing, edgeDefs, shadow_numEdgeDefs above).
+ *
+ *  The stencil-shadow builder needs, per silhouette pass, an edge table keyed
+ *  by first vertex.  edgeDefs holds up to MAX_EDGE_DEFS {secondVertex,facing}
+ *  pairs per vertex; numEdgeDefs (shadow_numEdgeDefs) is the parallel per-vertex
+ *  count; facing[] flags whether each triangle faces the light.  edgeDefs is
+ *  retail's edgeDef_t[][MAX_EDGE_DEFS] ({secondVertex, facing}, 8 bytes) held
+ *  as a flat int[] in the blob (retail 0x011FECE4 is edgeDefs[0][0].facing --
+ *  the +4 alias).  Indexing the int[] directly (EDGE_I2 / EDGE_FACING) lets VC7
+ *  fold the table base into the displacement as retail does; a cast
+ *  edgeDef_t (*)[MAX_EDGE_DEFS] pointer emits a lea instead.
+ *
+ *  Only the first half of tess.xyz may hold shadow-source vertices; the loop
+ *  in RB_ShadowTessEnd fills the second half with the light-extruded copy, so
+ *  vertex v pairs with the extruded vertex (v + tess.numVertexes).
+ * ------------------------------------------------------------------------- */
+#define MAX_EDGE_DEFS   32
+
+#define EDGE_I2( v, n )       edgeDefs[2 * ( MAX_EDGE_DEFS * (v) + (n) )]
+#define EDGE_FACING( v, n )   edgeDefs[2 * ( MAX_EDGE_DEFS * (v) + (n) ) + 1]
+
+#define numEdgeDefs   shadow_numEdgeDefs   /* per-vertex edge counts (0x013FECE0) */
+
+/* The shadow code reads e.shadowPlane (+0x18) and lightDir (+0xa4) of the
+ * current entity (tr_local.h trRefEntity_t). */
+typedef trRefEntity_t shadowEntity_t;
+ASSERT_OFF(shadowEntity_t, e.shadowPlane, 0x18);
+ASSERT_OFF(shadowEntity_t, lightDir,    0xa4);
+
+/* File-local copies of tr_debug.c's RB_glVertex3f / RB_glVertex3fv with
+ * retail's float parameters.  Retail inlines them into R_RenderShadowEdges and
+ * moves each coordinate through the x87 (fld / fstp); the int bit-pattern
+ * versions in tr_debug.c would use integer moves here.  The view mirrors
+ * tr_debug.c's debugVertex_t with xyz typed as float. */
+typedef struct {
+	float xyz[3];         /* +0x00 */
+	int   s;              /* +0x0c */
+	int   t;              /* +0x10 */
+	float lightmap[2];   /* +0x14  polyVert_t's lightmap ST (tr_surface.c); unused here */
+	byte  color[4];       /* +0x1c  RGBA8 */
+} shadowVertex_t;
+COD1_ASSERT_SIZE(shadowVertex_t, 0x20);
+
+static void RB_ShadowVertex3f( float x, float y, float z )
+{
+  shadowVertex_t *v;
+
+  if ( rendererDebugState.immediateVertexCount < rendererDebugState.immediateVertexCapacity )
   {
-    result = 2 * (v3 + 32 * a1);
-    edgeDefs[result] = a2;
-    dword_11FECE4[result] = a3;
-    dword_13FECE0[a1] = v3 + 1;
+    v = &((shadowVertex_t *)rendererDebugState.immediateVertices)[rendererDebugState.immediateVertexCount];
+    v->color[0] = rendererDebugState.immediateColorR;
+    v->color[1] = rendererDebugState.immediateColorG;
+    v->color[2] = rendererDebugState.immediateColorB;
+    v->color[3] = rendererDebugState.immediateColorA;
+    v->s = (*(int *)&rendererDebugState.immediateTexCoordS);
+    v->t = (*(int *)&rendererDebugState.immediateTexCoordT);
+    v->xyz[0] = x;
+    v->xyz[1] = y;
+    v->xyz[2] = z;
+    ++rendererDebugState.immediateVertexCount;
   }
-  return result * 4;
 }
 
-/* ---- R_RenderShadowEdges  0x005129D0 ----  VERIFIED */
+static void RB_ShadowVertex3fv( const float *v )
+{
+  RB_ShadowVertex3f( v[0], v[1], v[2] );
+}
+
+/* ---- R_AddEdgeDef  0x00512990 ----  [HIGH]
+ * Append one directed edge (i1 -> i2, carrying the source triangle's facing
+ * flag) to i1's edge list, dropping it on overflow. */
+void __cdecl R_AddEdgeDef( int i1, int i2, int facingFlag )
+{
+  int c;
+
+  c = numEdgeDefs[i1];
+  if ( c == MAX_EDGE_DEFS )
+    return;   /* overflow */
+  EDGE_I2( i1, c )     = i2;
+  EDGE_FACING( i1, c ) = facingFlag;
+
+  numEdgeDefs[i1] = c + 1;
+}
+
+/* ---- R_RenderShadowEdges  0x005129D0 ----  VERIFIED
+ * Draw the silhouette edges of the shadow volume as light-extruded quads.  An
+ * edge is a silhouette edge unless it has a reverse-paired edge that also
+ * faces the light (a well-formed closed hull has exactly two faces per edge,
+ * but many models have dangling / overfanned edges).  Each surviving edge is
+ * emitted as a GL_TRIANGLE_STRIP of {front[i], back[i], front[i2], back[i2]}
+ * through the immediate-mode vertex buffer (RB_glBegin / RB_glVertex3fv /
+ * RB_glEnd inlined; each vertex address is formed just before its call). */
 void R_RenderShadowEdges()
 {
-  int v0;
-  GLsizei v1;
-  int *v2;
-  int v3;
-  int v4;
-  int *v5;
-  int v6;
-  double v7;
-  double v8;
-  double v9;
-  char *v10;
-  int v11;
-  int v12;
-  double v13;
-  double v14;
-  double v15;
-  char *v16;
-  int v17;
-  double v18;
-  double v19;
-  double v20;
-  char *v21;
-  int v22;
-  int v23;
-  double v24;
-  double v25;
-  double v26;
-  char *v27;
-  int v28;
-  int v29;
-  int v30;
-  int *v31;
+  int i;
+  int c;
+  int j;
+  int i2;
+  int c2;
+  int k;
   int hit[2];
 
   RB_BeginImmediateMode();
-  v0 = 0;
-  if ( tess_numVertexes > 0 )
+
+  for ( i = 0; i < tess_numVertexes; i++ )
   {
-    v1 = rbDebug_immediateVertexCount;
-    v2 = edgeDefs;
-    v31 = edgeDefs;
-    do
+    c = numEdgeDefs[i];
+    for ( j = 0; j < c; j++ )
     {
-      if ( dword_13FECE0[v0] > 0 )
+      if ( !EDGE_FACING( i, j ) )
+        continue;
+
+      hit[0] = 0;
+      hit[1] = 0;
+
+      /* count reverse edges (i2 -> i) by their facing */
+      i2 = EDGE_I2( i, j );
+      c2 = numEdgeDefs[i2];
+      for ( k = 0; k < c2; k++ )
       {
-        v30 = dword_13FECE0[v0];
-        do
-        {
-          if ( v2[1] )
-          {
-            v3 = *v2;
-            v4 = dword_13FECE0[*v2];
-            hit[0] = 0;
-            hit[1] = 0;
-            if ( v4 <= 0 )
-              goto LABEL_12;
-            v5 = &dword_11FECE4[64 * v3];
-            v6 = v4;
-            do
-            {
-              if ( *(v5 - 1) == v0 )
-                ++hit[*v5];
-              v5 += 2;
-              --v6;
-            }
-            while ( v6 );
-            if ( !hit[1] )
-            {
-LABEL_12:
-              v7 = *(float *)&dword_17BFF68[v0 * tess_vertexComponentCount];
-              v8 = flt_17BFF64[v0 * tess_vertexComponentCount];
-              v9 = *(float *)&tess_xyz[v0 * tess_vertexComponentCount];
-              mode = 5;
-              if ( v1 < rbDebug_immediateVertexCapacity )
-              {
-                v10 = (char *)rbDebug_immediateVertices + 32 * v1;
-                v10[28] = rbDebug_immediateColorR;
-                v10[29] = rbDebug_immediateColorG;
-                v10[30] = rbDebug_immediateColorB;
-                v10[31] = rbDebug_immediateColorA;
-                *((_DWORD *)v10 + 3) = rbDebug_immediateTexCoordS;
-                v11 = rbDebug_immediateTexCoordT;
-                *(float *)v10 = v9;
-                *((_DWORD *)v10 + 4) = v11;
-                *((float *)v10 + 1) = v8;
-                *((float *)v10 + 2) = v7;
-                v1 = ++rbDebug_immediateVertexCount;
-              }
-              v12 = tess_vertexComponentCount * (v0 + tess_numVertexes);
-              v13 = *(float *)&dword_17BFF68[v12];
-              v14 = flt_17BFF64[v12];
-              v15 = *(float *)&tess_xyz[v12];
-              if ( v1 < rbDebug_immediateVertexCapacity )
-              {
-                v16 = (char *)rbDebug_immediateVertices + 32 * v1;
-                v16[28] = rbDebug_immediateColorR;
-                v16[29] = rbDebug_immediateColorG;
-                v16[30] = rbDebug_immediateColorB;
-                v16[31] = rbDebug_immediateColorA;
-                *((_DWORD *)v16 + 3) = rbDebug_immediateTexCoordS;
-                v17 = rbDebug_immediateTexCoordT;
-                *(float *)v16 = v15;
-                *((_DWORD *)v16 + 4) = v17;
-                *((float *)v16 + 1) = v14;
-                *((float *)v16 + 2) = v13;
-                v1 = ++rbDebug_immediateVertexCount;
-              }
-              v18 = *(float *)&dword_17BFF68[v3 * tess_vertexComponentCount];
-              v19 = flt_17BFF64[v3 * tess_vertexComponentCount];
-              v20 = *(float *)&tess_xyz[v3 * tess_vertexComponentCount];
-              if ( v1 < rbDebug_immediateVertexCapacity )
-              {
-                v21 = (char *)rbDebug_immediateVertices + 32 * v1;
-                v21[28] = rbDebug_immediateColorR;
-                v21[29] = rbDebug_immediateColorG;
-                v21[30] = rbDebug_immediateColorB;
-                v21[31] = rbDebug_immediateColorA;
-                *((_DWORD *)v21 + 3) = rbDebug_immediateTexCoordS;
-                v22 = rbDebug_immediateTexCoordT;
-                *(float *)v21 = v20;
-                *((_DWORD *)v21 + 4) = v22;
-                *((float *)v21 + 1) = v19;
-                *((float *)v21 + 2) = v18;
-                v1 = ++rbDebug_immediateVertexCount;
-              }
-              v23 = tess_vertexComponentCount * (tess_numVertexes + v3);
-              v24 = *(float *)&dword_17BFF68[v23];
-              v25 = flt_17BFF64[v23];
-              v26 = *(float *)&tess_xyz[v23];
-              if ( v1 < rbDebug_immediateVertexCapacity )
-              {
-                v27 = (char *)rbDebug_immediateVertices + 32 * v1;
-                v27[28] = rbDebug_immediateColorR;
-                v27[29] = rbDebug_immediateColorG;
-                v27[30] = rbDebug_immediateColorB;
-                v27[31] = rbDebug_immediateColorA;
-                *((_DWORD *)v27 + 3) = rbDebug_immediateTexCoordS;
-                v28 = rbDebug_immediateTexCoordT;
-                *(float *)v27 = v26;
-                *((_DWORD *)v27 + 4) = v28;
-                *((float *)v27 + 1) = v25;
-                *((float *)v27 + 2) = v24;
-                v1 = ++rbDebug_immediateVertexCount;
-              }
-              glDrawArrays(mode, 0, v1);
-              v1 = 0;
-              rbDebug_immediateVertexCount = 0;
-              mode = 0;
-            }
-          }
-          v2 += 2;
-          --v30;
-        }
-        while ( v30 );
+        if ( EDGE_I2( i2, k ) == i )
+          hit[EDGE_FACING( i2, k )]++;
       }
-      ++v0;
-      v2 = v31 + 64;
-      v31 += 64;
-    }
-    while ( v0 < tess_numVertexes );
-  }
-  rbDebug_immediateModeActive = 0;
-  if ( !backEnd_projection2D && (glState_glStateBits & 0x200000) == 0 )
-  {
-    if ( r_fog->integer )
-    {
-      v29 = dword_16C4BB0;
-      if ( (backEnd_refdef_rdflags & 8) == 0 )
-        v29 = glfogNum;
-      if ( v29 )
+
+      /* not a silhouette edge if a reverse front-facing edge shares it */
+      if ( hit[1] == 0 )
       {
-        glEnable(0xB60u);
-        glState_glStateBits |= 0x200000u;
+        rendererDebugState.immediateMode = 5;                                   /* GL_TRIANGLE_STRIP */
+        RB_ShadowVertex3fv( &tess_xyz[i * tess_vertexComponentCount] );
+        RB_ShadowVertex3fv( &tess_xyz[(i + tess_numVertexes) * tess_vertexComponentCount] );
+        RB_ShadowVertex3fv( &tess_xyz[i2 * tess_vertexComponentCount] );
+        RB_ShadowVertex3fv( &tess_xyz[(i2 + tess_numVertexes) * tess_vertexComponentCount] );
+        glDrawArrays( rendererDebugState.immediateMode, 0, rendererDebugState.immediateVertexCount );
+        rendererDebugState.immediateVertexCount = 0;
+        rendererDebugState.immediateMode = 0;
       }
     }
   }
-  glVertexPointer(3, 0x1406u, 0, tess_xyz);
+
+  /* RB_EndImmediateMode inlined: leave immediate mode and restore fog / xyz */
+  rendererDebugState.immediateModeActive = 0;
+  R_FogOn();
+  glVertexPointer( 3, 0x1406u, 0, tess_xyz );        /* GL_FLOAT */
 }
 
-/* ---- RB_ShadowTessEnd  0x00512D60 ----  [HIGH] */
+/* ---- RB_ShadowTessEnd  0x00512D60 ----  [HIGH]
+ * Build and render one entity's stencil shadow volume from the current tess.
+ * Extrudes every vertex away from the light, tags each triangle's facing,
+ * builds the edge table, then renders the silhouette twice (increment on the
+ * back-facing pass, decrement on the front-facing pass) into the stencil.
+ * CrossProduct is com_math.c's (/Op); retail inlines it, which is what stores
+ * d1 / d2 / normal / d to their slots.  The two cull blocks are open-coded
+ * (calling GL_Cull inlines with a different branch layout). */
 void RB_ShadowTessEnd()
 {
-  int v0;
-  int v1;
-  float *v2;
-  float *i;
-  int v4;
-  __int16 *v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  float v20;
-  __int16 *j;
-  float v22;
-  int v23;
-  float v24;
-  float v25;
-  float v26;
-  float v27;
-  float v28;
-  float v29;
-  float v30;
-  float v31;
-  float v32;
-  float v33;
-  float v34;
-  float v35;
-  float v36;
-  float v37;
+  vec3_t lightDir;
+  float *front;
+  float *back;
+  int    numTris;
+  int    i;
 
-  v0 = tess_numVertexes;
-  if ( tess_numVertexes < 4096 && glConfig_stencilBits >= 4 )
+  /* need room for the extruded copy (second half of tess.xyz) and a stencil */
+  if ( tess_numVertexes >= 4096 || glConfig_stencilBits < 4 )
+    return;
+
+  lightDir[0] = ((shadowEntity_t *)backEnd_currentEntity)->lightDir[0];
+  lightDir[1] = ((shadowEntity_t *)backEnd_currentEntity)->lightDir[1];
+  lightDir[2] = ((shadowEntity_t *)backEnd_currentEntity)->lightDir[2];
+
+  /* project each vertex 512 units away from the light into the second half */
+  front = tess_xyz;
+  back  = &tess_xyz[tess_numVertexes * tess_vertexComponentCount];
+  for ( i = 0; i < tess_numVertexes; front += tess_vertexComponentCount, back += tess_vertexComponentCount, ++i )
   {
-    v32 = *(float *)(backEnd_currentEntity + 164);
-    v33 = *(float *)(backEnd_currentEntity + 168);
-    v1 = 0;
-    v34 = *(float *)(backEnd_currentEntity + 172);
-    v2 = (float *)tess_xyz;
-    for ( i = (float *)(4 * tess_numVertexes * tess_vertexComponentCount + ((int)(char *)tess_xyz)); v1 < tess_numVertexes; ++v1 )
-    {
-      v20 = v32 * 512.0;
-      *i = *v2 - v20;
-      v22 = v33 * 512.0;
-      i[1] = v2[1] - v22;
-      v24 = v34 * 512.0;
-      i[2] = v2[2] - v24;
-      v2 += tess_vertexComponentCount;
-      i += tess_vertexComponentCount;
-      v0 = tess_numVertexes;
-    }
-    memset(dword_13FECE0, 0, 4 * v0);
-    v4 = 0;
-    v23 = tess_numIndexes / 3;
-    if ( tess_numIndexes / 3 > 0 )
-    {
-      v5 = word_17A7F62;
-      for ( j = word_17A7F62; ; v5 = j )
-      {
-        v6 = (unsigned __int16)*v5;
-        v7 = (unsigned __int16)*(v5 - 1);
-        v8 = (unsigned __int16)v5[1];
-        v29 = *(float *)&tess_xyz[v6 * tess_vertexComponentCount] - *(float *)&tess_xyz[v7 * tess_vertexComponentCount];
-        v30 = flt_17BFF64[v6 * tess_vertexComponentCount] - flt_17BFF64[v7 * tess_vertexComponentCount];
-        v31 = *(float *)&dword_17BFF68[v6 * tess_vertexComponentCount] - *(float *)&dword_17BFF68[v7 * tess_vertexComponentCount];
-        v26 = *(float *)&tess_xyz[v8 * tess_vertexComponentCount] - *(float *)&tess_xyz[v7 * tess_vertexComponentCount];
-        v27 = flt_17BFF64[v8 * tess_vertexComponentCount] - flt_17BFF64[v7 * tess_vertexComponentCount];
-        v28 = *(float *)&dword_17BFF68[v8 * tess_vertexComponentCount] - *(float *)&dword_17BFF68[v7 * tess_vertexComponentCount];
-        v35 = v28 * v30 - v27 * v31;
-        v36 = v26 * v31 - v28 * v29;
-        v37 = v27 * v29 - v26 * v30;
-        v25 = v37 * v34 + v36 * v33 + v35 * v32;
-        facing[v4] = v25 > 0.0;
-        v9 = dword_13FECE0[v7];
-        if ( v9 != 32 )
-        {
-          v10 = facing[v4];
-          v11 = 2 * (v9 + 32 * v7);
-          edgeDefs[v11] = v6;
-          dword_11FECE4[v11] = v10;
-          dword_13FECE0[v7] = v9 + 1;
-        }
-        v12 = dword_13FECE0[v6];
-        if ( v12 != 32 )
-        {
-          v13 = facing[v4];
-          v14 = 2 * (v12 + 32 * v6);
-          edgeDefs[v14] = v8;
-          dword_11FECE4[v14] = v13;
-          dword_13FECE0[v6] = v12 + 1;
-        }
-        v15 = dword_13FECE0[v8];
-        if ( v15 != 32 )
-        {
-          v16 = facing[v4];
-          v17 = 2 * (v15 + 32 * v8);
-          edgeDefs[v17] = v7;
-          dword_11FECE4[v17] = v16;
-          dword_13FECE0[v8] = v15 + 1;
-        }
-        ++v4;
-        j += 3;
-        if ( v4 >= v23 )
-          break;
-      }
-    }
-    GL_Bind((GLenum *)tr_whiteImage);
-    GL_State(18);
-    qglColor3f(0.2f, 0.2f, 0.2f);
-    qglColorMask(0, 0, 0, 0);
-    glEnable(0xB90u);
-    glStencilFunc(0x207u, 1, 0xFFu);
-    if ( glState_faceCulling != 1 )
-    {
-      if ( glState_faceCulling == 2 )
-        glEnable(0xB44u);
-      if ( backEnd_viewParms_isMirror )
-        v18 = 1028;
-      else
-        v18 = 1029;
-      qglCullFace(v18);
-      glState_faceCulling = 1;
-    }
-    glStencilOp(0x1E00u, 0x1E00u, 0x1E02u);
-    R_RenderShadowEdges();
-    if ( glState_faceCulling )
-    {
-      if ( glState_faceCulling == 2 )
-        glEnable(0xB44u);
-      if ( backEnd_viewParms_isMirror )
-        v19 = 1029;
-      else
-        v19 = 1028;
-      qglCullFace(v19);
-      glState_faceCulling = 0;
-    }
-    glStencilOp(0x1E00u, 0x1E00u, 0x1E03u);
-    R_RenderShadowEdges();
-    qglColorMask(1, 1, 1, 1);
+    back[0] = front[0] - lightDir[0] * 512.0f;
+    back[1] = front[1] - lightDir[1] * 512.0f;
+    back[2] = front[2] - lightDir[2] * 512.0f;
   }
+
+  /* decide which triangles face the light and build the edge table */
+  memset( numEdgeDefs, 0, 4 * tess_numVertexes );
+
+  numTris = tess_numIndexes / 3;
+  for ( i = 0; i < numTris; ++i )
+  {
+    int    i1, i2, i3;
+    vec3_t d1, d2, normal;
+    float *v1, *v2, *v3;
+    float  d;
+
+    i1 = tess_indexes[i * 3 + 0];
+    i2 = tess_indexes[i * 3 + 1];
+    i3 = tess_indexes[i * 3 + 2];
+
+    v1 = &tess_xyz[i1 * tess_vertexComponentCount];
+    v2 = &tess_xyz[i2 * tess_vertexComponentCount];
+    v3 = &tess_xyz[i3 * tess_vertexComponentCount];
+
+    d1[0] = v2[0] - v1[0];
+    d1[1] = v2[1] - v1[1];
+    d1[2] = v2[2] - v1[2];
+    d2[0] = v3[0] - v1[0];
+    d2[1] = v3[1] - v1[1];
+    d2[2] = v3[2] - v1[2];
+
+    CrossProduct( d1, d2, normal );
+
+    d = normal[2] * lightDir[2] + normal[1] * lightDir[1] + normal[0] * lightDir[0];
+    if ( d > 0.0f )
+      facing[i] = 1;
+    else
+      facing[i] = 0;
+
+    /* create the edges */
+    R_AddEdgeDef( i1, i2, facing[i] );
+    R_AddEdgeDef( i2, i3, facing[i] );
+    R_AddEdgeDef( i3, i1, facing[i] );
+  }
+
+  /* draw the silhouette edges into the stencil buffer */
+  GL_Bind( (GLenum *)tr_whiteImage );
+  GL_State( 18 );                                   /* 0x12  GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO */
+  qglColor3f( 0.2f, 0.2f, 0.2f );
+  qglColorMask( 0, 0, 0, 0 );                        /* don't touch the color buffer */
+  glEnable( 0xB90u );                                /* GL_STENCIL_TEST */
+  glStencilFunc( 0x207u, 1, 0xFFu );                 /* GL_ALWAYS, ref 1, mask 255 */
+
+  /* increment the stencil on back faces (mirrors reverse the culling) */
+  if ( glState_faceCulling != 1 )
+  {
+    if ( glState_faceCulling == 2 )
+      glEnable( 0xB44u );                            /* GL_CULL_FACE */
+    if ( backEnd_viewParms_isMirror )
+      qglCullFace( 0x404u );                         /* GL_FRONT */
+    else
+      qglCullFace( 0x405u );                         /* GL_BACK */
+    glState_faceCulling = 1;
+  }
+  glStencilOp( 0x1E00u, 0x1E00u, 0x1E02u );          /* GL_KEEP, GL_KEEP, GL_INCR */
+  R_RenderShadowEdges();
+
+  /* decrement the stencil on front faces */
+  if ( glState_faceCulling != 0 )
+  {
+    if ( glState_faceCulling == 2 )
+      glEnable( 0xB44u );                            /* GL_CULL_FACE */
+    if ( backEnd_viewParms_isMirror )
+      qglCullFace( 0x405u );                         /* GL_BACK */
+    else
+      qglCullFace( 0x404u );                         /* GL_FRONT */
+    glState_faceCulling = 0;
+  }
+  glStencilOp( 0x1E00u, 0x1E00u, 0x1E03u );          /* GL_KEEP, GL_KEEP, GL_DECR */
+  R_RenderShadowEdges();
+
+  qglColorMask( 1, 1, 1, 1 );                         /* re-enable the color buffer */
 }
 
-/* ---- RB_ShadowFinish  0x00513130 ----  VERIFIED */
+/* ---- RB_ShadowFinish  0x00513130 ----  VERIFIED
+ * Darken everything inside a shadow volume once, after all volumes have been
+ * stencilled, by drawing a fullscreen grey quad wherever the stencil is set.
+ * Delayed to here so overlapping body-part shadows don't double-darken. */
 void RB_ShadowFinish()
 {
-  if ( cg_shadows->integer == 2 && glConfig_stencilBits >= 4 )
+  if ( cg_shadows->integer != 2 || glConfig_stencilBits < 4 )
+    return;
+
+  glEnable( 0xB90u );                                /* GL_STENCIL_TEST */
+  glStencilFunc( 0x205u, 0, 0xFFu );                 /* GL_NOTEQUAL, ref 0, mask 255 */
+  glDisable( 0x3000u );                              /* GL_CLIP_PLANE0 */
+
+  /* GL_Cull(CT_TWO_SIDED) inlined: disable face culling */
+  if ( glState_faceCulling != 2 )
   {
-    glEnable(0xB90u);
-    glStencilFunc(0x205u, 0, 0xFFu);
-    glDisable(0x3000u);
-    if ( glState_faceCulling != 2 )
-    {
-      glDisable(0xB44u);
-      glState_faceCulling = 2;
-    }
-    GL_Bind((GLenum *)tr_whiteImage);
-    qglLoadIdentity();
-    RB_BeginImmediateMode();
-    rbDebug_immediateColorR = -103;
-    rbDebug_immediateColorG = -103;
-    rbDebug_immediateColorB = -103;
-    rbDebug_immediateColorA = -1;
-    GL_State(275);
-    mode = 7;
-    RB_glVertex3f(-1027080192, 1120403456, -1054867456);
-    RB_glVertex3f(1120403456, 1120403456, -1054867456);
-    RB_glVertex3f(1120403456, -1027080192, -1054867456);
-    RB_glVertex3f(-1027080192, -1027080192, -1054867456);
-    glDrawArrays(mode, 0, rbDebug_immediateVertexCount);
-    rbDebug_immediateVertexCount = 0;
-    mode = 0;
-    glDisable(0xB90u);
-    rbDebug_immediateModeActive = 0;
-    R_FogOn();
-    glVertexPointer(3, 0x1406u, 0, tess_xyz);
+    glDisable( 0xB44u );                             /* GL_CULL_FACE */
+    glState_faceCulling = 2;
   }
+
+  GL_Bind( (GLenum *)tr_whiteImage );
+  qglLoadIdentity();
+
+  RB_BeginImmediateMode();
+  rendererDebugState.immediateColorR = -103;                    /* 0x99 -> ~0.6 grey */
+  rendererDebugState.immediateColorG = -103;
+  rendererDebugState.immediateColorB = -103;
+  rendererDebugState.immediateColorA = -1;                      /* 0xFF */
+  GL_State( 275 );                                   /* 0x113  GLS_DEPTHMASK_TRUE | GLS_SRCBLEND_DST_COLOR | GLS_DSTBLEND_ZERO */
+
+  /* fullscreen quad in identity space; args are float bit patterns */
+  rendererDebugState.immediateMode = 7;                                          /* GL_QUADS */
+  RB_glVertex3f( -1027080192,  1120403456, -1054867456 );  /* (-100,  100, -10) */
+  RB_glVertex3f(  1120403456,  1120403456, -1054867456 );  /* ( 100,  100, -10) */
+  RB_glVertex3f(  1120403456, -1027080192, -1054867456 );  /* ( 100, -100, -10) */
+  RB_glVertex3f( -1027080192, -1027080192, -1054867456 );  /* (-100, -100, -10) */
+  glDrawArrays( rendererDebugState.immediateMode, 0, rendererDebugState.immediateVertexCount );
+  rendererDebugState.immediateVertexCount = 0;
+  rendererDebugState.immediateMode = 0;
+
+  glDisable( 0xB90u );                               /* GL_STENCIL_TEST */
+
+  /* RB_EndImmediateMode inlined: leave immediate mode and restore fog / xyz */
+  rendererDebugState.immediateModeActive = 0;
+  R_FogOn();
+  glVertexPointer( 3, 0x1406u, 0, tess_xyz );        /* GL_FLOAT */
 }
 
-/* ---- RB_ProjectionShadowDeform  0x00513290 ----  VERIFIED */
+/* ---- RB_ProjectionShadowDeform  0x00513290 ----  VERIFIED
+ * Flatten the current tess onto the entity's ground plane, projecting each
+ * vertex along the (clamped) light direction.  The light direction is clamped
+ * so the projection never grows too long or flips behind the plane.  The int
+ * return is dead EAX (retail returns tess.numVertexes). */
 int RB_ProjectionShadowDeform()
 {
-  float *v0;
-  double v1;
-  double v2;
-  double v3;
-  double v4;
-  double v5;
-  int result;
-  double v7;
-  float v8;
-  float v9;
-  float v10;
-  float v11;
-  float v12;
-  float v13;
-  float i;
-  float v15;
-  float v16;
+  vec3_t  ground;
+  vec3_t  lightDir;
+  vec3_t  light;
+  float   groundDist;
+  float   d;
+  float   extra;
+  float   height;
+  float  *xyz;
+  int     i;
 
-  v10 = flt_16D8DBC;
-  v12 = flt_16D8DD4;
-  v11 = flt_16D8DC8;
-  v13 = *(float *)(backEnd_currentEntity + 172);
-  v9 = flt_16D8DB0 - *(float *)(backEnd_currentEntity + 24);
-  v0 = (float *)tess_xyz;
-  v1 = *(float *)(backEnd_currentEntity + 164);
-  v2 = *(float *)(backEnd_currentEntity + 168);
-  v3 = v13 * flt_16D8DD4 + v2 * flt_16D8DC8 + v1 * flt_16D8DBC;
-  if ( (v3 < 0.5) | __UNORDERED__(v3, 0.5) )
+  xyz = tess_xyz;
+
+  ground[0]  = backEnd_or.axis[0][2];
+  ground[1]  = backEnd_or.axis[1][2];
+  ground[2]  = backEnd_or.axis[2][2];
+  groundDist = backEnd_or.origin[2] - ((shadowEntity_t *)backEnd_currentEntity)->e.shadowPlane;
+
+  lightDir[0] = ((shadowEntity_t *)backEnd_currentEntity)->lightDir[0];
+  lightDir[1] = ((shadowEntity_t *)backEnd_currentEntity)->lightDir[1];
+  lightDir[2] = ((shadowEntity_t *)backEnd_currentEntity)->lightDir[2];
+
+  d = lightDir[2] * ground[2] + lightDir[1] * ground[1] + lightDir[0] * ground[0];
+  /* don't let the shadow get too long or go negative */
+  if ( d < 0.5f )
   {
-    v4 = 0.5 - v3;
-    v1 = v1 + flt_16D8DBC * v4;
-    v2 = v2 + flt_16D8DC8 * v4;
-    v5 = v4 * flt_16D8DD4 + v13;
-    v13 = v5;
-    v3 = v5 * flt_16D8DD4 + v2 * flt_16D8DC8 + v1 * flt_16D8DBC;
+    extra = 0.5f - d;
+    lightDir[0] += ground[0] * extra;
+    lightDir[1] += ground[1] * extra;
+    lightDir[2] += ground[2] * extra;
+    d = lightDir[2] * ground[2] + lightDir[1] * ground[1] + lightDir[0] * ground[0];
   }
-  result = 0;
-  v8 = 1.0 / v3;
-  for ( i = v8 * v1; result < tess_numVertexes; v0 += tess_vertexComponentCount )
+
+  d = 1.0f / d;
+  light[0] = d * lightDir[0];
+  light[1] = d * lightDir[1];
+  light[2] = d * lightDir[2];
+
+  for ( i = 0; i < tess_numVertexes; ++i, xyz += tess_vertexComponentCount )
   {
-    ++result;
-    v7 = v12 * v0[2] + v11 * v0[1] + v10 * *v0 + v9;
-    *v0 = *v0 - i * v7;
-    v15 = v8 * v2;
-    v0[1] = v0[1] - v15 * v7;
-    v16 = v8 * v13;
-    v0[2] = v0[2] - v7 * v16;
+    height = ground[2] * xyz[2] + ground[1] * xyz[1] + ground[0] * xyz[0] + groundDist;
+    xyz[0] -= light[0] * height;
+    xyz[1] -= light[1] * height;
+    xyz[2] -= light[2] * height;
   }
-  return result;
+
+  return i;
 }
-

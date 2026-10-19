@@ -4,351 +4,394 @@
  * /Volumes/BigCheese/ Source/AspyrP4/CoD/Source/xanim/xmodel_optimize.c
  * Retail range 0x0048C580-0x0048CB2F, 7 functions.
  * @fidelity: likely
+ *
+ * These functions build the per-XSurface vertex/index buffers that a rigid
+ * (non-skinned) surface is drawn from, using whichever GL path the driver
+ * supports: ARB vertex_buffer_object, NV vertex_array_range, or ATI
+ * vertex_array_object.  Every vertex is packed into a 32-byte interleaved
+ * record (2 texcoord floats followed by 6 vertex floats).  Struct layouts and
+ * field offsets below were cross-checked against the CoDMP.exe decompile.
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "../renderer/qgl.h"
+#include "../renderer/tr_local.h"   /* glConfig, tr's static vertex-memory pools */
 
 void *Hunk_AllocAlignInternal( int size, int align );
 
 extern int R_CreateBufferARB();
 
-/* ---- XSurfaceRefresh_ARB  0x0048C580 ----  VERIFIED */
-int __cdecl XSurfaceRefresh_ARB(int a1, char a2)
-{
-  int result;
-  _DWORD *v3;
-  _DWORD *v4;
-  unsigned int v5;
-  int v6;
-  _DWORD *v7;
-  int v8;
-  _BYTE v9[0x40000]; /* retail frame slot [ebp-40000h] */
+/* ------------------------------------------------------------------------- *
+ *  File-local typed views (same CoD XModel layout tr_staticmodel.c uses).
+ *  Only the fields these functions touch are named.
+ * ------------------------------------------------------------------------- */
+#undef ASSERT_OFF
+#define ASSERT_OFF( type, field, off ) \
+	COD1_STATIC_ASSERT( offsetof( type, field ) == (off), #type "." #field " offset" )
 
-  result = *(_DWORD *)(a1 + 40);
-  v7 = (_DWORD *)result;
-  if ( result )
-  {
-    result = *(__int16 *)(a1 + 4);
-    v3 = *(_DWORD **)(a1 + 32);
-    v4 = *(_DWORD **)(a1 + 36);
-    v5 = (6 * result + 31) & 0xFFFFFFE0;
-    v6 = 32 * *(__int16 *)(a1 + 2);
-    if ( *(__int16 *)(a1 + 2) > 0 )
-    {
-      result = (int)(v9 + 4);
-      v8 = *(__int16 *)(a1 + 2);
-      do
-      {
-        *(_DWORD *)(result - 4) = *v4;
-        *(_DWORD *)result = v4[1];
-        *(_DWORD *)(result + 4) = *v3;
-        *(_DWORD *)(result + 8) = v3[1];
-        *(_DWORD *)(result + 12) = v3[2];
-        *(_DWORD *)(result + 16) = v3[3];
-        *(_DWORD *)(result + 20) = v3[4];
-        *(_DWORD *)(result + 24) = v3[5];
-        v3 += 6;
-        v4 += 2;
-        result += 32;
-        --v8;
-      }
-      while ( v8 );
-    }
-    if ( (a2 & 2) != 0 )
-    {
-      qglBindBufferARB(34963, v7[1]);
-      qglBufferDataARB(34963, v5, 0, 35044);
-      qglBufferDataARB(34963, v5, *(_DWORD *)(a1 + 28), 35044);
-      qglBindBufferARB(34963, 0);
-    }
-    if ( (a2 & 1) != 0 )
-    {
-      qglBindBufferARB(34962, *v7);
-      qglBufferDataARB(34962, v6, 0, 35044);
-      qglBufferDataARB(34962, v6, v9, 35044);
-      qglBindBufferARB(34962, 0);
-      return result;
-    }
-  }
-  return result;
+typedef struct {
+	unsigned char   tileMode;          /* +0x00 */
+	unsigned char   pad01;             /* +0x01 */
+	short           vertexCount;       /* +0x02 */
+	short           triangleCount;     /* +0x04 */
+	short           boneMatrixOffset;  /* +0x06  -1 (0xFFFF) => skinned (skip rigid optimize) */
+	unsigned int    boneUsage[4];      /* +0x08 */
+	void           *weightedPoints;    /* +0x18 */
+	unsigned short *triangles;         /* +0x1c  index triples */
+	void           *vertexData;        /* +0x20  6 dwords/vertex (pos+normal) */
+	float         (*texCoords)[2];     /* +0x24  2 floats/vertex */
+	void           *optimizedDataARB;  /* +0x28 */
+	void           *optimizedDataATI;  /* +0x2c */
+	void           *optimizedDataNV;   /* +0x30 */
+} XSurface;
+COD1_ASSERT_SIZE( XSurface, 0x34 );
+ASSERT_OFF( XSurface, vertexCount, 0x02 );
+ASSERT_OFF( XSurface, triangleCount, 0x04 );
+ASSERT_OFF( XSurface, boneMatrixOffset, 0x06 );
+ASSERT_OFF( XSurface, triangles, 0x1c );
+ASSERT_OFF( XSurface, vertexData, 0x20 );
+ASSERT_OFF( XSurface, texCoords, 0x24 );
+ASSERT_OFF( XSurface, optimizedDataARB, 0x28 );
+ASSERT_OFF( XSurface, optimizedDataATI, 0x2c );
+ASSERT_OFF( XSurface, optimizedDataNV, 0x30 );
+
+typedef struct XModelSurfsData {
+	struct XModelSurfsData *next;         /* +0x00 */
+	short                   surfaceCount; /* +0x04 */
+	short                   pad06;        /* +0x06 */
+	XSurface              **surfaces;     /* +0x08 */
+} XModelSurfsData;
+COD1_ASSERT_SIZE( XModelSurfsData, 0x0c );
+ASSERT_OFF( XModelSurfsData, surfaceCount, 0x04 );
+ASSERT_OFF( XModelSurfsData, surfaces, 0x08 );
+
+/* Per-vertex record written into the interleave scratch and uploaded to GL. */
+typedef struct {
+	unsigned int texCoord[2];  /* +0x00  from XSurface.texCoords */
+	unsigned int vertex[6];    /* +0x08  from XSurface.vertexData (pos+normal) */
+} xoptVertex_t;
+COD1_ASSERT_SIZE( xoptVertex_t, 0x20 );
+
+/* GL buffer descriptors the alloc callbacks hand back (one per rendering path). */
+typedef struct {
+	unsigned int vertexBuffer;  /* +0x00  GL_ARRAY_BUFFER name */
+	unsigned int indexBuffer;   /* +0x04  GL_ELEMENT_ARRAY_BUFFER name */
+} xoptArbBuffers_t;
+COD1_ASSERT_SIZE( xoptArbBuffers_t, 0x08 );
+
+typedef struct {
+	int   poolType;  /* +0x00  1=primary 2=secondary 3=hunk */
+	void *base;      /* +0x04  interleaved vertex data */
+} xoptNvBuffer_t;
+COD1_ASSERT_SIZE( xoptNvBuffer_t, 0x08 );
+
+typedef struct {
+	int          type;          /* +0x00  always 3 */
+	unsigned int arrayObject;   /* +0x04  ATI array-object name */
+	unsigned int vertexOffset;  /* +0x08  index bytes + base offset */
+	unsigned int indexOffset;   /* +0x0c  base offset */
+} xoptAtiBuffer_t;
+COD1_ASSERT_SIZE( xoptAtiBuffer_t, 0x10 );
+
+/* File-local GL enum names (kept out of qgl.h; sibling renderer files do the same). */
+#define GL_ARRAY_BUFFER_ARB          34962   /* 0x8892 */
+#define GL_ELEMENT_ARRAY_BUFFER_ARB  34963   /* 0x8893 */
+#define GL_STATIC_DRAW_ARB           35044   /* 0x88E4 */
+#define GL_PRESERVE_ATI              34658   /* 0x8762 */
+
+/* Retail [ebp-40000h] frame scratch: 0x40000 bytes == 8192 interleaved verts. */
+#define XOPT_SCRATCH_VERTS  8192
+
+/*
+ * NOTE: all seven functions return void in retail (the decompile's int results
+ * were leftover EAX; every caller discards them).  Retail passes surf/modelSurfs
+ * in registers (LTCG conventions), which the typed void signatures reproduce.
+ */
+
+/* ---- XSurfaceRefresh_ARB  0x0048C580 ----  VERIFIED */
+void __cdecl XSurfaceRefresh_ARB( XSurface *surf, int refreshMask )
+{
+	xoptArbBuffers_t   *buffers;
+	unsigned int        indexSize;
+	int                 vertexSize;
+	int                 vertexCount;
+	const unsigned int *srcVertex;
+	const unsigned int *srcTexCoord;
+	int                 i;
+	xoptVertex_t        vertexScratch[XOPT_SCRATCH_VERTS]; /* retail [ebp-40000h] */
+
+	buffers = (xoptArbBuffers_t *)surf->optimizedDataARB;
+	if ( !buffers )
+		return;
+
+	indexSize   = (6 * surf->triangleCount + 31) & 0xFFFFFFE0;
+	srcVertex   = (const unsigned int *)surf->vertexData;
+	srcTexCoord = (const unsigned int *)surf->texCoords;
+	vertexCount = surf->vertexCount;
+	vertexSize  = 32 * vertexCount;
+	for ( i = 0; i < vertexCount; ++i )
+	{
+		vertexScratch[i].texCoord[0] = srcTexCoord[0];
+		vertexScratch[i].texCoord[1] = srcTexCoord[1];
+		vertexScratch[i].vertex[0]   = srcVertex[0];
+		vertexScratch[i].vertex[1]   = srcVertex[1];
+		vertexScratch[i].vertex[2]   = srcVertex[2];
+		vertexScratch[i].vertex[3]   = srcVertex[3];
+		vertexScratch[i].vertex[4]   = srcVertex[4];
+		vertexScratch[i].vertex[5]   = srcVertex[5];
+		srcVertex   += 6;
+		srcTexCoord += 2;
+	}
+
+	if ( refreshMask & 2 )   /* refresh index buffer */
+	{
+		qglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, buffers->indexBuffer );
+		qglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB, indexSize, NULL, GL_STATIC_DRAW_ARB );
+		qglBufferDataARB( GL_ELEMENT_ARRAY_BUFFER_ARB, indexSize, surf->triangles, GL_STATIC_DRAW_ARB );
+		qglBindBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB, 0 );
+	}
+	if ( refreshMask & 1 )   /* refresh vertex buffer */
+	{
+		qglBindBufferARB( GL_ARRAY_BUFFER_ARB, buffers->vertexBuffer );
+		qglBufferDataARB( GL_ARRAY_BUFFER_ARB, vertexSize, NULL, GL_STATIC_DRAW_ARB );
+		qglBufferDataARB( GL_ARRAY_BUFFER_ARB, vertexSize, vertexScratch, GL_STATIC_DRAW_ARB );
+		qglBindBufferARB( GL_ARRAY_BUFFER_ARB, 0 );
+	}
 }
 
 /* ---- XModelSurfsRefresh_ARB  0x0048C6C0 ----  VERIFIED */
-int __cdecl XModelSurfsRefresh_ARB(int result, char a2)
+void __cdecl XModelSurfsRefresh_ARB( XModelSurfsData *modelSurfs, int refreshMask )
 {
-  int v2;
-  int v3;
-  int i;
+	int       surfaceCount;
+	XSurface **surfaces;
+	int       i;
 
-  v2 = *(__int16 *)(result + 4);
-  v3 = *(_DWORD *)(result + 8);
-  for ( i = 0; i < v2; ++i )
-    result = XSurfaceRefresh_ARB(*(_DWORD *)(v3 + 4 * i), a2);
-  return result;
+	surfaceCount = modelSurfs->surfaceCount;
+	surfaces     = modelSurfs->surfaces;
+	for ( i = 0; i < surfaceCount; ++i )
+		XSurfaceRefresh_ARB( surfaces[i], refreshMask );
 }
 
 /* ---- R_OptimizeRigidXSurfaceARB  0x0048C6F0 ----  VERIFIED */
-int *__cdecl R_OptimizeRigidXSurfaceARB(int a1, int (__cdecl *a2)(int))
+void __cdecl R_OptimizeRigidXSurfaceARB( XSurface *surf, int (__cdecl *alloc)(int) )
 {
-  int *result;
-  _DWORD *v3;
-  _DWORD *v4;
-  unsigned int v5;
-  int v6;
-  char *v7;
-  int BufferARB;
-  int v9; /* retail frame slot [ebp-40004h] */
-  _BYTE v10[0x40000]; /* retail frame slot [ebp-40000h] */
+	unsigned int        indexSize;
+	int                 vertexSize;
+	const unsigned int *srcVertex;
+	const unsigned int *srcTexCoord;
+	int                 i;
+	unsigned int        indexBuffer;
+	unsigned int        vertexBuffer;
+	xoptArbBuffers_t   *buffers;
+	xoptVertex_t        vertexScratch[XOPT_SCRATCH_VERTS]; /* retail [ebp-40000h] */
 
-  result = *(int **)(a1 + 40);
-  if ( !result )
-  {
-    v3 = *(_DWORD **)(a1 + 32);
-    v4 = *(_DWORD **)(a1 + 36);
-    v5 = (6 * *(__int16 *)(a1 + 4) + 31) & 0xFFFFFFE0;
-    v6 = 32 * *(__int16 *)(a1 + 2);
-    if ( *(__int16 *)(a1 + 2) > 0 )
-    {
-      v7 = (char *)v10 + 4;   /* retail 0x0048C72D lea eax,[esp+40010h+var_3FFFC] */
-      v9 = *(__int16 *)(a1 + 2);
-      do
-      {
-        *((_DWORD *)v7 - 1) = *v4;
-        *(_DWORD *)v7 = v4[1];
-        *((_DWORD *)v7 + 1) = *v3;
-        *((_DWORD *)v7 + 2) = v3[1];
-        *((_DWORD *)v7 + 3) = v3[2];
-        *((_DWORD *)v7 + 4) = v3[3];
-        *((_DWORD *)v7 + 5) = v3[4];
-        *((_DWORD *)v7 + 6) = v3[5];
-        v3 += 6;
-        v4 += 2;
-        v7 += 32;
-        --v9;
-      }
-      while ( v9 );
-    }
-    result = (int *)R_CreateBufferARB((int)v3, 34963, v5, *(_DWORD *)(a1 + 28), 35044);
-    v9 = (int)result;
-    if ( result )
-    {
-      BufferARB = R_CreateBufferARB((int)v10, 34962, v6, (int)v10, 35044);
-      if ( BufferARB )
-      {
-        result = (int *)a2(8);
-        result[1] = v9;
-        *result = BufferARB;
-        *(_DWORD *)(a1 + 40) = result;
-      }
-      else
-      {
-        qglDeleteBuffersARB(1, &v9);
-        return result;
-      }
-    }
-  }
-  return result;
+	if ( surf->optimizedDataARB )
+		return;
+
+	indexSize   = (6 * surf->triangleCount + 31) & 0xFFFFFFE0;
+	srcVertex   = (const unsigned int *)surf->vertexData;
+	srcTexCoord = (const unsigned int *)surf->texCoords;
+	vertexSize  = 32 * surf->vertexCount;
+	for ( i = 0; i < surf->vertexCount; ++i )
+	{
+		vertexScratch[i].texCoord[0] = srcTexCoord[0];
+		vertexScratch[i].texCoord[1] = srcTexCoord[1];
+		vertexScratch[i].vertex[0]   = srcVertex[0];
+		vertexScratch[i].vertex[1]   = srcVertex[1];
+		vertexScratch[i].vertex[2]   = srcVertex[2];
+		vertexScratch[i].vertex[3]   = srcVertex[3];
+		vertexScratch[i].vertex[4]   = srcVertex[4];
+		vertexScratch[i].vertex[5]   = srcVertex[5];
+		srcVertex   += 6;
+		srcTexCoord += 2;
+	}
+
+	indexBuffer = R_CreateBufferARB( GL_ELEMENT_ARRAY_BUFFER_ARB,
+	                                 indexSize, (int)surf->triangles, GL_STATIC_DRAW_ARB );
+	if ( !indexBuffer )
+		return;
+	vertexBuffer = R_CreateBufferARB( GL_ARRAY_BUFFER_ARB,
+	                                  vertexSize, (int)vertexScratch, GL_STATIC_DRAW_ARB );
+	if ( !vertexBuffer )
+	{
+		qglDeleteBuffersARB( 1, &indexBuffer );
+		return;
+	}
+	buffers = (xoptArbBuffers_t *)alloc( 8 );
+	buffers->indexBuffer   = indexBuffer;
+	buffers->vertexBuffer  = vertexBuffer;
+	surf->optimizedDataARB = buffers;
 }
 
-/* ---- R_OptimizeRigidXSurfaceNV  0x0048C7F0 ----  VERIFIED */
-int __cdecl R_OptimizeRigidXSurfaceNV(int a1, int (__cdecl *a2)(int))
+/* ---- R_OptimizeRigidXSurfaceNV  0x0048C7F0 ----  VERIFIED
+ * Retail Hunk_AllocAlignInternal takes size in ECX (the tree's in EBX), which is
+ * what still shifts this function's register allocation. */
+void __cdecl R_OptimizeRigidXSurfaceNV( XSurface *surf, int (__cdecl *alloc)(int) )
 {
-  int v2;
-  int result;
-  _DWORD *v4;
-  unsigned int v5;
-  _DWORD *v6;
-  _DWORD *v7;
-  int v8;
+	xoptNvBuffer_t     *nvBuffer;
+	int                 allocSize;
+	int                 poolType;   /* 1=primary 2=secondary 3=hunk */
+	const unsigned int *srcVertex;
+	const unsigned int *srcTexCoord;
+	int                 i;
 
-  v2 = a1;
-  result = *(_DWORD *)(a1 + 48);
-  if ( !result )
-  {
-    v4 = (_DWORD *)a2(8);
-    v5 = (32 * *(__int16 *)(a1 + 2) + 31) & 0xFFFFFFE0;
-    if ( (int)(tr_staticVertexMemoryPrimaryUsed + v5) >= tr_staticVertexMemoryPrimaryLimit )
-    {
-      if ( (int)(tr_staticVertexMemorySecondaryUsed + v5) >= tr_staticVertexMemorySecondaryLimit )
-      {
-        v4[1] = (int)Hunk_AllocAlignInternal(v5, 32);
-        result = 3;
-      }
-      else
-      {
-        v4[1] = tr_staticVertexMemorySecondaryUsed + tr_staticVertexMemorySecondary;
-        tr_staticVertexMemorySecondaryUsed += v5;
-        result = 2;
-      }
-    }
-    else
-    {
-      v4[1] = tr_staticVertexMemoryPrimaryUsed + tr_staticVertexMemoryPrimary;
-      tr_staticVertexMemoryPrimaryUsed += v5;
-      result = 1;
-    }
-    *v4 = result;
-    v6 = *(_DWORD **)(a1 + 32);
-    v7 = *(_DWORD **)(a1 + 36);
-    v8 = 0;
-    if ( *(__int16 *)(a1 + 2) > 0 )
-    {
-      result = 0;
-      do
-      {
-        *(_DWORD *)(result + v4[1]) = *v7;
-        *(_DWORD *)(result + v4[1] + 4) = v7[1];
-        *(_DWORD *)(result + v4[1] + 8) = *v6;
-        *(_DWORD *)(result + v4[1] + 12) = v6[1];
-        *(_DWORD *)(result + v4[1] + 16) = v6[2];
-        *(_DWORD *)(result + v4[1] + 20) = v6[3];
-        *(_DWORD *)(result + v4[1] + 24) = v6[4];
-        *(_DWORD *)(result + v4[1] + 28) = v6[5];
-        v2 = a1;
-        v6 += 6;
-        v7 += 2;
-        ++v8;
-        result += 32;
-      }
-      while ( v8 < *(__int16 *)(a1 + 2) );
-    }
-    *(_DWORD *)(v2 + 48) = v4;
-  }
-  return result;
+	if ( surf->optimizedDataNV )
+		return;
+
+	nvBuffer  = (xoptNvBuffer_t *)alloc( 8 );
+	allocSize = (32 * surf->vertexCount + 31) & 0xFFFFFFE0;
+	if ( tr_staticVertexMemoryPrimaryUsed + allocSize < tr_staticVertexMemoryPrimaryLimit )
+	{
+		nvBuffer->base = (void *)(tr_staticVertexMemoryPrimary + tr_staticVertexMemoryPrimaryUsed);
+		tr_staticVertexMemoryPrimaryUsed += allocSize;
+		poolType = 1;
+	}
+	else if ( tr_staticVertexMemorySecondaryUsed + allocSize < tr_staticVertexMemorySecondaryLimit )
+	{
+		nvBuffer->base = (void *)(tr_staticVertexMemorySecondary + tr_staticVertexMemorySecondaryUsed);
+		tr_staticVertexMemorySecondaryUsed += allocSize;
+		poolType = 2;
+	}
+	else
+	{
+		nvBuffer->base = Hunk_AllocAlignInternal( allocSize, 32 );
+		poolType = 3;
+	}
+	nvBuffer->poolType = poolType;
+
+	srcVertex   = (const unsigned int *)surf->vertexData;
+	srcTexCoord = (const unsigned int *)surf->texCoords;
+	for ( i = 0; i < surf->vertexCount; ++i )
+	{
+		((xoptVertex_t *)nvBuffer->base)[i].texCoord[0] = srcTexCoord[0];
+		((xoptVertex_t *)nvBuffer->base)[i].texCoord[1] = srcTexCoord[1];
+		((xoptVertex_t *)nvBuffer->base)[i].vertex[0]   = srcVertex[0];
+		((xoptVertex_t *)nvBuffer->base)[i].vertex[1]   = srcVertex[1];
+		((xoptVertex_t *)nvBuffer->base)[i].vertex[2]   = srcVertex[2];
+		((xoptVertex_t *)nvBuffer->base)[i].vertex[3]   = srcVertex[3];
+		((xoptVertex_t *)nvBuffer->base)[i].vertex[4]   = srcVertex[4];
+		((xoptVertex_t *)nvBuffer->base)[i].vertex[5]   = srcVertex[5];
+		srcVertex   += 6;
+		srcTexCoord += 2;
+	}
+	surf->optimizedDataNV = nvBuffer;
 }
 
-/* ---- R_OptimizeRigidXSurfaceATI  0x0048C900 ----  VERIFIED */
-int __cdecl R_OptimizeRigidXSurfaceATI(int a1, int a2, int a3, int (__stdcall *a4)(int, int, int))
+/* ---- R_OptimizeRigidXSurfaceATI  0x0048C900 ----  VERIFIED
+ * Retail is __usercall: surf in EDI, alloc as the only stack argument
+ * (LTCG convention; callers: push alloc; call; add esp,4).  alloc is the same
+ * one-argument __cdecl allocator the ARB/NV paths take (0x0048C98B push 10h;
+ * call [alloc]; 0x0048C99A add esp,4 pops the size; the push esi before
+ * it is a callee-save, popped at 0x0048CA5D).  Frame: 0x40008 bytes = poolSelect (frame-0x40008,
+ * later reused as the copy-loop counter), vertexUploadSize (frame-0x40004),
+ * then the 0x40000-byte scratch. */
+void __cdecl R_OptimizeRigidXSurfaceATI( XSurface *surf, int (__cdecl *alloc)(int) )
 {
-  int result;
-  unsigned int v5;
-  int v6;
-  unsigned int v7;
-  _DWORD *v8;
-  _DWORD *v9;
-  _DWORD *v10;
-  char *v11;
-  int v13;
-  int v14;
-  int v15;
-  _BYTE v16[0x3FFF4]; /* retail frame slot [ebp-3FFF4h] */
+	unsigned int        indexSize;
+	int                 vertexUploadSize;
+	int                 allocSize;
+	int                 poolBase;
+	int                 poolSelect;   /* 1 = primary pool, 2 = secondary pool */
+	xoptAtiBuffer_t    *atiBuffer;
+	const unsigned int *srcVertex;
+	const unsigned int *srcTexCoord;
+	int                 i;
+	xoptVertex_t        vertexScratch[XOPT_SCRATCH_VERTS]; /* retail frame-0x40000 */
 
-  result = *(_DWORD *)(a2 + 44);
-  if ( !result )
-  {
-    if ( glConfig_ATIElementArray )
-      v5 = (6 * *(__int16 *)(a2 + 4) + 31) & 0xFFFFFFE0;
-    else
-      v5 = 0;
-    v6 = tr_staticVertexMemoryPrimaryUsed;
-    v7 = (32 * *(__int16 *)(a2 + 2) + v5 + 31) & 0xFFFFFFE0;
-    if ( (int)(tr_staticVertexMemoryPrimaryUsed + v7) > tr_staticVertexMemoryPrimaryLimit )
-    {
-      v6 = tr_staticVertexMemorySecondaryUsed;
-      result = tr_staticVertexMemorySecondaryUsed + v7;
-      if ( result > tr_staticVertexMemorySecondaryLimit )
-        return result;
-      tr_staticVertexMemorySecondaryUsed = result;
-    }
-    else
-    {
-      tr_staticVertexMemoryPrimaryUsed += v7;
-    }
-    v8 = (_DWORD *)a4(16, a3, a1);
-    *v8 = 3;
-    if ( v13 == 1 )
-      v8[1] = tr_staticVertexMemoryPrimary;
-    else
-      v8[1] = tr_staticVertexMemorySecondary;
-    v8[3] = v6;
-    v8[2] = v5 + v6;
-    v9 = *(_DWORD **)(a2 + 32);
-    v10 = *(_DWORD **)(a2 + 36);
-    if ( *(__int16 *)(a2 + 2) > 0 )
-    {
-      v11 = (char *)v16 + 4;
-      v14 = *(__int16 *)(a2 + 2);
-      do
-      {
-        *((_DWORD *)v11 - 1) = *v10;
-        *(_DWORD *)v11 = v10[1];
-        *((_DWORD *)v11 + 1) = *v9;
-        *((_DWORD *)v11 + 2) = v9[1];
-        *((_DWORD *)v11 + 3) = v9[2];
-        *((_DWORD *)v11 + 4) = v9[3];
-        *((_DWORD *)v11 + 5) = v9[4];
-        *((_DWORD *)v11 + 6) = v9[5];
-        v9 += 6;
-        v10 += 2;
-        v11 += 32;
-        --v14;
-      }
-      while ( v14 );
-    }
-    if ( v5 )
-      qglUpdateObjectBufferATI(v8[1], v8[3], v5, *(_DWORD *)(a2 + 28), 34658);
-    qglUpdateObjectBufferATI(v8[1], v8[2], v15, v16, 34658);
-    *(_DWORD *)(a2 + 44) = v8;
-  }
-  return result;
+	if ( surf->optimizedDataATI )
+		return;
+
+	if ( glConfig_ATIElementArray )
+		indexSize = (6 * surf->triangleCount + 31) & 0xFFFFFFE0;
+	else
+		indexSize = 0;
+
+	vertexUploadSize = 32 * surf->vertexCount;
+	allocSize        = (vertexUploadSize + indexSize + 31) & 0xFFFFFFE0;
+	if ( tr_staticVertexMemoryPrimaryUsed + allocSize <= tr_staticVertexMemoryPrimaryLimit )
+	{
+		poolBase = tr_staticVertexMemoryPrimaryUsed;
+		tr_staticVertexMemoryPrimaryUsed += allocSize;
+		poolSelect = 1;
+	}
+	else
+	{
+		if ( tr_staticVertexMemorySecondaryUsed + allocSize > tr_staticVertexMemorySecondaryLimit )
+			return;
+		poolBase = tr_staticVertexMemorySecondaryUsed;
+		tr_staticVertexMemorySecondaryUsed += allocSize;
+		poolSelect = 2;
+	}
+
+	atiBuffer = (xoptAtiBuffer_t *)alloc( 16 );
+	atiBuffer->type = 3;
+	if ( poolSelect == 1 )
+		atiBuffer->arrayObject = tr_staticVertexMemoryPrimary;
+	else
+		atiBuffer->arrayObject = tr_staticVertexMemorySecondary;
+	atiBuffer->indexOffset  = poolBase;
+	atiBuffer->vertexOffset = poolBase + indexSize;
+
+	srcVertex   = (const unsigned int *)surf->vertexData;
+	srcTexCoord = (const unsigned int *)surf->texCoords;
+	for ( i = 0; i < surf->vertexCount; ++i )
+	{
+		vertexScratch[i].texCoord[0] = srcTexCoord[0];
+		vertexScratch[i].texCoord[1] = srcTexCoord[1];
+		vertexScratch[i].vertex[0]   = srcVertex[0];
+		vertexScratch[i].vertex[1]   = srcVertex[1];
+		vertexScratch[i].vertex[2]   = srcVertex[2];
+		vertexScratch[i].vertex[3]   = srcVertex[3];
+		vertexScratch[i].vertex[4]   = srcVertex[4];
+		vertexScratch[i].vertex[5]   = srcVertex[5];
+		srcVertex   += 6;
+		srcTexCoord += 2;
+	}
+
+	if ( indexSize )
+		qglUpdateObjectBufferATI( atiBuffer->arrayObject, atiBuffer->indexOffset,
+		                          indexSize, surf->triangles, GL_PRESERVE_ATI );
+	qglUpdateObjectBufferATI( atiBuffer->arrayObject, atiBuffer->vertexOffset,
+	                          vertexUploadSize, vertexScratch, GL_PRESERVE_ATI );
+	surf->optimizedDataATI = atiBuffer;
 }
 
 /* ---- XModelOptimize  0x0048CA70 ----  VERIFIED */
-int *__cdecl XModelOptimize(int a1, int (__cdecl *a2)(int))
+void __cdecl XModelOptimize( XModelSurfsData *modelSurfs, int (__cdecl *alloc)(int) )
 {
-  int v2;
-  int *result;
-  int v4;
-  int v5;
-  int *i;
+	int        surfaceCount;
+	XSurface **surfaces;
+	XSurface  *surf;
+	int        i;
 
-  v2 = *(__int16 *)(a1 + 4);
-  result = *(int **)(a1 + 8);
-  v4 = 0;
-  for ( i = result; v4 < v2; ++v4 )
-  {
-    v5 = i[v4];
-    if ( *(_WORD *)(v5 + 6) != 0xFFFF )
-    {
-      if ( glConfig_ARBVertexBufferObject )
-      {
-        result = R_OptimizeRigidXSurfaceARB(v5, a2);
-      }
-      else if ( glConfig_NVVertexArrayRange )
-      {
-        result = (int *)R_OptimizeRigidXSurfaceNV(v5, a2);
-      }
-      else
-      {
-        result = (int *)glConfig_ATIVertexArrayObject;
-        if ( glConfig_ATIVertexArrayObject )
-          result = (int *)R_OptimizeRigidXSurfaceATI(v2, v5, (int)a2, (int (__stdcall *)(int, int, int))a2);
-      }
-    }
-  }
-  return result;
+	surfaceCount = modelSurfs->surfaceCount;
+	surfaces     = modelSurfs->surfaces;
+	for ( i = 0; i < surfaceCount; ++i )
+	{
+		surf = surfaces[i];
+		if ( surf->boneMatrixOffset != -1 )   /* rigid surface only */
+		{
+			if ( glConfig_ARBVertexBufferObject )
+				R_OptimizeRigidXSurfaceARB( surf, alloc );
+			else if ( glConfig_NVVertexArrayRange )
+				R_OptimizeRigidXSurfaceNV( surf, alloc );
+			else if ( glConfig_ATIVertexArrayObject )
+				R_OptimizeRigidXSurfaceATI( surf, alloc );
+		}
+	}
 }
 
-/* ---- XSurfaceOptimize  0x0048CAE0 ----  VERIFIED */
-int *__cdecl XSurfaceOptimize(int *result, int a2, int a3, int a4)
+/* ---- XSurfaceOptimize  0x0048CAE0 ----  VERIFIED
+ * Retail: alloc in EAX, surf in ECX (LTCG convention; no caller in the tree). */
+void __cdecl XSurfaceOptimize( XSurface *surf, int (__cdecl *alloc)(int) )
 {
-  if ( *(_WORD *)(a2 + 6) != 0xFFFF )
-  {
-    if ( glConfig_ARBVertexBufferObject )
-    {
-      return R_OptimizeRigidXSurfaceARB(a2, (int (__cdecl *)(int))result);
-    }
-    else if ( glConfig_NVVertexArrayRange )
-    {
-      return (int *)R_OptimizeRigidXSurfaceNV(a2, (int (__cdecl *)(int))result);
-    }
-    else if ( glConfig_ATIVertexArrayObject )
-    {
-      return (int *)R_OptimizeRigidXSurfaceATI(a3, a2, a4, (int (__stdcall *)(int, int, int))result);
-    }
-  }
-  return result;
+	if ( surf->boneMatrixOffset != -1 )   /* rigid surface only */
+	{
+		if ( glConfig_ARBVertexBufferObject )
+			R_OptimizeRigidXSurfaceARB( surf, alloc );
+		else if ( glConfig_NVVertexArrayRange )
+			R_OptimizeRigidXSurfaceNV( surf, alloc );
+		else if ( glConfig_ATIVertexArrayObject )
+			R_OptimizeRigidXSurfaceATI( surf, alloc );
+	}
 }

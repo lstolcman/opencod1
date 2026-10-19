@@ -1,27 +1,6 @@
-/*
- * cg_predict.c -- this file generates cg.predictedPlayerState by either
- * interpolating between snapshots from the server or locally predicting
- * ahead the client's movement.
- *
- * Call of Duty 1.1 multiplayer client game (cgame_mp_x86.dll, imagebase
- * 0x30000000).  RTCW's cgame/cg_predict.c is the ancestor and every function
- * below is still its text; the CoD-specific differences are called out in the
- * comments where they occur.  The three that matter:
- *
- *   - cg.nextSnap is never NULL in 1.1.  CG_TransitionSnapshot assigns
- *     cg.snap = cg.nextSnap and leaves nextSnap alone, so "no next frame"
- *     is spelled `cg.nextSnap == cg.snap` and CG_BuildSolidList /
- *     CG_InterpolatePlayerState / CG_PredictPlayerState_Internal all read
- *     cg.nextSnap unconditionally where RTCW picks between the two.
- *   - the prediction pmove uses CG_TraceCapsule, not CG_Trace, for all three
- *     pmove_t trace slots (0x30029550).  CG_Trace survives for the view code.
- *   - CG_TouchTriggerPrediction still runs the bmodel trace but throws the
- *     result away: the push/teleport/objective trigger handling is gone.
- *
- * Functions are in address order, which is the original file order.
- *
- * @fidelity: likely
- */
+// cg_predict.c -- this file generates cg.predictedPlayerState by either
+// interpolating between snapshots from the server or locally predicting
+// ahead the client's movement.
 
 #include <string.h>
 #include <math.h>
@@ -32,15 +11,10 @@
 #define YAW                         1
 #define ROLL                        2
 
-/* Owned by other units. */
-void        CG_Printf( const char *msg, ... );                  /* cg_main.c 0x300206F0 */
+void        CG_Printf( const char *msg, ... );
 void        CG_AdjustPositionForMover( const vec3_t in, int moverNum, int fromTime, int toTime,
-									   vec3_t out, vec3_t angles_out );  /* cg_ent.c 0x3001BAA0 */
+									   vec3_t out, vec3_t angles_out );
 
-/*
- * bg_pmove.c / bg_misc.c.  bg_public.h declares neither PM_UpdateViewAngles
- * nor the two item helpers.
- */
 void        PM_UpdateViewAngles( playerState_t *ps, const usercmd_t *cmd,
 								 void ( *trace )( trace_t *results, const vec3_t start,
 												  const vec3_t mins, const vec3_t maxs,
@@ -64,20 +38,13 @@ qboolean    BG_CanItemBeGrabbed( const entityState_t *ent, const playerState_t *
 #define CONTENTS_SOLID              0x00000001
 #define CONTENTS_BODY               0x02000000
 
-/*
- * The prediction clipmask (0x3002958A).  It is g_client_mp.c's MASK_CLIENTSOLID
- * and NOT bg_pmove.c's MASK_PLAYERSOLID (0x02810191): cgame predicts without
- * 0x80 and 0x100.  A spectator additionally loses CONTENTS_BODY and 0x10000
- * (0x3002959C masks with 0xFDFEFFFF).
- */
+// the prediction clipmask (not MASK_PLAYERSOLID)
 #define MASK_CLIENTSOLID            0x02810011
 #define MASK_SPECTATORCLEAR         0x02010000
 
-/* playerState_t.pm_flags; the two spellings the game module already uses. */
 #define PMF_FOLLOW                  0x00010000
 #define PMF_INWORLD                 0x00040000
 
-/* bg_misc.c's eventnames[] index for "EV_ITEM_PICKUP". */
 #define EV_ITEM_PICKUP              146
 
 #define CMD_BACKUP                  64
@@ -109,15 +76,13 @@ void CG_BuildSolidList( void ) {
 	cg_numSolidEntities = 0;
 	cg_numTriggerEntities = 0;
 
-	/* RTCW picks cg.snap when there is no next frame or a teleport is pending;
-	   1.1 always takes cg.nextSnap (0x30028D54). */
 	snap = cg.nextSnap;
 
 	for ( i = 0 ; i < snap->numEntities ; i++ ) {
 		cent = &cg_entities[ snap->entities[ i ].number ];
 		ent = &cent->currentState;
 
-		// dont clip again non-solid bmodels
+		// RF, dont clip again non-solid bmodels
 		if ( cent->nextState.solid == SOLID_BMODEL && ( cent->nextState.eFlags & EF_NONSOLID_BMODEL ) ) {
 			continue;
 		}
@@ -172,29 +137,28 @@ static void CG_ClipMoveToEntities( const vec3_t start, const vec3_t mins, const 
 			zd = ( ( ent->solid >> 8 ) & 255 );
 			zu = ( ( ent->solid >> 16 ) & 255 ) - 32;
 
-			bmins[0] = bmins[1] = (float)-x;
+			// keep: negated after the conversion, matches original codegen
+			bmins[0] = bmins[1] = -(float)x;
 			bmaxs[0] = bmaxs[1] = (float)x;
-			bmins[2] = (float)-zd;
+			bmins[2] = -(float)zd;
 			bmaxs[2] = (float)zu;
 
-			/* CoD addition: the trace only sees this entity if its own contents
-			   are in the mask (0x30028ECF). */
-			if ( ent->eType == ET_PLAYER ) {
+			// the trace only sees this entity if its own contents are in the mask
+			// (keep: a switch, matches original codegen)
+			switch ( ent->eType ) {
+			case ET_PLAYER:
 				contents = CONTENTS_BODY;
-			} else {
+				break;
+			default:
 				contents = CONTENTS_SOLID;
+				break;
 			}
 			if ( !( mask & contents ) ) {
 				continue;
 			}
 
-			// use bbox or capsule
-			/* Pass the entity contents as the third trap arg (0x300307A0/
-			   0x300307B0 reach CM_TempBoxModel's contents slot).  Retail's
-			   client left it unset and the engine clipped against a stale
-			   code pointer; a build where that dword lacks
-			   CONTENTS_SOLID|CONTENTS_BODY has CM_Trace gate the capsule away,
-			   so the crosshair never hits a teammate.  See cg_syscalls_mp.c. */
+			// MrE: use bbox or capsule
+			// (contents is passed explicitly; the original left it unset, see cg_syscalls_mp.c)
 			if ( ent->eFlags & EF_CAPSULE ) {
 				cmodel = trap_CM_TempCapsuleModel( bmins, bmaxs, contents );
 			} else {
@@ -203,7 +167,7 @@ static void CG_ClipMoveToEntities( const vec3_t start, const vec3_t mins, const 
 			VectorCopy( vec3_origin, angles );
 			VectorCopy( cent->lerpOrigin, origin );
 		}
-		// use bbox of capsule
+		// MrE: use bbox of capsule
 		if ( capsule ) {
 			trap_CM_TransformedCapsuleTrace( &trace, start, end,
 											 mins, maxs, cmodel, mask, origin, angles );
@@ -290,8 +254,6 @@ int     CG_PointContents( const vec3_t point, int passEntityNum, int contentMask
 			continue;
 		}
 
-		/* RTCW hands the trap ent->origin / ent->angles; 1.1 hands it the
-		   interpolated pair (0x3002919A). */
 		contents |= trap_CM_TransformedPointContents( point, cmodel,
 													 cent->lerpOrigin, cent->lerpAngles );
 	}
@@ -317,8 +279,6 @@ static void CG_InterpolatePlayerState( qboolean grabAngles ) {
 	prev = cg.snap;
 	next = cg.nextSnap;
 
-	/* RTCW copies prev->ps; 1.1 copies the newer one, so every field this
-	   function does not lerp comes from cg.nextSnap (0x300291F0). */
 	*out = cg.nextSnap->ps;
 
 	cg.weaponInfo = bg_weaponInfo[ cg.predictedPlayerState.weapon ];
@@ -344,8 +304,7 @@ static void CG_InterpolatePlayerState( qboolean grabAngles ) {
 	if ( i < prev->ps.bobCycle ) {
 		i += 256;       // handle wraparound
 	}
-	/* the truncation really is inside the parentheses (__ftol2 at 0x30029284
-	   runs before the add). */
+	// keep: the truncation is inside the parentheses
 	out->bobCycle = prev->ps.bobCycle + (int)( f * ( i - prev->ps.bobCycle ) );
 
 	out->aimSpreadScale = prev->ps.aimSpreadScale +
@@ -383,8 +342,7 @@ static void CG_TouchItem( centity_t *cent ) {
 	}
 
 	// never pick an item up twice in a prediction
-	/* cent->miscTime; cg_local.h leaves it inside unknown_0x1F0 (0x300293C4). */
-	if ( *(int *)&cent->unknown_0x1F0[4] == cg.time ) {
+	if ( cent->miscTime == cg.time ) {
 		return;
 	}
 
@@ -396,7 +354,7 @@ static void CG_TouchItem( centity_t *cent ) {
 	cent->currentState.eFlags |= EF_NODRAW;
 
 	// don't touch it again this prediction
-	*(int *)&cent->unknown_0x1F0[4] = cg.time;
+	cent->miscTime = cg.time;
 
 	// grab it
 	BG_AddPredictableEventToPlayerstate( EV_ITEM_PICKUP, cent->currentState.index,
@@ -407,9 +365,7 @@ static void CG_TouchItem( centity_t *cent ) {
 =========================
 CG_TouchTriggerPrediction
 
-Predict items.  The bmodel trace below is still issued and its result still
-discarded -- the push / teleport / objective trigger arms RTCW hangs off it are
-not in 1.1.
+Predict items
 =========================
 */
 static void CG_TouchTriggerPrediction( void ) {
@@ -471,6 +427,8 @@ top of the most recent playerState_t received from the server.
 
 Each new snapshot will usually have one or more new usercmd over the last,
 but we simulate all unacknowledged commands each time, not just the new ones.
+This means that on an internet connection, quite a few pmoves may be issued
+each frame.
 
 We detect prediction errors and allow them to be decayed off over several frames
 to ease the jerk.
@@ -497,7 +455,6 @@ static void CG_PredictPlayerState_Internal( void ) {
 	}
 
 	// prepare for pmove
-	/* all three trace slots get the capsule trace (0x30029550). */
 	cg_pmove.trace = CG_TraceCapsule;
 	cg_pmove.trace2 = CG_TraceCapsule;
 	cg_pmove.trace3 = CG_TraceCapsule;
@@ -533,7 +490,9 @@ static void CG_PredictPlayerState_Internal( void ) {
 	trap_GetUserCmd( current, &latestCmd );
 
 	// get the most recent information we have, even if
-	// the server time is beyond our current cg.time
+	// the server time is beyond our current cg.time,
+	// because predicted player positions are going to
+	// be ahead of everything else anyway
 	cg.predictedPlayerState = cg.nextSnap->ps;
 	cg.physicsTime = cg.nextSnap->serverTime;
 
@@ -582,11 +541,12 @@ static void CG_PredictPlayerState_Internal( void ) {
 			vec3_t delta;
 			float len;
 			vec3_t adjusted;
+			rfloat lenUnrounded;    // compared before rounding to float
 
 			CG_AdjustPositionForMover( cg.predictedPlayerState.origin,
 									   cg.predictedPlayerState.groundEntityNum,
 									   cg.physicsTime, cg.oldTime, adjusted, deltaAngles );
-			// add the deltaAngles (fixes jittery view while riding trains)
+			// RF, add the deltaAngles (fixes jittery view while riding trains)
 			cg.predictedPlayerState.delta_angles[YAW] += ANGLE2SHORT( deltaAngles[YAW] );
 
 			if ( cg_showmiss.integer ) {
@@ -596,9 +556,15 @@ static void CG_PredictPlayerState_Internal( void ) {
 					CG_Printf( "prediction error\n" );
 				}
 			}
-			VectorSubtract( oldPlayerState.origin, adjusted, delta );
-			len = (float)sqrt( delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2] );
-			if ( len > 0.1f ) {
+			delta[0] = oldPlayerState.origin[0] - adjusted[0];
+			delta[1] = oldPlayerState.origin[1] - adjusted[1];
+			delta[2] = (rfloat)oldPlayerState.origin[2] - adjusted[2];
+			// keep: VectorLength inlined, matches original codegen
+			lenUnrounded = sqrt( ( (rfloat)oldPlayerState.origin[2] - adjusted[2] ) * delta[2]
+								 + (rfloat)delta[1] * delta[1]
+								 + (rfloat)delta[0] * delta[0] );
+			len = lenUnrounded;
+			if ( lenUnrounded > 0.1f ) {
 				if ( cg_showmiss.integer ) {
 					CG_Printf( "Prediction miss: %f\n", len );
 				}
@@ -606,10 +572,8 @@ static void CG_PredictPlayerState_Internal( void ) {
 					int t;
 					float f;
 
-					/* cg.predictedErrorTime; cg_local.h leaves it as
-					   unknown_0x27348 (0x30029839). */
-					t = cg.time - *(int *)cg.unknown_0x27348;
-					f = ( cg_errordecay.value - t ) / cg_errordecay.value;
+					t = cg.time - cg.predictedErrorTime;
+					f = ( cg_errordecay.value - (rfloat)t ) / cg_errordecay.value;
 					if ( f < 0 ) {
 						f = 0;
 					}
@@ -620,8 +584,8 @@ static void CG_PredictPlayerState_Internal( void ) {
 				} else {
 					VectorClear( cg.predictedError );
 				}
-				*(int *)cg.unknown_0x27348 = cg.oldTime;
-				VectorAdd( delta, cg.predictedError, cg.predictedError );
+				cg.predictedErrorTime = cg.oldTime;
+				VectorAdd( cg.predictedError, delta, cg.predictedError );
 			}
 		}
 

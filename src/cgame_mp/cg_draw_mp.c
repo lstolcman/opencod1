@@ -1,43 +1,7 @@
-/*
- * cg_draw_mp.c -- draw all of the graphical elements during active (after
- * loading) gameplay.  (original source: cgame/cg_draw.c)
- *
- * cgame_mp_x86.dll 0x30014400 .. 0x30018CB6, 48 functions in binary order.
- * RTCW's cgame/cg_draw.c is the ancestor.  CoD replaced the whole 2D layer:
- *
- *   - SURVIVING, essentially unchanged: CG_DrawFieldWidth, CG_DrawField (both
- *     dead in 1.1 -- nothing calls them), CG_DrawSnapshot, CG_DrawFPS,
- *     CG_DrawUpperRight, CG_AddLagometerFrameInfo, CG_AddLagometerSnapshotInfo,
- *     CG_DrawDisconnect, CG_DrawLagometer, CG_CenterPrint,
- *     CG_PriorityCenterPrint, CG_DrawCenterString, CG_ScanForCrosshairEntity,
- *     CG_DrawFlashFade, CG_DrawFlashDamage, CG_DrawTimedMenus, CG_ScreenFade,
- *     CG_Fade, CG_UpdateCameraShake, CG_StartShakeCamera, CG_ShakeCamera,
- *     CG_DrawSpectator, CG_DrawVote, CG_DrawIntermission,
- *     CG_DrawSpectatorMessage, CG_DrawFollow, CG_Draw2D, CG_DrawActive.
- *   - GONE: the bitmap font (every string here goes out through
- *     trap_R_Text_Paint / trap_R_Text_Width), the whole hardcoded status bar,
- *     CG_DrawTimer, CG_DrawTeamOverlay, CG_DrawTeamInfo, CG_DrawPickupItem,
- *     CG_DrawNotify, CG_DrawDynamiteStatus, CG_ActivateLimboMenu,
- *     CG_DrawLimboMessage, CG_DrawWarmup, CG_ObjectivePrint,
- *     CG_DrawObjectiveInfo/Icons, CG_DrawCompass*, CG_Draw3DModel, CG_DrawHead,
- *     CG_DrawFlagModel, CG_DrawKeyModel, CG_DrawFlashZoomTransition,
- *     CG_DrawFlashFire, CG_DrawFlashLightning, CG_DrawFlashBlend*,
- *     CG_DrawBinocReticle.  The HUD is hudelems (cg_hudelem.c) and the menu
- *     system now.
- *   - NEW in CoD: CG_DrawScriptUsage, CG_DrawChatMessages,
- *     CG_CalcCrosshairPosition, CG_GetWeapReticleZoom, CG_DrawTurretCrossHair,
- *     CG_CheckForCursorHints, CG_DrawDamageDirectionIndicators,
- *     CG_DrawSoundOverlay, CG_DrawGameMessages, CG_DrawBoldGameMessages,
- *     CG_DrawMiniConsole, CG_DrawSubtitles, CG_DrawSay,
- *     CG_DrawPerformanceWarnings, CG_DrawDebugOverlays,
- *     CG_DrawSavedScreenBlend.
- *   - CG_DrawWeapReticle and CG_DrawCrosshair are RTCW functions rewritten from
- *     scratch around the weaponInfo_t reticle fields.
- *
- * Addresses in comments are addresses in that DLL.
- *
- * @fidelity: likely
- */
+// cg_draw.c -- draw all of the graphical elements during
+// active (after loading) gameplay
+// The status bar is hudelems and menus now; this file draws the crosshair,
+// scope overlay, chat, lagometer, center print, fades and debug overlays.
 
 #include <math.h>
 #include <string.h>
@@ -45,11 +9,8 @@
 
 #include "cg_local.h"
 
-/* Declarations no header carries. */
-
-/* universal/q_shared.c, universal/com_math.c. */
-extern vec3_t vec3_origin;
-extern vec4_t colorWhite;                       /* 0x30060804 */
+extern const vec3_t vec3_origin;
+extern vec4_t colorWhite;
 
 #ifndef COLOR_RED
 #define COLOR_RED       '1'
@@ -61,47 +22,20 @@ extern vec4_t colorWhite;                       /* 0x30060804 */
 #define ColorIndex( c ) ( ( (c) - '0' ) & 7 )
 #endif
 
-/* game_mp/bg_weapon.c. */
-float       BG_GetMinSpreadForWeapon( int time, const playerState_t *ps, int weaponIndex );
+double      BG_GetMinSpreadForWeapon( int time, const playerState_t *ps, int weaponIndex );
 
-/* other cgame_mp units. */
 qboolean    CG_DrawScoreboard( void );
 void        CG_DrawScoreboard_GetTeamColor( vec4_t color, int team );
 void        CG_DrawHudElems( void );
 void        CG_DrawWeaponSelect( void );
-/* Returns the sound length; `name` comes in through eax, the rest on the
-   stack. */
 int         CG_PlaySoundAliasByName( const char *name, int entnum, const vec3_t origin );
 
-/* ui_mp/ui_shared.c and ui_mp/ui_players.c. */
 void       *Menus_FindByName( const char *p );
 void        Menus_Close( void *menu );
 void        Menu_PaintAll( void );
 void        Controls_GetConfig( void );
-/* ui_shared.c 0x30046940: ( name, out ). */
 int         GetKeyBindingLocalizedString( const char *name, char **out );
 
-/*
- * cg_t fields cg_local.h has no name for; each one is inside a range that
- * header spells as a byte hole.
- */
-/* cg+0x2AA40 -- the gun's aim angles, [PITCH,YAW]; CG_CalcCrosshairPosition
-   0x30015D73/0x30015D79 runs AngleVectors' forward on them. */
-#define CG_GUN_ANGLES       ( (float *)( cg.unknown_0x2AA40 ) )
-/* cg+0x2AA9C -- RTCW's cg.cameraMode (CG_Draw2D 0x3001882B). */
-#define CG_CAMERA_MODE      ( *(int *)( cg.unknown_0x2AA40 + 0x5C ) )
-/* cg+0x27318 -- nonzero picks the weapon's "in" fractions over its "out"
-   fractions (CG_GetWeapReticleZoom 0x30015F60, CG_DrawCrosshair 0x300168C9). */
-#define CG_ADS_ZOOMING_IN   ( *(int *)( cg.unknown_0x27314 + 4 ) )
-/* cg+0x2A87C -- the grenadeTimeLeft the last pulse sound was played for
-   (CG_DrawCrosshair 0x30016AB6). */
-#define CG_LAST_GRENADE_PULSE   ( *(int *)( cg.unknown_0x2A87C ) )
-/* cg+0x2A798 / cg+0x2A79C -- CG_DrawCrosshairNames' "flash this name" latch
-   and its 0..100 countdown (0x30017050, 0x30017058). */
-#define CG_NAMEFLASH_CLIENT ( cg.unknown_0x2A798 )
-#define CG_NAMEFLASH_VALUE  ( cg.unknown_0x2A79C )
-
-/* Neither header carries these. */
 #ifndef BIGCHAR_WIDTH
 #define BIGCHAR_WIDTH       16
 #define BIGCHAR_HEIGHT      16
@@ -114,42 +48,35 @@ int         GetKeyBindingLocalizedString( const char *name, char **out );
 #define ROLL    2
 #endif
 #ifndef STAT_MINUS
-#define STAT_MINUS      10          /* num frame for '-' (0x3001464F) */
+#define STAT_MINUS      10          // num frame for '-' stats digit
 #endif
 #ifndef CMD_BACKUP
-#define CMD_BACKUP      64          /* CG_DrawDisconnect's `sub eax, 3Fh` */
+#define CMD_BACKUP      64
 #endif
 #ifndef SNAPFLAG_RATE_DELAYED
 #define SNAPFLAG_RATE_DELAYED   1
 #endif
 #ifndef CS_SERVERINFO
-#define CS_SERVERINFO   0
+#define CS_SERVERINFO   0       // an info string with all the serverinfo cvars
 #endif
-/* CG_DrawTeamBackground's two cases; no header carries the team enum. */
 #ifndef TEAM_AXIS
 #define TEAM_AXIS       1
 #define TEAM_ALLIES     2
 #endif
-/* vmMain's CG_DRAW_ACTIVE_FRAME stereoView argument; spelled with plain ints
-   the way cg_local.h already spells CG_DrawActiveFrame's. */
 #ifndef STEREO_CENTER
 #define STEREO_CENTER   0
 #define STEREO_LEFT     1
 #define STEREO_RIGHT    2
 #endif
 
-/* The damage-indicator quad's texture coordinates, 0x30060FB4. */
-static float cg_damageIconTexCoords[8] = { 1, 1,  0, 1,  0, 0,  1, 0 };
-
 static void CG_DrawTurretCrossHair( void );
 static void CG_DrawDisconnect( void );
 
 /*
 ================
-CG_DrawFieldWidth     0x30014400
+CG_DrawFieldWidth
 
-How wide CG_DrawField's output would be.  Straight RTCW; nothing in 1.1 calls
-it.  `width` comes in through ecx.
+How wide CG_DrawField's output would be
 ================
 */
 int CG_DrawFieldWidth( int x, int y, int width, int value, int charWidth, int charHeight ) {
@@ -211,10 +138,7 @@ int CG_DrawFieldWidth( int x, int y, int width, int value, int charWidth, int ch
 
 /*
 ================
-CG_DrawField          0x30014530
-
-Straight RTCW again, and just as dead.  CG_DrawPic is inlined at the one call
-site (0x300146F4).
+CG_DrawField
 ================
 */
 int CG_DrawField( int x, int y, int width, int value, int charWidth, int charHeight, qboolean dodrawpic, qboolean leftAlign ) {
@@ -257,6 +181,7 @@ int CG_DrawField( int x, int y, int width, int value, int charWidth, int charHei
 		l = width;
 	}
 
+	// NERVE - SMF
 	if ( !leftAlign ) {
 		x -= 2 + charWidth * ( l );
 	}
@@ -286,11 +211,8 @@ int CG_DrawField( int x, int y, int width, int value, int charWidth, int charHei
 
 /*
 ================
-CG_DrawTeamBackground 0x30014740
+CG_DrawTeamBackground
 
-RTCW's, with cgs.media.teamStatusBar replaced by the hud colour bar.  `team`
-comes in through eax.  CG_DrawPic is inlined (0x300147E1).  The rectangle is
-FLOATS, not RTCW's ints: 0x30014796 onward are `fmul dword ptr [esp+arg_*]`.
 ================
 */
 void CG_DrawTeamBackground( float x, float y, float w, float h, float alpha, int team ) {
@@ -315,19 +237,18 @@ void CG_DrawTeamBackground( float x, float y, float w, float h, float alpha, int
 
 /*
 =================
-CG_DrawScriptUsage    0x30014800
+CG_DrawScriptUsage
 
-cg_drawScriptUsage.  The three traps are no-ops in retail (205, 206) and one
-global dword (207), so all three lines read zero in a shipped build.
+cg_drawScriptUsage: script variable, thread and string counts
 =================
 */
 void CG_DrawScriptUsage( void ) {
-	trap_R_Text_Paint( 480, 92.8f, 5, 0.33333334f, colorWhite,
-					   va( "num vars:    %d", trap_syscall_0xCD() ), 8, 0, 3 );
-	trap_R_Text_Paint( 480, 108.8f, 5, 0.33333334f, colorWhite,
-					   va( "num threads: %d", trap_syscall_0xCE() ), 8, 0, 3 );
-	trap_R_Text_Paint( 480, 124.8f, 5, 0.33333334f, colorWhite,
-					   va( "string usage: %d", trap_syscall_0xCF() ), 8, 0, 3 );
+	CG_DrawStringExt( 480, 80, va( "num vars:    %d", trap_Scr_GetNumVars() ), colorWhite,
+					  qfalse, qtrue, 8, 16, 0, qtrue );
+	CG_DrawStringExt( 480, 96, va( "num threads: %d", trap_Scr_GetNumThreads() ), colorWhite,
+					  qfalse, qtrue, 8, 16, 0, qtrue );
+	CG_DrawStringExt( 480, 112, va( "string usage: %d", trap_Scr_GetStringUsage() ), colorWhite,
+					  qfalse, qtrue, 8, 16, 0, qtrue );
 }
 
 /*
@@ -338,16 +259,16 @@ void CG_DrawScriptUsage( void ) {
 ===========================================================================================
 */
 
-#define UPPERRIGHT_X 620
+static const int UPPERRIGHT_X = 620;    // keep: a const object, not RTCW's #define
 
 /*
 ==================
-CG_DrawSnapshot       0x30014990
+CG_DrawSnapshot
 ==================
 */
 static float CG_DrawSnapshot( float y ) {
 	char        *s;
-	float w;        /* retail: fild; fmul f:16; fsubr f:620 (0x300149D4) */
+	float w;
 
 	s = va( "time:%i snap:%i cmd:%i", cg.snap->serverTime,
 			cg.latestSnapshotNum, cgs.serverCommandSequence );
@@ -361,42 +282,40 @@ static float CG_DrawSnapshot( float y ) {
 
 /*
 ==================
-CG_DrawFPS            0x30014A00
+CG_DrawFPS
 
-RTCW's four-frame average became a 32-frame one that also prints the min/max
-frame rate and the mean absolute deviation, and cg_drawFPS 2 adds the renderer's
-own statistics block underneath.
+Prints the average, min/max and deviation over FPS_FRAMES frames;
+cg_drawFPS 2 adds the renderer's statistics underneath.
 ==================
 */
 #define FPS_FRAMES  32
 
-/* trap 107 (re slot +0xA0) fills this.  The names are what CG_DrawFPS prints
-   each dword as; the three at +0x10..+0x18 are only ever printed as megabytes. */
+// filled in by trap_R_TrackStatistics; names are what CG_DrawFPS prints them as
 typedef struct {
-	int tris;                       /* +0x00 */
-	int totalTris;                  /* +0x04 */
-	int verts;                      /* +0x08 */
-	int prims;                      /* +0x0C */
-	int memA;                       /* +0x10 */
-	int memB;                       /* +0x14 */
-	int memC;                       /* +0x18 */
-	int ents;                       /* +0x1C */
-	float dc;                       /* +0x20 */
+	int tris;
+	int totalTris;
+	int verts;
+	int prims;
+	int memA;
+	int memB;
+	int memC;
+	int ents;
+	float dc;
 } rendererStats_t;
 
-static int previousTimes[FPS_FRAMES];   /* 0x30093A60 */
-static int fadeLastTime;                /* 0x30093AE0 -- CG_DrawFlashFade's */
-static int index;                       /* 0x30093AE4 */
-static int previous;                    /* 0x30093AE8 */
-static rendererStats_t r_stats;         /* 0x30093AEC */
+static int previousTimes[FPS_FRAMES];
+static int fadeLastTime;                // CG_DrawFlashFade's
+static int index;
+static int previous;
+static rendererStats_t r_stats;
 
 static float CG_DrawFPS( float y ) {
 	char        *s;
 	float w;
 	int i, total;
 	int minTime, maxTime;
-	int fps;
-	float variance;
+	int fps, lowFps, highFps;
+	float mean, variance;
 	int t, frameTime;
 
 	// don't use serverTime, because that will be drifting to
@@ -404,6 +323,8 @@ static float CG_DrawFPS( float y ) {
 	t = trap_Milliseconds();
 	frameTime = t - previous;
 	previous = t;
+	minTime = 0x7FFFFFFF;
+	maxTime = 0;
 
 	previousTimes[index % FPS_FRAMES] = frameTime;
 	index++;
@@ -413,8 +334,6 @@ static float CG_DrawFPS( float y ) {
 
 	// average multiple frames together to smooth changes out a bit
 	total = 0;
-	minTime = 0x7FFFFFFF;
-	maxTime = 0;
 	for ( i = 0 ; i < FPS_FRAMES ; i++ ) {
 		total += previousTimes[i];
 		if ( minTime > previousTimes[i] ) {
@@ -425,9 +344,10 @@ static float CG_DrawFPS( float y ) {
 		}
 	}
 
+	mean = total * ( 1.0f / FPS_FRAMES );
 	variance = 0;
 	for ( i = 0 ; i < FPS_FRAMES ; i++ ) {
-		variance += (float)fabs( previousTimes[i] - total * ( 1.0f / FPS_FRAMES ) );
+		variance += (float)fabs( previousTimes[i] - mean );
 	}
 	variance *= ( 1.0f / FPS_FRAMES );
 
@@ -438,9 +358,10 @@ static float CG_DrawFPS( float y ) {
 		minTime = 1;
 	}
 	fps = Q_ftol( 1000 * FPS_FRAMES / (float)total );
+	lowFps = Q_ftol( 1000 / (float)maxTime );
+	highFps = Q_ftol( 1000 / (float)minTime );
 
-	s = va( "%ifps(%i-%i,%i)", fps, Q_ftol( 1000 / (float)maxTime ),
-			Q_ftol( 1000 / (float)minTime ), Q_ftol( variance ) );
+	s = va( "%ifps(%i-%i,%i)", fps, lowFps, highFps, Q_ftol( variance ) );
 	w = (float)Q_DrawStrlen( s ) * BIGCHAR_WIDTH;
 
 	CG_DrawBigString( UPPERRIGHT_X - w, y + 2, s, 1.0F );
@@ -450,7 +371,7 @@ static float CG_DrawFPS( float y ) {
 		return y;
 	}
 
-	trap_syscall_0x6B( (int)&r_stats );
+	trap_R_TrackStatistics( &r_stats );
 
 	s = va( "%i/%i tris", r_stats.tris / 3, r_stats.totalTris / 3 );
 	w = (float)Q_DrawStrlen( s ) * SMALLCHAR_WIDTH;
@@ -479,21 +400,21 @@ static float CG_DrawFPS( float y ) {
 	CG_DrawSmallString( UPPERRIGHT_X - w, y + 1, s, 1.0F );
 	y += SMALLCHAR_HEIGHT;
 
-	if ( r_stats.dc == 0 ) {
+	if ( r_stats.dc != 0 ) {
+		s = va( "%.2f dc  ", r_stats.dc );
+		w = (float)Q_DrawStrlen( s ) * SMALLCHAR_WIDTH;
+		CG_DrawSmallString( UPPERRIGHT_X - w, y + 1, s, 1.0F );
+		y += SMALLCHAR_HEIGHT;
 		return y;
 	}
-
-	s = va( "%.2f dc  ", r_stats.dc );
-	w = (float)Q_DrawStrlen( s ) * SMALLCHAR_WIDTH;
-	CG_DrawSmallString( UPPERRIGHT_X - w, y + 1, s, 1.0F );
-	y += SMALLCHAR_HEIGHT;
 
 	return y;
 }
 
 /*
 =====================
-CG_DrawUpperRight     0x30015070
+CG_DrawUpperRight
+
 =====================
 */
 static void CG_DrawUpperRight( void ) {
@@ -511,27 +432,27 @@ static void CG_DrawUpperRight( void ) {
 
 /*
 =================
-CG_DrawChatMessages   0x300150B0
+CG_DrawChatMessages
 
-CoD's replacement for RTCW's CG_DrawTeamInfo.  Each line gets a coloured bar
-behind it, and the "^7" CG_AddToTeamChat puts after the speaker's name splits
-the line into a team-coloured name and a white message.
+Each line gets a colored bar behind it, and the "^7" after the speaker's
+name splits it into a team-colored name and a white message
 =================
 */
 static void CG_DrawChatMessages( void ) {
 	int chatHeight;
 	int i;
 	float alpha;
-	float y;
-	char *s;
+	float x, y;
+	float w;
 	char *sep;
-	int w;
 	vec4_t hcolor;
 
-	chatHeight = cg_chatHeight.integer;
-	if ( chatHeight >= TEAMCHAT_HEIGHT ) {
+	if ( cg_chatHeight.integer < TEAMCHAT_HEIGHT ) {
+		chatHeight = cg_chatHeight.integer;
+	} else {
 		chatHeight = TEAMCHAT_HEIGHT;
-	} else if ( chatHeight <= 0 ) {
+	}
+	if ( chatHeight <= 0 ) {
 		return;
 	}
 
@@ -552,14 +473,11 @@ static void CG_DrawChatMessages( void ) {
 		if ( alpha > 200.0f ) {
 			alpha = 1.0f;
 		} else {
-			alpha /= 200;
+			alpha *= ( 1.0f / 200.0f );
 			if ( alpha <= 0 ) {
 				continue;
 			}
 		}
-
-		s = cgs.teamChatMsgs[i % chatHeight];
-		y = (float)( ( i - cgs.teamChatPos ) * 10 + 84 );
 
 		CG_DrawScoreboard_GetTeamColor( hcolor, bg_clientinfo[cg.snap->ps.clientNum].team );
 		hcolor[0] *= 0.25f;
@@ -567,25 +485,30 @@ static void CG_DrawChatMessages( void ) {
 		hcolor[2] *= 0.25f;
 		hcolor[3] = alpha * 0.6f;
 
-		w = trap_R_Text_Width( s, 0, 10 / 48.0f, 0 );
+		y = ( i - cgs.teamChatPos ) * 10 + 84;
+		w = trap_R_Text_Width( cgs.teamChatMsgs[i % chatHeight], 0, 10 / 48.0f, 0 ) + 24;
 		trap_R_SetColor( hcolor );
-		CG_DrawPic( 0, y, (float)( w + 24 ), 10, cgs.media.hudColorBar );
+		CG_DrawPic( 0, y, w, 10, cgs.media.hudColorBar );
 
 		hcolor[3] = alpha;
-		y = (float)( ( i - cgs.teamChatPos ) * 10 + 93 );
+		y = ( i - cgs.teamChatPos ) * 10 + 93;
+		x = 8;
 
-		sep = strstr( s, "^7" );
-		if ( sep && sep != s ) {
-			/* the name half, in the speaker's team colour */
+		sep = strstr( cgs.teamChatMsgs[i % chatHeight], "^7" );
+		if ( sep && sep != cgs.teamChatMsgs[i % chatHeight] ) {
+			// the name half, in the speaker's team color
 			CG_DrawScoreboard_GetTeamColor( hcolor, bg_clientinfo[cg.snap->ps.clientNum].team );
-			trap_R_Text_Paint( 8, y, 0, 10 / 48.0f, hcolor, s, 0, sep - s, 3 );
-			w = trap_R_Text_Width( s, 0, 10 / 48.0f, sep - s );
-			hcolor[0] = hcolor[1] = hcolor[2] = 1.0f;
-			trap_R_Text_Paint( w + 8.0f, y, 0, 10 / 48.0f, hcolor, sep, 0, 0, 3 );
+			trap_R_Text_Paint( x, y, 0, 10 / 48.0f, hcolor, cgs.teamChatMsgs[i % chatHeight], 0,
+							   sep - cgs.teamChatMsgs[i % chatHeight], 3 );
+			x += trap_R_Text_Width( cgs.teamChatMsgs[i % chatHeight], 0, 10 / 48.0f,
+									sep - cgs.teamChatMsgs[i % chatHeight] );
 		} else {
-			hcolor[0] = hcolor[1] = hcolor[2] = 1.0f;
-			trap_R_Text_Paint( 8, y, 0, 10 / 48.0f, hcolor, s, 0, 0, 3 );
+			sep = cgs.teamChatMsgs[i % chatHeight];
 		}
+		hcolor[0] = 1.0f;
+		hcolor[1] = 1.0f;
+		hcolor[2] = 1.0f;
+		trap_R_Text_Paint( x, y, 0, 10 / 48.0f, hcolor, sep, 0, 0, 3 );
 	}
 
 	trap_R_SetColor( NULL );
@@ -602,18 +525,18 @@ LAGOMETER
 #define LAG_SAMPLES     128
 
 typedef struct {
-	int frameSamples[LAG_SAMPLES];          /* 0x3019E1E0 */
-	int frameCount;                         /* 0x3019E3E0 */
-	int snapshotFlags[LAG_SAMPLES];         /* 0x3019E3E4 */
-	int snapshotSamples[LAG_SAMPLES];       /* 0x3019E5E4 */
-	int snapshotCount;                      /* 0x3019E7E4 */
+	int frameSamples[LAG_SAMPLES];
+	int frameCount;
+	int snapshotFlags[LAG_SAMPLES];
+	int snapshotSamples[LAG_SAMPLES];
+	int snapshotCount;
 } lagometer_t;
 
 lagometer_t lagometer;
 
 /*
 ==============
-CG_AddLagometerFrameInfo      0x300153D0
+CG_AddLagometerFrameInfo
 
 Adds the current interpolate / extrapolate bar for this frame
 ==============
@@ -628,11 +551,12 @@ void CG_AddLagometerFrameInfo( void ) {
 
 /*
 ==============
-CG_AddLagometerSnapshotInfo   0x30015400
+CG_AddLagometerSnapshotInfo
 
-Each time a snapshot is received, log its ping time and the number of snapshots
-that were dropped before it.  Pass NULL for a dropped packet.  `snap` comes in
-through eax.
+Each time a snapshot is received, log its ping time and
+the number of snapshots that were dropped before it.
+
+Pass NULL for a dropped packet.
 ==============
 */
 void CG_AddLagometerSnapshotInfo( snapshot_t *snap ) {
@@ -651,7 +575,7 @@ void CG_AddLagometerSnapshotInfo( snapshot_t *snap ) {
 
 /*
 ==============
-CG_DrawDisconnect             0x30015450
+CG_DrawDisconnect
 
 Should we draw something differnet for long lag vs no packets?
 ==============
@@ -660,8 +584,9 @@ static void CG_DrawDisconnect( void ) {
 	int cmdNum;
 	usercmd_t cmd;
 	const char      *s;
-	float w;        /* retail: fild after trap_R_Text_Width, ftol before the subtract (0x300154F8) */
+	float w;
 	vec4_t color = { 1, 1, 1, 1 };
+	float x;
 
 	// draw the phone jack if we are completely past our buffers
 	cmdNum = trap_GetCurrentCmdNumber() - CMD_BACKUP + 1;
@@ -672,9 +597,10 @@ static void CG_DrawDisconnect( void ) {
 	}
 
 	// also add text in center of screen
-	s = CG_SafeTranslateString_Internal( "cgame", "CGAME_CONNECTIONINTERUPTED" );
+	s = CG_SafeTranslateString( "CGAME_CONNECTIONINTERUPTED" );
 	w = trap_R_Text_Width( s, 0, 16 / 48.0f, 0 );
-	trap_R_Text_Paint( (float)( ( 640 - (int)w ) / 2 ), 100, 0, 16 / 48.0f, color, s, 0, 0, 3 );
+	x = ( 640 - (int)w ) / 2;
+	trap_R_Text_Paint( x, 100, 0, 16 / 48.0f, color, s, 0, 0, 3 );
 
 	// blink the icon
 	if ( ( cg.time >> 9 ) & 1 ) {
@@ -690,7 +616,7 @@ static void CG_DrawDisconnect( void ) {
 
 /*
 ==============
-CG_DrawLagometer              0x30015580
+CG_DrawLagometer
 ==============
 */
 static void CG_DrawLagometer( void ) {
@@ -699,6 +625,7 @@ static void CG_DrawLagometer( void ) {
 	float ax, ay, aw, ah, mid, range;
 	int color;
 	float vscale;
+	rfloat vd;      // keep: rfloat and reciprocal multiplies match original codegen
 
 	if ( !cg_lagometer.integer || cgs.localServer ) {
 		CG_DrawDisconnect();
@@ -718,10 +645,10 @@ static void CG_DrawLagometer( void ) {
 	CG_AdjustFrom640( &ax, &ay, &aw, &ah );
 
 	color = -1;
-	range = ah / 3;
-	mid = ay + range;
+	range = ah * ( 1.0f / 3.0f );
+	mid = (rfloat)ah * ( 1.0f / 3.0f ) + ay;
 
-	vscale = range / MAX_LAGOMETER_RANGE;
+	vscale = range * ( 1.0f / MAX_LAGOMETER_RANGE );
 
 	// draw the frame interpoalte / extrapolate graph
 	for ( a = 0 ; a < aw ; a++ ) {
@@ -752,7 +679,7 @@ static void CG_DrawLagometer( void ) {
 
 	// draw the snapshot latency / drop graph
 	range = ah / 2;
-	vscale = range / MAX_LAGOMETER_PING;
+	vscale = range * ( 1.0f / MAX_LAGOMETER_PING );
 
 	for ( a = 0 ; a < aw ; a++ ) {
 		i = ( lagometer.snapshotCount - a - 1 ) & ( LAG_SAMPLES - 1 );
@@ -769,11 +696,12 @@ static void CG_DrawLagometer( void ) {
 					trap_R_SetColor( g_color_table[ColorIndex( COLOR_GREEN )] );
 				}
 			}
-			v = v * vscale;
-			if ( v > range ) {
-				v = range;
+			vd = v * (rfloat)vscale;
+			if ( vd > range ) {
+				vd = range;
 			}
-			trap_R_DrawStretchPic( ax + aw - a, ay + ah - v, 1, v, 0, 0, 0, 0, cgs.media.whiteShader );
+			v = vd;
+			trap_R_DrawStretchPic( ax + aw - a, FCAST( (rfloat)ay + ah - vd ), 1, v, 0, 0, 0, 0, cgs.media.whiteShader );
 		} else if ( v < 0 ) {
 			if ( color != 4 ) {
 				color = 4;          // RED for dropped snapshots
@@ -805,32 +733,30 @@ CENTER PRINTING
 
 /*
 ==============
-CG_PriorityCenterPrint        0x300159E0
+CG_PriorityCenterPrint
 
-Called for important messages that should stay in the center of the screen for a
-few moments.  `priority` comes in through eax; `y` and `charWidth` are floats
-here and are stored as ints.
+Called for important messages that should stay in the center of the screen
+for a few moments
 ==============
 */
 void CG_PriorityCenterPrint( const char *str, float y, float charWidth, int priority ) {
 	char    *s;
 	int len;
-	qboolean neednewline;
+	qboolean neednewline = qfalse;
 	int c;
 
-	// don't draw if this print message is less important
+	// NERVE - SMF - don't draw if this print message is less important
 	if ( cg.centerPrintTime && priority < cg.centerPrintPriority ) {
 		return;
 	}
 
-	strncpy( cg.centerPrint, CG_TranslateMessage( str, "Center Print" ),
-			 sizeof( cg.centerPrint ) - 1 );
+	str = CG_TranslateMessage( str, "Center Print" );
+	strncpy( cg.centerPrint, str, sizeof( cg.centerPrint ) - 1 );
 	cg.centerPrintPriority = priority;
 	cg.centerPrint[ sizeof( cg.centerPrint ) - 1 ] = 0;
 
 	// turn spaces into newlines, if we've run over the linewidth
 	len = 0;
-	neednewline = qfalse;
 	s = cg.centerPrint;
 	while ( *s ) {
 		c = trap_SE_ReadCharFromString( (const unsigned char **)&s, NULL );
@@ -854,10 +780,8 @@ void CG_PriorityCenterPrint( const char *str, float y, float charWidth, int prio
 	}
 
 	cg.centerPrintTime = cg.time + 2000;
-	/* cg_local.h types both float; the binary __ftol2's the argument and
-	   stores an int, and CG_DrawCenterString fild's them back. */
-	cg.centerPrintY = (float)(int)y;
-	cg.centerPrintCharWidth = (float)(int)charWidth;
+	cg.centerPrintY = y;
+	cg.centerPrintCharWidth = charWidth;
 
 	// count the number of lines for centering
 	cg.centerPrintLines = 1;
@@ -875,10 +799,10 @@ void CG_PriorityCenterPrint( const char *str, float y, float charWidth, int prio
 
 /*
 ==============
-CG_CenterPrint                0x30015B20
+CG_CenterPrint
 
-`str` comes in through edx.  Unnamed in retail; the name is RTCW's, and it is
-the priority-0 wrapper RTCW's is.
+Called for important messages that should stay in the center of the screen
+for a few moments
 ==============
 */
 void CG_CenterPrint( const char *str, float y, float charWidth ) {
@@ -887,7 +811,7 @@ void CG_CenterPrint( const char *str, float y, float charWidth ) {
 
 /*
 ===================
-CG_DrawCenterString           0x30015B40
+CG_DrawCenterString
 ===================
 */
 static void CG_DrawCenterString( void ) {
@@ -895,6 +819,7 @@ static void CG_DrawCenterString( void ) {
 	int l;
 	int h;
 	float x, y, lineHeight;
+	float w;
 	float scale;
 	float   *color;
 	char linebuffer[1024];
@@ -917,7 +842,8 @@ static void CG_DrawCenterString( void ) {
 	scale = cg.centerPrintCharWidth / 32.0f;
 	h = trap_R_Text_Height( 0, scale );
 
-	y = cg.centerPrintY - h * 0.5f * cg.centerPrintLines - h;
+	// keep: the double cast matches original codegen
+	y = FCAST( cg.centerPrintY - (double)( h * 0.5f ) * cg.centerPrintLines ) - h;
 	lineHeight = h * 1.2f;
 
 	while ( 1 ) {
@@ -927,9 +853,10 @@ static void CG_DrawCenterString( void ) {
 			}
 			linebuffer[l] = start[l];
 		}
-		linebuffer[l] = 0;
+		*( linebuffer + l ) = 0;    // keep: pointer store, not linebuffer[l]
 
-		x = ( 640.0f - trap_R_Text_Width( linebuffer, 0, scale, 0 ) ) * 0.5f;
+		w = trap_R_Text_Width( linebuffer, 0, scale, 0 );
+		x = ( 640.0f - w ) * 0.5f;
 		trap_R_Text_Paint( x, y, 0, scale, color, linebuffer, 0, 0, 3 );
 
 		y += lineHeight;
@@ -948,31 +875,34 @@ static void CG_DrawCenterString( void ) {
 
 
 /*
-=================
-CG_CalcCrosshairPosition      0x30015D70
+================================================================================
 
-Project the gun's aim direction onto the 640x480 virtual screen, relative to its
-centre.  `x` comes in through edi and `y` through esi.  No RTCW counterpart --
-RTCW's crosshair is always dead centre.
+CROSSHAIRS
+
+================================================================================
+*/
+
+/*
+=================
+CG_CalcCrosshairPosition
+
+Project the gun's aim direction onto the 640x480 virtual screen, relative to
+its center
 =================
 */
 static void CG_CalcCrosshairPosition( float *x, float *y ) {
-	float sp, cp, sy, cy;
+	vec3_t angles;
 	vec3_t forward;
 	float dot;
 
-	cy = (float)cos( CG_GUN_ANGLES[YAW] * ( M_PI / 180.0f ) );
-	sy = (float)sin( CG_GUN_ANGLES[YAW] * ( M_PI / 180.0f ) );
-	cp = (float)cos( CG_GUN_ANGLES[PITCH] * ( M_PI / 180.0f ) );
-	sp = (float)sin( CG_GUN_ANGLES[PITCH] * ( M_PI / 180.0f ) );
+	angles[PITCH] = cg.gunPitch;
+	angles[YAW] = cg.gunYaw;
+	angles[ROLL] = 0;
+	AngleVectors( angles, forward, NULL, NULL );
 
-	forward[0] = cp * cy;
-	forward[1] = cp * sy;
-	forward[2] = -sp;
-
-	dot = cg.refdef.viewaxis[0][2] * forward[2]
+	dot = cg.refdef.viewaxis[0][0] * forward[0]
 		  + cg.refdef.viewaxis[0][1] * forward[1]
-		  + cg.refdef.viewaxis[0][0] * forward[0];
+		  + cg.refdef.viewaxis[0][2] * forward[2];
 
 	if ( dot <= 0 || cg.refdef.fov_x <= 0 || cg.refdef.fov_y <= 0 ) {
 		*x = 0;
@@ -980,25 +910,24 @@ static void CG_CalcCrosshairPosition( float *x, float *y ) {
 		return;
 	}
 
-	*x = ( cg.refdef.viewaxis[1][2] * forward[2]
+	*x = ( cg.refdef.viewaxis[1][0] * forward[0]
 		   + cg.refdef.viewaxis[1][1] * forward[1]
-		   + cg.refdef.viewaxis[1][0] * forward[0] )
+		   + cg.refdef.viewaxis[1][2] * forward[2] )
 		 / ( (float)tan( cg.refdef.fov_x * ( M_PI / 360.0f ) ) * dot ) * -320.0f;
 
-	*y = ( cg.refdef.viewaxis[2][2] * forward[2]
+	*y = ( cg.refdef.viewaxis[2][0] * forward[0]
 		   + cg.refdef.viewaxis[2][1] * forward[1]
-		   + cg.refdef.viewaxis[2][0] * forward[0] )
+		   + cg.refdef.viewaxis[2][2] * forward[2] )
 		 / ( (float)tan( cg.refdef.fov_y * ( M_PI / 360.0f ) ) * dot ) * -240.0f;
 }
 
 /*
 =================
-CG_GetWeapReticleZoom         0x30015F20
+CG_GetWeapReticleZoom
 
-How far into the ADS overlay we are, 0..1.  `zoom` comes in through ecx.
+How far into the ADS overlay we are, 0..1
 =================
 */
-/* NOT static: cg_weapons_mp.c's CG_AddViewWeapon calls it. */
 qboolean CG_GetWeapReticleZoom( float *zoom ) {
 	float frac;
 
@@ -1010,7 +939,7 @@ qboolean CG_GetWeapReticleZoom( float *zoom ) {
 		return qfalse;
 	}
 
-	if ( CG_ADS_ZOOMING_IN ) {
+	if ( cg.playerEntity.bPositionToADS ) {
 		*zoom = frac - ( 1.0f - cg.weaponInfo->adsZoomInFrac );
 		if ( *zoom > 0 ) {
 			*zoom = *zoom / cg.weaponInfo->adsZoomInFrac;
@@ -1022,15 +951,18 @@ qboolean CG_GetWeapReticleZoom( float *zoom ) {
 		}
 	}
 
-	return *zoom > 0.01f;
+	if ( *zoom <= 0.01f ) {
+		return qfalse;
+	}
+	return qtrue;
 }
 
 /*
 =================
-CG_DrawWeapReticle            0x30015FE0
+CG_DrawWeapReticle
 
-Draw the scope overlay: four mirrored corner quads of the side shader, the black
-fill outside them, and then whichever centre reticle the weapon asked for.
+Draw the scope overlay: four mirrored quadrants of the overlay shader, the
+fill outside them, and then whichever center reticle the weapon asked for.
 Returns how much of the world is still visible, which is what the crosshair
 fades itself by.
 =================
@@ -1041,9 +973,9 @@ static float CG_DrawWeapReticle( void ) {
 	int weapnum;
 	float crossX, crossY;
 	float halfW, halfH;
-	float cx, cy;
+	float cx = 0, cy = 0;   // keep: dead inits, *= forms and FCASTs match original codegen
 	float x0, y0, x1, y1;
-	float size, w, h;
+	float w, h;
 	qhandle_t shader;
 
 	if ( !CG_GetWeapReticleZoom( &zoom ) ) {
@@ -1055,8 +987,10 @@ static float CG_DrawWeapReticle( void ) {
 
 	CG_CalcCrosshairPosition( &crossX, &crossY );
 
-	halfW = cg.weaponInfo->adsOverlayWidth * cgs.screenXScale;
-	halfH = cg.weaponInfo->adsOverlayHeight * cgs.screenYScale;
+	halfW = cg.weaponInfo->adsOverlayWidth;
+	halfW *= cgs.screenXScale;
+	halfH = cg.weaponInfo->adsOverlayHeight;
+	halfH *= cgs.screenYScale;
 	cx = cgs.screenXScale * crossX + cg.refdef.width * 0.5f + cg.refdef.x;
 	cy = cgs.screenYScale * crossY + cg.refdef.height * 0.5f + cg.refdef.y;
 
@@ -1093,50 +1027,46 @@ static float CG_DrawWeapReticle( void ) {
 		}
 	}
 
-	switch ( cg.weaponInfo->adsOverlayReticle ) {
-	case 1:     // the weapon's own centre reticle, at its natural size
-		size = (float)cg.weaponInfo->reticleCenterSize;
-		w = size * cgs.screenXScale;
-		h = size * cgs.screenYScale;
-		trap_R_DrawStretchPic(
-			cg.refdef.x + ( cg.refdef.width - w ) * 0.5f + cgs.screenXScale * crossX,
-			cg.refdef.y + ( cg.refdef.height - h ) * 0.5f + cgs.screenYScale * crossY,
-			w, h, 0, 0, 1, 1, cg_weapons[ weapnum ].reticleCenter );
-		break;
-
-	case 2:     // a short crosshair with a gap
-		color[0] = color[1] = color[2] = 0;
-		trap_R_SetColor( color );
-		trap_R_DrawStretchPic( cx - 1, cy, 3, halfH * 0.9f, 0, 0, 1, 1,
-							   cgs.media.hudSoftLineShader );
-		trap_R_DrawStretchPic( cx - halfW * 0.9f, cy - 1, halfW * 0.75f, 3, 0, 0, 1, 1,
-							   cgs.media.hudSoftLineHShader );
-		trap_R_DrawStretchPic( cx + halfW * 0.15f, cy - 1, halfW * 0.75f, 3, 0, 0, 1, 1,
-							   cgs.media.hudSoftLineHShader );
-		break;
-
-	case 3:     // one long cross through the middle
-		color[0] = color[1] = color[2] = 0;
-		trap_R_SetColor( color );
-		trap_R_DrawStretchPic( cx - 1, cy - halfH * 0.9f, 3, halfH * 1.8f, 0, 0, 1, 1,
-							   cgs.media.hudSoftLineShader );
-		trap_R_DrawStretchPic( cx - halfW * 0.9f, cy - 1, halfW * 1.8f, 3, 0, 0, 1, 1,
-							   cgs.media.hudSoftLineHShader );
-		break;
-
-	case 4:     // same as case 2; the compiler emitted both copies
-		color[0] = color[1] = color[2] = 0;
-		trap_R_SetColor( color );
-		trap_R_DrawStretchPic( cx - 1, cy, 3, halfH * 0.9f, 0, 0, 1, 1,
-							   cgs.media.hudSoftLineShader );
-		trap_R_DrawStretchPic( cx - halfW * 0.9f, cy - 1, halfW * 0.75f, 3, 0, 0, 1, 1,
-							   cgs.media.hudSoftLineHShader );
-		trap_R_DrawStretchPic( cx + halfW * 0.15f, cy - 1, halfW * 0.75f, 3, 0, 0, 1, 1,
-							   cgs.media.hudSoftLineHShader );
-		break;
-
-	default:
-		break;
+	if ( cg.weaponInfo->adsOverlayReticle ) {
+		if ( cg.weaponInfo->adsOverlayReticle == 1 ) {
+			// the weapon's own center reticle, at its natural size
+			w = (float)cg.weaponInfo->reticleCenterSize;
+			h = w;
+			w *= cgs.screenXScale;
+			h *= cgs.screenYScale;
+			trap_R_DrawStretchPic(
+				( cg.refdef.width - w ) * 0.5f + cgs.screenXScale * crossX + cg.refdef.x,
+				( cg.refdef.height - h ) * 0.5f + cgs.screenYScale * crossY + cg.refdef.y,
+				w, h, 0, 0, 1, 1, cg_weapons[ weapnum ].reticleCenter );
+		} else if ( cg.weaponInfo->adsOverlayReticle == 2 ) {
+			// a short crosshair with a gap
+			color[0] = color[1] = color[2] = 0;
+			trap_R_SetColor( color );
+			trap_R_DrawStretchPic( cx - 1, cy, 3, halfH * 0.9f, 0, 0, 1, 1,
+								   cgs.media.hudSoftLineShader );
+			trap_R_DrawStretchPic( cx - halfW * 0.9f, cy - 1, halfW * 0.75f, 3, 0, 0, 1, 1,
+								   cgs.media.hudSoftLineHShader );
+			trap_R_DrawStretchPic( cx + FCAST( halfW * 0.15f ), cy - 1, halfW * 0.75f, 3, 0, 0, 1, 1,
+								   cgs.media.hudSoftLineHShader );
+		} else if ( cg.weaponInfo->adsOverlayReticle == 3 ) {
+			// one long cross through the middle
+			color[0] = color[1] = color[2] = 0;
+			trap_R_SetColor( color );
+			trap_R_DrawStretchPic( cx - 1, cy - halfH * 0.9f, 3, halfH * 1.8f, 0, 0, 1, 1,
+								   cgs.media.hudSoftLineShader );
+			trap_R_DrawStretchPic( cx - halfW * 0.9f, cy - 1, halfW * 1.8f, 3, 0, 0, 1, 1,
+								   cgs.media.hudSoftLineHShader );
+		} else if ( cg.weaponInfo->adsOverlayReticle == 4 ) {
+			// same as 2
+			color[0] = color[1] = color[2] = 0;
+			trap_R_SetColor( color );
+			trap_R_DrawStretchPic( cx - 1, cy, 3, halfH * 0.9f, 0, 0, 1, 1,
+								   cgs.media.hudSoftLineShader );
+			trap_R_DrawStretchPic( cx - halfW * 0.9f, cy - 1, halfW * 0.75f, 3, 0, 0, 1, 1,
+								   cgs.media.hudSoftLineHShader );
+			trap_R_DrawStretchPic( cx + FCAST( halfW * 0.15f ), cy - 1, halfW * 0.75f, 3, 0, 0, 1, 1,
+								   cgs.media.hudSoftLineHShader );
+		}
 	}
 
 	trap_R_SetColor( NULL );
@@ -1146,32 +1076,34 @@ static float CG_DrawWeapReticle( void ) {
 
 /*
 =================
-CG_DrawTurretCrossHair        0x30016610
+CG_DrawTurretCrossHair
 
-The crosshair of the MG42 / tank the player is locked to.  The two `* 0.0`
-multiplies are the compiler keeping a provably-zero crosshair offset.
+The crosshair of the turret the player is locked to
+(keep: the two * 0.0f terms match original codegen)
 =================
 */
 static void CG_DrawTurretCrossHair( void ) {
 	vec4_t color = { 1, 1, 1, 0 };
+	centity_t *cent;
 	int weapnum;
 	weaponInfo_t *weapon;
-	float size, w, h;
+	float w, h;
 
 	if ( !cg_drawCrosshair.integer ) {
 		return;
 	}
-	if ( cl_paused.integer ) {   /* retail gates on cl_paused here, not crosshairNoGun */
+	if ( cl_paused.integer ) {
 		return;
 	}
 	if ( cg.renderingThirdPerson ) {
 		return;
 	}
 
-	weapnum = cg_entities[ cg.predictedPlayerState.viewlocked_entNum ].currentState.weapon;
-	if ( !weapnum ) {
+	cent = &cg_entities[ cg.predictedPlayerState.viewlocked_entNum ];
+	if ( !cent->currentState.weapon ) {
 		return;
 	}
+	weapnum = cent->currentState.weapon;
 	weapon = bg_weaponInfo[weapnum];
 	if ( !weapon->reticleCenter[0] ) {
 		return;
@@ -1184,9 +1116,8 @@ static void CG_DrawTurretCrossHair( void ) {
 
 	trap_R_SetColor( color );
 
-	size = (float)weapon->reticleCenterSize;
-	w = size * cgs.screenXScale;
-	h = size * cgs.screenYScale;
+	w = weapon->reticleCenterSize * cgs.screenXScale;
+	h = weapon->reticleCenterSize * cgs.screenYScale;
 
 	trap_R_DrawStretchPic(
 		cg.refdef.x + ( cg.refdef.width - w ) * 0.5f + cgs.screenXScale * 0.0f,
@@ -1196,14 +1127,9 @@ static void CG_DrawTurretCrossHair( void ) {
 
 /*
 =================
-CG_DrawCrosshair              0x30016760
-
-Nothing is ever written into this in 1.1, so the fallback below always registers
-the empty string.  It is a file-static, at 0x3020D5F0.
+CG_DrawCrosshair
 =================
 */
-static char cg_crosshairShaderName[64];
-
 static void CG_DrawCrosshair( void ) {
 	vec4_t color = { 1, 1, 1, 0 };
 	float frac;
@@ -1211,24 +1137,23 @@ static void CG_DrawCrosshair( void ) {
 	float offsetY;
 	float crossX, crossY;
 	int weapnum;
-	weaponInfo_t *weapon;
 	float f;
-	float size;
+	float size, barSize;
 	float hx, hy;
 	qhandle_t shader;
-	float minSpread, spread;
-	float spreadX, spreadY, minOfs;
-	int left;
+	rfloat minSpread, spread, spreadY;  // keep: rfloat, FCAST and statement order match original codegen
+	float spreadX, minOfs;
 	int i;
 	float dir[4][2], ofs[4][2], add[4][2];
+
+	frac = cg.predictedPlayerState.fWeaponPosFrac;
+	scale = 1.0f;
+	offsetY = 0;
 
 	if ( cg.renderingThirdPerson ) {
 		return;
 	}
 
-	frac = cg.predictedPlayerState.fWeaponPosFrac;
-	scale = 1.0f;
-	offsetY = 0;
 	color[3] = cg_crosshairAlpha.value;
 
 	if ( cg.predictedPlayerState.eFlags & 0xC000 ) {        // riding a turret
@@ -1239,8 +1164,7 @@ static void CG_DrawCrosshair( void ) {
 	}
 
 	if ( cg.predictedPlayerState.serverCursorHint == 9 ) {
-		color[0] = 0.25f;
-		color[2] = 0.25f;
+		color[0] = color[2] = 0.25f;
 	}
 
 	weapnum = cg.weaponInfo->weapIndex;
@@ -1255,7 +1179,7 @@ static void CG_DrawCrosshair( void ) {
 	if ( !cg_drawCrosshair.integer ) {
 		return;
 	}
-	if ( cl_paused.integer ) {   /* retail gates on cl_paused here, not crosshairNoGun */
+	if ( cl_paused.integer ) {
 		return;
 	}
 	if ( frac == 1.0f && cg_drawGun.integer ) {
@@ -1272,23 +1196,21 @@ static void CG_DrawCrosshair( void ) {
 	CG_CalcCrosshairPosition( &crossX, &crossY );
 	trap_R_SetColor( color );
 
-	weapon = cg.weaponInfo;
-
 	if ( frac != 0 ) {
-		if ( CG_ADS_ZOOMING_IN ) {
-			f = frac - ( 1.0f - weapon->adsCrosshairInFrac );
+		if ( cg.playerEntity.bPositionToADS ) {
+			f = frac - ( 1.0f - cg.weaponInfo->adsCrosshairInFrac );
 			if ( f > 0 ) {
-				f = f / weapon->adsCrosshairInFrac;
+				f = f / cg.weaponInfo->adsCrosshairInFrac;
 			}
 		} else {
-			f = frac - ( 1.0f - weapon->adsCrosshairOutFrac );
+			f = frac - ( 1.0f - cg.weaponInfo->adsCrosshairOutFrac );
 			if ( f > 0 ) {
-				f = f / weapon->adsCrosshairOutFrac;
+				f = f / cg.weaponInfo->adsCrosshairOutFrac;
 			}
 		}
 		if ( f > 0 ) {
 			scale = 1.0f - 0.5f * f;
-			offsetY = 480.0f / cg.refdef.fov_y * weapon->adsAimPitch * f;
+			offsetY = FCAST( 480.0f / cg.refdef.fov_y ) * cg.weaponInfo->adsAimPitch * f;
 		}
 
 		if ( !cg_drawGun.integer ) {
@@ -1296,10 +1218,11 @@ static void CG_DrawCrosshair( void ) {
 			if ( scale < 1.0f ) {
 				shader = cg_weapons[ weapnum ].reticleCenter;
 				if ( !shader ) {
-					shader = trap_R_RegisterShader( cg_crosshairShaderName, 5 );
+					shader = trap_R_RegisterShader( cg_crosshairNoGun.string, 5 );
 				}
 				if ( shader ) {
-					size = (float)weapon->reticleCenterSize * ( 1.5f - scale );
+					size = (float)cg.weaponInfo->reticleCenterSize;
+					size *= 1.5f - scale;
 					trap_R_DrawStretchPic(
 						cg.refdef.x + ( cg.refdef.width - size ) * 0.5f + cgs.screenXScale * crossX,
 						cg.refdef.y + ( cg.refdef.height - size ) * 0.5f + cgs.screenYScale * crossY,
@@ -1318,21 +1241,21 @@ static void CG_DrawCrosshair( void ) {
 		crossY = offsetY;
 	}
 
-	if ( weapon->reticleCenter[0] ) {
+	if ( cg.weaponInfo->reticleCenter[0] ) {
 		hx = cgs.screenXScale * crossX;
 		hy = cgs.screenYScale * crossY;
-		size = (float)weapon->reticleCenterSize;
+		size = (float)cg.weaponInfo->reticleCenterSize;
 
 		// a cooking grenade grows its reticle and ticks once a second
-		if ( weapon->weaponType == 1 && cg.predictedPlayerState.grenadeTimeLeft
-			 && weapon->cookOffHold ) {
-			left = cg.predictedPlayerState.grenadeTimeLeft;
-			if ( CG_LAST_GRENADE_PULSE % 1000 < left % 1000 && (unsigned)( left / 1000 ) < 4 ) {
-				CG_PlayClientSoundAliasByName( (const char *)cgs.media.grenadePulse[left / 1000] );
-				left = cg.predictedPlayerState.grenadeTimeLeft;
+		if ( cg.weaponInfo->weaponType == 1 && cg.predictedPlayerState.grenadeTimeLeft
+			 && cg.weaponInfo->cookOffHold ) {
+			if ( cg.grenLastTime % 1000 < cg.predictedPlayerState.grenadeTimeLeft % 1000
+				 && (unsigned)( cg.predictedPlayerState.grenadeTimeLeft / 1000 ) < 4 ) {
+				CG_PlayClientSoundAliasByName(
+					(const char *)cgs.media.grenadePulse[cg.predictedPlayerState.grenadeTimeLeft / 1000] );
 			}
-			CG_LAST_GRENADE_PULSE = left;
-			size += ( left % 1000 ) * 0.01f;
+			cg.grenLastTime = cg.predictedPlayerState.grenadeTimeLeft;
+			size += ( cg.predictedPlayerState.grenadeTimeLeft % 1000 ) * 0.01f;
 		}
 
 		size *= scale;
@@ -1340,17 +1263,16 @@ static void CG_DrawCrosshair( void ) {
 			cg.refdef.x + ( cg.refdef.width - size ) * 0.5f + hx,
 			cg.refdef.y + ( cg.refdef.height - size ) * 0.5f + hy,
 			size, size, 0, 0, 1, 1, cg_weapons[ weapnum ].reticleCenter );
-		weapon = cg.weaponInfo;
 	}
 
-	if ( !weapon->reticleSide[0] ) {
+	if ( !cg.weaponInfo->reticleSide[0] ) {
 		trap_R_SetColor( NULL );
 		return;
 	}
 
 	// the four spread bars
 	color[3] = CG_DrawWeapReticle()
-			   * ( 1.0f - cg.predictedPlayerState.aimSpreadScale / 255.0f )
+			   * ( 1.0f - cg.predictedPlayerState.aimSpreadScale * ( 1.0f / 255.0f ) )
 			   * cg_crosshairAlpha.value;
 	if ( color[3] < cg_crosshairAlphaMin.value ) {
 		color[3] = cg_crosshairAlphaMin.value;
@@ -1358,13 +1280,13 @@ static void CG_DrawCrosshair( void ) {
 	trap_R_SetColor( color );
 
 	minSpread = BG_GetMinSpreadForWeapon( cg.snap->serverTime, &cg.predictedPlayerState, weapnum );
-	spread = ( weapon->hipSpreadMax - minSpread )
-			 * ( cg.predictedPlayerState.aimSpreadScale / 255.0f ) + minSpread;
+	spread = ( cg.weaponInfo->hipSpreadMax - minSpread )
+			 * ( cg.predictedPlayerState.aimSpreadScale * ( 1.0f / 255.0f ) ) + minSpread;
 	spread *= scale;
 
-	spreadX = 640.0f / cg.refdef.fov_x * spread;
-	spreadY = 480.0f / cg.refdef.fov_y * spread;
-	minOfs = (float)weapon->reticleMinOfs;
+	spreadX = FCAST( 640.0f / cg.refdef.fov_x ) * spread;
+	spreadY = FCAST( 480.0f / cg.refdef.fov_y ) * spread;
+	minOfs = (float)cg.weaponInfo->reticleMinOfs;
 	if ( spreadX < minOfs ) {
 		spreadX = minOfs;
 	}
@@ -1374,36 +1296,36 @@ static void CG_DrawCrosshair( void ) {
 
 	shader = cg_weapons[ weapnum ].reticleSide;
 
-	dir[0][0] = 0;      dir[0][1] = -1;
-	dir[1][0] = 1;      dir[1][1] = 0;
-	dir[2][0] = 0;      dir[2][1] = 1;
-	dir[3][0] = -1;     dir[3][1] = 0;
-
+	i = 0;
 	ofs[0][0] = -0.5f;  ofs[0][1] = -1;
 	ofs[1][0] = 0;      ofs[1][1] = -0.5f;
 	ofs[2][0] = -0.5f;  ofs[2][1] = 0;
 	ofs[3][0] = -1;     ofs[3][1] = -0.5f;
+
+	dir[0][0] = 0;      dir[0][1] = -1;
+	dir[1][0] = 1;      dir[1][1] = 0;
+	dir[2][0] = 0;      dir[2][1] = 1;
+	dir[3][0] = -1;     dir[3][1] = 0;
 
 	add[0][0] = 0;      add[0][1] = -1;
 	add[1][0] = 0;      add[1][1] = 0;
 	add[2][0] = 0;      add[2][1] = 0;
 	add[3][0] = -1;     add[3][1] = 0;
 
-	for ( i = 0; i < 4; i++ ) {
-		size = (float)weapon->reticleSideSize * scale;
+	for ( ; i < 4; i++ ) {
+		barSize = (float)cg.weaponInfo->reticleSideSize * scale;
 		trap_R_DrawStretchPicRotate(
-			cg.refdef.x + cg.refdef.width * 0.5f
-				+ ( spreadX * dir[i][0] + crossX ) * cgs.screenXScale
-				+ size * ofs[i][0] + add[i][0]
-				- dir[i][0] * weapon->hipReticleSidePos * size,
-			cg.refdef.y + cg.refdef.height * 0.5f
-				+ ( spreadY * dir[i][1] + crossY ) * cgs.screenYScale
-				+ size * ofs[i][1] + add[i][1]
-				- dir[i][1] * weapon->hipReticleSidePos * size,
-			size, size,
+			( spreadX * dir[i][0] + crossX ) * cgs.screenXScale
+				+ barSize * ofs[i][0] + add[i][0]
+				- dir[i][0] * cg.weaponInfo->hipReticleSidePos * barSize
+				+ cg.refdef.width * 0.5f + cg.refdef.x,
+			( spreadY * dir[i][1] + crossY ) * cgs.screenYScale
+				+ barSize * ofs[i][1] + add[i][1]
+				- dir[i][1] * cg.weaponInfo->hipReticleSidePos * barSize
+				+ cg.refdef.height * 0.5f + cg.refdef.y,
+			barSize, barSize,
 			0, (float)( ( i >> 1 ) & 1 ), 1, (float)( ( ( i - 2 ) >> 1 ) & 1 ),
 			( i & 1 ) * 90.0f, shader );
-		weapon = cg.weaponInfo;
 	}
 
 	trap_R_SetColor( NULL );
@@ -1411,22 +1333,17 @@ static void CG_DrawCrosshair( void ) {
 
 /*
 =================
-CG_ScanForCrosshairEntity     0x30016E50
+CG_ScanForCrosshairEntity
 =================
 */
 static void CG_ScanForCrosshairEntity( void ) {
 	trace_t trace;
 	vec3_t start, end;
 
-	start[0] = cg.refdef.vieworg[0];
-	start[1] = cg.refdef.vieworg[1];
-	start[2] = cg.refdef.vieworg[2];
+	VectorCopy( cg.refdef.vieworg, start );
+	VectorMA( start, 8192, cg.refdef.viewaxis[0], end );
 
-	end[0] = cg.refdef.viewaxis[0][0] * 8192 + cg.refdef.vieworg[0];
-	end[1] = cg.refdef.viewaxis[0][1] * 8192 + cg.refdef.vieworg[1];
-	end[2] = cg.refdef.viewaxis[0][2] * 8192 + cg.refdef.vieworg[2];
-
-	/* 0x2000001 -- CONTENTS_SOLID | CONTENTS_BODY */
+	// CONTENTS_SOLID | CONTENTS_BODY
 	CG_Trace( &trace, start, vec3_origin, vec3_origin, end,
 			  cg.snap->ps.clientNum, 0x2000001 );
 
@@ -1441,7 +1358,7 @@ static void CG_ScanForCrosshairEntity( void ) {
 
 /*
 ==============
-CG_CheckForCursorHints        0x30016F10
+CG_CheckForCursorHints
 ==============
 */
 void CG_CheckForCursorHints( void ) {
@@ -1461,7 +1378,7 @@ void CG_CheckForCursorHints( void ) {
 
 /*
 =====================
-CG_DrawCrosshairNames         0x30016F70
+CG_DrawCrosshairNames
 =====================
 */
 static void CG_DrawCrosshairNames( void ) {
@@ -1506,14 +1423,15 @@ static void CG_DrawCrosshairNames( void ) {
 		return;
 	}
 
-	name = va( "%s", bg_clientinfo[cg.crosshairClientNum].name );
+	name = bg_clientinfo[cg.crosshairClientNum].name;
+	name = va( "%s", name );
 	if ( !name || !*name ) {
 		return;
 	}
 	Q_CleanStr( name );
 
-	if ( cg.crosshairClientNum == CG_NAMEFLASH_CLIENT ) {
-		f = CG_NAMEFLASH_VALUE * 0.01f;
+	if ( cg.crosshairClientNum == cg.identifyClientNum ) {
+		f = cg.identifyClientHealth * 0.01f;
 		if ( f > 1.0f ) {
 			f = 1.0f;
 		} else if ( f < 0 ) {
@@ -1537,34 +1455,34 @@ static void CG_DrawCrosshairNames( void ) {
 	trap_R_Text_Paint( 345, 217, 0, 0.25f, color, name, 0, 0, 3 );
 }
 
+//==================================================================================
+
 /*
 ==============
-CG_DrawFlashFade              0x30017120
+CG_DrawFlashFade
 
-The script fade: cgs.scriptFade[0] is the target alpha, [1] the current one;
-scriptFadeStartTime / scriptFadeDuration sit beside them.
+The script fade: cgs.scriptFade[0] is the target alpha, [1] the current one
 ==============
 */
 static void CG_DrawFlashFade( void ) {
 	int t, msec;
-	float d;
 	vec4_t col;
 
 	if ( cgs.scriptFadeStartTime + cgs.scriptFadeDuration < cg.time ) {
 		cgs.scriptFade[1] = cgs.scriptFade[0];
 	} else if ( cgs.scriptFade[1] != cgs.scriptFade[0] ) {
-		t = trap_Milliseconds();
+		t = trap_Milliseconds();    // we need to use trap_Milliseconds() here since the cg.time gets modified upon reloading
 		msec = t - fadeLastTime;
 		fadeLastTime = t;
 		if ( msec < 500 && msec > 0 ) {
-			d = msec / (float)cgs.scriptFadeDuration;
+			// keep: the rfloat casts match original codegen
 			if ( cgs.scriptFade[1] > cgs.scriptFade[0] ) {
-				cgs.scriptFade[1] -= d;
+				cgs.scriptFade[1] -= msec / (rfloat)cgs.scriptFadeDuration;
 				if ( cgs.scriptFade[1] < cgs.scriptFade[0] ) {
 					cgs.scriptFade[1] = cgs.scriptFade[0];
 				}
 			} else {
-				cgs.scriptFade[1] += d;
+				cgs.scriptFade[1] += msec / (rfloat)cgs.scriptFadeDuration;
 				if ( cgs.scriptFade[1] > cgs.scriptFade[0] ) {
 					cgs.scriptFade[1] = cgs.scriptFade[0];
 				}
@@ -1572,10 +1490,9 @@ static void CG_DrawFlashFade( void ) {
 		}
 	}
 
-	if ( cgs.scriptFade[1] > 0 ) {
-		col[0] = 0;
-		col[1] = 0;
-		col[2] = 0;
+	// now draw the fade
+	if ( cgs.scriptFade[1] > 0.0 ) {
+		VectorClear( col );
 		col[3] = cgs.scriptFade[1];
 		CG_FillRect( 0, 0, 640, 480, col );
 	}
@@ -1583,7 +1500,7 @@ static void CG_DrawFlashFade( void ) {
 
 /*
 ==============
-CG_DrawFlashDamage            0x30017250
+CG_DrawFlashDamage
 ==============
 */
 #define DAMAGE_TIME 500
@@ -1599,7 +1516,7 @@ static void CG_DrawFlashDamage( void ) {
 		return;
 	}
 
-	redFlash = (float)fabs( cg.damageY * ( (float)( cg.v_dmg_time - cg.time ) / DAMAGE_TIME ) );
+	redFlash = (float)fabs( cg.v_dmg_pitch * ( (float)( cg.v_dmg_time - cg.time ) * ( 1.0f / DAMAGE_TIME ) ) );
 
 	// blend the entire screen red
 	if ( redFlash > 5 ) {
@@ -1609,15 +1526,17 @@ static void CG_DrawFlashDamage( void ) {
 	col[0] = 0.2f;
 	col[1] = 0;
 	col[2] = 0;
-	col[3] = 0.7f * ( redFlash / 5 );
+	col[3] = 0.7f * ( redFlash * 0.2f );
 	CG_FillRect( -10, -10, 650, 490, col );
 }
 
+static const float cg_damageIconTexCoords[8] = { 1, 1,  0, 1,  0, 0,  1, 0 };
+
 /*
 ==============
-CG_DrawDamageDirectionIndicators      0x300172F0
+CG_DrawDamageDirectionIndicators
 
-Eight 12-byte records in cg.damageIndicators: { serverTime, lifetime, yaw }.
+Each cg.damageIndicators entry is { serverTime, lifetime, yaw }
 ==============
 */
 static void CG_DrawDamageDirectionIndicators( void ) {
@@ -1628,8 +1547,7 @@ static void CG_DrawDamageDirectionIndicators( void ) {
 	vec4_t color = { 1, 1, 1, 0 };
 	int i;
 	int t, duration;
-	float yaw;
-	float alpha;
+	rfloat alpha;
 
 	if ( !cg.snap ) {
 		return;
@@ -1648,40 +1566,37 @@ static void CG_DrawDamageDirectionIndicators( void ) {
 	}
 
 	w = cg_hudDamageIconWidth.value * 0.5f;
-	verts[0] = -w;
-	verts[1] = cg_hudDamageIconOffset.value;
-	verts[2] = w;
-	verts[3] = cg_hudDamageIconOffset.value;
-	verts[4] = w;
-	verts[5] = cg_hudDamageIconHeight.value + cg_hudDamageIconOffset.value;
-	verts[6] = -w;
-	verts[7] = cg_hudDamageIconHeight.value + cg_hudDamageIconOffset.value;
+	verts[0] = verts[6] = -w;
+	verts[2] = verts[4] = w;
+	verts[1] = verts[3] = cg_hudDamageIconOffset.value;
+	verts[5] = verts[7] = cg_hudDamageIconHeight.value + cg_hudDamageIconOffset.value;
 
 	for ( i = 0; i < 8; i++ ) {
-		t = cg.time - cg.damageIndicators[i][0];
 		duration = cg.damageIndicators[i][1];
+		t = cg.time - cg.damageIndicators[i][0];
 		if ( t <= 0 || t >= duration ) {
 			continue;
 		}
 
-		yaw = vectoyaw( cg.refdef.viewaxis[0] ) - *(float *)&cg.damageIndicators[i][2];
+		// keep: zoom is reused for the yaw
+		zoom = vectoyaw( cg.refdef.viewaxis[0] ) - *(float *)&cg.damageIndicators[i][2];
 
-		alpha = 2.0f - ( t + t ) / (float)duration;
-		if ( alpha > 1.0f ) {
+		alpha = 2.0f - (rfloat)t * 2.0f / duration;
+		if ( 1.0f < alpha ) {
 			color[3] = 1.0f;
 		} else {
 			color[3] = alpha;
 		}
 
 		trap_R_SetColor( color );
-		CG_DrawRotatedQuadPic( x, y, verts, cg_damageIconTexCoords, yaw,
+		CG_DrawRotatedQuadPic( x, y, verts, cg_damageIconTexCoords, zoom,
 							   cgs.media.hudHitDirection );
 	}
 }
 
 /*
 ==============
-CG_DrawTimedMenus             0x30017470
+CG_DrawTimedMenus
 ==============
 */
 static void CG_DrawTimedMenus( void ) {
@@ -1699,15 +1614,13 @@ static void CG_DrawTimedMenus( void ) {
 
 /*
 ==============
-CG_Fade                       0x300174C0
+CG_Fade
 
-`startTime` comes in through ecx and `duration` through eax; r, g and b are
-accepted and never read -- CoD's script fade is alpha only.  Nothing in the DLL
-calls this.
+The script fade is alpha only: r, g and b are unused
 ==============
 */
 void CG_Fade( int r, int g, int b, int a, int startTime, int duration ) {
-	cgs.scriptFade[0] = (float)a / 255.0f;
+	cgs.scriptFade[0] = (float)a * ( 1.0f / 255.0f );
 	cgs.scriptFadeStartTime = startTime;
 	cgs.scriptFadeDuration = duration;
 
@@ -1718,7 +1631,7 @@ void CG_Fade( int r, int g, int b, int a, int startTime, int duration ) {
 
 /*
 ==============
-CG_ScreenFade                 0x30017500
+CG_ScreenFade
 ==============
 */
 static void CG_ScreenFade( void ) {
@@ -1734,9 +1647,9 @@ static void CG_ScreenFade( void ) {
 	msec = cg.fadeTime - cg.time;
 	if ( msec <= 0 ) {
 		cg.fadeFrom[0] = cg.fadeTo[0];
-		cg.fadeFrom[3] = cg.fadeTo[3];
 		cg.fadeFrom[1] = cg.fadeTo[1];
 		cg.fadeFrom[2] = cg.fadeTo[2];
+		cg.fadeFrom[3] = cg.fadeTo[3];
 
 		if ( !cg.fadeTo[3] ) {
 			cg.fadeRate = 0;
@@ -1760,18 +1673,17 @@ static void CG_ScreenFade( void ) {
 
 /*
 ==============
-CG_DrawSoundOverlay           0x30017620
+CG_DrawSoundOverlay
 
-cg_drawSoundOverlay.  The engine fills an array of 20-byte records, one per
-mixer channel: { name, vol, rvol, hz, pit }.
+cg_drawSoundOverlay: one line per mixer channel
 ==============
 */
 typedef struct {
-	const char *name;               /* +0x00 */
-	float vol;                      /* +0x04 */
-	float rvol;                     /* +0x08 */
-	int hz;                         /* +0x0C */
-	float pit;                      /* +0x10 */
+	const char *name;
+	float vol;
+	float rvol;
+	int hz;
+	float pit;
 } soundOverlay_t;
 
 void CG_DrawSoundOverlay( void ) {
@@ -1785,7 +1697,7 @@ void CG_DrawSoundOverlay( void ) {
 	int bits, khz, stereo;
 	char *s;
 
-	count = trap_MSS_GetSoundOverlay( cg_drawSoundOverlay.integer, (int)chans, 64, (int)&cpu );
+	count = trap_MSS_GetSoundOverlay( cg_drawSoundOverlay.integer, chans, 64, &cpu );
 	if ( count <= 0 ) {
 		return;
 	}
@@ -1800,26 +1712,26 @@ void CG_DrawSoundOverlay( void ) {
 
 	s = va( "CPU: ^3%%%i ^73D provider: ^3%s ^7bits: ^3%i ^7kHz: ^3%i ^7chan: ^3%i",
 			cpu, provider, bits, khz, ( stereo != 0 ) + 1 );
-	CG_DrawStringExt( 2, 82, s, colorWhite, qtrue, qfalse, 8, 16, 0, qfalse );
+	CG_DrawStringExt( 2, 82, s, colorWhite, qfalse, qtrue, 8, 16, 0, qfalse );
 
 	y = 98;
 	for ( i = 0; i < count; i++ ) {
-		if ( chans[i].name ) {
+		if ( !chans[i].name ) {
+			s = va( "%2i", i );
+		} else {
 			s = va( "%2i %-50s vol:^3%04.2f ^7rvol:^3%04.2f ^7pit:^3%04.2f ^7hz:^3%5i",
 					i, chans[i].name, chans[i].vol, chans[i].rvol, chans[i].pit, chans[i].hz );
-		} else {
-			s = va( "%2i", i );
 		}
-		CG_DrawStringExt( 2, y, s, NULL, qfalse, qtrue, 8, 16, 0, qfalse );
+		CG_DrawStringExt( 2, y, s, colorWhite, qfalse, qtrue, 8, 16, 0, qfalse );
 		y += 16;
 	}
 }
 
 /*
 ==============
-CG_DrawGameMessages           0x30017880
+CG_DrawGameMessages
 
-The console's notify lines, parked under the compass.
+The console's notify lines, under the compass
 ==============
 */
 static void CG_DrawGameMessages( void ) {
@@ -1845,7 +1757,7 @@ static void CG_DrawGameMessages( void ) {
 
 /*
 ==============
-CG_DrawBoldGameMessages       0x30017940
+CG_DrawBoldGameMessages
 ==============
 */
 static void CG_DrawBoldGameMessages( void ) {
@@ -1871,11 +1783,12 @@ static void CG_DrawBoldGameMessages( void ) {
 
 /*
 ==============
-CG_DrawMiniConsole            0x300179F0
+CG_DrawMiniConsole
 ==============
 */
 static void CG_DrawMiniConsole( void ) {
 	float x, y;
+	float alpha;
 
 	if ( con_minicon.integer < 0 ) {
 		return;
@@ -1885,13 +1798,14 @@ static void CG_DrawMiniConsole( void ) {
 	}
 
 	x = 2;
+	alpha = cg_hudAlpha.value;
 	y = 4;
-	trap_DrawMiniConsole( Q_ftol( x ), Q_ftol( y ), cg_hudAlpha.value );
+	trap_DrawMiniConsole( Q_ftol( x ), Q_ftol( y ), alpha );
 }
 
 /*
 ==============
-CG_DrawSubtitles              0x30017A80
+CG_DrawSubtitles
 ==============
 */
 static void CG_DrawSubtitles( void ) {
@@ -1908,7 +1822,7 @@ static void CG_DrawSubtitles( void ) {
 
 /*
 ==============
-CG_DrawSay                    0x30017B00
+CG_DrawSay
 ==============
 */
 static void CG_DrawSay( void ) {
@@ -1917,10 +1831,9 @@ static void CG_DrawSay( void ) {
 
 /*
 ==============
-CG_DrawPerformanceWarnings    0x30017B10
+CG_DrawPerformanceWarnings
 
-StatMon's warning icons, laid out two per row in the top-left corner.  The
-engine hands back an array of { endTime, shader } pairs.
+StatMon's warning icons, two per row down the left side
 ==============
 */
 typedef struct {
@@ -1936,16 +1849,14 @@ static void CG_DrawPerformanceWarnings( void ) {
 	float x, y;
 
 	now = trap_Milliseconds();
-	trap_syscall_0xBB( (int)&warnings, (int)&count );
+	trap_StatMon_GetStatsArray( &warnings, &count );
 
 	x = 2;
 	y = 200;
 
 	for ( i = 0; i < count; i++ ) {
 		if ( warnings[i].endTime >= now ) {
-			trap_R_DrawStretchPic( x * cgs.screenXScale, y * cgs.screenYScale,
-								   32 * cgs.screenXScale, 32 * cgs.screenYScale,
-								   0, 0, 1, 1, warnings[i].shader );
+			CG_DrawPic( x, y, 32, 32, warnings[i].shader );
 		}
 		x += 34;
 		if ( x + 32 > 68 ) {
@@ -1957,24 +1868,18 @@ static void CG_DrawPerformanceWarnings( void ) {
 
 /*
 ==============
-CG_DrawShader                 0x30017C50
+CG_DrawShader
 
-The renderer's own per-frame statistics, three lines of them.  Trap 108 fills
-three buffers and returns whether it wrote anything; only the last two are
-0x1000 bytes, the first is 64.
-
-0x30017C50..0x30017D0F, a separate body the compiler tail-inlined into
-CG_DrawDebugOverlays.
+cg_drawShader: describe the shader under the crosshair
 ==============
 */
 static void CG_DrawShader( void ) {
 	char header[64];
-	char line1[1024];
-	char line2[1024];
+	char line1[0x1000];
+	char line2[0x1000];
 
-	if ( !trap_R_TrackStatistics( (int)cg.refdef.vieworg, (int)cg.refdef.viewaxis,
-								  (int)header, (int)line1, (int)line2,
-								  sizeof( line1 ) ) ) {
+	if ( !trap_R_PickShader( cg.refdef.vieworg, cg.refdef.viewaxis[0],
+								  header, line1, line2, sizeof( line1 ) ) ) {
 		return;
 	}
 
@@ -1985,10 +1890,9 @@ static void CG_DrawShader( void ) {
 
 /*
 ==============
-CG_DrawDebugOverlays          0x30017D10
+CG_DrawDebugOverlays
 
-Three mutually exclusive debug pages.  CG_DrawShader (0x30017C50) above is a
-separate function that the compiler tail-inlined into this one.
+Three mutually exclusive debug pages
 ==============
 */
 static void CG_DrawDebugOverlays( void ) {
@@ -2003,31 +1907,28 @@ static void CG_DrawDebugOverlays( void ) {
 
 /*
 ==============
-CG_UpdateCameraShake          0x30017D40
+CG_UpdateCameraShake
 
-Recompute one shake's weight for this frame.  `shake` comes in through esi.
+Recompute one shake's weight for this frame
 ==============
 */
 static qboolean CG_UpdateCameraShake( cameraShake_t *shake ) {
 	int msec;
 	float scale;
-	float amplitude;
+	rfloat amplitude;   // keep: rfloat matches original codegen
 
 	msec = cg.time - shake->startTime;
-	if ( msec < 0 ) {
-		return qfalse;
-	}
-	if ( (float)msec >= shake->duration ) {
+	if ( msec < 0 || (rfloat)msec >= shake->duration ) {
 		return qfalse;
 	}
 
-	scale = 1.0f - Distance( cg.refdef.vieworg, shake->origin ) / shake->radius;
+	scale = 1.0f - FCAST( Distance( shake->origin, cg.refdef.vieworg ) ) / shake->radius;
 	amplitude = ( 1.0f - msec / shake->duration ) * shake->amplitude;
 
-	if ( scale < 0 ) {
-		shake->weight = scale / amplitude;
-	} else {
+	if ( scale >= 0 ) {
 		shake->weight = scale * amplitude;
+	} else {
+		shake->weight = scale / amplitude;
 	}
 	shake->frameAmplitude = amplitude;
 
@@ -2036,61 +1937,59 @@ static qboolean CG_UpdateCameraShake( cameraShake_t *shake ) {
 
 /*
 ==============
-CG_StartShakeCamera           0x30017DD0
+CG_StartShakeCamera
 
-`origin` comes in through ecx.  Take the first free or expired slot; if all four
-are busy, replace the weakest -- and if this one is weaker than all of them,
-drop it.
+Take the first free or expired slot; if all four are busy, replace the
+weakest, and if this one is weaker than all of them, drop it
 ==============
 */
 void CG_StartShakeCamera( float amplitude, int duration, float radius, const vec3_t origin ) {
 	cameraShake_t shake;
 	int i;
 	float weakest;
+	int time;       // keep: rfloat casts and the time copy match original codegen
 
 	if ( amplitude <= 0 ) {
 		return;
 	}
 
-	shake.startTime = cg.time;
+	time = cg.time;
+	shake.startTime = time;
 	shake.amplitude = amplitude;
 	shake.duration = (float)duration;
-	shake.radius = radius;
 	shake.origin[0] = origin[0];
 	shake.origin[1] = origin[1];
 	shake.origin[2] = origin[2];
+	shake.radius = radius;
 
 	CG_UpdateCameraShake( &shake );
 
 	for ( i = 0; i < 4; i++ ) {
-		if ( cg.cameraShakes[i].startTime > cg.time ) {
-			break;
-		}
-		if ( cg.time >= (float)cg.cameraShakes[i].startTime
-			 + cg.cameraShakes[i].duration ) {
-			break;
+		if ( cg.cameraShakes[i].startTime > time
+			 || (rfloat)cg.cameraShakes[i].startTime + cg.cameraShakes[i].duration
+			 <= (rfloat)cg.time ) {
+			memcpy( &cg.cameraShakes[i], &shake, sizeof( shake ) );
+			return;
 		}
 	}
 
-	if ( i == 4 ) {
-		weakest = shake.weight;
-		if ( cg.cameraShakes[0].weight < weakest ) {
-			i = 0;
-			weakest = cg.cameraShakes[0].weight;
-		}
-		if ( cg.cameraShakes[1].weight < weakest ) {
-			i = 1;
-			weakest = cg.cameraShakes[1].weight;
-		}
-		if ( cg.cameraShakes[2].weight < weakest ) {
-			i = 2;
-			weakest = cg.cameraShakes[2].weight;
-		}
-		if ( cg.cameraShakes[3].weight < weakest ) {
-			i = 3;
-		} else if ( i == 4 ) {
-			return;
-		}
+	weakest = shake.weight;
+	if ( cg.cameraShakes[0].weight < weakest ) {
+		i = 0;
+		weakest = cg.cameraShakes[0].weight;
+	}
+	if ( cg.cameraShakes[1].weight < weakest ) {
+		i = 1;
+		weakest = cg.cameraShakes[1].weight;
+	}
+	if ( cg.cameraShakes[2].weight < weakest ) {
+		i = 2;
+		weakest = cg.cameraShakes[2].weight;
+	}
+	if ( cg.cameraShakes[3].weight < weakest ) {
+		i = 3;
+	} else if ( i == 4 ) {
+		return;
 	}
 
 	memcpy( &cg.cameraShakes[i], &shake, sizeof( shake ) );
@@ -2098,9 +1997,10 @@ void CG_StartShakeCamera( float amplitude, int duration, float radius, const vec
 
 /*
 ==============
-CG_ShakeCamera                0x30017F00
+CG_ShakeCamera
 
-cg.shakePhase is the sine phase and cg.shakeMinAmplitude an always-on floor.
+cg.shakePhase is the sine phase and cg.shakeMinAmplitude an always-on floor
+(keep: the rfloat casts and FCASTs match original codegen)
 ==============
 */
 void CG_ShakeCamera( void ) {
@@ -2111,7 +2011,7 @@ void CG_ShakeCamera( void ) {
 
 	amplitude = 0;
 	weight = 0;
-	t = cg.time / 600.0f;
+	t = (rfloat)cg.time * ( 1.0f / 600.0f );
 
 	for ( i = 0; i < 4; i++ ) {
 		if ( CG_UpdateCameraShake( &cg.cameraShakes[i] )
@@ -2127,8 +2027,7 @@ void CG_ShakeCamera( void ) {
 	}
 
 	if ( weight <= 0 ) {
-		/* crandom() * M_PI: ONE rand (0x30017F95), then `fadd st,st` doubles it
-		   before the -1.0 (0x30017FA8) -- not two draws from the sequence */
+		// crandom() * M_PI, from a single rand()
 		r = rand() / 32768.0f;
 		cg.shakePhase = ( r + r - 1.0f ) * (float)M_PI;
 		return;
@@ -2138,72 +2037,71 @@ void CG_ShakeCamera( void ) {
 		weight = 1.0f;
 	}
 
-	cg.refdefViewAngles[PITCH] += (float)sin( t * 25.132742f + cg.shakePhase )
-								  * weight * amplitude * 18.0f;
-	cg.refdefViewAngles[YAW] += (float)sin( t * 47.12389f + cg.shakePhase )
-								* weight * amplitude * 16.0f;
-	cg.refdefViewAngles[ROLL] += (float)sin( t * 37.699112f + cg.shakePhase )
-								 * weight * amplitude * 10.0f;
+	// up/down, left/right, roll
+	cg.refdefViewAngles[PITCH] += FCAST( sin( (rfloat)t * 25.132742f + cg.shakePhase ) ) * weight * amplitude * 18.0f;
+	cg.refdefViewAngles[YAW] += FCAST( sin( (rfloat)t * 47.12389f + cg.shakePhase ) ) * weight * amplitude * 16.0f;
+	cg.refdefViewAngles[ROLL] += FCAST( sin( (rfloat)t * 37.699112f + cg.shakePhase ) ) * weight * amplitude * 10.0f;
 }
 
 /*
 =================
-CG_DrawSpectator              0x30018070
+CG_DrawSpectator
 =================
 */
 static void CG_DrawSpectator( void ) {
 	const char *s;
 	int w;
 	vec4_t color = { 1, 1, 1, 1 };
+	float x;
 
-	s = CG_SafeTranslateString_Internal( "cgame", "CGAME_SPECTATOR" );
+	s = CG_SafeTranslateString( "CGAME_SPECTATOR" );
 	w = trap_R_Text_Width( s, 0, 16 / 48.0f, 0 );
-	trap_R_Text_Paint( ( 640.0f - w ) * 0.5f, 458, 4, 16 / 48.0f, color, s, 0, 0, 3 );
+	x = ( 640.0f - w ) * 0.5f;
+	trap_R_Text_Paint( x, 458, 4, 16 / 48.0f, color, s, 0, 0, 3 );
 }
 
 /*
 =================
-CG_DrawVote                   0x30018120
+CG_DrawVote
 =================
 */
 static void CG_DrawVote( void ) {
 	const char *s;
+	const char *yesStr, *noStr;
 	int sec;
 	vec4_t color = { 1, 1, 0, 1 };
 	char *binding;
 	char yesKey[256];
 	char noKey[256];
 
-	if ( cgs.unknown_0x0A434 > cg.time || cgs.voteTime ) {
+	if ( cgs.complaintEndTime > cg.time || cgs.voteTime ) {
 		if ( GetKeyBindingLocalizedString( "vote yes", &binding ) ) {
-			strncpy( yesKey, binding, sizeof( yesKey ) - 1 );
+			Q_strncpyz( yesKey, binding, sizeof( yesKey ) );
 		} else {
-			strncpy( yesKey, "vote yes", sizeof( yesKey ) - 1 );
+			Q_strncpyz( yesKey, "vote yes", sizeof( yesKey ) );
 		}
-		yesKey[ sizeof( yesKey ) - 1 ] = 0;
 
 		if ( GetKeyBindingLocalizedString( "vote no", &binding ) ) {
-			strncpy( noKey, binding, sizeof( noKey ) - 1 );
+			Q_strncpyz( noKey, binding, sizeof( noKey ) );
 		} else {
-			strncpy( noKey, "vote no", sizeof( noKey ) - 1 );
+			Q_strncpyz( noKey, "vote no", sizeof( noKey ) );
 		}
-		noKey[ sizeof( noKey ) - 1 ] = 0;
 	}
 
-	if ( cgs.unknown_0x0A434 > cg.time ) {
+	if ( cgs.complaintEndTime > cg.time ) {
 		// a teamkill complaint
-		switch ( cgs.unknown_0x0A430 ) {
+		switch ( cgs.complaintClient ) {
 		case -1:
-			s = CG_SafeTranslateString_Internal( "cgame", "CGAME_COMPLAINTFILED" );
+			s = CG_SafeTranslateString( "CGAME_COMPLAINTFILED" );
 			break;
 		case -2:
-			s = CG_SafeTranslateString_Internal( "cgame", "CGAME_COMPLAINTDISMISSED" );
+			s = CG_SafeTranslateString( "CGAME_COMPLAINTDISMISSED" );
 			break;
 		case -3:
-			s = CG_SafeTranslateString_Internal( "cgame", "CGAME_COMPLAINTSERVERHOST" );
+			s = CG_SafeTranslateString( "CGAME_COMPLAINTSERVERHOST" );
 			break;
 		case -4:
-			s = CG_SafeTranslateString_Internal( "cgame", "CGAME_SERVERHOSTTEAMKILLED" );
+			s = CG_SafeTranslateString( "CGAME_SERVERHOSTTEAMKILLED" );
 			break;
 		default:
 			s = NULL;
@@ -2215,17 +2113,16 @@ static void CG_DrawVote( void ) {
 			return;
 		}
 
-		if ( !bg_clientinfo[cgs.unknown_0x0A430].infoValid ) {
+		if ( !bg_clientinfo[cgs.complaintClient].infoValid ) {
 			return;
 		}
 
-		s = CG_SafeTranslateString_Internal( "cgame", "CGAME_COMPLAINTTEAMKILLFILE" );
-		trap_R_Text_Paint( 8, 200, 0, 10 / 48.0f, color,
-						   va( s, bg_clientinfo[cgs.unknown_0x0A430].name ), 0, 0, 3 );
+		s = CG_SafeTranslateString( "CGAME_COMPLAINTTEAMKILLFILE" );
+		s = va( s, bg_clientinfo[cgs.complaintClient].name );
+		trap_R_Text_Paint( 8, 200, 0, 10 / 48.0f, color, s, 0, 0, 3 );
 
-		s = CG_SafeTranslateString_Internal( "cgame", "CGAME_PRESSYESNO" );
-		trap_R_Text_Paint( 8, 210, 0, 10 / 48.0f, color,
-						   va( s, yesKey, noKey ), 0, 0, 3 );
+		s = va( CG_SafeTranslateString( "CGAME_PRESSYESNO" ), yesKey, noKey );
+		trap_R_Text_Paint( 8, 210, 0, 10 / 48.0f, color, s, 0, 0, 3 );
 		return;
 	}
 
@@ -2235,8 +2132,7 @@ static void CG_DrawVote( void ) {
 
 	if ( cgs.voteModified ) {
 		cgs.voteModified = qfalse;
-		CG_PlaySoundAliasByName( (const char *)cgs.media.talkSound,
-								 cg.snap->ps.clientNum, cg.snap->ps.origin );
+		CG_PlayClientSoundAliasByName( (const char *)cgs.media.talkSound );
 	}
 
 	sec = ( cgs.voteTime - cg.time ) / 1000;
@@ -2245,33 +2141,27 @@ static void CG_DrawVote( void ) {
 	}
 
 	if ( cg.snap->ps.eFlags & 0x20000 ) {
-		s = CG_SafeTranslateString_Internal( "cgame", "CGAME_VOTE" );
-		trap_R_Text_Paint( 8, 200, 0, 10 / 48.0f, color,
-						   va( "%s(%i):%s", s, sec, cgs.voteString ), 0, 0, 3 );
+		s = va( "%s(%i):%s", CG_SafeTranslateString( "CGAME_VOTE" ), sec, cgs.voteString );
+		trap_R_Text_Paint( 8, 200, 0, 10 / 48.0f, color, s, 0, 0, 3 );
 
-		trap_R_Text_Paint( 8, 210, 0, 10 / 48.0f, color,
-						   va( "%s:%i, %s:%i",
-									CG_SafeTranslateString_Internal( "cgame", "CGAME_YES" ),
-									cgs.voteYes,
-									CG_SafeTranslateString_Internal( "cgame", "CGAME_NO" ),
-									cgs.voteNo ), 0, 0, 3 );
+		noStr = CG_SafeTranslateString( "CGAME_NO" );
+		yesStr = CG_SafeTranslateString( "CGAME_YES" );
+		s = va( "%s:%i, %s:%i", yesStr, cgs.voteYes, noStr, cgs.voteNo );
+		trap_R_Text_Paint( 8, 210, 0, 10 / 48.0f, color, s, 0, 0, 3 );
 	} else {
-		s = CG_SafeTranslateString_Internal( "cgame", "CGAME_VOTE" );
-		trap_R_Text_Paint( 8, 200, 0, 10 / 48.0f, color,
-						   va( "%s(%i):%s", s, sec, cgs.voteString ), 0, 0, 3 );
+		s = va( "%s(%i):%s", CG_SafeTranslateString( "CGAME_VOTE" ), sec, cgs.voteString );
+		trap_R_Text_Paint( 8, 200, 0, 10 / 48.0f, color, s, 0, 0, 3 );
 
-		trap_R_Text_Paint( 8, 210, 0, 10 / 48.0f, color,
-						   va( "%s(%s):%i, %s(%s):%i",
-									CG_SafeTranslateString_Internal( "cgame", "CGAME_YES" ),
-									yesKey, cgs.voteYes,
-									CG_SafeTranslateString_Internal( "cgame", "CGAME_NO" ),
-									noKey, cgs.voteNo ), 0, 0, 3 );
+		noStr = CG_SafeTranslateString( "CGAME_NO" );
+		yesStr = CG_SafeTranslateString( "CGAME_YES" );
+		s = va( "%s(%s):%i, %s(%s):%i", yesStr, yesKey, cgs.voteYes, noStr, noKey, cgs.voteNo );
+		trap_R_Text_Paint( 8, 210, 0, 10 / 48.0f, color, s, 0, 0, 3 );
 	}
 }
 
 /*
 =================
-CG_DrawIntermission           0x30018530
+CG_DrawIntermission
 =================
 */
 static void CG_DrawIntermission( void ) {
@@ -2282,7 +2172,7 @@ static void CG_DrawIntermission( void ) {
 
 /*
 =================
-CG_DrawSpectatorMessage       0x30018550
+CG_DrawSpectatorMessage
 =================
 */
 static void CG_DrawSpectatorMessage( void ) {
@@ -2302,14 +2192,14 @@ static void CG_DrawSpectatorMessage( void ) {
 	if ( !GetKeyBindingLocalizedString( "+attack", &binding ) ) {
 		binding = (char *)"+attack";
 	}
-	str = CG_SafeTranslateString_Internal( "cgame", "CGAME_FOLLOWNEXTPLAYER" );
+	str = CG_SafeTranslateString( "CGAME_FOLLOWNEXTPLAYER" );
 	trap_R_Text_Paint( 240, 426, 0, 10 / 48.0f, color,
 					   va( str, binding ), 0, 0, 3 );
 
 	if ( !GetKeyBindingLocalizedString( "+melee", &binding ) ) {
 		binding = (char *)"+melee";
 	}
-	str = CG_SafeTranslateString_Internal( "cgame", "CGAME_FOLLOWPREVIOUSPLAYER" );
+	str = CG_SafeTranslateString( "CGAME_FOLLOWPREVIOUSPLAYER" );
 	trap_R_Text_Paint( 240, 436, 0, 10 / 48.0f, color,
 					   va( str, binding ), 0, 0, 3 );
 
@@ -2320,53 +2210,55 @@ static void CG_DrawSpectatorMessage( void ) {
 		 && !GetKeyBindingLocalizedString( "+speed", &binding ) ) {
 		return;
 	}
-	str = CG_SafeTranslateString_Internal( "cgame", "CGAME_FOLLOWSTOP" );
-	trap_R_Text_Paint( 240, 446, 0, 10 / 48.0f, color,
-					   va( str, binding ), 0, 0, 3 );
+	str = CG_SafeTranslateString( "CGAME_FOLLOWSTOP" );
+	str = va( str, binding );
+	trap_R_Text_Paint( 240, 446, 0, 10 / 48.0f, color, str, 0, 0, 3 );
 }
 
 /*
 =================
-CG_DrawFollow                 0x30018710
+CG_DrawFollow
 =================
 */
 static qboolean CG_DrawFollow( void ) {
 	const char *s;
 	int w;
 	vec4_t color = { 1, 1, 1, 1 };
+	float x;
 
 	if ( !( cg.snap->ps.pm_flags & 0x10000 ) ) {
 		return qfalse;
 	}
 
 	if ( bg_clientinfo[cg.snap->ps.clientNum].infoValid ) {
-		s = va( "CGAME_FOLLOWING\x15: %s", bg_clientinfo[cg.snap->ps.clientNum].name );
+		s = trap_SE_LocalizeMessage( va( "CGAME_FOLLOWING\x15: %s", bg_clientinfo[cg.snap->ps.clientNum].name ),
+									 "spectator follow string" );
 	} else {
-		s = va( "CGAME_FOLLOWING\x15: %s", "?" );
+		s = trap_SE_LocalizeMessage( va( "CGAME_FOLLOWING\x15: %s", "?" ), "spectator follow string" );
 	}
-	s = trap_SE_LocalizeMessage( s, "spectator follow string" );
 
 	w = trap_R_Text_Width( s, 0, 16 / 48.0f, 0 );
-	trap_R_Text_Paint( ( 640 - w ) * 0.5f, 414, 0, 16 / 48.0f, color, s, 0, 0, 3 );
+	x = ( 640 - w ) * 0.5f;
+	trap_R_Text_Paint( x, 414, 0, 16 / 48.0f, color, s, 0, 0, 3 );
 
 	return qtrue;
 }
 
 /*
 =================
-CG_Draw2D                     0x30018810
+CG_Draw2D
 =================
 */
 static void CG_Draw2D( void ) {
-	if ( *(int *)cg.unknown_0x0000C ) {
+	if ( cg.levelShot ) {
 		return;
 	}
-	if ( cg.unknown_0x00010 ) {
+	if ( cg.cubemapShot ) {
 		return;
 	}
 
 	// if we are taking a levelshot for the menu, don't draw anything
-	if ( CG_CAMERA_MODE || !cg_draw2D.integer ) {
+	if ( cg.cameraMode || !cg_draw2D.integer ) {
 		CG_DrawFlashFade();
 		return;
 	}
@@ -2426,89 +2318,31 @@ static void CG_Draw2D( void ) {
 
 /*
 =====================
-CG_DrawSavedScreenBlend       0x30018920
-
-Uncalled in 1.1; CG_DrawActive inlines the same call.
+CG_DrawSavedScreenBlend
 =====================
 */
 void CG_DrawSavedScreenBlend( void ) {
-	CG_DrawShellShockSavedScreenBlend( cg.shellshock.startTime, cg.shellshock.duration,
-									   cg.shellshock.parms );
+	CG_DrawShellShockSavedScreenBlend( cg.shellshock.parms, cg.shellshock.startTime,
+									   cg.shellshock.duration );
 }
 
 /*
 =====================
-CG_DrawActive                 0x30018940
+CG_DrawActive
 
-Perform all drawing needed to completely fill the screen.  The no-snapshot half
-is CoD's loading screen; RTCW draws that from CG_DrawInformation alone.
+Perform all drawing needed to completely fill the screen
 =====================
 */
-/*
- * 0x300EEF28 is cg_info_mp.c's cg_drawingInformation, NOT a static of this
- * unit: CG_DrawActive's two accesses (0x3001895F, 0x30018973) hit the same
- * dword CG_DrawInformation, CG_DrawActiveFrame, CG_RegisterGraphics,
- * CG_RegisterWeapon, CG_SetConfigValues, CG_DrawObjectiveInfo and the three
- * Register traps use, so the recursion guard is shared.
- */
-extern int  cg_drawingInformation;              /* cg_info.c, 0x300EEF28 */
-
 void CG_DrawActive( int stereoView ) {
 	float separation;
 	vec3_t baseOrg;
-	const char *info;
-	qhandle_t levelshot;
-	char buf[64];
-	int expected;
-	float frac;
 
+	// optionally draw the info screen instead
 	if ( !cg.snap ) {
-		// no snapshot yet: this is the loading screen
-		if ( cg_drawingInformation ) {
-			return;
-		}
-		cg_drawingInformation = 1;
-
-		if ( cl_serverloadmap.string[0] ) {
-			trap_Cvar_Set( "cl_serverloadmap", "" );
-		}
-		if ( cl_serverloadgametype.string[0] ) {
-			trap_Cvar_Set( "cl_serverloadgametype", "" );
-		}
-		if ( cl_serverloadwaiting.integer ) {
-			trap_Cvar_Set( "cl_serverloadwaiting", "0" );
-		}
-
-		levelshot = 0;
-		info = Info_ValueForKey( CG_ConfigString( CS_SERVERINFO ), "mapname" );
-		if ( info && *info ) {
-			levelshot = trap_R_RegisterShaderNoMip( va( "levelshots/%s.tga", info ), 2 );
-		}
-		if ( !levelshot ) {
-			levelshot = trap_R_RegisterShaderNoMip( "menu/art/unknownmap", 2 );
-		}
-
-		trap_R_SetColor( NULL );
-		trap_R_DrawStretchPic( 0 * cgs.screenXScale, 0 * cgs.screenYScale,
-							   640 * cgs.screenXScale, 480 * cgs.screenYScale,
-							   0, 0, 1, 1, levelshot );
-
-		trap_Cvar_VariableStringBuffer( "com_expectedhunkusage", buf, sizeof( buf ) );
-		expected = atoi( buf );
-		if ( expected > 0 ) {
-			frac = trap_hunkUsed() / (float)expected;
-			if ( frac > 1.0f ) {
-				frac = 1.0f;
-			}
-			CG_HorizontalPercentBar( 200, 468, 240, 10, frac );
-		}
-
-		trap_UpdateScreen();
-		cg_drawingInformation--;
+		CG_DrawInformation( 0 );
 		return;
 	}
 
-	// optionally draw the info screen instead
 	switch ( stereoView ) {
 	case STEREO_CENTER:
 		separation = 0;
@@ -2525,14 +2359,12 @@ void CG_DrawActive( int stereoView ) {
 		break;
 	}
 
-	// clear around the rendered view if sized down
+	// offset vieworg appropriately if we're doing stereo separation
 	baseOrg[0] = cg.refdef.vieworg[0];
 	baseOrg[1] = cg.refdef.vieworg[1];
 	baseOrg[2] = cg.refdef.vieworg[2];
 	if ( separation != 0 ) {
-		cg.refdef.vieworg[0] = cg.refdef.viewaxis[1][0] * -separation + cg.refdef.vieworg[0];
-		cg.refdef.vieworg[1] = cg.refdef.viewaxis[1][1] * -separation + cg.refdef.vieworg[1];
-		cg.refdef.vieworg[2] = cg.refdef.viewaxis[1][2] * -separation + cg.refdef.vieworg[2];
+		VectorMA( cg.refdef.vieworg, -separation, cg.refdef.viewaxis[1], cg.refdef.vieworg );
 	}
 
 	cg.refdef.rdflags |= 0x10;
@@ -2550,10 +2382,12 @@ void CG_DrawActive( int stereoView ) {
 		cg.refdef.vieworg[2] = baseOrg[2];
 	}
 
-	CG_DrawShellShockSavedScreenBlend( cg.shellshock.startTime, cg.shellshock.duration,
-									   cg.shellshock.parms );
+	CG_DrawShellShockSavedScreenBlend( cg.shellshock.parms, cg.shellshock.startTime,
+									   cg.shellshock.duration );
+
+	// clear around the rendered view if sized down
 	CG_TileClear();
 
-	// draw status bar and other overlays
+	// draw status bar and other floating elements
 	CG_Draw2D();
 }

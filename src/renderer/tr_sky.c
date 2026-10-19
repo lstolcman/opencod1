@@ -4,28 +4,94 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "tr_records.h"
 #include "tr_gl_types.h"
 #include "tr_tess.h"
+#include "tr_local.h"
+/* ---- renderer-owned globals ---- */
+int s_cloudTexCoords[3392];             /* 0x011DAE68 */
+float sky_mins[2][6];                   /* 0x011DAE08: s mins, then t mins */
+float sky_maxs[2][6];                   /* 0x011DAE38: s maxs, then t maxs */
+float sky_max;
+float sky_min;
+unsigned char s_cloudTexP[15608];
+int rendererSkyBox;
+/* the sun sprite / flare / blind / glare state (0x011DBDA0); tr_records.h SUNBASE views */
+int rendererSunState[39];
+
 
 extern int GL_Bind();
 extern int GL_ClientState();
 extern int GL_State();
+void __cdecl GL_Cull( int cullType );
 extern int Hunk_AllocAlignInternal();
 void __cdecl RB_BeginSurface( void *shader, int vertexComponentCount );
 extern int RB_EndMultitexture();
 void __cdecl RB_EndSurface( void );
 extern int RB_SelectStorageATI();
 extern int RB_SelectStorageNV();
-extern void __cdecl RB_UpdateSunFlare( int a1, int a2, int a3, float a4, int a5, int a6 );
+void __cdecl RB_SelectStorage( int storageMode );
+extern void __cdecl RB_UpdateSunFlare(int shader,float brightness,float size,float spriteSize,int fadeInMsec,int fadeOutMsec);
 extern int R_CreateBufferARB();
+int __cdecl myftol( float value );   /* tr_shade_calc.c 0x00515940; LTCG inlines it */
+float Q_acos( float c );             /* com_math.c (/Op); LTCG inlines it */
 extern int R_FindShader();
 extern int R_FogOn();
+void sub_50AF10(char *comment); /* GLimp_LogComment */
  double __cdecl R_UpdateOverTime( float current, float target,
                                   int fadeInRate, int fadeOutRate,
                                   int elapsedMsec );
+
+/* -------------------------------------------------------------------------
+ *  Sky grid geometry.  Each cube face is a 9x9 grid of vertices (8 sky
+ *  subdivisions), giving 6*9*9 = 486 vertices per sky box.
+ * ------------------------------------------------------------------------- */
+#define SKYBOX_FACE_COUNT   6
+#define SKY_GRID_SIDE       9
+#define SKY_GRID_CENTER     4
+#define SKY_VERTEX_COUNT    ( SKYBOX_FACE_COUNT * SKY_GRID_SIDE * SKY_GRID_SIDE )   /* 486 */
+#define SKY_SUBDIVISIONS        8
+#define HALF_SKY_SUBDIVISIONS   ( SKY_SUBDIVISIONS / 2 )
+
+/* -------------------------------------------------------------------------
+ *  One sky-grid vertex, exactly as uploaded to the vertex buffer: a 2D
+ *  texcoord followed by a homogeneous position (CoDUO renderer_sky_vertex_t).
+ * ------------------------------------------------------------------------- */
+typedef struct {
+	float texCoord[2];        /* +0x00 */
+	float position[4];        /* +0x08 */
+} skyVertex_t;
+COD1_ASSERT_SIZE(skyVertex_t, 0x18);
+ASSERT_OFF(skyVertex_t, position, 0x08);
+
+#define SKY_VERTEX_BYTES   ( SKY_VERTEX_COUNT * (int)sizeof(skyVertex_t) )   /* 11664 = 0x2D90 */
+
+/* -------------------------------------------------------------------------
+ *  The sky-box vertex-storage descriptor (CoDUO renderer_sky_vertex_storage_t).
+ *  rendererSkyBox holds the ADDRESS of one of these; R_BuildSkyBox fills it for
+ *  whichever static-vertex backend is active, and DrawSkyBox binds the arrays
+ *  accordingly.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+	int      memorySource;    /* +0x00  static-vertex memory source / pool selector */
+	int      backend;         /* +0x04  SKYVB_* */
+	void    *base;            /* +0x08  client vertex ptr, or ARB/ATI buffer object name */
+	unsigned objectOffset;    /* +0x0c  ATI object-buffer byte offset */
+} skyVertexStorage_t;
+COD1_ASSERT_SIZE(skyVertexStorage_t, 0x10);
+ASSERT_OFF(skyVertexStorage_t, base, 0x08);
+
+enum {
+	SKYVB_CLIENT     = 0,     /* client memory (glLockArraysEXT path) */
+	SKYVB_ARB_BUFFER = 1,     /* ARB vertex buffer object */
+	SKYVB_ATI_OBJECT = 2,     /* ATI object buffer */
+	SKYVB_NV_MEMORY  = 3      /* NV vertex-array-range / hunk memory */
+};
+
+/* shader_t fields reached here by raw offset (not in tr_local.h's shared view):
+ *   +0x60 skyCloudHeight (float)     +0x64 skyOuterBox[6] (image_t*)
+ *   +0x7c skyInnerBox[6]  (image_t*) +0x154 stages[8]     (shaderStage_t*)
+ * shaderStage_t: +0x684 stateBits (u32; 0x100 == GLS_DEPTHMASK_TRUE). */
 
 static const char * const r_sunCvarNames[20] =
 {
@@ -101,137 +167,83 @@ static const int st_to_vec[6][3] =
 
 static const int sky_texorder[6] = { 0, 2, 1, 3, 4, 5 };
 
-/* ---- AddSkyPolygon  0x004E61D0 ----  VERIFIED */
-void __cdecl AddSkyPolygon(float *a1, int a2)
-{
-  double v2;
-  long double v3;
-  float *v4;
-  int v5;
-  int v6;
-  int v7;
-  double v8;
-  int v9;
-  int v10;
-  int v11;
-  double v12;
-  int v13;
-  double v14;
-  int v15;
-  double v16;
-  float v17;
-  float v18;
-  float v19;
-  float v20;
-  float v21;
-  float v22;
-  float v23;
-  float v24;
-  float v25;
-  float v26;
-  float v27;
+/*
+ * Sky s/t bounds accumulated per cube face.  Retail keeps them as four separate
+ * 6-float rows: the s-bounds in sky_mins/sky_maxs and the t-bounds in the rows
+ * immediately after (sky_mins_1 = sky_mins[1], sky_maxs_1 = sky_maxs[1],
+ * both aliased in tr_tess.h).
+ */
 
-  v2 = 0.0;
-  v3 = 0.0;
-  v4 = a1;
-  v20 = 0.0;
-  v5 = a2;
-  v6 = 0;
-  v22 = 0.0;
-  if ( a2 >= 4 )
+/* ---- AddSkyPolygon  0x004E61D0 ----  VERIFIED
+ * Fold a clipped polygon into the dominant cube face's s/t bounds. */
+void __cdecl AddSkyPolygon(int nump, float *vecs)
+{
+  int    i, j;
+  vec3_t v, av;
+  float  s, t, dv;
+  int    axis;
+  float *vp;
+
+  /* decide which face it maps to */
+  VectorCopy(vec3_origin, v);
+  for ( i = 0, vp = vecs; i < nump; i++, vp += 3 )
   {
-    v7 = 3;
-    do
-    {
-      v7 += 4;
-      v8 = v2 + *a1;
-      v6 += 4;
-      a1 += 12;
-      v23 = v22 + *(a1 - 10);
-      v18 = v8 + *(a1 - 9);
-      v19 = v18 + *(a1 - 6);
-      v21 = v20 + *(a1 - 11) + *(a1 - 8) + *(a1 - 5);
-      v24 = v23 + *(a1 - 7) + *(a1 - 4);
-      v2 = v19 + *(a1 - 3);
-      v3 = v21 + *(a1 - 2);
-      v20 = v3;
-      v22 = v24 + *(a1 - 1);
-    }
-    while ( v7 < v5 );
+    VectorAdd(vp, v, v);
   }
-  if ( v6 < v5 )
+  av[0] = fabs(v[0]);
+  av[1] = fabs(v[1]);
+  av[2] = fabs(v[2]);
+  if ( av[0] > av[1] && av[0] > av[2] )
   {
-    v9 = v5 - v6;
-    do
-    {
-      a1 += 3;
-      --v9;
-      v2 = v2 + *(a1 - 3);
-      v3 = v3 + *(a1 - 2);
-      v22 = v22 + *(a1 - 1);
-    }
-    while ( v9 );
-    v20 = v3;
-  }
-  v25 = fabs(v2);
-  v26 = fabs(v3);
-  v27 = fabs(v22);
-  if ( v25 <= (double)v26 || v25 <= (double)v27 )
-  {
-    if ( v26 <= (double)v27 || v26 <= (double)v25 )
-    {
-      v10 = 5;
-      if ( !((v22 < 0.0) | __UNORDERED__(v22, 0.0)) )
-        v10 = 4;
-    }
-    else if ( (v20 < 0.0) | __UNORDERED__(v20, 0.0) )
-    {
-      v10 = 3;
-    }
+    if ( v[0] < 0 )
+      axis = 1;
     else
-    {
-      v10 = 2;
-    }
+      axis = 0;
+  }
+  else if ( av[1] > av[2] && av[1] > av[0] )
+  {
+    if ( v[1] < 0 )
+      axis = 3;
+    else
+      axis = 2;
   }
   else
   {
-    v10 = ((v2 < 0.0) | __UNORDERED__(v2, 0.0)) != 0;
+    if ( v[2] < 0 )
+      axis = 5;
+    else
+      axis = 4;
   }
-  if ( v5 > 0 )
+
+  /* project new texture coords */
+  for ( i = 0; i < nump; i++, vecs += 3 )
   {
-    v11 = vec_to_st[v10][2];
-    do
-    {
-      if ( v11 <= 0 )
-        v12 = -v4[-v11 - 1];
-      else
-        v12 = v4[v11 - 1];
-      if ( !((v12 < 0.001) | __UNORDERED__(v12, 0.001)) )
-      {
-        v13 = vec_to_st[v10][0];
-        if ( v13 >= 0 )
-          v14 = v4[v13 - 1] / v12;
-        else
-          v14 = -1.0 / v12 * v4[-v13 - 1];
-        v15 = vec_to_st[v10][1];
-        v17 = v14;
-        if ( v15 >= 0 )
-          v16 = v4[v15 - 1] / v12;
-        else
-          v16 = -1.0 / v12 * v4[-v15 - 1];
-        if ( (v17 < (double)sky_mins[v10]) | __UNORDERED__(v17, sky_mins[v10]) )
-          sky_mins[v10] = v17;
-        if ( (v16 < flt_11DAE20[v10]) | __UNORDERED__(v16, flt_11DAE20[v10]) )
-          flt_11DAE20[v10] = v16;
-        if ( v17 > (double)sky_maxs[v10] )
-          sky_maxs[v10] = v17;
-        if ( v16 > flt_11DAE50[v10] )
-          flt_11DAE50[v10] = v16;
-      }
-      v4 += 3;
-      --v5;
-    }
-    while ( v5 );
+    j = vec_to_st[axis][2];
+    if ( j > 0 )
+      dv = vecs[j - 1];
+    else
+      dv = -vecs[-j - 1];
+    if ( dv < 0.001 )
+      continue;                            /* don't divide by zero */
+    j = vec_to_st[axis][0];
+    if ( j < 0 )
+      s = -vecs[-j - 1] / dv;
+    else
+      s = vecs[j - 1] / dv;
+    j = vec_to_st[axis][1];
+    if ( j < 0 )
+      t = -vecs[-j - 1] / dv;
+    else
+      t = vecs[j - 1] / dv;
+
+    if ( s < sky_mins[0][axis] )
+      sky_mins[0][axis] = s;
+    if ( t < sky_mins_1[axis] )
+      sky_mins_1[axis] = t;
+    if ( s > sky_maxs[0][axis] )
+      sky_maxs[0][axis] = s;
+    if ( t > sky_maxs_1[axis] )
+      sky_maxs_1[axis] = t;
   }
 }
 
@@ -244,855 +256,554 @@ static const float sky_clip[6][3] = {
 	{ -1.0f,  0.0f,  1.0f }
 };
 
-/* ---- ClipSkyPolygon  0x004E6450 ----  VERIFIED */
-void __cdecl ClipSkyPolygon(int a1, int a2, int a3)
+/* ---- ClipSkyPolygon  0x004E6450 ----  VERIFIED
+ * Recursively clip a polygon against the six sky-box planes; a fully clipped
+ * polygon (stage 6) is projected onto the sky bounds.  `vecs` needs one spare
+ * vertex because the polygon is closed in place before it is split. */
+void __cdecl ClipSkyPolygon(int nump, float *vecs, int stage)
 {
-  int v3;
-  int v4;
-  int v5;
-  float *v6;
-  float *v7;
-  double v8;
-  double v9;
-  _DWORD *v10;
-  int v11;
-  int v12;
-  _DWORD *v13;
-  char *v14;
-  _DWORD *v15;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  int v20;
-  double v21;
-  double v22;
-  int v23;
-  double v24;
-  double v25;
-  int v26;
-  int v27;
-  float *v28;
-  float *v29;
-  float *v30;
-  int v31;
-  _DWORD v32[64];
-  float v33[64];
-  float v34[64][3]; // [esp+220h] [ebp-600h] BYREF
-  _DWORD v37[192]; // [esp+520h] [ebp-300h] BYREF -- the newv[1] half
+  const float *norm;
+  float       *v;
+  qboolean     front, back;
+  rfloat       d, e;                       /* kept on the x87 stack by retail */
+  float        dists[64];                  /* MAX_CLIP_VERTS */
+  int          sides[64];
+  vec3_t       newv[2][64];
+  int          newc[2];
+  int          i, j;
 
-  if ( a1 > 62 )
-    ri_Error(1, "\x15" "ClipSkyPolygon: MAX_CLIP_VERTS");
-  v3 = a3;
-  if ( a3 == 6 )
+  if ( nump > 64 - 2 )                     /* MAX_CLIP_VERTS - 2 */
+    ri.Error(1, "\x15" "ClipSkyPolygon: MAX_CLIP_VERTS");
+  if ( stage == 6 )
   {
-    AddSkyPolygon((float *)a2, a1);
+    /* fully clipped, so draw it */
+    AddSkyPolygon(nump, vecs);
     return;
   }
-  v4 = 0;
-  v5 = 0;
-  v6 = (float *)sky_clip[a3];   /* retail 0x00571468 */
-  v26 = 0;
-  if ( a1 > 0 )
+
+  front = back = qfalse;
+  norm = sky_clip[stage];
+  for ( i = 0, v = vecs; i < nump; i++, v += 3 )
   {
-    v7 = (float *)(a2 + 4);
-    while ( 1 )
+    d = DotProduct(v, norm);
+    if ( d > 0.1f )                        /* ON_EPSILON */
     {
-      v8 = v7[1] * v6[2] + *(v7 - 1) * *v6 + v6[1] * *v7;
-      if ( v8 <= 0.1 )
-      {
-        if ( (v8 < -0.1) | __UNORDERED__(v8, -0.1) )
-        {
-          v26 = 1;
-          v32[v4] = 1;
-        }
-        else
-        {
-          v32[v4] = 2;
-        }
-      }
-      else
-      {
-        v5 = 1;
-        v32[v4] = 0;
-      }
-      v33[v4++] = v8;
-      v7 += 3;
-      if ( v4 >= a1 )
+      front = qtrue;
+      sides[i] = 0;                        /* SIDE_FRONT */
+    }
+    else if ( d < -0.1f )
+    {
+      back = qtrue;
+      sides[i] = 1;                        /* SIDE_BACK */
+    }
+    else
+      sides[i] = 2;                        /* SIDE_ON */
+    dists[i] = d;
+  }
+
+  if ( !front || !back )
+  {
+    /* not clipped */
+    ClipSkyPolygon(nump, vecs, stage + 1);
+    return;
+  }
+
+  /* clip it */
+  sides[i] = sides[0];
+  dists[i] = dists[0];
+  VectorCopy(vecs, (vecs + (i * 3)));
+  newc[0] = newc[1] = 0;
+
+  for ( i = 0, v = vecs; i < nump; i++, v += 3 )
+  {
+    switch ( sides[i] )
+    {
+      case 0:
+        VectorCopy(v, newv[0][newc[0]]);
+        newc[0]++;
         break;
-      v6 = (float *)sky_clip[a3];   /* retail 0x00571468 */
+      case 1:
+        VectorCopy(v, newv[1][newc[1]]);
+        newc[1]++;
+        break;
+      case 2:
+        VectorCopy(v, newv[0][newc[0]]);
+        newc[0]++;
+        VectorCopy(v, newv[1][newc[1]]);
+        newc[1]++;
+        break;
     }
-    if ( v5 && v26 )
+
+    if ( sides[i] == 2 || sides[i + 1] == 2 || sides[i + 1] == sides[i] )
+      continue;
+
+    d = dists[i] / (dists[i] - dists[i + 1]);
+    for ( j = 0; j < 3; j++ )
     {
-      v9 = v33[0];
-      v32[v4] = v32[0];
-      v33[v4] = v9;
-      v10 = (_DWORD *)(a2 + 12 * v4);
-      *v10 = *(_DWORD *)a2;
-      v10[1] = *(_DWORD *)(a2 + 4);
-      v10[2] = *(_DWORD *)(a2 + 8);
-      v28 = &v34[0][2];
-      v11 = 0;
-      v29 = &v34[0][1];
-      v31 = 0;
-      v27 = 0;
-      v12 = a2 + 4;
-      v13 = (_DWORD *)&v34[0][2];
-      v14 = (char *)&v34[0][1];
-      v15 = (_DWORD *)&v34[0][0];
-      v30 = &v34[0][0];
-      while ( 1 )
-      {
-        v16 = v32[v27];
-        if ( !v16 )
-        {
-          *v15 = *(_DWORD *)(v12 - 4);
-          *(_DWORD *)v14 = *(_DWORD *)v12;
-          *v13 = *(_DWORD *)(v12 + 4);
-          ++v31;
-          v30 += 3;
-          v29 += 3;
-          v15 += 3;
-          v14 += 12;
-          v13 += 3;
-          v28 += 3;
-          goto LABEL_23;
-        }
-        v17 = v16 - 1;
-        if ( !v17 )
-          goto LABEL_21;
-        if ( v17 == 1 )
-        {
-          *v15 = *(_DWORD *)(v12 - 4);
-          *(_DWORD *)v14 = *(_DWORD *)v12;
-          *v13 = *(_DWORD *)(v12 + 4);
-          ++v31;
-          v30 += 3;
-          v29 += 3;
-          v15 += 3;
-          v14 += 12;
-          v13 += 3;
-          v28 += 3;
-LABEL_21:
-          v18 = 3 * v11;
-          v37[v18] = *(_DWORD *)(v12 - 4);
-          v37[v18 + 1] = *(_DWORD *)v12;
-          v37[v18 + 2] = *(_DWORD *)(v12 + 4);
-          ++v11;
-        }
-LABEL_23:
-        v19 = v32[v27];
-        if ( v19 != 2 )
-        {
-          v20 = v32[v27 + 1];
-          if ( v20 != 2 && v20 != v19 )
-          {
-            v15 += 3;
-            v14 += 12;
-            v21 = v33[v27] / (v33[v27] - v33[v27 + 1]);
-            v13 += 3;
-            v22 = (*(float *)(v12 + 8) - *(float *)(v12 - 4)) * v21 + *(float *)(v12 - 4);
-            *v30 = v22;
-            v23 = 3 * v11;
-            *(float *)&v37[v23] = v22;
-            v24 = (*(float *)(v12 + 12) - *(float *)v12) * v21 + *(float *)v12;
-            *v29 = v24;
-            *(float *)&v37[v23 + 1] = v24;
-            v28 += 3;
-            v25 = v21 * (*(float *)(v12 + 16) - *(float *)(v12 + 4)) + *(float *)(v12 + 4);
-            *(v28 - 3) = v25;
-            *(float *)&v37[v23 + 2] = v25;
-            ++v31;
-            v30 += 3;
-            v29 += 3;
-            ++v11;
-          }
-        }
-        v12 += 12;
-        if ( ++v27 >= a1 )
-        {
-          ClipSkyPolygon(v31, (int)v34, a3 + 1);
-          ClipSkyPolygon(v11, (int)v37, a3 + 1);
-          return;
-        }
-      }
+      e = v[j] + d * (v[j + 3] - v[j]);
+      newv[0][newc[0]][j] = e;
+      newv[1][newc[1]][j] = e;
     }
-    v3 = a3;
+    newc[0]++;
+    newc[1]++;
   }
-  ClipSkyPolygon(a1, a2, v3 + 1);
+
+  /* continue */
+  ClipSkyPolygon(newc[0], newv[0][0], stage + 1);
+  ClipSkyPolygon(newc[1], newv[1][0], stage + 1);
 }
 
-/* ---- ClearSkyBox  0x004E67A0 ----  [HIGH] */
-int ClearSkyBox()
+/* ---- ClearSkyBox  0x004E67A0 ----  [HIGH]
+ * Reset every face's s/t bounds.  EAX is left at 6*4 (the strength-reduced
+ * loop counter; dead). */
+void ClearSkyBox()
 {
-  int result;
-
-  for ( result = 0; result < 6; ++result )
-  {
-    flt_11DAE20[result] = 9999.0;
-    sky_mins[result] = 9999.0;
-    flt_11DAE50[result] = -9999.0;
-    sky_maxs[result] = -9999.0;
-  }
-  return result * 4;
-}
-
-/* ---- RB_ClipSkyPolygons  0x004E67E0 ----  VERIFIED */
-int __cdecl RB_ClipSkyPolygons(int a1)
-{
-  int result;
   int i;
-  int v3;
-  int v4;
-  double v5;
-  int v6;
-  double v7;
-  int v8;
-  float v9[15]; // [esp+4h] [ebp-3Ch] BYREF -- Q3 vec3_t p[5]
+
+  for ( i = 0; i < 6; i++ )
+  {
+    sky_mins[0][i] = sky_mins_1[i] =  9999.0f;
+    sky_maxs[0][i] = sky_maxs_1[i] = -9999.0f;
+  }
+}
+
+/* ---- RB_ClipSkyPolygons  0x004E67E0 ----  VERIFIED
+ * Project every tessellated triangle onto the sky box to grow the per-face
+ * bounds.  input is &tess (retail passes it in ESI). */
+void __cdecl RB_ClipSkyPolygons(shaderCommands_t *input)
+{
+  vec3_t p[5];                             /* one spare vertex for the in-place close */
+  int    i, j;
 
   ClearSkyBox();
-  result = tess_numIndexes;
-  for ( i = 0; i < result; i += 3 )
-  {
-    v3 = tess_vertexComponentCount;
-    v4 = v3 * (unsigned __int16)tess_indexes[i];
-    v9[0] = tess_xyz[v4] - backEnd_viewParms_originX[0];
-    v9[1] = tess_xyz[v4 + 1] - backEnd_viewParms_originY;
-    v5 = tess_xyz[v4 + 2];
-    v6 = v3 * (unsigned __int16)tess_indexes[i + 1];
-    v9[2] = v5 - backEnd_viewParms_originZ;
-    v9[3] = tess_xyz[v6] - backEnd_viewParms_originX[0];
-    v9[4] = tess_xyz[v6 + 1] - backEnd_viewParms_originY;
-    v7 = tess_xyz[v6 + 2];
-    v8 = v3 * (unsigned __int16)tess_indexes[i + 2];
-    v9[5] = v7 - backEnd_viewParms_originZ;
-    v9[6] = tess_xyz[v8] - backEnd_viewParms_originX[0];
-    v9[7] = tess_xyz[v8 + 1] - backEnd_viewParms_originY;
-    v9[8] = tess_xyz[v8 + 2] - backEnd_viewParms_originZ;
-    ClipSkyPolygon(3, (int)v9, 0);
-    result = tess_numIndexes;
-  }
-  return result;
-}
 
-/* ---- MakeSkyVec  0x004E68E0 ----  [HIGH] */
-void __cdecl MakeSkyVec(int a1, float *a2, float *a3, float a4, float a5)
-{
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  double v9;
-  _DWORD v11[3];
-  float v12;
-
-  *(float *)v11 = a4;
-  v5 = a1;
-  *(float *)&v11[1] = a5;
-  v6 = st_to_vec[v5][0];
-  v11[2] = 1065353216;
-  if ( v6 >= 0 )
-    *(_DWORD *)a2 = v11[v6 - 1];
-  else
-    *a2 = -*(float *)&v11[-v6 - 1];
-  v7 = st_to_vec[v5][1];
-  if ( v7 >= 0 )
-    *((_DWORD *)a2 + 1) = v11[v7 - 1];
-  else
-    a2[1] = -*(float *)&v11[-v7 - 1];
-  v8 = st_to_vec[v5][2];
-  if ( v8 >= 0 )
-    *((_DWORD *)a2 + 2) = v11[v8 - 1];
-  else
-    a2[2] = -*(float *)&v11[-v8 - 1];
-  a2[3] = 0.0;
-  v9 = (a4 + 1.0) * 0.5;
-  v12 = (a5 + 1.0) * 0.5;
-  if ( (v9 < sky_min) | __UNORDERED__(v9, sky_min) )
+  for ( i = 0; i < input->numIndexes; i += 3 )
   {
-    v9 = sky_min;
-  }
-  else if ( v9 > sky_max )
-  {
-    v9 = sky_max;
-  }
-  if ( (v12 < (double)sky_min) | __UNORDERED__(v12, sky_min) )
-  {
-    v12 = sky_min;
-  }
-  else if ( v12 > (double)sky_max )
-  {
-    v12 = sky_max;
-  }
-  if ( a3 )
-  {
-    *a3 = v9;
-    a3[1] = 1.0 - v12;
+    for ( j = 0; j < 3; j++ )
+    {
+      VectorSubtract( &input->xyz[input->indexes[i + j] * input->vertexComponentCount],
+                      backEnd_viewParms_originX, p[j] );
+    }
+    ClipSkyPolygon(3, p[0], 0);
   }
 }
 
-/* ---- DrawSkyBox  0x004E6A30 ----  VERIFIED */
-int __cdecl DrawSkyBox(int a1, int a2)
+/* ---- MakeSkyVec  0x004E68E0 ----  [HIGH]
+ * Map a face-local (s,t) in [-1,1] to a world direction (position, a vec4 whose
+ * w is 0) and, if texCoord is non-NULL, the clamped sky-image texcoord. */
+void __cdecl MakeSkyVec(float s, float t, int axis, float *texCoord, float *position)
 {
-  int v2;
-  int v3;
-  int result;
-  GLsizei v5;
-  bool v6; // c0
-  double v7;
-  int v8;
-  int v9;
-  int v10;
-  unsigned __int64 v11; // rax
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  __int16 v16;
-  int v17;
-  GLenum *v18;
-  int v19;
-  float v20;
-  int v21;
-  int v22;
-  float *v23;
-  int v24;
-  int v25;
-  _WORD indices[256]; // [esp+9Ch] [ebp-204h] BYREF
-  unsigned int v27;
-  unsigned int retaddr;
+  float source[3];
+  int   sel, c;
 
-  v27 = retaddr ^ _security_cookie;
-  RB_EndMultitexture();
-  v2 = *(_DWORD *)rendererSkyBox;
-  if ( *(_DWORD *)rendererSkyBox != glState_currentStorageMode )
+  source[0] = s;
+  source[1] = t;
+  source[2] = 1.0f;
+
+  for ( c = 0; c < 3; c++ )
   {
-    if ( glConfig_NVVertexArrayRange )
-    {
-      RB_SelectStorageNV(v2);
-    }
-    else if ( glConfig_ATIVertexArrayObject )
-    {
-      RB_SelectStorageATI(*(_DWORD *)rendererSkyBox);
-    }
-    glState_currentStorageMode = v2;
-  }
-  GL_State(256);
-  v3 = 0;
-  if ( glState_faceCulling )
-  {
-    if ( glState_faceCulling == 2 )
-      glEnable(0xB44u);
-    if ( backEnd_viewParms_isMirror )
-      v19 = 1029;
+    sel = st_to_vec[axis][c];
+    if ( sel < 0 )
+      position[c] = -source[-sel - 1];
     else
-      v19 = 1028;
-    qglCullFace(v19);
-    glState_faceCulling = 0;
+      position[c] = source[sel - 1];
   }
-  GL_ClientState(1025);
-  qglColor3f(tr_identityLight, tr_identityLight, tr_identityLight);
-  if ( a2 )
+  position[3] = 0.0f;
+
+  /* avoid bilerp seam */
+  s = (s + 1.0f) * 0.5f;
+  t = (t + 1.0f) * 0.5f;
+  if ( s < sky_min )      s = sky_min;
+  else if ( s > sky_max ) s = sky_max;
+  if ( t < sky_min )      t = sky_min;
+  else if ( t > sky_max ) t = sky_max;
+
+  t = 1.0f - t;
+
+  if ( texCoord )
   {
-    qglBlendFunc(770, 771);
-    glEnable(0xBE2u);
+    texCoord[0] = s;
+    texCoord[1] = t;
+  }
+}
+
+/* rendererSkyBox holds the address of the active skyVertexStorage_t; retail
+ * re-reads it at every use. */
+#define SKYBOX   ( (skyVertexStorage_t *)rendererSkyBox )
+
+/* ---- DrawSkyBox  0x004E6A30 ----  VERIFIED
+ * Draw one sky box (innerBox == 0: the opaque outer box; innerBox != 0: the blended inner
+ * box) as GL_QUADS over the pre-built 9x9 vertex grid, one face at a time.
+ * shader is the sky shader.  RB_SelectStorage and GL_Cull are inlined by retail. */
+void __cdecl DrawSkyBox(int shader, int innerBox)
+{
+  unsigned short indices[256];
+  int arraysLocked;
+  int i;
+  int indexCount;
+
+  RB_EndMultitexture();
+  RB_SelectStorage(SKYBOX->memorySource);
+  GL_State(256);                           /* GLS_DEPTHMASK_TRUE */
+  GL_Cull(0);                              /* CT_FRONT_SIDED */
+  GL_ClientState(1025);                    /* texcoord0 + vertex arrays */
+  qglColor3f(tr_identityLight, tr_identityLight, tr_identityLight);
+
+  if ( innerBox )                                /* inner box: alpha blended */
+  {
+    qglBlendFunc(770, 771);                /* GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA */
+    glEnable(0xBE2u);                      /* GL_BLEND */
     if ( glState_texEnv[glState_currentTmu] != 8448 )
     {
-      glState_texEnv[glState_currentTmu] = 8448;
+      glState_texEnv[glState_currentTmu] = 8448;   /* GL_MODULATE */
       glTexEnvi(0x2300u, 0x2200u, 8448);
     }
   }
-  result = rendererSkyBox;
-  v25 = 0;
-  switch ( *(_DWORD *)(rendererSkyBox + 4) )
+
+  arraysLocked = 0;
+  switch ( SKYBOX->backend )
   {
-    case 0:
-      glTexCoordPointer(2, 0x1406u, 24, *(const GLvoid **)(rendererSkyBox + 8));
-      glVertexPointer(4, 0x1406u, 24, (const GLvoid *)(*(_DWORD *)(rendererSkyBox + 8) + 8));
+    case SKYVB_CLIENT:
+      glTexCoordPointer(2, 0x1406u, 24, SKYBOX->base);                   /* GL_FLOAT */
+      glVertexPointer(4, 0x1406u, 24, (char *)SKYBOX->base + 8);
       if ( qglLockArraysEXT )
       {
         qglLockArraysEXT(0, 486);
-        v25 = 1;
+        arraysLocked = 1;
       }
-      goto LABEL_24;
-    case 1:
-      qglBindBufferARB(34962, *(_DWORD *)(rendererSkyBox + 8));
+      break;
+    case SKYVB_ARB_BUFFER:
+      qglBindBufferARB(34962, (int)SKYBOX->base);                       /* GL_ARRAY_BUFFER_ARB */
       glTexCoordPointer(2, 0x1406u, 24, 0);
       glVertexPointer(4, 0x1406u, 24, (const GLvoid *)8);
-      goto LABEL_24;
-    case 2:
-      qglArrayObjectATI(32888, 2, 5126, 24, *(_DWORD *)(rendererSkyBox + 8), *(_DWORD *)(rendererSkyBox + 12));
-      qglArrayObjectATI(32884, 4, 5126, 24, *(_DWORD *)(rendererSkyBox + 8), *(_DWORD *)(rendererSkyBox + 12) + 8);
-      goto LABEL_24;
-    case 3:
-      glTexCoordPointer(2, 0x1406u, 24, *(const GLvoid **)(rendererSkyBox + 8));
-      glVertexPointer(4, 0x1406u, 24, (const GLvoid *)(*(_DWORD *)(rendererSkyBox + 8) + 8));
-LABEL_24:
-      v5 = 0;
-      v22 = 0;
-      do
-      {
-        sky_mins[v3] = floor(sky_mins[v3] * 4.0) * 0.25;
-        v23 = &sky_maxs[v3];
-        flt_11DAE20[v3] = floor(flt_11DAE20[v3] * 4.0) * 0.25;
-        sky_maxs[v3] = ceil(sky_maxs[v3] * 4.0) * 0.25;
-        v20 = ceil(flt_11DAE50[v3] * 4.0) * 0.25;
-        v6 = sky_mins[v3] < (double)sky_maxs[v3];
-        flt_11DAE50[v3] = v20;
-        if ( v6 && flt_11DAE20[v3] < (double)v20 )
-        {
-          v7 = flt_11DAE20[v3] * 4.0;
-          v8 = (unsigned __int64)(sky_mins[v3] * 4.0);
-          v9 = (unsigned __int64)v7;
-          v10 = (unsigned __int64)(*v23 * 4.0);
-          v11 = (unsigned __int64)(v20 * 4.0);
-          if ( v8 >= -4 )
-          {
-            if ( v8 > 4 )
-              v8 = 4;
-          }
-          else
-          {
-            v8 = -4;
-          }
-          if ( v9 >= -4 )
-          {
-            if ( v9 > 4 )
-              v9 = 4;
-          }
-          else
-          {
-            v9 = -4;
-          }
-          if ( v10 >= -4 )
-          {
-            if ( v10 > 4 )
-              v10 = 4;
-          }
-          else
-          {
-            v10 = -4;
-          }
-          if ( (int)v11 >= -4 )
-          {
-            if ( (int)v11 > 4 )
-              LODWORD(v11) = 4;
-          }
-          else
-          {
-            LODWORD(v11) = -4;
-          }
-          v12 = v11 + 4;
-          v13 = v9 + 4;
-          v24 = v12;
-          if ( v13 < v12 )
-          {
-            v21 = v8 + 4;
-            v14 = v10 + 4;
-            do
-            {
-              v15 = v21;
-              if ( v21 < v14 )
-              {
-                v16 = 9 * (v13 + 8 * v22 + v22);
-                do
-                {
-                  indices[v5] = v16 + v15 + 1;
-                  indices[v5 + 1] = v16 + v15;
-                  indices[v5 + 2] = v16 + v15 + 9;
-                  indices[v5 + 3] = v16 + v15 + 10;
-                  v5 += 4;
-                  ++v15;
-                }
-                while ( v15 < v14 );
-                v12 = v24;
-              }
-              ++v13;
-            }
-            while ( v13 < v12 );
-          }
-          v17 = sky_texorder[v22];
-          if ( a2 )
-            v18 = *(GLenum **)(a1 + 4 * v17 + 124);
-          else
-            v18 = *(GLenum **)(a1 + 4 * v17 + 100);
-          GL_Bind(v18);
-          backEnd_pc_drawnIndexCount += v5;
-          ++backEnd_pc_drawCallCount;
-          glDrawElements(7u, v5, 0x1403u, indices);
-          if ( r_showtris->integer )
-          {
-            glPolygonMode(0x408u, 0x1B01u);
-            glDisable(0xDE1u);
-            qglColor3f(1.0f, 1.0f, 1.0f);
-            backEnd_pc_drawnIndexCount += v5;
-            ++backEnd_pc_drawCallCount;
-            glDrawElements(7u, v5, 0x1403u, indices);
-            glEnable(0xDE1u);
-            glPolygonMode(0x408u, 0x1B02u);
-          }
-          v3 = v22;
-          backEnd_pc_indexCount += v5;
-          backEnd_pc_vertexCount += 486;
-          v5 = 0;
-        }
-        v22 = ++v3;
-      }
-      while ( v3 < 6 );
-      if ( v25 )
-        qglUnlockArraysEXT();
-      if ( a2 )
-        glDisable(0xBE2u);
-      result = rendererSkyBox;
-      if ( *(_DWORD *)(rendererSkyBox + 4) == 1 )
-        qglBindBufferARB(34962, 0);
+      break;
+    case SKYVB_ATI_OBJECT:
+      qglArrayObjectATI(32888, 2, 5126, 24, (int)SKYBOX->base, SKYBOX->objectOffset);      /* GL_TEXTURE_COORD_ARRAY, GL_FLOAT */
+      qglArrayObjectATI(32884, 4, 5126, 24, (int)SKYBOX->base, SKYBOX->objectOffset + 8);  /* GL_VERTEX_ARRAY, GL_FLOAT */
+      break;
+    case SKYVB_NV_MEMORY:
+      glTexCoordPointer(2, 0x1406u, 24, SKYBOX->base);
+      glVertexPointer(4, 0x1406u, 24, (char *)SKYBOX->base + 8);
       break;
     default:
-      return result;
+      return;
   }
-  return result;
+
+  indexCount = 0;
+  for ( i = 0; i < 6; i++ )
+  {
+    int      sky_mins_subd[2], sky_maxs_subd[2];
+    int      s, t;
+    GLenum  *image;
+
+    sky_mins[0][i]   = FCAST(floor(sky_mins[0][i] * HALF_SKY_SUBDIVISIONS)) / HALF_SKY_SUBDIVISIONS;
+    sky_mins_1[i] = FCAST(floor(sky_mins_1[i] * HALF_SKY_SUBDIVISIONS)) / HALF_SKY_SUBDIVISIONS;
+    /* plain (float) on the maxs: FCAST's extra parentheses move the reload of the
+     * spilled &sky_maxs[0][i] before the fmul (ceil is integral: same value) */
+    sky_maxs[0][i]   = (float)ceil(sky_maxs[0][i] * HALF_SKY_SUBDIVISIONS) / HALF_SKY_SUBDIVISIONS;
+    sky_maxs_1[i] = (float)ceil(sky_maxs_1[i] * HALF_SKY_SUBDIVISIONS) / HALF_SKY_SUBDIVISIONS;
+
+    if ( ( sky_mins[0][i] >= sky_maxs[0][i] ) || ( sky_mins_1[i] >= sky_maxs_1[i] ) )
+      continue;
+
+    sky_mins_subd[0] = sky_mins[0][i]   * HALF_SKY_SUBDIVISIONS;
+    sky_mins_subd[1] = sky_mins_1[i] * HALF_SKY_SUBDIVISIONS;
+    sky_maxs_subd[0] = sky_maxs[0][i]   * HALF_SKY_SUBDIVISIONS;
+    sky_maxs_subd[1] = sky_maxs_1[i] * HALF_SKY_SUBDIVISIONS;
+
+    if ( sky_mins_subd[0] < -HALF_SKY_SUBDIVISIONS )
+      sky_mins_subd[0] = -HALF_SKY_SUBDIVISIONS;
+    else if ( sky_mins_subd[0] > HALF_SKY_SUBDIVISIONS )
+      sky_mins_subd[0] = HALF_SKY_SUBDIVISIONS;
+    if ( sky_mins_subd[1] < -HALF_SKY_SUBDIVISIONS )
+      sky_mins_subd[1] = -HALF_SKY_SUBDIVISIONS;
+    else if ( sky_mins_subd[1] > HALF_SKY_SUBDIVISIONS )
+      sky_mins_subd[1] = HALF_SKY_SUBDIVISIONS;
+
+    if ( sky_maxs_subd[0] < -HALF_SKY_SUBDIVISIONS )
+      sky_maxs_subd[0] = -HALF_SKY_SUBDIVISIONS;
+    else if ( sky_maxs_subd[0] > HALF_SKY_SUBDIVISIONS )
+      sky_maxs_subd[0] = HALF_SKY_SUBDIVISIONS;
+    if ( sky_maxs_subd[1] < -HALF_SKY_SUBDIVISIONS )
+      sky_maxs_subd[1] = -HALF_SKY_SUBDIVISIONS;
+    else if ( sky_maxs_subd[1] > HALF_SKY_SUBDIVISIONS )
+      sky_maxs_subd[1] = HALF_SKY_SUBDIVISIONS;
+
+    for ( t = sky_mins_subd[1] + HALF_SKY_SUBDIVISIONS; t < sky_maxs_subd[1] + HALF_SKY_SUBDIVISIONS; t++ )
+    {
+      for ( s = sky_mins_subd[0] + HALF_SKY_SUBDIVISIONS; s < sky_maxs_subd[0] + HALF_SKY_SUBDIVISIONS; s++ )
+      {
+        unsigned short vertex = 81 * i + 9 * t + s;
+        indices[indexCount + 0] = vertex + 1;
+        indices[indexCount + 1] = vertex;
+        indices[indexCount + 2] = vertex + 9;
+        indices[indexCount + 3] = vertex + 10;
+        indexCount += 4;
+      }
+    }
+
+    if ( innerBox )
+      image = *(GLenum **)(shader + 4 * sky_texorder[i] + 124);   /* shader->skyInnerBox[texorder] */
+    else
+      image = *(GLenum **)(shader + 4 * sky_texorder[i] + 100);   /* shader->skyOuterBox[texorder] */
+    GL_Bind(image);
+    backEnd_pc_drawnIndexCount += indexCount;
+    ++backEnd_pc_drawCallCount;
+    glDrawElements(7u, indexCount, 0x1403u, indices);            /* GL_QUADS, GL_UNSIGNED_SHORT */
+
+    if ( r_showtris->integer )
+    {
+      glPolygonMode(0x408u, 0x1B01u);      /* GL_FRONT_AND_BACK, GL_LINE */
+      glDisable(0xDE1u);                   /* GL_TEXTURE_2D */
+      qglColor3f(1.0f, 1.0f, 1.0f);
+      backEnd_pc_drawnIndexCount += indexCount;
+      ++backEnd_pc_drawCallCount;
+      glDrawElements(7u, indexCount, 0x1403u, indices);
+      glEnable(0xDE1u);
+      glPolygonMode(0x408u, 0x1B02u);      /* GL_FILL */
+    }
+
+    backEnd_pc_indexCount  += indexCount;
+    backEnd_pc_vertexCount += 486;
+    indexCount = 0;
+  }
+
+  if ( arraysLocked )
+    qglUnlockArraysEXT();
+  if ( innerBox )
+    glDisable(0xBE2u);                     /* GL_BLEND */
+  if ( SKYBOX->backend == SKYVB_ARB_BUFFER )
+    qglBindBufferARB(34962, 0);
 }
 
-/* ---- FillCloudySkySide  0x004E6F80 ----  VERIFIED */
-int __cdecl FillCloudySkySide(int a1, _WORD *a2, _WORD *a3, int a4, int a5)
-{
-  int v5;
-  _DWORD *v6;
-  _WORD *v7;
-  __int16 v8;
-  int v9;
-  unsigned __int16 v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  int result;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  __int16 v20;
-  float v21;
-  int v22;
-  int v23;
-  float v24;
-  int v25;
-  unsigned __int16 v26;
-  int v27;
-  int v28;
+/* the cloud texcoords as retail's [side][t][s][st] grid */
+#define s_cloudTexCoordsGrid ( (float (*)[9][9][2])s_cloudTexCoords )
+#define s_cloudTexPGrid      ( (float (*)[9][9])s_cloudTexP )
 
-  HIWORD(v5) = HIWORD(tess_numVertexes);
-  v6 = a3;
-  v7 = a2;
-  v27 = tess_numVertexes;
-  LOWORD(v5) = a2[2];
-  v8 = a3[2] - v5;
-  v22 = v5 + 4;
-  v9 = (unsigned __int16)(v5 + 4);
-  v10 = v8 + 1;
-  v11 = (unsigned __int16)(*a3 - *a2) + 1;
-  v26 = v10;
-  if ( v9 <= *((_DWORD *)a3 + 1) + 4 )
+/* ---- FillCloudySkySide  0x004E6F80 ----  VERIFIED
+ * Emit the cloud-layer vertices (and, for the first stage, the indices) for one
+ * cube face.  mins/maxs are the clamped [-4,4] grid extents.  Returns
+ * tHeight-1 when indices were added, else 0 (dead EAX). */
+void __cdecl FillCloudySkySide(int *mins, int *maxs, int side, int addIndexes)
+{
+  int vertexStart = tess_numVertexes;
+  unsigned short tHeight;
+  unsigned short sWidth;
+  unsigned short s,t;
+
+  tHeight = maxs[1] - mins[1] + 1;
+  sWidth  = maxs[0] - mins[0] + 1;
+
+  for ( t = mins[1] + 4; t <= maxs[1] + 4; t++ )
   {
-    while ( 1 )
+    for ( s = mins[0] + 4; s <= maxs[0] + 4; s++ )
     {
-      LOWORD(a1) = *v7 + 4;
-      v12 = (unsigned __int16)a1;
-      if ( (unsigned __int16)a1 <= *v6 + 4 )
-      {
-        v13 = a4;
-        v25 = 9 * (v9 + 8 * a4 + a4);
-        v24 = (double)(v9 - 4) * 0.25;
-        while ( 1 )
-        {
-          v21 = (double)(v12 - 4) * 0.25;
-          MakeSkyVec(v13, (float *)(4 * tess_numVertexes * tess_vertexComponentCount + ((int)(char *)tess_xyz)), 0, v21, v24);
-          v14 = 2 * (v25 + v12);
-          dword_17DFF60[2 * tess_numVertexes] = s_cloudTexCoords[v14];
-          dword_17DFF64[2 * tess_numVertexes++] = dword_11DAE6C[v14];
-          if ( tess_numVertexes >= 0x2000 )
-            ri_Error(1, "\x15" "SHADER_MAX_VERTEXES hit in FillCloudySkySide()\n");
-          v6 = a3;
-          v12 = (unsigned __int16)++a1;
-          if ( (unsigned __int16)a1 > *(_DWORD *)a3 + 4 )
-            break;
-          v13 = a4;
-        }
-        v10 = v26;
-      }
-      v9 = (unsigned __int16)++v22;
-      if ( (unsigned __int16)v22 > v6[1] + 4 )
-        break;
-      v7 = a2;
+      MakeSkyVec((float)(s - 4) * 0.25f, (float)(t - 4) * 0.25f, side, 0,
+                 &tess_xyz[tess_numVertexes * tess_vertexComponentCount]);
+      tess_texCoords0[2 * tess_numVertexes + 0] = s_cloudTexCoordsGrid[side][t][s][0];
+      tess_texCoords0[2 * tess_numVertexes + 1] = s_cloudTexCoordsGrid[side][t][s][1];
+      tess_numVertexes++;
+      if ( tess_numVertexes >= 0x2000 )
+        ri.Error(1, "\x15" "SHADER_MAX_VERTEXES hit in FillCloudySkySide()\n");
     }
   }
-  result = a5;
-  if ( a5 )
-  {
-    result = v10 - 1;
-    v23 = 0;
-    v28 = result;
-    if ( result > 0 )
-    {
-      v16 = (unsigned __int16)v11 - 1;
-      v17 = v27 + 1;
-      do
-      {
-        v18 = 0;
-        if ( v16 > 0 )
-        {
-          v19 = v17;
-          do
-          {
-            tess_indexes[tess_numIndexes++] = v19 - 1;
-            v20 = v11 + v19 - 1;
-            tess_indexes[tess_numIndexes++] = v20;
-            tess_indexes[tess_numIndexes++] = v19;
-            tess_indexes[tess_numIndexes++] = v20;
-            tess_indexes[tess_numIndexes++] = v11 + v19;
-            tess_indexes[tess_numIndexes] = v19;
-            ++v18;
-            ++tess_numIndexes;
-            ++v19;
-          }
-          while ( (unsigned __int16)v18 < v16 );
-          result = v28;
-        }
-        v17 += v11;
-        ++v23;
-      }
-      while ( (unsigned __int16)v23 < result );
-    }
-  }
-  return result;
-}
 
-/* ---- FillCloudBox  0x004E71D0 ----  VERIFIED */
-void __cdecl FillCloudBox(int a1, int a2)
-{
-  int i;
-  double v3;
-  int v4;
-  double v5;
-  int v6;
-  double v7;
-  int v8;
-  double v9;
-  float v10;
-  float v11;
-  float v12;
-  float v13;
-  int v14; // [esp+18h] [ebp-10h] BYREF
-  int v15;
-  int v16; // [esp+20h] [ebp-8h] BYREF
-  int v17;
-  int savedregs; // [esp+28h] [ebp+0h] BYREF
-
-  for ( i = 0; i < 6; ++i )
+  /* only the first stage adds indices, else the box would draw once per stage */
+  if ( addIndexes )
   {
-    if ( i != 5 )
+    for ( t = 0; t < tHeight - 1; t++ )
     {
-      sky_mins[i] = floor(sky_mins[i] * 4.0) * 0.25;
-      flt_11DAE20[i] = floor(flt_11DAE20[i] * 4.0) * 0.25;
-      sky_maxs[i] = ceil(sky_maxs[i] * 4.0) * 0.25;
-      v3 = ceil(flt_11DAE50[i] * 4.0) * 0.25;
-      flt_11DAE50[i] = v3;
-      if ( sky_mins[i] < (double)sky_maxs[i] && v3 > flt_11DAE20[i] )
+      for ( s = 0; s < sWidth - 1; s++ )
       {
-        v10 = sky_mins[i] * 4.0;
-        ftol_tempSpill = (int)v10;
-        v4 = (int)v10;
-        v5 = flt_11DAE20[i] * 4.0;
-        v16 = v4;
-        v11 = v5;
-        ftol_tempSpill = (int)v11;
-        v6 = (int)v11;
-        v7 = sky_maxs[i] * 4.0;
-        v17 = v6;
-        v12 = v7;
-        ftol_tempSpill = (int)v12;
-        v8 = (int)v12;
-        v9 = flt_11DAE50[i] * 4.0;
-        v14 = v8;
-        v13 = v9;
-        ftol_tempSpill = (int)v13;
-        v15 = (int)v13;
-        if ( v4 >= -4 )
-        {
-          if ( v4 > 4 )
-            v16 = 4;
-        }
-        else
-        {
-          v16 = -4;
-        }
-        if ( ((double)v17 < -4.0) | __UNORDERED__((double)v17, -4.0) )
-        {
-          v17 = -4;
-        }
-        else if ( v6 > 4 )
-        {
-          v17 = 4;
-        }
-        if ( v8 >= -4 )
-        {
-          if ( v8 > 4 )
-            v14 = 4;
-        }
-        else
-        {
-          v14 = -4;
-        }
-        if ( ((double)v15 < -4.0) | __UNORDERED__((double)v15, -4.0) )
-        {
-          v15 = -4;
-        }
-        else if ( (int)v13 > 4 )
-        {
-          v15 = 4;
-        }
-        FillCloudySkySide((int)&savedregs, &v16, &v14, i, a2 == 0);
+        tess_indexes[tess_numIndexes] = vertexStart + s + t * sWidth;
+        tess_numIndexes++;
+        tess_indexes[tess_numIndexes] = vertexStart + s + ( t + 1 ) * sWidth;
+        tess_numIndexes++;
+        tess_indexes[tess_numIndexes] = vertexStart + s + 1 + t * sWidth;
+        tess_numIndexes++;
+
+        tess_indexes[tess_numIndexes] = vertexStart + s + ( t + 1 ) * sWidth;
+        tess_numIndexes++;
+        tess_indexes[tess_numIndexes] = vertexStart + s + 1 + ( t + 1 ) * sWidth;
+        tess_numIndexes++;
+        tess_indexes[tess_numIndexes] = vertexStart + s + 1 + t * sWidth;
+        tess_numIndexes++;
       }
     }
   }
 }
 
-/* ---- RB_BuildCloudData  0x004E73F0 ----  VERIFIED */
-void __cdecl RB_BuildCloudData(int a1)
+/* ---- FillCloudBox  0x004E71D0 ----  VERIFIED
+ * Build the cloud geometry for all faces except the bottom (Q3's FillCloudBox
+ * with fullClouds; MIN_T stays a float, so the t clamps compare as floats).
+ * shader (the shader) is unused by retail. */
+void __cdecl FillCloudBox(int shader, int stage)
 {
-  double v1;
+  int   i;
+  int   sky_mins_subd[2], sky_maxs_subd[2];
+  float MIN_T;
+
+  (void)shader;
+
+  for ( i = 0; i < 6; i++ )
+  {
+    MIN_T = -HALF_SKY_SUBDIVISIONS;
+
+    /* still don't want to draw the bottom, even if fullClouds */
+    if ( i == 5 )
+      continue;
+
+    sky_mins[0][i]   = FCAST(floor(sky_mins[0][i] * HALF_SKY_SUBDIVISIONS)) / HALF_SKY_SUBDIVISIONS;
+    sky_mins_1[i] = FCAST(floor(sky_mins_1[i] * HALF_SKY_SUBDIVISIONS)) / HALF_SKY_SUBDIVISIONS;
+    sky_maxs[0][i]   = FCAST(ceil(sky_maxs[0][i] * HALF_SKY_SUBDIVISIONS)) / HALF_SKY_SUBDIVISIONS;
+    sky_maxs_1[i] = FCAST(ceil(sky_maxs_1[i] * HALF_SKY_SUBDIVISIONS)) / HALF_SKY_SUBDIVISIONS;
+
+    if ( ( sky_mins[0][i] >= sky_maxs[0][i] ) || ( sky_mins_1[i] >= sky_maxs_1[i] ) )
+      continue;
+
+    sky_mins_subd[0] = myftol(sky_mins[0][i]   * HALF_SKY_SUBDIVISIONS);
+    sky_mins_subd[1] = myftol(sky_mins_1[i] * HALF_SKY_SUBDIVISIONS);
+    sky_maxs_subd[0] = myftol(sky_maxs[0][i]   * HALF_SKY_SUBDIVISIONS);
+    sky_maxs_subd[1] = myftol(sky_maxs_1[i] * HALF_SKY_SUBDIVISIONS);
+
+    if ( sky_mins_subd[0] < -HALF_SKY_SUBDIVISIONS )
+      sky_mins_subd[0] = -HALF_SKY_SUBDIVISIONS;
+    else if ( sky_mins_subd[0] > HALF_SKY_SUBDIVISIONS )
+      sky_mins_subd[0] = HALF_SKY_SUBDIVISIONS;
+    if ( sky_mins_subd[1] < MIN_T )
+      sky_mins_subd[1] = MIN_T;
+    else if ( sky_mins_subd[1] > HALF_SKY_SUBDIVISIONS )
+      sky_mins_subd[1] = HALF_SKY_SUBDIVISIONS;
+
+    if ( sky_maxs_subd[0] < -HALF_SKY_SUBDIVISIONS )
+      sky_maxs_subd[0] = -HALF_SKY_SUBDIVISIONS;
+    else if ( sky_maxs_subd[0] > HALF_SKY_SUBDIVISIONS )
+      sky_maxs_subd[0] = HALF_SKY_SUBDIVISIONS;
+    if ( sky_maxs_subd[1] < MIN_T )
+      sky_maxs_subd[1] = MIN_T;
+    else if ( sky_maxs_subd[1] > HALF_SKY_SUBDIVISIONS )
+      sky_maxs_subd[1] = HALF_SKY_SUBDIVISIONS;
+
+    /* only add indexes for the first stage */
+    FillCloudySkySide(sky_mins_subd, sky_maxs_subd, i, ( stage == 0 ));
+  }
+}
+
+/* ---- RB_BuildCloudData  0x004E73F0 ----  VERIFIED
+ * Generate the cloud vertices for every active stage of the sky shader.  input
+ * is &tess (retail passes it in EDI); the counters are written through tess. */
+void __cdecl RB_BuildCloudData(shaderCommands_t *input)
+{
   int i;
 
   tess_numIndexes = 0;
   tess_numVertexes = 0;
   tess_vertexComponentCount = 4;
-  v1 = *(float *)(tess_shader + 96);
-  sky_min = 0.00390625;
-  sky_max = 0.99609375;
-  if ( !((v1 == 0.0) | __UNORDERED__(v1, 0.0)) )
+  sky_min = 0.00390625f;                   /* 1/256 */
+  sky_max = 0.99609375f;                   /* 255/256 */
+
+  if ( *(float *)(input->shader + 96) != 0.0f )   /* shader->skyCloudHeight */
   {
-    for ( i = 0; i < 8; ++i )
+    for ( i = 0; i < 8; i++ )
     {
-      if ( !*(_DWORD *)(tess_activeStages + 4 * i) )
+      if ( !*(int *)(tess_activeStages + 4 * i) )
         break;
-      FillCloudBox(tess_shader, i);
+      FillCloudBox(input->shader, i);
     }
   }
 }
 
-/* ---- R_BuildSkyBox  0x004E7470 ----  VERIFIED */
-int __cdecl R_BuildSkyBox(const void *a1)
+/* Static vertex memory for the NV vertex-array-range path: primary pool, then
+ * secondary, then an aligned hunk block.  Returns the memory source (1/2/3). */
+static __forceinline int R_AllocSkyVertexMemoryNV(void **base, int size)
 {
-  int v2;
-  int v3;
-  int result;
-  int *v5;
-  int v6;
-  _DWORD *v7;
-  void *v8;
-  int v9;
-  int v10;
-  int v11;
+  if ( tr_staticVertexMemoryPrimaryUsed + size < tr_staticVertexMemoryPrimaryLimit )
+  {
+    *base = (void *)(tr_staticVertexMemoryPrimary + tr_staticVertexMemoryPrimaryUsed);
+    tr_staticVertexMemoryPrimaryUsed += size;
+    return 1;
+  }
+  if ( tr_staticVertexMemorySecondaryUsed + size < tr_staticVertexMemorySecondaryLimit )
+  {
+    *base = (void *)(tr_staticVertexMemorySecondary + tr_staticVertexMemorySecondaryUsed);
+    tr_staticVertexMemorySecondaryUsed += size;
+    return 2;
+  }
+  *base = (void *)Hunk_AllocAlignInternal(size, 32);
+  return 3;
+}
 
+/* ATI object-buffer offset in the primary pool, else the secondary.  Returns
+ * the pool (1/2), or 0 when both are full. */
+static __forceinline int R_AllocSkyVertexMemoryATI(unsigned *offset, int size)
+{
+  if ( tr_staticVertexMemoryPrimaryUsed + size <= tr_staticVertexMemoryPrimaryLimit )
+  {
+    *offset = tr_staticVertexMemoryPrimaryUsed;
+    tr_staticVertexMemoryPrimaryUsed += size;
+    return 1;
+  }
+  if ( tr_staticVertexMemorySecondaryUsed + size <= tr_staticVertexMemorySecondaryLimit )
+  {
+    *offset = tr_staticVertexMemorySecondaryUsed;
+    tr_staticVertexMemorySecondaryUsed += size;
+    return 2;
+  }
+  return 0;
+}
+
+/* ---- R_BuildSkyBox  0x004E7470 ----  VERIFIED
+ * Upload the 486-vertex sky box through whichever static-vertex backend is
+ * available (ARB VBO, NV vertex-array range, ATI object buffer) and fall back
+ * to a client-side hunk copy otherwise.  The NV/ATI pool helpers are inlined
+ * by retail. */
+void __cdecl R_BuildSkyBox(const skyVertex_t *skyVertices)
+{
   if ( glConfig_ARBVertexBufferObject )
   {
-    v2 = rendererSkyBox;
-    v3 = storageClass;
-    *(_DWORD *)rendererSkyBox = storageClass;
-    *(_DWORD *)(v2 + 4) = 1;
-    result = R_CreateBufferARB(v3, 34962, 11664, (int)a1, 35044);
-    v5 = (int *)rendererSkyBox;
-    *(_DWORD *)(rendererSkyBox + 8) = result;
-    if ( !result )
+    SKYBOX->memorySource = storageClass;
+    SKYBOX->backend = SKYVB_ARB_BUFFER;
+    SKYBOX->base = (void *)R_CreateBufferARB(34962, 11664, (int)skyVertices, 35044);   /* GL_ARRAY_BUFFER_ARB, GL_STATIC_DRAW_ARB */
+    if ( !SKYBOX->base )
     {
-LABEL_3:
-      *v5 = 3;
-      v5[1] = 0;
-      result = ri_Hunk_Alloc(11664);
-      *(_DWORD *)(rendererSkyBox + 8) = result;
-      qmemcpy((void *)result, a1, 0x2D90u);
+      /* buffer creation failed (or no usable backend): client copy */
+clientCopy:
+      SKYBOX->memorySource = 3;
+      SKYBOX->backend = SKYVB_CLIENT;
+      SKYBOX->base = (void *)ri.Hunk_Alloc(11664);
+      memcpy(SKYBOX->base, skyVertices, 0x2D90u);
     }
   }
   else if ( glConfig_NVVertexArrayRange )
   {
-    v6 = rendererSkyBox;
-    v7 = (_DWORD *)(rendererSkyBox + 8);
-    if ( tr_staticVertexMemoryPrimaryUsed + 11680 >= tr_staticVertexMemoryPrimaryLimit )
+    SKYBOX->memorySource = R_AllocSkyVertexMemoryNV(&SKYBOX->base, 11680);
+    SKYBOX->backend = SKYVB_NV_MEMORY;
+    memcpy(SKYBOX->base, skyVertices, 0x2D90u);
+  }
+  else if ( glConfig_ATIVertexArrayObject )
+  {
+    SKYBOX->memorySource = R_AllocSkyVertexMemoryATI(&SKYBOX->objectOffset, 11680);
+    SKYBOX->backend = SKYVB_ATI_OBJECT;
+    switch ( SKYBOX->memorySource )
     {
-      if ( tr_staticVertexMemorySecondaryUsed + 11680 >= tr_staticVertexMemorySecondaryLimit )
-      {
-        v8 = Hunk_AllocAlignInternal(0x2DA0u, 32);
-        v6 = rendererSkyBox;
-        *v7 = v8;
-        result = 3;
-        *(_DWORD *)v6 = 3;
-      }
-      else
-      {
-        *v7 = tr_staticVertexMemorySecondary + tr_staticVertexMemorySecondaryUsed;
-        tr_staticVertexMemorySecondaryUsed += 11680;
-        result = 2;
-        *(_DWORD *)v6 = 2;
-      }
-      *(_DWORD *)(v6 + 4) = 3;
-      qmemcpy(*(void **)(v6 + 8), a1, 0x2D90u);
-    }
-    else
-    {
-      *v7 = tr_staticVertexMemoryPrimary + tr_staticVertexMemoryPrimaryUsed;
-      tr_staticVertexMemoryPrimaryUsed += 11680;
-      result = 1;
-      *(_DWORD *)v6 = 1;
-      *(_DWORD *)(v6 + 4) = 3;
-      qmemcpy(*(void **)(v6 + 8), a1, 0x2D90u);
+      case 1:
+        SKYBOX->memorySource = 3;
+        SKYBOX->base = (void *)tr_staticVertexMemoryPrimary;
+        qglUpdateObjectBufferATI((GLuint)SKYBOX->base, SKYBOX->objectOffset, 11664, skyVertices, 34658);   /* GL_PRESERVE_ATI */
+        break;
+      case 2:
+        SKYBOX->memorySource = 3;
+        SKYBOX->base = (void *)tr_staticVertexMemorySecondary;
+        qglUpdateObjectBufferATI((GLuint)SKYBOX->base, SKYBOX->objectOffset, 11664, skyVertices, 34658);
+        break;
+      default:
+        goto clientCopy;                   /* both ATI pools full */
     }
   }
   else
   {
-    v5 = (int *)rendererSkyBox;
-    if ( !glConfig_ATIVertexArrayObject )
-      goto LABEL_3;
-    if ( tr_staticVertexMemoryPrimaryUsed + 11680 > tr_staticVertexMemoryPrimaryLimit )
-    {
-      if ( tr_staticVertexMemorySecondaryUsed + 11680 > tr_staticVertexMemorySecondaryLimit )
-      {
-        v9 = 0;
-      }
-      else
-      {
-        *(_DWORD *)(rendererSkyBox + 12) = tr_staticVertexMemorySecondaryUsed;
-        tr_staticVertexMemorySecondaryUsed += 11680;
-        v9 = 2;
-      }
-    }
-    else
-    {
-      *(_DWORD *)(rendererSkyBox + 12) = tr_staticVertexMemoryPrimaryUsed;
-      tr_staticVertexMemoryPrimaryUsed += 11680;
-      v9 = 1;
-    }
-    *v5 = v9;
-    v5[1] = 2;
-    if ( *v5 == 1 )
-    {
-      *v5 = 3;
-      v11 = tr_staticVertexMemoryPrimary;
-      v5[2] = tr_staticVertexMemoryPrimary;
-      qglUpdateObjectBufferATI(v11, v5[3], 11664, a1, 34658);
-      return result;
-    }
-    else
-    {
-      if ( *v5 != 2 )
-        goto LABEL_3;
-      *v5 = 3;
-      v10 = tr_staticVertexMemorySecondary;
-      v5[2] = tr_staticVertexMemorySecondary;
-      qglUpdateObjectBufferATI(v10, v5[3], 11664, a1, 34658);
-      return result;
-    }
+    goto clientCopy;
   }
-  return result;
 }
 
 /* ---- R_SetSkyBox  0x004E7690 ----  [HIGH] */
@@ -1102,328 +813,241 @@ int __cdecl R_SetSkyBox(int result)
   return result;
 }
 
-#define SKY_TEXP_BYTES  (6 * 9 * 9 * 4)
-
-/* ---- R_InitSkyTexCoords  0x004E76A0 ----  VERIFIED */
-int __cdecl R_InitSkyTexCoords(float a1)
+/* ---- R_InitSkyTexCoords  0x004E76A0 ----  VERIFIED
+ * Called when a sky shader is parsed: for every point of every cube face,
+ * intersect the sky ray with the cloud sphere, storing the ray scale
+ * (s_cloudTexP) and the angular cloud texcoord (s_cloudTexCoords), then upload
+ * the sky box. */
+void __cdecl R_InitSkyTexCoords(float cloudHeight)
 {
-  int *v1;
-  float *v2;
-  float *v3;
-  int v4;
-  double v5;
-  int v6;
-  int v7;
-  float *v8;
-  bool v9; // cc
-  float v11;
-  float v12;
-  float v13;
-  float v14;
-  float v15;
-  float v16;
-  float v17;
-  float v18;
-  float *v19;
-  float v20;
-  float v21;
-  float v22;
-  int v23;
-  int v24;
-  float v25;
-  float v26;
-  float v27[3]; // [esp+40h] [ebp-2DA8h] BYREF
-  float v30;
-  float v31;
-  float v32;
-  float v33[2916]; // [esp+58h] [ebp-2D90h] BYREF
+  skyVertex_t  skyVertices[SKY_VERTEX_COUNT];
+  skyVertex_t *vert;
+  float        cloudHeightSq;
+  float        cloudHeightSqPlusRadSq;
+  float        xx, yy, zz;
+  float        root, p;
+  float        sRad, tRad;
+  float        tScale;
+  vec3_t       skyVec;
+  vec3_t       v;
+  int          side, t, s;
 
-  v26 = a1 * a1;
-  sky_min = 0.0;
-  v23 = 0;
+  cloudHeightSq          = cloudHeight * cloudHeight;
+  cloudHeightSqPlusRadSq = cloudHeightSq + 16777216.0f;   /* + radiusWorld^2 (4096^2) */
+
+  sky_min = 0.0f;
+  /* init zFar so MakeSkyVec works before a world is bounded; R_RenderView
+   * overwrites it with the active value before rendering.  1090519040 == 8.0f. */
   backEnd_viewParms_zFar = 1090519040;
-  v32 = v26 + 16777216.0;
-  sky_max = 1.0;
-  v1 = dword_11DAE6C;
-  v2 = (float *)&s_cloudTexP;
-  v3 = &v33[2];
-  do
+  sky_max = 1.0f;
+
+  for ( side = 0; side < SKYBOX_FACE_COUNT; side++ )
   {
-    v24 = 0;
-    do
+    for ( t = 0; t <= SKY_GRID_SIDE - 1; t++ )
     {
-      v4 = 0;
-      v19 = v2;
-      v12 = (float)(v24 - 4);
-      v30 = v12 / 4.0;
-      do
+      tScale = ( t - SKY_GRID_CENTER ) / 4.0f;
+      for ( s = 0; s <= SKY_GRID_SIDE - 1; s++ )
       {
-        v13 = (float)(v4 - 4);
-        v11 = v13 / 4.0;
-        MakeSkyVec(v23, v3, v3 - 2, v11, v30);
-        v22 = v3[2];
-        v21 = v3[1];
-        v20 = *v3;
-        v14 = v22 * v22;
-        v25 = v21 * v21;
-        v17 = v20 * v20;
-        v31 = sqrt((v17 + v25 + v14) * a1 * 8192.0 + (v17 + v25) * v26 + v32 * v14);
-        v5 = v17 + v25 + v14;
-        v18 = (v31 + v31 - v22 * 8192.0) * (1.0 / (v5 + v5));
-        *v19 = v18;
-        v27[0] = v18 * v20;
-        v27[1] = v18 * v21;
-        v27[2] = v18 * v22;
-        v27[2] = v27[2] + 4096.0;
-        VectorNormalize(v27);
-        v15 = acos(v27[0]);
-        v6 = 1078530011;
-        if ( v15 <= 3.1415927 && !((v15 < -3.1415927) | __UNORDERED__(v15, -3.1415927)) )
-          v6 = LODWORD(v15);
-        v16 = acos(v27[1]);
-        if ( v16 <= 3.1415927 )
-        {
-          v7 = 1078530011;
-          if ( !((v16 < -3.1415927) | __UNORDERED__(v16, -3.1415927)) )
-            v7 = LODWORD(v16);
-        }
-        else
-        {
-          v7 = 1078530011;
-        }
-        *(v1 - 1) = v6;
-        *v1 = v7;
-        ++v4;
-        v8 = v19 + 1;
-        v3 += 6;
-        v1 += 2;
-        ++v19;
+        vert = &skyVertices[( side * SKY_GRID_SIDE + t ) * SKY_GRID_SIDE + s];
+        MakeSkyVec( ( s - SKY_GRID_CENTER ) / 4.0f, tScale, side, vert->texCoord, vert->position );
+        VectorCopy( vert->position, skyVec );
+
+        /* parametric 'p' where the sky ray meets the cloud sphere */
+        zz = skyVec[2] * skyVec[2];
+        yy = skyVec[1] * skyVec[1];
+        xx = skyVec[0] * skyVec[0];
+        root = sqrt( ( xx + yy + zz ) * cloudHeight * 8192.0f
+                   + ( xx + yy ) * cloudHeightSq
+                   + cloudHeightSqPlusRadSq * zz );
+        p = ( 2 * root - skyVec[2] * 8192.0f ) * ( 1.0f / ( 2 * ( xx + yy + zz ) ) );
+        s_cloudTexPGrid[side][t][s] = p;
+
+        VectorScale( skyVec, p, v );
+        v[2] += 4096.0f;
+        VectorNormalize( v );
+
+        sRad = Q_acos( v[0] );
+        tRad = Q_acos( v[1] );
+
+        s_cloudTexCoordsGrid[side][t][s][0] = sRad;
+        s_cloudTexCoordsGrid[side][t][s][1] = tRad;
       }
-      while ( v4 <= 8 );
-      v9 = ++v24 <= 8;
-      v2 = v8;
     }
-    while ( v9 );
-    ++v23;
   }
-  while ( v8 < (float *)&s_cloudTexP[SKY_TEXP_BYTES] );
-  return R_BuildSkyBox(v33);
+
+  R_BuildSkyBox(skyVertices);
 }
 
-/* ---- R_FindSunSpriteShader  0x004E7930 ----  VERIFIED */
-char *__cdecl R_FindSunSpriteShader(char *a1)
+/* ---- R_FindSunSpriteShader  0x004E7930 ----  VERIFIED
+ * Find the sun sprite shader and clear the depth-write bit on each of its
+ * stages so the sprite never occludes anything. */
+char *__cdecl R_FindSunSpriteShader(char *shaderName)
 {
-  char *result;
-  int v2;
-  char *v3;
-  int v4;
+  char *shader;
+  int   stage;
+  int   i;
 
-  result = R_FindShader(a1, -3, 0, (const char *)4);
-  v2 = 0;
-  v3 = result + 340;
-  do
+  shader = (char *)R_FindShader(shaderName, -3, 0, (const char *)4);
+  for ( i = 0; i < 8; i++ )
   {
-    v4 = *(_DWORD *)v3;
-    if ( !*(_DWORD *)v3 )
+    stage = ((int *)(shader + 340))[i];    /* shader->stages[i] (+0x154) */
+    if ( !stage )
       break;
-    ++v2;
-    v3 += 4;
-    *(_DWORD *)(v4 + 1668) &= ~0x100u;
+    *(int *)(stage + 1668) &= ~0x100u;     /* stage->stateBits &= ~GLS_DEPTHMASK_TRUE (+0x684) */
   }
-  while ( v2 < 8 );
-  return result;
+  return shader;
 }
 
-/* ---- R_SetSunSpriteSize  0x004E7980 ----  VERIFIED */
-int __cdecl R_SetSunSpriteSize(float a1)
-{
-  int result;
-  float v2;
-  float v3[3]; // [esp+8h] [ebp-30h] BYREF -- retail vec3_t
-  float v6;
-  float v7;
-  float v8;
-  float v9;
-  float v10;
-  float v11;
-  float v12;
-  float v13;
-  float v14;
+void Perp2D( vec3_t out, const vec3_t in );   /* universal/com_math.c */
 
-  v2 = a1 * 0.001311093;
-  if ( *(float *)&dword_16C57D8 * *(float *)&dword_16C57D8 <= 0.99000001 )
-  {
-    v12 = *(float *)&dword_16C57D4;
-    v13 = -*(float *)&tr_sunDirection;
-  }
+/* ---- R_SetSunSpriteSize  0x004E7980 ----  VERIFIED
+ * Build the four sun-sprite corner vertices from tr.sunDirection.
+ * tr_sunDirection[0..2] are tr.sunDirection's components.  Retail inlines the
+ * /Op com_math.c helpers (Perp2D, CrossProduct), so every vector lives in a
+ * stack slot. */
+void __cdecl R_SetSunSpriteSize(float spriteSize)
+{
+  vec3_t reference;
+  vec3_t right;
+  vec3_t up;
+  vec3_t rpu;                              /* right + up */
+  vec3_t rmu;                              /* right - up */
+  float  scale;
+  float  z;
+
+  scale = spriteSize * 0.001311093f;               /* angular size -> displacement */
+
+  /* pick a stable reference perpendicular to the sun direction */
+  z = tr_sunDirection[2];
+  if ( z * z > 0.99000001f )
+    VectorSet(reference, 1.0f, 0.0f, 0.0f);
   else
-  {
-    v12 = 1.0;
-    v13 = 0.0;
-  }
-  v3[0] = *(float *)&dword_16C57D4 * 0.0 - *(float *)&dword_16C57D8 * v13;
-  v3[1] = *(float *)&dword_16C57D8 * v12 - *(float *)&tr_sunDirection * 0.0;
-  v3[2] = *(float *)&tr_sunDirection * v13 - *(float *)&dword_16C57D4 * v12;
-  VectorNormalize(v3);
-  v3[0] = v3[0] * v2;
-  v3[1] = v3[1] * v2;
-  v3[2] = v3[2] * v2;
-  v6 = *(float *)&dword_16C57D8 * v3[1] - *(float *)&dword_16C57D4 * v3[2];
-  v7 = *(float *)&tr_sunDirection * v3[2] - *(float *)&dword_16C57D8 * v3[0];
-  v8 = *(float *)&dword_16C57D4 * v3[0] - *(float *)&tr_sunDirection * v3[1];
-  v9 = v6 + v3[0];
-  v10 = v7 + v3[1];
-  v11 = v8 + v3[2];
-  v12 = v3[0] - v6;
-  v13 = v3[1] - v7;
-  v14 = v3[2] - v8;
-  rendererSunState_spriteVert0X = *(float *)&tr_sunDirection + v9;
-  rendererSunState_spriteVert0Y = *(float *)&dword_16C57D4 + v10;
-  rendererSunState_spriteVert0Z = *(float *)&dword_16C57D8 + v11;
-  rendererSunState_spriteVert1X = *(float *)&tr_sunDirection + v12;
-  rendererSunState_spriteVert1Y = *(float *)&dword_16C57D4 + v13;
+    Perp2D(reference, tr_sunDirection);
+
+  CrossProduct(tr_sunDirection, reference, right);
+  VectorNormalize(right);
+  VectorScale(right, scale, right);
+  CrossProduct(right, tr_sunDirection, up);
+
+  VectorAdd(up, right, rpu);
+  VectorSubtract(right, up, rmu);
+
+  VectorAdd(tr_sunDirection, rpu, &rendererSunState_spriteVert0X);
+  VectorAdd(tr_sunDirection, rmu, &rendererSunState_spriteVert1X);
+  VectorSubtract(tr_sunDirection, rpu, &rendererSunState_spriteVert2X);
+  VectorSubtract(tr_sunDirection, rmu, &rendererSunState_spriteVert3X);
   rendererSunState_spriteVert0W = 0;
   rendererSunState_spriteVert1W = 0;
   rendererSunState_spriteVert2W = 0;
-  rendererSunState_spriteVert1Z = *(float *)&dword_16C57D8 + v14;
   rendererSunState_spriteVert3W = 0;
-  rendererSunState_spriteSize = a1;
-  rendererSunState_spriteVert2X = *(float *)&tr_sunDirection - v9;
-  rendererSunState_spriteVert2Y = *(float *)&dword_16C57D4 - v10;
-  rendererSunState_spriteVert2Z = *(float *)&dword_16C57D8 - v11;
-  rendererSunState_spriteVert3X = *(float *)&tr_sunDirection - v12;
-  rendererSunState_spriteVert3Y = *(float *)&dword_16C57D4 - v13;
-  rendererSunState_spriteVert3Z = *(float *)&dword_16C57D8 - v14;
-  result = 0;   /* retail leaves EDI (zeroed at 0x004E799C) in the return slot */
-  return result;
+  rendererSunState_spriteSize = spriteSize;
 }
 
-/* ---- R_SetSunFromCvars  0x004E7BE0 ----  [HIGH] */
+/* client_mp/cl_console_mp.c 0x00408370, inlined by LTCG: fld / fadd qword
+ * 2^-30 / fistp -- round-to-nearest, not the truncating __ftol2 of an (int)
+ * cast.  So r_sunflare_fadein 0.7 gives 700, not 699. */
+extern int FastRound( float f );
+
+/* DEG2RAD with the float M_PI: retail fmul flt_568F90 (pi) then fmul
+ * flt_569098 (0x3BB60B61, VC7's reciprocal of the 180.0f divisor). */
+#ifdef COD1_VC7
+#define SUN_DEG2RAD( a )   ( ( (a) * M_PI ) / 180.0f )
+#else
+#define SUN_DEG2RAD( a )   ( (double)(a) * (double)M_PI * (double)0.0055555557f )
+#endif
+
+/* ---- R_SetSunFromCvars  0x004E7BE0 ----  [HIGH]
+ * Rebuild the whole sun state from the r_sun* cvars.  Returns dead EAX (the
+ * last glare fade-in value).  Fields holding float bit patterns in int slots
+ * (flareMaxAlpha / blindMaxDarken / glareMaxLighten) are reinterpreted. */
 int R_SetSunFromCvars()
 {
-  char *string;
-  char *v1;
   int result;
-  float v3;
-  float v4;
-  float v5;
-  float v6;
-  float v7;
-  float v8;
 
-  rendererSunState = 0;
-  string = r_sunsprite_shader->string;
-  if ( *string )
-    rendererSunState = (int)R_FindSunSpriteShader(string);
+  rendererSunState_spriteShader = 0;
+  if ( r_sunsprite_shader->string[0] )
+    rendererSunState_spriteShader = (int)R_FindSunSpriteShader(r_sunsprite_shader->string);
   R_SetSunSpriteSize(r_sunsprite_size->value);
+
   rendererSunState_flareShader = 0;
-  v1 = r_sunflare_shader->string;
-  if ( *v1 )
-    rendererSunState_flareShader = (int)R_FindShader(v1, -3, 0, (const char *)4);
-  rendererSunState_flareMinHalfSize = r_sunflare_min_size->value * 0.5;
-  rendererSunState_flareMinCosAngle = cos(r_sunflare_min_angle->value * 3.1415927 * 0.0055555557);
-  rendererSunState_flareMaxHalfSize = r_sunflare_max_size->value * 0.5;
-  rendererSunState_flareMaxCosAngle = cos(r_sunflare_max_angle->value * 3.1415927 * 0.0055555557);
-  rendererSunState_flareMaxAlpha = LODWORD(r_sunflare_max_alpha->value);
-  v3 = r_sunflare_fadein->value * 1000.0;
-  rendererSunState_flareFadeInMsec = (int)(v3 + 9.313225746154785e-10);
-  v4 = r_sunflare_fadeout->value * 1000.0;
-  rendererSunState_flareFadeOutMsec = (int)(v4 + 9.313225746154785e-10);
-  rendererSunState_blindMinCosAngle = cos(r_sunblind_min_angle->value * 3.1415927 * 0.0055555557);
-  rendererSunState_blindMaxCosAngle = cos(r_sunblind_max_angle->value * 3.1415927 * 0.0055555557);
-  rendererSunState_blindMaxDarken = LODWORD(r_sunblind_max_darken->value);
-  v5 = r_sunblind_fadein->value * 1000.0;
-  rendererSunState_blindFadeInMsec = (int)(v5 + 9.313225746154785e-10);
-  v6 = r_sunblind_fadeout->value * 1000.0;
-  rendererSunState_blindFadeOutMsec = (int)(v6 + 9.313225746154785e-10);
-  rendererSunState_glareMinCosAngle = cos(r_sunglare_min_angle->value * 3.1415927 * 0.0055555557);
-  rendererSunState_glareMaxCosAngle = cos(r_sunglare_max_angle->value * 3.1415927 * 0.0055555557);
-  rendererSunState_glareMaxLighten = LODWORD(r_sunglare_max_lighten->value);
-  v7 = r_sunglare_fadein->value * 1000.0;
-  result = (int)(v7 + 9.313225746154785e-10);
-  rendererSunState_glareFadeInMsec = result;
-  v8 = r_sunglare_fadeout->value * 1000.0;
-  rendererSunState_glareFadeOutMsec = (int)(v8 + 9.313225746154785e-10);
+  if ( r_sunflare_shader->string[0] )
+    rendererSunState_flareShader = (int)R_FindShader(r_sunflare_shader->string, -3, 0, (const char *)4);
+
+  rendererSunState_flareMinHalfSize = r_sunflare_min_size->value * 0.5f;
+  rendererSunState_flareMinCosAngle = cos(SUN_DEG2RAD(r_sunflare_min_angle->value));
+  rendererSunState_flareMaxHalfSize = r_sunflare_max_size->value * 0.5f;
+  rendererSunState_flareMaxCosAngle = cos(SUN_DEG2RAD(r_sunflare_max_angle->value));
+  rendererSunState_flareMaxAlpha    = *(int *)&r_sunflare_max_alpha->value;
+  rendererSunState_flareFadeInMsec  = FastRound(r_sunflare_fadein->value * 1000.0f);
+  rendererSunState_flareFadeOutMsec = FastRound(r_sunflare_fadeout->value * 1000.0f);
+
+  rendererSunState_blindMinCosAngle = cos(SUN_DEG2RAD(r_sunblind_min_angle->value));
+  rendererSunState_blindMaxCosAngle = cos(SUN_DEG2RAD(r_sunblind_max_angle->value));
+  rendererSunState_blindMaxDarken   = *(int *)&r_sunblind_max_darken->value;
+  rendererSunState_blindFadeInMsec  = FastRound(r_sunblind_fadein->value * 1000.0f);
+  rendererSunState_blindFadeOutMsec = FastRound(r_sunblind_fadeout->value * 1000.0f);
+
+  rendererSunState_glareMinCosAngle = cos(SUN_DEG2RAD(r_sunglare_min_angle->value));
+  rendererSunState_glareMaxCosAngle = cos(SUN_DEG2RAD(r_sunglare_max_angle->value));
+  rendererSunState_glareMaxLighten  = *(int *)&r_sunglare_max_lighten->value;
+  result                            = FastRound(r_sunglare_fadein->value * 1000.0f);
+  rendererSunState_glareFadeInMsec  = result;
+  rendererSunState_glareFadeOutMsec = FastRound(r_sunglare_fadeout->value * 1000.0f);
   return result;
 }
 
-/* ---- R_SaveSunFromCvars  0x004E7EA0 ----  VERIFIED */
-int __cdecl R_SaveSunFromCvars(const char *a1)
+/* ---- R_SaveSunFromCvars  0x004E7EA0 ----  VERIFIED
+ * ri.SaveCvarsToBuffer is passed the ADDRESS of the r_sunCvarNames table. */
+void __cdecl R_SaveSunFromCvars(const char *sunName)
 {
-  int result;
-  unsigned int v2; // kr00_4
-  char *v3;
-  char v4[65536]; // [esp+0h] [ebp-10004h] BYREF
-  unsigned int v5;
-  unsigned int retaddr;
+  char buffer[65536];
 
-  v5 = retaddr ^ _security_cookie;
-  result = ri_SaveCvarsToBuffer(r_sunCvarNames, 20, v4, 0x10000);   /* 0x004E7EC9: `push offset off_5713C8`, the ADDRESS */
-  if ( result )
-  {
-    v2 = strlen(v4);
-    v3 = va("scripts/%s.sun", a1);
-    return ri_FS_WriteFile(v3, v4, v2);
-  }
-  return result;
+  if ( ri.SaveCvarsToBuffer(r_sunCvarNames, 20, buffer, 0x10000) )
+    ri.FS_WriteFile(va("scripts/%s.sun", sunName), buffer, strlen(buffer));
 }
 
 /* ---- R_LoadSunThroughCvars  0x004E7F30 ----  VERIFIED */
-void __cdecl R_LoadSunThroughCvars(const char *a1)
+void __cdecl R_LoadSunThroughCvars(const char *sunName)
 {
-  char *v1;
-  int v2; // [esp+4h] [ebp-4h] BYREF
+  char *fileName;
+  int   fileBuffer;                        /* [ebp-4h] BYREF */
 
-  v1 = va("scripts/%s.sun", a1);
-  if ( ri_FS_ReadFile(v1, &v2) >= 0 )
+  fileName = va("scripts/%s.sun", sunName);
+  if ( ri.FS_ReadFile(fileName, &fileBuffer) < 0 )
   {
-    if ( ri_LoadCvarsFromBuffer(r_sunCvarNames, 20, v2, v1) )
-      R_SetSunFromCvars();
-    ri_FS_FreeFile(v2);
+    ri.Printf(0, "^3WARNING: couldn't load sun file '%s'\n", fileName);
+    return;
   }
-  else
-  {
-    ri_Printf(0, "^3WARNING: couldn't load sun file '%s'\n", v1);
-  }
+  if ( ri.LoadCvarsFromBuffer(r_sunCvarNames, 20, fileBuffer, fileName) )
+    R_SetSunFromCvars();
+  ri.FS_FreeFile(fileBuffer);
 }
 
 /* ---- R_SaveSun_f  0x004E7FA0 ----  [HIGH] */
 void R_SaveSun_f()
 {
-  const char *v0;
-
-  if ( ri_Cmd_Argc() == 2 )
+  if ( ri.Cmd_Argc() != 2 )
   {
-    v0 = (const char *)ri_Cmd_Argv(1);
-    R_SaveSunFromCvars(v0);
+    ri.Printf(0, "USAGE: r_savesun <sunname>\n  sunname must not have an extension\n");
+    return;
   }
-  else
-  {
-    ri_Printf(0, "USAGE: r_savesun <sunname>\n  sunname must not have an extension\n");
-  }
+  R_SaveSunFromCvars((const char *)ri.Cmd_Argv(1));
 }
 
 /* ---- R_LoadSun_f  0x004E7FD0 ----  [HIGH] */
 void R_LoadSun_f()
 {
-  const char *v0;
-
-  if ( ri_Cmd_Argc() == 2 )
+  if ( ri.Cmd_Argc() != 2 )
   {
-    if ( sv_cheats->integer )
-    {
-      v0 = (const char *)ri_Cmd_Argv(1);
-      R_LoadSunThroughCvars(v0);
-    }
-    else
-    {
-      ri_Printf(0, "You must have cheats enabled to use r_loadsun\n");
-    }
+    ri.Printf(0, "USAGE: r_loadsun <sunname>\n  sunname must not have an extension\n");
+    return;
   }
-  else
+  if ( !sv_cheats->integer )
   {
-    ri_Printf(0, "USAGE: r_loadsun <sunname>\n  sunname must not have an extension\n");
+    ri.Printf(0, "You must have cheats enabled to use r_loadsun\n");
+    return;
   }
+  R_LoadSunThroughCvars((const char *)ri.Cmd_Argv(1));
 }
 
 /* ---- R_SunHelp_f  0x004E8020 ----  VERIFIED */
@@ -1431,183 +1055,199 @@ void R_SunHelp_f()
 {
 	int i;
 
-	ri_Printf(0, "\n=== SUN COMMANDS ===\n");
-	ri_Printf(0, "r_loadsun <sunname> -- loads sun from 'scripts/<sunname>.sun'\n");
-	ri_Printf(0, "r_savesun <sunname> -- saves sun as 'scripts/<sunname>.sun'\n");
-	ri_Printf(0, "\n=== SUN CVARS ===\n");
-	ri_Printf(0, "(must have r_suntest set to 1 to tweak these values)\n");
-	for ( i = 0; i < 20; ++i )
+	ri.Printf(0, "\n=== SUN COMMANDS ===\n");
+	ri.Printf(0, "r_loadsun <sunname> -- loads sun from 'scripts/<sunname>.sun'\n");
+	ri.Printf(0, "r_savesun <sunname> -- saves sun as 'scripts/<sunname>.sun'\n");
+	ri.Printf(0, "\n=== SUN CVARS ===\n");
+	ri.Printf(0, "(must have r_suntest set to 1 to tweak these values)\n");
+	for ( i = 0; i < sizeof( r_sunCvarNames ) / sizeof( r_sunCvarNames[0] ); ++i )
 	{
 		if ( i > 0 )
 		{
 			if ( _strnicmp(r_sunCvarNames[i - 1], r_sunCvarNames[i], 8u) )
-				ri_Printf(0, "\n");
+				ri.Printf(0, "\n");
 		}
-		ri_Printf(0, "^2%-22s^7 %s\n", r_sunCvarNames[i], r_sunCvarHelp[i]);
+		ri.Printf(0, "^2%-22s^7 %s\n", r_sunCvarNames[i], r_sunCvarHelp[i]);
 	}
 }
 
-/* ---- RB_DrawSunSprite  0x004E80C0 ----  VERIFIED */
+/* ---- RB_DrawSunSprite  0x004E80C0 ----  VERIFIED
+ * Emit the sun sprite (the pre-built quad in rendererSunState) into tess. */
 void RB_DrawSunSprite()
 {
-  int v0;
+  if ( !rendererSunState_spriteShader )
+    return;
 
-  if ( rendererSunState )
-  {
-    v0 = storageClass;
-    if ( storageClass != glState_currentStorageMode )
-    {
-      if ( glConfig_NVVertexArrayRange )
-      {
-        RB_SelectStorageNV(storageClass);
-      }
-      else if ( glConfig_ATIVertexArrayObject )
-      {
-        RB_SelectStorageATI(storageClass);
-      }
-      glState_currentStorageMode = v0;
-    }
-    RB_BeginSurface((void *)rendererSunState, 4);   /* 0x004E810E: mov ecx,rendererSunState / push 4 */
-    tess_stageIterator = tr_stageIteratorFunc;
-    qmemcpy(tess_xyz, &rendererSunState_spriteVert0X, 0x40u);
-    dword_17DFF60[0] = 1065353216;
-    dword_17DFF64[0] = 1065353216;
-    dword_17DFF68[0] = 0;
-    dword_17DFF6C[0] = 1065353216;
-    dword_17DFF70[0] = 0;
-    dword_17DFF74[0] = 0;
-    dword_17DFF78[0] = 1065353216;
-    dword_17DFF7C[0] = 0;
-    tess_numVertexes = 4;
-    tess_indexes[0] = 0;
-    word_17A7F62[0] = 1;
-    word_17A7F64[0] = 2;
-    word_17A7F66[0] = 0;
-    word_17A7F68[0] = 2;
-    word_17A7F6A[0] = 3;
-    tess_numIndexes = 6;
-    RB_EndSurface();
-  }
+  RB_SelectStorage(storageClass);          /* inlined by retail */
+
+  RB_BeginSurface((void *)rendererSunState_spriteShader, 4);
+  tess_stageIterator = tr_stageIteratorFunc;
+
+  memcpy(tess_xyz, &rendererSunState_spriteVert0X, 0x40u);   /* 4 vec4 corner verts */
+
+  tess_texCoords0[0] = 1.0f;   tess_texCoords0[1] = 1.0f;     /* v0 (1,1) */
+  tess_texCoords0[2] = 0.0f;   tess_texCoords0[3] = 1.0f;     /* v1 (0,1) */
+  tess_texCoords0[4] = 0.0f;   tess_texCoords0[5] = 0.0f;     /* v2 (0,0) */
+  tess_texCoords0[6] = 1.0f;   tess_texCoords0[7] = 0.0f;     /* v3 (1,0) */
+
+  tess_numVertexes = 4;
+  tess_indexes[0] = 0;
+  tess_indexes[1] = 1;
+  tess_indexes[2] = 2;
+  tess_indexes[3] = 0;
+  tess_indexes[4] = 2;
+  tess_indexes[5] = 3;
+  tess_numIndexes = 6;
+
+  RB_EndSurface();
 }
 
-/* ---- RB_CalcSunFlare  0x004E81E0 ----  [HIGH] */
-void __cdecl RB_CalcSunFlare(float a1)
+/* ---- RB_CalcSunFlare  0x004E81E0 ----  [HIGH]
+ * If the sun is within the flare cone, submit a sun flare whose alpha/size ramp
+ * with the view-to-sun angle.  a2/a3 to RB_UpdateSunFlare carry float bit
+ * patterns in int slots. */
+void __cdecl RB_CalcSunFlare(float sunCosAngle)
 {
-  double v1;
-  int v2;
-  int v3;
+  rfloat frac;
+  float alpha,size;
 
-  if ( rendererSunState_flareShader )
-  {
-    if ( a1 > (double)rendererSunState_flareMinCosAngle )
-    {
-      if ( a1 < (double)rendererSunState_flareMaxCosAngle )
-        v1 = (a1 - rendererSunState_flareMinCosAngle) / (rendererSunState_flareMaxCosAngle - rendererSunState_flareMinCosAngle);
-      else
-        v1 = 1.0;
-      *(float *)&v3 = rendererSunState_flareMaxHalfSize * v1 + rendererSunState_flareMinHalfSize;
-      *(float *)&v2 = *(float *)&rendererSunState_flareMaxAlpha * v1;
-      RB_UpdateSunFlare(rendererSunState_flareShader, v2, v3, rendererSunState_spriteSize, rendererSunState_flareFadeInMsec, rendererSunState_flareFadeOutMsec);
-    }
-  }
-}
+  if ( !rendererSunState_flareShader )
+    return;
+  if ( sunCosAngle <= rendererSunState_flareMinCosAngle )
+    return;
 
-/* ---- RB_CalcSunBlind  0x004E8270 ----  [HIGH] */
-void __cdecl RB_CalcSunBlind(float *a1, float *a2, float a3)
-{
-  int v3;
-  double v4;
-  double updated;
-  double v6;
-  double v7;
-  float v8;
-  float v9;
-  float v10;
-
-  if ( rendererSunState_lastUpdateTime )
-    v3 = backEnd_refdef_time - rendererSunState_lastUpdateTime;
+  if ( sunCosAngle >= rendererSunState_flareMaxCosAngle )
+    frac = 1.0f;
   else
-    v3 = 10;
+    frac = (sunCosAngle - rendererSunState_flareMinCosAngle)
+         / (rendererSunState_flareMaxCosAngle - rendererSunState_flareMinCosAngle);
+
+  size  = rendererSunState_flareMaxHalfSize * frac + rendererSunState_flareMinHalfSize;
+  alpha = *(float *)&rendererSunState_flareMaxAlpha * frac;
+  RB_UpdateSunFlare(rendererSunState_flareShader, alpha,size,
+                    rendererSunState_spriteSize,
+                    rendererSunState_flareFadeInMsec, rendererSunState_flareFadeOutMsec);
+}
+
+/* ---- RB_CalcSunBlind  0x004E8270 ----  [HIGH]
+ * Age the sun blind/glare fractions toward the view-angle target scaled by the
+ * sun's current visibility (visibility), writing *outGlare = glare rgb level and *outBlind = blind
+ * overlay alpha. */
+void __cdecl RB_CalcSunBlind(float *outBlind, float *outGlare, float visibility)
+{
+  int    elapsed;
+  rfloat frac;
+  rfloat updated;
+  float  sunViewDot;
+
+  if ( !rendererSunState_lastUpdateTime )
+    elapsed = 10;
+  else
+    elapsed = backEnd_refdef_time - rendererSunState_lastUpdateTime;
   rendererSunState_lastUpdateTime = backEnd_refdef_time;
-  v10 = backEnd_viewParms_axis02 * *(float *)&dword_16C57D8
-      + backEnd_viewParms_axis01 * *(float *)&dword_16C57D4
-      + backEnd_viewParms_axis00 * *(float *)&tr_sunDirection;
-  if ( *(float *)&rendererSunState_blindMaxDarken > 0.0 )
+
+#ifdef COD1_VC7
+  sunViewDot = tr_sunDirection[0] * backEnd_viewParms_axis00   /* VC7 sums this as [2],[1],[0], like retail */
+             + tr_sunDirection[1] * backEnd_viewParms_axis01
+             + tr_sunDirection[2] * backEnd_viewParms_axis02;
+#else
+  sunViewDot = tr_sunDirection[2] * backEnd_viewParms_axis02
+             + tr_sunDirection[1] * backEnd_viewParms_axis01
+             + tr_sunDirection[0] * backEnd_viewParms_axis00;
+#endif
+
+  if ( *(float *)&rendererSunState_blindMaxDarken <= 0.0f )
   {
-    if ( v10 > (double)rendererSunState_blindMinCosAngle )
-    {
-      if ( v10 < (double)rendererSunState_blindMaxCosAngle )
-        v4 = (v10 - rendererSunState_blindMinCosAngle) / (rendererSunState_blindMaxCosAngle - rendererSunState_blindMinCosAngle);
-      else
-        v4 = 1.0;
-    }
+    *outBlind = 0.0f;
+  }
+  else
+  {
+    if ( sunViewDot <= rendererSunState_blindMinCosAngle )
+      frac = 0.0f;
+    else if ( sunViewDot >= rendererSunState_blindMaxCosAngle )
+      frac = 1.0f;
     else
-    {
-      v4 = 0.0;
-    }
-    v8 = v4 * a3;
-    updated = R_UpdateOverTime(rendererSunState_currentBlindFraction, v8, rendererSunState_blindFadeInMsec, rendererSunState_blindFadeOutMsec, v3);
+      frac = (sunViewDot - rendererSunState_blindMinCosAngle)
+           / (rendererSunState_blindMaxCosAngle - rendererSunState_blindMinCosAngle);
+    updated = R_UpdateOverTime(rendererSunState_currentBlindFraction, FCAST(frac * visibility),
+                               rendererSunState_blindFadeInMsec, rendererSunState_blindFadeOutMsec,
+                               elapsed);
     rendererSunState_currentBlindFraction = updated;
-    *a2 = updated * *(float *)&rendererSunState_blindMaxDarken;
+#ifdef COD1_VC7
+    *outBlind = rendererSunState_currentBlindFraction * *(float *)&rendererSunState_blindMaxDarken;   /* VC7 reuses the unrounded value */
+#else
+    *outBlind = updated * *(float *)&rendererSunState_blindMaxDarken;
+#endif
+  }
+
+  if ( *(float *)&rendererSunState_glareMaxLighten <= 0.0f )
+  {
+    *outGlare = 0.0f;
   }
   else
   {
-    *a2 = 0.0;
-  }
-  if ( *(float *)&rendererSunState_glareMaxLighten > 0.0 )
-  {
-    if ( v10 > (double)rendererSunState_glareMinCosAngle )
-    {
-      if ( v10 < (double)rendererSunState_glareMaxCosAngle )
-        v6 = (v10 - rendererSunState_glareMinCosAngle) / (rendererSunState_glareMaxCosAngle - rendererSunState_glareMinCosAngle);
-      else
-        v6 = 1.0;
-    }
+    if ( sunViewDot <= rendererSunState_glareMinCosAngle )
+      frac = 0.0f;
+    else if ( sunViewDot >= rendererSunState_glareMaxCosAngle )
+      frac = 1.0f;
     else
-    {
-      v6 = 0.0;
-    }
-    v9 = v6 * a3;
-    v7 = R_UpdateOverTime(rendererSunState_currentGlareFraction, v9, rendererSunState_glareFadeInMsec, rendererSunState_glareFadeOutMsec, v3);
-    rendererSunState_currentGlareFraction = v7;
-    *a1 = v7 * *(float *)&rendererSunState_glareMaxLighten;
-  }
-  else
-  {
-    *a1 = 0.0;
+      frac = (sunViewDot - rendererSunState_glareMinCosAngle)
+           / (rendererSunState_glareMaxCosAngle - rendererSunState_glareMinCosAngle);
+    updated = R_UpdateOverTime(rendererSunState_currentGlareFraction, FCAST(frac * visibility),
+                               rendererSunState_glareFadeInMsec, rendererSunState_glareFadeOutMsec,
+                               elapsed);
+    rendererSunState_currentGlareFraction = updated;
+#ifdef COD1_VC7
+    *outGlare = rendererSunState_currentGlareFraction * *(float *)&rendererSunState_glareMaxLighten;   /* VC7 reuses the unrounded value */
+#else
+    *outGlare = updated * *(float *)&rendererSunState_glareMaxLighten;
+#endif
   }
 }
 
-/* ---- RB_AddSunEffects  0x004E83F0 ----  [HIGH] */
+/* ---- RB_AddSunEffects  0x004E83F0 ----  [HIGH]
+ * When a sun exists and it is in front of the eye, draw the sun sprite and
+ * queue its flare. */
 void RB_AddSunEffects()
 {
-  double v0;
-  float v1;
+  float sunViewDot;
 
-  if ( *(_DWORD *)(tr_world + 276) )
-  {
-    if ( r_suntest->integer )
-      R_SetSunFromCvars();
-    v0 = backEnd_viewParms_axis02 * *(float *)&dword_16C57D8
-       + backEnd_viewParms_axis01 * *(float *)&dword_16C57D4
-       + backEnd_viewParms_axis00 * *(float *)&tr_sunDirection;
-    if ( v0 > 0.0 )
-    {
-      RB_DrawSunSprite();
-      v1 = v0;
-      RB_CalcSunFlare(v1);
-    }
-  }
+  if ( !*(int *)(tr_world + 276) )         /* tr.world->sunLight */
+    return;
+
+  if ( r_suntest->integer )
+    R_SetSunFromCvars();
+
+#ifdef COD1_VC7
+  sunViewDot = tr_sunDirection[0] * backEnd_viewParms_axis00   /* VC7 sums this as [2],[1],[0], like retail */
+             + tr_sunDirection[1] * backEnd_viewParms_axis01
+             + tr_sunDirection[2] * backEnd_viewParms_axis02;
+#else
+  sunViewDot = tr_sunDirection[2] * backEnd_viewParms_axis02
+             + tr_sunDirection[1] * backEnd_viewParms_axis01
+             + tr_sunDirection[0] * backEnd_viewParms_axis00;
+#endif
+  if ( sunViewDot <= 0.0f )
+    return;
+
+  RB_DrawSunSprite();
+  RB_CalcSunFlare(sunViewDot);
 }
 
-/* ---- RB_DrawSun  0x004E8460 ----  [HIGH] */
+/* ---- RB_DrawSun  0x004E8460 ----  [HIGH]
+ * The sky shader is captured BEFORE RB_AddSunEffects (retail holds it in ESI,
+ * 0x004E846D / 0x004E847A): RB_DrawSunSprite re-begins tess with the sun
+ * sprite shader, so tess_shader read after the call would be the wrong one. */
 void RB_DrawSun()
 {
-  if ( r_drawSun->integer )
-  {
-    RB_AddSunEffects();
-    RB_BeginSurface((void *)tess_shader, 3);   /* 0x004E847C: push 3 / mov ecx,esi; esi = tess_shader */
-  }
+  void *skyShader;
+
+  if ( !r_drawSun->integer )
+    return;
+
+  skyShader = (void *)tess_shader;         /* retail keeps it in ESI across the call */
+  RB_AddSunEffects();
+  RB_BeginSurface(skyShader, 3);
 }
 
 /* ---- R_ClearSun  0x004E8490 ----  [HIGH] */
@@ -1618,96 +1258,84 @@ void R_ClearSun()
   rendererSunState_lastUpdateTime = 0;
 }
 
-/* ---- R_FlushSun  0x004E84B0 ----  [HIGH] */
-int R_FlushSun()
+/* ---- R_FlushSun  0x004E84B0 ----  [HIGH]
+ * Zero the whole 156-byte sun state. */
+void R_FlushSun()
 {
   Com_Memset(&rendererSunState, 0, 0x9Cu);
-  return 0;
 }
 
-/* ---- RB_StageIteratorSky  0x004E84D0 ----  VERIFIED */
+/* ---- RB_StageIteratorSky  0x004E84D0 ----  VERIFIED
+ * The sky-shader stage iterator: clip the sky polygons, draw the outer box, the
+ * sun, the cloud stages, then the inner box.  RB_DrawSun and R_FogOff are
+ * inlined by retail; the log-comment file guards are kept. */
 void RB_StageIteratorSky()
 {
-  int v0;
-  int v1;
-  int v2;
-  GLclampd v3;
-  GLclampd v4;
+  int outerImage;
+  int innerImage;
 
   if ( r_fastsky->integer )
   {
-    if ( r_drawSun->integer )
-    {
-      RB_AddSunEffects();
-      RB_BeginSurface((void *)tess_shader, 3);   /* 0x004E84FE: push 3 / mov ecx,esi; esi = tess_shader */
-    }
+    RB_DrawSun();                          /* inlined by retail (0x004E84EF / 0x004E84FC) */
     return;
   }
-  if ( !dword_16DCA54 || (backEnd_refdef_rdflags & 8) != 0 )
+
+  /* with a skybox-portal view present, only render the sky for that view */
+  if ( rendererSkyboxPortal && (backEnd_refdef_rdflags & 8) == 0 )
+    return;
+
+  /* the active fog can suppress the sky */
+  if ( backEnd_viewParms_glFogRegistered )
   {
-    if ( backEnd_viewParms_glFogRegistered )
-    {
-      v0 = backEnd_viewParms_glFogDrawSky;
-    }
-    else
-    {
-      if ( glfogNum <= 0 )
-      {
-LABEL_11:
-        if ( Stream )
-          fprintf(Stream, "%s", (int)"--- RB_StageIteratorSky ---\n");
-        backEnd_refdef_rdflags |= 0x40u;
-        RB_ClipSkyPolygons((int)tess_indexes);
-        if ( r_showsky->integer )
-        {
-          v4 = 0.0;
-          HIDWORD(v3) = 0;
-        }
-        else
-        {
-          v4 = 1.0;
-          HIDWORD(v3) = 1072693248;
-        }
-        LODWORD(v3) = 0;
-        glDepthRange(v3, v4);
-        if ( (glState_glStateBits & 0x200000) != 0 )
-        {
-          glDisable(0xB60u);
-          glState_glStateBits &= ~0x200000u;
-        }
-        v1 = *(_DWORD *)(tess_shader + 100);
-        if ( v1 )
-        {
-          if ( v1 != tr_defaultImage )
-            DrawSkyBox(tess_shader, 0);
-        }
-        tess_numIndexes = 0;
-        if ( r_drawSun->integer )
-        {
-          RB_AddSunEffects();
-          RB_BeginSurface((void *)tess_shader, 3);   /* 0x004E860B: push 3 / mov ecx,esi; esi = ecx = tess_shader, 0x004E85E1 */
-        }
-        RB_BuildCloudData((int)tess_indexes);
-        if ( tess_numIndexes )
-          tr_stageIteratorFunc(0);
-        v2 = *(_DWORD *)(tess_shader + 124);
-        if ( v2 )
-        {
-          if ( v2 != tr_defaultImage )
-            DrawSkyBox(tess_shader, 1);
-        }
-        R_FogOn();
-        glDepthRange(0.0, 1.0);
-        backEnd_refdef_rdflags &= ~0x40u;
-        backEnd_skyRenderedThisView = 1;
-        if ( Stream )
-          fprintf(Stream, "%s", (int)"----------\n");
-        return;
-      }
-      v0 = dword_16C4C74;
-    }
-    if ( !v0 )
+    if ( !backEnd_viewParms_glFogDrawSky )
       return;
-    goto LABEL_11;
   }
+  else if ( glfogNum > 0 )
+  {
+    if ( !tr_fogCurrent_drawSky )                  /* glfogsettings[FOG_CURRENT].drawsky */
+      return;
+  }
+
+  sub_50AF10("--- RB_StageIteratorSky ---\n");
+
+  backEnd_refdef_rdflags |= 0x40u;         /* RDF_DRAWINGSKY */
+  RB_ClipSkyPolygons(&tess);
+
+  /* r_showsky draws the sky in front of everything to reveal how much is drawn */
+  if ( r_showsky->integer )
+    glDepthRange(0.0, 0.0);
+  else
+    glDepthRange(1.0, 1.0);
+
+  /* R_FogOff (inlined) */
+  if ( (glState_glStateBits & 0x200000) != 0 )
+  {
+    glDisable(0xB60u);                     /* GL_FOG */
+    glState_glStateBits &= ~0x200000u;
+  }
+
+  outerImage = *(int *)(tess_shader + 100);   /* shader->skyOuterBox[0] */
+  if ( outerImage && outerImage != tr_defaultImage )
+    DrawSkyBox(tess_shader, 0);
+
+  tess_numIndexes = 0;
+
+  /* RB_DrawSun (inlined by retail, 0x004E8600 / 0x004E8609) re-begins tess with
+   * the sky shader, not the sun sprite's */
+  RB_DrawSun();
+
+  RB_BuildCloudData(&tess);
+  if ( tess_numIndexes )
+    tr_stageIteratorFunc(0);
+
+  innerImage = *(int *)(tess_shader + 124);   /* shader->skyInnerBox[0] */
+  if ( innerImage && innerImage != tr_defaultImage )
+    DrawSkyBox(tess_shader, 1);
+
+  R_FogOn();
+  glDepthRange(0.0, 1.0);
+  backEnd_refdef_rdflags &= ~0x40u;
+  backEnd_skyRenderedThisView = 1;
+
+  sub_50AF10("----------\n");
 }

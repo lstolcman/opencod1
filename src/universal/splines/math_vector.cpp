@@ -9,8 +9,6 @@
  * the 1.1 Windows build.
  */
 
-#include "../qcommon/cod1_types.h"
-
 
 /* ISO C requires a translation unit to contain at least one declaration. */
 typedef int math_vector_placeholder_t;

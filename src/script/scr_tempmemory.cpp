@@ -9,9 +9,14 @@
  * @fidelity: verified
  */
 
+#ifdef __cplusplus
+/* retail built this unit as C++ with exceptions (/TP /GX); every name keeps C linkage */
+extern "C" {
+#endif
+
 #include "scr_local.h"
 
-extern int currentPos;
+int currentPos;   /* 0x01407368 */
 #define scrTempMemory_currentPos currentPos
 
 extern void *Hunk_ReallocateTempMemory( int size );
@@ -21,20 +26,28 @@ void TempMemoryReset( void ) {
 	scrTempMemory_currentPos = 0;
 }
 
-/* ---- TempMalloc  0x00470480 ---- VERIFIED */
+/* ---- TempMalloc  0x00470480 ---- VERIFIED
+ * Retail keeps the new cursor in a register and only stores it to
+ * currentPos after Hunk_ReallocateTempMemory returns, so an ERR_DROP
+ * raised inside the realloc leaves currentPos unchanged. The realloc
+ * argument is spelled out apart from newPos: inlined TempMalloc(0) callers
+ * then keep retail's `mov edi,esi` copy and currentPos reload. */
 void *TempMalloc( int len ) {
-	int oldPos;
+	int   newPos;
+	char *result;
 
-	oldPos = scrTempMemory_currentPos;
-	scrTempMemory_currentPos += len;
-	return (char *)Hunk_ReallocateTempMemory( scrTempMemory_currentPos ) + oldPos;
+	newPos = scrTempMemory_currentPos + len;
+	result = (char *)Hunk_ReallocateTempMemory( scrTempMemory_currentPos + len ) + scrTempMemory_currentPos;
+	scrTempMemory_currentPos = newPos;
+	return result;
 }
 
 /* ---- TempMemorySetPos  0x004704A0 ---- VERIFIED */
 void TempMemorySetPos( void *pos ) {
-	char *end;
-
-	end = (char *)TempMalloc( 0 );
-	scrTempMemory_currentPos -= (int)( end - (char *)pos );
+	scrTempMemory_currentPos -= (char *)TempMalloc( 0 ) - (char *)pos;
 	Hunk_ReallocateTempMemory( scrTempMemory_currentPos );
 }
+
+#ifdef __cplusplus
+}
+#endif

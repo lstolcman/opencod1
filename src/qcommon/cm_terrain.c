@@ -9,42 +9,16 @@
  * @fidelity: likely
  */
 
-#include "../qcommon/cm_patch_local.h"
-#include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
+#include "../qcommon/cm_local.h"
+
+/* cm_boxOnTerrainWarned (0x01407438) is owned by this unit; defined here and declared
+ * locally so this unit needs only cm_local.h, exactly as cm_trace.c does. */
+int cm_boxOnTerrainWarned;
 
 extern void *Hunk_AllocAlignInternal( int size, int align );
 extern void PerpendicularVector( vec3_t dst, const vec3_t src );
 qboolean PlaneFromPoints( vec4_t plane, const vec3_t a, const vec3_t b,
 						  const vec3_t c );
-
-typedef struct cmTerrainSphere_t
-{
-	qboolean use;                   /* +0x0F4 */
-	float radius;                   /* +0x0F8 */
-	float halfheight;               /* +0x0FC */
-	vec3_t offset;                  /* +0x100 */
-} cmTerrainSphere_t;
-
-typedef struct cmTerrainTrace_t
-{
-	vec3_t start;                   /* +0x000 */
-	vec3_t end;                     /* +0x00C */
-	vec3_t delta;                   /* +0x018 */
-	float deltaLengthSquared;       /* +0x024 */
-	vec3_t mins;                    /* +0x028 */
-	vec3_t maxs;                    /* +0x034 */
-	vec3_t offsets[8];              /* +0x040 */
-	byte _pad_A0[0x0C0 - 0x0A0];
-	qboolean isPoint;               /* +0x0C0 */
-	trace_t trace;                  /* +0x0C4 */
-	cmTerrainSphere_t sphere;       /* +0x0F4 */
-	vec3_t sphereExtents;           /* +0x10C */
-} cmTerrainTrace_t;
-COD1_ASSERT_SIZE( cmTerrainTrace_t, 280 );
-
-#define CM_TW( p )  ( ( cmTerrainTrace_t * ) (void *) (p) )
 
 typedef struct terrainPlane_t
 {
@@ -83,7 +57,7 @@ typedef struct terrainCollide_t
 {
 	unsigned short facetCount;      /* +0x00 */
 	byte capsuleOffsetSign;         /* +0x02 */
-	byte unk03;                     /* +0x03 */
+	byte pad_0x03;                  /* +0x03 alignment: the facet array follows at +4; no access */
 } terrainCollide_t;
 COD1_ASSERT_SIZE( terrainCollide_t, 4 );
 
@@ -102,701 +76,398 @@ COD1_ASSERT_SIZE( terrainCollide_t, 4 );
 #define CM_CHECKCOUNT           cm_checkcount
 
 /* ---- FindEdge  0x00420000 ---- VERIFIED */
-int __cdecl FindEdge(int *edges, int numEdges, __int16 p1, __int16 p2)
+int __cdecl FindEdge( short ( *edges )[2], int numEdges, short p1, short p2 )
 {
-  int result;
-  __int16 v5;
+	int i;
 
-  result = 0;
-  if ( numEdges <= 0 )
-    return -1;
-  while ( 1 )
-  {
-    v5 = edges[result];
-    if ( v5 == p2 && HIWORD(edges[result]) == p1 )
-      break;
-    if ( v5 == p1 && HIWORD(edges[result]) == p2 )
-      break;
-    if ( ++result >= numEdges )
-      return -1;
-  }
-  return result;
+	/* An edge matches ( p1, p2 ) in either orientation.  Both endpoints are
+	 * compared as 16-bit values (`cmp word ptr [edx+eax*4+2],di`,
+	 * 0x0042000F). */
+	for ( i = 0; i < numEdges; i++ ) {
+		if ( edges[i][0] == p2 && edges[i][1] == p1 ) {
+			return i;
+		}
+		if ( edges[i][0] == p1 && edges[i][1] == p2 ) {
+			return i;
+		}
+	}
+	return -1;
 }
 
 /* ---- CM_GenerateTerrainCollide  0x00420030 ---- VERIFIED */
-void *__cdecl CM_GenerateTerrainCollide(int numIndexes, const short *indexes,
-                                        int numVerts, const vec3_t *pointArray,
-                                        vec3_t *bounds)
+/*
+ * Builds the sphere/cylinder terrain collide from a triangle-soup index/vertex
+ * list.  Layout (see cm_patch_local.h): a 4-byte header (terrainCollide_t:
+ * facetCount plus the capsuleOffsetSign flag) followed by inline 72-byte
+ * facets, plus two side arrays -- one 16-byte vertex sphere per referenced
+ * vertex and one 56-byte edge cylinder per surviving edge.
+ *
+ * Two big _WORD scratch arrays live on the stack.  vertMap[] first stores, per
+ * edge, the third (opposite) vertex of the triangle that created that edge;
+ * after the memset it is reused as a vertex -> sphere-index map.  edgeVerts[]
+ * holds the two endpoint vertices of each edge.
+ *
+ * PlaneFromPoints's argument order is load-bearing: the three vertices must be
+ * passed as ( a, b, c ) = ( points[i0], points[i1], points[i2] ).  Any other
+ * order negates every facet's surface plane, so terrain becomes solid from
+ * behind and passable from the front (see the IDA note at 0x0042050D).
+ */
+void *__cdecl CM_GenerateTerrainCollide( int numIndexes, const short *indexes,
+										 int numVerts, const vec3_t *points,
+										 vec3_t *bounds )
 {
-  const int width    = numIndexes;
-  const int height   = (int)indexes;
-  const int points   = numVerts;
-  const int contents = (int)pointArray;
+	short vertMap[0x10000];         /* per-edge opposite vertex, then reused as
+									 * a vertex -> sphere-index map */
+	short edgeVerts[0x10000][2];    /* the two endpoint vertices of each edge */
+	terrainCollide_t *tc;
+	terrainFacet_t *facets;
+	terrainVertexSphere_t *vertSpheres;
+	terrainEdgeCylinder_t *edgeCylinders;
+	int numFacets;
+	int numEdges;
+	int numSpheres;
+	/* f is the one counter of the index-triple, facet and edge-cylinder
+	 * passes: retail keeps all three in the same frame slot (esp+20h at
+	 * 0x00420096, 0x004204AC, 0x00420C5F), and separate counters move it. */
+	int i, f, k, j;
+	qboolean hasUpFacing;
+	qboolean hasDownFacing;
 
-  int v4;
-  __int16 v5;
-  unsigned __int16 v6;
-  bool v7;
-  int v8;
-  __int16 v9;
-  __int16 v10;
-  double v11;
-  float *v12;
-  float *v13;
-  float *v14;
-  double v15;
-  int v16;
-  float *v17;
-  double v18;
-  __int16 v19;
-  float v20;
-  __int16 v21;
-  _WORD *v22;
-  int v23;
-  int i;
-  int v25;
-  bool v26;
-  _WORD *v27;
-  int v28;
-  _WORD *v29;
-  __int16 v30;
-  _WORD *v31;
-  float *v32;
-  unsigned __int16 v33;
-  unsigned __int16 v34;
-  float *v35;
-  float *v36;
-  double v37;
-  double v38;
-  double v39;
-  double v40;
-  __int16 v41;
-  double v42;
-  char *v43;
-  double v44;
-  char *v45;
-  __int16 v46;
-  __int16 v47;
-  char *v48;
-  __int16 v49;
-  __int16 v50;
-  char *v51;
-  int v52;
-  __int16 v53;
-  char *v54;
-  __int16 v55;
-  int v56;
-  __int16 v57;
-  char *v58;
-  int v59;
-  __int16 v60;
-  char *v61;
-  unsigned __int16 *v62;
-  __int16 *v63;
-  bool v64;
-  char v65;
-  float *v66;
-  char *v67;
-  int v68;
-  float *v69;
-  __int16 v70;
-  char *v71;
-  __int16 v72;
-  char *v73;
-  __int16 v74;
-  char *v75;
-  __int16 v76;
-  char *v77;
-  float *v78;
-  __int16 v79;
-  char *v80;
-  int v81;
-  float *v82;
-  int v83;
-  int v84;
-  int v85;
-  int v86;
-  float *v87;
-  float *v88;
-  float *v89;
-  double v90;
-  double v91;
-  __int16 *v93;
-  float v94;
-  float v95;
-  int v96;
-  float v97;
-  float v98;
-  float v99;
-  float v100;
-  char v101;
-  char v102;
-  int v103;
-  int v104;
-  int v105;
-  int v106;
-  float vec3a[3];
-  float v110;
-  float vec3b[3];
-  int v114;
-  float v115;
-  int v116;
-  float v117;
-  __int16 *v118;
-  float v119;
-  char *v120;
-  char *v121;
-  float v122;
-  float v123;
-  float v124;
-  float v125;
-  float v126;
-  float v127;
-  float v128;
-  float v129;
-  float v130;
-  float v131;
-  float v132;
-  float v133;
-  float v134;
-  float v135;
-  _WORD vertMap[0x10000];
-  _WORD edgeVerts[0x10000][2];
-  unsigned int v137;
-  unsigned int retaddr;
-  float *v139 = &bounds[0][0];
+	numFacets = numIndexes / 3;
+	if ( numIndexes % 3 ) {
+		Com_Error( ERR_DROP, "\x15" "CM_GenerateTerrainCollide: numIndexes % 3 != 0, corrupt bsp?" );
+	}
+	if ( (unsigned int) numVerts >= 0x10000 ) {
+		Com_Error( ERR_DROP, "\x15" "CM_GenerateTerrainCollide: too many vertices" );
+	}
 
-  v137 = retaddr ^ _security_cookie;
-  LODWORD(v110) = width / 3;
-  if ( width % 3 )
-    Com_Error(ERR_DROP, "\x15" "CM_GenerateTerrainCollide: numIndexes % 3 != 0, corrupt bsp?");
-  if ( (unsigned int)points >= 0x10000 )
-    Com_Error(ERR_DROP, "\x15" "CM_GenerateTerrainCollide: too many vertices");
-  v103 = 0;
-  v104 = 0;
-  if ( width > 0 )
-  {
-    v4 = height;
-    do
-    {
-      v114 = 2;
-      v93 = (__int16 *)v4;
-      v96 = 3;
-      do
-      {
-        v5 = *v93;
-        v6 = *(_WORD *)(height + 2 * (v104 + (v114 - 1) % 3));
-        v7 = *v93 == (__int16)v6;
-        LOWORD(v118) = *(_WORD *)(height + 2 * (v104 + v114 % 3));
-        if ( v7 )
-          Com_Error(ERR_DROP, "\x15" "CM_GenerateTerrainCollide: degenerate triangle, corrupt bsp?");
-        v8 = 0;
-        if ( v103 <= 0 )
-          goto LABEL_18;
-        while ( 1 )
-        {
-          v9 = edgeVerts[v8][0];
-          if ( v9 == v6 && edgeVerts[v8][1] == v5 )
-            break;
-          if ( v9 == v5 && edgeVerts[v8][1] == v6 )
-            break;
-          if ( ++v8 >= v103 )
-            goto LABEL_18;
-        }
-        if ( v8 >= 0 )
-        {
-          v11 = *(float *)(contents + 12 * v5);
-          v12 = (float *)(contents + 12 * v5);
-          v13 = (float *)(contents + 12 * (__int16)v118);
-          v14 = (float *)(contents + 12 * (__int16)v6);
-          v127 = v11 - *v13;
-          v15 = v12[1];
-          LODWORD(v115) = &vertMap[v8];
-          v16 = (__int16)*(_WORD *)LODWORD(v115);
-          v128 = v15 - v13[1];
-          v17 = (float *)(contents + 12 * v16);
-          v129 = v12[2] - v13[2];
-          vec3b[0] = *v14 - *v13;
-          vec3b[1] = v14[1] - v13[1];
-          vec3b[2] = v14[2] - v13[2];
-          v133 = *v17 - *v13;
-          v134 = v17[1] - v13[1];
-          v135 = v17[2] - v13[2];
-          vec3a[0] = vec3b[1] * v129 - vec3b[2] * v128;
-          vec3a[1] = vec3b[2] * v127 - vec3b[0] * v129;
-          vec3a[2] = vec3b[0] * v128 - vec3b[1] * v127;
-          *(float *)&v116 = vec3a[2] * v135 + vec3a[1] * v134 + vec3a[0] * v133;
-          if ( *(float *)&v116 > 0.0 )
-          {
-            v124 = *v17 - *v12;
-            v125 = v17[1] - v12[1];
-            v126 = v17[2] - v12[2];
-            v122 = v126 * v126 + v125 * v125 + v124 * v124;
-            v130 = *v17 - *v14;
-            v131 = v17[1] - v14[1];
-            v132 = v17[2] - v14[2];
-            v123 = v132 * v132 + v131 * v131 + v130 * v130;
-            if ( v122 <= (double)v123 )
-              v117 = v123;
-            else
-              v117 = v122;
-            v18 = vec3a[2] * vec3a[2] + vec3a[1] * vec3a[1] + vec3a[0] * vec3a[0];
-            if ( (v18 < v117 * 0.0000000064000001) | __UNORDERED__(v18, v117 * 0.0000000064000001) )
-            {
-              edgeVerts[v8][0] = edgeVerts[v103 - 1][0];
-              v19 = edgeVerts[v103 - 1][1];
-              v20 = v115;
-              v21 = vertMap[--v103];
-              edgeVerts[v8][1] = v19;
-              *(_WORD *)LODWORD(v20) = v21;
-            }
-          }
-        }
-        else
-        {
-LABEL_18:
-          if ( (unsigned int)v103 >= 0x10000 )
-            Com_Error(ERR_DROP, "\x15" "CM_GenerateTerrainCollide: too many edges");
-          v10 = (__int16)v118;
-          edgeVerts[v103][0] = v5;
-          edgeVerts[v103][1] = v6;
-          vertMap[v103++] = v10;
-        }
-        v22 = v93 + 1;
-        v7 = v96 == 1;
-        ++v93;
-        ++v114;
-        --v96;
-      }
-      while ( !v7 );
-      v4 = (int)v22;
-      v104 += 3;
-    }
-    while ( v104 < width );
-  }
-  memset(vertMap, 0xFF, sizeof(vertMap));
-  v23 = 0;
-  for ( i = 0; i < v103; ++i )
-  {
-    v25 = (__int16)edgeVerts[i][0];
-    v26 = (__int16)vertMap[v25] < 0;
-    v27 = &vertMap[v25];
-    if ( v26 )
-      *v27 = v23++;
-    v28 = (__int16)edgeVerts[i][1];
-    v26 = (__int16)vertMap[v28] < 0;
-    v29 = &vertMap[v28];
-    if ( v26 )
-      *v29 = v23++;
-  }
-  v30 = LOWORD(v110);
-  v31 = Hunk_AllocAlignInternal(72 * LODWORD(v110) + 4, 32);
-  v114 = (int)v31;
-  v120 = (char *)Hunk_AllocAlignInternal(16 * v23, 32);
-  v121 = (char *)Hunk_AllocAlignInternal(56 * v103, 32);
-  v102 = 0;
-  v101 = 0;
-  *v31 = LOWORD(v110);
-  v105 = 0;
-  if ( !v30 )
-    goto LABEL_81;
-  v32 = (float *)(v31 + 6);
-  v118 = (__int16 *)(height + 4);
-  do
-  {
-    v33 = *(v118 - 1);
-    v34 = *(v118 - 2);
-    LODWORD(v122) = *v118;
-    v116 = v33;
-    v35 = (float *)(contents + 12 * (__int16)v33);
-    LODWORD(v117) = v34;
-    v36 = (float *)(contents + 12 * (__int16)v34);
-    LODWORD(v115) = contents + 12 * SLOWORD(v122);
-    PlaneFromPoints( v32 - 2, v36, v35, (float *)LODWORD(v115) );
-    if ( (*v32 < -0.001) | __UNORDERED__(*v32, -0.001) )
-    {
-      v102 = 1;
-    }
-    else if ( *v32 > 0.001 )
-    {
-      v101 = 1;
-    }
-    vec3b[0] = *v35 - *v36;
-    vec3b[1] = v35[1] - v36[1];
-    vec3b[2] = v35[2] - v36[2];
-    v110 = VectorNormalize(vec3b);
-    vec3a[0] = *(float *)LODWORD(v115) - *v36;
-    vec3a[1] = *(float *)(LODWORD(v115) + 4) - v36[1];
-    vec3a[2] = *(float *)(LODWORD(v115) + 8) - v36[2];
-    v115 = VectorNormalize(vec3a);
-    v97 = vec3a[2] * vec3b[2] + vec3a[1] * vec3b[1] + vec3a[0] * vec3b[0];
-    v94 = 1.0 / (1.0 - v97 * v97);
-    vec3b[0] = v94 * vec3b[0];
-    vec3b[1] = v94 * vec3b[1];
-    vec3b[2] = v94 * vec3b[2];
-    vec3a[0] = v94 * vec3a[0];
-    vec3a[1] = v94 * vec3a[1];
-    vec3a[2] = v94 * vec3a[2];
-    v95 = -v97;
-    v98 = 1.0 / v110;
-    v110 = (v95 * vec3a[0] + vec3b[0]) * v98;
-    v37 = v95 * vec3a[1];
-    v32[2] = v110;
-    v119 = (v37 + vec3b[1]) * v98;
-    v38 = v95 * vec3a[2];
-    v32[3] = v119;
-    v99 = (v38 + vec3b[2]) * v98;
-    v39 = v119;
-    v32[4] = v99;
-    v32[5] = v39 * v36[1] + v99 * v36[2] + v110 * *v36;
-    v100 = 1.0 / v115;
-    v115 = (v95 * vec3b[0] + vec3a[0]) * v100;
-    v40 = v95 * vec3b[1];
-    v32[6] = v115;
-    v41 = vertMap[SLOWORD(v117)];
-    v110 = (v40 + vec3a[1]) * v100;
-    v42 = v95 * vec3b[2];
-    v32[7] = v110;
-    v43 = v120;
-    v119 = (v42 + vec3a[2]) * v100;
-    v44 = v110;
-    v32[8] = v119;
-    v32[9] = v44 * v36[1] + v119 * v36[2] + v115 * *v36;
-    if ( v41 < 0 )
-      v45 = 0;
-    else
-      v45 = &v43[16 * v41];
-    v46 = v116;
-    *((_DWORD *)v32 + 10) = v45;
-    v47 = vertMap[v46];
-    if ( v47 < 0 )
-      v48 = 0;
-    else
-      v48 = &v43[16 * v47];
-    v49 = LOWORD(v122);
-    *((_DWORD *)v32 + 11) = v48;
-    v50 = vertMap[v49];
-    if ( v50 < 0 )
-      v51 = 0;
-    else
-      v51 = &v43[16 * v50];
-    *((_DWORD *)v32 + 12) = v51;
-    v52 = 0;
-    if ( v103 <= 0 )
-      goto LABEL_56;
-    while ( 1 )
-    {
-      v53 = edgeVerts[v52][0];
-      if ( v53 == v49 && edgeVerts[v52][1] == v46 )
-        break;
-      if ( v53 == v46 && edgeVerts[v52][1] == v49 )
-        break;
-      if ( ++v52 >= v103 )
-        goto LABEL_56;
-    }
-    if ( v52 < 0 )
-LABEL_56:
-      v54 = 0;
-    else
-      v54 = &v121[56 * v52];
-    v55 = LOWORD(v117);
-    *((_DWORD *)v32 + 13) = v54;
-    v56 = 0;
-    if ( v103 <= 0 )
-      goto LABEL_63;
-    while ( 1 )
-    {
-      v57 = edgeVerts[v56][0];
-      if ( v57 == v55 && edgeVerts[v56][1] == v49 )
-        break;
-      if ( v57 == v49 && edgeVerts[v56][1] == v55 )
-        break;
-      if ( ++v56 >= v103 )
-        goto LABEL_63;
-    }
-    if ( v56 < 0 )
-LABEL_63:
-      v58 = 0;
-    else
-      v58 = &v121[56 * v56];
-    *((_DWORD *)v32 + 14) = v58;
-    v59 = 0;
-    if ( v103 <= 0 )
-      goto LABEL_70;
-    while ( 1 )
-    {
-      v60 = edgeVerts[v59][0];
-      if ( v60 == (_WORD)v116 && edgeVerts[v59][1] == v55 )
-        break;
-      if ( v60 == v55 && edgeVerts[v59][1] == (_WORD)v116 )
-        break;
-      if ( ++v59 >= v103 )
-        goto LABEL_70;
-    }
-    if ( v59 < 0 )
-LABEL_70:
-      v61 = 0;
-    else
-      v61 = &v121[56 * v59];
-    v62 = (unsigned __int16 *)v114;
-    v63 = v118;
-    *((_DWORD *)v32 + 15) = v61;
-    v32 += 18;
-    v64 = ++v105 < *v62;
-    v118 = v63 + 3;
-  }
-  while ( v64 );
-  if ( v102 && !v101 )
-    v65 = 1;
-  else
-LABEL_81:
-    v65 = 0;
-  v66 = (float *)points;
-  v67 = v120;
-  *(_BYTE *)(v114 + 2) = v65;
-  v139[2] = 262144.0;
-  v139[1] = 262144.0;
-  *v139 = 262144.0;
-  v68 = 0;
-  v139[5] = -262144.0;
-  v139[4] = -262144.0;
-  v139[3] = -262144.0;
-  if ( (int)points >= 4 )
-  {
-    v116 = 3;
-    v69 = (float *)(contents + 20);
-    do
-    {
-      if ( (*(v69 - 5) < (double)*v139) | __UNORDERED__(*(v69 - 5), *v139) )
-        *v139 = *(v69 - 5);
-      if ( *(v69 - 5) > (double)v139[3] )
-        v139[3] = *(v69 - 5);
-      if ( (*(v69 - 4) < (double)v139[1]) | __UNORDERED__(*(v69 - 4), v139[1]) )
-        v139[1] = *(v69 - 4);
-      if ( *(v69 - 4) > (double)v139[4] )
-        v139[4] = *(v69 - 4);
-      if ( (*(v69 - 3) < (double)v139[2]) | __UNORDERED__(*(v69 - 3), v139[2]) )
-        v139[2] = *(v69 - 3);
-      if ( *(v69 - 3) > (double)v139[5] )
-        v139[5] = *(v69 - 3);
-      v70 = vertMap[v68];
-      if ( v70 >= 0 )
-      {
-        v71 = &v67[16 * v70];
-        *(_DWORD *)v71 = 0;
-        *((float *)v71 + 1) = *(v69 - 5);
-        *((float *)v71 + 2) = *(v69 - 4);
-        *((float *)v71 + 3) = *(v69 - 3);
-      }
-      if ( (*(v69 - 2) < (double)*v139) | __UNORDERED__(*(v69 - 2), *v139) )
-        *v139 = *(v69 - 2);
-      if ( *(v69 - 2) > (double)v139[3] )
-        v139[3] = *(v69 - 2);
-      if ( (*(v69 - 1) < (double)v139[1]) | __UNORDERED__(*(v69 - 1), v139[1]) )
-        v139[1] = *(v69 - 1);
-      if ( *(v69 - 1) > (double)v139[4] )
-        v139[4] = *(v69 - 1);
-      if ( (*v69 < (double)v139[2]) | __UNORDERED__(*v69, v139[2]) )
-        v139[2] = *v69;
-      if ( *v69 > (double)v139[5] )
-        v139[5] = *v69;
-      v72 = vertMap[v68 + 1];
-      if ( v72 >= 0 )
-      {
-        v73 = &v67[16 * v72];
-        *(_DWORD *)v73 = 0;
-        *((float *)v73 + 1) = *(v69 - 2);
-        *((float *)v73 + 2) = *(v69 - 1);
-        *((float *)v73 + 3) = *v69;
-      }
-      if ( (v69[1] < (double)*v139) | __UNORDERED__(v69[1], *v139) )
-        *v139 = v69[1];
-      if ( v69[1] > (double)v139[3] )
-        v139[3] = v69[1];
-      if ( (v69[2] < (double)v139[1]) | __UNORDERED__(v69[2], v139[1]) )
-        v139[1] = v69[2];
-      if ( v69[2] > (double)v139[4] )
-        v139[4] = v69[2];
-      if ( (v69[3] < (double)v139[2]) | __UNORDERED__(v69[3], v139[2]) )
-        v139[2] = v69[3];
-      if ( v69[3] > (double)v139[5] )
-        v139[5] = v69[3];
-      v74 = vertMap[v68 + 2];
-      if ( v74 >= 0 )
-      {
-        v75 = &v67[16 * v74];
-        *(_DWORD *)v75 = 0;
-        *((float *)v75 + 1) = v69[1];
-        *((float *)v75 + 2) = v69[2];
-        *((float *)v75 + 3) = v69[3];
-      }
-      if ( (v69[4] < (double)*v139) | __UNORDERED__(v69[4], *v139) )
-        *v139 = v69[4];
-      if ( v69[4] > (double)v139[3] )
-        v139[3] = v69[4];
-      if ( (v69[5] < (double)v139[1]) | __UNORDERED__(v69[5], v139[1]) )
-        v139[1] = v69[5];
-      if ( v69[5] > (double)v139[4] )
-        v139[4] = v69[5];
-      if ( (v69[6] < (double)v139[2]) | __UNORDERED__(v69[6], v139[2]) )
-        v139[2] = v69[6];
-      if ( v69[6] > (double)v139[5] )
-        v139[5] = v69[6];
-      v76 = vertMap[v68 + 3];
-      if ( v76 >= 0 )
-      {
-        v77 = &v67[16 * v76];
-        *(_DWORD *)v77 = 0;
-        *((float *)v77 + 1) = v69[4];
-        *((float *)v77 + 2) = v69[5];
-        *((float *)v77 + 3) = v69[6];
-      }
-      v66 = (float *)points;
-      v68 += 4;
-      v69 += 12;
-      v116 += 4;
-    }
-    while ( v116 < (int)points );
-  }
-  if ( v68 < (int)v66 )
-  {
-    v78 = (float *)(contents + 12 * v68 + 8);
-    do
-    {
-      if ( (*(v78 - 2) < (double)*v139) | __UNORDERED__(*(v78 - 2), *v139) )
-        *v139 = *(v78 - 2);
-      if ( *(v78 - 2) > (double)v139[3] )
-        v139[3] = *(v78 - 2);
-      if ( (*(v78 - 1) < (double)v139[1]) | __UNORDERED__(*(v78 - 1), v139[1]) )
-        v139[1] = *(v78 - 1);
-      if ( *(v78 - 1) > (double)v139[4] )
-        v139[4] = *(v78 - 1);
-      if ( (*v78 < (double)v139[2]) | __UNORDERED__(*v78, v139[2]) )
-        v139[2] = *v78;
-      if ( *v78 > (double)v139[5] )
-        v139[5] = *v78;
-      v79 = vertMap[v68];
-      if ( v79 >= 0 )
-      {
-        v80 = &v67[16 * v79];
-        *(_DWORD *)v80 = 0;
-        *((float *)v80 + 1) = *(v78 - 2);
-        *((float *)v80 + 2) = *(v78 - 1);
-        *((float *)v80 + 3) = *v78;
-      }
-      ++v68;
-      v78 += 3;
-    }
-    while ( v68 < (int)points );
-  }
-  v81 = 0;
-  v106 = 0;
-  if ( v103 > 0 )
-  {
-    v82 = (float *)(v121 + 24);
-    while ( 1 )
-    {
-      v83 = (__int16)edgeVerts[v81][0];
-      v84 = (__int16)edgeVerts[v81][1];
-      *(v82 - 6) = 0.0;
-      v83 *= 3;
-      v85 = *(_DWORD *)(contents + 4 * v83);
-      v86 = contents + 4 * v83;
-      *((_DWORD *)v82 - 5) = v85;
-      *(v82 - 4) = *(float *)(v86 + 4);
-      *(v82 - 3) = *(float *)(v86 + 8);
-      v87 = (float *)(contents + 12 * v84);
-      v88 = v82 + 4;
-      v82[4] = *v87 - *(float *)v86;
-      v82[5] = v87[1] - *(float *)(v86 + 4);
-      v82[6] = v87[2] - *(float *)(v86 + 8);
-      v89 = v82 - 2;
-      v82[7] = VectorNormalize(v82 + 4);
-      PerpendicularVector(v82 - 2, v82 + 4);
-      v90 = v82[5] * *v82;
-      v91 = v82[6] * *(v82 - 1);
-      v82 += 14;
-      v64 = ++v106 < v103;
-      *(v82 - 13) = v90 - v91;
-      *(v82 - 12) = *(v82 - 8) * *v89 - *(v82 - 14) * *v88;
-      *(v82 - 11) = *(v82 - 15) * *v88 - *(v82 - 9) * *v89;
-      if ( !v64 )
-        break;
-      v81 = v106;
-    }
-  }
-  return (void *)v114;
+	/* ---- Pass 1: build the unique edge list, dropping every interior edge
+	 * whose two triangles are near-coplanar (no cylinder on a flat seam). ---- */
+	numEdges = 0;
+	for ( f = 0; f < numIndexes; f += 3 ) {
+		for ( k = 0; k < 3; k++ ) {
+			short p1  = indexes[f + k];
+			short p2  = indexes[f + ( k + 1 ) % 3];
+			short opp = indexes[f + ( k + 2 ) % 3];
+			int edge;
+
+			if ( p1 == p2 ) {
+				Com_Error( ERR_DROP, "\x15" "CM_GenerateTerrainCollide: degenerate triangle, corrupt bsp?" );
+			}
+
+			/* ( p2, p1 ): FindEdge is symmetric; this order gives retail's
+			 * p1@si / p2@bx (0x004200C8). */
+			edge = FindEdge( ( short ( * )[2] ) edgeVerts, numEdges, p2, p1 );
+			if ( edge < 0 ) {
+				if ( (unsigned int)numEdges >= 0x10000 ) {
+					Com_Error( ERR_DROP, "\x15" "CM_GenerateTerrainCollide: too many edges" );
+				}
+				edgeVerts[numEdges][0] = p1;
+				edgeVerts[numEdges][1] = p2;
+				vertMap[numEdges] = opp;
+				numEdges++;
+			} else {
+				vec3_t dP1, dP2, dOther, n, eOther1, eOther2;
+				float side, lenSq1, lenSq2, maxLenSq;
+
+				VectorSubtract( points[p1], points[opp], dP1 );
+				VectorSubtract( points[p2], points[opp], dP2 );
+				VectorSubtract( points[vertMap[edge]], points[opp], dOther );
+				CrossProduct( dP2, dP1, n );
+
+				/* Retail sums every dot product here as (z+y)+x
+				 * (0x00420266, 0x004202C0, 0x00420305, 0x00420362). */
+				side = ( n[2] * dOther[2] + n[1] * dOther[1] ) + n[0] * dOther[0];
+				if ( side > 0.0f ) {
+					VectorSubtract( points[vertMap[edge]], points[p1], eOther1 );
+					lenSq1 = ( eOther1[2] * eOther1[2] + eOther1[1] * eOther1[1] )
+							 + eOther1[0] * eOther1[0];
+					VectorSubtract( points[vertMap[edge]], points[p2], eOther2 );
+					lenSq2 = ( eOther2[2] * eOther2[2] + eOther2[1] * eOther2[1] )
+							 + eOther2[0] * eOther2[0];
+					/* Retail `test ah,41h` + `jnz` (0x00420344): only an
+					 * ordered lenSq1 > lenSq2 keeps lenSq1. */
+					maxLenSq = ( lenSq1 > lenSq2 ) ? lenSq1 : lenSq2;
+
+					/* n.n is left unrounded and compared (fcompp, 0x0042037E)
+					 * with maxLenSq times the FLOAT flt_5690F8 (0x31DBE6FF,
+					 * 6.4000000854491645e-09); float*float is exact at _PC_53. */
+					if ( maxLenSq * 0.0000000064000001f
+						 > ( n[2] * n[2] + n[1] * n[1] ) + n[0] * n[0] ) {
+						/* swap-remove the interior edge */
+						edgeVerts[edge][0] = edgeVerts[numEdges - 1][0];
+						edgeVerts[edge][1] = edgeVerts[numEdges - 1][1];
+						vertMap[edge] = vertMap[--numEdges];
+					}
+				}
+			}
+		}
+	}
+
+	/* ---- vertMap now becomes a vertex -> sphere-index map: every vertex that
+	 * survives as an edge endpoint is assigned one sphere. ---- */
+	memset( vertMap, 0xFF, sizeof( vertMap ) );
+	numSpheres = 0;
+	for ( i = 0; i < numEdges; i++ ) {
+		short *sp;
+
+		sp = &vertMap[edgeVerts[i][0]];
+		if ( *sp < 0 ) {
+			*sp = numSpheres++;
+		}
+		sp = &vertMap[edgeVerts[i][1]];
+		if ( *sp < 0 ) {
+			*sp = numSpheres++;
+		}
+	}
+
+	/* ---- Allocate the collide and its two side arrays. ---- */
+	tc = Hunk_AllocAlignInternal( 72 * numFacets + 4, 32 );
+	vertSpheres = Hunk_AllocAlignInternal( 16 * numSpheres, 32 );
+	edgeCylinders = Hunk_AllocAlignInternal( 56 * numEdges, 32 );
+
+	hasUpFacing = 0;
+	hasDownFacing = 0;
+	tc->facetCount = ( unsigned short ) numFacets;
+	facets = CM_TC_FACETS_W( tc );
+
+	/* ---- Pass 2: one facet per triangle.  Retail bounds this loop by the
+	 * stored 16-bit facetCount (`test si,si` at 0x00420498, `movzx edx,word
+	 * ptr [ecx]` at 0x00420860), not by the int numFacets. ---- */
+	for ( f = 0; f < tc->facetCount; f++ ) {
+		const short *tri = &indexes[3 * f];
+		terrainFacet_t *facet = &facets[f];
+		short i0 = tri[0];
+		short i1 = tri[1];
+		short i2 = tri[2];
+		const float *b = points[i1];
+		const float *a = points[i0];
+		const float *c = points[i2];
+		vec3_t edge1, edge2;
+		float len1, len2, cosAngle, scale, negCos, inv1, inv2;
+		short s0, s1, s2;
+		int e0, e1, e2;
+
+		/* Surface plane -- ( a, b, c ) MUST be ( i0, i1, i2 ) in this order. */
+		PlaneFromPoints( ( float * ) &facet->surfacePlane, a, b, c );
+		if ( facet->surfacePlane.normal[2] < -0.001f ) {
+			hasDownFacing = 1;
+		} else if ( facet->surfacePlane.normal[2] > 0.001f ) {
+			hasUpFacing = 1;
+		}
+
+		/* Two edge planes for the barycentric inside test.  edge1 = b - a and
+		 * edge2 = c - a, each normalised, then de-skewed by the cosine of the
+		 * angle between them. */
+		VectorSubtract( b, a, edge1 );
+		len1 = VectorNormalize( edge1 );
+		VectorSubtract( c, a, edge2 );
+		len2 = VectorNormalize( edge2 );
+		/* Retail sums cosAngle as (z+y)+x (0x00420592) and each edge-plane
+		 * dist as (y+z)+x over the stored float normal (0x00420678,
+		 * 0x00420706). */
+		cosAngle = ( edge2[2] * edge1[2] + edge2[1] * edge1[1] )
+				   + edge2[0] * edge1[0];
+		scale = 1.0f / ( 1.0f - cosAngle * cosAngle );
+		VectorScale( edge1, scale, edge1 );
+		VectorScale( edge2, scale, edge2 );
+		negCos = -cosAngle;
+
+		inv1 = 1.0f / len1;
+		facet->edgePlanes[0].normal[0] = ( negCos * edge2[0] + edge1[0] ) * inv1;
+		facet->edgePlanes[0].normal[1] = ( negCos * edge2[1] + edge1[1] ) * inv1;
+		facet->edgePlanes[0].normal[2] = ( negCos * edge2[2] + edge1[2] ) * inv1;
+		facet->edgePlanes[0].dist =
+			( facet->edgePlanes[0].normal[1] * a[1]
+			  + facet->edgePlanes[0].normal[2] * a[2] )
+			+ facet->edgePlanes[0].normal[0] * a[0];
+
+		inv2 = 1.0f / len2;
+		facet->edgePlanes[1].normal[0] = ( negCos * edge1[0] + edge2[0] ) * inv2;
+		facet->edgePlanes[1].normal[1] = ( negCos * edge1[1] + edge2[1] ) * inv2;
+		facet->edgePlanes[1].normal[2] = ( negCos * edge1[2] + edge2[2] ) * inv2;
+		facet->edgePlanes[1].dist =
+			( facet->edgePlanes[1].normal[1] * a[1]
+			  + facet->edgePlanes[1].normal[2] * a[2] )
+			+ facet->edgePlanes[1].normal[0] * a[0];
+
+		/* Vertex spheres for i0, i1, i2. */
+		s0 = ( short ) vertMap[i0];
+		facet->vertexSpheres[0] = ( s0 >= 0 ) ? &vertSpheres[s0] : NULL;
+		s1 = ( short ) vertMap[i1];
+		facet->vertexSpheres[1] = ( s1 >= 0 ) ? &vertSpheres[s1] : NULL;
+		s2 = ( short ) vertMap[i2];
+		facet->vertexSpheres[2] = ( s2 >= 0 ) ? &vertSpheres[s2] : NULL;
+
+		/* Edge cylinders, each keyed on the edge opposite the like-numbered
+		 * vertex: [0] = edge i1-i2, [1] = edge i0-i2, [2] = edge i0-i1
+		 * (FindEdge is symmetric; [1] passes ( i2, i0 ) as retail does). */
+		e0 = FindEdge( ( short ( * )[2] ) edgeVerts, numEdges, i1, i2 );
+		facet->edgeCylinders[0] = ( e0 >= 0 ) ? &edgeCylinders[e0] : NULL;
+		e1 = FindEdge( ( short ( * )[2] ) edgeVerts, numEdges, i2, i0 );
+		facet->edgeCylinders[1] = ( e1 >= 0 ) ? &edgeCylinders[e1] : NULL;
+		e2 = FindEdge( ( short ( * )[2] ) edgeVerts, numEdges, i0, i1 );
+		facet->edgeCylinders[2] = ( e2 >= 0 ) ? &edgeCylinders[e2] : NULL;
+	}
+
+	tc->capsuleOffsetSign = ( hasDownFacing && !hasUpFacing ) ? 1 : 0;
+
+	/* ---- Fold every vertex into the patch bounds and seed its sphere. ---- */
+	bounds[0][0] = bounds[0][1] = bounds[0][2] = 262144.0f;
+	bounds[1][0] = bounds[1][1] = bounds[1][2] = -262144.0f;
+	for ( j = 0; j < numVerts; j++ ) {
+		const float *p = points[j];
+		short s;
+
+		if ( p[0] < bounds[0][0] ) { bounds[0][0] = p[0]; }
+		if ( p[0] > bounds[1][0] ) { bounds[1][0] = p[0]; }
+		if ( p[1] < bounds[0][1] ) { bounds[0][1] = p[1]; }
+		if ( p[1] > bounds[1][1] ) { bounds[1][1] = p[1]; }
+		if ( p[2] < bounds[0][2] ) { bounds[0][2] = p[2]; }
+		if ( p[2] > bounds[1][2] ) { bounds[1][2] = p[2]; }
+
+		s = ( short ) vertMap[j];
+		if ( s >= 0 ) {
+			vertSpheres[s].checkcount = 0;
+			VectorCopy( p, vertSpheres[s].origin );
+		}
+	}
+
+	/* ---- Build each surviving edge's cylinder. ---- */
+	for ( f = 0; f < numEdges; f++ ) {
+		terrainEdgeCylinder_t *cyl = &edgeCylinders[f];
+		int ea = edgeVerts[f][0];
+		int eb = edgeVerts[f][1];
+
+		cyl->checkcount = 0;
+		VectorCopy( points[ea], cyl->origin );
+		VectorSubtract( points[eb], points[ea], cyl->axis );
+		cyl->length = VectorNormalize( cyl->axis );
+		PerpendicularVector( cyl->radialAxes[0], cyl->axis );
+		CrossProduct( cyl->axis, cyl->radialAxes[0], cyl->radialAxes[1] );
+	}
+
+	return tc;
 }
 
 /* ---- CM_TracePointThroughTerrainCollide  0x00420D50 ---- VERIFIED */
-void __cdecl CM_TracePointThroughTerrainCollide(traceWork_t *twOpaque, void *tc)
+void __cdecl CM_TracePointThroughTerrainCollide(traceWork_t *tw, void *tcVoid)
 {
-	cmTerrainTrace_t *tw = CM_TW( twOpaque );
-	const terrainFacet_t *facets = CM_TC_FACETS( tc );
-	int numFacets = ( int ) CM_TC( tc )->facetCount;
+	const terrainCollide_t *tc = CM_TC( tcVoid );
+	const terrainFacet_t *facet;
 	int i;
+	float d1, d2, frac, e0;
+	/* The rfloat locals are values retail keeps on the x87 stack at
+	 * _PC_53; each float twin is the copy retail stores with fst.  The
+	 * ( rfloat ) casts keep the modern build at that precision too. */
+	rfloat d1u, d2u, fracU, hitFrac, e0u, e1;
+#ifndef COD1_VC7
+	rfloat hitZ;
+#endif
+	vec3_t hit;
 
-	for ( i = 0; i < numFacets; i++ ) {
-		const terrainFacet_t *facet = &facets[i];
-		const terrainPlane_t *surf = &facet->surfacePlane;
-		float d1, d2, enterFrac, hitFrac, e0, e1;
-		vec3_t hit;
+	/* Retail re-reads the 16-bit facetCount every iteration (0x00420EAA). */
+	for ( i = 0; i < tc->facetCount; i++ ) {
+		facet = &CM_TC_FACETS( tc )[i];
 
-		d2 = ( tw->end[0] * surf->normal[0] + tw->end[1] * surf->normal[1] )
-			 + tw->end[2] * surf->normal[2] - surf->dist;
-		if ( d2 >= 0.0f ) {
+		/* d2 sums z+(y+x) and d1 (z+y)+x; each test reads the unrounded
+		 * value (0x00420D62-0x00420DAA). */
+		d2u = ( rfloat ) tw->end[2] * facet->surfacePlane.normal[2]
+			  + ( ( rfloat ) tw->end[1] * facet->surfacePlane.normal[1]
+				  + ( rfloat ) tw->end[0] * facet->surfacePlane.normal[0] )
+			  - facet->surfacePlane.dist;
+		d2 = d2u;
+		if ( d2u >= 0.0f ) {
 			continue;
 		}
 
-		d1 = ( tw->start[0] * surf->normal[0] + tw->start[1] * surf->normal[1] )
-			 + tw->start[2] * surf->normal[2] - surf->dist;
-		if ( 0.0f >= d1 ) {
+		d1u = ( ( rfloat ) tw->start[2] * facet->surfacePlane.normal[2]
+				+ ( rfloat ) tw->start[1] * facet->surfacePlane.normal[1] )
+			  + ( rfloat ) tw->start[0] * facet->surfacePlane.normal[0]
+			  - facet->surfacePlane.dist;
+		d1 = d1u;
+		if ( d1u <= 0.0f ) {
 			continue;
 		}
 
-		enterFrac = ( d1 - TERRAIN_CLIP_EPSILON ) / ( d1 - d2 );
-		if ( enterFrac >= tw->trace.fraction ) {
+		/* d1 - d2 from the stored floats; the enter quotient is compared
+		 * with trace.fraction before it is rounded (0x00420DCF). */
+		fracU = ( ( rfloat ) d1 - TERRAIN_CLIP_EPSILON ) / ( ( rfloat ) d1 - d2 );
+		frac = fracU;
+		if ( fracU >= tw->trace.fraction ) {
 			continue;
 		}
 
-		hitFrac = d1 / ( d1 - d2 );
-		hit[0] = tw->start[0] + tw->delta[0] * hitFrac;
-		hit[1] = tw->start[1] + tw->delta[1] * hitFrac;
-		hit[2] = tw->start[2] + tw->delta[2] * hitFrac;
-
-		e0 = ( hit[0] * facet->edgePlanes[0].normal[0]
-			   + hit[1] * facet->edgePlanes[0].normal[1] )
-			 + hit[2] * facet->edgePlanes[0].normal[2]
-			 - facet->edgePlanes[0].dist;
-		if ( TERRAIN_BARY_MIN > e0 || e0 > TERRAIN_BARY_MAX ) {
+		/* hitFrac is never rounded; hit.x/y/z are stored, and e0 = (z+y)+x
+		 * reads the UNROUNDED hit.z (0x00420DE4-0x00420E21). */
+		hitFrac = ( rfloat ) d1 / ( ( rfloat ) d1 - d2 );
+		hit[0] = tw->start[0] + ( rfloat ) tw->delta[0] * hitFrac;
+		hit[1] = tw->start[1] + ( rfloat ) tw->delta[1] * hitFrac;
+#ifdef COD1_VC7
+		hit[2] = tw->start[2] + ( rfloat ) tw->delta[2] * hitFrac;
+		e0u = ( ( rfloat ) hit[2] * facet->edgePlanes[0].normal[2]
+				+ ( rfloat ) hit[1] * facet->edgePlanes[0].normal[1] )
+			  + ( rfloat ) hit[0] * facet->edgePlanes[0].normal[0]
+			  - facet->edgePlanes[0].dist;
+#else
+		hitZ = tw->start[2] + ( rfloat ) tw->delta[2] * hitFrac;
+		hit[2] = hitZ;
+		e0u = ( hitZ * facet->edgePlanes[0].normal[2]
+				+ ( rfloat ) hit[1] * facet->edgePlanes[0].normal[1] )
+			  + ( rfloat ) hit[0] * facet->edgePlanes[0].normal[0]
+			  - facet->edgePlanes[0].dist;
+#endif
+		/* The low-bound test reads the unrounded e0, the high-bound test
+		 * the stored float. */
+		e0 = e0u;
+		if ( e0u < TERRAIN_BARY_MIN ) {
+			continue;
+		}
+		if ( e0 > TERRAIN_BARY_MAX ) {
 			continue;
 		}
 
-		e1 = ( hit[0] * facet->edgePlanes[1].normal[0]
-			   + hit[1] * facet->edgePlanes[1].normal[1] )
-			 + hit[2] * facet->edgePlanes[1].normal[2]
+		/* e1 = (z+y)+x with the stored float hit.z, never rounded. */
+		e1 = ( ( rfloat ) hit[2] * facet->edgePlanes[1].normal[2]
+			   + ( rfloat ) hit[1] * facet->edgePlanes[1].normal[1] )
+			 + ( rfloat ) hit[0] * facet->edgePlanes[1].normal[0]
 			 - facet->edgePlanes[1].dist;
-		if ( TERRAIN_BARY_MIN > e1 || e0 + e1 > TERRAIN_BARY_MAX ) {
+		if ( e1 < TERRAIN_BARY_MIN ) {
+			continue;
+		}
+		if ( e0 + e1 > TERRAIN_BARY_MAX ) {
 			continue;
 		}
 
-		tw->trace.fraction = enterFrac;
-		VectorCopy( surf->normal, tw->trace.normal );
+		tw->trace.fraction = frac;
+		VectorCopy( facet->surfacePlane.normal, tw->trace.normal );
 	}
 }
 
 /* ---- CM_TraceSphereThroughTerrainCollide  0x00420EC0 ---- */
-void __cdecl CM_TraceSphereThroughTerrainCollide( traceWork_t *twOpaque,
-												 void *tcVoid )
+/*
+ * Two bodies.  The COD1_VC7 one is retail's source shape: VC7 compiles it to
+ * retail's exact bytes, keeping on the x87 stack (at _PC_53) every value the
+ * other body models as a double.  The modern body spells out that precision
+ * (which values retail rounds, and each sum's order) for a compiler that
+ * rounds at every float assignment.
+ */
+void __cdecl CM_TraceSphereThroughTerrainCollide( traceWork_t *tw,
+												 const terrainCollide_t *tc )
 {
-	cmTerrainTrace_t *tw = CM_TW( twOpaque );
-	const terrainCollide_t *tc = CM_TC( tcVoid );
-	terrainFacet_t *facets = CM_TC_FACETS_W( tcVoid );
-	int numFacets = ( int ) tc->facetCount;
-	float capOffset = tw->sphere.halfheight - tw->sphere.radius;
-	float capDelta, radius, negRadius;
-	int i;
+#ifdef COD1_VC7
+	terrainEdgeCylinder_t *cyl;
+	terrainVertexSphere_t *vert;
+	int i, e;
+	unsigned int outside;
+	/* t is one shared temporary: capDist on the deep path, the cylinder
+	 * fraction below (a separate local permutes VC7's operand order). */
+	rfloat capOffset, t, off, e1, hitFrac, disc, frac, inv, axialAt, vlenSq;
+	float capDelta, radius, negRadius, d1, d2, delta, invNz, baseE0, baseE1, e0;
+	float radiusDelta, vdot;
+	vec3_t hit, d, local, n;
 
+	capOffset = tw->sphere.halfheight - tw->sphere.radius;
 	if ( tc->capsuleOffsetSign ) {
 		capDelta = capOffset * -2.0f;
 		tw->start[2] += capOffset;
@@ -810,34 +481,261 @@ void __cdecl CM_TraceSphereThroughTerrainCollide( traceWork_t *twOpaque,
 	radius = tw->sphere.radius + TERRAIN_CLIP_EPSILON;
 	negRadius = -radius;
 
-	for ( i = 0; i < numFacets; i++ ) {
-		terrainFacet_t *facet = &facets[i];
-		const terrainPlane_t *surf = &facet->surfacePlane;
-		float d1, d2, delta;
-
-		d2 = ( tw->end[0] * surf->normal[0] + tw->end[1] * surf->normal[1] )
-			 + tw->end[2] * surf->normal[2] - surf->dist;
+	for ( i = 0; i < tc->facetCount; i++ ) {
+		d2 = ( tw->end[2] * CM_TC_FACETS( tc )[i].surfacePlane.normal[2]
+			   + tw->end[1] * CM_TC_FACETS( tc )[i].surfacePlane.normal[1] )
+			 + tw->end[0] * CM_TC_FACETS( tc )[i].surfacePlane.normal[0]
+			 - CM_TC_FACETS( tc )[i].surfacePlane.dist;
 		if ( d2 >= radius ) {
 			continue;
 		}
-
-		d1 = ( tw->start[0] * surf->normal[0] + tw->start[1] * surf->normal[1] )
-			 + tw->start[2] * surf->normal[2] - surf->dist;
+		d1 = ( CM_TC_FACETS( tc )[i].surfacePlane.normal[2] * tw->start[2]
+			   + CM_TC_FACETS( tc )[i].surfacePlane.normal[1] * tw->start[1] )
+			 + CM_TC_FACETS( tc )[i].surfacePlane.normal[0] * tw->start[0]
+			 - CM_TC_FACETS( tc )[i].surfacePlane.dist;
 		delta = d1 - d2;
+		if ( delta <= 0.0f ) {
+			continue;
+		}
+
+		if ( d1 <= negRadius ) {
+			t = capDelta * CM_TC_FACETS( tc )[i].surfacePlane.normal[2] + d1;
+			if ( t <= negRadius ) {
+				continue;
+			}
+			invNz = 1.0f / CM_TC_FACETS( tc )[i].surfacePlane.normal[2];
+			off = ( negRadius - d1 ) * invNz;
+			baseE0 = DotProduct( tw->start, CM_TC_FACETS( tc )[i].edgePlanes[0].normal )
+					 - CM_TC_FACETS( tc )[i].edgePlanes[0].dist;
+			baseE1 = DotProduct( tw->start, CM_TC_FACETS( tc )[i].edgePlanes[1].normal )
+					 - CM_TC_FACETS( tc )[i].edgePlanes[1].dist;
+			e0 = off * CM_TC_FACETS( tc )[i].edgePlanes[0].normal[2] + baseE0;
+			if ( e0 >= 0.0f ) {
+				e1 = off * CM_TC_FACETS( tc )[i].edgePlanes[1].normal[2] + baseE1;
+				if ( e1 >= 0.0f && e0 + e1 <= 1.0f ) {
+					VectorCopy( CM_TC_FACETS( tc )[i].surfacePlane.normal, tw->trace.normal );
+					tw->trace.fraction = 0.0f;
+					tw->trace.startsolid = 1;
+					return;
+				}
+			}
+			if ( t < radius ) {
+				off = capDelta;
+			} else {
+				off = ( radius - d1 ) * invNz;
+			}
+			e0 = off * CM_TC_FACETS( tc )[i].edgePlanes[0].normal[2] + baseE0;
+			if ( e0 < 0.0f ) {
+				continue;
+			}
+			e1 = off * CM_TC_FACETS( tc )[i].edgePlanes[1].normal[2] + baseE1;
+			if ( e1 < 0.0f ) {
+				continue;
+			}
+			if ( e0 + e1 > 1.0f ) {
+				continue;
+			}
+			VectorCopy( CM_TC_FACETS( tc )[i].surfacePlane.normal, tw->trace.normal );
+			tw->trace.fraction = 0.0f;
+			tw->trace.startsolid = 1;
+			return;
+		}
+
+		if ( d1 < radius ) {
+			hitFrac = 0.0f;
+			VectorCopy( tw->start, hit );
+		} else {
+			hitFrac = ( d1 - radius ) / delta;
+			if ( hitFrac > tw->trace.fraction ) {
+				continue;
+			}
+			VectorMA( tw->start, hitFrac, tw->delta, hit );
+		}
+		e0 = DotProduct( hit, CM_TC_FACETS( tc )[i].edgePlanes[0].normal )
+			 - CM_TC_FACETS( tc )[i].edgePlanes[0].dist;
+		e1 = DotProduct( hit, CM_TC_FACETS( tc )[i].edgePlanes[1].normal )
+			 - CM_TC_FACETS( tc )[i].edgePlanes[1].dist;
+		outside = ( e0 + e1 > 1.0f );
+		outside |= ( e0 < 0.0f ) << 1;
+		outside |= ( e1 < 0.0f ) << 2;
+		if ( !outside ) {
+			VectorCopy( CM_TC_FACETS( tc )[i].surfacePlane.normal, tw->trace.normal );
+			if ( hitFrac <= TERRAIN_HIT_EPSILON ) {
+				tw->trace.fraction = 0.0f;
+				tw->trace.startsolid = 1;
+				return;
+			}
+			tw->trace.fraction = hitFrac - TERRAIN_HIT_EPSILON;
+			continue;
+		}
+
+		for ( e = 0; e < 3; e++ ) {
+			if ( outside & ( 1 << e ) ) {
+				cyl = CM_TC_FACETS( tc )[i].edgeCylinders[e];
+				if ( !cyl ) {
+					continue;
+				}
+				if ( cyl->checkcount == CM_CHECKCOUNT ) {
+					continue;
+				}
+				cyl->checkcount = CM_CHECKCOUNT;
+				VectorSubtract( tw->start, cyl->origin, d );
+				local[0] = DotProduct( d, cyl->radialAxes[0] );
+				local[1] = DotProduct( d, cyl->radialAxes[1] );
+				local[2] = DotProduct( d, cyl->axis );
+				radiusDelta = local[0] * local[0] + local[1] * local[1] - radius * radius;
+				if ( radiusDelta <= 0.0f ) {
+					if ( local[2] < 0.0f ) {
+						continue;
+					}
+					if ( local[2] > cyl->length ) {
+						continue;
+					}
+					VectorCopy( CM_TC_FACETS( tc )[i].surfacePlane.normal, tw->trace.normal );
+					tw->trace.fraction = 0.0f;
+					tw->trace.startsolid = 1;
+					return;
+				}
+				/* d[0..1] now hold the velocity in the cylinder frame. */
+				d[0] = DotProduct( tw->delta, cyl->radialAxes[0] );
+				d[1] = DotProduct( tw->delta, cyl->radialAxes[1] );
+				vdot = d[0] * local[0] + d[1] * local[1];
+				if ( vdot >= 0.0f ) {
+					continue;
+				}
+				vlenSq = d[0] * d[0] + d[1] * d[1];
+				disc = vdot * vdot - vlenSq * radiusDelta;
+				if ( disc <= 0.0f ) {
+					continue;
+				}
+				t = ( -sqrt( disc ) - vdot ) / vlenSq;
+				if ( t < tw->trace.fraction ) {
+					axialAt = DotProduct( cyl->axis, tw->delta ) * t + local[2];
+					if ( axialAt < 0.0f ) {
+						continue;
+					}
+					if ( axialAt > cyl->length ) {
+						continue;
+					}
+					inv = 1.0f / radius;
+					n[0] = ( d[0] * t + local[0] ) * inv;
+					n[1] = ( d[1] * t + local[1] ) * inv;
+					VectorScale( cyl->radialAxes[0], n[0], tw->trace.normal );
+					VectorMA( tw->trace.normal, n[1], cyl->radialAxes[1], tw->trace.normal );
+					if ( tw->trace.fraction <= TERRAIN_HIT_EPSILON ) {
+						tw->trace.fraction = 0.0f;
+						tw->trace.startsolid = 1;
+						return;
+					}
+					tw->trace.fraction = t - TERRAIN_HIT_EPSILON;
+				}
+			} else {
+				vert = CM_TC_FACETS( tc )[i].vertexSpheres[e];
+				if ( !vert ) {
+					continue;
+				}
+				if ( vert->checkcount == CM_CHECKCOUNT ) {
+					continue;
+				}
+				vert->checkcount = CM_CHECKCOUNT;
+				VectorSubtract( tw->start, vert->origin, d );
+				radiusDelta = DotProduct( d, d ) - radius * radius;
+				if ( radiusDelta <= 0.0f ) {
+					VectorCopy( CM_TC_FACETS( tc )[i].surfacePlane.normal, tw->trace.normal );
+					tw->trace.fraction = 0.0f;
+					tw->trace.startsolid = 1;
+					return;
+				}
+				vdot = DotProduct( tw->delta, d );
+				if ( vdot >= 0.0f ) {
+					continue;
+				}
+				vlenSq = tw->deltaLengthSquared;
+				disc = vdot * vdot - vlenSq * radiusDelta;
+				if ( disc < 0.0f ) {
+					continue;
+				}
+				frac = ( -sqrt( disc ) - vdot ) / vlenSq;
+				if ( frac < tw->trace.fraction ) {
+					inv = 1.0f / radius;
+					tw->trace.normal[0] = ( frac * tw->delta[0] + d[0] ) * inv;
+					tw->trace.normal[1] = ( frac * tw->delta[1] + d[1] ) * inv;
+					tw->trace.normal[2] = ( frac * tw->delta[2] + d[2] ) * inv;
+					if ( tw->trace.fraction <= TERRAIN_HIT_EPSILON ) {
+						tw->trace.fraction = 0.0f;
+						tw->trace.startsolid = 1;
+						return;
+					}
+					tw->trace.fraction = frac - TERRAIN_HIT_EPSILON;
+				}
+			}
+		}
+	}
+#else
+	const terrainFacet_t *facets = CM_TC_FACETS( tc );
+	int numFacets = ( int ) tc->facetCount;
+	/* Every double local in this walker is a value retail keeps on the x87
+	 * stack at _PC_53 and never rounds to float.  capOffset is one: it is
+	 * never stored, and start/end[2] are shifted by the unrounded value
+	 * (0x00420EC0-0x00420F10). */
+	double capOffset = ( double ) tw->sphere.halfheight - tw->sphere.radius;
+	float capDelta, radius, negRadius;
+	int i;
+
+	if ( tc->capsuleOffsetSign ) {
+		capDelta = ( float ) ( capOffset * -2.0 );
+		tw->start[2] = ( float ) ( capOffset + tw->start[2] );
+		tw->end[2] = ( float ) ( capOffset + tw->end[2] );
+	} else {
+		capDelta = ( float ) ( capOffset + capOffset );
+		tw->start[2] = ( float ) ( tw->start[2] - capOffset );
+		tw->end[2] = ( float ) ( tw->end[2] - capOffset );
+	}
+
+	radius = tw->sphere.radius + TERRAIN_CLIP_EPSILON;
+	negRadius = -radius;
+
+	for ( i = 0; i < numFacets; i++ ) {
+		const terrainFacet_t *facet = &facets[i];
+		const terrainPlane_t *surf = &facet->surfacePlane;
+		double d1u, d2u;
+		float d1, delta;
+
+		/* d2 and d1 sum (z+y)+x.  d2 is tested against the radius
+		 * unrounded and never stored; delta is the unrounded d1 - d2,
+		 * rounded once (0x00420F50-0x00420F96). */
+		d2u = ( ( double ) tw->end[2] * surf->normal[2]
+				+ ( double ) tw->end[1] * surf->normal[1] )
+			  + ( double ) tw->end[0] * surf->normal[0] - surf->dist;
+		if ( d2u >= radius ) {
+			continue;
+		}
+
+		d1u = ( ( double ) tw->start[2] * surf->normal[2]
+				+ ( double ) tw->start[1] * surf->normal[1] )
+			  + ( double ) tw->start[0] * surf->normal[0] - surf->dist;
+		d1 = ( float ) d1u;
+		delta = ( float ) ( d1u - d2u );
 		if ( 0.0f >= delta ) {
 			continue;
 		}
 
-		if ( !( d1 > negRadius ) ) {
-			float capDist = capDelta * surf->normal[2] + d1;
-			float invNz, off, baseE0, baseE1, e0, e1;
+		/* Retail `test ah,41h` + `jp` (0x00420FBE): a NaN d1 takes the
+		 * above-plane branch. */
+		if ( d1 <= negRadius ) {
+			double capDist, off, e0u, e1u;
+			float invNz, baseE0, baseE1, e0;
 
-			if ( !( capDist > negRadius ) ) {
+			/* capDist, off and e1 stay on the stack; e0 is stored with fst
+			 * and its float is what e0 + e1 adds (0x00420FC4-0x0042106E).
+			 * The capDist test is retail's jnp on ordered less-or-equal. */
+			capDist = ( double ) capDelta * surf->normal[2] + d1;
+			if ( capDist <= negRadius ) {
 				continue;
 			}
 
 			invNz = 1.0f / surf->normal[2];
-			off = ( negRadius - d1 ) * invNz;
+			off = ( ( double ) negRadius - d1 ) * invNz;
 
 			baseE0 = ( tw->start[0] * facet->edgePlanes[0].normal[0]
 					   + tw->start[1] * facet->edgePlanes[0].normal[1] )
@@ -848,10 +746,11 @@ void __cdecl CM_TraceSphereThroughTerrainCollide( traceWork_t *twOpaque,
 					 + tw->start[2] * facet->edgePlanes[1].normal[2]
 					 - facet->edgePlanes[1].dist;
 
-			e0 = off * facet->edgePlanes[0].normal[2] + baseE0;
-			if ( e0 >= 0.0f ) {
-				e1 = off * facet->edgePlanes[1].normal[2] + baseE1;
-				if ( e1 >= 0.0f && e0 + e1 <= 1.0f ) {
+			e0u = off * facet->edgePlanes[0].normal[2] + baseE0;
+			e0 = ( float ) e0u;
+			if ( e0u >= 0.0 ) {
+				e1u = off * facet->edgePlanes[1].normal[2] + baseE1;
+				if ( e1u >= 0.0 && e0 + e1u <= 1.0 ) {
 					goto startSolid;
 				}
 			}
@@ -859,13 +758,16 @@ void __cdecl CM_TraceSphereThroughTerrainCollide( traceWork_t *twOpaque,
 			if ( capDist < radius ) {
 				off = capDelta;
 			} else {
-				off = ( radius - d1 ) * invNz;
+				off = ( ( double ) radius - d1 ) * invNz;
 			}
 
-			e0 = off * facet->edgePlanes[0].normal[2] + baseE0;
-			if ( !( e0 < 0.0f ) ) {
-				e1 = off * facet->edgePlanes[1].normal[2] + baseE1;
-				if ( !( e1 < 0.0f ) && e0 + e1 <= 1.0f ) {
+			/* Second pass: the final test is `!(>)`, so a NaN sum takes
+			 * retail's jz fall-through into startSolid (0x0042110E). */
+			e0u = off * facet->edgePlanes[0].normal[2] + baseE0;
+			e0 = ( float ) e0u;
+			if ( !( e0u < 0.0 ) ) {
+				e1u = off * facet->edgePlanes[1].normal[2] + baseE1;
+				if ( !( e1u < 0.0 ) && !( e0 + e1u > 1.0 ) ) {
 					goto startSolid;
 				}
 			}
@@ -877,59 +779,69 @@ startSolid:
 			tw->trace.startsolid = 1;
 			return;
 		} else {
-			float hitFrac, e0, e1;
-			vec3_t hit;
+			double hitFrac, e1u;
+			double hit[3];
+			float e0;
 			unsigned int outside;
 			int e;
 
-			if ( !( d1 >= radius ) ) {
-				hitFrac = 0.0f;
-				VectorCopy( tw->start, hit );
+			/* hitFrac and hit[0..2] stay on the stack (0x0042115E-0x004211A2).
+			 * `d1 < radius` is retail's `test ah,5` + `jp`, so a NaN d1 takes
+			 * the computed-hitFrac path. */
+			if ( d1 < radius ) {
+				hitFrac = 0.0;
+				hit[0] = tw->start[0];
+				hit[1] = tw->start[1];
+				hit[2] = tw->start[2];
 			} else {
-				hitFrac = ( d1 - radius ) / delta;
+				hitFrac = ( ( double ) d1 - radius ) / delta;
 				if ( hitFrac > tw->trace.fraction ) {
 					continue;
 				}
-				hit[0] = tw->start[0] + tw->delta[0] * hitFrac;
-				hit[1] = tw->start[1] + tw->delta[1] * hitFrac;
-				hit[2] = tw->start[2] + tw->delta[2] * hitFrac;
+				hit[0] = hitFrac * tw->delta[0] + tw->start[0];
+				hit[1] = hitFrac * tw->delta[1] + tw->start[1];
+				hit[2] = hitFrac * tw->delta[2] + tw->start[2];
 			}
 
-			e0 = ( hit[0] * facet->edgePlanes[0].normal[0]
-				   + hit[1] * facet->edgePlanes[0].normal[1] )
-				 + hit[2] * facet->edgePlanes[0].normal[2]
-				 - facet->edgePlanes[0].dist;
-			e1 = ( hit[0] * facet->edgePlanes[1].normal[0]
-				   + hit[1] * facet->edgePlanes[1].normal[1] )
-				 + hit[2] * facet->edgePlanes[1].normal[2]
-				 - facet->edgePlanes[1].dist;
+			/* e0 = ((x+y)+z) - d, stored as float; e1 = ((z+y)+x) - d, never
+			 * rounded (0x004211A2-0x004211CC). */
+			e0 = ( float ) ( ( ( hit[0] * facet->edgePlanes[0].normal[0]
+								 + hit[1] * facet->edgePlanes[0].normal[1] )
+							   + hit[2] * facet->edgePlanes[0].normal[2] )
+							 - facet->edgePlanes[0].dist );
+			e1u = ( ( hit[2] * facet->edgePlanes[1].normal[2]
+					  + hit[1] * facet->edgePlanes[1].normal[1] )
+					+ hit[0] * facet->edgePlanes[1].normal[0] )
+				  - facet->edgePlanes[1].dist;
 
 			outside = 0;
-			if ( e0 + e1 > 1.0f ) {
+			if ( e0 + e1u > 1.0 ) {
 				outside |= 1;
 			}
 			if ( e0 < 0.0f ) {
 				outside |= 2;
 			}
-			if ( e1 < 0.0f ) {
+			if ( e1u < 0.0 ) {
 				outside |= 4;
 			}
 
 			if ( !outside ) {
 				VectorCopy( surf->normal, tw->trace.normal );
+				/* Both the test and the back-off read the unrounded hitFrac
+				 * (0x0042122F, 0x00421258). */
 				if ( hitFrac <= TERRAIN_HIT_EPSILON ) {
 					tw->trace.fraction = 0.0f;
 					tw->trace.startsolid = 1;
 					return;
 				}
-				tw->trace.fraction = hitFrac - TERRAIN_HIT_EPSILON;
+				tw->trace.fraction = ( float ) ( hitFrac - TERRAIN_HIT_EPSILON );
 				continue;
 			}
 
 			for ( e = 0; e < 3; e++ ) {
 				if ( ( outside >> e ) & 1 ) {
 					terrainEdgeCylinder_t *cyl = facet->edgeCylinders[e];
-					vec3_t d;
+					double dx, dy, dz, rdU;
 					float radial0, radial1, axial, radiusDelta;
 
 					if ( !cyl || cyl->checkcount == CM_CHECKCOUNT ) {
@@ -937,20 +849,30 @@ startSolid:
 					}
 					cyl->checkcount = CM_CHECKCOUNT;
 
-					VectorSubtract( tw->start, cyl->origin, d );
-					radial0 = ( d[0] * cyl->radialAxes[0][0]
-								+ d[1] * cyl->radialAxes[0][1] )
-							  + d[2] * cyl->radialAxes[0][2];
-					radial1 = ( d[0] * cyl->radialAxes[1][0]
-								+ d[1] * cyl->radialAxes[1][1] )
-							  + d[2] * cyl->radialAxes[1][2];
-					axial = ( d[0] * cyl->axis[0] + d[1] * cyl->axis[1] )
-							+ d[2] * cyl->axis[2];
-					radiusDelta = ( radial0 * radial0 + radial1 * radial1 )
-								  - radius * radius;
+					/* d stays on the stack; radial0/1 sum (x+z)+y and axial
+					 * (z+y)+x, each stored as float (0x004212A1-0x004212F1). */
+					dx = ( double ) tw->start[0] - cyl->origin[0];
+					dy = ( double ) tw->start[1] - cyl->origin[1];
+					dz = ( double ) tw->start[2] - cyl->origin[2];
+					radial0 = ( float ) ( ( dx * cyl->radialAxes[0][0]
+											+ dz * cyl->radialAxes[0][2] )
+										  + dy * cyl->radialAxes[0][1] );
+					radial1 = ( float ) ( ( dx * cyl->radialAxes[1][0]
+											+ dz * cyl->radialAxes[1][2] )
+										  + dy * cyl->radialAxes[1][1] );
+					axial = ( float ) ( ( dz * cyl->axis[2] + dy * cyl->axis[1] )
+										+ dx * cyl->axis[0] );
+					/* radiusDelta is stored with fst; the branch reads the
+					 * unrounded value with `test ah,41h` + `jp`, so NaN takes
+					 * the moving branch (0x004212F5-0x00421320). */
+					rdU = ( ( double ) radial0 * radial0
+							+ ( double ) radial1 * radial1 )
+						  - ( double ) radius * radius;
+					radiusDelta = ( float ) rdU;
 
-					if ( radiusDelta > 0.0f ) {
-						float vel0, vel1, vdot, vlenSq, disc, frac;
+					if ( !( rdU <= 0.0 ) ) {
+						float vel0, vel1, vdot, frac;
+						double vdotU, vlenSq, disc, fracU, axialU;
 
 						vel0 = ( tw->delta[0] * cyl->radialAxes[0][0]
 								 + tw->delta[1] * cyl->radialAxes[0][1] )
@@ -958,40 +880,61 @@ startSolid:
 						vel1 = ( tw->delta[0] * cyl->radialAxes[1][0]
 								 + tw->delta[1] * cyl->radialAxes[1][1] )
 							   + tw->delta[2] * cyl->radialAxes[1][2];
-						vdot = vel0 * radial0 + vel1 * radial1;
-						if ( !( vdot < 0.0f ) ) {
+						/* vdot is stored with fst; the test reads the
+						 * unrounded value and only an ordered >= 0 rejects
+						 * (`test ah,1` + `jz`, 0x004213CE-0x004213DD). */
+						vdotU = ( double ) vel0 * radial0
+								+ ( double ) vel1 * radial1;
+						vdot = ( float ) vdotU;
+						if ( vdotU >= 0.0 ) {
 							continue;
 						}
 
-						vlenSq = vel0 * vel0 + vel1 * vel1;
-						disc = vdot * vdot - vlenSq * radiusDelta;
-						if ( !( disc > 0.0f ) ) {
+						/* vlenSq, disc and the sqrt stay on the stack
+						 * (0x004213E3-0x0042141E).  The disc test is retail's
+						 * jnp on ordered less-or-equal, so NaN falls through. */
+						vlenSq = ( double ) vel0 * vel0 + ( double ) vel1 * vel1;
+						disc = ( double ) vdot * vdot - vlenSq * radiusDelta;
+						if ( disc <= 0.0 ) {
 							continue;
 						}
 
-						frac = ( ( float ) -sqrt( disc ) - vdot ) / vlenSq;
-						if ( !( frac < tw->trace.fraction ) ) {
+						/* The fraction test reads the unrounded quotient;
+						 * the float frac feeds everything after it
+						 * (0x00421420). */
+						fracU = ( -sqrt( disc ) - vdot ) / vlenSq;
+						frac = ( float ) fracU;
+						if ( !( fracU < tw->trace.fraction ) ) {
 							continue;
 						}
 
-						axial += frac * ( ( tw->delta[0] * cyl->axis[0]
-											+ tw->delta[1] * cyl->axis[1] )
-										  + tw->delta[2] * cyl->axis[2] );
-						if ( axial < 0.0f || axial > cyl->length ) {
+						/* axialAt = ((z+x)+y) * frac + axial, unrounded
+						 * (0x00421435-0x00421453). */
+						axialU = ( ( ( double ) cyl->axis[2] * tw->delta[2]
+									 + ( double ) tw->delta[0] * cyl->axis[0] )
+								   + ( double ) cyl->axis[1] * tw->delta[1] )
+								 * frac + axial;
+						if ( axialU < 0.0 || axialU > cyl->length ) {
 							continue;
 						}
 
 						{
-							float inv = 1.0f / radius;
-							float n0 = ( vel0 * frac + radial0 ) * inv;
-							float n1 = ( vel1 * frac + radial1 ) * inv;
+							/* 1/radius and n0 stay on the stack; only n1 is
+							 * stored (0x00421472-0x004214B5). */
+							double inv = 1.0 / radius;
+							double n0 = ( ( double ) vel0 * frac + radial0 ) * inv;
+							float n1 = ( float ) ( ( ( double ) vel1 * frac + radial1 )
+												   * inv );
 
-							tw->trace.normal[0] = cyl->radialAxes[0][0] * n0;
-							tw->trace.normal[1] = cyl->radialAxes[0][1] * n0;
-							tw->trace.normal[2] = cyl->radialAxes[0][2] * n0;
-							tw->trace.normal[0] += cyl->radialAxes[1][0] * n1;
-							tw->trace.normal[1] += cyl->radialAxes[1][1] * n1;
-							tw->trace.normal[2] += cyl->radialAxes[1][2] * n1;
+							tw->trace.normal[0] = ( float ) ( n0 * cyl->radialAxes[0][0] );
+							tw->trace.normal[1] = ( float ) ( n0 * cyl->radialAxes[0][1] );
+							tw->trace.normal[2] = ( float ) ( n0 * cyl->radialAxes[0][2] );
+							tw->trace.normal[0] = n1 * cyl->radialAxes[1][0]
+												  + tw->trace.normal[0];
+							tw->trace.normal[1] = n1 * cyl->radialAxes[1][1]
+												  + tw->trace.normal[1];
+							tw->trace.normal[2] = n1 * cyl->radialAxes[1][2]
+												  + tw->trace.normal[2];
 						}
 
 						if ( tw->trace.fraction <= TERRAIN_HIT_EPSILON ) {
@@ -999,8 +942,12 @@ startSolid:
 							tw->trace.startsolid = 1;
 							return;
 						}
+						/* Unlike the vertex path, the cylinder backs off the
+						 * STORED float frac (0x0042150D). */
 						tw->trace.fraction = frac - TERRAIN_HIT_EPSILON;
-					} else if ( !( axial < 0.0f ) && axial <= cyl->length ) {
+					} else if ( !( axial < 0.0f ) && !( axial > cyl->length ) ) {
+						/* Both rejects are ordered (`jnp` / `jz`,
+						 * 0x00421322-0x00421343), so NaN lands here. */
 						VectorCopy( surf->normal, tw->trace.normal );
 						tw->trace.fraction = 0.0f;
 						tw->trace.startsolid = 1;
@@ -1009,402 +956,95 @@ startSolid:
 				} else {
 					terrainVertexSphere_t *vert = facet->vertexSpheres[e];
 					vec3_t d;
-					float radiusDelta, vdot, disc, frac, inv;
+					double dz, rd, vdotU, disc, fracU, inv;
+					float radiusDelta, vdot;
 
 					if ( !vert || vert->checkcount == CM_CHECKCOUNT ) {
 						continue;
 					}
 					vert->checkcount = CM_CHECKCOUNT;
 
-					VectorSubtract( tw->start, vert->origin, d );
-					radiusDelta = ( d[0] * d[0] + d[1] * d[1] + d[2] * d[2] )
-								  - radius * radius;
-					if ( radiusDelta <= 0.0f ) {
+					/* d.x/d.y are stored floats; dz is stored with fst and
+					 * the first product is dz_unrounded * dz_float, then
+					 * + dy^2 + dx^2, tested before rounding
+					 * (0x00421551-0x00421581). */
+					d[0] = tw->start[0] - vert->origin[0];
+					d[1] = tw->start[1] - vert->origin[1];
+					dz = ( double ) tw->start[2] - vert->origin[2];
+					d[2] = ( float ) dz;
+					rd = ( ( dz * d[2] + ( double ) d[1] * d[1] )
+						   + ( double ) d[0] * d[0] )
+						 - ( double ) radius * radius;
+					radiusDelta = ( float ) rd;
+					if ( rd <= 0.0 ) {
 						VectorCopy( surf->normal, tw->trace.normal );
 						tw->trace.fraction = 0.0f;
 						tw->trace.startsolid = 1;
 						return;
 					}
 
-					vdot = ( tw->delta[0] * d[0] + tw->delta[1] * d[1] )
-						   + tw->delta[2] * d[2];
-					if ( !( vdot < 0.0f ) ) {
+					/* vdot is stored with fst; the test reads the unrounded
+					 * value and only an ordered >= 0 rejects (`test ah,1` +
+					 * `jz`, 0x004215AB-0x004215BA). */
+					vdotU = ( ( double ) tw->delta[0] * d[0]
+							  + ( double ) tw->delta[1] * d[1] )
+							+ ( double ) tw->delta[2] * d[2];
+					vdot = ( float ) vdotU;
+					if ( vdotU >= 0.0 ) {
 						continue;
 					}
 
-					disc = vdot * vdot
-						   - tw->deltaLengthSquared * radiusDelta;
-					if ( disc < 0.0f ) {
+					/* disc, the sqrt, frac and 1/radius all stay on the
+					 * stack; the normal and the backed-off fraction use the
+					 * unrounded frac (0x004215C0-0x00421649). */
+					disc = ( double ) vdot * vdot
+						   - ( double ) tw->deltaLengthSquared * radiusDelta;
+					if ( disc < 0.0 ) {
 						continue;
 					}
 
-					frac = ( ( float ) -sqrt( disc ) - vdot )
-						   / tw->deltaLengthSquared;
-					if ( !( frac < tw->trace.fraction ) ) {
+					fracU = ( -sqrt( disc ) - vdot ) / tw->deltaLengthSquared;
+					if ( !( fracU < tw->trace.fraction ) ) {
 						continue;
 					}
 
-					inv = 1.0f / radius;
-					tw->trace.normal[0] = ( tw->delta[0] * frac + d[0] ) * inv;
-					tw->trace.normal[1] = ( tw->delta[1] * frac + d[1] ) * inv;
-					tw->trace.normal[2] = ( tw->delta[2] * frac + d[2] ) * inv;
+					inv = 1.0 / radius;
+					tw->trace.normal[0] = ( float ) ( ( fracU * tw->delta[0] + d[0] ) * inv );
+					tw->trace.normal[1] = ( float ) ( ( fracU * tw->delta[1] + d[1] ) * inv );
+					tw->trace.normal[2] = ( float ) ( ( fracU * tw->delta[2] + d[2] ) * inv );
 
 					if ( tw->trace.fraction <= TERRAIN_HIT_EPSILON ) {
 						tw->trace.fraction = 0.0f;
 						tw->trace.startsolid = 1;
 						return;
 					}
-					tw->trace.fraction = frac - TERRAIN_HIT_EPSILON;
+					tw->trace.fraction = ( float ) ( fracU - TERRAIN_HIT_EPSILON );
 				}
 			}
 		}
 	}
-}
-#if 0
-void __cdecl CM_TraceSphereThroughTerrainCollide(traceWork_t *tw, void *tc)
-{
-  int v2;
-  double v3;
-  int v5;
-  double v6;
-  int v7;
-  int v8;
-  float *v9;
-  double v10;
-  double v11;
-  double v12;
-  double v13;
-  double v14;
-  double v15;
-  _DWORD *v16;
-  double v17;
-  double v18;
-  double v19;
-  double v20;
-  double v21;
-  double v22;
-  double v23;
-  double v24;
-  int i;
-  int v26;
-  float v27;
-  double v28;
-  double v29;
-  double v30;
-  double v31;
-  _DWORD *v32;
-  double v33;
-  double v34;
-  long double v35;
-  long double v36;
-  double v37;
-  double v38;
-  double v39;
-  float v40;
-  double v41;
-  double v42;
-  double v43;
-  double v44;
-  double v45;
-  double v46;
-  float v47;
-  float v48;
-  float v49;
-  float v50;
-  float v51;
-  float v52;
-  float v53;
-  float v54;
-  float v55;
-  int v56;
-  float v57;
-  float v58;
-  float v59;
-  float v60;
-  int v61;
-  float v62;
-  float v63;
-  float v64;
-  float v65;
-  float v66;
-  float v67;
-  float v68;
-  float v69;
-  float v70;
-  float v71;
-  float v72;
-  float twa;
-
-  v3 = *(float *)(v2 + 252) - *(float *)(v2 + 248);
-  if ( BYTE2(tw->start[0]) )
-  {
-    v59 = -2.0 * v3;
-    *(float *)(v2 + 8) = v3 + *(float *)(v2 + 8);
-    *(float *)(v2 + 20) = v3 + *(float *)(v2 + 20);
-  }
-  else
-  {
-    v59 = v3 + v3;
-    *(float *)(v2 + 8) = *(float *)(v2 + 8) - v3;
-    *(float *)(v2 + 20) = *(float *)(v2 + 20) - v3;
-  }
-  v5 = 0;
-  v6 = *(float *)(v2 + 248) + 0.125;
-  v7 = 0;
-  v56 = 0;
-  twa = v6;
-  v58 = -v6;
-  if ( LOWORD(tw->start[0]) )
-  {
-    v8 = 13;
-    v9 = &tw->delta[1];
-    while ( 1 )
-    {
-      v10 = *(v9 - 4) * *(float *)(v2 + 20)
-          + *(v9 - 5) * *(float *)(v2 + 16)
-          + *(v9 - 6) * *(float *)(v2 + 12)
-          - *(v9 - 3);
-      if ( v10 < twa )
-      {
-        v11 = *(v9 - 4) * *(float *)(v2 + 8) + *(v9 - 5) * *(float *)(v2 + 4) + *(v9 - 6) * *(float *)v2 - *(v9 - 3);
-        v52 = v11;
-        v62 = v11 - v10;
-        if ( v62 > 0.0 )
-        {
-          if ( v52 > (double)v58 )
-          {
-            if ( (v52 < (double)twa) | __UNORDERED__(v52, twa) )
-            {
-              v20 = 0.0;
-              v21 = *(float *)v2;
-              v22 = *(float *)(v2 + 4);
-              v23 = *(float *)(v2 + 8);
-            }
-            else
-            {
-              v20 = (v52 - twa) / v62;
-              if ( v20 > *(float *)(v2 + 196) )
-                goto LABEL_57;
-              v21 = v20 * *(float *)(v2 + 24) + *(float *)v2;
-              v22 = v20 * *(float *)(v2 + 28) + *(float *)(v2 + 4);
-              v23 = v20 * *(float *)(v2 + 32) + *(float *)(v2 + 8);
-            }
-            v49 = v22 * *(v9 - 1) + v21 * *(v9 - 2) + v23 * *v9 - v9[1];
-            v24 = v23 * v9[4] + v22 * v9[3] + v21 * v9[2] - v9[5];
-            if ( v49 + v24 > 1.0 )
-              v5 = 1;
-            v61 = (4 * (((v24 < 0.0) | __UNORDERED__(v24, 0.0)) != 0))
-                | (2 * (((v49 < 0.0) | __UNORDERED__(v49, 0.0)) != 0))
-                | v5;
-            if ( v61 )
-            {
-              for ( i = 0; i < 3; ++i )
-              {
-                v26 = v8 + i;
-                if ( ((1 << i) & v61) != 0 )
-                {
-                  v27 = tw->end[v26];
-                  if ( v27 != 0.0 && *(_DWORD *)LODWORD(v27) != cm_checkcount )
-                  {
-                    *(_DWORD *)LODWORD(v27) = cm_checkcount;
-                    v28 = *(float *)v2 - *(float *)(LODWORD(v27) + 4);
-                    v29 = *(float *)(v2 + 4) - *(float *)(LODWORD(v27) + 8);
-                    v30 = *(float *)(v2 + 8) - *(float *)(LODWORD(v27) + 12);
-                    v69 = v28 * *(float *)(LODWORD(v27) + 16)
-                        + v30 * *(float *)(LODWORD(v27) + 24)
-                        + v29 * *(float *)(LODWORD(v27) + 20);
-                    v70 = v28 * *(float *)(LODWORD(v27) + 28)
-                        + v30 * *(float *)(LODWORD(v27) + 36)
-                        + v29 * *(float *)(LODWORD(v27) + 32);
-                    v71 = v30 * *(float *)(LODWORD(v27) + 48)
-                        + v29 * *(float *)(LODWORD(v27) + 44)
-                        + v28 * *(float *)(LODWORD(v27) + 40);
-                    v31 = v70 * v70 + v69 * v69 - twa * twa;
-                    v53 = v31;
-                    if ( v31 > 0.0 )
-                    {
-                      v64 = *(float *)(LODWORD(v27) + 16) * *(float *)(v2 + 24)
-                          + *(float *)(v2 + 28) * *(float *)(LODWORD(v27) + 20)
-                          + *(float *)(LODWORD(v27) + 24) * *(float *)(v2 + 32);
-                      v66 = *(float *)(v2 + 28) * *(float *)(LODWORD(v27) + 32)
-                          + *(float *)(v2 + 24) * *(float *)(LODWORD(v27) + 28)
-                          + *(float *)(LODWORD(v27) + 36) * *(float *)(v2 + 32);
-                      v33 = v70 * v66 + v69 * v64;
-                      v50 = v33;
-                      if ( v33 < 0.0 )
-                      {
-                        v34 = v66 * v66 + v64 * v64;
-                        v35 = v50 * v50 - v34 * v53;
-                        if ( v35 > 0.0 )
-                        {
-                          v36 = (-sqrt(v35) - v50) / v34;
-                          v54 = v36;
-                          if ( (v36 < *(float *)(v2 + 196)) | __UNORDERED__(v36, *(float *)(v2 + 196)) )
-                          {
-                            v37 = (*(float *)(LODWORD(v27) + 48) * *(float *)(v2 + 32)
-                                 + *(float *)(v2 + 24) * *(float *)(LODWORD(v27) + 40)
-                                 + *(float *)(LODWORD(v27) + 44) * *(float *)(v2 + 28))
-                                * v54
-                                + v71;
-                            if ( !((v37 < 0.0) | __UNORDERED__(v37, 0.0)) && v37 <= *(float *)(LODWORD(v27) + 52) )
-                            {
-                              v38 = 1.0 / twa;
-                              v39 = (v64 * v54 + v69) * v38;
-                              v72 = (v66 * v54 + v70) * v38;
-                              *(float *)(v2 + 212) = v39 * *(float *)(LODWORD(v27) + 16);
-                              *(float *)(v2 + 216) = v39 * *(float *)(LODWORD(v27) + 20);
-                              *(float *)(v2 + 220) = v39 * *(float *)(LODWORD(v27) + 24);
-                              *(float *)(v2 + 212) = v72 * *(float *)(LODWORD(v27) + 28) + *(float *)(v2 + 212);
-                              *(float *)(v2 + 216) = v72 * *(float *)(LODWORD(v27) + 32) + *(float *)(v2 + 216);
-                              *(float *)(v2 + 220) = v72 * *(float *)(LODWORD(v27) + 36) + *(float *)(v2 + 220);
-                              if ( *(float *)(v2 + 196) <= 0.0000099999997 )
-                                goto LABEL_39;
-                              *(float *)(v2 + 196) = v54 - 0.0000099999997;
-                            }
-                          }
-                        }
-                      }
-                    }
-                    else if ( !((v71 < 0.0) | __UNORDERED__(v71, 0.0)) && v71 <= (double)*(float *)(LODWORD(v27) + 52) )
-                    {
-LABEL_38:
-                      v32 = (_DWORD *)&tw->start[18 * v56];
-                      *(_DWORD *)(v2 + 212) = v32[1];
-                      *(_DWORD *)(v2 + 216) = v32[2];
-                      *(_DWORD *)(v2 + 220) = v32[3];
-LABEL_39:
-                      *(_DWORD *)(v2 + 196) = 0;
-                      *(_BYTE *)(v2 + 243) = 1;
-                      return;
-                    }
-                  }
-                }
-                else
-                {
-                  v40 = tw->start[v26];
-                  if ( v40 != 0.0 && *(_DWORD *)LODWORD(v40) != cm_checkcount )
-                  {
-                    *(_DWORD *)LODWORD(v40) = cm_checkcount;
-                    v65 = *(float *)v2 - *(float *)(LODWORD(v40) + 4);
-                    v67 = *(float *)(v2 + 4) - *(float *)(LODWORD(v40) + 8);
-                    v41 = *(float *)(v2 + 8) - *(float *)(LODWORD(v40) + 12);
-                    v68 = v41;
-                    v42 = v41 * v68 + v67 * v67 + v65 * v65 - twa * twa;
-                    v55 = v42;
-                    if ( v42 <= 0.0 )
-                      goto LABEL_38;
-                    v43 = v67 * *(float *)(v2 + 28) + v65 * *(float *)(v2 + 24) + v68 * *(float *)(v2 + 32);
-                    v51 = v43;
-                    if ( v43 < 0.0 )
-                    {
-                      v44 = v51 * v51 - *(float *)(v2 + 36) * v55;
-                      if ( !((v44 < 0.0) | __UNORDERED__(v44, 0.0)) )
-                      {
-                        v45 = (-sqrt(v44) - v51) / *(float *)(v2 + 36);
-                        if ( (v45 < *(float *)(v2 + 196)) | __UNORDERED__(v45, *(float *)(v2 + 196)) )
-                        {
-                          v46 = 1.0 / twa;
-                          *(float *)(v2 + 212) = (v45 * *(float *)(v2 + 24) + v65) * v46;
-                          *(float *)(v2 + 216) = (v45 * *(float *)(v2 + 28) + v67) * v46;
-                          *(float *)(v2 + 220) = (v45 * *(float *)(v2 + 32) + v68) * v46;
-                          if ( *(float *)(v2 + 196) <= 0.0000099999997 )
-                            goto LABEL_60;
-                          *(float *)(v2 + 196) = v45 - 0.0000099999997;
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-              v7 = v56;
-            }
-            else
-            {
-              *(float *)(v2 + 212) = *(v9 - 6);
-              *(float *)(v2 + 216) = *(v9 - 5);
-              *(float *)(v2 + 220) = *(v9 - 4);
-              if ( v20 <= 0.0000099999997 )
-              {
-LABEL_60:
-                *(_DWORD *)(v2 + 196) = 0;
-                *(_BYTE *)(v2 + 243) = 1;
-                return;
-              }
-              *(float *)(v2 + 196) = v20 - 0.0000099999997;
-            }
-          }
-          else
-          {
-            v12 = v59 * *(v9 - 4) + v52;
-            if ( v12 > v58 )
-            {
-              v60 = 1.0 / *(v9 - 4);
-              v13 = (v58 - v52) * v60;
-              v57 = *(v9 - 1) * *(float *)(v2 + 4) + *(v9 - 2) * *(float *)v2 + *v9 * *(float *)(v2 + 8) - v9[1];
-              v63 = v9[3] * *(float *)(v2 + 4) + v9[2] * *(float *)v2 + v9[4] * *(float *)(v2 + 8) - v9[5];
-              v14 = v13 * *v9 + v57;
-              if ( v14 >= 0.0 )
-              {
-                v15 = v13 * v9[4] + v63;
-                if ( v15 >= 0.0 )
-                {
-                  v47 = v14;
-                  if ( v47 + v15 <= 1.0 )
-                    goto LABEL_14;
-                }
-              }
-              v17 = (v12 < twa) | (unsigned __int8)__UNORDERED__(v12, twa) ? v59 : (twa - v52) * v60;
-              v18 = v17 * *v9 + v57;
-              if ( !((v18 < 0.0) | __UNORDERED__(v18, 0.0)) )
-              {
-                v19 = v17 * v9[4] + v63;
-                if ( !((v19 < 0.0) | __UNORDERED__(v19, 0.0)) )
-                {
-                  v48 = v18;
-                  if ( v48 + v19 <= 1.0 )
-                  {
-LABEL_14:
-                    v16 = (_DWORD *)&tw->start[18 * v7];
-                    *(_DWORD *)(v2 + 212) = v16[1];
-                    *(_DWORD *)(v2 + 216) = v16[2];
-                    *(_DWORD *)(v2 + 220) = v16[3];
-                    *(_DWORD *)(v2 + 196) = 0;
-                    *(_BYTE *)(v2 + 243) = 1;
-                    return;
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-LABEL_57:
-      ++v7;
-      v9 += 18;
-      v8 += 18;
-      v56 = v7;
-      if ( v7 >= LOWORD(tw->start[0]) )
-        return;
-      v5 = 0;
-    }
-  }
-}
 #endif
+}
 
 /* ---- CM_PositionTestSphereWithTerrainCollide  0x004216B0 ---- */
-qboolean __cdecl CM_PositionTestSphereWithTerrainCollide(traceWork_t *twOpaque,
-														 void *tcVoid)
+/*
+ * Two bodies, as in the sphere walker: the COD1_VC7 one is retail's source
+ * shape for VC7, the modern one spells out retail's x87 precision.
+ */
+qboolean __cdecl CM_PositionTestSphereWithTerrainCollide( traceWork_t *tw,
+														  const terrainCollide_t *tc )
 {
-	cmTerrainTrace_t *tw = CM_TW( twOpaque );
-	const terrainCollide_t *tc = CM_TC( tcVoid );
-	const terrainFacet_t *facets = CM_TC_FACETS( tcVoid );
-	int numFacets = ( int ) tc->facetCount;
-	float radius = tw->sphere.radius;
-	float negRadius = -radius;
-	float capOffset = tw->sphere.halfheight - radius;
-	float capDelta;
-	int i;
+#ifdef COD1_VC7
+	const terrainFacet_t *facets;
+	const terrainEdgeCylinder_t *cyl;
+	const terrainVertexSphere_t *vert;
+	int i, e;
+	unsigned int outside;
+	rfloat capOffset, capDist, off, e0, distSq;
+	float capDelta, radius, negRadius, surfDist, invNz, baseE0, baseE1, e1, along;
+	vec3_t proj, d;
 
+	capOffset = tw->sphere.halfheight - tw->sphere.radius;
 	if ( tc->capsuleOffsetSign ) {
 		capDelta = capOffset * -2.0f;
 		tw->start[2] += capOffset;
@@ -1415,30 +1055,166 @@ qboolean __cdecl CM_PositionTestSphereWithTerrainCollide(traceWork_t *twOpaque,
 		tw->end[2] -= capOffset;
 	}
 
-	for ( i = 0; i < numFacets; i++ ) {
-		const terrainFacet_t *facet = &facets[i];
-		const terrainPlane_t *surf = &facet->surfacePlane;
-		float surfDist;
+	radius = tw->sphere.radius;
+	negRadius = -radius;
 
-		surfDist = ( tw->start[0] * surf->normal[0]
-					 + tw->start[1] * surf->normal[1] )
-				   + tw->start[2] * surf->normal[2] - surf->dist;
-
+	/* The planes are read through facets[] and the sphere/cylinder
+	 * pointers through CM_TC_FACETS( tc ): that is what puts retail's
+	 * strength-reduced pointer at +0x0C and its index at 0x0D. */
+	facets = CM_TC_FACETS( tc );
+	for ( i = 0; i < tc->facetCount; i++ ) {
+		/* The parenthesis nesting is load-bearing: VC7 keeps paren nodes, and
+		 * this grouping is the one that gives retail's operand order in all
+		 * three products (normal[2] first, then start[1], start[0];
+		 * 0x00421733-0x00421745). */
+		surfDist = ( ( ( tw->start[2] ) * ( facets[i].surfacePlane.normal[2] ) ) + tw->start[1] * ( ( facets[i].surfacePlane.normal[1] ) ) ) + tw->start[0] * facets[i].surfacePlane.normal[0]
+				   - facets[i].surfacePlane.dist;
 		if ( surfDist >= radius ) {
 			continue;
 		}
 
 		if ( surfDist <= negRadius ) {
-			float capDist = surfDist + capDelta * surf->normal[2];
-			float invNormalZ, enterOffset, leaveOffset;
-			float baseE0, baseE1, e0, e1;
+			capDist = capDelta * facets[i].surfacePlane.normal[2] + surfDist;
+			if ( capDist <= negRadius ) {
+				continue;
+			}
+			invNz = 1.0f / facets[i].surfacePlane.normal[2];
+			off = ( negRadius - surfDist ) * invNz;
+			baseE0 = DotProduct( tw->start, facets[i].edgePlanes[0].normal )
+					 - facets[i].edgePlanes[0].dist;
+			baseE1 = DotProduct( tw->start, facets[i].edgePlanes[1].normal )
+					 - facets[i].edgePlanes[1].dist;
+			e0 = off * facets[i].edgePlanes[0].normal[2] + baseE0;
+			if ( e0 >= 0.0f ) {
+				e1 = off * facets[i].edgePlanes[1].normal[2] + baseE1;
+				if ( e1 >= 0.0f && e0 + e1 <= 1.0f ) {
+					return qtrue;
+				}
+			}
+			if ( capDist < radius ) {
+				off = capDelta;
+			} else {
+				off = ( radius - surfDist ) * invNz;
+			}
+			e0 = off * facets[i].edgePlanes[0].normal[2] + baseE0;
+			if ( e0 < 0.0f ) {
+				continue;
+			}
+			e1 = off * facets[i].edgePlanes[1].normal[2] + baseE1;
+			if ( e1 < 0.0f ) {
+				continue;
+			}
+			if ( e0 + e1 > 1.0f ) {
+				continue;
+			}
+			return qtrue;
+		}
 
+		VectorMA( tw->start, -surfDist, facets[i].surfacePlane.normal, proj );
+		e0 = ( proj[2] * facets[i].edgePlanes[0].normal[2]
+			   + proj[1] * facets[i].edgePlanes[0].normal[1] )
+			 + proj[0] * facets[i].edgePlanes[0].normal[0]
+			 - facets[i].edgePlanes[0].dist;
+		e1 = ( proj[2] * facets[i].edgePlanes[1].normal[2]
+			   + proj[1] * facets[i].edgePlanes[1].normal[1] )
+			 + proj[0] * facets[i].edgePlanes[1].normal[0]
+			 - facets[i].edgePlanes[1].dist;
+		outside = 0;
+		outside |= ( e1 + e0 > 1.0f );
+		outside |= ( e0 < 0.0f ) << 1;
+		outside |= ( e1 < 0.0f ) << 2;
+		if ( !outside ) {
+			return qtrue;
+		}
+
+		for ( e = 0; e < 3; e++ ) {
+			if ( outside & ( 1 << e ) ) {
+				cyl = CM_TC_FACETS( tc )[i].edgeCylinders[e];
+				if ( !cyl ) {
+					continue;
+				}
+				VectorSubtract( tw->start, cyl->origin, d );
+				along = ( d[2] * cyl->axis[2] + d[1] * cyl->axis[1] ) + d[0] * cyl->axis[0];
+				if ( !( along >= 0.0f ) ) {
+					continue;
+				}
+				if ( !( along <= cyl->length ) ) {
+					continue;
+				}
+				VectorMA( d, -along, cyl->axis, d );
+				distSq = ( d[2] * d[2] + d[1] * d[1] ) + d[0] * d[0];
+				if ( distSq < tw->sphere.radius * tw->sphere.radius ) {
+					return qtrue;
+				}
+			} else {
+				vert = CM_TC_FACETS( tc )[i].vertexSpheres[e];
+				if ( !vert ) {
+					continue;
+				}
+				VectorSubtract( tw->start, vert->origin, d );
+				distSq = ( d[2] * d[2] + d[1] * d[1] ) + d[0] * d[0];
+				if ( distSq < tw->sphere.radius * tw->sphere.radius ) {
+					return qtrue;
+				}
+			}
+		}
+	}
+
+	return qfalse;
+#else
+	const terrainFacet_t *facets = CM_TC_FACETS( tc );
+	int numFacets = ( int ) tc->facetCount;
+	float radius = tw->sphere.radius;
+	float negRadius = -radius;
+	/* As in the sphere walker, every double local here is a value retail
+	 * keeps on the x87 stack at _PC_53.  capOffset is never stored
+	 * (0x004216B0-0x00421701). */
+	double capOffset = ( double ) tw->sphere.halfheight - radius;
+	float capDelta;
+	int i;
+
+	if ( tc->capsuleOffsetSign ) {
+		capDelta = ( float ) ( capOffset * -2.0 );
+		tw->start[2] = ( float ) ( capOffset + tw->start[2] );
+		tw->end[2] = ( float ) ( capOffset + tw->end[2] );
+	} else {
+		capDelta = ( float ) ( capOffset + capOffset );
+		tw->start[2] = ( float ) ( tw->start[2] - capOffset );
+		tw->end[2] = ( float ) ( tw->end[2] - capOffset );
+	}
+
+	for ( i = 0; i < numFacets; i++ ) {
+		const terrainFacet_t *facet = &facets[i];
+		const terrainPlane_t *surf = &facet->surfacePlane;
+		double sd;
+		float surfDist;
+
+		/* surfDist sums (z+y)+x and is stored with fst: the radius test
+		 * reads the unrounded value, the -radius test the stored float
+		 * (0x00421733-0x00421761). */
+		sd = ( ( double ) tw->start[2] * surf->normal[2]
+			   + ( double ) tw->start[1] * surf->normal[1] )
+			 + ( double ) tw->start[0] * surf->normal[0] - surf->dist;
+		surfDist = ( float ) sd;
+
+		if ( sd >= radius ) {
+			continue;
+		}
+
+		if ( surfDist <= negRadius ) {
+			double capDist, enterOffset, leaveOffset, e0u, e1u;
+			float invNormalZ, baseE0, baseE1, e0;
+
+			/* capDist, both offsets and e1 stay on the stack; e0 is stored
+			 * with fst and its float is what e0 + e1 adds
+			 * (0x00421770-0x00421892). */
+			capDist = ( double ) capDelta * surf->normal[2] + surfDist;
 			if ( negRadius >= capDist ) {
 				continue;
 			}
 
 			invNormalZ = 1.0f / surf->normal[2];
-			enterOffset = ( negRadius - surfDist ) * invNormalZ;
+			enterOffset = ( ( double ) negRadius - surfDist ) * invNormalZ;
 
 			baseE0 = ( tw->start[0] * facet->edgePlanes[0].normal[0]
 					   + tw->start[1] * facet->edgePlanes[0].normal[1] )
@@ -1449,10 +1225,11 @@ qboolean __cdecl CM_PositionTestSphereWithTerrainCollide(traceWork_t *twOpaque,
 					 + tw->start[2] * facet->edgePlanes[1].normal[2]
 					 - facet->edgePlanes[1].dist;
 
-			e0 = baseE0 + enterOffset * facet->edgePlanes[0].normal[2];
-			if ( e0 >= 0.0f ) {
-				e1 = baseE1 + enterOffset * facet->edgePlanes[1].normal[2];
-				if ( e1 >= 0.0f && e0 + e1 <= 1.0f ) {
+			e0u = enterOffset * facet->edgePlanes[0].normal[2] + baseE0;
+			e0 = ( float ) e0u;
+			if ( e0u >= 0.0 ) {
+				e1u = enterOffset * facet->edgePlanes[1].normal[2] + baseE1;
+				if ( e1u >= 0.0 && e0 + e1u <= 1.0 ) {
 					return qtrue;
 				}
 			}
@@ -1460,40 +1237,48 @@ qboolean __cdecl CM_PositionTestSphereWithTerrainCollide(traceWork_t *twOpaque,
 			if ( radius > capDist ) {
 				leaveOffset = capDelta;
 			} else {
-				leaveOffset = ( radius - surfDist ) * invNormalZ;
+				leaveOffset = ( ( double ) radius - surfDist ) * invNormalZ;
 			}
 
-			e0 = baseE0 + leaveOffset * facet->edgePlanes[0].normal[2];
-			if ( !( 0.0f > e0 ) ) {
-				e1 = baseE1 + leaveOffset * facet->edgePlanes[1].normal[2];
-				if ( !( 0.0f > e1 ) && !( e0 + e1 > 1.0f ) ) {
+			e0u = leaveOffset * facet->edgePlanes[0].normal[2] + baseE0;
+			e0 = ( float ) e0u;
+			if ( !( 0.0 > e0u ) ) {
+				e1u = leaveOffset * facet->edgePlanes[1].normal[2] + baseE1;
+				if ( !( 0.0 > e1u ) && !( e0 + e1u > 1.0 ) ) {
 					return qtrue;
 				}
 			}
 		} else {
-			vec3_t proj;
-			float e0, e1;
+			float px, py, pz, e1;
+			double pzu, e0u, e1u;
 			unsigned int outside;
 			int e;
 
-			proj[0] = tw->start[0] - surfDist * surf->normal[0];
-			proj[1] = tw->start[1] - surfDist * surf->normal[1];
-			proj[2] = tw->start[2] - surfDist * surf->normal[2];
+			/* proj.x/y are stored floats; proj.z is stored with fst and the
+			 * unrounded value feeds e0 (0x00421899-0x004218BB).  e0 =
+			 * (z+y)+x - d stays unrounded; e1 = (z+y)+x - d over the float
+			 * proj is stored with fst.  The outside bits read e1u + e0u,
+			 * e0u and the float e1 (0x004218F3-0x0042192E). */
+			px = tw->start[0] - surfDist * surf->normal[0];
+			py = tw->start[1] - surfDist * surf->normal[1];
+			pzu = tw->start[2] - ( double ) surfDist * surf->normal[2];
+			pz = ( float ) pzu;
 
-			e0 = ( proj[0] * facet->edgePlanes[0].normal[0]
-				   + proj[1] * facet->edgePlanes[0].normal[1] )
-				 + proj[2] * facet->edgePlanes[0].normal[2]
-				 - facet->edgePlanes[0].dist;
-			e1 = ( proj[0] * facet->edgePlanes[1].normal[0]
-				   + proj[1] * facet->edgePlanes[1].normal[1] )
-				 + proj[2] * facet->edgePlanes[1].normal[2]
-				 - facet->edgePlanes[1].dist;
+			e0u = ( pzu * facet->edgePlanes[0].normal[2]
+					+ ( double ) py * facet->edgePlanes[0].normal[1] )
+				  + ( double ) px * facet->edgePlanes[0].normal[0]
+				  - facet->edgePlanes[0].dist;
+			e1u = ( ( double ) pz * facet->edgePlanes[1].normal[2]
+					+ ( double ) py * facet->edgePlanes[1].normal[1] )
+				  + ( double ) px * facet->edgePlanes[1].normal[0]
+				  - facet->edgePlanes[1].dist;
+			e1 = ( float ) e1u;
 
 			outside = 0;
-			if ( e0 + e1 > 1.0f ) {
+			if ( e1u + e0u > 1.0 ) {
 				outside |= 1;
 			}
-			if ( e0 < 0.0f ) {
+			if ( e0u < 0.0 ) {
 				outside |= 2;
 			}
 			if ( e1 < 0.0f ) {
@@ -1505,39 +1290,56 @@ qboolean __cdecl CM_PositionTestSphereWithTerrainCollide(traceWork_t *twOpaque,
 			}
 
 			for ( e = 0; e < 3; e++ ) {
-				vec3_t d;
-				float distSq;
+				double distSq;
 
 				if ( ( outside >> e ) & 1 ) {
 					const terrainEdgeCylinder_t *cyl = facet->edgeCylinders[e];
-					float along;
+					float dx, dy, dz, along;
+					double dzu, alongU, r0, r1, r2;
 
 					if ( !cyl ) {
 						continue;
 					}
 
-					VectorSubtract( tw->start, cyl->origin, d );
-					along = ( d[0] * cyl->axis[0] + d[1] * cyl->axis[1] )
-							+ d[2] * cyl->axis[2];
-					if ( along < 0.0f || along > cyl->length ) {
+					/* dx/dy are stored floats, dz is stored with fst and the
+					 * unrounded dz starts 'along' = (z+y)+x.  The low test
+					 * reads the unrounded along (jnz on C0, so NaN skips),
+					 * the length test the stored float (jp, so NaN skips)
+					 * (0x0042197E-0x004219D1). */
+					dx = tw->start[0] - cyl->origin[0];
+					dy = tw->start[1] - cyl->origin[1];
+					dzu = ( double ) tw->start[2] - cyl->origin[2];
+					dz = ( float ) dzu;
+					alongU = ( dzu * cyl->axis[2] + ( double ) dy * cyl->axis[1] )
+							 + ( double ) dx * cyl->axis[0];
+					along = ( float ) alongU;
+					if ( !( alongU >= 0.0 ) || !( along <= cyl->length ) ) {
 						continue;
 					}
 
-					d[0] -= along * cyl->axis[0];
-					d[1] -= along * cyl->axis[1];
-					d[2] -= along * cyl->axis[2];
+					/* The radial vector r = -along * axis + d stays on the
+					 * stack and is squared (z+y)+x (0x004219D7-0x00421A12). */
+					r0 = -along * ( double ) cyl->axis[0] + dx;
+					r1 = -along * ( double ) cyl->axis[1] + dy;
+					r2 = -along * ( double ) cyl->axis[2] + dz;
+					distSq = ( r2 * r2 + r1 * r1 ) + r0 * r0;
 				} else {
 					const terrainVertexSphere_t *vert = facet->vertexSpheres[e];
+					double dx, dy, dz;
 
 					if ( !vert ) {
 						continue;
 					}
 
-					VectorSubtract( tw->start, vert->origin, d );
+					/* d stays on the stack, squared (z+y)+x
+					 * (0x00421A27-0x00421A52). */
+					dx = ( double ) tw->start[0] - vert->origin[0];
+					dy = ( double ) tw->start[1] - vert->origin[1];
+					dz = ( double ) tw->start[2] - vert->origin[2];
+					distSq = ( dz * dz + dy * dy ) + dx * dx;
 				}
 
-				distSq = ( d[0] * d[0] + d[1] * d[1] ) + d[2] * d[2];
-				if ( distSq < radius * radius ) {
+				if ( distSq < ( double ) radius * radius ) {
 					return qtrue;
 				}
 			}
@@ -1545,167 +1347,12 @@ qboolean __cdecl CM_PositionTestSphereWithTerrainCollide(traceWork_t *twOpaque,
 	}
 
 	return qfalse;
-}
-#if 0
-qboolean __cdecl CM_PositionTestSphereWithTerrainCollide(traceWork_t *tw, void *tc)
-{
-  float *v2;
-  double v3;
-  int v5;
-  float *i;
-  double v7;
-  double v8;
-  double v9;
-  double v10;
-  double v11;
-  double v13;
-  double v14;
-  double v15;
-  double v16;
-  double v17;
-  double v18;
-  double v19;
-  int v20;
-  int v21;
-  float v22;
-  double v23;
-  unsigned __int8 v25; // c0
-  unsigned __int8 v26; // c3
-  float v28;
-  float v29;
-  float v30;
-  float v31;
-  float v32;
-  float v33;
-  float v34;
-  float v35;
-  int v36;
-  int v37;
-  float v38;
-  float v39;
-  float v40;
-  float v41;
-  float v42;
-  float twa;
-  float twb;
-  float twc;
-
-  v3 = v2[63] - v2[62];
-  if ( BYTE2(tw->start[0]) )
-  {
-    v32 = -2.0 * v3;
-    v2[2] = v3 + v2[2];
-    v2[5] = v3 + v2[5];
-  }
-  else
-  {
-    v32 = v3 + v3;
-    v2[2] = v2[2] - v3;
-    v2[5] = v2[5] - v3;
-  }
-  v30 = v2[62];
-  v31 = -v30;
-  v37 = 0;
-  if ( !LOWORD(tw->start[0]) )
-    return 0;
-  v5 = 13;
-  for ( i = tw->end; ; i += 18 )
-  {
-    v7 = *i * v2[2] + v2[1] * *(i - 1) + *v2 * *(i - 2) - i[1];
-    twa = v7;
-    if ( v7 >= v30 )
-      goto LABEL_31;
-    if ( twa > (double)v31 )
-      break;
-    v8 = v32 * *i + twa;
-    if ( v8 > v31 )
-    {
-      v33 = 1.0 / *i;
-      v9 = (v31 - twa) * v33;
-      v34 = i[3] * v2[1] + i[2] * *v2 + i[4] * v2[2] - i[5];
-      v35 = i[7] * v2[1] + i[6] * *v2 + i[8] * v2[2] - i[9];
-      v10 = v9 * i[4] + v34;
-      if ( v10 >= 0.0 )
-      {
-        v11 = v9 * i[8] + v35;
-        if ( v11 >= 0.0 )
-        {
-          v28 = v10;
-          if ( v28 + v11 <= 1.0 )
-            return 1;
-        }
-      }
-      v13 = (v8 < v30) | (unsigned __int8)__UNORDERED__(v8, v30) ? v32 : (v30 - twa) * v33;
-      v14 = v13 * i[4] + v34;
-      if ( !((v14 < 0.0) | __UNORDERED__(v14, 0.0)) )
-      {
-        v15 = v13 * i[8] + v35;
-        if ( !((v15 < 0.0) | __UNORDERED__(v15, 0.0)) )
-        {
-          v29 = v14;
-          if ( v29 + v15 <= 1.0 )
-            return 1;
-        }
-      }
-    }
-LABEL_31:
-    v5 += 18;
-    if ( ++v37 >= LOWORD(tw->start[0]) )
-      return 0;
-  }
-  v16 = -twa;
-  v38 = v16 * *(i - 2) + *v2;
-  v39 = v16 * *(i - 1) + v2[1];
-  v17 = v16 * *i + v2[2];
-  v40 = v17;
-  v18 = v17 * i[4] + v39 * i[3] + v38 * i[2] - i[5];
-  v19 = v40 * i[8] + v39 * i[7] + v38 * i[6] - i[9];
-  twb = v19;
-  v20 = (4 * (((twb < 0.0) | __UNORDERED__(twb, 0.0)) != 0))
-      | (2 * (((v18 < 0.0) | __UNORDERED__(v18, 0.0)) != 0))
-      | (v19 + v18 > 1.0);
-  v36 = v20;
-  if ( v20 )
-  {
-    v21 = 0;
-    while ( 1 )
-    {
-      if ( ((1 << v21) & v20) != 0 )
-      {
-        v22 = tw->end[v5 + v21];
-        if ( v22 == 0.0 )
-          goto LABEL_30;
-        v41 = *v2 - *(float *)(LODWORD(v22) + 4);
-        v42 = v2[1] - *(float *)(LODWORD(v22) + 8);
-        v23 = (v2[2] - *(float *)(LODWORD(v22) + 12)) * *(float *)(LODWORD(v22) + 48)
-            + v42 * *(float *)(LODWORD(v22) + 44)
-            + v41 * *(float *)(LODWORD(v22) + 40);
-        if ( v23 < 0.0 )
-          goto LABEL_30;
-        twc = v23;
-        if ( twc > (double)*(float *)(LODWORD(v22) + 52) )
-          goto LABEL_30;
-      }
-      else if ( !LODWORD(tw->start[v5 + v21]) )
-      {
-        goto LABEL_30;
-      }
-      if ( !(v25 | v26) )
-        return 1;
-LABEL_30:
-      if ( ++v21 >= 3 )
-        goto LABEL_31;
-      v20 = v36;
-    }
-  }
-  return 1;
-}
 #endif
+}
 
 /* ---- CM_TraceSquareThroughTerrainCollide  0x00421AA0 ---- VERIFIED */
-void __cdecl CM_TraceSquareThroughTerrainCollide(traceWork_t *twOpaque, void *tc)
+void __cdecl CM_TraceSquareThroughTerrainCollide(traceWork_t *tw, void *tc)
 {
-	cmTerrainTrace_t *tw = CM_TW( twOpaque );
 	float savedStartZ, savedEndZ, savedRadius;
 
 	if ( !cm_boxOnTerrainWarned ) {
@@ -1720,7 +1367,7 @@ void __cdecl CM_TraceSquareThroughTerrainCollide(traceWork_t *twOpaque, void *tc
 	tw->sphere.use = 1;
 	tw->sphere.radius = tw->maxs[0];
 
-	CM_TraceSphereThroughTerrainCollide( twOpaque, tc );
+	CM_TraceSphereThroughTerrainCollide( tw, tc );
 
 	tw->sphere.use = 0;
 	tw->start[2] = savedStartZ;
@@ -1729,12 +1376,10 @@ void __cdecl CM_TraceSquareThroughTerrainCollide(traceWork_t *twOpaque, void *tc
 }
 
 /* ---- CM_TraceThroughTerrainCollide  0x00421B20 ---- VERIFIED */
-void __cdecl CM_TraceThroughTerrainCollide(traceWork_t *twOpaque, void *tc)
+void __cdecl CM_TraceThroughTerrainCollide(traceWork_t *tw, void *tc)
 {
-	cmTerrainTrace_t *tw = CM_TW( twOpaque );
-
 	if ( tw->isPoint ) {
-		CM_TracePointThroughTerrainCollide( twOpaque, tc );
+		CM_TracePointThroughTerrainCollide( tw, tc );
 		return;
 	}
 
@@ -1742,33 +1387,32 @@ void __cdecl CM_TraceThroughTerrainCollide(traceWork_t *twOpaque, void *tc)
 		float savedStartZ = tw->start[2];
 		float savedEndZ = tw->end[2];
 
-		CM_TraceSphereThroughTerrainCollide( twOpaque, tc );
+		CM_TraceSphereThroughTerrainCollide( tw, tc );
 
 		tw->start[2] = savedStartZ;
 		tw->end[2] = savedEndZ;
 		return;
 	}
 
-	CM_TraceSquareThroughTerrainCollide( twOpaque, tc );
+	CM_TraceSquareThroughTerrainCollide( tw, tc );
 }
 
 /* ---- CM_SightTraceThroughTerrainCollide  0x00421B80 ---- VERIFIED */
-qboolean __cdecl CM_SightTraceThroughTerrainCollide(traceWork_t *twOpaque, void *tc)
+qboolean __cdecl CM_SightTraceThroughTerrainCollide(traceWork_t *tw, void *tc)
 {
-	cmTerrainTrace_t sightWork;
+	traceWork_t sightWork;
 
-	sightWork = *CM_TW( twOpaque );
+	sightWork = *tw;
 	sightWork.trace.fraction = 1.0f;
 
-	CM_TraceThroughTerrainCollide( ( traceWork_t * ) (void *) &sightWork, tc );
+	CM_TraceThroughTerrainCollide( &sightWork, tc );
 
 	return sightWork.trace.fraction == 1.0f;
 }
 
 /* ---- CM_PositionTestInTerrainCollide  0x00421BE0 ---- VERIFIED */
-qboolean __cdecl CM_PositionTestInTerrainCollide(traceWork_t *twOpaque, void *tc)
+qboolean __cdecl CM_PositionTestInTerrainCollide(traceWork_t *tw, void *tc)
 {
-	cmTerrainTrace_t *tw = CM_TW( twOpaque );
 	float savedStartZ, savedEndZ;
 	qboolean result;
 
@@ -1779,7 +1423,7 @@ qboolean __cdecl CM_PositionTestInTerrainCollide(traceWork_t *twOpaque, void *tc
 	savedStartZ = tw->start[2];
 	savedEndZ = tw->end[2];
 
-	result = CM_PositionTestSphereWithTerrainCollide( twOpaque, tc );
+	result = CM_PositionTestSphereWithTerrainCollide( tw, tc );
 
 	tw->start[2] = savedStartZ;
 	tw->end[2] = savedEndZ;

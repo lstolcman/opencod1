@@ -1,996 +1,824 @@
 /*
  * @fidelity: likely
  * @fidelity-default: unreviewed
+ *
+ * tr_font.c -- font registration and 2D text layout / painting.
+ *
+ * CoD1 ships pre-rendered bitmap fonts (RTCW's fontImage_%i.dat scheme) plus a
+ * CJK ("asian") atlas path RTCW never had.  RE_RegisterFont loads a glyph table
+ * from disk; R_GetCharacterGlyph / R_GetGlyphHorizAdvance / R_GetAsianScale
+ * resolve per-glyph metrics (routing CJK codepoints through the shared
+ * g_asianGlyph record); RE_Text_Width / RE_Text_Height measure a string; and the
+ * RE_Text_* / R_Text_* console entry points queue text-draw render commands.
+ *
+ * fontInfo_t / glyphInfo_t come from tr_font.h.
+ * The render command RE_Text_PaintWithCursor writes is defined file-locally
+ * (textPaintCommand_t -- offsets proven against the retail binary and its
+ * RB_Text_Paint / RB_Text_PaintWithCursor backend reader, pinned with asserts);
+ * tr_local.h / tr_font.h are intentionally not touched.
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
+#include "tr_records.h"
 #include "tr_gl_types.h"
 #include "tr_tess.h"
+#include "tr_local.h"
 #include "tr_font.h"
+/* ---- renderer-owned globals ---- */
+int rendererRegisteredFontCount;   /* 0x014072F4 */
+int rendererAsianFontLoaded;   /* 0x014072F8 */
+char s_consoleTextBuffer[1024];
+int rendererAsianFontLoadedLanguage = -1;   /* 0x00571544  retail .data init 0xFFFFFFFF */
+int g_asianFontPageCount;
+int g_asianFontPageDimension;
+int g_asianFontPageHandles[4];
+int rendererAsianFontLastPageHalfHeight;
+byte *s_fontData;
+int s_fontDataOffset;
+
 
 extern int RE_RegisterShaderNoMip();
 extern int RE_SetColor();
-extern int RE_StretchPic();
-extern int R_FindShader();
-extern int __cdecl R_IssueRenderCommands( int runPerformanceCounters );
+unsigned int __cdecl RE_StretchPic( float x, float y, float w, float h,
+                                    float s1, float t1, float s2, float t2, int hShader );
+extern void         __cdecl   R_IssueRenderCommands( int runPerformanceCounters );
+extern void         __cdecl   R_SyncRenderThread( void );
+extern unsigned int __cdecl R_GetCommandBuffer( unsigned int bytes );
 
+int __cdecl SEH_ReadCharFromString( unsigned char **pCursor, unsigned int *pIsPunct );
 unsigned int __fastcall Japanese_CollapseShiftJISCode( int uiCode );
 unsigned int __fastcall Korean_CollapseKSC5601HangulCode( int uiCode );
 int          __fastcall Taiwanese_CollapseBig5Code( int uiCode );
 
+/* RE_Text_PaintWithCursor is defined last but queued by RE_Text_Paint and
+ * RE_Text_ConsolePaint above it. */
+void __cdecl RE_Text_PaintWithCursor( float x, float y, int font, float scale, float *color,
+                                      const char *text, int cursorPos, char cursorChar, int fixedAdvance, int limit, int style );
 
+/* Readable aliases for the two font globals (standalone symbols in the retail
+ * image; defined above). */
+#define registeredFontCount       rendererRegisteredFontCount    /* 0x014072F4  RE_RegisterFont cache count */
+#define asianFontLoaded           rendererAsianFontLoaded    /* 0x014072F8  CJK atlas is registered */
+#define asianFontLoadedLanguage   rendererAsianFontLoadedLanguage     /* 0x00571544  init -1, no writer (cache never hits) */
+
+/* RE_RegisterFont's eight-entry font cache (registeredFontCount tracks fill). */
 static fontInfo_t s_registeredFonts[8];
 
+/* The CJK atlas glyph record: R_LoadAsianFont seeds it, R_GetCharacterGlyph
+ * rewrites its atlas coordinates + page handle in place.  Declared in tr_font.h. */
 glyphInfo_t g_asianGlyph;
 
-#define dword_11CBCA4  g_asianGlyph.top
-#define flt_11CBCA8    g_asianGlyph.vertBearing
-#define dword_11CBCAC  g_asianGlyph.horzBearing
-#define flt_11CBCB0    g_asianGlyph.xSkip
-#define dword_11CBCB4  g_asianGlyph.imageWidth
-#define dword_11CBCB8  g_asianGlyph.imageHeight
-#define flt_11CBCBC    g_asianGlyph.s
-#define flt_11CBCC0    g_asianGlyph.t
-#define flt_11CBCC4    g_asianGlyph.s2
-#define flt_11CBCC8    g_asianGlyph.t2
-#define dword_11CBCCC  g_asianGlyph.glyph
+/* Text-draw render command (RC_TEXT_PAINT == 6).  RE_Text_PaintWithCursor fills
+ * it; RB_Text_Paint unpacks it back into RB_Text_PaintWithCursor.  The DWORD
+ * slots are copied verbatim from the producer arguments. */
+typedef struct {
+    int   commandId;     /* +0x00  RC_TEXT_PAINT */
+    float x;             /* +0x04 */
+    float y;             /* +0x08 */
+    int   font;          /* +0x0c  font handle */
+    float scale;         /* +0x10 */
+    byte  color[4];      /* +0x14  RGBA */
+    int   fixedAdvance;  /* +0x18  float bits; fixed per-glyph advance / justify width */
+    int   style;         /* +0x1c  justify / style mode */
+    int   cursorPos;     /* +0x20  glyph index to draw the cursor at, -1 = none */
+    char  cursorChar;    /* +0x24 */
+    char  text[1];       /* +0x25  NUL-terminated, variable length */
+} textPaintCommand_t;
+ASSERT_OFF(textPaintCommand_t, x, 0x04);
+ASSERT_OFF(textPaintCommand_t, y, 0x08);
+ASSERT_OFF(textPaintCommand_t, font, 0x0c);
+ASSERT_OFF(textPaintCommand_t, scale, 0x10);
+ASSERT_OFF(textPaintCommand_t, color, 0x14);
+ASSERT_OFF(textPaintCommand_t, fixedAdvance, 0x18);
+ASSERT_OFF(textPaintCommand_t, style, 0x1c);
+ASSERT_OFF(textPaintCommand_t, cursorPos, 0x20);
+ASSERT_OFF(textPaintCommand_t, cursorChar, 0x24);
+ASSERT_OFF(textPaintCommand_t, text, 0x25);
 
-int    __cdecl R_LoadAsianFont( const char *shaderPath );
-double __cdecl R_GetAsianScale( int font, float scale );
-double __cdecl R_GetGlyphHorizAdvance( unsigned int c, int font );
-int   *__cdecl R_GetCharacterGlyph( unsigned int c, int font );
-int __fastcall R_DrawStrlen( int ecxUnused, _BYTE *text );
-void   __cdecl RE_Text_PaintWithCursor( int a1, int a2, int a3, int a4, float *a5, const char *a6, int a7, char a8, int a9, int a10, int a11 );
 
-/* ---- R_LoadAsianFont  0x004DE850 ----  VERIFIED */
-int __cdecl R_LoadAsianFont(const char *a1)
+/* ---- R_LoadAsianFont  0x004DE850 ----  VERIFIED
+ * Register the CJK atlas pages for the current language into g_asianFontPage*
+ * and seed the shared g_asianGlyph metrics.  The retail cache guard compares
+ * asianFontLoadedLanguage (init -1, never written), so a supported language
+ * always reloads. */
+void __cdecl R_LoadAsianFont( const char *shaderUsage )
 {
-  int result;
-  int v2;
-  const char *v3;
-  int v4;
-  int v5;
-  char *Shader;
-  char v7[64]; // [esp+8h] [ebp-44h] BYREF
-  unsigned int v8;
-  unsigned int retaddr;
+  int         page;
+  const char *prefix;
+  int         pageCount;
+  int         cellSize;
+  char        shaderName[64];
 
-  v8 = retaddr ^ _security_cookie;
-  result = g_currentAsian;
-  v2 = 0;
   if ( !g_currentAsian )
   {
-    dword_14072F8 = 0;
-    return result;
+    asianFontLoaded = 0;
+    return;
   }
-  result = (int)cl_language;
-  if ( !dword_14072F8 || -1 != cl_language->integer )
+
+  if ( asianFontLoaded && asianFontLoadedLanguage == cl_language->integer )
+    return;
+
+  switch ( cl_language->integer )
   {
-    if ( cl_language->integer == 8 )
-    {
+    case 8:                                        /* Korean */
       g_asianFontPageDimension = 32;
-      v3 = "kor";
-    }
-    else
-    {
-      if ( cl_language->integer == 9 )
-      {
-        g_asianFontPageDimension = 64;
-        v4 = 4;
-        v3 = "tai";
-        goto LABEL_13;
-      }
-      result = cl_language->integer - 10;
-      if ( cl_language->integer != 10 )
-      {
-        dword_14072F8 = 0;
-        return result;
-      }
+      prefix = "kor";
+      pageCount = 3;
+      break;
+    case 9:                                        /* Taiwanese */
       g_asianFontPageDimension = 64;
-      v3 = "jap";
-    }
-    v4 = 3;
-LABEL_13:
-    g_asianFontPageCount = v4;
-    do
-    {
-      Com_sprintf(v7, sizeof(v7), "font/%s_%d_1024_%d.tga", v3, 1024 / g_asianFontPageDimension, v2);
-      if ( tr_registered )
-      {
-        if ( strlen(v7) < 0x40 )
-        {
-          Shader = R_FindShader(v7, -4, 0, a1);
-          if ( (Shader[76] & 1) != 0 )
-            v5 = 0;
-          else
-            v5 = *((_DWORD *)Shader + 17);
-        }
-        else
-        {
-          Com_Printf("Shader name exceeds MAX_QPATH\n");
-          v5 = 0;
-        }
-      }
-      else
-      {
-        v5 = 0;
-      }
-      g_asianFontPageHandles[v2++] = v5;
-    }
-    while ( v2 < g_asianFontPageCount );
-    result = 1024 / g_asianFontPageDimension;
-    rendererAsianFontLastPageHalfHeight = 1;
-    dword_11CBCAC = 0;
-    dword_14072F8 = 1;
-    g_asianGlyph.height = 1024 / g_asianFontPageDimension;
-    dword_11CBCA4 = 1024 / g_asianFontPageDimension;
-    dword_11CBCB4 = 1024 / g_asianFontPageDimension;
-    flt_11CBCA8 = (float)(1024 / g_asianFontPageDimension);
-    dword_11CBCB8 = 1024 / g_asianFontPageDimension;
-    flt_11CBCB0 = flt_11CBCA8;
+      pageCount = 4;
+      prefix = "tai";
+      break;
+    case 10:                                       /* Japanese */
+      g_asianFontPageDimension = 64;
+      prefix = "jap";
+      pageCount = 3;
+      break;
+    default:
+      asianFontLoaded = 0;
+      return;
   }
-  return result;
+
+  g_asianFontPageCount = pageCount;
+  for ( page = 0; page < g_asianFontPageCount; page++ )
+  {
+    Com_sprintf( shaderName, sizeof( shaderName ), "font/%s_%d_1024_%d.tga",
+                 prefix, 1024 / g_asianFontPageDimension, page );
+    g_asianFontPageHandles[page] = RE_RegisterShaderNoMip( shaderName, shaderUsage );
+  }
+
+  cellSize = 1024 / g_asianFontPageDimension;
+  rendererAsianFontLastPageHalfHeight = 1;
+  g_asianGlyph.horzBearing = 0;
+  asianFontLoaded = 1;
+  g_asianGlyph.height      = cellSize;
+  g_asianGlyph.top         = cellSize;
+  g_asianGlyph.imageWidth  = cellSize;
+  g_asianGlyph.vertBearing = (float)cellSize;
+  g_asianGlyph.imageHeight = cellSize;
+  g_asianGlyph.xSkip       = g_asianGlyph.vertBearing;
 }
 
-/* ---- R_GetAsianCode  0x004DEA00 ----  VERIFIED */
-int __cdecl R_GetAsianCode(int this)
+/* ---- R_GetAsianCode  0x004DEA00 ----  VERIFIED
+ * Collapse a CJK codepoint to its atlas index for the active language, or 0. */
+int __cdecl R_GetAsianCode( int character )
 {
-  int result;
-
-  result = 0;
-  if ( dword_14072F8 )
+  int code = 0;
+  if ( asianFontLoaded )
   {
     switch ( cl_language->integer )
     {
-      case 8:
-        return Korean_CollapseKSC5601HangulCode(this);
-      case 9:
-        return Taiwanese_CollapseBig5Code(this);
-      case 0xA:
-        return Japanese_CollapseShiftJISCode(this);
+      case 8:  code = Korean_CollapseKSC5601HangulCode( character ); break;
+      case 9:  code = Taiwanese_CollapseBig5Code( character ); break;
+      case 10: code = Japanese_CollapseShiftJISCode( character ); break;
     }
   }
-  return result;
+  return code;
 }
 
-/* ---- R_GetCharacterGlyph  0x004DEA30 ----  VERIFIED */
-int *__cdecl R_GetCharacterGlyph(unsigned int a1, int a2)
+/* ---- R_GetCharacterGlyph  0x004DEA30 ----  VERIFIED
+ * Resolve a codepoint to its glyph.  A Latin (or unmapped) code indexes the
+ * font's own glyph table; a CJK code rewrites the shared g_asianGlyph atlas
+ * coordinates (per-language layout) and returns a pointer to it.  `c` carries
+ * the full two-byte code; only the Latin fallback masks it to a byte. */
+glyphInfo_t *__cdecl R_GetCharacterGlyph( unsigned int c, fontInfo_t *font )
 {
-  signed int v3;
-  signed int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  double v10;
-  double v11;
-  double v12;
-  int integer;
+  int code;
+  int page;
+  int row;
+  int column;
+  int pageRows;
+  int language;
 
-  if ( !dword_14072F8 )
-    return (int *)(a2 + 80 * (a1 & 0xFF));
-  integer = cl_language->integer;
-  switch ( integer )
+  if ( asianFontLoaded )
   {
-    case 8:
-      v3 = Korean_CollapseKSC5601HangulCode(a1);
-      break;
-    case 9:
-      v3 = Taiwanese_CollapseBig5Code(a1);
-      break;
-    case 10:
-      v3 = Japanese_CollapseShiftJISCode(a1);
-      break;
-    default:
-      return (int *)(a2 + 80 * (a1 & 0xFF));
-  }
-  v4 = v3;
-  if ( v3 )
-  {
-    v5 = g_asianFontPageDimension * g_asianFontPageDimension;
-    v6 = v3 / (g_asianFontPageDimension * g_asianFontPageDimension);
-    if ( v6 > g_asianFontPageCount )
-      v6 = 0;
-    v7 = (v3 - v6 * v5) / g_asianFontPageDimension;
-    v8 = (v4 - v6 * v5) % g_asianFontPageDimension;
-    if ( v6 == g_asianFontPageCount - 1 && rendererAsianFontLastPageHalfHeight )
-      v9 = g_asianFontPageDimension / 2;
-    else
-      v9 = g_asianFontPageDimension;
-    if ( integer == 9 )
+    language = cl_language->integer;
+    code = R_GetAsianCode(c);
+
+    if ( code )
     {
-      flt_11CBCBC = (double)(v8 * (1024 / g_asianFontPageDimension) + 1) * 0.0009765625;
-      flt_11CBCC0 = (double)(v7 * (1024 / v9) + 1) * 0.0009765625;
-      flt_11CBCC4 = (double)(1024 / g_asianFontPageDimension * (v8 + 1)) * 0.0009765625;
-      v12 = (double)(1024 / v9 * (v7 + 1));
-    }
-    else
-    {
-      if ( integer != 10 )
+      page = code / ( g_asianFontPageDimension * g_asianFontPageDimension );
+      if ( page > g_asianFontPageCount )
+        page = 0;
+      code -= page * ( g_asianFontPageDimension * g_asianFontPageDimension );
+      column = code % g_asianFontPageDimension;
+      row    = code / g_asianFontPageDimension;
+      if ( page == g_asianFontPageCount - 1 && rendererAsianFontLastPageHalfHeight )
+        pageRows = g_asianFontPageDimension / 2;
+      else
+        pageRows = g_asianFontPageDimension;
+
+      switch ( language )
       {
-        v10 = (double)g_asianFontPageDimension;
-        flt_11CBCBC = (double)v8 / v10;
-        v11 = (double)v9;
-        flt_11CBCC0 = (double)v7 / v11;
-        flt_11CBCC4 = (double)(v8 + 1) / v10;
-        flt_11CBCC8 = (double)(v7 + 1) / v11;
-LABEL_21:
-        dword_11CBCCC = g_asianFontPageHandles[v6];
-        return (int *)&g_asianGlyph;
+        case 8:                                    /* Korean: normalized cell coords */
+        default:
+          g_asianGlyph.s  = (rfloat)column         / (rfloat)g_asianFontPageDimension;
+          g_asianGlyph.t  = (rfloat)row            / (rfloat)pageRows;
+          g_asianGlyph.s2 = (rfloat)( column + 1 ) / (rfloat)g_asianFontPageDimension;
+          g_asianGlyph.t2 = (rfloat)( row + 1 )    / (rfloat)pageRows;
+          break;
+        case 9:                                    /* Taiwanese: half-texel inset */
+          g_asianGlyph.s  = (rfloat)( ( 1024 / g_asianFontPageDimension ) * column + 1 ) / 1024.0f;
+          g_asianGlyph.t  = (rfloat)( ( 1024 / pageRows ) * row + 1 )                     / 1024.0f;
+          g_asianGlyph.s2 = (rfloat)( ( 1024 / g_asianFontPageDimension ) * ( column + 1 ) ) / 1024.0f;
+          g_asianGlyph.t2 = (rfloat)( ( 1024 / pageRows ) * ( row + 1 ) )                     / 1024.0f;
+          break;
+        case 10:                                   /* Japanese: full-texel inset */
+          g_asianGlyph.s  = (rfloat)( ( 1024 / g_asianFontPageDimension ) * column )           / 1024.0f;
+          g_asianGlyph.t  = (rfloat)( ( 1024 / pageRows ) * row )                               / 1024.0f;
+          g_asianGlyph.s2 = (rfloat)( ( 1024 / g_asianFontPageDimension ) * ( column + 1 ) - 1 ) / 1024.0f;
+          g_asianGlyph.t2 = (rfloat)( ( 1024 / pageRows ) * ( row + 1 ) - 1 )                     / 1024.0f;
+          break;
       }
-      flt_11CBCBC = (double)(v8 * (1024 / g_asianFontPageDimension)) * 0.0009765625;
-      flt_11CBCC0 = (double)(v7 * (1024 / v9)) * 0.0009765625;
-      flt_11CBCC4 = (double)(1024 / g_asianFontPageDimension * (v8 + 1) - 1) * 0.0009765625;
-      v12 = (double)(1024 / v9 * (v7 + 1) - 1);
+
+      g_asianGlyph.glyph = g_asianFontPageHandles[page];
+      return &g_asianGlyph;
     }
-    flt_11CBCC8 = v12 * 0.0009765625;
-    goto LABEL_21;
   }
-  return (int *)(a2 + 80 * (a1 & 0xFF));
+
+  return &font->glyphs[c & 0xFF];
 }
 
-/* ---- R_GetGlyphHorizAdvance  0x004DEC50 ----  VERIFIED */
-double __cdecl R_GetGlyphHorizAdvance(unsigned int a1, int a2)
+/* ---- R_GetGlyphHorizAdvance  0x004DEC50 ----  VERIFIED
+ * Horizontal advance for a codepoint: the CJK atlas xSkip for a mapped CJK
+ * code, else the glyph's own xSkip (falling back to '.' when it is zero). */
+double __cdecl R_GetGlyphHorizAdvance( unsigned int c, fontInfo_t *font )
 {
-  unsigned int v3;
-  double v5;
+  unsigned int code;
 
-  if ( !dword_14072F8 )
-    goto LABEL_10;
-  switch ( cl_language->integer )
+  if ( asianFontLoaded )
   {
-    case 8:
-      v3 = Korean_CollapseKSC5601HangulCode(a1);
-      break;
-    case 9:
-      v3 = Taiwanese_CollapseBig5Code(a1);
-      break;
-    case 0xA:
-      v3 = Japanese_CollapseShiftJISCode(a1);
-      break;
-    default:
-      goto LABEL_10;
+    switch ( cl_language->integer )
+    {
+      case 8:  code = Korean_CollapseKSC5601HangulCode( c ); break;
+      case 9:  code = Taiwanese_CollapseBig5Code( c );        break;
+      case 10: code = Japanese_CollapseShiftJISCode( c );     break;
+      default: goto notAsian;
+    }
+    if ( code )
+      return g_asianGlyph.xSkip;
   }
-  if ( v3 )
-    return flt_11CBCB0;
-LABEL_10:
-  v5 = *(float *)(80 * (a1 & 0xFF) + a2 + 16);
-  if ( (v5 == 0.0) | __UNORDERED__(v5, 0.0) )
-    return *(float *)(a2 + 3696);
-  else
-    return *(float *)(80 * (a1 & 0xFF) + a2 + 16);
+notAsian:
+  if ( font->glyphs[c & 0xFF].xSkip != 0.0f )
+    return font->glyphs[c & 0xFF].xSkip;
+  return font->glyphs['.'].xSkip;
 }
 
-/* ---- R_GetAsianScale  0x004DECD0 ----  VERIFIED */
-double __cdecl R_GetAsianScale(int font, float a1)
+/* ---- R_GetAsianScale  0x004DECD0 ----  VERIFIED
+ * Per-glyph scale for the CJK atlas relative to the font's 48-point base,
+ * clamped so an adjusted glyph never renders below 16 screen pixels.  The
+ * SCR_AdjustFrom640 result is intentionally discarded (retail retains the
+ * independently computed scale). */
+double __cdecl R_GetAsianScale( fontInfo_t *font, float scale )
 {
-  int v1 = font;
-  float v3;
+  float asianScale;
+  float adjustedHeight;
 
-  v3 = 48.0 / *(float *)(v1 + 20480) / (double)g_asianGlyph.height;
-  if ( a1 > 0.25 )
-    v3 = ((a1 - 0.25) * 0.40000001 + 0.25) / a1 * v3;
-  a1 = (double)dword_11CBCB8 * v3 * a1 * *(float *)(v1 + 20480);
-  ri_SCR_AdjustFrom640(0, 0, 0, &a1);
-  if ( (a1 < 16.0) | __UNORDERED__(a1, 16.0) )
-    return 16.0 / a1 * v3;
-  else
-    return v3;
+  asianScale = (rfloat)48.0f / font->glyphScale / g_asianGlyph.height;
+  if ( scale > 0.25f )
+    asianScale = ( ( (rfloat)scale - 0.25f ) * 0.4f + 0.25f ) / scale * asianScale;
+
+  adjustedHeight = (rfloat)g_asianGlyph.imageHeight * asianScale * scale * font->glyphScale;
+  ri.SCR_AdjustFrom640( 0, 0, 0, &adjustedHeight );
+
+  if ( adjustedHeight < 16.0f )
+    return FCAST( (rfloat)16.0f / adjustedHeight ) * asianScale;
+  return asianScale;
 }
 
 /* ---- R_GetAsianGlyphHeight  0x004DED70 ----  VERIFIED */
-double R_GetAsianGlyphHeight()
+double R_GetAsianGlyphHeight( void )
 {
   return (double)g_asianGlyph.height;
 }
 
-/* ---- readInt  0x004DED80 ----  VERIFIED */
-int readInt()
+/* ---- readInt  0x004DED80 ----  VERIFIED
+ * Little-endian 32-bit read from the font-data cursor; advances it by 4.
+ * RE_RegisterFont's calls are inlined. */
+int readInt( void )
 {
-  int result;
-
-  result = *(unsigned __int8 *)(s_fontDataOffset + s_fontData)
-         + ((*(unsigned __int8 *)(s_fontDataOffset + s_fontData + 1)
-           + ((*(unsigned __int8 *)(s_fontDataOffset + s_fontData + 2)
-             + (*(unsigned __int8 *)(s_fontDataOffset + s_fontData + 3) << 8)) << 8)) << 8);
+  int i = s_fontData[s_fontDataOffset] + ( s_fontData[s_fontDataOffset + 1] << 8 )
+        + ( s_fontData[s_fontDataOffset + 2] << 16 ) + ( s_fontData[s_fontDataOffset + 3] << 24 );
   s_fontDataOffset += 4;
-  return result;
-}
-
-/* ---- readFloat  0x004DEDC0 ----  VERIFIED */
-double readFloat()
-{
-  double result;
-
-  result = *(float *)(s_fontDataOffset + s_fontData);
-  s_fontDataOffset += 4;
-  return result;
-}
-
-/* ---- RE_RegisterFont  0x004DEE00 ----  VERIFIED */
-void __cdecl RE_RegisterFont(int a1, int size, int a5, const char *a6)
-{
-  int v6;
-  int v7;
-  int v8;
-  char *v9;
-  int v10;
-  int v11;
-  unsigned __int8 *v12;
-  _DWORD *v13;
-  int v14;
-  unsigned __int8 *v15;
-  char v16;
-  char v17;
-  int v18;
-  int v19;
-  int v20;
-  int v21;
-  int v22;
-  int v23;
-  char v24;
-  int v25;
-  char *v26;
-  int v27;
-  int v28;
-  char *Shader;
-  int v30;
-  int v34;
-  int v35;
-  int v36;
-  int v37;
-  int v38;
-  int v39;
-  int v40;
-  int v41;
-  int v42;
-  int v43; // [esp+24h] [ebp-408h] BYREF
-  char Source[1024]; // [esp+28h] [ebp-404h] BYREF
-  unsigned int v45;
-  unsigned int retaddr;
-
-  v6 = size;
-  v45 = retaddr ^ _security_cookie;
-  if ( size <= 0 )
-    v6 = 12;
-  if ( tr_registered )
-    R_IssueRenderCommands(0);       /* `push 0` -- ONE argument */
-  R_LoadAsianFont(a6);
-  if ( dword_14072F4 < 8 )
-  {
-    Com_sprintf(Source, sizeof(Source), "fonts/fontImage_%i.dat", v6);
-    v7 = dword_14072F4;
-    v8 = 0;
-    if ( dword_14072F4 <= 0 )
-    {
-LABEL_12:
-      if ( ri_FS_ReadFile(Source, 0) == 20552 )
-      {
-        ri_FS_ReadFile(Source, &v43);
-        v10 = v43;
-        s_fontData = v43;
-
-        {
-          const unsigned char *cur = (const unsigned char *)v10;
-          int glyphIndex;
-
-          for ( glyphIndex = 0; glyphIndex < 256; glyphIndex++ )
-          {
-            _DWORD *g = (_DWORD *)( a5 + 80 * glyphIndex );
-            int field;
-
-            for ( field = 0; field < 12; field++ )
-            {
-              g[field] = cur[0] | ( cur[1] << 8 ) | ( cur[2] << 16 ) | ( cur[3] << 24 );
-              cur += 4;
-            }
-            qmemcpy( g + 12, cur, 0x20u );
-            cur += 32;
-          }
-
-          *(_DWORD *)(a5 + 20480) = cur[0] | ( cur[1] << 8 ) | ( cur[2] << 16 ) | ( cur[3] << 24 );
-          cur += 4;
-          *(_DWORD *)(a5 + 20484) = cur[0] | ( cur[1] << 8 ) | ( cur[2] << 16 ) | ( cur[3] << 24 );
-          cur += 4;
-          s_fontDataOffset = (int)cur - v10;
-          qmemcpy((void *)(a5 + 20488), cur, 0x40u);
-          strncpy((char *)(a5 + 20488), Source, 0x3Fu);
-          *(_BYTE *)(a5 + 20551) = 0;
-        }
-        v26 = (char *)(a5 + 48);
-        v27 = 255;
-        do
-        {
-          if ( tr_registered )
-          {
-            if ( strlen(v26) < 0x40 )
-            {
-              Shader = R_FindShader(v26, -4, 0, a6);
-              if ( (Shader[76] & 1) != 0 )
-                v28 = 0;
-              else
-                v28 = *((_DWORD *)Shader + 17);
-            }
-            else
-            {
-              Com_Printf("Shader name exceeds MAX_QPATH\n");
-              v28 = 0;
-            }
-          }
-          else
-          {
-            v28 = 0;
-          }
-          *((_DWORD *)v26 - 1) = v28;
-          v26 += 80;
-          --v27;
-        }
-        while ( v27 );
-        v30 = dword_14072F4;
-        qmemcpy(&s_registeredFonts[dword_14072F4], (const void *)a5, 0x5048u);
-        dword_14072F4 = v30 + 1;
-        ri_FS_FreeFile(v43);
-      }
-      else
-      {
-        ri_Printf(0, "RE_RegisterFont: Unable to load font data %s\n", Source);
-      }
-    }
-    else
-    {
-      v9 = s_registeredFonts[0].name;               /* retail 0x011A8A50 */
-      while ( !v9 || Q_stricmpn(Source, v9, 99999) )
-      {
-        ++v8;
-        v9 += 20552;
-        if ( v8 >= v7 )
-          goto LABEL_12;
-      }
-      qmemcpy((void *)a5, &s_registeredFonts[v8], 0x5048u);
-    }
-  }
-  else
-  {
-    ri_Printf(0, "RE_RegisterFont: Too many fonts registered already.\n");
-  }
-}
-
-/* ---- R_InitFreeType  0x004DF2E0 ----  VERIFIED */
-int R_InitFreeType()
-{
-  int result;
-
-  result = 0;
-  dword_14072F4 = 0;
-  dword_14072F8 = 0;
-  return result;
-}
-
-/* ---- R_DoneFreeType  0x004DF2F0 ----  VERIFIED */
-int R_DoneFreeType()
-{
-  int result;
-
-  result = 0;
-  dword_14072F4 = 0;
-  dword_14072F8 = 0;
-  return result;
-}
-
-/* ---- R_GetFontInfo  0x004DF300 ----  VERIFIED */
-int __cdecl R_GetFontInfo(int ecxArg, int a1)
-{
-  return ri_GetFontInfo(ecxArg, a1);
-}
-
-/* ---- RE_Text_Width  0x004DF310 ----  VERIFIED */
-int __cdecl RE_Text_Width(char *a1, int a2, float a3, float a4, int a5)
-{
-  int v6;
-  cvar_t *v7;
-  unsigned __int8 v8;
-  char v9;
-  unsigned int v10;
-  int v11;
-  char v12;
-  unsigned int v13;
-  unsigned __int8 v14;
-  unsigned __int8 v15;
-  char v16;
-  double v17;
-  double GlyphHorizAdvance;
-  int v20;
-  float v21;
-  float AsianScale;
-  float v23;
-  float v24;
-
-  v6 = ri_GetFontInfo(a2, LODWORD(a3));
-  if ( (a4 == 0.0) | __UNORDERED__(a4, 0.0) )
-    v23 = a3 * *(float *)(v6 + 20480);
-  else
-    v23 = a4;
-  AsianScale = 1.0;
-  if ( g_currentAsian )
-    AsianScale = R_GetAsianScale(v6, a3);   /* `mov ecx, edi` at 0x4DF36A */
-  v24 = 0.0;
-  v21 = 0.0;
-  if ( a1 )
-  {
-    if ( a5 <= 0 )
-      a5 = 0x7FFFFFFF;
-    v20 = 0;
-    if ( *a1 )
-    {
-      v7 = cl_language;
-      while ( 1 )
-      {
-        if ( v20 >= a5 )
-          return (int)(v21 * v23);
-        if ( !g_currentAsian )
-          break;
-        switch ( v7->integer )
-        {
-          case 8:
-            v14 = *a1;
-            v15 = a1[1];
-            if ( (unsigned __int8)*a1 < 0xB0u || v14 > 0xC8u || v15 <= 0xA0u || v15 == 0xFF )
-              goto LABEL_38;
-            v10 = v15 + (v14 << 8);
-            a1 += 2;
-            break;
-          case 9:
-            v11 = (unsigned __int8)a1[1];
-            v12 = a1[1];
-            v13 = (unsigned int)(v11 + ((unsigned __int8)*a1 << 8)) >> 8;
-            if ( ((unsigned __int8)v13 < 0xA1u || (unsigned __int8)v13 > 0xC6u)
-              && ((unsigned __int8)v13 < 0xC9u || (unsigned __int8)v13 > 0xF9u)
-              || ((unsigned __int8)v12 < 0x40u || (unsigned __int8)v12 > 0x7Eu)
-              && ((unsigned __int8)v12 < 0xA1u || v12 == -1) )
-            {
-              goto LABEL_38;
-            }
-            v10 = v11 + ((unsigned __int8)*a1 << 8);
-            a1 += 2;
-            break;
-          case 0xA:
-            v8 = *a1;
-            v9 = a1[1];
-            if ( ((unsigned __int8)*a1 < 0x81u || v8 > 0x9Fu) && (v8 < 0xE0u || v8 > 0xEFu) )
-              goto LABEL_38;
-            if ( ((unsigned __int8)v9 < 0x40u || (unsigned __int8)v9 > 0x7Eu) && v9 > -4 )
-              goto LABEL_38;
-            v10 = (unsigned __int8)v9 + (v8 << 8);
-            a1 += 2;
-            break;
-          default:
-            goto LABEL_38;
-        }
-LABEL_39:
-        if ( v10 == 10 )
-        {
-          v24 = 0.0;
-        }
-        else if ( v10 == 94 && a1 && (v16 = *a1, *a1 != 94) && v16 >= 48 && v16 <= 55 )
-        {
-          ++a1;
-        }
-        else
-        {
-          if ( (a4 == 0.0) | __UNORDERED__(a4, 0.0) )
-          {
-            GlyphHorizAdvance = R_GetGlyphHorizAdvance(v10, v6);
-            if ( v10 > 0xFF )
-              GlyphHorizAdvance = GlyphHorizAdvance * AsianScale;
-            v17 = GlyphHorizAdvance + v24;
-          }
-          else
-          {
-            v17 = v24 + 1.0;
-          }
-          v24 = v17;
-          if ( v24 > (double)v21 )
-            v21 = v17;
-          ++v20;
-        }
-        if ( !*a1 )
-          return (int)(v21 * v23);
-      }
-LABEL_38:
-      v10 = (unsigned __int8)*a1++;
-      goto LABEL_39;
-    }
-  }
-  return (int)(v21 * v23);
-}
-
-/* ---- RE_Text_Height  0x004DF540 ----  VERIFIED */
-int __cdecl RE_Text_Height(int a1, float a2)
-{
-  return (int)(a2 * *(float *)(ri_GetFontInfo(a1, LODWORD(a2)) + 20484));
-}
-
-/* ---- RE_Text_Paint  0x004DF570 ----  VERIFIED */
-void __cdecl RE_Text_Paint(int a1, int a2, int a3, int a4, float *a5, const char *a6, int a7, int a8, int a9)
-{
-  RE_Text_PaintWithCursor(a1, a2, a3, a4, a5, a6, -1, 0, a7, a8, a9);
-}
-
-/* ---- R_Text_GetConsoleString  0x004DF5B0 ----  VERIFIED */
-int __cdecl R_Text_GetConsoleString(_DWORD *a1, float *a2, int a3, int *a4, _DWORD *a5)
-{
-  int v6;
-  int v7;
-  int v8;
-  unsigned __int16 v9;
-  int v10;
-  int v11;
-  char v12;
-  int v14;
-  int i;
-
-  *a1 = s_consoleTextBuffer;
-  if ( *a4 > 1023 )
-    *a4 = 1023;
-  s_consoleTextBuffer[0] = 0;
-  v6 = 0;
-  v7 = -1;
-  v8 = 0;
-  v14 = 7;
-  for ( i = 0; v8 < *a4; ++v8 )
-  {
-    v9 = *(_WORD *)(a3 + 2 * v8);
-    v10 = HIBYTE(v9);
-    if ( v10 == v14 )
-      goto LABEL_19;
-    switch ( v10 )
-    {
-      case 13:
-      case 16:
-      case 17:
-      case 18:
-        *a5 = a3 + 2 * v8;
-        v7 = -1;
-        i = 1;
-        goto LABEL_27;
-      case 10:
-        if ( a2 )
-          *a2 = (double)(unsigned __int8)*(_WORD *)(a3 + 2 * v8) * 0.0039215689;
-        break;
-      case 11:
-        if ( a2 )
-          a2[1] = (double)(unsigned __int8)*(_WORD *)(a3 + 2 * v8) * 0.0039215689;
-        break;
-      case 12:
-        if ( a2 )
-          a2[2] = (double)(unsigned __int8)*(_WORD *)(a3 + 2 * v8) * 0.0039215689;
-        break;
-      default:
-        s_consoleTextBuffer[v6] = 94;
-        v14 = HIBYTE(v9);
-        v11 = v6 + 1;
-        s_consoleTextBuffer[v11] = HIBYTE(v9) + 48;
-        v6 = v11 + 1;
-LABEL_19:
-        v12 = *(_BYTE *)(a3 + 2 * v8);
-        s_consoleTextBuffer[v6] = v12;
-        if ( v12 == 32 )
-        {
-          if ( v7 == -1 )
-            v7 = v6;
-        }
-        else
-        {
-          v7 = -1;
-        }
-        ++v6;
-        continue;
-    }
-  }
-LABEL_27:
-  s_consoleTextBuffer[v6] = 0;
-  if ( v7 >= 0 )
-    s_consoleTextBuffer[v7] = 0;
-  if ( v8 == *a4 )
-    *a5 = 0;
-  else
-    *a5 = a3 + 2 * v8;
-  *a4 -= v8;
   return i;
 }
 
-/* ---- R_Text_GetConsoleIcon  0x004DF750 ----  VERIFIED */
-int __cdecl R_Text_GetConsoleIcon(
-        _DWORD *a1,
-        int a2,
-        int *a3,
-        float a4,
-        float *a5,
-        float *a6,
-        int *a7,
-        float *a8)
-{
-  double v8;
-  int result;
-  int v10;
-  int v11;
-  int v12;
-  float *v13;
-  double v14;
-  char *v15;
-  __int16 v16;
-  char v17[64]; // [esp+0h] [ebp-44h] BYREF
-  unsigned int v18;
-  unsigned int retaddr;
+/* ---- readFloat  0x004DEDC0 ----  VERIFIED */
+typedef union {
+  byte  fred[4];
+  float ffred;
+} poor;
 
-  v8 = a4 * 48.0;
-  v18 = retaddr ^ _security_cookie;
-  *a5 = v8;
-  *a6 = v8;
-  *a7 = 0;
-  memset(v17, 0, sizeof(v17));
-  result = *a3;
-  v10 = 0;
-  if ( *a3 > 0 )
-  {
-    while ( 2 )
-    {
-      v11 = HIBYTE(*(unsigned __int16 *)(a2 + 2 * v10));
-      v12 = (unsigned __int8)*(_WORD *)(a2 + 2 * v10);
-      switch ( v11 )
-      {
-        case 13:
-          v13 = a8;
-          if ( !a8 )
-            goto LABEL_13;
-          v14 = (double)v12 * 0.0039215689;
-          goto LABEL_12;
-        case 14:
-          if ( a8 )
-            a8[1] = (double)v12 * 0.0039215689;
-          goto LABEL_13;
-        case 15:
-          if ( a8 )
-            a8[2] = (double)v12 * 0.0039215689;
-          goto LABEL_13;
-        case 16:
-          v13 = a5;
-          goto LABEL_11;
-        case 17:
-          v13 = a6;
-LABEL_11:
-          v14 = (double)v12 * 0.03125 * *v13;
-LABEL_12:
-          *v13 = v14;
-LABEL_13:
-          *a1 += 2;
-          goto LABEL_14;
-        case 18:
-          if ( v11 == 18 )
-          {
-            v15 = v17;
-            do
-            {
-              if ( !v12 )
-                break;
-              if ( v10 >= *a3 - 1 )
-                break;
-              *v15++ = v12;
-              *a1 += 2;
-              v16 = *(_WORD *)(a2 + 2 * v10++ + 2);
-              v12 = (unsigned __int8)v16;
-            }
-            while ( (v16 & 0xFF00) == 0x1200 );
-          }
-          *a7 = RE_RegisterShaderNoMip(v17, (const char *)5);
-          result = *a3 - v10;
-          *a3 = result;
-          return result;
-        default:
-LABEL_14:
-          result = *a3;
-          if ( ++v10 >= *a3 )
-            return result;
-          continue;
-      }
-    }
-  }
-  return result;
+float readFloat( void )
+{
+  poor me;
+
+  me.fred[0] = s_fontData[s_fontDataOffset + 0];
+  me.fred[1] = s_fontData[s_fontDataOffset + 1];
+  me.fred[2] = s_fontData[s_fontDataOffset + 2];
+  me.fred[3] = s_fontData[s_fontDataOffset + 3];
+  s_fontDataOffset += 4;
+  return me.ffred;
 }
 
-/* ---- R_DrawStrlen  0x004DF8E0 ----  VERIFIED */
-int __fastcall R_DrawStrlen(int a1, _BYTE *a2)
+/* ---- RE_RegisterFont  0x004DEE00 ----  VERIFIED
+ * Register a point-sized bitmap font (Q3's RE_RegisterFont): return a cached
+ * copy if the .dat has been read before, otherwise read the fixed little-endian
+ * glyph table through readInt/readFloat, resolve a shader for every glyph, and
+ * cache the result.  `fontName` is the legacy renderer-export argument the
+ * retail body never reads. */
+void __cdecl RE_RegisterFont( const char *fontName, int pointSize, fontInfo_t *font, const char *shaderUsage )
 {
-  int result;
-  char v3;
+  int   i;
+  void *faceData;
+  char  name[1024];
 
-  result = 0;
-  if ( *a2 )
+  (void)fontName;
+
+  if ( pointSize <= 0 )
+    pointSize = 12;
+
+  R_SyncRenderThread();
+  R_LoadAsianFont( shaderUsage );
+
+  if ( registeredFontCount >= 8 )
   {
-    do
+    ri.Printf( 0, "RE_RegisterFont: Too many fonts registered already.\n" );
+    return;
+  }
+
+  Com_sprintf( name, sizeof( name ), "fonts/fontImage_%i.dat", pointSize );
+  for ( i = 0; i < registeredFontCount; i++ )
+  {
+    if ( !Q_stricmp( name, s_registeredFonts[i].name ) )
     {
-      if ( *a2 == 94 && (v3 = a2[1]) != 0 && v3 != 94 && v3 >= 48 && v3 <= 55 )
-        a2 += 2;
+      memcpy( font, &s_registeredFonts[i], sizeof( fontInfo_t ) );
+      return;
+    }
+  }
+
+  if ( ri.FS_ReadFile( name, 0 ) == (int)sizeof( fontInfo_t ) )
+  {
+    ri.FS_ReadFile( name, &faceData );
+    s_fontDataOffset = 0;
+    s_fontData = (byte *)faceData;
+    for ( i = 0; i < 256; i++ )
+    {
+      font->glyphs[i].height      = readInt();
+      font->glyphs[i].top         = readInt();
+      font->glyphs[i].vertBearing = readFloat();
+      font->glyphs[i].horzBearing = readFloat();
+      font->glyphs[i].xSkip       = readFloat();
+      font->glyphs[i].imageWidth  = readInt();
+      font->glyphs[i].imageHeight = readInt();
+      font->glyphs[i].s           = readFloat();
+      font->glyphs[i].t           = readFloat();
+      font->glyphs[i].s2          = readFloat();
+      font->glyphs[i].t2          = readFloat();
+      font->glyphs[i].glyph       = readInt();
+      memcpy( font->glyphs[i].shaderName, &s_fontData[s_fontDataOffset], sizeof( font->glyphs[i].shaderName ) );
+      s_fontDataOffset += sizeof( font->glyphs[i].shaderName );
+    }
+    font->glyphScale = readFloat();
+    font->fontHeight = readFloat();
+    memcpy( font->name, &s_fontData[s_fontDataOffset], sizeof( font->name ) );
+    Q_strncpyz( font->name, name, sizeof( font->name ) );
+
+    /* resolve a shader handle for glyphs 0..254 */
+    for ( i = 0; i < 255; i++ )
+      font->glyphs[i].glyph = RE_RegisterShaderNoMip( font->glyphs[i].shaderName, shaderUsage );
+
+    memcpy( &s_registeredFonts[registeredFontCount++], font, sizeof( fontInfo_t ) );
+    ri.FS_FreeFile( faceData );
+    return;
+  }
+
+  ri.Printf( 0, "RE_RegisterFont: Unable to load font data %s\n", name );
+}
+
+/* ---- R_InitFreeType  0x004DF2E0 ----  VERIFIED  (returns 0, dead EAX) */
+int R_InitFreeType( void )
+{
+  registeredFontCount = 0;
+  asianFontLoaded = 0;
+  return 0;
+}
+
+/* ---- R_DoneFreeType  0x004DF2F0 ----  VERIFIED  (returns 0, dead EAX) */
+int R_DoneFreeType( void )
+{
+  registeredFontCount = 0;
+  asianFontLoaded = 0;
+  return 0;
+}
+
+/* ---- R_GetFontInfo  0x004DF300 ----  VERIFIED */
+int __cdecl R_GetFontInfo( int fontHandle, float scale )
+{
+  return ri.GetFontInfo( fontHandle, *(int *)&scale );
+}
+
+/* ---- RE_Text_Width  0x004DF310 ----  VERIFIED
+ * Width (in scaled pixels) of the widest line in `text`, up to maxChars glyphs.
+ * Characters are read with SEH_ReadCharFromString (CJK codepoints when
+ * g_currentAsian, advanced by asianScale), colour escapes (^0..^7) are skipped
+ * and newlines reset the line.  With a nonzero fixedWidth every glyph counts as
+ * one unit. */
+int __cdecl RE_Text_Width( char *text, int fontHandle, float scale, float fixedWidth, int maxChars )
+{
+  fontInfo_t   *font;
+  const char   *s = text;
+  unsigned int  code;
+  rfloat        advance;
+  int           count;
+  float         maxWidth;
+  float         asianScale;
+  float         scaleWidth;
+  float         lineWidth;
+
+  font = (fontInfo_t *)ri.GetFontInfo( fontHandle, *(int *)&scale );
+  if ( fixedWidth != 0.0f )
+    scaleWidth = fixedWidth;
+  else
+    scaleWidth = scale * font->glyphScale;
+
+  asianScale = 1.0f;
+  if ( g_currentAsian )
+    asianScale = R_GetAsianScale( font, scale );
+
+  lineWidth = 0.0f;
+  maxWidth = 0.0f;
+  if ( s )
+  {
+    if ( maxChars <= 0 )
+      maxChars = 0x7FFFFFFF;
+    count = 0;
+    while ( *s )
+    {
+      if ( count >= maxChars )
+        break;
+      code = SEH_ReadCharFromString( (unsigned char **)&s, 0 );
+      if ( code == 10 )                            /* '\n' */
+      {
+        lineWidth = 0.0f;
+      }
+      else if ( code == 94 && s && *s != 94 && *s >= 48 && *s <= 55 )
+      {                                            /* '^' colour escape ^0..^7 */
+        s++;
+      }
       else
-        ++result;
+      {
+        if ( fixedWidth != 0.0f )
+        {
+          lineWidth = lineWidth + 1.0f;
+        }
+        else
+        {
+          advance = R_GetGlyphHorizAdvance( code, font );
+          if ( code > 0xFF )
+            advance = advance * asianScale;
+          lineWidth = advance + lineWidth;
+        }
+        if ( lineWidth > maxWidth )
+          maxWidth = lineWidth;
+        count++;
+      }
     }
-    while ( *++a2 );
   }
+  return (int)( maxWidth * scaleWidth );
+}
+
+/* ---- RE_Text_Height  0x004DF540 ----  VERIFIED */
+int __cdecl RE_Text_Height( int fontHandle, float scale )
+{
+  fontInfo_t *font = (fontInfo_t *)ri.GetFontInfo( fontHandle, *(int *)&scale );
+  return (int)( scale * font->fontHeight );
+}
+
+/* ---- RE_Text_Paint  0x004DF570 ----  VERIFIED */
+void __cdecl RE_Text_Paint( float x, float y, int font, float scale, float *color, const char *text, int fixedAdvance, int limit, int style )
+{
+  RE_Text_PaintWithCursor( x, y, font, scale, color, text, -1, 0, fixedAdvance, limit, style );
+}
+
+/* ---- R_Text_GetConsoleString  0x004DF5B0 ----  VERIFIED
+ * Unpack one drawable run of the console's 16-bit (attribute:char) word stream
+ * into s_consoleTextBuffer, re-inserting ^-colour escapes when the attribute
+ * changes and applying colour-value words (attrs 10/11/12) to `color`.  Stops
+ * at an icon/embedded control word (13/16/17/18).  Returns 1 when it stopped on
+ * such a control word, else 0. */
+int __cdecl R_Text_GetConsoleString( int *out, float *color, int srcWords, int *count, int *next )
+{
+  int            dst;
+  int            spacePos;
+  int            i;
+  int            code;
+  int            curColor;
+  int            result;
+  unsigned short word;
+  char           ch;
+
+  *out = (int)s_consoleTextBuffer;
+  if ( *count > 1023 )
+    *count = 1023;
+  s_consoleTextBuffer[0] = 0;
+  dst = 0;
+  spacePos = -1;
+  curColor = 7;
+  result = 0;
+
+  for ( i = 0; i < *count; i++ )
+  {
+    word = ( (const unsigned short *)srcWords )[i];
+    code = word >> 8;
+    if ( code != curColor )
+    {
+      if ( code == 13 || code == 16 || code == 17 || code == 18 )
+      {
+        *next = srcWords + 2 * i;
+        spacePos = -1;
+        result = 1;
+        break;
+      }
+      if ( code == 10 )
+      {
+        if ( color )
+          color[0] = ( word & 0xFF ) * 0.0039215689f;
+        continue;
+      }
+      if ( code == 11 )
+      {
+        if ( color )
+          color[1] = ( word & 0xFF ) * 0.0039215689f;
+        continue;
+      }
+      if ( code == 12 )
+      {
+        if ( color )
+          color[2] = ( word & 0xFF ) * 0.0039215689f;
+        continue;
+      }
+      s_consoleTextBuffer[dst] = 94;               /* '^' */
+      curColor = code;
+      dst++;
+      s_consoleTextBuffer[dst++] = code + 48;
+    }
+
+    ch = (char)( (const unsigned short *)srcWords )[i];
+    s_consoleTextBuffer[dst] = ch;
+    if ( ch == 32 )                                /* ' ' -- remember last wrap point */
+    {
+      if ( spacePos == -1 )
+        spacePos = dst;
+    }
+    else
+    {
+      spacePos = -1;
+    }
+    ++dst;
+  }
+
+  /* retail 0x004DF704/0x004DF70D store with no bound check; pointer stores keep modern /GS from adding a range-check fast-fail */
+  *( s_consoleTextBuffer + dst ) = 0;
+  if ( spacePos >= 0 )
+    *( s_consoleTextBuffer + spacePos ) = 0;
+  if ( i == *count )
+    *next = 0;
+  else
+    *next = srcWords + 2 * i;
+  *count -= i;
   return result;
 }
 
-/* ---- RE_Text_ConsoleWidth  0x004DF920 ----  VERIFIED */
-int __cdecl RE_Text_ConsoleWidth(int a1, int a2, float a3, float a4, int a5)
+/* ---- R_Text_GetConsoleIcon  0x004DF750 ----  VERIFIED
+ * Decode an embedded console icon (attribute-18 run naming a shader) plus the
+ * colour / size control words that precede it.  Outputs the icon width/height
+ * (defaulting to scale*48), its shader handle, and (via colorOut) the running
+ * colour; on an icon, *count is left as the number of unconsumed words. */
+void __cdecl R_Text_GetConsoleIcon( int *cursor, int srcWords, int *count, float scale,
+                                    float *widthOut, float *heightOut, int *shaderOut, float *colorOut )
 {
-  int v5;
-  float v6;
-  float v7;
-  int ConsoleString;
-  double v10;
-  float v12;
-  int v13; // [esp+4h] [ebp-10h] BYREF
-  int v14; // [esp+8h] [ebp-Ch] BYREF
-  int v15; // [esp+Ch] [ebp-8h] BYREF
-  int v16; // [esp+10h] [ebp-4h] BYREF
+  const unsigned short *src = (const unsigned short *)srcWords;
+  rfloat defaultSize;
+  int    i;
+  short word;
+  int    code;
+  int    value;
+  char  *namePtr;
+  char   iconName[64];
 
-  v5 = a1;
-  v12 = 0.0;
-  if ( a1 )
+  defaultSize = scale * 48.0f;
+  *widthOut = defaultSize;
+  *heightOut = defaultSize;
+  *shaderOut = 0;
+  memset( iconName, 0, sizeof( iconName ) );
+
+  for ( i = 0; i < *count; i++ )
   {
-    v6 = a4;
-    v7 = a3;
+    word  = src[i];
+    code  = ( word >> 8 ) & 0xFF;
+    value = word & 0xFF;
+    switch ( code )
+    {
+      case 13:                                     /* colour */
+        if ( colorOut )
+          colorOut[0] = value * 0.0039215689f;
+        *cursor += 2;
+        break;
+      case 14:
+        if ( colorOut )
+          colorOut[1] = value * 0.0039215689f;
+        *cursor += 2;
+        break;
+      case 15:
+        if ( colorOut )
+          colorOut[2] = value * 0.0039215689f;
+        *cursor += 2;
+        break;
+      case 16:                                     /* scale icon width */
+        *widthOut = FCAST( value * 0.03125f ) * *widthOut;
+        *cursor += 2;
+        break;
+      case 17:                                     /* scale icon height */
+        *heightOut = FCAST( value * 0.03125f ) * *heightOut;
+        *cursor += 2;
+        break;
+      case 18:                                     /* icon shader name run */
+        if ( code == 18 )                          /* retail re-tests the code here */
+        {
+          namePtr = iconName;
+          do
+          {
+            if ( !value )
+              break;
+            if ( i >= *count - 1 )
+              break;
+            *namePtr++ = (char)value;
+            *cursor += 2;
+            i++;
+            word  = src[i];
+            value = word & 0xFF;
+          }
+          while ( ( word & 0xFF00 ) == 0x1200 );
+        }
+        *shaderOut = RE_RegisterShaderNoMip( iconName, 5 );
+        *count -= i;
+        return;
+    }
+  }
+}
+
+/* ---- R_DrawStrlen  0x004DF8E0 ----  VERIFIED
+ * Visible length of `str`, skipping ^0..^7 colour escapes (an escape also
+ * swallows the following character). */
+int R_DrawStrlen( const char *str )
+{
+  const char *s = str;
+  int count = 0;
+
+  while ( *s )
+  {
+    if ( s[0] == '^' && s[1] && s[1] != '^' && s[1] >= '0' && s[1] <= '7' )
+      s += 2;
+    else
+      count++;
+    s++;
+  }
+  return count;
+}
+
+/* ---- RE_Text_ConsoleWidth  0x004DF920 ----  VERIFIED
+ * Total width of a console line, summing each drawable run (RE_Text_Width, or
+ * R_DrawStrlen*fixedWidth) plus embedded icon widths. */
+int __cdecl RE_Text_ConsoleWidth( int text, int font, float scale, float fixedWidth, int count )
+{
+  int   next;
+  int   hasIcon;
+  int   strPtr;
+  float iconWidth;
+  float iconHeight;
+  int   iconShader;
+  float total;
+
+  total = 0.0f;
+  next = text;
+  if ( next )
+  {
     do
     {
-      ConsoleString = R_Text_GetConsoleString(&v13, 0, v5, &a5, &a1);
-      if ( v13 )
+      hasIcon = R_Text_GetConsoleString( &strPtr, 0, next, &count, &next );
+      if ( strPtr && *(char *)strPtr )
       {
-        if ( *(_BYTE *)v13 )
-        {
-          if ( (a4 == 0.0) | __UNORDERED__(a4, 0.0) )
-          {
-            v14 = RE_Text_Width((char *)v13, a2, v7, v6, a5);
-            v10 = (double)v14;
-          }
-          else
-          {
-            v14 = R_DrawStrlen(0, (_BYTE *)v13);  /* ecx is dead in the callee */
-            v10 = (double)v14 * a4;
-          }
-          v12 = v10 + v12;
-        }
+        if ( fixedWidth != 0.0f )
+          total += (rfloat)R_DrawStrlen( (const char *)strPtr ) * fixedWidth;
+        else
+          total += RE_Text_Width( (char *)strPtr, font, scale, fixedWidth, count );
       }
-      if ( ConsoleString )
+      if ( hasIcon )
       {
-        R_Text_GetConsoleIcon(&a1, a1, &a5, v7, (float *)&v15, (float *)&v16, &v14, 0);
-        v12 = *(float *)&v15 + v12;
+        R_Text_GetConsoleIcon( &next, next, &count, scale, &iconWidth, &iconHeight, &iconShader, 0 );
+        total += iconWidth;
       }
-      v5 = a1;
     }
-    while ( a1 );
+    while ( next );
   }
-  return (int)v12;
+
+  return (int)total;
 }
 
-/* ---- R_Text_PaintConsoleIcon  0x004DFA10 ----  VERIFIED */
-unsigned int __cdecl R_Text_PaintConsoleIcon(int a1, int a2, int a3, int a4, int a5)
+/* ---- R_Text_PaintConsoleIcon  0x004DFA10 ----  VERIFIED
+ * Draw one embedded console icon after mapping its 640-relative rect to screen
+ * space.  Dead EAX = the raw bits of s2 (1.0f) from RE_StretchPic. */
+unsigned int __cdecl R_Text_PaintConsoleIcon( float x, float y, float w, float h, int shader )
 {
-  ri_SCR_AdjustFrom640(&a1, &a2, &a3, &a4);
-  return RE_StretchPic(a1, a2, a3, a4, 0, 0, 0x3F800000u, 1065353216, a5);
+  ri.SCR_AdjustFrom640( &x, &y, &w, &h );
+  return RE_StretchPic( x, y, w, h, 0.0f, 0.0f, 1.0f, 1.0f, shader );
 }
 
-/* ---- RE_Text_ConsolePaint  0x004DFA60 ----  VERIFIED */
-int __cdecl RE_Text_ConsolePaint(float a1, int a2, int a3, int a4, int *a5, int a6, int a7, int a8, int a9)
+/* ---- RE_Text_ConsolePaint  0x004DFA60 ----  VERIFIED
+ * Paint a console line: for each run, draw the text, advance by its width, then
+ * draw and advance past any embedded icon (centred on the baseline). */
+int __cdecl RE_Text_ConsolePaint( float x, float y, int font, float scale, int *colorIn, int text, float fixedWidth, int count, int style )
 {
-  int v9;
-  int v10;
-  int v11;
-  int result;
-  int ConsoleString;
-  char *v14;
-  int v15;
-  float v16;
-  int v17;
-  int v18; // [esp+3Ch] [ebp-30h] BYREF
-  int v19; // [esp+40h] [ebp-2Ch] BYREF
-  int v20; // [esp+44h] [ebp-28h] BYREF
-  int v21; // [esp+48h] [ebp-24h] BYREF
-  int v22; // [esp+4Ch] [ebp-20h] BYREF
-  int v23; // [esp+50h] [ebp-1Ch] BYREF
-  int v24; // [esp+54h] [ebp-18h] BYREF
-  int v25; // [esp+58h] [ebp-14h] BYREF
-  int v26[4]; // [esp+5Ch] [ebp-10h] BYREF
-  float v27;
+  int    color[4];
+  int    strPtr;
+  int    hasIcon;
+  char  *str;
+  float  penX;
+  float  iconWidth, iconHeight;
+  int    iconShader;
+  int    cursor;
 
-  v9 = a5[1];
-  v26[0] = *a5;
-  v10 = a5[2];
-  v26[1] = v9;
-  v11 = a5[3];
-  result = a6;
-  v26[2] = v10;
-  v26[3] = v11;
-  v27 = 0.0;
-  while ( a6 )
+  color[0] = colorIn[0];
+  color[1] = colorIn[1];
+  color[2] = colorIn[2];
+  color[3] = colorIn[3];
+  penX = 0.0f;
+  cursor = text;
+  if ( cursor )
   {
-    ConsoleString = R_Text_GetConsoleString(&v24, (float *)v26, result, &a8, &a6);
-    v14 = (char *)v24;
-    v15 = ConsoleString;
-    if ( !v24 || !*(_BYTE *)v24 )
-      goto LABEL_6;
-    v16 = *(float *)&a7;
-    *(float *)&v17 = v27 + a1;
-    RE_Text_PaintWithCursor(v17, a2, a3, a4, (float *)v26, (const char *)v24, -1, 0, a7, 0, a9);
-    if ( v15 )
+    do
     {
-      v22 = RE_Text_Width(v14, a3, *(float *)&a4, v16, a8);
-      v27 = (double)v22 + v27;
-LABEL_6:
-      if ( v15 )
+      hasIcon = R_Text_GetConsoleString( &strPtr, (float *)color, cursor, &count, &cursor );
+      str = (char *)strPtr;
+
+      if ( str && *str )
       {
-        R_Text_GetConsoleIcon(&a6, a6, &a8, *(float *)&a4, (float *)&v23, (float *)&v18, &v25, (float *)v26);
-        RE_SetColor((float *)v26);
-        v19 = v18;
-        v20 = v23;
-        *(float *)&v21 = *(float *)&a2 - (*(float *)&a4 * 38.400002 + *(float *)&v18) * 0.5;
-        *(float *)&v22 = v27 + a1;
-        ri_SCR_AdjustFrom640(&v22, &v21, &v20, &v19);
-        RE_StretchPic(v22, v21, v20, v19, 0, 0, 0x3F800000u, 1065353216, v25);
-        v27 = *(float *)&v23 + v27;
+        RE_Text_PaintWithCursor( penX + x, y, font, scale, (float *)color, str, -1, 0, *(int *)&fixedWidth, 0, style );
+        if ( hasIcon )
+          penX += RE_Text_Width( str, font, scale, fixedWidth, count );
+      }
+
+      if ( hasIcon )
+      {
+        R_Text_GetConsoleIcon( &cursor, cursor, &count, scale, &iconWidth, &iconHeight, &iconShader, (float *)color );
+        RE_SetColor( (float *)color );
+        /* the redundant parentheses are VC7 scheduling weight (retail's x87/push interleave) */
+        R_Text_PaintConsoleIcon( penX + x, ( y - ( ( ( scale * 38.400002f ) + iconHeight ) * 0.5f ) ),
+                                 iconWidth, iconHeight, iconShader );
+        penX += iconWidth;
       }
     }
-    result = a6;
+    while ( cursor );
   }
-  return result;
+  return cursor;
 }
 
-extern unsigned int __fastcall R_GetCommandBuffer( int ecxUnused, int bytes );
-
-/* ---- RE_Text_PaintWithCursor  0x004DFC10 ----  VERIFIED */
-void __cdecl RE_Text_PaintWithCursor(
-        int a1,
-        int a2,
-        int a3,
-        int a4,
-        float *a5,
-        const char *a6,
-        int a7,
-        char a8,
-        int a9,
-        int a10,
-        int a11)
+/* ---- RE_Text_PaintWithCursor  0x004DFC10 ----  VERIFIED
+ * Queue a text-draw render command; limit clamps the drawn length.  cursorPos/cursorChar place an
+ * optional cursor glyph.  Colour is packed to RGBA bytes; the text is copied and
+ * NUL-terminated into the command's trailing buffer. */
+void __cdecl RE_Text_PaintWithCursor( float x, float y, int font, float scale, float *color,
+                                      const char *text, int cursorPos, char cursorChar, int fixedAdvance, int limit, int style )
 {
-  signed int v12;
-  unsigned int CommandBuffer;
-  unsigned int v14;
+  textPaintCommand_t *cmd;
+  int                 len;
 
-  if ( a6 )
-  {
-    v12 = strlen(a6);
-    if ( a10 > 0 && v12 > a10 )
-      v12 = a10;
+  if ( !text )
+    return;
 
-    CommandBuffer = R_GetCommandBuffer(0, (v12 + 41) & 0xFFFFFFFC);
-    v14 = CommandBuffer;
-    if ( CommandBuffer )
-    {
-      *(_DWORD *)(CommandBuffer + 4) = a1;
-      *(_DWORD *)(CommandBuffer + 8) = a2;
-      *(_DWORD *)(CommandBuffer + 12) = a3;
-      *(_DWORD *)(CommandBuffer + 16) = a4;
-      *(_DWORD *)CommandBuffer = 6;
-      *(_BYTE *)(CommandBuffer + 20) = (unsigned char)(int)(*a5 * 255.0);
-      *(_BYTE *)(CommandBuffer + 21) = (unsigned char)(int)(a5[1] * 255.0);
-      *(_BYTE *)(CommandBuffer + 22) = (unsigned char)(int)(a5[2] * 255.0);
-      *(_DWORD *)(v14 + 24) = a9;
-      *(_BYTE *)(v14 + 36) = a8;
-      *(_DWORD *)(v14 + 28) = a11;
-      *(_BYTE *)(v14 + 23) = (unsigned char)(int)(a5[3] * 255.0);
-      *(_DWORD *)(v14 + 32) = a7;
-      qmemcpy((void *)(v14 + 37), a6, v12);
-      *(_BYTE *)(v14 + v12 + 37) = 0;
-    }
-  }
+  len = strlen( text );
+  if ( limit > 0 && len > limit )
+    len = limit;
+
+  cmd = (textPaintCommand_t *)R_GetCommandBuffer( ( len + 41 ) & ~3 );
+  if ( !cmd )
+    return;
+
+  cmd->commandId    = 6;                           /* RC_TEXT_PAINT */
+  cmd->x            = x;
+  cmd->y            = y;
+  cmd->font         = font;
+  cmd->scale        = scale;
+  cmd->color[0]     = (byte)( (rfloat)*color   * 255.0f );
+  cmd->color[1]     = (byte)( (rfloat)color[1] * 255.0f );
+  cmd->color[2]     = (byte)( (rfloat)color[2] * 255.0f );
+  cmd->color[3]     = (byte)( (rfloat)color[3] * 255.0f );
+  cmd->fixedAdvance = fixedAdvance;
+  cmd->style        = style;
+  cmd->cursorPos    = cursorPos;
+  cmd->cursorChar   = cursorChar;
+  memcpy( cmd->text, text, len );
+  cmd->text[len]    = 0;
 }

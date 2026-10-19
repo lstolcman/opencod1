@@ -1,21 +1,5 @@
-/*
- * g_misc_mp.c -- the odds and ends: the positional info_* spawns, the
- * teleporter, the corona, misc_spawner, and CoD's player-operated turret.
- *
- * Call of Duty 1.1 multiplayer (game_mp_x86.dll, 0x20027180 .. 0x200295CC).
- * The head of the file is RTCW's game/g_misc.c almost verbatim -- info_camp /
- * info_null / info_notnull / light / TeleportPlayer / misc_teleporter_dest /
- * misc_model / corona -- with every RTCW-specific misc entity (the grabber,
- * the gamemodels, the portal surfaces, the spotlights, the flak/mg42 mounts)
- * cut.  Everything from G_InitTurrets down is CoD's own and has no RTCW
- * ancestor: a fixed pool of 32 turret_t records, a player who is view-locked
- * to one while he uses it, and the arc/rate clamping that keeps the barrel
- * inside the weapon file's limits.
- *
- * Function order is binary order.
- *
- * @fidelity: likely
- */
+// g_misc_mp.c -- info_* spawns, teleporters, misc_spawner and the
+// player-operated turrets
 
 #include <stdlib.h>
 #include <string.h>
@@ -24,125 +8,75 @@
 #include "bg_public.h"
 #include "g_local.h"
 
-/* bg_misc.c's eventnames[] indices. */
-#define EV_STANCE_FORCE_STAND       140
-#define EV_STANCE_FORCE_CROUCH      141
-#define EV_STANCE_FORCE_PRONE       142
-#define EV_FIRE_WEAPON_MG42         168
-#define EV_PLAYER_TELEPORT_IN       199
-#define EV_PLAYER_TELEPORT_OUT      200
-
-/* g_public.h carries these in the original tree. */
-#define ET_TURRET                   11
-#define ENTITYNUM_WORLD             1022
-#define TR_LINEAR_STOP              3
-
-#define SVF_BROADCAST               128
-
-/* playerState_t.eFlags.  0x4000 and 0x8000 are the pair turret_use sets from
- * turret_t.useMode and G_ClientStopUsingTurret clears; TeleportPlayer gates
- * its knockback on the same pair. */
-#define EF_TELEPORT_BIT             0x00000008
-#define EF_TURRET_STANCE_MASK       0x0000C000
-
-/* playerState_t.pm_flags */
-#define PMF_TIME_KNOCKBACK          0x00000200
-
-/* bg_animation.c's copies; no header carries either. */
-#define ANIM_TOGGLEBIT              0x200
-#define ANIMFL_TURRET               0x004
-
-/* trap_DObjGetMatrixArray's entries are 64 bytes -- three 4-float rows and
-   then the translation at +0x30 -- so a matrix43_t does not overlay one.
-   G_DObjGetLocalTagMatrix hands back a float * into that array. */
+// DObj bone matrices are 4x4 (three 4-float rows, then the translation),
+// so a matrix43_t does not overlay one
 #define DOBJ_TAG_AXIS               0
 #define DOBJ_TAG_ORIGIN             12
-
-/* The content mask G_PlayerTurretPositionAndBlend traces with (0x20027FDA).
-   No name for it is recovered in this module. */
-#define MASK_TURRET_PLAYER          0x02810011
 
 /* level.time is advanced in 100 msec steps, but the turret code runs off the
  * 50 msec client frame. */
 #define FRAMETIME                   100
 #define TURRET_FRAMETIME            50
 
-/* The pool G_InitTurrets clears, 0x20089730 .. 0x20089F30. */
 #define MAX_TURRETS                 32
 
-/*
- * The per-turret state record.  gentity_t.turret points at one of the 32 in
- * the fixed pool; G_SpawnTurret takes the first free slot and G_FreeTurret
- * releases it.  Field names are inferred from United Offensive, which has this
- * same record with a heat/overheating pair appended (0x48 there against 0x40
- * here).
- *
- * minArc/maxArc are one float pair each rather than the four separately named
- * arcs UO uses, because turret_clientaim (0x2002810F) and turret_use
- * (0x20028E95) index them: [0] is the pitch pair, [1] the yaw pair.  The
- * spawn keys that fill them are "toparc"/"rightarc" (min, forced <= 0) and
- * "bottomarc"/"leftarc" (max, forced >= 0).
- */
+// gentity_t.turret points at one of the fixed pool; G_SpawnTurret takes the
+// first free slot and G_FreeTurret releases it
 typedef struct turret_s {
-	int inUse;                      /* +0x00 pool slot taken (G_SpawnTurret 0x20029000) */
-	int flags;                      /* +0x04 3 at spawn; 0x100/0x200/0x400 drive the pitch
-									       return, 0x800 means "eat the next teleport bit" */
-	int fireTimeRemaining;          /* +0x08 counts down by 50 in turret_track */
-	float minArc[2];                /* +0x0C pitch, +0x10 yaw */
-	float maxArc[2];                /* +0x14 pitch, +0x18 yaw */
-	float restPitch;                /* +0x1C -90 until turret_think_init traces for it */
-	int useMode;                    /* +0x20 weaponInfo_t.stance (G_SpawnTurret 0x2002907F) */
-	int stopUseEventType;           /* +0x24 -1 / 0 / 1 / 2 -> EV_STANCE_FORCE_* */
-	int fireSoundTime;              /* +0x28 counts the sustained-fire loop down */
-	vec3_t stopUseOrigin;           /* +0x2C where the player is put back */
-	float restPitchClamp;           /* +0x38 turret_UpdateTargetAngles 0x20028590 */
-	byte sustainedFireLoopSound;    /* +0x3C weaponInfo_t.loopFireSound, as an alias index */
-	byte sustainedFireStopSound;    /* +0x3D weaponInfo_t.stopFireSound */
+	int inUse;
+	int flags;                      // 0x100/0x200/0x400 drive the pitch return, 0x800 toggles the teleport bit on the next aim
+	int fireTimeRemaining;          // msec until it can fire again
+	float minArc[2];                // pitch, yaw ("toparc", "rightarc"), <= 0
+	float maxArc[2];                // pitch, yaw ("bottomarc", "leftarc"), >= 0
+	float restPitch;                // -90 until turret_think_init traces for it
+	int useMode;                    // weaponInfo_t.stance
+	int stopUseEventType;           // -1 none, 0 stand, 1 crouch, 2 prone
+	int fireSoundTime;              // counts the sustained-fire loop down
+	vec3_t stopUseOrigin;           // where the player is put back
+	float restPitchClamp;
+	byte sustainedFireLoopSound;    // sound alias index
+	byte sustainedFireStopSound;    // sound alias index
 	byte pad_0x3E[2];
 } turret_t;
 G_ASSERT_SIZE( turret_t, 64 );
 
-turret_t g_turrets[MAX_TURRETS];        /* 0x20089730 */
+turret_t g_turrets[MAX_TURRETS];
 
 /* forward: bg_weapon.c */
 byte BG_GetWeaponIndexForName( const char *name );
 
-/* forward: g_utils_mp.c -- the bone-space form of G_DObjSetLocalTag, which
-   takes a resolved bone index instead of a tag name (0x2003B790). */
+/* forward: g_utils_mp.c -- G_DObjSetLocalTag by bone index instead of tag name */
 void G_DObjSetLocalTagInternal( gentity_t *ent, const vec3_t origin, const vec3_t angles,
 								int boneIndex );
-
-/* forward: bg_animation.c's globals -- 0x200A1C80. */
-extern animScriptData_t bgs_animScriptData;
 
 /* forward: universal/com_math.c */
 float AngleSubtract( float a1, float a2 );
 float AngleNormalize180( float angle );
 void AnglesToAxis( const vec3_t angles, vec3_t axis[3] );
 void AxisToAngles( vec3_t axis[3], vec3_t angles );
-void MatrixTransformVector43( const matrix43_t *mat, vec3_t out, const vec3_t in );
+void MatrixTransformVector43( const vec3_t in, const matrix43_t *mat, vec3_t out );
+float *MatrixTransformVector( const vec3_t in, float m[9], vec3_t out );
 void MatrixMultiply43( const void *in0, const void *in1, void *out );
 float vectosignedyaw( const vec3_t vec );
+void YawVectors( float yaw, vec3_t forward, vec3_t right );
+float Q_acos( float c );
+vec_t Distance( const vec3_t p1, const vec3_t p2 );
 void RotateVector2D( vec3_t v, float degrees );
-float RotationToYaw( const vec4_t rotation );
-void YawToAxis( float yaw, vec3_t axis[3] );   /* universal/com_math.c: yaw on the stack, axis in edx (retail 0x20016330 __usercall) -- the register order is not the parameter order */
+float RotationToYaw( const float v[2] );
+void YawToAxis( float yaw, vec3_t axis[3] );
 
 
-void nullsub_2( void ) {
+// keep: unused stubs (original layout)
+void G_UnusedStub1( void ) {
 }
 
 
-void nullsub_3( void ) {
+void G_UnusedStub2( void ) {
 }
 
 
-/*
- * 0x200271A0.  Two instructions, `fld [esp+4]; retn`: a float returned
- * unchanged.  Nothing in the module references it and it is byte-identical to
- * q_shared.c's FloatNoSwap (0x2003E420), so the original name is not
- * recoverable; the address placeholder is kept rather than a name inferred.
- */
-float sub_200271A0( float f ) {
+// keep: unused (original layout)
+float G_UnusedFloatIdentity( float f ) {
 	return f;
 }
 
@@ -165,6 +99,7 @@ void SP_info_null( gentity_t *self ) {
 
 /*QUAKED info_notnull (0 0.5 0) (-4 -4 -4) (4 4 4)
 Used as a positional target for in-game calculation, like jumppad targets.
+target_position does the same thing
 */
 void SP_info_notnull( gentity_t *self ) {
 	G_SetOrigin( self, self->r.currentOrigin );
@@ -173,6 +108,13 @@ void SP_info_notnull( gentity_t *self ) {
 
 /*QUAKED light (0 1 0) (-8 -8 -8) (8 8 8) nonlinear angle negative_spot negative_point q3map_non-dynamic
 Non-displayed light.
+"light" overrides the default 300 intensity.
+Nonlinear checkbox gives inverse square falloff instead of linear
+Angle adds light:surface angle calculations (only valid for "Linear" lights) (wolf)
+Lights pointed at a target will be spotlights.
+"radius" overrides the default 64 unit radius of a spotlight at the target point.
+"fade" falloff/radius adjustment value. multiply the run of the slope by "fade" (1.0f default) (only valid for "Linear" lights) (wolf)
+"q3map_non-dynamic" specifies that this light should not contribute to the world's 'light grid' and therefore will not light dynamic models in the game.(wolf)
 */
 void SP_light( gentity_t *self ) {
 	G_FreeEntity( self );
@@ -208,10 +150,8 @@ void TeleportPlayer( gentity_t *player, vec3_t origin, vec3_t angles ) {
 	VectorCopy( origin, player->client->ps.origin );
 	player->client->ps.origin[2] += 1;
 
-	/* The original wrote `|` where it meant `&` (0x20027333 is an OR, not a
-	   TEST), so the guard is always true and the block below is unreachable in
-	   the shipped binary.  Reproduced as-is. */
-	if ( !( player->client->ps.eFlags | EF_TURRET_STANCE_MASK ) ) {
+	// keep: original bug, '|' where '&' was meant -- the block below never runs
+	if ( !( player->client->ps.eFlags | EF_TURRET_ACTIVE ) ) {
 		// spit the player out
 		AngleVectors( angles, player->client->ps.velocity, NULL, NULL );
 		VectorScale( player->client->ps.velocity, 400, player->client->ps.velocity );
@@ -239,6 +179,8 @@ void TeleportPlayer( gentity_t *player, vec3_t origin, vec3_t angles ) {
 
 /*QUAKED misc_teleporter_dest (1 0 0) (-32 -32 -24) (32 32 -16)
 Point teleporters at these.
+Now that we don't have teleport destination pads, this is just
+an info_notnull
 */
 void SP_misc_teleporter_dest( gentity_t *ent ) {
 }
@@ -252,6 +194,12 @@ void SP_misc_model( gentity_t *ent ) {
 }
 
 
+/*
+==============
+use_corona
+	so level designers can toggle them on/off
+==============
+*/
 void use_corona( gentity_t *ent, gentity_t *other, gentity_t *activator ) {
 	if ( ent->r.linked ) {
 		trap_UnlinkEntity( ent );
@@ -263,7 +211,8 @@ void use_corona( gentity_t *ent, gentity_t *other, gentity_t *activator ) {
 
 
 /*QUAKED corona (0 1 0) (-4 -4 -4) (4 4 4) START_OFF
-Client-side only in 1.1; the game module just drops it.
+Use color picker to set color or key "color".  values are 0.0-1.0 for each color (rgb).
+"scale" will designate a multiplier to the default size.  (so 2.0 is 2xdefault size, 0.5 is half)
 */
 void SP_corona( gentity_t *ent ) {
 	G_FreeEntity( ent );
@@ -299,12 +248,7 @@ tip.
 */
 static qboolean Turret_FillWeaponParms( gentity_t *self, gentity_t *player,
 										weaponFireInfo_t *fireInfo ) {
-	/* G_DObjGetWorldTagMatrix writes a full 4x4 (DObjSkel2MatrixMultiply43 sets
-	   the padding column, [3][3]=1.0 at +0x3C and the translation at row 3,
-	   +0x30); a 48-byte matrix43_t would overflow by 16 bytes and its .origin
-	   at +0x24 would read a rotation term.  Retail frames these two as 64-byte
-	   matrices (sub esp,0x8c) and reads the muzzle at row 3 -- v17[12]/v14[11],
-	   0x200275f7/0x2002763c. */
+	// G_DObjGetWorldTagMatrix writes a full 4x4 matrix; the translation is row 3
 	float flashMat[4][4];
 	float playerMat[4][4];
 	vec3_t dir;
@@ -325,9 +269,7 @@ static qboolean Turret_FillWeaponParms( gentity_t *self, gentity_t *player,
 	AngleVectors( player->client->ps.viewangles, fireInfo->forward, fireInfo->right,
 				  fireInfo->up );
 
-	/* +0x30 of weaponFireInfo_t is a vec3_t; g_local.h still calls it
-	   unknown_0x30 (the store is 0x20027606). */
-	VectorCopy( fireInfo->forward, (float *)fireInfo->unknown_0x30 );
+	VectorCopy( fireInfo->forward, fireInfo->gunForward );
 
 	VectorSubtract( flashMat[3], playerMat[3], dir );
 	dist = VectorNormalize( dir );
@@ -338,7 +280,8 @@ static qboolean Turret_FillWeaponParms( gentity_t *self, gentity_t *player,
 }
 
 
-static void Fire_Lead( gentity_t *self, gentity_t *attacker, int damage ) {
+/* the fourth argument is never read; turret_shoot_internal passes 0 */
+static void Fire_Lead( gentity_t *self, gentity_t *attacker, int damage, int unused ) {
 	weaponFireInfo_t fireInfo;
 	vec3_t end;
 
@@ -352,16 +295,32 @@ static void Fire_Lead( gentity_t *self, gentity_t *attacker, int damage ) {
 
 	fireInfo.weapInfo = bg_weaponInfo[self->s.weapon];
 
-	if ( fireInfo.weapInfo->weaponType ) {
-		Weapon_RocketLauncher_Fire( self, &fireInfo, 0 );
-		G_AddEvent( self, EV_FIRE_WEAPON_MG42, 0 );
-	} else {
-		Bullet_Endpos( &fireInfo, end, 0 );
+	if ( fireInfo.weapInfo->weaponType == WEAPTYPE_BULLET ) {
+		Bullet_Endpos( 0, end, &fireInfo );
 		Bullet_Fire_Extended( self, attacker, fireInfo.start, end, damage, 0, &fireInfo, self );
-		G_AddEvent( self, EV_FIRE_WEAPON_MG42, 0 );
+	} else {
+		Weapon_RocketLauncher_Fire( self, &fireInfo, 0 );
 	}
+
+	G_AddEvent( self, EV_FIRE_WEAPON_MG42, 0 );
 }
 
+
+// Drive one goal weight at the rate that closes the gap in one server frame.
+// keep: plain { } block with its own locals (original codegen)
+#define SET_TURRET_GOAL_WEIGHT( animTree, anim, weight ) \
+	{ \
+		rfloat      sgw_rate; \
+		float       sgw_time; \
+		sgw_rate = fabs( trap_XAnimGetWeight( ( animTree ), ( anim ) ) - ( weight ) ) \
+				   * ( 1000.0f / level.frameTime ); \
+		if ( sgw_rate > 0 ) { \
+			sgw_time = FCAST( 1.0f / sgw_rate ); \
+		} else { \
+			sgw_time = 0; \
+		} \
+		trap_XAnimSetGoalWeight( ( animTree ), ( anim ), ( weight ), sgw_time, 1.0f, 0, 0 ); \
+	}
 
 /*
 ==============
@@ -385,11 +344,10 @@ one server frame.
 void G_PlayerTurretPositionAndBlend( gentity_t *player, gentity_t *turret ) {
 	clientInfo_t        *ci;
 	const weaponInfo_t  *weapInfo;
-	void                *animTree;
+	XAnimTree           *animTree;
 	const float         *weaponMat;
 	scr_anim_t rootAnim;
 	scr_anim_t childAnim;
-	scr_anim_t prevChildAnim;
 	scr_anim_t grandChildAnim;
 	scr_anim_t nextGrandChildAnim;
 	matrix43_t turretMat;
@@ -397,18 +355,19 @@ void G_PlayerTurretPositionAndBlend( gentity_t *player, gentity_t *turret ) {
 	matrix43_t playerMat;
 	trace_t tr;
 	vec3_t start, end;
-	vec3_t delta;
-	vec4_t deltaRot;
+	float deltaRot[2];      /* XAnimGetAbsDelta_m writes two floats */
 	vec3_t deltaMove;
 	float weaponYaw;
 	float alongUp, targetAlongUp;
-	float yawPos, frac, lastFrac;
+	float frac, lastFrac;
 	float lastAlongUp, blend;
-	float goalWeight, goalTime;
-	/* the x87 stack never rounds this to a float; only goalTime is spilled */
-	double rate;
+	// keep: rfloat / double locals match original codegen
+	rfloat yawPos;
+	rfloat delta[3];
 	int yawIndex, lastYawIndex;
 	int i, numRootChildren, numChildren;
+	int treeIndex;
+	double moveUp;
 
 	ci = &bg_clientinfo[player->s.clientNum];
 
@@ -428,10 +387,11 @@ void G_PlayerTurretPositionAndBlend( gentity_t *player, gentity_t *turret ) {
 		return;
 	}
 
-	weapInfo = bg_weaponInfo[turret->s.weapon];
 	animTree = ci->animTree;
-
-	rootAnim.anims = (unsigned short)Scr_GetAnimsIndex( bgs_animScriptData.animTreeIndex );
+	weapInfo = bg_weaponInfo[turret->s.weapon];
+	// keep: own local (original codegen)
+	treeIndex = bgs_animScriptData.animTreeIndex;
+	rootAnim.anims = (unsigned short)Scr_GetAnimsIndex( treeIndex );
 	rootAnim.index = (unsigned short)( ci->legs.animationNumber & ~ANIM_TOGGLEBIT );
 
 	weaponYaw = vectosignedyaw( &weaponMat[DOBJ_TAG_AXIS] );
@@ -445,7 +405,7 @@ void G_PlayerTurretPositionAndBlend( gentity_t *player, gentity_t *turret ) {
 	alongUp = DotProduct( delta, turretMat.axis[2] );
 	targetAlongUp = alongUp - weaponMat[DOBJ_TAG_ORIGIN + 2];
 
-	trap_XAnimClearTreeGoalWeightsStrict( animTree, rootAnim.index, 0.0f );
+	trap_XAnimClearTreeGoalWeightsStrict( animTree, rootAnim, 0.0f );
 
 	numRootChildren = trap_XAnimGetNumChildren( rootAnim );
 
@@ -460,9 +420,12 @@ void G_PlayerTurretPositionAndBlend( gentity_t *player, gentity_t *turret ) {
 				   trap_XAnimGetAnimName( rootAnim ) );
 	}
 
-	for ( i = 0; i < numRootChildren; i++ ) {
+	/* no entry test: Com_Error above does not return, so there is at least
+	   one child */
+	i = 0;
+	do {
 		childAnim = trap_XAnimGetChildAt( rootAnim, i );
-		trap_XAnimSetGoalWeight( animTree, childAnim.index, 1.0f, 1.0f, 1.0f, 0, 0 );
+		trap_XAnimSetGoalWeight( animTree, childAnim, 1.0f, 1.0f, 1.0f, 0, 0 );
 
 		numChildren = trap_XAnimGetNumChildren( childAnim );
 		if ( !numChildren ) {
@@ -472,7 +435,7 @@ void G_PlayerTurretPositionAndBlend( gentity_t *player, gentity_t *turret ) {
 
 		/* The horizontal stops run either side of centre, one every
 		   animHorRotateInc degrees. */
-		yawPos = numChildren * 0.5f - weaponYaw / weapInfo->animHorRotateInc;
+		yawPos = numChildren * 0.5f - (double)weaponYaw / weapInfo->animHorRotateInc;
 		if ( yawPos < 0 ) {
 			yawPos = 0;
 		} else if ( yawPos >= (float)( numChildren - 1 ) ) {
@@ -480,52 +443,35 @@ void G_PlayerTurretPositionAndBlend( gentity_t *player, gentity_t *turret ) {
 		}
 
 		yawIndex = (int)yawPos;
-		frac = yawPos - yawIndex;
+		frac = (float)( yawPos - yawIndex );
 
 		grandChildAnim = trap_XAnimGetChildAt( childAnim, yawIndex );
-		trap_XAnimSetGoalWeight( animTree, grandChildAnim.index, 1.0f - frac,
+		trap_XAnimSetGoalWeight( animTree, grandChildAnim, 1.0f - frac,
 								 1.0f, 1.0f, 0, 0 );
 
 		if ( frac != 0 ) {
 			nextGrandChildAnim = trap_XAnimGetChildAt( childAnim, yawIndex + 1 );
-			trap_XAnimSetGoalWeight( animTree, nextGrandChildAnim.index, frac,
+			trap_XAnimSetGoalWeight( animTree, nextGrandChildAnim, frac,
 									 1.0f, 1.0f, 0, 0 );
 		}
 
-		trap_XAnimCalcAbsDelta( animTree, childAnim.index, deltaRot, deltaMove );
+		trap_XAnimCalcAbsDelta( animTree, childAnim, deltaRot, deltaMove );
 
-		if ( deltaMove[2] >= targetAlongUp ) {
+		moveUp = deltaMove[2];
+		if ( (float)moveUp >= targetAlongUp ) {
 			break;
 		}
 
 		lastAlongUp = deltaMove[2];
 		lastFrac = frac;
 		lastYawIndex = yawIndex;
-	}
+	} while ( ++i < numRootChildren );
 
-	trap_XAnimClearTreeGoalWeightsStrict( animTree, rootAnim.index, 0.0f );
+	trap_XAnimClearTreeGoalWeightsStrict( animTree, rootAnim, 0.0f );
 
-	goalWeight = 1.0f - frac;
-	rate = fabs( trap_XAnimGetWeight( animTree, grandChildAnim.index ) - goalWeight )
-		   * ( 1000.0f / level.frameTime );
-	if ( rate > 0 ) {
-		goalTime = (float)( 1.0f / rate );
-	} else {
-		goalTime = 0;
-	}
-	trap_XAnimSetGoalWeight( animTree, grandChildAnim.index, goalWeight,
-							 goalTime, 1.0f, 0, 0 );
-
+	SET_TURRET_GOAL_WEIGHT( animTree, grandChildAnim, 1.0f - frac );
 	if ( frac != 0 ) {
-		rate = fabs( trap_XAnimGetWeight( animTree, nextGrandChildAnim.index ) - frac )
-			   * ( 1000.0f / level.frameTime );
-		if ( rate > 0 ) {
-			goalTime = (float)( 1.0f / rate );
-		} else {
-			goalTime = 0;
-		}
-		trap_XAnimSetGoalWeight( animTree, nextGrandChildAnim.index, frac,
-								 goalTime, 1.0f, 0, 0 );
+		SET_TURRET_GOAL_WEIGHT( animTree, nextGrandChildAnim, frac );
 	}
 
 	if ( i != 0 && i != numRootChildren ) {
@@ -533,52 +479,17 @@ void G_PlayerTurretPositionAndBlend( gentity_t *player, gentity_t *turret ) {
 		   stops it sits between, and give the lower one the yaw pair the walk
 		   was holding when it left it. */
 		blend = ( targetAlongUp - lastAlongUp ) / ( deltaMove[2] - lastAlongUp );
+		SET_TURRET_GOAL_WEIGHT( animTree, childAnim, blend );
 
-		rate = fabs( trap_XAnimGetWeight( animTree, childAnim.index ) - blend )
-			   * ( 1000.0f / level.frameTime );
-		if ( rate > 0 ) {
-			goalTime = (float)( 1.0f / rate );
-		} else {
-			goalTime = 0;
-		}
-		trap_XAnimSetGoalWeight( animTree, childAnim.index, blend,
-								 goalTime, 1.0f, 0, 0 );
+		childAnim = trap_XAnimGetChildAt( rootAnim, i - 1 );
+		SET_TURRET_GOAL_WEIGHT( animTree, childAnim, 1.0f - blend );
 
-		prevChildAnim = trap_XAnimGetChildAt( rootAnim, i - 1 );
-		goalWeight = 1.0f - blend;
-		rate = fabs( trap_XAnimGetWeight( animTree, prevChildAnim.index ) - goalWeight )
-			   * ( 1000.0f / level.frameTime );
-		if ( rate > 0 ) {
-			goalTime = (float)( 1.0f / rate );
-		} else {
-			goalTime = 0;
-		}
-		trap_XAnimSetGoalWeight( animTree, prevChildAnim.index, goalWeight,
-								 goalTime, 1.0f, 0, 0 );
-
-		grandChildAnim = trap_XAnimGetChildAt( prevChildAnim, lastYawIndex );
-		goalWeight = 1.0f - lastFrac;
-		rate = fabs( trap_XAnimGetWeight( animTree, grandChildAnim.index ) - goalWeight )
-			   * ( 1000.0f / level.frameTime );
-		if ( rate > 0 ) {
-			goalTime = (float)( 1.0f / rate );
-		} else {
-			goalTime = 0;
-		}
-		trap_XAnimSetGoalWeight( animTree, grandChildAnim.index, goalWeight,
-								 goalTime, 1.0f, 0, 0 );
+		grandChildAnim = trap_XAnimGetChildAt( childAnim, lastYawIndex );
+		SET_TURRET_GOAL_WEIGHT( animTree, grandChildAnim, 1.0f - lastFrac );
 
 		if ( lastFrac != 0 ) {
-			grandChildAnim = trap_XAnimGetChildAt( prevChildAnim, lastYawIndex + 1 );
-			rate = fabs( trap_XAnimGetWeight( animTree, grandChildAnim.index ) - lastFrac )
-				   * ( 1000.0f / level.frameTime );
-			if ( rate > 0 ) {
-				goalTime = (float)( 1.0f / rate );
-			} else {
-				goalTime = 0;
-			}
-			trap_XAnimSetGoalWeight( animTree, grandChildAnim.index, lastFrac,
-									 goalTime, 1.0f, 0, 0 );
+			grandChildAnim = trap_XAnimGetChildAt( childAnim, lastYawIndex + 1 );
+			SET_TURRET_GOAL_WEIGHT( animTree, grandChildAnim, lastFrac );
 		}
 	} else {
 		/* The walk ran off either end: there is nothing to split, so the last
@@ -589,34 +500,24 @@ void G_PlayerTurretPositionAndBlend( gentity_t *player, gentity_t *turret ) {
 			return;
 		}
 
-		rate = fabs( trap_XAnimGetWeight( animTree, childAnim.index ) - 1.0f )
-			   * ( 1000.0f / level.frameTime );
-		if ( rate > 0 ) {
-			goalTime = (float)( 1.0f / rate );
-		} else {
-			goalTime = 0;
-		}
-		trap_XAnimSetGoalWeight( animTree, childAnim.index, 1.0f,
-								 goalTime, 1.0f, 0, 0 );
+		SET_TURRET_GOAL_WEIGHT( animTree, childAnim, 1.0f );
 	}
 
-	trap_XAnimCalcAbsDelta( animTree, rootAnim.index, deltaRot, deltaMove );
+	trap_XAnimCalcAbsDelta( animTree, rootAnim, deltaRot, deltaMove );
 
 	/* The pose's delta is in the barrel's own frame; tag_weapon's yaw turns it
 	   back into the turret's, and its origin puts it on the barrel.  The
 	   height stays the one the player already had. */
 	RotateVector2D( deltaMove, weaponYaw );
+	barrelMat.origin[2] = alongUp;      // keep: store order matches original codegen
 	barrelMat.origin[0] = deltaMove[0] + weaponMat[DOBJ_TAG_ORIGIN + 0];
 	barrelMat.origin[1] = deltaMove[1] + weaponMat[DOBJ_TAG_ORIGIN + 1];
-	barrelMat.origin[2] = alongUp;
 
 	YawToAxis( RotationToYaw( deltaRot ) + weaponYaw, barrelMat.axis );
 
 	MatrixMultiply43( &barrelMat, &turretMat, &playerMat );
 
-	player->client->ps.origin[0] = playerMat.origin[0];
-	player->client->ps.origin[1] = playerMat.origin[1];
-	player->client->ps.origin[2] = playerMat.origin[2];
+	VectorCopy( playerMat.origin, player->client->ps.origin );
 
 	/* Come up from the turret's own base rather than dropping the player
 	   through whatever the pose put him inside of. */
@@ -624,7 +525,7 @@ void G_PlayerTurretPositionAndBlend( gentity_t *player, gentity_t *turret ) {
 	VectorCopy( player->client->ps.origin, end );
 	start[2] = turret->r.currentOrigin[2];
 
-	trap_Trace( &tr, start, NULL, NULL, end, player->s.number, MASK_TURRET_PLAYER );
+	trap_Trace( &tr, start, NULL, NULL, end, player->s.number, MASK_CLIENTSOLID );
 	if ( tr.fraction < 1.0f ) {
 		player->client->ps.origin[2] = tr.endpos[2];
 	}
@@ -655,7 +556,7 @@ static void turret_clientaim( gentity_t *player, gentity_t *turret ) {
 	qboolean clamped;
 	int i;
 
-	t = (turret_t *)turret->turret;
+	t = turret->turret;
 
 	player->client->ps.viewlocked = 1;
 	player->client->ps.viewlocked_entNum = turret->s.number;
@@ -667,11 +568,11 @@ static void turret_clientaim( gentity_t *player, gentity_t *turret ) {
 		aim[i] = AngleSubtract( player->client->ps.viewangles[i], turret->r.currentAngles[i] );
 
 		if ( aim[i] > t->maxArc[i] ) {
+			clamped = qtrue;
 			aim[i] = t->maxArc[i];
-			clamped = qtrue;
 		} else if ( aim[i] < t->minArc[i] ) {
-			aim[i] = t->minArc[i];
 			clamped = qtrue;
+			aim[i] = t->minArc[i];
 		}
 
 		diff = AngleSubtract( aim[i], turret->s.angles2[i] );
@@ -704,11 +605,11 @@ static void turret_clientaim( gentity_t *player, gentity_t *turret ) {
 
 
 static void turret_shoot_internal( gentity_t *self, gentity_t *player ) {
-	( (turret_t *)self->turret )->fireSoundTime =
+	self->turret->fireSoundTime =
 		3 * bg_weaponInfo[self->s.weapon]->fireTime;
 
 	if ( player->client ) {
-		Fire_Lead( self, player, self->damage );
+		Fire_Lead( self, player, self->damage, 0 );
 		player->client->ps.viewlocked = 2;
 	}
 }
@@ -718,7 +619,7 @@ static void turret_track( gentity_t *player, gentity_t *turret ) {
 	turret_t *t;
 	const weaponInfo_t *weapon;
 
-	t = (turret_t *)turret->turret;
+	t = turret->turret;
 
 	turret_clientaim( player, turret );
 	G_PlayerTurretPositionAndBlend( player, turret );
@@ -726,16 +627,16 @@ static void turret_track( gentity_t *player, gentity_t *turret ) {
 	weapon = bg_weaponInfo[turret->s.weapon];
 
 	player->client->ps.viewlocked = 1;
-	turret->s.eFlags &= ~0x400;
+	turret->s.eFlags &= ~EF_FIRING;
 
 	t->fireTimeRemaining -= TURRET_FRAMETIME;
 	if ( t->fireTimeRemaining <= 0 ) {
 		t->fireTimeRemaining = 0;
 
-		if ( player->client->buttons & 1 ) {
+		if ( player->client->buttons & BUTTON_ATTACK ) {
 			t->fireTimeRemaining = weapon->fireTime;
 			turret_shoot_internal( turret, player );
-			turret->s.eFlags |= 0x400;
+			turret->s.eFlags |= EF_FIRING;
 		}
 	}
 }
@@ -744,7 +645,7 @@ static void turret_track( gentity_t *player, gentity_t *turret ) {
 static void turret_UpdateSound( gentity_t *self ) {
 	turret_t *turret;
 
-	turret = (turret_t *)self->turret;
+	turret = self->turret;
 
 	self->s.loopSound = 0;
 
@@ -763,33 +664,31 @@ static void turret_UpdateSound( gentity_t *self ) {
 void G_ClientStopUsingTurret( gentity_t *self ) {
 	gentity_t *player;
 	turret_t *turret;
-	int event;
 
 	player = &g_entities[self->r.ownerNum];
-	turret = (turret_t *)self->turret;
+	turret = self->turret;
 
 	turret->fireSoundTime = 0;
 	self->s.loopSound = 0;
 
 	if ( turret->stopUseEventType != -1 ) {
 		if ( turret->stopUseEventType == 2 ) {
-			event = EV_STANCE_FORCE_PRONE;
+			G_AddEvent( player, EV_STANCE_FORCE_PRONE, 0 );
 		} else if ( turret->stopUseEventType == 1 ) {
-			event = EV_STANCE_FORCE_CROUCH;
+			G_AddEvent( player, EV_STANCE_FORCE_CROUCH, 0 );
 		} else {
-			event = EV_STANCE_FORCE_STAND;
+			G_AddEvent( player, EV_STANCE_FORCE_STAND, 0 );
 		}
-		G_AddEvent( player, event, 0 );
 		turret->stopUseEventType = -1;
 	}
 
 	TeleportPlayer( player, turret->stopUseOrigin, player->r.currentAngles );
 
-	player->client->ps.eFlags &= ~EF_TURRET_STANCE_MASK;
+	player->client->ps.eFlags &= ~EF_TURRET_ACTIVE;
 	player->client->ps.viewlocked = 0;
 	player->client->ps.viewlocked_entNum = ENTITYNUM_NONE;
-	player->client->ps.gunfx = 0;
 	player->active = 0;
+	player->client->ps.gunfx = 0;
 	player->s.otherEntityNum = 0;
 
 	self->active = 0;
@@ -831,10 +730,11 @@ static qboolean turret_UpdateTargetAngles( gentity_t *ent, const float *targetAn
 	float maxStep[2];
 	float target;
 	float diff;
+	double newPitch;
 	qboolean atRest;
 	int i;
 
-	turret = (turret_t *)ent->turret;
+	turret = ent->turret;
 
 	savePitch = ent->s.angles2[0];
 	ent->s.angles2[0] = ent->s.angles2[0] + ent->s.angles2[2];
@@ -868,18 +768,17 @@ static qboolean turret_UpdateTargetAngles( gentity_t *ent, const float *targetAn
 		ent->s.angles2[i] = ent->s.angles2[i] + diff;
 	}
 
-	target = ent->s.angles2[0];
-	ent->s.angles2[2] = ent->s.angles2[0];
+	ent->s.angles2[2] = target = ent->s.angles2[0];
 
 	if ( turret->flags & 0x200 ) {
-		if ( turret->flags & 0x400 ) {
-			if ( ent->s.angles2[0] < turret->restPitchClamp ) {
+		if ( !( turret->flags & 0x400 ) ) {
+			if ( ent->s.angles2[0] > turret->restPitchClamp ) {
 				target = turret->restPitchClamp;
 			} else {
 				turret->flags &= ~0x100;
 			}
 		} else {
-			if ( ent->s.angles2[0] > turret->restPitchClamp ) {
+			if ( ent->s.angles2[0] < turret->restPitchClamp ) {
 				target = turret->restPitchClamp;
 			} else {
 				turret->flags &= ~0x100;
@@ -896,20 +795,22 @@ static qboolean turret_UpdateTargetAngles( gentity_t *ent, const float *targetAn
 		atRest = qfalse;
 	}
 
-	ent->s.angles2[0] = savePitch + diff;
-	ent->s.angles2[2] = ent->s.angles2[2] - ent->s.angles2[0];
+	// keep: double residual matches original codegen
+	newPitch = (double)savePitch + diff;
+	ent->s.angles2[0] = (float)newPitch;
+	ent->s.angles2[2] = (float)( ent->s.angles2[2] - newPitch );
 
 	return atRest;
 }
 
 
-static qboolean turret_ReturnToDefaultPos( gentity_t *ent, int useWeaponRates ) {
+qboolean turret_ReturnToDefaultPos( gentity_t *ent, int useWeaponRates ) {
 	float targetAngles[2];
 
 	if ( useWeaponRates ) {
 		targetAngles[0] = 0;
 	} else {
-		targetAngles[0] = ( (turret_t *)ent->turret )->restPitch;
+		targetAngles[0] = ent->turret->restPitch;
 	}
 	targetAngles[1] = 0;
 
@@ -931,9 +832,9 @@ void turret_think( gentity_t *self ) {
 	}
 
 	turret_UpdateSound( self );
-	self->s.eFlags &= ~0x400;
+	self->s.eFlags &= ~EF_FIRING;
 
-	targetAngles[0] = ( (turret_t *)self->turret )->restPitch;
+	targetAngles[0] = self->turret->restPitch;
 	targetAngles[1] = 0;
 	turret_UpdateTargetAngles( self, targetAngles, 0 );
 }
@@ -953,13 +854,14 @@ void turret_think_init( gentity_t *self ) {
 	matrix43_t entMat;
 	const float *aimMat;
 	const float *buttMat;
-	vec3_t angles, forward, right, up, left;
+	vec3_t angles;
+	vec3_t axis[3];
 	vec3_t delta, offset, start, end;
 	trace_t trace;
 	int aimBone, buttBone;
 	int i;
 
-	turret = (turret_t *)self->turret;
+	turret = self->turret;
 
 	self->think = turret_think;
 	self->nextthink = level.time + TURRET_FRAMETIME;
@@ -969,7 +871,7 @@ void turret_think_init( gentity_t *self ) {
 		return;
 	}
 	G_DObjCalcBone( self, aimBone );
-	aimMat = (const float *)trap_DObjGetMatrixArray( self ) + 16 * aimBone;
+	aimMat = trap_DObjGetMatrixArray( self ) + 16 * aimBone;
 	if ( !aimMat ) {
 		return;
 	}
@@ -979,7 +881,7 @@ void turret_think_init( gentity_t *self ) {
 		return;
 	}
 	G_DObjCalcBone( self, buttBone );
-	buttMat = (const float *)trap_DObjGetMatrixArray( self ) + 16 * buttBone;
+	buttMat = trap_DObjGetMatrixArray( self ) + 16 * buttBone;
 	if ( !buttMat ) {
 		return;
 	}
@@ -990,26 +892,22 @@ void turret_think_init( gentity_t *self ) {
 	/* the bone matrices are 4x4; the translation is the fourth row */
 	VectorSubtract( buttMat + 12, aimMat + 12, delta );
 
-	MatrixTransformVector43( &entMat, start, aimMat + 12 );
+	MatrixTransformVector43( aimMat + 12, &entMat, start );
 
 	for ( i = 0; i <= 30; i++ ) {
 		angles[0] = (float)i * -3.0f;
 		angles[1] = 0;
 		angles[2] = 0;
 
-		AngleVectors( angles, forward, right, up );
-		VectorSubtract( vec3_origin, right, left );
-
-		offset[0] = up[0] * delta[2] + left[0] * delta[1] + forward[0] * delta[0];
-		offset[1] = up[1] * delta[2] + left[1] * delta[1] + forward[1] * delta[0];
-		offset[2] = up[2] * delta[2] + left[2] * delta[1] + forward[2] * delta[0];
+		AnglesToAxis( angles, axis );
+		MatrixTransformVector( delta, (float *)axis, offset );
 
 		VectorAdd( offset, aimMat + 12, offset );
 
-		MatrixTransformVector43( &entMat, end, offset );
+		MatrixTransformVector43( offset, &entMat, end );
 
-		trap_LocationalTrace( &trace, start, end, self->s.number, 0x11, bulletPriorityMap );
-		if ( trace.fraction < 1.0 ) {
+		trap_LocationalTrace( &trace, start, end, self->s.number, MASK_SOLID, bulletPriorityMap );
+		if ( trace.fraction < 1.0f ) {
 			turret->restPitch = angles[0];
 			return;
 		}
@@ -1030,8 +928,8 @@ void turret_controller( gentity_t *self, unsigned int *partBits ) {
 	vec3_t angles;
 	int boneIndex;
 
-	angles[0] = self->s.angles2[0];
 	angles[1] = self->s.angles2[1];
+	angles[0] = self->s.angles2[0];
 	angles[2] = 0;
 
 	boneIndex = trap_DObjGetBoneIndex( self, "tag_aim" );
@@ -1057,6 +955,9 @@ void turret_controller( gentity_t *self, unsigned int *partBits ) {
 }
 
 
+/* forward: bg_pmove.c */
+float PM_FloatAbs( float value );
+
 /*
 ==============
 turret_behind
@@ -1074,15 +975,11 @@ static qboolean turret_behind( gentity_t *player, gentity_t *turret ) {
 	vec3_t dir;
 	vec3_t delta;
 
-	t = (turret_t *)turret->turret;
+	t = turret->turret;
 
 	yaw = turret->r.currentAngles[1] + t->minArc[1];
-	halfArc = ( (float)fabs( t->maxArc[1] ) + (float)fabs( t->minArc[1] ) ) * 0.5f;
-	yaw = AngleNormalize180( yaw + halfArc );
-
-	dir[0] = (float)cos( yaw * 0.017453292f );
-	dir[1] = (float)sin( yaw * 0.017453292f );
-	dir[2] = 0;
+	halfArc = ( PM_FloatAbs( t->minArc[1] ) + PM_FloatAbs( t->maxArc[1] ) ) * 0.5f;
+	YawVectors( AngleNormalize180( yaw + halfArc ), dir, NULL );
 	VectorNormalize( dir );
 
 	delta[0] = turret->r.currentOrigin[0] - player->r.currentOrigin[0];
@@ -1090,16 +987,12 @@ static qboolean turret_behind( gentity_t *player, gentity_t *turret ) {
 	delta[2] = 0;
 	VectorNormalize( delta );
 
-	angle = (float)acos( DotProduct( dir, delta ) );
-	if ( angle > 3.1415927f ) {
-		angle = 3.1415927f;
-	} else if ( angle < -3.1415927f ) {
-		angle = 3.1415927f;
+	angle = Q_acos( DotProduct( dir, delta ) ) * 180.0f / M_PI;
+
+	if ( angle > halfArc ) {
+		return qfalse;
 	}
-
-	angle = angle * 180.0f / 3.1415927f;
-
-	return angle <= halfArc;
+	return qtrue;
 }
 
 
@@ -1109,25 +1002,14 @@ void G_FreeTurret( gentity_t *self ) {
 	}
 
 	self->active = 0;
-	( (turret_t *)self->turret )->inUse = 0;
+	self->turret->inUse = 0;
 	self->turret = NULL;
 }
 
 
 qboolean G_IsTurretUsable( gentity_t *turret, gentity_t *player ) {
-	if ( turret->active ) {
-		return qfalse;
-	}
-	if ( !turret->turret ) {
-		return qfalse;
-	}
-	if ( !turret->takedamage ) {
-		return qfalse;
-	}
-	if ( !turret_behind( player, turret ) ) {
-		return qfalse;
-	}
-	if ( player->client->ps.grenadeTimeLeft ) {
+	if ( turret->active || !turret->turret || !turret->takedamage
+		 || !turret_behind( player, turret ) || player->client->ps.grenadeTimeLeft ) {
 		return qfalse;
 	}
 
@@ -1140,7 +1022,7 @@ void turret_use( gentity_t *self, gentity_t *other, gentity_t *activator ) {
 	vec3_t angles;
 	int i;
 
-	turret = (turret_t *)self->turret;
+	turret = self->turret;
 
 	other->active = 1;
 	self->active = 1;
@@ -1154,20 +1036,22 @@ void turret_use( gentity_t *self, gentity_t *other, gentity_t *activator ) {
 
 	other->s.otherEntityNum = self->s.number;
 
-	if ( other->client->ps.pm_flags & 1 ) {
+	if ( other->client->ps.pm_flags & PMF_PRONE ) {
 		turret->stopUseEventType = 2;
+	} else if ( other->client->ps.pm_flags & PMF_DUCKED ) {
+		turret->stopUseEventType = 1;
 	} else {
-		turret->stopUseEventType = ( other->client->ps.pm_flags & 2 ) >> 1;
+		turret->stopUseEventType = 0;
 	}
 
-	if ( turret->useMode == 2 ) {
-		other->client->ps.eFlags |= 0x4000;
-		other->client->ps.eFlags &= ~0x8000;
-	} else if ( turret->useMode == 1 ) {
-		other->client->ps.eFlags |= 0x8000;
-		other->client->ps.eFlags &= ~0x4000;
+	if ( turret->useMode == WEAPSTANCE_PRONE ) {
+		other->client->ps.eFlags |= EF_TURRET_ACTIVE_PRONE;
+		other->client->ps.eFlags &= ~EF_TURRET_ACTIVE_DUCK;
+	} else if ( turret->useMode == WEAPSTANCE_DUCK ) {
+		other->client->ps.eFlags |= EF_TURRET_ACTIVE_DUCK;
+		other->client->ps.eFlags &= ~EF_TURRET_ACTIVE_PRONE;
 	} else {
-		other->client->ps.eFlags |= EF_TURRET_STANCE_MASK;
+		other->client->ps.eFlags |= EF_TURRET_ACTIVE;
 	}
 
 	VectorCopy( self->r.currentAngles, self->TargetAngles );
@@ -1198,7 +1082,8 @@ void G_SpawnTurret( const char *weaponName, gentity_t *ent ) {
 	int i;
 
 	for ( i = 0; i < MAX_TURRETS; i++ ) {
-		if ( !g_turrets[i].inUse ) {
+		turret = &g_turrets[i];
+		if ( !turret->inUse ) {
 			break;
 		}
 	}
@@ -1207,7 +1092,6 @@ void G_SpawnTurret( const char *weaponName, gentity_t *ent ) {
 				   MAX_TURRETS );
 	}
 
-	turret = &g_turrets[i];
 	memset( turret, 0, sizeof( *turret ) );
 
 	ent->turret = turret;
@@ -1301,11 +1185,11 @@ void G_SpawnTurret( const char *weaponName, gentity_t *ent ) {
 
 	turret->flags = 3;
 
-	ent->flags |= FL_SUPPORTS_LINKTO;
-	ent->clipmask = 1;
+	ent->clipmask = CONTENTS_SOLID;
 	ent->r.contents = 0x200004;
-	ent->r.svFlags = SVF_BROADCAST;
+	ent->r.svFlags = SVF_USE_CURRENT_ORIGIN;
 	ent->s.eType = ET_TURRET;
+	ent->flags |= FL_SUPPORTS_LINKTO;
 
 	G_DObjUpdate( ent );
 
@@ -1357,7 +1241,10 @@ misc_spawner
 */
 
 void misc_spawner_think( gentity_t *ent ) {
-	if ( !Drop_Item( ent, BG_FindItem( SL_ConvertToString( ent->spawnitem ) ), 0, 0 ) ) {
+	gitem_t *item;
+
+	item = BG_FindItem( SL_ConvertToString( ent->spawnitem ) );
+	if ( !Drop_Item( ent, item, 0, 0 ) ) {
 		G_Printf( "-----> WARNING <-------\n" );
 		G_Printf( "misc_spawner used at %s failed to drop!\n", vtos( ent->r.currentOrigin ) );
 	}
@@ -1372,7 +1259,9 @@ void misc_spawner_use( gentity_t *self, gentity_t *other, gentity_t *activator )
 
 
 /*QUAKED misc_spawner (1 0 0) (-16 -16 -16) (16 16 16)
-Drops its "spawnitem" every time it is used.
+use the pickup name
+  when this entity gets used it will spawn an item
+that matches its spawnitem field
 */
 void SP_misc_spawner( gentity_t *ent ) {
 	if ( !ent->spawnitem ) {
@@ -1395,13 +1284,8 @@ Take the first live client inside the gunner's radius as its enemy.
 */
 void miscGunnerEnemyScan( gentity_t *self ) {
 	gentity_t *ent;
-	vec3_t delta;
-	float dist;
-	int i;
 
-	for ( i = 0; i < level.maxclients; i++ ) {
-		ent = &g_entities[i];
-
+	for ( ent = g_entities; ent < &g_entities[level.maxclients]; ent++ ) {
 		if ( !ent->inuse ) {
 			continue;
 		}
@@ -1409,12 +1293,11 @@ void miscGunnerEnemyScan( gentity_t *self ) {
 			continue;
 		}
 
-		VectorSubtract( ent->r.currentOrigin, self->r.currentOrigin, delta );
-		dist = VectorLength( delta );
-
-		if ( dist <= (float)self->radius ) {
-			self->enemy = ent;
-			return;
+		if ( Distance( self->r.currentOrigin, ent->r.currentOrigin ) > (float)self->radius ) {
+			continue;
 		}
+
+		self->enemy = ent;
+		return;
 	}
 }

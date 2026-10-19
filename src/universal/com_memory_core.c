@@ -5,44 +5,60 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 
 #include <time.h>
 
-#define HUNK_LOW_MARK   ( *(int *) hunk_lowMark )
-#define HUNK_LOW_PERM   ( *(int *) hunk_temp_permanent )
-#define HUNK_LOW_TEMP   ( *(int *) hunk_temp_temp )
-#define HUNK_HIGH_MARK  ( *(int *) hunk_highMark )
-#define HUNK_HIGH_PERM  ( *(int *) hunk_highUsed )
-#define HUNK_HIGH_TEMP  ( *(int *) hunk_highTemp )
-#define HUNK_TOTAL      ( *(int *) hunk_totalSize )
-#define ZONE_TOTAL      ( *(int *) hunk_totalZoneSize )
+/* The hunk_* aliases hold pointers to these counters (Com_BindHunkGlobals).
+   Export the counters so memory and script routines can read the same storage
+   directly, as retail does. */
+#define HUNK_LOW_MARK   hunk_low_mark
+#define HUNK_LOW_PERM   hunk_low_permanent
+#define HUNK_LOW_TEMP   hunk_low_temp
+#define HUNK_HIGH_MARK  s_hunkHighMark
+#define HUNK_HIGH_PERM  s_hunkHighPermanent
+#define HUNK_HIGH_TEMP  s_hunkHighTemp
+#define HUNK_TOTAL      s_hunkTotal
+#define ZONE_TOTAL      s_zoneTotal
 
 extern void Com_Meminfo_f( void );
 extern void Sys_OutOfMemoryPrep( void );
+extern char *SEH_GetLocalizedString_m( const char *key );
+__declspec( dllimport ) int __stdcall MessageBoxA( void *h, const char *text, const char *caption, unsigned type );
 
-static int s_hunkTotal;                 /* 0x0089319C */
-static int s_zoneTotal;                 /* 0x008931A0 */
-static int s_hunkHighMark;              /* 0x008931A4 */
-static int s_hunkHighPermanent;         /* 0x008931AC */
-static int s_hunkHighTemp;              /* 0x008931B0 */
-static int s_hunkLowMark;               /* 0x008931BC */
-static int s_hunkLowPermanent;          /* 0x008931C4 */
-static int s_hunkLowTemp;               /* 0x008931C8 */
+int s_hunkTotal;                 /* 0x0089319C */
+int s_zoneTotal;                 /* 0x008931A0 */
+int s_hunkHighMark;              /* 0x008931A4 */
+int s_hunkHighPermanent;         /* 0x008931AC */
+int s_hunkHighTemp;              /* 0x008931B0 */
+int hunk_low_mark;                      /* 0x008931BC */
+int hunk_low_permanent;                 /* 0x008931C4 */
+int hunk_low_temp;                      /* 0x008931C8 */
+void *s_hunkData;                       /* 0x0140741C */
+
+/* The hunk_* cells: the high/low TEMP marks are plain counters, the rest hold
+   pointers to the counters above (Com_BindHunkGlobals). */
+int hunk_totalSize;                     /* 0x0089319C */
+signed __int32 hunk_totalZoneSize;      /* 0x008931A0 */
+int hunk_highMark;                      /* 0x008931A4 */
+int hunk_highTempMark;                  /* 0x008931A8 */
+int hunk_highUsed;                      /* 0x008931AC */
+int hunk_highTemp;                      /* 0x008931B0 */
+int hunk_lowMark;                       /* 0x008931BC */
+int hunk_lowTempMark;                   /* 0x008931C0 */
+int hunk_temp_permanent;                /* 0x008931C4 */
+int hunk_temp_temp;                     /* 0x008931C8 */
 
 void Com_BindHunkGlobals( void ) {
 	if ( hunk_totalSize ) {
 		return;
 	}
-	hunk_totalSize        = (int) &s_hunkTotal;
 	hunk_totalZoneSize        = (int) &s_zoneTotal;
 	hunk_highMark        = (int) &s_hunkHighMark;
 	hunk_highUsed        = (int) &s_hunkHighPermanent;
 	hunk_highTemp        = (int) &s_hunkHighTemp;
-	hunk_lowMark        = (int) &s_hunkLowMark;
-	hunk_temp_permanent = (int) &s_hunkLowPermanent;
-	hunk_temp_temp      = (int) &s_hunkLowTemp;
+	hunk_lowMark        = (int) &hunk_low_mark;
+	hunk_temp_permanent = (int) &hunk_low_permanent;
+	hunk_temp_temp      = (int) &hunk_low_temp;
 }
 
 /* ---- Com_InitHunkMemory  0x00431E00 ---- */
@@ -50,9 +66,6 @@ void Com_InitHunkMemory( void ) {
 	cvar_t      *cv;
 	int minMegs;
 	const char  *fmt;
-	void        *buf;
-
-	Com_BindHunkGlobals();
 
 	if ( FS_LoadStack() ) {
 		Com_Error( ERR_FATAL,
@@ -69,20 +82,23 @@ void Com_InitHunkMemory( void ) {
 		fmt = "Minimum com_hunkMegs is %i, allocating %i megs.\n";
 	}
 
-	if ( cv->integer >= minMegs ) {
-		HUNK_TOTAL = cv->integer << 20;
-	} else {
+	if ( cv->integer < minMegs ) {
 		HUNK_TOTAL = minMegs << 20;
 		Com_Printf( fmt, minMegs, HUNK_TOTAL / ( 1024 * 1024 ) );
+	} else {
+		HUNK_TOTAL = cv->integer << 20;
 	}
 
-	buf = malloc( HUNK_TOTAL + 31 );
-	if ( !buf ) {
+	s_hunkData = malloc( HUNK_TOTAL + 31 );
+	if ( !s_hunkData ) {
+		/* Sys_OutOfMemoryError (0x00462BA0) as retail inlines it; written out
+		   because the win_main.c body does not interleave the pushes yet */
 		Sys_OutOfMemoryPrep();
-		Sys_Error( "Com_InitHunkMemory: failed to allocate %i bytes", HUNK_TOTAL + 31 );
-		return;
+		MessageBoxA( 0, SEH_GetLocalizedString_m( "WIN_OUT_OF_MEM_BODY" ),
+		             SEH_GetLocalizedString_m( "WIN_OUT_OF_MEM_TITLE" ), 0x10 );
+		exit( -1 );
 	}
-	s_hunkData = (void *) ( ( (unsigned int) buf + 31 ) & 0xFFFFFFE0 );
+	s_hunkData = (void *) ( ( (unsigned int) s_hunkData + 31 ) & 0xFFFFFFE0 );
 
 	CL_ShutdownCGame();
 	CL_ShutdownUI();
@@ -100,8 +116,9 @@ void *Z_MallocInternal( int size ) {
 
 	p = malloc( size );
 	if ( !p ) {
-		Sys_Error( "Z_MallocInternal: failed to allocate %i bytes", size );
-		return NULL;
+		/* retail inlines Sys_OutOfMemoryError (0x00462BA0) here, but keeps the
+		   call where Z_MallocInternal itself is inlined (Sys_ListFilteredFiles) */
+		Sys_OutOfMemoryError();
 	}
 	Com_Memset( p, 0, size );
 	return p;
@@ -109,50 +126,46 @@ void *Z_MallocInternal( int size ) {
 
 /* ---- Hunk_AllocAlignInternal  0x00432170 ---- */
 void *Hunk_AllocAlignInternal( int size, int align ) {
-	int mark;
 	void *block;
 
+	align--;
 	if ( !s_hunkData ) {
 		Com_Error( ERR_FATAL, "\x15" "Hunk_AllocAlign: Hunk memory system not initialized" );
 	}
 
-	mark = ( align - 1 + size + HUNK_HIGH_PERM ) & ~( align - 1 );
-	block = (void *) ( (char *) s_hunkData + HUNK_TOTAL - mark );
+	HUNK_HIGH_PERM = ( HUNK_HIGH_PERM + size + align ) & ~align;
+	block = (void *) ( (char *) s_hunkData + HUNK_TOTAL - HUNK_HIGH_PERM );
+	HUNK_HIGH_TEMP = HUNK_HIGH_PERM;
 
-	HUNK_HIGH_PERM = mark;
-	HUNK_HIGH_TEMP = mark;
-
-	if ( mark + HUNK_LOW_TEMP > HUNK_TOTAL ) {
+	if ( HUNK_LOW_TEMP + HUNK_HIGH_TEMP > HUNK_TOTAL ) {
 		Com_Meminfo_f();
 		Com_Error( ERR_DROP, "\x15" "Hunk_AllocAlign failed on %i", size );
 	}
 
-	com_hunkMeminfoRunningTotal = mark + HUNK_LOW_PERM;
+	com_hunkMeminfoRunningTotal = HUNK_LOW_PERM + HUNK_HIGH_PERM;
 
-	Com_Memset( block, 0, size );
+	memset( block, 0, size );
 	return block;
 }
 
 /* ---- Hunk_AllocLowAlignInternal  0x00432280 ---- */
 void *Hunk_AllocLowAlignInternal( int size, int align ) {
-	int base, mark;
 	void *block;
 
-	base = ( align - 1 + HUNK_LOW_PERM ) & ~( align - 1 );
-	block = (void *) ( (char *) s_hunkData + base );
-	mark = size + base;
+	align--;
+	HUNK_LOW_PERM = ( HUNK_LOW_PERM + align ) & ~align;
+	block = (void *) ( (char *) s_hunkData + HUNK_LOW_PERM );
+	HUNK_LOW_PERM += size;
+	HUNK_LOW_TEMP = HUNK_LOW_PERM;
 
-	HUNK_LOW_PERM = mark;
-	HUNK_LOW_TEMP = mark;
-
-	if ( mark + HUNK_HIGH_TEMP > HUNK_TOTAL ) {
+	if ( HUNK_LOW_TEMP + HUNK_HIGH_TEMP > HUNK_TOTAL ) {
 		Com_Meminfo_f();
 		Com_Error( ERR_DROP, "\x15" "Hunk_AllocLowAlign failed on %i", size );
 	}
 
-	com_hunkMeminfoRunningTotal = mark + HUNK_HIGH_PERM;
+	com_hunkMeminfoRunningTotal = HUNK_LOW_PERM + HUNK_HIGH_PERM;
 
-	Com_Memset( block, 0, size );
+	memset( block, 0, size );
 	return block;
 }
 
@@ -175,7 +188,7 @@ typedef enum
 	PRE_READ_WRITE                              // prefetch assuming that buffer is used for both reading and writing
 } e_prefetch;
 
-void Com_Prefetch( const void *s, const unsigned int bytes, e_prefetch type );
+void Com_TouchMemoryBlock_m( const void *s, const unsigned int bytes, int type );   /* retail's Com_Prefetch, com_memory.c */
 
 /* RTCW _copyDWord; 0x004324B0, com_memory.c */
 void memset32( unsigned int *dest, unsigned int constant, unsigned int count );
@@ -184,7 +197,7 @@ void memset32( unsigned int *dest, unsigned int constant, unsigned int count );
 // optimized memory copy routine that handles all alignment
 // cases and block sizes efficiently
 void Com_Memcpy( void* dest, const void* src, size_t count ) {
-	Com_Prefetch( src, count, PRE_READ );       /* inlined in retail */
+	Com_TouchMemoryBlock_m( src, count, PRE_READ );       /* inlined in retail */
 	__asm
 	{
 		push edi
@@ -347,49 +360,9 @@ skipA:
 	}
 }
 
-/* ---- Com_Prefetch  0x004327C0 ---- VERIFIED */
-/* Alias Com_TouchMemoryBlock_m; type arrives in eax (LTCG).
-   The PRE_READ instance is inlined into Com_Memcpy in retail. */
-void Com_Prefetch( const void *s, const unsigned int bytes, e_prefetch type ) {
-	// write buffer prefetching is performed only if
-	// the processor benefits from it. Read and read/write
-	// prefetching is always performed.
-
-	switch ( type )
-	{
-	case PRE_WRITE: break;
-	case PRE_READ:
-	case PRE_READ_WRITE:
-
-		__asm
-		{
-			mov ebx,s
-			mov ecx,bytes
-			cmp ecx,4096                    // clamp to 4kB
-			jle skipClamp
-			mov ecx,4096
-skipClamp:
-			add ecx,0x1f
-			shr ecx,5                       // number of cache lines
-			jz skip
-			jmp loopie
-
-			align 16
-loopie: test byte ptr [ebx],al
-			add ebx,32
-			dec ecx
-			jnz loopie
-skip:
-		}
-
-		break;
-	}
-}
-
 /* ---- Hunk_AllocateTempMemoryInternal  0x00432310 ---- VERIFIED */
 void *Hunk_AllocateTempMemoryInternal( int size ) {
 	int *header;
-	int headerOffset;
 	int previousLowTemp;
 
 	if ( !s_hunkData ) {
@@ -400,7 +373,7 @@ void *Hunk_AllocateTempMemoryInternal( int size ) {
 
 	previousLowTemp = HUNK_LOW_TEMP;
 	HUNK_LOW_TEMP = ( HUNK_LOW_TEMP + 15 ) & ~15;
-	headerOffset = HUNK_LOW_TEMP;
+	header = (int *) ( (char *) s_hunkData + HUNK_LOW_TEMP );
 	HUNK_LOW_TEMP += size;
 
 	if ( HUNK_HIGH_TEMP + HUNK_LOW_TEMP > HUNK_TOTAL ) {
@@ -409,7 +382,6 @@ void *Hunk_AllocateTempMemoryInternal( int size ) {
 				   size, HUNK_HIGH_TEMP + HUNK_LOW_TEMP - HUNK_TOTAL );
 	}
 
-	header = (int *) ( (char *) s_hunkData + headerOffset );
 	header[0] = 0x89537892;
 	header[1] = HUNK_LOW_TEMP - previousLowTemp;
 
@@ -420,21 +392,11 @@ extern void Hunk_FreeTempMemory( void *buf );
 extern void Hunk_ClearTempMemory( void );
 extern int Hunk_ClearTempMemoryHigh( void );
 
-/* Hunk_FreeTempMemoryInternal  0x00432410  VERIFIED */
-void Hunk_FreeTempMemoryInternal( void *buf ) {
-	Hunk_FreeTempMemory( buf );
-}
-
-void Hunk_ResetTempMark( void ) {
-	Hunk_ClearTempMemory();
-	Hunk_ClearTempMemoryHigh();
-}
-
 /* ---- Hunk_ReallocateTempMemory  0x004323A0 ---- */
 void *Hunk_ReallocateTempMemory( int size ) {
 	HUNK_LOW_TEMP = HUNK_LOW_PERM + size;
 
-	if ( HUNK_LOW_PERM + size + HUNK_HIGH_TEMP > HUNK_TOTAL ) {
+	if ( HUNK_LOW_TEMP + HUNK_HIGH_TEMP > HUNK_TOTAL ) {
 		Com_Meminfo_f();
 		Com_Error( ERR_DROP, "\x15Hunk_ReallocateTempMemory: failed on %i", size );
 	}
@@ -447,11 +409,11 @@ void Hunk_ClearToStart( void ) {
 	extern void XModelClearData( void *high, void *low );
 	extern void FS_ClearDataForFiles( void *lowEnd, void *highEnd );
 	extern void FS_ClearMemory( void );
+	char *high;
+	char *low;
 
-	if ( !s_hunkData ) {
-		return;
-	}
-
+	/* retail has no s_hunkData guard: the whole body runs even before
+	   Com_InitHunkMemory (Com_Error fatal path, Com_Quit_f) */
 	HUNK_LOW_MARK = 0;
 	hunk_lowTempMark = 0;
 	HUNK_LOW_PERM = 0;
@@ -464,10 +426,10 @@ void Hunk_ClearToStart( void ) {
 
 	Com_Printf( "Hunk_Clear: reset the hunk ok\n" );
 
-	XModelClearData( (char *) s_hunkData + HUNK_TOTAL - HUNK_HIGH_PERM,
-					 (char *) s_hunkData + HUNK_LOW_PERM );
-	FS_ClearDataForFiles( (char *) s_hunkData + HUNK_LOW_PERM,
-						  (char *) s_hunkData + HUNK_TOTAL - HUNK_HIGH_PERM );
+	low = (char *) s_hunkData + HUNK_LOW_PERM;
+	high = (char *) s_hunkData + HUNK_TOTAL - HUNK_HIGH_PERM;
+	XModelClearData( high, low );
+	FS_ClearDataForFiles( low, high );
 
 	FS_ClearMemory();
 }
@@ -512,7 +474,8 @@ qboolean Com_Filter( const char *filter, const char *name, int casesensitive ) {
 				buf[i] = *filter;
 				filter++;
 			}
-			buf[i] = '\0';
+			/* pointer store: buf[i] = '\0' makes modern /GS add a range-check fast-fail VC7 never emitted */
+			*( buf + i ) = '\0';
 			if ( strlen( buf ) ) {
 				ptr = Com_StringContains( name, buf, casesensitive );
 				if ( !ptr ) {
@@ -599,7 +562,8 @@ qboolean Com_FilterPath( const char *filter, const char *name, int casesensitive
 			new_filter[i] = filter[i];
 		}
 	}
-	new_filter[i] = '\0';
+	/* pointer store: new_filter[i] = '\0' makes modern /GS add a range-check fast-fail VC7 never emitted */
+	*( new_filter + i ) = '\0';
 
 	for ( i = 0; i < MAX_QPATH - 1 && name[i]; i++ ) {
 		if ( name[i] == '\\' || name[i] == ':' ) {
@@ -608,7 +572,8 @@ qboolean Com_FilterPath( const char *filter, const char *name, int casesensitive
 			new_name[i] = name[i];
 		}
 	}
-	new_name[i] = '\0';
+	/* pointer store: new_name[i] = '\0' makes modern /GS add a range-check fast-fail VC7 never emitted */
+	*( new_name + i ) = '\0';
 
 	return Com_Filter( new_filter, new_name, casesensitive );
 }

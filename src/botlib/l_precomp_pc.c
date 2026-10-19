@@ -61,9 +61,8 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "l_script.h"
+#include "l_memory.h"
 
 /* Defined in l_precomp_mp.c; all three are __cdecl there. */
 extern int PC_ReadToken( void *source, token_t *token );            /* l_precomp_mp.c 0x00441490 */
@@ -78,21 +77,11 @@ extern int Com_Compress( char *data_p );                            /* universal
  * PC_SetBaseFolder / PS_SetBaseFolder and read here and in LoadScriptFile. */
 #define pc_basefolder  ( (char *) pc_baseFolder )
 
-/* Retail's Z_Malloc wrapper is inlined at every site: allocate four bytes more
- * than asked, stamp 0x12345678 into the first dword, hand back the payload.
- * FreeSource and PC_FreeDefine check that magic before calling free(). */
-#define Z_MAGIC  0x12345678
-
-static void *PC_GetMemory( int size ) {
-	int *block;
-
-	block = (int *) Z_MallocInternal( size + 4 );
-	if ( !block ) {
-		return NULL;
-	}
-	*block = Z_MAGIC;
-	return block + 1;
-}
+/* Allocation goes through botlib's GetMemory / GetClearedMemory (l_memory_mp.c
+ * 0x0043D6B0 / 0x0043D6D0: Z_MallocInternal( size + 4 ) with the 0x12345678
+ * magic in the first dword), which LTCG inlines into LoadScriptFile and
+ * LoadSourceFile as in retail.  No tree-only static copies: VC7 would emit
+ * them as dead functions retail does not have. */
 
 /*
 ========================
@@ -196,7 +185,7 @@ VERIFIED 0x00443A60.
   * the frame has exactly one argument slot (`fmt` at +0x4C) above
     `__return_address` at +0x48;
   * `lea edi,[ebx+571h]` then `lea ecx,[edi+4]` is Z_MallocInternal(length +
-    1393 + 4), i.e. PC_GetMemory( sizeof(script_t) + length + 1 ) with
+    1393 + 4), i.e. GetMemory( sizeof(script_t) + length + 1 ) with
     sizeof(script_t) == 1392;
   * the guard is `test ebp,ebp` on the HANDLE, not on the length, so a
     zero-length file that opens is still loaded -- `if ( !f )`, not
@@ -236,14 +225,11 @@ script_t *LoadScriptFile( const char *filename ) {
 		return NULL;
 	}
 
-	script = (script_t *) PC_GetMemory( sizeof( script_t ) + length + 1 );
-	if ( !script ) {
-		FS_FCloseFile( f );
-		return NULL;
-	}
-	/* Retail zeroes the whole block and then zeroes the header a second time
-	 * (0x00443B16 and 0x00443B2A).  The second pass is redundant. */
-	memset( script, 0, sizeof( script_t ) + length + 1 );
+	/* Unchecked: Z_MallocInternal does not return NULL.  Retail zeroes the
+	 * whole block and then zeroes the header a second time (0x00443B16 and
+	 * 0x00443B2A).  The second pass is redundant. */
+	script = (script_t *) GetClearedMemory( sizeof( script_t ) + length + 1 );
+	memset( script, 0, sizeof( script_t ) );
 
 	strcpy( script->filename, filename );          /* unbounded -- see above */
 	script->buffer = (char *) script + sizeof( script_t );
@@ -296,10 +282,8 @@ source_t *LoadSourceFile( const char *filename ) {
 	}
 	script->next = NULL;
 
-	source = (source_t *) PC_GetMemory( sizeof( source_t ) );
-	if ( !source ) {
-		return NULL;
-	}
+	/* Unchecked, as LoadScriptFile: Z_MallocInternal does not return NULL. */
+	source = (source_t *) GetMemory( sizeof( source_t ) );
 	memset( source, 0, sizeof( source_t ) );
 
 	/* strncpy, not strcpy: retail bounds this one at 260 and does NOT
@@ -312,10 +296,7 @@ source_t *LoadSourceFile( const char *filename ) {
 	source->indentstack = NULL;
 	source->skip        = 0;
 
-	source->definehash = (void **) PC_GetMemory( 1024 * sizeof( void * ) );
-	if ( source->definehash ) {
-		memset( source->definehash, 0, 1024 * sizeof( void * ) );
-	}
+	source->definehash = (void **) GetClearedMemory( 1024 * sizeof( void * ) );
 
 	PC_AddGlobalDefinesToSource( source );
 	return source;
@@ -329,7 +310,7 @@ file-local in retail as it is in RTCW: the only five functions that touch
 0x01646440 are the five below, so this is a private table in everything but
 storage.  It stays on the shared symbol rather than becoming a `static` here
 so that all five agree on one array (0x01646444 is &sourceFiles[1], the scan
-base).  cod1_globals.h types it `int[64]`; the cast to `source_t *` is
+base).  It is typed `int[64]`; the cast to `source_t *` is
 confined to this one macro.
 
 Retail's scan at 0x00442020 is the compiler's 9-way unrolling of the plain
@@ -337,6 +318,7 @@ RTCW loop; it can read up to sourceFiles[71] before the `cmp ebx,40h` bound
 check rejects the index, which is harmless -- the over-read is discarded.
 ========================
 */
+int sourceFiles[64];   /* 0x01646440 */
 #define pc_sourceFiles  ( (source_t **) sourceFiles )
 
 /*
@@ -403,11 +385,12 @@ narrowed to 32 bits by the `fstp dword ptr [edi+0Ch]` at 0x004421BF.
 The stack token_t is 1072 bytes at [esp+0]..[esp+42Fh] with the cookie at
 [esp+430h]; PC_ReadToken fills all 1072 bytes of it.
 
-DIVERGENCE (deliberate): the record is zeroed before the call.  Retail does
-not, and PC_ReadToken's early-failure paths can leave it untouched, which makes
-the strcpy below read an uninitialised 1024-byte stack buffer with no
-guaranteed NUL.  Retail got away with it; there is no behavioural difference on
-the success path and the failure path stops depending on stack residue.
+Retail does not zero the record before the call, and neither does this.  No
+path through PC_ReadToken can leave it untouched: its first act is
+PC_ReadSourceToken, which either copies a queued token or calls PS_ReadToken,
+and PS_ReadToken (0x00442FB0) writes all 0x10C dwords -- `rep movsd` from
+script->token or `rep stosd` of zero -- before any failure return.  So the
+strcpy below always sees a terminated string, success or failure.
 ========================
 */
 int PC_ReadTokenHandle( int handle, pc_token_t *pc_token ) {
@@ -421,7 +404,6 @@ int PC_ReadTokenHandle( int handle, pc_token_t *pc_token ) {
 		return 0;
 	}
 
-	memset( &token, 0, sizeof( token ) );        /* see DIVERGENCE above */
 	ret = PC_ReadToken( pc_sourceFiles[handle], &token );
 
 	strcpy( pc_token->string, token.string );
@@ -431,8 +413,7 @@ int PC_ReadTokenHandle( int handle, pc_token_t *pc_token ) {
 	pc_token->floatvalue = (float) token.floatvalue;
 
 	if ( pc_token->type == TT_STRING ) {
-		/* __fastcall(unused@ecx, string@edx); see l_script.h. */
-		StripDoubleQuotes( 0, pc_token->string );
+		StripDoubleQuotes( pc_token->string );
 	}
 	return ret;
 }
@@ -445,19 +426,16 @@ PC_SourceFileAndLine      0x00442220
 ========================
 */
 int PC_SourceFileAndLine( int handle, char *filename, int *line ) {
-	source_t *source;
-
 	if ( handle < 1 || handle >= MAX_SOURCEFILES ) {
 		return 0;
 	}
-	source = pc_sourceFiles[handle];
-	if ( !source ) {
+	if ( !pc_sourceFiles[handle] ) {
 		return 0;
 	}
 
-	strcpy( filename, source->filename );
-	if ( source->scriptstack ) {
-		*line = source->scriptstack->line;
+	strcpy( filename, pc_sourceFiles[handle]->filename );
+	if ( pc_sourceFiles[handle]->scriptstack ) {
+		*line = pc_sourceFiles[handle]->scriptstack->line;
 	} else {
 		*line = 0;
 	}
@@ -510,8 +488,8 @@ typedef struct directive_s {
 /* The 16 handlers, all in l_precomp_mp.c, all __cdecl with the source_t as
  * their one stack argument (`push ebp / call [table] / add esp,4` at
  * 0x004410EF).  Declared with a uniform prototype so the table needs no casts;
- * l_precomp_mp.c spells the same parameter `int` or `_DWORD *` from function
- * to function, the same 4-byte cdecl argument either way. */
+ * l_precomp_mp.c types the same parameter `source_t *`, the same 4-byte cdecl
+ * argument either way. */
 extern int PC_Directive_if             ( void *source );   /* 0x00440BE0 */
 extern int PC_Directive_ifdef          ( void *source );   /* 0x0043FA60 */
 extern int PC_Directive_ifndef         ( void *source );   /* 0x0043FA80 */
@@ -534,8 +512,8 @@ extern int PC_DollarDirective_evalfloat( void *source );   /* 0x00441220 */
  * all (0x00441002-0x00441008), so neither is a stack argument in the
  * original; the order below is the one the definition and every call site in
  * l_precomp_mp.c agree on. */
-extern int  PC_ReadSourceToken  ( token_t *token, void *source );  /* 0x0043DA50 */
-extern int  PC_UnreadSourceToken( token_t *token, void *source );  /* 0x0043DBC0 */
+extern int PC_ReadSourceToken(source_t *source,token_t *token);  /* 0x0043DA50 */
+extern int PC_UnreadSourceToken(source_t *source,const token_t *token);  /* 0x0043DBC0 */
 extern void SourceError         ( void *source, char *fmt, ... );  /* 0x0043D7B0 */
 
 /* VERIFIED 0x0057AAA0 (directives) and 0x0057AB40 (dollardirectives).  The
@@ -597,13 +575,13 @@ int PC_ReadDirective( void *source ) {
 	int     i;
 
 	/* read the directive name */
-	if ( !PC_ReadSourceToken( &token, source ) ) {
+	if ( !PC_ReadSourceToken(source,&token) ) {
 		SourceError( source, "found # without name" );
 		return 0;
 	}
 	/* the directive name must be on the same line as the # */
 	if ( token.linescrossed > 0 ) {
-		PC_UnreadSourceToken( &token, source );
+		PC_UnreadSourceToken(source,&token);
 		SourceError( source, "found # at end of line" );
 		return 0;
 	}
@@ -634,12 +612,12 @@ int PC_ReadDollarDirective( void *source ) {
 	token_t token;
 	int     i;
 
-	if ( !PC_ReadSourceToken( &token, source ) ) {
+	if ( !PC_ReadSourceToken(source,&token) ) {
 		SourceError( source, "found $ without name" );
 		return 0;
 	}
 	if ( token.linescrossed > 0 ) {
-		PC_UnreadSourceToken( &token, source );
+		PC_UnreadSourceToken(source,&token);
 		SourceError( source, "found $ at end of line" );
 		return 0;
 	}
@@ -650,7 +628,7 @@ int PC_ReadDollarDirective( void *source ) {
 			}
 		}
 	}
-	PC_UnreadSourceToken( &token, source );
+	PC_UnreadSourceToken(source,&token);
 	SourceError( source, "unknown precompiler directive %s", token.string );
 	return 0;
 }

@@ -2,18 +2,9 @@
  * cm_patch_local.h -- the curved-patch collision record layouts for
  * Call of Duty 1.1 (Windows, CoDMP.exe).
  *
- * qcommon/cod1_types.h still declares patchCollide_t (16 bytes) and facet_t
- * (320 bytes) as opaque blobs, and qcommon/cm_local.h passes them around by
- * pointer without ever looking inside.  Both of those are shared headers, so
- * the real layouts live here instead and the opaque names are renamed aside
- * for the duration of the qcommon.h include -- exactly the pattern cm_local.h
- * uses for cbrush_t and friends.
- *
- * Include this INSTEAD of (and before) qcommon.h.  When these layouts move
- * into cod1_types.h the whole #define/#undef block below is deleted in one
- * step and no .c file changes.
- *
- * Consumers: qcommon/cm_patch.c, qcommon/cm_terrain.c.
+ * RTCW keeps these in qcommon/cm_patch.h, which its cm_local.h includes;
+ * qcommon/cm_local.h includes this header the same way, and cm_patch.c,
+ * which builds the records, includes it directly.
  *
  * ---------------------------------------------------------------------------
  * EVIDENCE
@@ -22,7 +13,7 @@
  * These three records are Q3's, inherited essentially unchanged, and three
  * independent sources agree:
  *
- *  1. The sizes cod1_types.h already proves from array strides:
+ *  1. The sizes the retail array strides prove:
  *         patchCollide_t  16      facet_t  320 (0x140)   patchPlane_t  20
  *
  *  2. opencoduo (coduo-server-master/dedicated-engine/src/physics_collision/
@@ -71,16 +62,7 @@
 #ifndef __CM_PATCH_LOCAL_H__
 #define __CM_PATCH_LOCAL_H__
 
-/* Rename cod1_types.h's opaque placeholders aside.  Delete this block, the
- * matching #undef block and the two typedefs below once the real layouts live
- * in cod1_types.h. */
-#define patchCollide_t      cod1_opaque_patchCollide_t
-#define facet_t             cod1_opaque_facet_t
-
 #include "qcommon.h"
-
-#undef patchCollide_t
-#undef facet_t
 
 /* patchPlane_t lives here, where RTCW keeps it (qcommon/cm_patch.h).  It is
  * the same record as opencoduo's { vec3_t normal; float dist; uint32 signbits; }.
@@ -106,8 +88,6 @@ typedef struct facet_s
 	qboolean borderNoAdjust[MAX_FACET_BORDERS]; /* +0x0D8 */
 } facet_t;                                      /*  =0x140 */
 COD1_ASSERT_SIZE( facet_t, 320 );
-COD1_STATIC_ASSERT( sizeof( facet_t ) == sizeof( cod1_opaque_facet_t ),
-					"facet_t must match the proven size of cod1_opaque_facet_t" );
 
 typedef struct patchCollide_s
 {
@@ -117,17 +97,6 @@ typedef struct patchCollide_s
 	facet_t         *facets;        /* +0x0C */
 } patchCollide_t;                   /*  =0x10 */
 COD1_ASSERT_SIZE( patchCollide_t, 16 );
-COD1_STATIC_ASSERT( sizeof( patchCollide_t ) == sizeof( cod1_opaque_patchCollide_t ),
-					"patchCollide_t must match the proven size of cod1_opaque_patchCollide_t" );
-
-/*
- * cm_local.h declares CM_GeneratePatchCollide as returning the OPAQUE
- * patchCollide_t*, and cPatch_t.pc is an opaque pointer too.  Units that
- * include this header therefore need one cast at each boundary; it disappears
- * with the #define block above.
- */
-#define CM_PC( p )      ( (patchCollide_t *) (p) )
-#define CM_PC_OPAQUE( p ) ( (cod1_opaque_patchCollide_t *) (p) )
 
 /*
  * THE PATCH PLANE POOL -- `patchPlane_t cm_patchPlanes[4096]` at 0x0087C7E0,

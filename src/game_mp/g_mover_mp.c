@@ -1,23 +1,4 @@
-/*
- * g_mover_mp.c -- the multiplayer game module's movers.
- *
- * RTCW's game/g_mover.c is the direct ancestor and most of this unit is that
- * text: the push solver (G_TestEntityPosition .. G_MoverTeam), the binary
- * mover state machine (SetMoverState .. Use_BinaryMover), the door triggers,
- * and the func_* spawn functions.  CoD 1.1 cut everything RTCW's single player
- * needed and nothing else does -- the AI hooks, the AAS blocking, func_secret's
- * trinary mover, plats, buttons, trains and bats -- and replaced the hardcoded
- * door sound table with the spawn-key driven one DoorSetSounds parses.  The
- * FL_KICKACTIVATE half of RTCW's kicked/soft door pair is gone as well; only
- * FL_SOFTACTIVATE survives.
- *
- * SetMoverState / MatchTeam are shared with the script mover in
- * g_scr_mover_mp.c, which is why they are not static here.
- *
- * Function order is binary order (0x2002A980 .. 0x2002E2C0).
- *
- * @fidelity: likely
- */
+// g_mover_mp.c -- pushers, doors and the other func_* movers, and trigger_use
 
 #include "g_local.h"
 
@@ -26,66 +7,29 @@
 #include <string.h>
 
 /* Declarations that belong in a shared header. */
-
-#define PITCH   0
-#define YAW     1
-#define ROLL    2
-
 #define ANGLE2SHORT( x )    ( (int)( ( x ) * ( 65536 / 360.0f ) ) & 65535 )
 
-/* G_RunFrameForEntity's think period; finishSpawningKeyedMover and the door
-   spawns all schedule level.time + 100. */
-#define FRAMETIME               100
-
-/* gentity_t.flags.  0x100 is the only one of RTCW's door activation flags CoD
-   kept (SetMoverState 0x2002B90A, Use_BinaryMover 0x2002C468). */
-#define FL_TEAMSLAVE            0x00000004
-#define FL_TOGGLE               0x00000080
-#define FL_SOFTACTIVATE         0x00000100
-
-/* entityState_t.eType, off the G_MoverPush filter (0x2002B3B0) and InitMover
-   (0x2002C7EA). */
-#define ET_PLAYER               1
-#define ET_ITEM                 3
-#define ET_MISSILE              4
-#define ET_MOVER                5
-
-/* trajectory_t.trType */
-#define TR_STATIONARY           0
-#define TR_LINEAR               2
-#define TR_LINEAR_STOP          3
-#define TR_SINE                 4
-
-/* entityShared_t.svFlags */
-#define SVF_NOCLIENT            0x00000001
-#define SVF_USE_CURRENT_ORIGIN  0x00000080
+#define FRAMETIME               100     // msec
 
 /* entityState_t.eFlags */
-#define EF_MOVER_STOP           0x04000000
+#define EF_MOVER_STOP           0x04000000      // will push otherwise
 
-/* Content bits.  MASK_SOLID is the 0x11 G_TestEntityPosition falls back to
-   when the entity has no clipmask (0x2002A99F); its two bits are not named. */
-#define MASK_SOLID              0x00000011
-#define CONTENTS_CORPSE         0x04000000
-#define CONTENTS_TRIGGER        0x40000000
-
-/* entity_event_t members this unit raises (bg_misc.c's eventnames[]). */
-#define EV_SOUND_ALIAS          172
-#define EV_ITEM_POP             198
-
-/* meansOfDeath, emitted as a literal by every G_Damage call here. */
-#define MOD_CRUSH               19
-
-/* trigger_use's "hintstring" pool: 32 configstrings ending where
-   CS_LOCALIZED_STRINGS (1244) begins.  0x2002E20A / 0x2002E266. */
-#define CS_HINTSTRINGS          1212
-#define MAX_HINTSTRINGS         32
-
-/* entityState_t.dmgFlags values, named by predef_hintStrings[] below. */
-#define HINT_ACTIVATE           2
-#define HINT_NUM_HINTS          11
-
-#define FOFS( x )   ( (int)&( ( (gentity_t *)0 )->x ) )
+/* entityState_t.dmgFlags values, also used by GScr_SetCursorHint.  The lookup
+   in trigger_use runs into the trailing NULL with the unguarded Q_strcasecmp,
+   so an unrecognised "cursorhint" value faults (original bug, kept). */
+char *hintStrings[HINT_NUM_HINTS] = {
+	"",                  // HINT_NONE
+	"HINT_NONE",     // actually HINT_FORCENONE, but since this is being specified in the ent, the designer actually means HINT_FORCENONE
+	"HINT_ACTIVATE",
+	"HINT_NOACTIVATE",
+	"HINT_DOOR",
+	"HINT_DOOR_LOCKED",
+	"HINT_MG42",
+	"HINT_HEALTH",
+	"HINT_LADDER",
+	"HINT_FRIENDLY",
+	NULL
+};
 
 /* forward: q_math.c */
 float   RadiusFromBounds( const vec3_t mins, const vec3_t maxs );
@@ -93,11 +37,13 @@ void    AddPointToBounds( const vec3_t v, vec3_t mins, vec3_t maxs );
 void    VectorInverse( vec3_t v );
 void    vectoangles( const vec3_t value1, vec3_t angles );
 
-/* forward: g_main_mp.c */
-extern vmCvar_t g_gravity;                      /* 0x2016EFE0 */
+/* forward: q_shared.c.  Not NULL-guarded (unlike Q_stricmp). */
+int     Q_strcasecmp( char *s1, char *s2 );
 
-/* forward: g_combat_mp.c.  Every call site in this unit passes dir/point
- * NULL, dflags 0, mod MOD_CRUSH, hitLoc 0. */
+/* forward: g_main_mp.c */
+extern vmCvar_t g_gravity;
+
+/* forward: g_combat_mp.c */
 void    G_Damage( gentity_t *targ, gentity_t *inflictor, gentity_t *attacker,
 				  const vec3_t dir, const vec3_t point, int damage, int dflags,
 				  int mod, int hitLoc );
@@ -113,12 +59,10 @@ PUSHMOVE
 typedef struct {
 	gentity_t   *ent;
 	vec3_t origin;
-	vec3_t angles;          /* never written or read in 1.1; only the 32-byte
-							   stride is known */
-	float deltayaw;         /* CoD stores amove[YAW], not the client's
-							   delta_angles[YAW] (0x2002B4F6) */
+	vec3_t angles;          // unused
+	float deltayaw;         // amove[YAW], not the client's delta_angles[YAW]
 } pushed_t;
-pushed_t pushed[MAX_GENTITIES], *pushed_p;      /* 0x202C5340, 0x20089F30 */
+pushed_t pushed[MAX_GENTITIES], *pushed_p;
 
 
 /*
@@ -283,13 +227,13 @@ qboolean G_TryPushingEntity( gentity_t *check, gentity_t *pusher, vec3_t move, v
 	// if it is ok to leave in the old position, do it
 	// this is only relevent for riding entities, not pushed
 	// Sliding trapdoors can cause this.
-	if ( G_TestEntityPosition( check, check->r.currentOrigin ) ) {
-		// blocked
-		return qfalse;
+	if ( !G_TestEntityPosition( check, check->r.currentOrigin ) ) {
+		check->s.groundEntityNum = ENTITYNUM_NONE;
+		return qtrue;
 	}
 
-	check->s.groundEntityNum = ENTITYNUM_NONE;
-	return qtrue;
+	// blocked
+	return qfalse;
 }
 
 /*
@@ -321,7 +265,7 @@ qboolean G_MoverPush( gentity_t *pusher, vec3_t move, vec3_t amove, gentity_t **
 		radius = RadiusFromBounds( pusher->r.mins, pusher->r.maxs );
 		for ( i = 0; i < 3; i++ ) {
 			mins[i] = pusher->r.currentOrigin[i] - radius + move[i];
-			maxs[i] = pusher->r.currentOrigin[i] + radius + move[i];
+			maxs[i] = pusher->r.currentOrigin[i] + move[i] + radius;
 			totalMins[i] = pusher->r.currentOrigin[i] - radius;
 			totalMaxs[i] = pusher->r.currentOrigin[i] + radius;
 		}
@@ -345,8 +289,7 @@ qboolean G_MoverPush( gentity_t *pusher, vec3_t move, vec3_t amove, gentity_t **
 	// unlink the pusher so we don't get it in the entityList
 	trap_UnlinkEntity( pusher );
 
-	/* 0x02000180 is CONTENTS_BODY plus two bits with no recovered name
-	   (0x2002B2FA). */
+	// CONTENTS_BODY plus two more content bits
 	listedEntities = trap_EntitiesInBox( totalMins, totalMaxs, entityList, MAX_GENTITIES, 0x02000180 );
 
 	// move the pusher to it's final position
@@ -418,7 +361,7 @@ qboolean G_MoverPush( gentity_t *pusher, vec3_t move, vec3_t amove, gentity_t **
 
 		// bobbing entities are instant-kill and never get blocked
 		if ( pusher->s.pos.trType == TR_SINE || pusher->s.apos.trType == TR_SINE ) {
-			G_Damage( check, pusher, pusher, NULL, NULL, 99999, 0, MOD_CRUSH, 0 );
+			G_Damage( check, pusher, pusher, NULL, NULL, 99999, 0, MOD_CRUSH, HITLOC_NONE );
 			continue;
 		}
 
@@ -446,7 +389,7 @@ G_MoverTeam
 */
 void G_MoverTeam( gentity_t *ent ) {
 	vec3_t move, amove;
-	gentity_t   *part, *obstacle;
+	gentity_t   *part, *obstacle, *check;
 	pushed_t    *p;
 	vec3_t origin, angles;
 
@@ -473,13 +416,14 @@ void G_MoverTeam( gentity_t *ent ) {
 		// go backwards, so if the same entity was pushed
 		// twice, it goes back to the original position
 		for ( p = pushed_p - 1 ; p >= pushed ; p-- ) {
-			VectorCopy( p->origin, p->ent->r.currentOrigin );
-			VectorCopy( p->origin, p->ent->s.pos.trBase );
-			if ( p->ent->client ) {
-				p->ent->client->ps.delta_angles[YAW] -= ANGLE2SHORT( p->deltayaw );
-				VectorCopy( p->origin, p->ent->client->ps.origin );
+			check = p->ent;
+			VectorCopy( p->origin, check->r.currentOrigin );
+			VectorCopy( p->origin, check->s.pos.trBase );
+			if ( check->client ) {
+				check->client->ps.delta_angles[YAW] -= ANGLE2SHORT( p->deltayaw );
+				VectorCopy( p->origin, check->client->ps.origin );
 			}
-			trap_LinkEntity( p->ent );
+			trap_LinkEntity( check );
 		}
 
 		// go back to the previous position
@@ -536,10 +480,10 @@ void G_RunMover( gentity_t *ent ) {
 		// FIXME
 		// hack to fix problem of tram car slaves being linked
 		// after being unlinked in G_FindTeams
-		if ( ent->r.linked ) {
-			if ( ent->classname == scr_const.func_tramcar || ent->classname == scr_const.func_rotating ) {
-				trap_UnlinkEntity( ent );
-			}
+		if ( ent->r.linked && ent->classname == scr_const.func_tramcar ) {
+			trap_UnlinkEntity( ent );
+		} else if ( ent->r.linked && ent->classname == scr_const.func_rotating ) {
+			trap_UnlinkEntity( ent );
 		}
 		return;
 	}
@@ -799,12 +743,14 @@ Reached_BinaryMover
 ================
 */
 void Reached_BinaryMover( gentity_t *ent ) {
-	qboolean soft;
-
-	soft = ( ent->flags & FL_SOFTACTIVATE );
+	qboolean soft = qfalse;
 
 	// stop the looping sound
 	ent->s.loopSound = 0;
+
+	if ( ent->flags & FL_SOFTACTIVATE ) {
+		soft = qtrue;
+	}
 
 	if ( ent->moverState == MOVER_1TO2 ) {
 		// reached pos2
@@ -964,11 +910,13 @@ Use_BinaryMover
 ================
 */
 void Use_BinaryMover( gentity_t *ent, gentity_t *other, gentity_t *activator ) {
+	qboolean soft = qfalse;
 	qboolean isblocked = qfalse;
 	qboolean nosound = qfalse;
-	qboolean soft;
 
-	soft = ( ent->flags & FL_SOFTACTIVATE );
+	if ( ent->flags & FL_SOFTACTIVATE ) {
+		soft = qtrue;
+	}
 
 	if ( level.time <= 4000 ) { // hack.  don't play door sounds if in the first /four/ seconds of game
 		nosound = qtrue;
@@ -978,7 +926,7 @@ void Use_BinaryMover( gentity_t *ent, gentity_t *other, gentity_t *activator ) {
 	if ( ent->flags & FL_TEAMSLAVE ) {
 
 		// pass along flags for how door was activated
-		if ( ent->flags & FL_SOFTACTIVATE ) {
+		if ( soft ) {
 			ent->teammaster->flags |= FL_SOFTACTIVATE;
 		}
 
@@ -1156,7 +1104,7 @@ so the movement delta can be calculated
 */
 void InitMover( gentity_t *ent ) {
 	vec3_t move;
-	float distance;
+	rfloat distance;
 	float light;
 	vec3_t color;
 	qboolean lightSet, colorSet;
@@ -1185,7 +1133,7 @@ void InitMover( gentity_t *ent ) {
 		if ( b > 255 ) {
 			b = 255;
 		}
-		i = light / 4;
+		i = light * 0.25f;
 		if ( i > 255 ) {
 			i = 255;
 		}
@@ -1212,7 +1160,8 @@ void InitMover( gentity_t *ent ) {
 
 	// calculate time to reach second position from speed
 	VectorSubtract( ent->pos2, ent->pos1, move );
-	distance = VectorLength( move );
+	// keep: length written out (not VectorLength) to match original codegen
+	distance = sqrt( move[2] * move[2] + move[1] * move[1] + move[0] * move[0] );
 	if ( !ent->speed ) {
 		ent->speed = 100;
 	}
@@ -1328,7 +1277,7 @@ void Blocked_Door( gentity_t *ent, gentity_t *other ) {
 		}
 
 		if ( ent->damage ) {
-			G_Damage( other, ent, ent, NULL, NULL, ent->damage, 0, MOD_CRUSH, 0 );
+			G_Damage( other, ent, ent, NULL, NULL, ent->damage, 0, MOD_CRUSH, HITLOC_NONE );
 		}
 	}
 
@@ -1367,11 +1316,11 @@ void Blocked_DoorRotate( gentity_t *ent, gentity_t *other ) {
 		}
 
 		if ( other->health <= 0 ) {
-			G_Damage( other, ent, ent, NULL, NULL, 99999, 0, MOD_CRUSH, 0 );
+			G_Damage( other, ent, ent, NULL, NULL, 99999, 0, MOD_CRUSH, HITLOC_NONE );
 		}
 
 		if ( ent->damage ) {
-			G_Damage( other, ent, ent, NULL, NULL, ent->damage, 0, MOD_CRUSH, 0 );
+			G_Damage( other, ent, ent, NULL, NULL, ent->damage, 0, MOD_CRUSH, HITLOC_NONE );
 		}
 	}
 
@@ -1411,7 +1360,7 @@ All of the parts of a door have been spawned, so create
 a trigger that encloses all of them
 ======================
 */
-void Think_SpawnNewDoorTriggerInternal( gentity_t *ent ) {
+gentity_t *Think_SpawnNewDoorTriggerInternal( gentity_t *ent ) {
 	gentity_t       *other;
 	vec3_t mins, maxs;
 	int i, best;
@@ -1450,6 +1399,8 @@ void Think_SpawnNewDoorTriggerInternal( gentity_t *ent ) {
 	trap_LinkEntity( other );
 
 	MatchTeam( ent, ent->moverState, level.time );
+
+	return other;
 }
 
 /*
@@ -1542,7 +1493,7 @@ Door_reverse_sounds
 ==============
 */
 void Door_reverse_sounds( gentity_t *ent ) {
-	byte stemp;
+	int stemp;
 
 	stemp = ent->soundOpening;
 	ent->soundOpening = ent->soundClosing;
@@ -1572,7 +1523,7 @@ DoorSetSounds
 	(used by SP_func_door() and SP_func_door_rotating() )
 ==============
 */
-void DoorSetSounds( gentity_t *ent ) {
+void DoorSetSounds( gentity_t *ent, qboolean isRotating ) {
 	ent->soundOpening       = G_SoundAliasIndex( "door_opening" );
 	ent->soundOpenEnd       = G_SoundAliasIndex( "door_open_end" );
 	ent->soundClosing       = G_SoundAliasIndex( "door_closing" );
@@ -1606,8 +1557,8 @@ void G_TryDoor( gentity_t *ent, gentity_t *other, gentity_t *activator ) {
 				return;
 			}
 
-			Scr_AddEntityNum( activator->s.number, 0 );
-			Scr_NotifyNum( ent->s.number, 0, scr_const.trigger, 1 );
+			Scr_AddEntityNum( activator->s.number, SCR_CLASS_ENTITY );
+			Scr_NotifyNum( ent->s.number, SCR_CLASS_ENTITY, scr_const.trigger, 1 );
 
 			if ( ent->teammaster && ent->team && ent != ent->teammaster ) {
 				ent->teammaster->active = qtrue;
@@ -1630,7 +1581,19 @@ void G_TryDoor( gentity_t *ent, gentity_t *other, gentity_t *activator ) {
 
 /*QUAKED func_door (0 .5 .8) ? START_OPEN TOGGLE CRUSHER TOUCH
 TOGGLE      wait in both the start and end states for a trigger event.
-START_OPEN  the door to moves to its destination when spawned, and operate in reverse.
+START_OPEN  the door to moves to its destination when spawned, and operate in reverse.  It is used to temporarily or permanently close off an area when triggered (not useful for touch or takedamage doors).
+
+"key"       if set, the door is locked
+"angle"	    determines the opening direction
+"speed"	    movement speed (400 default)
+"closespeed" optional different movement speed for door closing
+"wait"      wait before returning (2 default, -1 = never return)
+"lip"       lip remaining at end of move (8 default)
+"dmg"       damage to inflict when blocked (2 default)
+"color"     constantLight color
+"light"     constantLight radius
+"health"    if set, the door must be shot open
+"team"		team name.  other doors with same team name will open/close in syncronicity
 */
 void SP_func_door( gentity_t *ent ) {
 	vec3_t abs_movedir;
@@ -1640,7 +1603,7 @@ void SP_func_door( gentity_t *ent ) {
 	int key;
 	int health;
 
-	DoorSetSounds( ent );
+	DoorSetSounds( ent, qfalse );
 
 	ent->blocked = Blocked_Door;
 
@@ -1655,8 +1618,8 @@ void SP_func_door( gentity_t *ent ) {
 	}
 	ent->wait *= 1000;
 
-	// door keys.  1.1 keeps only "was a key given", not the number (0x2002D6E7)
-	ent->key = G_SpawnInt( "key", "", &key );
+	// door keys.  only the presence of a key is kept, not its number
+	ent->key = G_SpawnInt( "key", "", &key ) != 0;
 
 	// default lip of 8 units
 	G_SpawnFloat( "lip", "8", &lip );
@@ -1735,6 +1698,14 @@ Static_Pain
 */
 void Static_Pain( gentity_t *ent, gentity_t *attacker, int damage, const float *point,
 				  int mod, const float *dir, int hitLoc ) {
+	// keep: the separate (identical) painEFX arm matches original codegen
+	if ( ent->spawnflags & 4 ) {
+		if ( level.time > ent->wait + ent->delay + rand() % 1000 + 500 ) {
+			ent->wait = level.time;
+		}
+		return;
+	}
+
 	if ( level.time > ent->wait + ent->delay + rand() % 1000 + 500 ) {
 		ent->wait = level.time;
 	}
@@ -1752,6 +1723,14 @@ void SP_func_leaky( gentity_t *ent ) {
 
 /*QUAKED func_static (0 .5 .8) ? start_invis pain painEFX
 A bmodel that just sits there, doing nothing.  Can be used for conditional walls and models.
+"color"		constantLight color
+"light"		constantLight radius
+"start_invis" will start the entity as non-existant
+If targeted, it will toggle existance when triggered
+
+When using pain you will need to specify the delay time
+value of 1 = 1 sec 2 = 2 sec so on...
+default is 1 sec you can use decimals
 */
 void SP_func_static( gentity_t *ent ) {
 	int health;
@@ -1791,6 +1770,14 @@ void SP_func_static( gentity_t *ent ) {
 }
 
 /*QUAKED func_rotating (0 .5 .8) ? START_ON STARTINVIS X_AXIS Y_AXIS
+You need to have an origin brush as part of this entity.  The center of that brush will be
+the point around which it is rotated. It will rotate around the Z axis by default.  You can
+check either the X_AXIS or Y_AXIS box to change that.
+
+"speed"		determines how fast it moves; default value is 100.
+"dmg"		damage to inflict when blocked (2 default)
+"color"		constantLight color
+"light"		constantLight radius
 */
 void Use_Func_Rotate( gentity_t *ent, gentity_t *other, gentity_t *activator ) {
 	if ( ent->spawnflags & 4 ) {
@@ -1854,6 +1841,12 @@ BOBBING
 
 /*QUAKED func_bobbing (0 .5 .8) ? X_AXIS Y_AXIS
 Normally bobs on the Z axis
+"height"	amplitude of bob (32 default)
+"speed"		seconds to complete a bob cycle (4 default)
+"phase"		the 0.0 to 1.0 offset in the cycle to start at
+"dmg"		damage to inflict when blocked (2 default)
+"color"		constantLight color
+"light"		constantLight radius
 */
 void SP_func_bobbing( gentity_t *ent ) {
 	float height;
@@ -1884,7 +1877,14 @@ void SP_func_bobbing( gentity_t *ent ) {
 }
 
 /*QUAKED func_pendulum (0 .5 .8) ?
+You need to have an origin brush as part of this entity.
+Pendulums always swing north / south on unrotated models.  Add an angles field to the model to allow rotation in other directions.
+Pendulum frequency is a physical constant based on the length of the beam and gravity.
 "speed"		the number of degrees each way the pendulum swings, (30 default)
+"phase"		the 0.0 to 1.0 offset in the cycle to start at
+"dmg"		damage to inflict when blocked (2 default)
+"color"		constantLight color
+"light"		constantLight radius
 */
 void SP_func_pendulum( gentity_t *ent ) {
 	float freq;
@@ -1904,7 +1904,7 @@ void SP_func_pendulum( gentity_t *ent ) {
 		length = 8;
 	}
 
-	freq = 1 / ( M_PI * 2 ) * sqrt( g_gravity.value / ( 3 * length ) );
+	freq = 1 / ( M_PI * 2 ) * FCAST( sqrt( g_gravity.value / ( 3 * length ) ) );
 
 	ent->s.pos.trDuration = ( 1000 / freq );
 
@@ -1920,6 +1920,20 @@ void SP_func_pendulum( gentity_t *ent ) {
 }
 
 /*QUAKED func_door_rotating (0 .5 .8) ? START_OPEN TOGGLE X_AXIS Y_AXIS REVERSE FORCE STAYOPEN
+You need to have an origin brush as part of this entity.  The center of that brush will be
+the point around which it is rotated. It will rotate around the Z axis by default.  You can
+check either the X_AXIS or Y_AXIS box to change that (only one axis allowed. If both X and Y
+are checked, the default of Z will be used).
+FORCE		door opens even if blocked
+
+"key"       if set, the door is locked
+"degrees"   determines how many degrees it will turn (90 default)
+"speed"     how many milliseconds it will take to open (1000 default)
+"wait"      wait before returning (2 default, -1 = never return)
+"color"     constantLight color
+"light"     constantLight radius
+"health"    if set, the door must be shot open
+"team"		team name.  other doors with same team name will open/close in syncronicity
 */
 void SP_func_door_rotating( gentity_t *ent ) {
 	int key;
@@ -1930,7 +1944,7 @@ void SP_func_door_rotating( gentity_t *ent ) {
 	}
 	ent->spawnflags &= ~64;
 
-	DoorSetSounds( ent );
+	DoorSetSounds( ent, qtrue );
 
 	// set the duration
 	if ( !ent->speed ) {
@@ -1953,7 +1967,7 @@ void SP_func_door_rotating( gentity_t *ent ) {
 	}
 
 	// door keys.  as in SP_func_door, only the presence of the key is kept
-	ent->key = G_SpawnInt( "key", "", &key );
+	ent->key = G_SpawnInt( "key", "", &key ) != 0;
 
 	// set the rotation axis
 	VectorClear( ent->rotate );
@@ -1967,7 +1981,8 @@ void SP_func_door_rotating( gentity_t *ent ) {
 		ent->rotate[1] = 1;
 	}
 
-	if ( VectorLength( ent->rotate ) > 1 ) { // check that rotation is only set for one axis
+	// keep: length written out (not VectorLength) to match original codegen
+	if ( FCAST( sqrt( ent->rotate[0] * ent->rotate[0] + ent->rotate[1] * ent->rotate[1] + ent->rotate[2] * ent->rotate[2] ) ) > 1 ) { // check that rotation is only set for one axis
 		G_Error( "Too many axis marked in func_door_rotating entity.  Only choose one axis of rotation. (defaulting to standard door rotation)" );
 		VectorClear( ent->rotate );
 		ent->rotate[1] = 1;
@@ -2004,24 +2019,6 @@ TRIGGER_USE
 ===============================================================================
 */
 
-/* entityState_t.dmgFlags values.  The trailing NULL is in the image
-   (0x20069DC0) and the loop below walks past the last name into it. */
-/* Not static: g_scr_main_mp.c walks the same table (0x20069D98) from
-   GScr_SetCursorHint. */
-char *predef_hintStrings[HINT_NUM_HINTS] = {
-	"",
-	"HINT_NONE",
-	"HINT_ACTIVATE",
-	"HINT_NOACTIVATE",
-	"HINT_DOOR",
-	"HINT_DOOR_LOCKED",
-	"HINT_MG42",
-	"HINT_HEALTH",
-	"HINT_LADDER",
-	"HINT_FRIENDLY",
-	NULL
-};
-
 void use_trigger_use( gentity_t *ent, gentity_t *other, gentity_t *activator ) {
 	if ( level.time > ent->wait ) {
 		ent->wait = level.time + ent->delay;
@@ -2050,8 +2047,8 @@ void trigger_use( gentity_t *ent ) {
 
 	ent->delay *= 1000;
 
-	VectorCopy( ent->r.currentOrigin, ent->s.pos.trBase );
 	ent->s.pos.trType = TR_STATIONARY;
+	VectorCopy( ent->r.currentOrigin, ent->s.pos.trBase );
 
 	ent->r.contents = 0x00200000;       /* trigger_use's own content bit */
 	ent->r.svFlags = SVF_NOCLIENT;
@@ -2060,11 +2057,11 @@ void trigger_use( gentity_t *ent ) {
 	ent->s.dmgFlags = HINT_ACTIVATE;
 
 	if ( G_SpawnString( "cursorhint", "", &s ) ) {
-		if ( !Q_stricmp( "HINT_INHERIT", s ) ) {
-			ent->s.dmgFlags = -1;
+		if ( !Q_strcasecmp( s, "HINT_INHERIT" ) ) {
+			ent->s.dmgFlags = HINT_INHERIT;
 		} else {
-			for ( i = 1 ; i < HINT_NUM_HINTS ; i++ ) {
-				if ( !Q_stricmp( predef_hintStrings[i], s ) ) {
+			for ( i = 1 ; i < sizeof( hintStrings ) / sizeof( hintStrings[0] ) ; i++ ) {
+				if ( !Q_strcasecmp( s, hintStrings[i] ) ) {
 					ent->s.dmgFlags = i;
 					break;
 				}
@@ -2072,10 +2069,10 @@ void trigger_use( gentity_t *ent ) {
 		}
 	}
 
-	ent->s.scale = 255;
+	ent->s.scale = HINT_STRING_NONE;
 
 	if ( G_SpawnString( "hintstring", "", &s ) ) {
-		for ( i = 0 ; i < MAX_HINTSTRINGS ; i++ ) {
+		for ( i = 0 ; i < CS_HINTSTRINGS_COUNT ; i++ ) {
 			trap_GetConfigstring( CS_HINTSTRINGS + i, buffer, sizeof( buffer ) );
 			if ( !buffer[0] ) {
 				trap_SetConfigstring( CS_HINTSTRINGS + i, s );
@@ -2088,8 +2085,8 @@ void trigger_use( gentity_t *ent ) {
 			}
 		}
 
-		if ( i == MAX_HINTSTRINGS ) {
-			Com_Error( ERR_DROP, "\x15" "Too many different hintstring key values on trigger_use entities. Max allowed is %i", MAX_HINTSTRINGS );
+		if ( i == CS_HINTSTRINGS_COUNT ) {
+			Com_Error( ERR_DROP, "\x15" "Too many different hintstring key values on trigger_use entities. Max allowed is %i", CS_HINTSTRINGS_COUNT );
 		}
 	}
 }
@@ -2098,8 +2095,7 @@ void trigger_use( gentity_t *ent ) {
 ==========
 G_Activate
 
-  Generic activation routine for doors.  Nothing in the retail 1.1 module
-  references it; the name is inferred from RTCW.
+  Generic activation routine for doors
 ==========
 */
 void G_Activate( gentity_t *ent, gentity_t *activator ) {

@@ -1,576 +1,519 @@
 /*
  * @fidelity: likely
  * @fidelity-default: unreviewed
+ *
+ * tr_model.c -- model registry and XModel loading.
+ *
+ * CoD1 models are XModel-based, not RTCW's md3/mdc/mds meshes, so the loader
+ * here (R_LoadXModel / R_FixupXModelTexCoords / R_RefreshXModels_ARB) walks an
+ * XModel -> XModelInfo -> XModelLodInfo -> XModelSurfs -> XSurface chain that
+ * RTCW's tr_models.c has no counterpart for.  Only the registry entry points
+ * (R_GetModelByHandle, R_AllocModel, RE_RegisterModel, R_ModelInit,
+ * RE_BeginRegistration, R_ModelBounds) line up with RTCW.
+ *
+ * model_t / bmodel_t come from tr_local.h.  The XModel chain and the tex-coord
+ * remap record are file-local (proven against the retail binary + CoDUO and
+ * pinned with size/offset asserts); tr_local.h is intentionally not touched.
  */
 
 #include <malloc.h>
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
+#include "tr_records.h"
 #include "tr_shaderregistry.h"
 #include "tr_gl_types.h"
 #include "tr_tess.h"
+#include "tr_local.h"
+
+extern int GetRefString_var;   /* script/scr_memorytree.cpp: the script string arena (scr_local.h) */
 
 extern char xmodel_defaultCollision[];
 
 extern int Hunk_AllocAlignInternal();
 extern int Hunk_AllocXModelPrecache();
 extern int Hunk_AllocXModelPrecacheMesh();
-extern int RB_ExecuteRenderCommands();
+extern void __cdecl RB_ExecuteRenderCommands(const void *data);
 extern int RE_ClearFlares();
 extern int R_FindShader();
-extern int R_FinishLoadingStaticModels();
-extern int R_Init();
+extern void R_FinishLoadingStaticModels(void);
+extern void __cdecl R_Init( void );
 extern int R_LoadDelayedImages();
 extern int R_MergeShadersForImageSheets();
 extern int R_SetupTextureCoordinateRemap();
-extern _DWORD *__cdecl R_SyncRenderThread( void );
+extern void __cdecl R_SyncRenderThread( void );
+extern int RE_ClearScene(void);
+extern int R_OptimizeRigidXSurfaceARB();
+extern int R_OptimizeRigidXSurfaceNV();
+extern int R_OptimizeRigidXSurfaceATI();
 typedef void *( *XModelAllocFn )( int size );
 void *XModelPrecache( const char *name, int loadSurfaces, XModelAllocFn alloc, XModelAllocFn allocMesh );
 extern int qsort_m();
 extern int DObjGetNumSurfaces();
-extern int DObjGetSurfaces();
+extern void DObjGetSurfaces();
 extern int XSurfaceGetVerts();
 extern int XSurfaceRefresh_ARB();
 
+/* shader_t bits/fields used here that fall outside tr_local.h's named prefix.
+ * (tr_local.h shader_t: flags +0x4c, remappedShader +0x180). */
+#define SHADER_DEFAULTED         0x0001    /* flags: default (missing) shader */
+#define SHADER_REMAPPED          0x1000    /* flags: uses a remapped shader */
+#define R_ShaderRemapped(sh)     (((shader_t *)(sh))->remappedShader)
+
+/* render command list, inside the backEndData frame (see tr_cmds.c) */
+#define RCL_CMDS                 1636096   /* renderCommandList.cmds base */
+#define RCL_USED                 1898240   /* renderCommandList.used */
+
+/* ------------------------------------------------------------------------- *
+ *  XModel data chain (file-local typed views).
+ *
+ *  XModel (0x0c) -> XModelInfo (0x68) -> XModelLodInfo[3] (0x14 each) ->
+ *  XModelSurfs (0x0c) -> XModelSurfsData (0x0c) -> XSurface* [].
+ *  Every offset below is proven against retail CoDMP.exe (IDA struct db) and
+ *  cross-checked with CoDUO; sizes/offsets are pinned so a wrong one fails the
+ *  build.  Only the fields the loader touches are named.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+	unsigned char  tileMode;          /* +0x00 */
+	unsigned char  pad01;             /* +0x01 */
+	short          vertexCount;       /* +0x02 */
+	short          triangleCount;     /* +0x04 */
+	unsigned short boneMatrixOffset;  /* +0x06  0xFFFF => not a rigid surface (unsigned: retail cmp word ptr [edi+6],0FFFFh) */
+	unsigned int   boneUsage[4];      /* +0x08 */
+	void          *weightedPoints;    /* +0x18 */
+	void          *triangles;         /* +0x1c */
+	void          *vertexData;        /* +0x20 */
+	float        (*texCoords)[2];     /* +0x24 */
+	void          *optimizedDataARB;  /* +0x28 */
+	void          *optimizedDataATI;  /* +0x2c */
+	void          *optimizedDataNV;   /* +0x30 */
+} XSurface;
+COD1_ASSERT_SIZE(XSurface, 0x34);
+ASSERT_OFF(XSurface, vertexCount, 0x02);
+ASSERT_OFF(XSurface, triangleCount, 0x04);
+ASSERT_OFF(XSurface, boneMatrixOffset, 0x06);
+ASSERT_OFF(XSurface, texCoords, 0x24);
+ASSERT_OFF(XSurface, optimizedDataATI, 0x2c);
+ASSERT_OFF(XSurface, optimizedDataNV, 0x30);
+
+typedef struct XModelSurfsData {
+	struct XModelSurfsData *next;         /* +0x00 */
+	short                   surfaceCount; /* +0x04 */
+	short                   pad06;        /* +0x06 */
+	XSurface              **surfaces;     /* +0x08 */
+} XModelSurfsData;
+COD1_ASSERT_SIZE(XModelSurfsData, 0x0c);
+ASSERT_OFF(XModelSurfsData, surfaceCount, 0x04);
+ASSERT_OFF(XModelSurfsData, surfaces, 0x08);
+
+typedef struct {
+	const char      *name;                /* +0x00 */
+	XModelSurfsData *surfs;               /* +0x04 */
+	void           (*freeData)(void *);   /* +0x08 */
+} XModelSurfs;
+COD1_ASSERT_SIZE(XModelSurfs, 0x0c);
+ASSERT_OFF(XModelSurfs, surfs, 0x04);
+
+typedef struct {
+	float           distance;             /* +0x00 */
+	const char     *name;                 /* +0x04 */
+	short           surfaceCount;         /* +0x08 */
+	short           pad0a;                /* +0x0a */
+	unsigned short *surfaceNameTable;     /* +0x0c */
+	XModelSurfs    *surfs;                /* +0x10 */
+} XModelLodInfo;
+COD1_ASSERT_SIZE(XModelLodInfo, 0x14);
+ASSERT_OFF(XModelLodInfo, surfaceNameTable, 0x0c);
+ASSERT_OFF(XModelLodInfo, surfs, 0x10);
+
+typedef struct {
+	void          *parts;                 /* +0x00 */
+	XModelLodInfo  lodRecords[3];         /* +0x04  stride 0x14 */
+	void          *collisionSurfaces;     /* +0x40 */
+	int            collisionSurfaceCount; /* +0x44 */
+	int            contents;              /* +0x48 */
+	float          mins[3];               /* +0x4c */
+	float          maxs[3];               /* +0x58 */
+	short          lodCount;              /* +0x64 */
+	short          modelFileCount;        /* +0x66 */
+} XModelInfo;
+COD1_ASSERT_SIZE(XModelInfo, 0x68);
+ASSERT_OFF(XModelInfo, lodRecords, 0x04);
+ASSERT_OFF(XModelInfo, lodCount, 0x64);
+
+typedef struct {
+	const char  *name;                    /* +0x00 */
+	XModelInfo  *info;                    /* +0x04 */
+	void       (*freeData)(void *);       /* +0x08 */
+} XModel;
+COD1_ASSERT_SIZE(XModel, 0x0c);
+ASSERT_OFF(XModel, info, 0x04);
+
+/* one (shader,surface) tex-coord remap record used by R_FixupXModelTexCoords;
+ * matches CoDUO xsurface_remap_t (sourceShader / sourceSurface / result). */
+typedef struct {
+	shader_t *sourceShader;               /* +0x00 */
+	XSurface *sourceSurface;              /* +0x04 */
+	XSurface *remappedSurface;            /* +0x08 */
+} xsurfaceRemap_t;
+COD1_ASSERT_SIZE(xsurfaceRemap_t, 0x0c);
+ASSERT_OFF(xsurfaceRemap_t, sourceSurface, 0x04);
+ASSERT_OFF(xsurfaceRemap_t, remappedSurface, 0x08);
+
 /* ---- R_GetModelByHandle  0x005029B0 ----  VERIFIED */
-int __cdecl R_GetModelByHandle(int a1)
+int __cdecl R_GetModelByHandle(int handle)
 {
-  return tr_models[a1];
+  return tr_models[handle];
 }
 
 /* ---- RE_GetXModelByHandle  0x005029C0 ----  VERIFIED */
-int __cdecl RE_GetXModelByHandle(int a1)
+int __cdecl RE_GetXModelByHandle(int handle)
 {
-  return *(_DWORD *)(tr_models[a1] + 84);
+  return (int)((model_t *)tr_models[handle])->xmodel;
 }
 
-/* ---- R_GetXModelBounds  0x005029D0 ----  VERIFIED */
-float *__cdecl R_GetXModelBounds(float *a1, int a2, float *a3, float *a4)
+/* ---- R_GetXModelBounds  0x005029D0 ----  VERIFIED
+ * Transformed AABB of an animated DObj.  If any child uses the default
+ * ("bad") collision model the box is reported inverted/infinite; otherwise
+ * every surface's verts are run through the 3x3 transform axis.  dobj is the DObj;
+ * its fields and the child XModel -> surface lookup stay as raw offset
+ * expressions because the per-model LOD index is read through retail-specific
+ * stack aliasing.  Returns numSurfaces (dead EAX) or maxs on the bad path. */
+void __cdecl R_GetXModelBounds(float *axis, int dobj, float *mins, float *maxs)
 {
-  int v4;
-  int v5;
-  _WORD *v7;
-  float *result;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  float *v14;
-  double v15;
-  double v16;
-  double v17;
-  _WORD *v18;
-  float v19[3 * 8192]; // [esp+8h] [ebp-18020h] BYREF -- retail's positionsOut
-  int v21[4]; // [esp+18008h] [ebp-20h] BYREF -- partBits, 128 bits
-  _WORD *v22;  /* the alloca'd surfaceRefs */
-  int v23;  /* surfaceCount */
-  int v24; // [esp+18020h] [ebp-8h] BYREF     -- lodIndex
-  int v25;
+  int       childIdx;
+  int       surfaceCount;
+  short    *surfaceRefs;               /* DObjSurfaceRef {short child, short surface}; read movsx (0x00502AA0) */
+  int       partBits[4];
+  int       lodIndex;
+  int       i;
+  float     positionsOut[3 * 8192];    /* XSurfaceGetVerts working set, 8192 verts */
 
-  v4 = *(unsigned __int8 *)(a2 + 22) - 1;
-  if ( v4 < 0 )
+  /* scan children top-down for one whose model uses the default collision */
+  for ( childIdx = *(unsigned char *)(dobj + 22) - 1; childIdx >= 0; --childIdx )   /* DObj.childCount - 1 */
   {
-LABEL_5:
-    *a3 = 3.4028235e38;
-    a3[1] = 3.4028235e38;
-    a3[2] = 3.4028235e38;
-    *a4 = -3.4028235e38;
-    a4[1] = -3.4028235e38;
-    a4[2] = -3.4028235e38;
-    v24 = 0;
-    v23 = DObjGetNumSurfaces(a2, (int)&v24);
-    v18 = (_WORD *)_alloca((4 * v23 + 3) & ~3);
-    v7 = v18;
-    v22 = v18;
-    DObjGetSurfaces(v21, a2, v18, (int)&v24);
-    result = (float *)v23;
-    v9 = 0;
-    v25 = 0;
-    if ( v23 > 0 )
+    if ( (void *)(*(XModel **)(dobj + 4 * childIdx + 24))->info == (void *)xmodel_defaultCollision )
     {
-      while ( 1 )
+      /* found a bad child -> infinite/inverted bounds */
+      mins[0] = -3.4028235e38f;
+      mins[1] = -3.4028235e38f;
+      mins[2] = -3.4028235e38f;
+      maxs[0] = 3.4028235e38f;
+      maxs[1] = 3.4028235e38f;
+      maxs[2] = 3.4028235e38f;
+      return;
+    }
+  }
+
+  mins[0] = 3.4028235e38f;
+  mins[1] = 3.4028235e38f;
+  mins[2] = 3.4028235e38f;
+  maxs[0] = -3.4028235e38f;
+  maxs[1] = -3.4028235e38f;
+  maxs[2] = -3.4028235e38f;
+
+  lodIndex = 0;
+  surfaceCount = DObjGetNumSurfaces(dobj, (int)&lodIndex);
+  surfaceRefs = (short *)_alloca(4 * surfaceCount);
+  DObjGetSurfaces(partBits, dobj, surfaceRefs, (int)&lodIndex);
+
+  for ( i = 0; i < surfaceCount; ++i )
+  {
+    int       modelIndex = surfaceRefs[2 * i];
+    int       childLod   = *(&lodIndex + modelIndex);                   /* per-model LOD (retail stack aliasing) */
+    XModel   *child      = *(XModel **)(dobj + 4 * modelIndex + 24);      /* DObj.childRefs[modelIndex] */
+    /* bone matrix = DObj.evalStorage + childPartBaseIndices[modelIndex]*64 + 0x30 */
+    int       boneMat    = (*(unsigned char *)(dobj + modelIndex + 80) << 6) + *(int *)(dobj + 4) + 48;
+    XSurface *surf       = child->info->lodRecords[childLod].surfs->surfs->surfaces[surfaceRefs[2 * i + 1]];
+    int       vertexCount = surf->vertexCount;
+    float    *vertPtr;
+    int       n;
+
+    XSurfaceGetVerts((int)surf, boneMat, positionsOut, 0, 0);
+
+    vertPtr = &positionsOut[2];          /* -> z of vertex 0 */
+    /* bounds tests written bound-first: VC7 then keeps t on the x87 stack (fcom), as retail */
+    n = vertexCount;
+    while ( n-- > 0 )
+    {
       {
-        v10 = (__int16)v7[2 * v9];
-        v11 = v25;
-        v12 = *(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(a2 + 4 * v10 + 24) + 4)
-                                                            + 20 * (*(&v24 + v10) + 1))
-                                                + 4)
-                                    + 8)
-                        + 4 * (__int16)v7[2 * v25 + 1]);
-        v13 = *(__int16 *)(v12 + 2);
-        XSurfaceGetVerts(0, v19, v12, (*(unsigned __int8 *)(v10 + a2 + 80) << 6) + *(_DWORD *)(a2 + 4) + 48, 0);
-        if ( v13 > 0 )
-        {
-          v14 = &v19[2];       /* ebp-0x18018 == v19 + 8 */
-          v25 = v13;
-          do
-          {
-            v15 = a1[6] * *v14 + a1[3] * *(v14 - 1) + *a1 * *(v14 - 2);
-            if ( (v15 < *a3) | __UNORDERED__(v15, *a3) )
-              *a3 = v15;
-            if ( v15 > *a4 )
-              *a4 = v15;
-            v16 = a1[7] * *v14 + a1[4] * *(v14 - 1) + a1[1] * *(v14 - 2);
-            if ( (v16 < a3[1]) | __UNORDERED__(v16, a3[1]) )
-              a3[1] = v16;
-            if ( v16 > a4[1] )
-              a4[1] = v16;
-            v17 = a1[8] * *v14 + a1[5] * *(v14 - 1) + a1[2] * *(v14 - 2);
-            if ( (v17 < a3[2]) | __UNORDERED__(v17, a3[2]) )
-              a3[2] = v17;
-            if ( v17 > a4[2] )
-              a4[2] = v17;
-            v14 += 3;
-            --v25;
-          }
-          while ( v25 );
-        }
-        result = (float *)v23;
-        v9 = v11 + 1;
-        v25 = v9;
-        if ( v9 >= v23 )
-          break;
-        v7 = v22;
+        float tx = axis[6] * vertPtr[0] + axis[3] * vertPtr[-1] + axis[0] * vertPtr[-2];
+        if ( mins[0] > tx ) mins[0] = tx;
+        if ( maxs[0] < tx ) maxs[0] = tx;
       }
+      {
+        float ty = axis[7] * vertPtr[0] + axis[4] * vertPtr[-1] + axis[1] * vertPtr[-2];
+        if ( mins[1] > ty ) mins[1] = ty;
+        if ( maxs[1] < ty ) maxs[1] = ty;
+      }
+      {
+        float tz = axis[8] * vertPtr[0] + axis[5] * vertPtr[-1] + axis[2] * vertPtr[-2];
+        if ( mins[2] > tz ) mins[2] = tz;
+        if ( maxs[2] < tz ) maxs[2] = tz;
+      }
+      vertPtr += 3;
     }
   }
-  else
-  {
-    v5 = a2 + 4 * v4 + 24;
-    while ( (void *)*(_DWORD *)(*(_DWORD *)v5 + 4) != (void *)xmodel_defaultCollision )
-    {
-      --v4;
-      v5 -= 4;
-      if ( v4 < 0 )
-        goto LABEL_5;
-    }
-    *a3 = -3.4028235e38;
-    a3[1] = -3.4028235e38;
-    a3[2] = -3.4028235e38;
-    result = a4;
-    *a4 = 3.4028235e38;
-    a4[1] = 3.4028235e38;
-    a4[2] = 3.4028235e38;
-  }
-  return result;
+  return;
 }
 
-/* ---- sub_502BD0  0x00502BD0 ----  VERIFIED */
-void __cdecl sub_502BD0(void *this)
+/* ---- R_Hunk_AllocXModel_m  0x00502BD0 ----  VERIFIED */
+void __cdecl R_Hunk_AllocXModel_m(void *this)
 {
   Hunk_AllocAlignInternal((unsigned int)this, 32);
 }
 
-/* ---- sub_502BE0  0x00502BE0 ----  VERIFIED */
-void __cdecl sub_502BE0(void *this)
+/* ---- R_Hunk_AllocXModelMesh_m  0x00502BE0 ----  VERIFIED */
+void __cdecl R_Hunk_AllocXModelMesh_m(void *this)
 {
   Hunk_AllocAlignInternal((unsigned int)this, 32);
 }
 
-/* ---- R_LoadXModel  0x00502BF0 ----  VERIFIED */
-int __cdecl R_LoadXModel(_DWORD *a1, const char *a2, const char *a3)
+/* ---- R_LoadXModel  0x00502BF0 ----  VERIFIED
+ * Precache the XModel, then build the per-LOD surface->shader-handle tables:
+ * one uint16 handle per surface, looked up from "skins/<surfaceName>".  A
+ * remapped shader is chased to its target; a defaulted shader stores 0. */
+int __cdecl R_LoadXModel(model_t *model, const char *name, const char *shaderUsage)
 {
-  int *v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  _DWORD *v9;
-  _DWORD *v10;
-  char *v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  unsigned __int16 v17;
-  const char *v18;
-  char *Shader;
-  int v20;
-  bool v21; // zf
-  int result;
-  _DWORD *v23;
-  int *v24;
-  int v25;
-  char *v26;
-  int v27;
-  _DWORD *v28;
-  char v29[68]; // [esp+28h] [ebp-48h] BYREF
-  unsigned int v30;
-  unsigned int retaddr;
+  XModel          *xmodel;
+  XModelInfo      *info;
+  int              lodCount;
+  int              totalSurfaceCount;
+  unsigned short **shaderHandles;
+  unsigned short  *surfaceHandle;
+  int              lodIndex;
+  char             shaderName[64];      /* 64: retail frame 0x60 */
 
-  v30 = retaddr ^ _security_cookie;
-  if ( tr_modelsFinishedLoading )
-  {
-    if ( r_errorOnConflicts->integer )
-    {
-      if ( !tr_ignorePrecacheErrorCount )
-        ri_Error(1, "\x15" "model '%s' not precached\n", a2);
-    }
-  }
-  else
+  if ( !tr_modelsFinishedLoading )
   {
     tr_delayedImageGroup = ++tr_delayedImageGroupSequence;
   }
-  v3 = (int *)XModelPrecache(
-         a2,
-         2,
-         (XModelAllocFn)Hunk_AllocXModelPrecache,
-         (XModelAllocFn)Hunk_AllocXModelPrecacheMesh);
-  v4 = v3[1];
-  v5 = *(__int16 *)(v4 + 100);
-  v6 = 0;
-  v24 = v3;
-  if ( v5 > 0 )
+  else if ( r_errorOnConflicts->integer && !tr_ignorePrecacheErrorCount )
   {
-    v7 = v4 + 20;
-    v8 = v5;
-    do
-    {
-      v6 += *(__int16 *)(*(_DWORD *)(*(_DWORD *)v7 + 4) + 4);
-      v7 += 20;
-      --v8;
-    }
-    while ( v8 );
+    ri.Error(1, "\x15" "model '%s' not precached\n", name);
   }
-  v9 = Hunk_AllocAlignInternal(2 * (v6 + 2 * v5), 32);
-  v10 = v9;
-  v28 = v9;
-  v11 = (char *)&v9[v5];
-  if ( v5 > 0 )
+
+  xmodel = (XModel *)XModelPrecache(
+             name,
+             2,
+             (XModelAllocFn)Hunk_AllocXModelPrecache,
+             (XModelAllocFn)Hunk_AllocXModelPrecacheMesh);
+  info = xmodel->info;
+  lodCount = info->lodCount;
+
+  totalSurfaceCount = 0;
+  for ( lodIndex = 0; lodIndex < lodCount; ++lodIndex )
+    totalSurfaceCount += info->lodRecords[lodIndex].surfs->surfs->surfaceCount;
+
+  shaderHandles = (unsigned short **)Hunk_AllocAlignInternal(2 * (totalSurfaceCount + 2 * lodCount), 32);
+  surfaceHandle = (unsigned short *)&shaderHandles[lodCount];
+
+  for ( lodIndex = 0; lodIndex < lodCount; ++lodIndex )
   {
-    v12 = 0;
-    v23 = v9;
-    v25 = v5;
-    while ( 1 )
+    XModelSurfsData *surfs        = xmodel->info->lodRecords[lodIndex].surfs->surfs;
+    int              surfaceCount = surfs->surfaceCount;
+    XSurface       **surfaces     = surfs->surfaces;
+    int              surfaceIndex;
+
+    shaderHandles[lodIndex] = surfaceHandle;
+    surfaceHandle += surfaceCount;
+    for ( surfaceIndex = 0; surfaceIndex < surfaceCount; ++surfaceIndex )
     {
-      v13 = *(_DWORD *)(*(_DWORD *)(v3[1] + v12 + 20) + 4);
-      v14 = *(__int16 *)(v13 + 4);
-      v15 = *(_DWORD *)(v13 + 8);
-      *v23 = v11;
-      v16 = 0;
-      v27 = v15;
-      v26 = &v11[2 * v14];
-      if ( v14 > 0 )
+      unsigned short  nameIndex;
+      const char     *surfaceName;
+      char           *dst;
+      char            c;
+      shader_t       *shader;
+      int             handle;
+
+      strcpy(shaderName, "skins/");
+      nameIndex = xmodel->info->lodRecords[lodIndex].surfaceNameTable[surfaceIndex];
+      if ( nameIndex )
+        surfaceName = (const char *)(GetRefString_var + 8 * nameIndex + 4);
+      else
+        surfaceName = "DEFAULT";
+      dst = &shaderName[6];
+      do                                    /* hand copy, not strcpy (retail 0x00502D40) */
       {
-        while ( 1 )
-        {
-          strcpy(v29, "skins/");
-          v17 = *(_WORD *)(*(_DWORD *)(v24[1] + v12 + 16) + 2 * v16);
-          v18 = v17 ? (const char *)(GetRefString_var + 8 * v17 + 4) : "DEFAULT";
-          strcpy(&v29[6], v18);
-          if ( tr_delayedImageGroup )
-          {
-            tr_delayedImageGroupTriCount = *(__int16 *)(*(_DWORD *)(v15 + 4 * v16) + 4);
-            tr_delayedImageGroupTileMode = **(unsigned __int8 **)(v15 + 4 * v16);
-          }
-          Shader = R_FindShader(v29, -1, 1, a3);
-          if ( (*((_DWORD *)Shader + 19) & 0x1000) != 0 )
-          {
-            ri_Printf(2, "WARNING: model '%s' not precached, bad texturing will result on some surfaces\n", a2);
-            Shader = (char *)*((_DWORD *)Shader + 96);
-          }
-          if ( (Shader[76] & 1) != 0 )
-            LOWORD(v20) = 0;
-          else
-            v20 = *((_DWORD *)Shader + 17);
-          *(_WORD *)(*v23 + 2 * v16++) = v20;
-          if ( v16 >= v14 )
-            break;
-          v15 = v27;
-        }
-        v10 = v28;
+        c = *surfaceName++;
+        *dst++ = c;
       }
-      v3 = v24;
-      v12 += 20;
-      v21 = v25 == 1;
-      ++v23;
-      --v25;
-      if ( v21 )
-        break;
-      v11 = v26;
+      while ( c );
+
+      if ( tr_delayedImageGroup )
+      {
+        tr_delayedImageGroupTriCount = surfaces[surfaceIndex]->triangleCount;
+        tr_delayedImageGroupTileMode = surfaces[surfaceIndex]->tileMode;
+      }
+
+      shader = (shader_t *)R_FindShader(shaderName, -1, 1, shaderUsage);
+      if ( shader->flags & SHADER_REMAPPED )
+      {
+        ri.Printf(2, "WARNING: model '%s' not precached, bad texturing will result on some surfaces\n", name);
+        shader = R_ShaderRemapped(shader);
+      }
+      handle = !(shader->flags & SHADER_DEFAULTED) ? shader->index : 0;
+      shaderHandles[lodIndex][surfaceIndex] = (unsigned short)handle;
     }
   }
-  a1[21] = v3;
-  a1[16] = 2;
-  a1[20] = v10;
-  result = 0;
-  tr_delayedImageGroup = 0;
+
+  model->xmodel        = xmodel;
+  model->type          = MOD_XMODEL;
+  model->shaderHandles = shaderHandles;
+  tr_delayedImageGroup         = 0;
   tr_delayedImageGroupTriCount = 0;
-  return result;
+  return 0;
 }
 
-/* ---- compare_xsurface_remap  0x00502E20 ----  VERIFIED */
-int __cdecl compare_xsurface_remap(_DWORD *a1, _DWORD *a2)
+/* ---- compare_xsurface_remap  0x00502E20 ----  VERIFIED
+ * qsort comparator: order by source surface address, then source shader index
+ * (raw pointer difference / shader stride).  qsort only uses the sign. */
+int __cdecl compare_xsurface_remap(xsurfaceRemap_t *remapA, xsurfaceRemap_t *remapB)
 {
   int result;
 
-  result = a1[1] - a2[1];
+  result = (int)remapA->sourceSurface - (int)remapB->sourceSurface;
   if ( !result )
-    return (*a1 - *a2) / 408;
+    result = ((int)remapA->sourceShader - (int)remapB->sourceShader) / 408;
   return result;
 }
 
-/* ---- R_FixupXModelTexCoords  0x00502E50 ----  [HIGH] */
-int R_FixupXModelTexCoords()
-{
-  int result;
-  int v1;
-  signed int v2;
-  int v3;
-  int v4;
-  float v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  signed int v11;
-  int *v12;
-  int v13;
-  int ***v14;
-  int **v15;
-  __int16 *v16;
-  int v17;
-  void *v18;
-  int v19;
-  int v20;
-  int **v21;
-  int *v22;
-  int v23;
-  BOOL v24;
-  int v25;
-  double v26;
-  bool v27; // cc
-  int v28;
-  int v29;
-  int v30;
-  int v31;
-  int v32;
-  int v33;
-  int v34;
-  _WORD *v35;
-  int v36;
-  int v37;
-  signed int v38;
-  _DWORD *v39;
-  int v40;
-  int ***v41;
-  int v42;
-  int j; // [esp+18h] [ebp-C0020h] BYREF
-  int i;
-  int v45;
-  BOOL v46; // [esp+24h] [ebp-C0014h] BYREF
-  float v47[2]; // [esp+28h] [ebp-C0010h] BYREF
-  float v48[2]; // [esp+30h] [ebp-C0008h] BYREF
-  _DWORD remaps[65536][3]; // [esp+38h] [ebp-C0000h] BYREF
+int __cdecl XModelGetNumLods( const XModel *model );                                       /* xanim/xmodel.cpp */
+int __cdecl XModelGetSurfaces( int lodIndex, const XModel *model, XSurface ***surfaces );  /* xanim/xmodel.cpp */
 
-  result = tr_numModels;
-  v1 = 1;
-  v2 = 0;
-  v45 = 0;
-  j = 1;
-  if ( tr_numModels > 1 )
+/* ---- R_FixupXModelTexCoords  0x00502E50 ----  [HIGH]
+ * Build the set of unique (remappable-shader, surface) pairs across every
+ * XModel; clone surfaces shared by more than one pair so their texture
+ * coordinates can be remapped independently; then rewrite each model's surface
+ * pointers to the (possibly cloned/remapped) surface and update its shader
+ * handles.  Structure follows the Mac 1.3 build (XModel/XSurface helpers). */
+XSurface *__cdecl XSurfaceCloneSurface( const XSurface *surface, XModelAllocFn alloc );  /* xanim/xmodel.cpp */
+void __cdecl XSurfaceRemapTextureCoordinates( XSurface *surface, const float *scale, const float *offset,
+                                              int sourceUIndex, int sourceVIndex );     /* xanim/xmodel.cpp */
+
+void R_FixupXModelTexCoords()
+{
+  xsurfaceRemap_t remaps[65536];       /* on the stack, as retail (0xC0000-byte frame) */
+  int        remapCount;
+  int        modelIndex;
+  model_t   *model;
+  int        lodCount;
+  int        lodIndex;
+  int        surfaceCount;
+  XSurface **surfaces;
+  int        surfaceIndex;
+  shader_t  *sourceShader;
+  int        k;
+  int        i;
+
+  remapCount = 0;
+
+  /* pass 1: collect unique (sourceShader, sourceSurface) pairs */
+  for ( modelIndex = 1; modelIndex < tr_numModels; ++modelIndex )
   {
-    do
+    model = (model_t *)tr_models[modelIndex];
+    if ( !model->xmodel )
+      continue;
+
+    lodCount = XModelGetNumLods( (XModel *)model->xmodel );
+    for ( lodIndex = 0; lodIndex < lodCount; ++lodIndex )
     {
-      v3 = tr_models[v1];
-      v4 = *(_DWORD *)(v3 + 84);
-      v5 = 0.0;
-      v46 = v3;
-      if ( v4 )
+      surfaceCount = XModelGetSurfaces( lodIndex, (XModel *)model->xmodel, &surfaces );
+      for ( surfaceIndex = 0; surfaceIndex < surfaceCount; ++surfaceIndex )
       {
-        v45 = *(__int16 *)(*(_DWORD *)(v4 + 4) + 100);
-        v47[0] = 0.0;
-        if ( v45 > 0 )
+        int handle = ((unsigned short **)model->shaderHandles)[lodIndex][surfaceIndex];
+
+        if ( !handle )
+          continue;
+
+        sourceShader = (shader_t *)tr_shaders[handle];
+        if ( !( sourceShader->flags & SHADER_REMAPPED ) )
+          sourceShader = 0;
+
+        if ( remapCount == 0x10000 )
+          ri.Error(1, "\x15" "More than %i xmodel surfaces need to be remapped\n"
+                      "You may need to set r_optimizeTextures temporarily to 0\n"
+                      "Eventually you want to use fewer unique model surfaces\n", 0x10000);
+
+        for ( k = 0; k < remapCount; ++k )
         {
-          v40 = 0;
-          do
-          {
-            v6 = *(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(v3 + 84) + 4) + v40 + 20) + 4);
-            v7 = *(__int16 *)(v6 + 4);
-            v8 = *(_DWORD *)(v6 + 8);
-            v9 = 0;
-            for ( i = v7; v9 < v7; ++v9 )
-            {
-              if ( *(_WORD *)(*(_DWORD *)(*(_DWORD *)(v3 + 80) + 4 * LODWORD(v5)) + 2 * v9) )
-              {
-                v10 = tr_shaders[*(unsigned __int16 *)(*(_DWORD *)(*(_DWORD *)(v3 + 80) + 4 * LODWORD(v5)) + 2 * v9)];
-                if ( (*(_DWORD *)(v10 + 76) & 0x1000) == 0 )
-                  v10 = 0;
-                if ( v2 == 0x10000 )
-                  ri_Error(1, "\x15" "More than %i xmodel surfaces need to be remapped\n"
-                              "You may need to set r_optimizeTextures temporarily to 0\n"
-                              "Eventually you want to use fewer unique model surfaces\n", 0x10000);
-                v11 = 0;
-                if ( v2 <= 0 )
-                {
-LABEL_16:
-                  v13 = 3 * v2;
-                  remaps[v2][0] = v10;
-                  remaps[v2][1] = *(_DWORD *)(v8 + 4 * v9);
-                  remaps[v2][2] = 0;
-                  ++v2;
-                }
-                else
-                {
-                  v12 = &remaps[0][0];
-                  while ( v12[1] != *(_DWORD *)(v8 + 4 * v9) || *v12 != v10 )
-                  {
-                    ++v11;
-                    v12 += 3;
-                    if ( v11 >= v2 )
-                      goto LABEL_16;
-                  }
-                }
-                v3 = v46;
-                v5 = v47[0];
-                v7 = i;
-              }
-            }
-            ++LODWORD(v5);
-            v47[0] = v5;
-            v40 += 20;
-          }
-          while ( SLODWORD(v5) < v45 );
-          v1 = j;
+          if ( remaps[k].sourceSurface == surfaces[surfaceIndex]
+            && remaps[k].sourceShader == sourceShader )
+            goto alreadyListed;   /* goto: retail has no post-loop index test */
         }
-      }
-      result = tr_numModels;
-      j = ++v1;
-    }
-    while ( v1 < tr_numModels );
-    v45 = v2;
-    if ( v2 )
-    {
-      qsort_m((unsigned int)remaps, v2, 0xCu, (int (__cdecl *)(unsigned int, _BYTE *))compare_xsurface_remap);
-      i = 0;
-      if ( v2 > 0 )
-      {
-        v14 = (int ***)&remaps[0][1];
-        v41 = (int ***)&remaps[0][1];
-        do
-        {
-          v15 = *v14;
-          if ( v14[3] == *v14 )
-          {
-            v16 = (__int16 *)Hunk_AllocAlignInternal(0x34u, 32);
-            qmemcpy(v16, v15, 0x34u);
-            v17 = v16[1];
-            *((_DWORD *)v16 + 11) = 0;
-            *((_DWORD *)v16 + 12) = 0;
-            v18 = Hunk_AllocAlignInternal(8 * v17, 32);
-            v19 = 8 * v16[1];
-            *((_DWORD *)v16 + 9) = v18;
-            Com_Memcpy((int)v18, v15[9], v19);
-            v2 = v45;
-            v41[1] = (int **)v16;
-            v14 = v41;
-          }
-          else
-          {
-            v14[1] = *v14;
-          }
-          v20 = (int)*(v14 - 1);
-          if ( v20 )
-          {
-            R_SetupTextureCoordinateRemap(v20, v47, &v46, v48, &j);
-            v21 = v14[1];
-            v22 = v21[9];
-            v23 = *((__int16 *)v21 + 1);
-            if ( v23 )
-            {
-              v24 = v46;
-              v25 = j;
-              do
-              {
-                v26 = *(float *)&v22[v24];
-                v22 += 2;
-                --v23;
-                *((float *)v22 - 2) = *(float *)&v22[v25 - 2] * v47[0] + v48[0];
-                *((float *)v22 - 1) = v47[1] * v26 + v48[1];
-              }
-              while ( v23 );
-            }
-          }
-          v14 += 3;
-          v27 = ++i < v2;
-          v41 = v14;
-        }
-        while ( v27 );
-      }
-      result = tr_numModels;
-      v28 = 1;
-      for ( j = 1; v28 < tr_numModels; j = v28 )
-      {
-        v29 = tr_models[v28];
-        v30 = *(_DWORD *)(v29 + 84);
-        v46 = v29;
-        if ( v30 )
-        {
-          v31 = *(__int16 *)(*(_DWORD *)(v30 + 4) + 100);
-          v45 = v31;
-          v47[0] = 0.0;
-          if ( v31 > 0 )
-          {
-            v42 = 0;
-            do
-            {
-              v32 = *(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(v29 + 84) + 4) + v42 + 20) + 4);
-              v33 = *(_DWORD *)(v32 + 8);
-              v34 = 0;
-              i = *(__int16 *)(v32 + 4);
-              if ( i > 0 )
-              {
-                do
-                {
-                  v35 = (_WORD *)(*(_DWORD *)(*(_DWORD *)(v29 + 80) + 4 * LODWORD(v47[0])) + 2 * v34);
-                  v36 = (unsigned __int16)*v35;
-                  if ( *v35 )
-                  {
-                    v37 = tr_shaders[v36];
-                    if ( (*(_DWORD *)(v37 + 76) & 0x1000) != 0 )
-                      v36 = *(_DWORD *)(*(_DWORD *)(v37 + 384) + 68);
-                    else
-                      v37 = 0;
-                    *v35 = v36;
-                    v38 = 0;
-                    if ( v2 > 0 )
-                    {
-                      v39 = &remaps[0][1];
-                      while ( *(v39 - 1) != v37 || *v39 != *(_DWORD *)(v33 + 4 * v34) )
-                      {
-                        ++v38;
-                        v39 += 3;
-                        if ( v38 >= v2 )
-                          goto LABEL_49;
-                      }
-                      *(_DWORD *)(v33 + 4 * v34) = remaps[v38][2];
-                    }
-                  }
-LABEL_49:
-                  v29 = v46;
-                  ++v34;
-                }
-                while ( v34 < i );
-                v31 = v45;
-              }
-              v27 = ++LODWORD(v47[0]) < v31;
-              v42 += 20;
-            }
-            while ( v27 );
-            v28 = j;
-          }
-        }
-        result = tr_numModels;
-        ++v28;
+
+        remaps[remapCount].sourceShader    = sourceShader;
+        remaps[remapCount].sourceSurface   = surfaces[surfaceIndex];
+        remaps[remapCount].remappedSurface = 0;
+        ++remapCount;
+alreadyListed:
+        ;
       }
     }
   }
-  return result;
+
+  if ( !remapCount )
+    return;
+
+  qsort_m((unsigned int)remaps, remapCount, 0xCu,
+          (int (__cdecl *)(unsigned int, byte *))compare_xsurface_remap);
+
+  /* pass 2: clone shared surfaces and remap their texture coordinates */
+  for ( i = 0; i < remapCount; ++i )
+  {
+    /* redundant i < remapCount: retail 0x00502FC8 tests it on loop entry */
+    if ( i < remapCount && remaps[i + 1].sourceSurface == remaps[i].sourceSurface )
+      remaps[i].remappedSurface = XSurfaceCloneSurface( remaps[i].sourceSurface, (XModelAllocFn)Hunk_AllocXModelPrecacheMesh );
+    else
+      remaps[i].remappedSurface = remaps[i].sourceSurface;
+
+    if ( remaps[i].sourceShader )
+    {
+      float scale[2];
+      float offset[2];
+      int   sourceU;
+      int   sourceV;
+
+      R_SetupTextureCoordinateRemap(remaps[i].sourceShader, scale, offset, &sourceU, &sourceV);
+      XSurfaceRemapTextureCoordinates( remaps[i].remappedSurface, scale, offset, sourceU, sourceV );
+    }
+  }
+
+  /* pass 3: point each surface at its remapped copy and fix shader handles */
+  for ( modelIndex = 1; modelIndex < tr_numModels; ++modelIndex )
+  {
+    model = (model_t *)tr_models[modelIndex];
+    if ( !model->xmodel )
+      continue;
+
+    lodCount = XModelGetNumLods( (XModel *)model->xmodel );
+    for ( lodIndex = 0; lodIndex < lodCount; ++lodIndex )
+    {
+      surfaceCount = XModelGetSurfaces( lodIndex, (XModel *)model->xmodel, &surfaces );
+      for ( surfaceIndex = 0; surfaceIndex < surfaceCount; ++surfaceIndex )
+      {
+        int handle = ((unsigned short **)model->shaderHandles)[lodIndex][surfaceIndex];
+
+        if ( !handle )
+          continue;
+
+        sourceShader = (shader_t *)tr_shaders[handle];
+        if ( !( sourceShader->flags & SHADER_REMAPPED ) )
+          sourceShader = 0;
+        else
+          handle = R_ShaderRemapped(sourceShader)->index;
+        ((unsigned short **)model->shaderHandles)[lodIndex][surfaceIndex] = (unsigned short)handle;
+
+        for ( k = 0; k < remapCount; ++k )
+        {
+          if ( remaps[k].sourceShader == sourceShader
+            && remaps[k].sourceSurface == surfaces[surfaceIndex] )
+          {
+            surfaces[surfaceIndex] = remaps[k].remappedSurface;
+            break;
+          }
+        }
+      }
+    }
+  }
 }
 
 /* ---- R_AllocModel  0x005033C0 ----  VERIFIED */
@@ -580,289 +523,227 @@ int R_AllocModel()
 
   if ( tr_numModels == 2048 )
     return 0;
-  result = ri_Hunk_Alloc(96);
-  *(_DWORD *)(result + 68) = tr_numModels;
+  result = ri.Hunk_Alloc(96);
+  ((model_t *)result)->index = tr_numModels;
   tr_models[tr_numModels++] = result;
   return result;
 }
 
-/* ---- RE_RegisterModel  0x00503400 ----  VERIFIED */
-int __cdecl RE_RegisterModel(char *Source, const char *a2)
+/* ---- RE_RegisterModel  0x00503400 ----  VERIFIED
+ * Look up a model by name, else allocate one and (for "xmodel/..." names)
+ * load it.  Failed/non-xmodel names keep a MOD_BAD entry so the lookup is not
+ * retried.  Returns the model handle, or 0 on failure. */
+int __cdecl RE_RegisterModel(char *name, const char *shaderUsage)
 {
-  const char *v3;
-  int v4;
-  int v5;
-  int v6;
-  char v7;
+  model_t *model;
+  int      handle;
+  char     firstChar;
 
-  if ( !Source || !*Source )
+  if ( !name || !*name )
     return 0;
-  if ( strlen(Source) >= 0x40 )
+  if ( strlen(name) >= 0x40 )
   {
     Com_Printf("Model name exceeds MAX_QPATH\n");
     return 0;
   }
-  v3 = (const char *)tr_numModels;
-  v4 = 1;
-  if ( tr_numModels <= 1 )
+
+  for ( handle = 1; handle < tr_numModels; ++handle )
   {
-LABEL_9:
-    if ( v3 == (const char *)2048 )
+    model = (model_t *)tr_models[handle];
+    if ( !Q_stricmp(model->name, name) )
     {
-      ri_Printf(2, "RE_RegisterModel: R_AllocModel() failed for '%s'\n", Source);
-      return 0;
+      if ( model->type == MOD_BAD )
+        return 0;
+      return handle;
     }
-    v6 = ri_Hunk_Alloc(96);
-    *(_DWORD *)(v6 + 68) = tr_numModels;
-    tr_models[tr_numModels++] = v6;
-    strncpy((char *)v6, Source, 0x3Fu);
-    *(_BYTE *)(v6 + 63) = 0;
-    R_SyncRenderThread();
-    *(_DWORD *)(v6 + 92) = 0;
-    if ( !_strnicmp(Source, "xmodel", 6u) )
-    {
-      v7 = Source[6];
-      if ( v7 == 47 || v7 == 92 )
-      {
-        R_LoadXModel((_DWORD *)v6, Source + 7, a2);
-        return *(_DWORD *)(v6 + 68);
-      }
-    }
-    *(_DWORD *)(v6 + 64) = 0;
+  }
+
+  model = (model_t *)R_AllocModel();
+  if ( !model )
+  {
+    ri.Printf(2, "RE_RegisterModel: R_AllocModel() failed for '%s'\n", name);
     return 0;
   }
-  while ( 1 )
+  Q_strncpyz(model->name, name, 64);
+  R_SyncRenderThread();
+  model->numLods = 0;
+  if ( !_strnicmp(name, "xmodel", 6u) )
   {
-    v5 = tr_models[v4];
-    if ( v5 )
+    firstChar = name[6];
+    if ( firstChar == '/' || firstChar == '\\' )
     {
-      if ( !Q_stricmpn((const char *)v5, Source, 99999) )
-        return *(_DWORD *)(v5 + 64) != 0 ? v4 : 0;
+      R_LoadXModel(model, name + 7, shaderUsage);
+      return model->index;
     }
-    if ( ++v4 >= (int)v3 )
-      goto LABEL_9;
   }
+  model->type = MOD_BAD;
+  return 0;
 }
 
-/* ---- RE_FinishLoadingModels  0x00503540 ----  VERIFIED */
-cvar_t *RE_FinishLoadingModels()
-{
-  void *v0;
-  cvar_t *result;
-  cvar_t *v2;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  _WORD *v10;
-  bool v11; // zf
-  int v12;
-  int v13;
-  unsigned __int16 *v14;
-  int v15;
-  int v16;
-  int v17;
-  bool v18; // cc
-  int v19;
-  int v20;
-  int v21;
-  int i;
-  int v23;
-  _DWORD v24[1024]; // [esp+14h] [ebp-1000h] BYREF
+int __cdecl XSurfaceGetNumVerts( const XSurface *surface );                                /* xanim/xmodel.cpp */
 
+/* ---- R_OptimizeXModels  0x005031E0 ----  [HIGH]
+ * Not in the retail function list: RE_FinishLoadingModels tail-jumps here
+ * (0x0050355E).  When r_optimize is on, optimize each XModel's rigid surfaces
+ * into GPU vertex buffers.  A surface is optimized when it is "large" or its
+ * shader handle is unique within the LOD. */
+static void R_OptimizeXModels()
+{
+  int largeSurface[1024];
+  int modelIndex;
+
+  if ( !r_optimize->integer || r_optimizeXModels->integer <= 0 )
+    return;
+
+  for ( modelIndex = 1; modelIndex < tr_numModels; ++modelIndex )
+  {
+    model_t *model = (model_t *)tr_models[modelIndex];
+    int      lodCount;
+    int      lodIndex;
+
+    if ( !model->xmodel )
+      continue;
+
+    lodCount = XModelGetNumLods( (XModel *)model->xmodel );
+    for ( lodIndex = 0; lodIndex < lodCount; ++lodIndex )
+    {
+      XSurface **surfaces;
+      int        surfaceCount = XModelGetSurfaces( lodIndex, (XModel *)model->xmodel, &surfaces );
+      int        surfaceIndex;
+
+      for ( surfaceIndex = 0; surfaceIndex < surfaceCount; ++surfaceIndex )
+      {
+        largeSurface[surfaceIndex] = 0;
+        if ( ((unsigned short **)model->shaderHandles)[lodIndex][surfaceIndex]
+          && XSurfaceGetNumVerts( surfaces[surfaceIndex] ) >= r_optimizeXModels->integer )
+          largeSurface[surfaceIndex] = 1;
+      }
+
+      for ( surfaceIndex = 0; surfaceIndex < surfaceCount; ++surfaceIndex )
+      {
+        int       handle = ((unsigned short **)model->shaderHandles)[lodIndex][surfaceIndex];
+        XSurface *surf;
+
+        if ( !handle )
+          continue;
+
+        if ( !largeSurface[surfaceIndex] )
+        {
+          int other;
+          for ( other = 0; other < surfaceCount; ++other )
+          {
+            /* a duplicate handle keeps this surface unoptimized (goto: retail has
+             * no post-loop index test) */
+            if ( other != surfaceIndex && ((unsigned short **)model->shaderHandles)[lodIndex][other] == handle )
+              goto nextSurface;
+          }
+        }
+
+        surf = surfaces[surfaceIndex];
+        if ( surf->boneMatrixOffset != 0xFFFF )   /* 0x0050330A: skinned surfaces (0xFFFF) are skipped */
+        {
+          if ( glConfig_ARBVertexBufferObject )
+          {
+            R_OptimizeRigidXSurfaceARB(surf, (int (__cdecl *)(int))Hunk_AllocXModelPrecacheMesh);
+          }
+          else if ( glConfig_NVVertexArrayRange )
+          {
+            R_OptimizeRigidXSurfaceNV(surf, (int (__cdecl *)(int))Hunk_AllocXModelPrecacheMesh);
+          }
+          else if ( glConfig_ATIVertexArrayObject )
+          {
+            /* 0x00503348: push offset Hunk_AllocXModelPrecacheMesh (surf in EDI) */
+            R_OptimizeRigidXSurfaceATI(surf, (int (__cdecl *)(int))Hunk_AllocXModelPrecacheMesh);
+          }
+        }
+nextSurface:
+        ;
+      }
+    }
+  }
+  xmodel_animCheck = 1;
+}
+
+/* ---- RE_FinishLoadingModels  0x00503540 ----  VERIFIED
+ * Finalize the registered models: load delayed images, merge sheet shaders,
+ * finish static models, fix up tex coords, then optimize the XModels. */
+void RE_FinishLoadingModels()
+{
   R_LoadDelayedImages();
   tr_modelsFinishedLoading = 1;
   R_MergeShadersForImageSheets();
   R_FinishLoadingStaticModels();
   R_FixupXModelTexCoords();
-  v0 = alloca(4116);
-  result = r_optimize;
-  if ( r_optimize->integer )
-  {
-    v2 = r_optimizeXModels;
-    if ( r_optimizeXModels->integer > 0 )
-    {
-      result = (cvar_t *)tr_numModels;
-      v3 = 1;
-      for ( i = 1; v3 < tr_numModels; i = v3 )
-      {
-        v4 = tr_models[v3];
-        v5 = *(_DWORD *)(v4 + 84);
-        v21 = v4;
-        if ( v5 )
-        {
-          v23 = *(__int16 *)(*(_DWORD *)(v5 + 4) + 100);
-          v19 = 0;
-          if ( v23 > 0 )
-          {
-            v20 = 0;
-            do
-            {
-              v6 = *(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(v4 + 84) + 4) + v20 + 20) + 4);
-              v7 = *(__int16 *)(v6 + 4);
-              v8 = *(_DWORD *)(v6 + 8);
-              v9 = 0;
-              if ( v7 > 0 )
-              {
-                v10 = *(_WORD **)(*(_DWORD *)(v4 + 80) + 4 * v19);
-                do
-                {
-                  v11 = *v10 == 0;
-                  v24[v9] = 0;
-                  if ( !v11 && *(__int16 *)(*(_DWORD *)((char *)&v24[v9] + v8 - (_DWORD)v24) + 2) >= v2->integer )
-                    v24[v9] = 1;
-                  ++v9;
-                  ++v10;
-                }
-                while ( v9 < v7 );
-                v4 = v21;
-              }
-              v12 = 0;
-              if ( v7 > 0 )
-              {
-                v13 = v8 - (_DWORD)v24;
-                do
-                {
-                  v14 = *(unsigned __int16 **)(*(_DWORD *)(v4 + 80) + 4 * v19);
-                  v15 = v14[v12];
-                  if ( v14[v12] )
-                  {
-                    if ( v24[v12] )
-                    {
-LABEL_22:
-                      v17 = *(_DWORD *)((char *)&v24[v12] + v13);
-                      if ( *(_WORD *)(v17 + 6) != 0xFFFF )
-                      {
-                        if ( glConfig_ARBVertexBufferObject )
-                        {
-                          R_OptimizeRigidXSurfaceARB(v17, (int (__cdecl *)(int))Hunk_AllocXModelPrecacheMesh);
-                        }
-                        else if ( glConfig_NVVertexArrayRange )
-                        {
-                          R_OptimizeRigidXSurfaceNV(v17, (int (__cdecl *)(int))Hunk_AllocXModelPrecacheMesh);
-                        }
-                        else if ( glConfig_ATIVertexArrayObject )
-                        {
-                          R_OptimizeRigidXSurfaceATI(v7, v17, v13, (int (__stdcall *)(int, int, int))Hunk_AllocXModelPrecacheMesh);
-                        }
-                      }
-                    }
-                    else
-                    {
-                      v16 = 0;
-                      while ( v16 == v12 || *v14 != v15 )
-                      {
-                        ++v16;
-                        ++v14;
-                        if ( v16 >= v7 )
-                          goto LABEL_22;
-                      }
-                    }
-                    v4 = v21;
-                  }
-                  ++v12;
-                }
-                while ( v12 < v7 );
-              }
-              v2 = r_optimizeXModels;
-              v18 = ++v19 < v23;
-              v20 += 20;
-            }
-            while ( v18 );
-            v3 = i;
-          }
-        }
-        result = (cvar_t *)tr_numModels;
-        ++v3;
-      }
-      xmodel_animCheck = 1;
-    }
-  }
-  return result;
+  R_OptimizeXModels();
 }
 
 /* ---- RE_SetIgnorePrecacheErrors  0x00503570 ----  VERIFIED */
-int __cdecl RE_SetIgnorePrecacheErrors(int a1)
+int __cdecl RE_SetIgnorePrecacheErrors(int ignore)
 {
-  if ( a1 )
+  if ( ignore )
     return ++tr_ignorePrecacheErrorCount;
   else
     return --tr_ignorePrecacheErrorCount;
 }
 
 /* ---- RE_GetIgnorePrecacheErrors  0x00503590 ----  VERIFIED */
-BOOL RE_GetIgnorePrecacheErrors()
+int RE_GetIgnorePrecacheErrors()
 {
   return tr_ignorePrecacheErrorCount != 0;
 }
 
-/* ---- RE_BeginRegistration  0x005035A0 ----  [HIGH] */
-unsigned int __cdecl RE_BeginRegistration(const char *a1, int *a2)
+/* ---- RE_BeginRegistration  0x005035A0 ----  [HIGH]
+ * Start a registration sequence: (re)init the renderer, flush any pending
+ * render commands, reset the scene baselines, then queue a degenerate warm-up
+ * command so the first real stretchPic is not dropped.  Copies the 0xA0-byte
+ * glConfig out through glConfigOut.  Returns the command-list write offset / 1.0f bits (dead EAX). */
+void __cdecl RE_BeginRegistration(glconfig_t *glConfigOut)
 {
-  int v2;
-  cvar_t *v3;
-  int v4;
-  int v5;
+  int          frame;
+  unsigned int used;
   unsigned int result;
-  _DWORD *v7;
-  char *v8;
+  int         *cmd;
+  char        *shader;
 
-  R_Init(a1);
-  v2 = backEndData;
-  qmemcpy(a2, &glConfig_renderer_string, 0xA0u);
-  if ( tr_registered )
-  {
-    *(_DWORD *)(v2 + 1636096 + *(_DWORD *)(v2 + 1898240)) = 0;
-    v3 = r_skipBackEnd;
-    *(_DWORD *)(v2 + 1898240) = 0;
-    if ( !v3->integer )
-    {
-      RB_ExecuteRenderCommands((_DWORD *)(v2 + 1636096), a1);
-      v2 = backEndData;              /* `mov edx, backEndData` 0x5035ED */
-    }
-  }
-  v4 = v2;
+  R_Init();
+  *glConfigOut=glConfig;    /* rep movsd, 0x005035B1 */
+  R_SyncRenderThread();
+  frame = backEndData;
   tr_viewCluster = -1;
   RE_ClearFlares();
-  r_firstSceneDlight = r_numdlights;
-  r_firstSceneEntity = r_numentities;
-  tr_registered = 1;
-  v5 = *(_DWORD *)(v4 + 1898240);
-  r_firstSceneCorona = r_numcoronas;
-  result = v5 + 40;
-  r_firstScenePoly = r_numpolys;
+  RE_ClearScene();
+  tr_registered[0] = 1;
+  used = *(int *)(frame + RCL_USED);
+  result = used + 40;
   if ( result <= 0x3FFF8 )
   {
-    v7 = (_DWORD *)(result + v4 + 1636056);
-    *(_DWORD *)(v4 + 1898240) = result;
-    if ( result + v4 != -1636056 )
+    cmd = (int *)(frame + (RCL_CMDS - 40) + result);
+    *(int *)(frame + RCL_USED) = result;
+    if ( cmd )
     {
-      *v7 = 2;
-      if ( tr_numShaders[0] > 0 )
+      cmd[0] = 2;                    /* RC_STRETCH_PIC warm-up quad */
+      if ( tr_numShaders[0] <= 0 )
       {
-        v8 = (char *)tr_shaders[0];
+        ri.Printf(2, "R_GetShaderByHandle: out of range hShader '%d'\n", 0);
+        shader = tr_defaultShader;
       }
       else
       {
-        ri_Printf(2, "R_GetShaderByHandle: out of range hShader '%d'\n", 0);
-        v8 = tr_defaultShader;
+        shader = (char *)tr_shaders[0];
       }
-      v7[1] = v8;
-      result = 1065353216;
-      v7[2] = 0;
-      v7[3] = 0;
-      v7[4] = 0;
-      v7[5] = 0;
-      v7[6] = 0;
-      v7[7] = 0;
-      v7[8] = 1065353216;
-      v7[9] = 1065353216;
+      cmd[1] = (int)shader;
+      result = 1065353216;           /* 1.0f */
+      cmd[2] = 0;
+      cmd[3] = 0;
+      cmd[4] = 0;
+      cmd[5] = 0;
+      cmd[6] = 0;
+      cmd[7] = 0;
+      cmd[8] = 1065353216;           /* 1.0f */
+      cmd[9] = 1065353216;           /* 1.0f */
     }
   }
-  return result;
+  return;
 }
 
 /* ---- R_ModelInit  0x005036B0 ----  VERIFIED */
@@ -871,159 +752,96 @@ int R_ModelInit()
   int result;
 
   tr_numModels = 0;
-  result = ri_Hunk_Alloc(96);
-  *(_DWORD *)(result + 68) = tr_numModels;
+  result = ri.Hunk_Alloc(96);
+  ((model_t *)result)->index = tr_numModels;
   tr_models[tr_numModels++] = result;
-  *(_DWORD *)(result + 64) = 0;
+  ((model_t *)result)->type = MOD_BAD;
   return result;
 }
 
-/* ---- R_ModelBounds  0x005036F0 ----  VERIFIED */
-_DWORD *__cdecl R_ModelBounds(int a1, _DWORD *a2, _DWORD *a3)
+/* ---- R_ModelBounds  0x005036F0 ----  VERIFIED
+ * Bounding box of a brush model; non-brush models report an all-zero box.
+ * model->bmodel is re-read per component, as retail. */
+void __cdecl R_ModelBounds(int handle, float *mins, float *maxs)
 {
-  int v3;
-  _DWORD *v4;
-  _DWORD *result;
+  model_t *model = (model_t *)tr_models[handle];
 
-  v3 = tr_models[a1];
-  v4 = *(_DWORD **)(v3 + 76);
-  if ( v4 )
+  if ( model->bmodel )
   {
-    *a2 = *v4;
-    a2[1] = *(_DWORD *)(*(_DWORD *)(v3 + 76) + 4);
-    a2[2] = *(_DWORD *)(*(_DWORD *)(v3 + 76) + 8);
-    *a3 = *(_DWORD *)(*(_DWORD *)(v3 + 76) + 12);
-    a3[1] = *(_DWORD *)(*(_DWORD *)(v3 + 76) + 16);
-    result = *(_DWORD **)(v3 + 76);
-    a3[2] = result[5];
+    mins[0] = model->bmodel->bounds[0][0];
+    mins[1] = model->bmodel->bounds[0][1];
+    mins[2] = model->bmodel->bounds[0][2];
+    maxs[0] = model->bmodel->bounds[1][0];
+    maxs[1] = model->bmodel->bounds[1][1];
+    maxs[2] = model->bmodel->bounds[1][2];
+    return;
   }
-  else
-  {
-    a2[2] = 0;
-    a2[1] = 0;
-    *a2 = 0;
-    result = a3;
-    a3[2] = 0;
-    a3[1] = 0;
-    *a3 = 0;
-  }
-  return result;
+  mins[0] = mins[1] = mins[2] = 0;
+  maxs[0] = maxs[1] = maxs[2] = 0;
 }
 
-/* ---- R_RefreshXModels_ARB  0x00503760 ----  [HIGH] */
-int __cdecl R_RefreshXModels_ARB(char a1)
+/* ---- R_RefreshXModels_ARB  0x00503760 ----  [HIGH]
+ * Refresh every XModel surface's ARB vertex buffer.  The model pointer is
+ * re-read from tr_models for every LOD, as retail. */
+void __cdecl R_RefreshXModels_ARB(int refreshFlags)
 {
-  int result;
-  int *v2;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  bool v9; // zf
-  bool v10; // cc
-  int v11;
-  int v12;
-  int v13;
-  int *v14;
+  int        modelIndex;
+  int        lodIndex;
+  int        lodCount;
+  int        surfaceIndex;
+  int        surfaceCount;
+  XSurface **surfaces;
 
-  result = tr_numModels;
-  v13 = 0;
-  if ( tr_numModels > 0 )
+  for ( modelIndex = 0; modelIndex < tr_numModels; modelIndex++ )
   {
-    v2 = tr_models;
-    v14 = tr_models;
-    do
+    if ( !((model_t *)tr_models[modelIndex])->xmodel )
+      continue;
+    lodCount = XModelGetNumLods( (XModel *)((model_t *)tr_models[modelIndex])->xmodel );
+    for ( lodIndex = 0; lodIndex < lodCount; lodIndex++ )
     {
-      v3 = *(_DWORD *)(*v2 + 84);
-      if ( v3 )
-      {
-        v4 = *(__int16 *)(*(_DWORD *)(v3 + 4) + 100);
-        if ( v4 > 0 )
-        {
-          v11 = 0;
-          v12 = v4;
-          do
-          {
-            v5 = *(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*v2 + 84) + 4) + v11 + 20) + 4);
-            v6 = *(__int16 *)(v5 + 4);
-            v7 = *(_DWORD *)(v5 + 8);
-            v8 = 0;
-            if ( v6 > 0 )
-            {
-              do
-                XSurfaceRefresh_ARB(*(_DWORD *)(v7 + 4 * v8++), a1);
-              while ( v8 < v6 );
-              v2 = v14;
-            }
-            v9 = v12 == 1;
-            v11 += 20;
-            --v12;
-          }
-          while ( !v9 );
-        }
-      }
-      result = v13 + 1;
-      ++v2;
-      v10 = ++v13 < tr_numModels;
-      v14 = v2;
+      surfaceCount = XModelGetSurfaces( lodIndex, (XModel *)((model_t *)tr_models[modelIndex])->xmodel, &surfaces );
+      for ( surfaceIndex = 0; surfaceIndex < surfaceCount; surfaceIndex++ )
+        XSurfaceRefresh_ARB( surfaces[surfaceIndex], refreshFlags );
     }
-    while ( v10 );
   }
-  return result;
 }
 
-/* ---- R_IncrementalRefreshXModels_ARB  0x00503820 ----  [HIGH] */
-int __cdecl R_IncrementalRefreshXModels_ARB(char a1)
+/* ---- R_IncrementalRefreshXModels_ARB  0x00503820 ----  [HIGH]
+ * Refresh at most one XModel surface per call, advancing the persistent
+ * (model, LOD, surface) cursor.  The cursor is incremented before selection,
+ * so surface 0 of each LOD is skipped -- retail behaviour, preserved.  The
+ * cursor globals are updated in place (retail keeps them in registers). */
+void __cdecl R_IncrementalRefreshXModels_ARB(int refreshFlags)
 {
-  int v1;
-  int result;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
+  int        startModel;
+  int        surfaceCount;
+  int        lodCount;
+  XSurface **surfaces;
 
-  v1 = tr_xmodelRefreshLodIndex;
-  result = tr_xmodelRefreshModelIndex;
-  v3 = tr_xmodelRefreshSurfaceIndex;
+nextLod:
+  if ( ((model_t *)tr_models[tr_xmodelRefreshModelIndex])->xmodel )
+  {
+    surfaceCount = XModelGetSurfaces( tr_xmodelRefreshLodIndex, (XModel *)((model_t *)tr_models[tr_xmodelRefreshModelIndex])->xmodel, &surfaces );
+    if ( ++tr_xmodelRefreshSurfaceIndex < surfaceCount )
+    {
+      XSurfaceRefresh_ARB(surfaces[tr_xmodelRefreshSurfaceIndex], refreshFlags);
+      return;
+    }
+    tr_xmodelRefreshSurfaceIndex = 0;
+    lodCount = XModelGetNumLods( (XModel *)((model_t *)tr_models[tr_xmodelRefreshModelIndex])->xmodel );
+    if ( ++tr_xmodelRefreshLodIndex < lodCount )
+      goto nextLod;
+  }
+
+  tr_xmodelRefreshLodIndex = 0;
+  startModel = tr_xmodelRefreshModelIndex;
   do
   {
-LABEL_2:
-    v4 = *(_DWORD *)(tr_models[result] + 84);
-    if ( !v4 )
-      break;
-    v5 = *(_DWORD *)(*(_DWORD *)(*(_DWORD *)(v4 + 4) + 4 * (5 * v1 + 5)) + 4);
-    v6 = *(_DWORD *)(v5 + 8);
-    v7 = *(__int16 *)(v5 + 4);
-    v8 = v3 + 1;
-    tr_xmodelRefreshSurfaceIndex = v8;
-    if ( v8 < v7 )
-      return XSurfaceRefresh_ARB(*(_DWORD *)(v6 + 4 * v8), a1);
-    v3 = 0;
-    tr_xmodelRefreshSurfaceIndex = 0;
-    v9 = *(__int16 *)(*(_DWORD *)(*(_DWORD *)(tr_models[result] + 84) + 4) + 100);
-    tr_xmodelRefreshLodIndex = ++v1;
-  }
-  while ( v1 < v9 );
-  v1 = 0;
-  tr_xmodelRefreshLodIndex = 0;
-  v10 = result;
-  while ( 1 )
-  {
-    tr_xmodelRefreshModelIndex = ++result;
-    if ( result >= tr_numModels )
-    {
-      result = 0;
+    if ( ++tr_xmodelRefreshModelIndex >= tr_numModels )
       tr_xmodelRefreshModelIndex = 0;
-    }
-    if ( result == v10 )
-      return result;
-    if ( *(_DWORD *)(tr_models[result] + 84) )
-      goto LABEL_2;
+    if ( tr_xmodelRefreshModelIndex == startModel )
+      return;
   }
+  while ( !((model_t *)tr_models[tr_xmodelRefreshModelIndex])->xmodel );
+  goto nextLod;
 }

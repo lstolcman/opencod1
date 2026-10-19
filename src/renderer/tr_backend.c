@@ -4,40 +4,71 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#define funcs_4D4A37 funcs_4D4A37__cod1_hdr   /* cod1_globals.h types it unsigned char[432]; real typed def below */
-#include "../qcommon/cod1_globals.h"
-#undef funcs_4D4A37
 #include "tr_records.h"
 #include "tr_shaderregistry.h"
 #include "tr_gl_types.h"
 #include "tr_orientation.h"   /* backEnd.or 0x016D8DA8 -- one object, not 16 shards */
 #include "tr_tess.h"
 #include "tr_font.h"
+#include "tr_local.h"         /* typed structs + asserts; after tr_records.h (TRG) */
+#include "../client_mp/cl_refapi.h"   /* re: RB_SwapBuffers locates the client's debug draws through it */
+
+/* backEnd (RTCW backEndState_t backEnd, tr_backend.c): one 0x1A4C-byte object at 0x016D89C0 that
+ * the renderer addresses through tr_records.h's BACKEND views.  backEndStorage is defined in
+ * client_mp/cl_refstorage.c: a definition in a renderer unit (linked after l_precomp_mp.obj)
+ * renumbers the symbols before it and flips the PC_EvaluateTokens / Sys_GetVideoRam scheduling
+ * ties (tools/vc7/tie_probe.py). */
+
+/* backEndData (RTCW tr_backend.c backEndData_t *backEndData[SMP_FRAMES]) */
+int backEndData;
+COD1_ASSERT_SIZE( backEndDynamicBuffer_t, 0x1020 );
+
+/* fog[FOG_PORTALVIEW=2].color inside tr_fogTable (0x016C4B90..0x016C4B9C; IDA
+ * names them red/green/blue/alpha).  R_SetFog writes FOG_TABLE[2].color here;
+ * RB_BeginDrawingView reads it as the skybox-portal clear colour.  The
+ * red/green/blue/alpha names IDA gave them are not separate storage. */
+#define tr_fogPortalView_colorR  (*(float *)(FOGBASE + 0x090))   /* 0x016C4B90 */
+#define tr_fogPortalView_colorG  (*(float *)(FOGBASE + 0x094))   /* 0x016C4B94 */
+#define tr_fogPortalView_colorB  (*(float *)(FOGBASE + 0x098))   /* 0x016C4B98 */
+#define tr_fogPortalView_colorA  (*(float *)(FOGBASE + 0x09C))   /* 0x016C4B9C */
+
+/* backEnd_t fields at backEndStorage (0x016D89C0) + offset, so R_Init's
+ * memset(&backEndStorage, 0, 0x1A4C) clears them as in retail (they used to be
+ * standalone ints). */
+#define backEnd_isHyperspace     (*(int *)(BACKEND + 0x0498))   /* 0x016D8E58 */
+#define backEnd_endFramePending  (*(int *)(BACKEND + 0x04AC))   /* 0x016D8E6C */
+#define backEnd_color2D          (*(int *)(BACKEND + 0x04B4))   /* 0x016D8E74 */
+
 
 extern void GLimp_EndFrame( void );
-extern int RB_BeginImmediateMode();
+void RB_BeginImmediateMode( void );
+void RB_EndImmediateMode( void );
 void __cdecl RB_BeginSurface( void *shader, int vertexComponentCount );
-extern int RB_CheckOverflow();
-extern int RB_DrawDebug();
+void __cdecl RB_CheckOverflow( int verts, int indexes );
+extern int FastRound( float f );   /* client_mp/cl_console_mp.c 0x00408370 */
+void __cdecl RB_DrawDebug( void );
 extern int RB_EndMultitexture();
 void __cdecl RB_EndSurface( void );
 extern int RB_RenderFlares();
 extern int RB_SelectStorageATI();
 extern int RB_SelectStorageNV();
 extern int RB_ShadowFinish();
-int __cdecl RB_ExecuteRenderCommands( _DWORD *a1, const char *a2 );
+void __cdecl RB_ExecuteRenderCommands( const void *data );
+void __cdecl R_SyncRenderThread( void );
 __declspec(dllimport) unsigned long __stdcall timeGetTime( void );
-extern int RB_glVertex3f();
+GLenum __cdecl RB_glBegin( GLenum result );
+void RB_glEnd( void );
+void __cdecl RB_glVertex2f( float x, float y );
+void __cdecl RB_glTexCoord2f( float s, float t );
+unsigned __int64 __cdecl RB_glColor3fv( const float *v );
 extern int RE_SetColor();
 extern int R_FogOn();
 extern double __cdecl R_GetAsianScale( int font, float scale );
 extern int *R_GetCharacterGlyph( int character, int fontBase );
-extern int R_RotateForModelEntity();
+extern void R_RotateForModelEntity();
 extern int R_SetFogColor();
 extern int R_TransformDlights();
 
-typedef void (__cdecl *rb_surfaceFunc_t)( void *surf );
 #define rb_surfaceTable   ((rb_surfaceFunc_t *)(void *)funcs_4D4A37)
 
 /* === Merged from renderer/tr_backend_rdata.c (retail linked it as tr_*.obj .rdata/.data). === */
@@ -104,92 +135,247 @@ rb_surfaceFunc_t funcs_4D4A37[29] =
     /* 28  0x00512660 */  RB_SurfaceOptimized
 };
 
-/* ---- GL_Bind  0x004D5450 ----  VERIFIED */
-void __cdecl GL_Bind(GLenum *a1)
-{
-  GLuint v1;
-  GLenum v2;
+/* ------------------------------------------------------------------------- *
+ *  File-local typed views over the data this file receives by POINTER.
+ *
+ *  The renderer's globals stay on the tr_records.h / tr_tess.h offset macros
+ *  (hybrid blob+symbol storage); these structs only add C types for the
+ *  records that arrive through a pointer -- images and the render-command
+ *  buffer -- so the field soup ( *(unsigned int *)(x + off) ) becomes named access.
+ *  Retyping a pointer never moves storage; each offset is pinned so a wrong
+ *  one is a build error.  The command structs mirror the producers in
+ *  tr_cmds.c (a separate translation unit); duplicating them file-locally is
+ *  intentional.
+ * ------------------------------------------------------------------------- */
 
-  if ( a1 )
+/* image_t -- the tr.images / scratch-image record.  Only the fields the
+ * backend touches are named; the tr_* image globals are declared `int` but
+ * hold an image_t*, so they are cast to this type at the point of use. */
+typedef struct {
+	char           imgName[64];       /* +0x00  (tr_image.c image_t) */
+	unsigned short width;             /* +0x40 */
+	unsigned short height;            /* +0x42 */
+	unsigned short uploadWidth;       /* +0x44 */
+	unsigned short uploadHeight;      /* +0x46 */
+	int            cardMemory;        /* +0x48 */
+	int            textureMemory;     /* +0x4c */
+	int            imageTrack;        /* +0x50 */
+	GLenum         textureTarget;     /* +0x54  GL_TEXTURE_2D ... (per-image enable cap) */
+	GLuint         texnum;            /* +0x58 */
+	int            frameUsed;         /* +0x5c  tr.frameCount when last bound */
+	unsigned int   internalFormat;    /* +0x60 */
+	unsigned int   flags;             /* +0x64  IMAGE_FLAG_* */
+	int            TMU;               /* +0x68  RB_ShowImages skips images with a nonzero value */
+} image_t;
+ASSERT_OFF(image_t, width, 0x40);
+ASSERT_OFF(image_t, uploadWidth, 0x44);
+ASSERT_OFF(image_t, textureTarget, 0x54);
+ASSERT_OFF(image_t, texnum, 0x58);
+ASSERT_OFF(image_t, frameUsed, 0x5c);
+ASSERT_OFF(image_t, TMU, 0x68);
+
+/* Render-command ids (renderCommand_t).  RB_ExecuteRenderCommands dispatches
+ * on these; the retail switch is written over (id - 1) so it is zero-based. */
+typedef enum {
+	RC_END_OF_LIST          = 0,
+	RC_SET_COLOR            = 1,
+	RC_STRETCH_PIC          = 2,
+	RC_STRETCH_PIC_GRADIENT = 3,
+	RC_STRETCH_PIC_ROTATE   = 4,
+	RC_DRAW_QUAD_PIC        = 5,
+	RC_TEXT_PAINT           = 6,
+	RC_DRAW_SURFS           = 7,
+	RC_DRAW_BUFFER          = 8,
+	RC_SAVE_SCREEN          = 9,
+	RC_BLEND_SAVED_SCREEN   = 10,
+	RC_SWAP_BUFFERS         = 11
+} renderCommand_t;
+
+typedef struct {
+	int   commandId;                  /* +0x00 */
+	byte  color[4];                   /* +0x04  packed RGBA */
+} setColorCommand_t;
+COD1_ASSERT_SIZE(setColorCommand_t, 8);
+
+typedef struct {
+	int       commandId;              /* +0x00 */
+	shader_t *shader;                 /* +0x04 */
+	float     x, y, w, h;             /* +0x08 */
+	float     s1, t1, s2, t2;         /* +0x18 */
+} stretchPicCommand_t;
+COD1_ASSERT_SIZE(stretchPicCommand_t, 40);
+
+typedef struct {
+	int       commandId;              /* +0x00 */
+	shader_t *shader;                 /* +0x04 */
+	float     x, y, w, h;             /* +0x08 */
+	float     s1, t1, s2, t2;         /* +0x18 */
+	byte      gradientColor[4];       /* +0x28 */
+	int       gradientType;           /* +0x2c */
+} stretchPicGradientCommand_t;
+COD1_ASSERT_SIZE(stretchPicGradientCommand_t, 48);
+
+typedef struct {
+	int       commandId;              /* +0x00 */
+	shader_t *shader;                 /* +0x04 */
+	float     x, y, w, h;             /* +0x08 */
+	float     s1, t1, s2, t2;         /* +0x18 */
+	float     angle;                  /* +0x28  radians */
+} stretchPicRotateCommand_t;
+COD1_ASSERT_SIZE(stretchPicRotateCommand_t, 44);
+
+typedef struct {
+	int       commandId;              /* +0x00 */
+	shader_t *shader;                 /* +0x04 */
+	float     positions[4][2];        /* +0x08 */
+	float     texCoords[4][2];        /* +0x28 */
+} drawQuadPicCommand_t;
+COD1_ASSERT_SIZE(drawQuadPicCommand_t, 72);
+
+typedef struct {
+	int         commandId;            /* +0x000 */
+	byte        refdef[0x188];        /* +0x004  copy of tr.refdef (trRefdef_t) */
+	viewParms_t viewParms;            /* +0x18c  copy of tr.viewParms */
+	drawSurf_t *drawSurfs;            /* +0x3ec */
+	int         numDrawSurfs;         /* +0x3f0 */
+} drawSurfsCommand_t;
+COD1_ASSERT_SIZE(drawSurfsCommand_t, 1012);
+ASSERT_OFF(drawSurfsCommand_t, viewParms, 0x18c);
+ASSERT_OFF(drawSurfsCommand_t, drawSurfs, 0x3ec);
+ASSERT_OFF(drawSurfsCommand_t, numDrawSurfs, 0x3f0);
+
+typedef struct {
+	int commandId;                    /* +0x00 */
+	int buffer;                       /* +0x04  GL draw-buffer enum */
+} drawBufferCommand_t;
+COD1_ASSERT_SIZE(drawBufferCommand_t, 8);
+
+typedef struct {
+	int commandId;                    /* +0x00 */
+} saveScreenCommand_t;
+COD1_ASSERT_SIZE(saveScreenCommand_t, 4);
+
+typedef struct {
+	int commandId;                    /* +0x00 */
+	int duration;                     /* +0x04 */
+} blendSavedScreenCommand_t;
+COD1_ASSERT_SIZE(blendSavedScreenCommand_t, 8);
+
+typedef struct {
+	int commandId;                    /* +0x00 */
+} swapBuffersCommand_t;
+COD1_ASSERT_SIZE(swapBuffersCommand_t, 4);
+
+/* shader flag bits the draw-surface dispatch tests */
+#define SHADER_FLAG_ENTITY_MERGABLE   0x04    /* shader->flags & 4 */
+#define SHADER_LIGHTING_ENTITY_MASK   0x18    /* shader->lightingFlags & 0x18 */
+#define RF_DEPTH_RANGE_FLAGS          0x18    /* renderfx bits that select a depth range */
+#define RF_FORCE_MIN_LIGHT            0x20    /* renderfx: clamp entity ambient up to r_entMinLight */
+
+/* one entry of trRefEntity_t.lights[8] (at entity+0xD0); count at entity+0xCC */
+typedef struct {
+	dlight_t *light;                  /* +0x00 */
+	float     scale;                  /* +0x04  per-light intensity */
+} rbEntityLight_t;
+COD1_ASSERT_SIZE(rbEntityLight_t, 8);
+
+/* rendererDebugState.immediateVertices entry -- the immediate-mode vertex (position, one
+ * texcoord, packed color) used by RE_StretchRaw / the overdraw overlay. */
+typedef struct {
+	float xyz[3];                     /* +0x00 */
+	float s;                          /* +0x0c */
+	float t;                          /* +0x10 */
+	float lightmap[2];                /* +0x14  polyVert_t's lightmap ST (tr_surface.c); not written here */
+	byte  color[4];                   /* +0x1c */
+} rbImmediateVertex_t;
+COD1_ASSERT_SIZE(rbImmediateVertex_t, 0x20);
+ASSERT_OFF(rbImmediateVertex_t, s, 0x0c);
+ASSERT_OFF(rbImmediateVertex_t, color, 0x1c);
+
+/* ---- GL_Bind  0x004D5450 ----  VERIFIED */
+void __cdecl GL_Bind(image_t *image)
+{
+  GLuint texnum;
+
+  if ( !image )
   {
-    v1 = a1[22];
+    ri.Printf(2, "GL_Bind: NULL image\n");
+    texnum = ((image_t *)tr_defaultImage)->texnum;
   }
   else
   {
-    ri_Printf(2, "GL_Bind: NULL image\n");
-    v1 = *(_DWORD *)(tr_defaultImage + 88);
+    texnum = image->texnum;
   }
 
   if ( r_nobind->integer )
   {
     if ( tr_dlightImage )
-      v1 = *(_DWORD *)(tr_dlightImage + 88);
+      texnum = ((image_t *)tr_dlightImage)->texnum;
   }
-  v2 = cap[glState_currentTmu];
-  if ( v2 != a1[21] )
+  if ( glState_cap[glState_currentTmu] != image->textureTarget )
   {
-    if ( v2 )
-      glDisable(cap[glState_currentTmu]);
-    glEnable(a1[21]);
-    cap[glState_currentTmu] = a1[21];
+    if ( glState_cap[glState_currentTmu] )
+      glDisable(glState_cap[glState_currentTmu]);
+    glEnable(image->textureTarget);
+    glState_cap[glState_currentTmu] = image->textureTarget;
   }
-  if ( glState_currentTextures[glState_currentTmu] != v1 )
+  if ( glState_currentTextures[glState_currentTmu] != texnum )
   {
-    a1[23] = tr_frameCount;
-    glState_currentTextures[glState_currentTmu] = v1;
-    glBindTexture(a1[21], v1);
+    image->frameUsed = tr_frameCount;
+    glState_currentTextures[glState_currentTmu] = texnum;
+    glBindTexture(image->textureTarget, texnum);
   }
 }
 
 /* ---- GL_SetTextureTarget  0x004D5500 ----  VERIFIED */
-void __cdecl GL_SetTextureTarget(GLenum a1)
+void __cdecl GL_SetTextureTarget(GLenum target)
 {
-  GLenum v1;
+  GLenum current = glState_cap[glState_currentTmu];
 
-  v1 = cap[glState_currentTmu];
-  if ( v1 != a1 )
+  if ( current != target )
   {
-    if ( v1 )
-      glDisable(cap[glState_currentTmu]);
-    if ( a1 )
-      glEnable(a1);
-    cap[glState_currentTmu] = a1;
+    if ( current )
+      glDisable(glState_cap[glState_currentTmu]);
+    if ( target )
+      glEnable(target);
+    glState_cap[glState_currentTmu] = target;
   }
 }
 
 /* ---- GL_SelectTexture  0x004D5540 ----  VERIFIED */
-void __cdecl GL_SelectTexture(int a1)
+void __cdecl GL_SelectTexture(int tmu)
 {
-  if ( glState_currentTmu != a1 )
+  if ( glState_currentTmu != tmu )
   {
-    qglActiveTextureARB(a1 + 33984);
-    glState_currentTmu = a1;
+    qglActiveTextureARB(tmu + 33984);
+    glState_currentTmu = tmu;
   }
-  if ( glState_currentClientTmu != a1 )
+  if ( glState_currentClientTmu != tmu )
   {
-    qglClientActiveTextureARB(a1 + 33984);
-    glState_currentClientTmu = a1;
+    qglClientActiveTextureARB(tmu + 33984);
+    glState_currentClientTmu = tmu;
   }
 }
 
-/* ---- GL_BindMultitexture  0x004D5580 ----  VERIFIED */
-void __cdecl GL_BindMultitexture(int a1, int a2, int a3)
+/* ---- GL_BindMultitexture  0x004D5580 ----  VERIFIED
+ * env0 is the (unused) TMU-0 texture env; only the two images bind. */
+void __cdecl GL_BindMultitexture(image_t *image0, int env0, image_t *image1)
 {
-  GLuint v3;
-  GLuint v4;
+  GLuint texnum0;
+  GLuint texnum1;
 
-  v3 = *(_DWORD *)(a3 + 88);
-  v4 = *(_DWORD *)(a1 + 88);
+  texnum1 = image1->texnum;
+  texnum0 = image0->texnum;
 
   if ( r_nobind->integer )
   {
     if ( tr_dlightImage )
     {
-      v3 = *(_DWORD *)(tr_dlightImage + 88);
-      v4 = v3;
+      texnum1 = ((image_t *)tr_dlightImage)->texnum;
+      texnum0 = texnum1;
     }
   }
-  if ( glState_currentTextures[1] != v3 )
+  if ( glState_currentTextures[1] != texnum1 )
   {
     if ( glState_currentTmu != 1 )
     {
@@ -201,11 +387,11 @@ void __cdecl GL_BindMultitexture(int a1, int a2, int a3)
       qglClientActiveTextureARB(33985);
       glState_currentClientTmu = 1;
     }
-    *(_DWORD *)(a3 + 92) = tr_frameCount;
-    glState_currentTextures[1] = v3;
-    glBindTexture(0xDE1u, v3);
+    image1->frameUsed = tr_frameCount;
+    glState_currentTextures[1] = texnum1;
+    glBindTexture(0xDE1u, texnum1);
   }
-  if ( glState_currentTextures[0] != v4 )
+  if ( glState_currentTextures[0] != texnum0 )
   {
     if ( glState_currentTmu )
     {
@@ -217,97 +403,96 @@ void __cdecl GL_BindMultitexture(int a1, int a2, int a3)
       qglClientActiveTextureARB(33984);
       glState_currentClientTmu = 0;
     }
-    *(_DWORD *)(a1 + 92) = tr_frameCount;
-    glState_currentTextures[0] = v4;
-    glBindTexture(0xDE1u, v4);
+    image0->frameUsed = tr_frameCount;
+    glState_currentTextures[0] = texnum0;
+    glBindTexture(0xDE1u, texnum0);
   }
 }
 
 /* ---- GL_Cull  0x004D5670 ----  VERIFIED */
-void __cdecl GL_Cull(int a1)
+void __cdecl GL_Cull(int cullType)
 {
-  if ( glState_faceCulling != a1 )
+  if ( glState_faceCulling == cullType )
+    return;
+  if ( cullType == 2 )
   {
-    if ( a1 == 2 )
-    {
-      glDisable(0xB44u);
-      glState_faceCulling = 2;
-      return;
-    }
+    glDisable(0xB44u);
+  }
+  else
+  {
     if ( glState_faceCulling == 2 )
       glEnable(0xB44u);
-    if ( a1 == 1 )
+    if ( cullType == 1 )
     {
-      if ( !backEnd_viewParms_isMirror )
-      {
-LABEL_8:
+      if ( backEnd_viewParms_isMirror )
+        qglCullFace(1028);
+      else
         qglCullFace(1029);
-        glState_faceCulling = a1;
-        return;
-      }
     }
-    else if ( backEnd_viewParms_isMirror )
+    else
     {
-      goto LABEL_8;
+      if ( backEnd_viewParms_isMirror )
+        qglCullFace(1029);
+      else
+        qglCullFace(1028);
     }
-    qglCullFace(1028);
-    glState_faceCulling = a1;
   }
+  glState_faceCulling = cullType;
 }
 
 /* ---- GL_TexEnv  0x004D56E0 ----  VERIFIED */
-void __cdecl GL_TexEnv(int a1)
+void __cdecl GL_TexEnv(int env)
 {
-  if ( a1 != glState_texEnv[glState_currentTmu] )
+  if ( env == glState_texEnv[glState_currentTmu] )
+    return;
+
+  glState_texEnv[glState_currentTmu] = env;
+
+  switch ( env )
   {
-    glState_texEnv[glState_currentTmu] = a1;
-    if ( a1 <= 8448 )
-    {
-      switch ( a1 )
-      {
-        case 8448:
-          glTexEnvi(0x2300u, 0x2200u, 8448);
-          return;
-        case 260:
-          glTexEnvi(0x2300u, 0x2200u, 260);
-          return;
-        case 7681:
-          glTexEnvi(0x2300u, 0x2200u, 7681);
-          return;
-      }
-      goto LABEL_10;
-    }
-    if ( a1 != 8449 )
-    {
-LABEL_10:
-      ri_Error(1, "\x15" "GL_TexEnv: invalid env '%x' passed\n", a1);
-      return;
-    }
-    glTexEnvi(0x2300u, 0x2200u, 8449);
+    case 0x2100:  /* GL_MODULATE */
+      glTexEnvi(0x2300u, 0x2200u, 0x2100);
+      break;
+    case 0x1E01:  /* GL_REPLACE */
+      glTexEnvi(0x2300u, 0x2200u, 0x1E01);
+      break;
+    case 0x2101:  /* GL_DECAL */
+      glTexEnvi(0x2300u, 0x2200u, 0x2101);
+      break;
+    case 0x104:   /* GL_ADD */
+      glTexEnvi(0x2300u, 0x2200u, 0x104);
+      break;
+    default:
+      ri.Error(1, "\x15" "GL_TexEnv: invalid env '%x' passed\n", env);
+      break;
   }
 }
 
-/* ---- GL_Normalize  0x004D5794 ----  VERIFIED */
-void __cdecl GL_Normalize(GLenum a1)
+/* ---- GL_Normalize  0x004D5794 ----  VERIFIED
+   real entry 0x004D5780 (retail list starts it at its tail); uncalled in retail */
+void __cdecl GL_Normalize(GLenum target)
 {
-  glState_normalizeTarget = a1;
-  if ( a1 )
-    glEnable(a1);
+  if ( target == glState_normalizeTarget )
+    return;
+  if ( glState_normalizeTarget )
+    glDisable(glState_normalizeTarget);
+  glState_normalizeTarget = target;
+  if ( target )
+    glEnable(target);
 }
 
 /* ---- GL_State  0x004D57B0 ----  VERIFIED */
-int __cdecl GL_State( int stateBits )
+void __cdecl GL_State( unsigned long stateBits )
 {
-	int   bits = stateBits;   /* ebx -- retail mutates it before storing */
-	int   diff;
-	int   srcFactor;          /* edi */
-	int   dstFactor;          /* esi */
-	float offsetFactor;
-	float offsetUnits;
+	unsigned long diff;
+	GLenum        srcFactor;          /* edi */
+	GLenum        dstFactor;          /* esi */
+	float         offsetFactor;
+	float         offsetUnits;
 
-	diff = bits ^ glState_glStateBits;
+	diff = stateBits ^ glState_glStateBits;
 	if ( !diff )                                        /* 0x004D57BF */
-		return 0;
+		return;
 
 	/* ---- depth test and depth func  0x004D57C5 ---- */
 	if ( diff & 0x70000 )
@@ -315,14 +500,14 @@ int __cdecl GL_State( int stateBits )
 		if ( diff & 0x10000 )
 		{
 			/* NOTE the polarity: the bit DISABLES.  0x004D57D3. */
-			if ( bits & 0x10000 )
+			if ( stateBits & 0x10000 )
 				glDisable( 0xB71u );
 			else
 				glEnable( 0xB71u );
 		}
-		if ( bits & 0x20000 )
+		if ( stateBits & 0x20000 )
 			glDepthFunc( 0x202u );
-		else if ( bits & 0x40000 )
+		else if ( stateBits & 0x40000 )
 			glDepthFunc( 0x207u );
 		else
 			glDepthFunc( 0x203u );
@@ -330,58 +515,55 @@ int __cdecl GL_State( int stateBits )
 
 	/* ---- depth mask  0x004D5817 ---- */
 	if ( diff & 0x100 )
-		qglDepthMask( ( bits & 0x100 ) != 0 );
+	{
+		if ( stateBits & 0x100 )
+			qglDepthMask( 1 );
+		else
+			qglDepthMask( 0 );
+	}
 
 	/* ---- polygon mode  0x004D5835 ---- */
 	if ( diff & 0x1000 )
 	{
-		if ( bits & 0x1000 )
+		if ( stateBits & 0x1000 )
 			glPolygonMode( 0x408u, 0x1B01u );
 		else
 			glPolygonMode( 0x408u, 0x1B02u );
 	}
 
+	/* ---- alpha test  0x004D585A ---- */
 	if ( diff & 0x70000000 )
 	{
-		int atest = bits & 0x70000000;
-
-		if ( (unsigned int)atest > 0x20000000 )
+		switch ( stateBits & 0x70000000 )
 		{
-			if ( atest == 0x40000000 )
-			{
+			case 0:
+				glDisable( 0xBC0u );
+				break;
+			case 0x10000000:
 				glEnable( 0xBC0u );
-				glAlphaFunc( 0x206u, 0.5f);
-			}
-		}
-		else if ( atest == 0x20000000 )
-		{
-			glEnable( 0xBC0u );
-			glAlphaFunc( 0x201u, 0.5f);
-		}
-		else if ( atest )
-		{
-			if ( atest == 0x10000000 )
-			{
+				glAlphaFunc( 0x204u, 0.0f );
+				break;
+			case 0x20000000:
 				glEnable( 0xBC0u );
-				glAlphaFunc( 0x204u, 0.0f);
-			}
-		}
-		else
-		{
-			glDisable( 0xBC0u );
+				glAlphaFunc( 0x201u, 0.5f );
+				break;
+			case 0x40000000:
+				glEnable( 0xBC0u );
+				glAlphaFunc( 0x206u, 0.5f );
+				break;
 		}
 	}
 
 	if ( diff & 0x100000 )
 	{
-		if ( *(_DWORD *)(tr_world + 280) && !r_entFullbright->integer && ( bits & 0x100000 ) )
+		if ( *(unsigned int *)(tr_world + 280) && !r_entFullbright->integer && ( stateBits & 0x100000 ) )
 		{
 			glEnable( 0xB50u );
 		}
 		else
 		{
 			glDisable( 0xB50u );
-			if ( bits & 0x100000 )
+			if ( stateBits & 0x100000 )
 			{
 				if ( glState_clientStateBits & 0x100 )
 				{
@@ -391,14 +573,14 @@ int __cdecl GL_State( int stateBits )
 				qglColor3f( tr_identityLight,
 				               tr_identityLight,
 				               tr_identityLight);
-				bits &= ~0x100000;
+				stateBits &= ~0x100000;
 			}
 		}
 	}
 
 	if ( diff & 0x200000 )
 	{
-		if ( bits & 0x200000 )
+		if ( stateBits & 0x200000 )
 		{
 			R_FogOn();
 		}
@@ -412,15 +594,15 @@ int __cdecl GL_State( int stateBits )
 	/* ---- polygon offset  0x004D598D ---- */
 	if ( diff & 0xE000 )
 	{
-		if ( bits & 0xE000 )
+		if ( stateBits & 0xE000 )
 		{
 			glEnable( 0x8037u );
-			if ( bits & 0x2000 )
+			if ( stateBits & 0x2000 )
 			{
 				qglPolygonOffset( r_offsetfactor->value,
 				               r_offsetunits->value);
 			}
-			else if ( bits & 0x4000 )
+			else if ( stateBits & 0x4000 )
 			{
 				offsetUnits  = r_offsetunits->value  + r_offsetunits->value;
 				offsetFactor = r_offsetfactor->value + r_offsetfactor->value;
@@ -440,535 +622,243 @@ int __cdecl GL_State( int stateBits )
 	/* ---- programmable pipeline toggles  0x004D5A0D ---- */
 	if ( diff & 0x2000000 )
 	{
-		if ( bits & 0x2000000 )
+		if ( stateBits & 0x2000000 )
 			glEnable( 0x8620u );
 		else
 			glDisable( 0x8620u );
 	}
 	if ( diff & 0x400000 )
 	{
-		if ( bits & 0x400000 )
+		if ( stateBits & 0x400000 )
 			glEnable( 0x86DEu );
 		else
 			glDisable( 0x86DEu );
 	}
 	if ( diff & 0x800000 )
 	{
-		if ( bits & 0x800000 )
+		if ( stateBits & 0x800000 )
 			glEnable( 0x8522u );
 		else
 			glDisable( 0x8522u );
 	}
 	if ( diff & 0x1000000 )
 	{
-		if ( bits & 0x1000000 )
+		if ( stateBits & 0x1000000 )
 			glEnable( 0x8920u );
 		else
 			glDisable( 0x8920u );
 	}
 
-	glState_glStateBits = bits;
-	if ( !( diff & 0xFF ) )
-		return 0;
+	glState_glStateBits = stateBits;
 
-	if ( !( bits & 0xFF ) )
+	/* ---- blend  0x004D5AA1 ---- */
+	if ( diff & 0xFF )
 	{
-		glDisable( 0xBE2u );
-		return R_SetFogColor();                         /* tail jump, 0x004D5BB3 */
-	}
+		if ( stateBits & 0xFF )
+		{
+			switch ( stateBits & 0xF )
+			{
+				case 1:  srcFactor = 0x000; break;
+				case 2:  srcFactor = 0x001; break;
+				case 3:  srcFactor = 0x306; break;
+				case 4:  srcFactor = 0x307; break;
+				case 5:  srcFactor = 0x302; break;
+				case 6:  srcFactor = 0x303; break;
+				case 7:  srcFactor = 0x304; break;
+				case 8:  srcFactor = 0x305; break;
+				case 9:  srcFactor = 0x308; break;
+				default:
+					srcFactor = 1;
+					ri.Error( 1, "\x15" "GL_State: invalid src blend state bits\n" );
+					break;
+			}
 
-	switch ( bits & 0xF )
-	{
-		case 1:  srcFactor = 0x000; break;
-		case 2:  srcFactor = 0x001; break;
-		case 3:  srcFactor = 0x306; break;
-		case 4:  srcFactor = 0x307; break;
-		case 5:  srcFactor = 0x302; break;
-		case 6:  srcFactor = 0x303; break;
-		case 7:  srcFactor = 0x304; break;
-		case 8:  srcFactor = 0x305; break;
-		case 9:  srcFactor = 0x308; break;
-		default:
-			srcFactor = 1;
-			ri_Error( 1, "\x15" "GL_State: invalid src blend state bits\n" );
-			break;
-	}
+			switch ( stateBits & 0xF0 )
+			{
+				case 0x10:  dstFactor = 0x000; break;
+				case 0x20:  dstFactor = 0x001; break;
+				case 0x30:  dstFactor = 0x300; break;
+				case 0x40:  dstFactor = 0x301; break;
+				case 0x50:  dstFactor = 0x302; break;
+				case 0x60:  dstFactor = 0x303; break;
+				case 0x70:  dstFactor = 0x304; break;
+				case 0x80:  dstFactor = 0x305; break;
+				default:
+					dstFactor = 1;
+					ri.Error( 1, "\x15" "GL_State: invalid dst blend state bits\n" );
+					break;
+			}
 
-	switch ( bits & 0xF0 )
-	{
-		case 0x10:  dstFactor = 0x000; break;
-		case 0x20:  dstFactor = 0x001; break;
-		case 0x30:  dstFactor = 0x300; break;
-		case 0x40:  dstFactor = 0x301; break;
-		case 0x50:  dstFactor = 0x302; break;
-		case 0x60:  dstFactor = 0x303; break;
-		case 0x70:  dstFactor = 0x304; break;
-		case 0x80:  dstFactor = 0x305; break;
-		default:
-			dstFactor = 1;
-			ri_Error( 1, "\x15" "GL_State: invalid dst blend state bits\n" );
-			break;
+			glEnable( 0xBE2u );
+			qglBlendFunc( srcFactor, dstFactor );
+		}
+		else
+		{
+			glDisable( 0xBE2u );
+		}
+		R_SetFogColor();                                /* tail jumps 0x004D5B9E / 0x004D5BB3 */
 	}
-
-	glEnable( 0xBE2u );
-	qglBlendFunc( srcFactor, dstFactor );
-	return R_SetFogColor();                             /* tail jump, 0x004D5B9E */
 }
 
-#if 0
-char __cdecl GL_State(int a1)
-{
-  int v1;
-  int v2;
-  int v3;
-  int v4;
-  unsigned int v5;
-  int v6;
-  float v8;
-  float v9;
-  int v10;
-
-  v1 = a1;
-  v2 = a1 ^ glState_glStateBits;
-  v10 = v2;
-  if ( v2 )
-  {
-    if ( (v2 & 0x70000) != 0 )
-    {
-      if ( (v2 & 0x10000) != 0 )
-      {
-        if ( (v1 & 0x10000) != 0 )
-          glDisable(0xB71u);
-        else
-          glEnable(0xB71u);
-      }
-      if ( (v1 & 0x20000) != 0 )
-      {
-        glDepthFunc(0x202u);
-      }
-      else if ( (v1 & 0x40000) != 0 )
-      {
-        glDepthFunc(0x207u);
-      }
-      else
-      {
-        glDepthFunc(0x203u);
-      }
-    }
-    if ( (v10 & 0x100) != 0 )
-      qglDepthMask((v1 & 0x100) != 0);
-    if ( (v10 & 0x1000) != 0 )
-    {
-      if ( (v1 & 0x1000) != 0 )
-        glPolygonMode(0x408u, 0x1B01u);
-      else
-        glPolygonMode(0x408u, 0x1B02u);
-    }
-    if ( (v10 & 0x70000000) != 0 )
-    {
-      v3 = v1 & 0x70000000;
-      if ( (v1 & 0x70000000u) > 0x20000000 )
-      {
-        if ( v3 == 0x40000000 )
-        {
-          glEnable(0xBC0u);
-          glAlphaFunc(0x206u, 0.5);
-        }
-      }
-      else if ( (v1 & 0x70000000) == 0x20000000 )
-      {
-        glEnable(0xBC0u);
-        glAlphaFunc(0x201u, 0.5);
-      }
-      else if ( v3 )
-      {
-        if ( v3 == 0x10000000 )
-        {
-          glEnable(0xBC0u);
-          glAlphaFunc(0x204u, 0.0);
-        }
-      }
-      else
-      {
-        glDisable(0xBC0u);
-      }
-    }
-    if ( (v10 & 0x100000) != 0 )
-    {
-      if ( *(_DWORD *)(tr_world + 280) && !r_entFullbright->integer && (v1 & 0x100000) != 0 )
-      {
-        glEnable(0xB50u);
-      }
-      else
-      {
-        glDisable(0xB50u);
-        if ( (v1 & 0x100000) != 0 )
-        {
-          if ( (glState_clientStateBits & 0x100) != 0 )
-          {
-            glDisableClientState(0x8076u);
-            glState_clientStateBits &= ~0x100u;
-          }
-          qglColor3f(tr_identityLight, tr_identityLight, tr_identityLight);
-          v1 &= ~0x100000u;
-        }
-      }
-    }
-    if ( (v10 & 0x200000) != 0 )
-    {
-      if ( (v1 & 0x200000) != 0 )
-      {
-        R_FogOn();
-      }
-      else if ( (glState_glStateBits & 0x200000) != 0 )
-      {
-        glDisable(0xB60u);
-        glState_glStateBits &= ~0x200000u;
-      }
-    }
-    if ( (v10 & 0xE000) != 0 )
-    {
-      if ( (v1 & 0xE000) != 0 )
-      {
-        glEnable(0x8037u);
-        if ( (v1 & 0x2000) != 0 )
-        {
-          qglPolygonOffset(r_offsetfactor->value, r_offsetunits->value);
-        }
-        else if ( (v1 & 0x4000) != 0 )
-        {
-          v9 = r_offsetunits->value + r_offsetunits->value;
-          v8 = r_offsetfactor->value + r_offsetfactor->value;
-          qglPolygonOffset(v8, v9);
-        }
-        else
-        {
-          qglPolygonOffset(0.0f, r_offsetunits->value);
-        }
-      }
-      else
-      {
-        glDisable(0x8037u);
-      }
-    }
-    if ( (v10 & 0x2000000) != 0 )
-    {
-      if ( (v1 & 0x2000000) != 0 )
-        glEnable(0x8620u);
-      else
-        glDisable(0x8620u);
-    }
-    /* Retail 0x004D5A32/0x004D5A57/0x004D5A7C: `test ..., 400000h / 800000h /
-     * 1000000h` -- EXT_vertex_shader and the ATI fragment-shader state bits. */
-    if ( (v10 & 0x400000) != 0 )
-    {
-      if ( (v1 & 0x400000) != 0 )
-        glEnable(0x86DEu);
-      else
-        glDisable(0x86DEu);
-    }
-    if ( (v10 & 0x800000) != 0 )
-    {
-      if ( (v1 & 0x800000) != 0 )
-        glEnable(0x8522u);
-      else
-        glDisable(0x8522u);
-    }
-    if ( (v10 & 0x1000000) != 0 )
-    {
-      if ( (v1 & 0x1000000) != 0 )
-        glEnable(0x8920u);
-      else
-        glDisable(0x8920u);
-    }
-    LOBYTE(v2) = v10;
-    glState_glStateBits = v1;
-    if ( (_BYTE)v10 )
-    {
-      if ( (_BYTE)v1 )
-      {
-        switch ( v1 & 0xF )
-        {
-          case 1:
-            v4 = 0;
-            break;
-          case 2:
-            v4 = 1;
-            break;
-          case 3:
-            v4 = 774;
-            break;
-          case 4:
-            v4 = 775;
-            break;
-          case 5:
-            v4 = 770;
-            break;
-          case 6:
-            v4 = 771;
-            break;
-          case 7:
-            v4 = 772;
-            break;
-          case 8:
-            v4 = 773;
-            break;
-          case 9:
-            v4 = 776;
-            break;
-          default:
-            v4 = 1;
-            ri_Error(1, "\x15" "GL_State: invalid src blend state bits\n");
-            break;
-        }
-        v5 = (v1 & 0xF0) - 16;
-        if ( v5 > 0x70 )
-        {
-LABEL_89:
-          v6 = 1;
-          ri_Error(1, "\x15" "GL_State: invalid dst blend state bits\n");
-        }
-        else
-        {
-          switch ( *((_BYTE *)GL_State_dstBlendIndexTable + v5) )
-          {
-            case 0:
-              v6 = 0;
-              break;
-            case 1:
-              v6 = 1;
-              break;
-            case 2:
-              v6 = 768;
-              break;
-            case 3:
-              v6 = 769;
-              break;
-            case 4:
-              v6 = 770;
-              break;
-            case 5:
-              v6 = 771;
-              break;
-            case 6:
-              v6 = 772;
-              break;
-            case 7:
-              v6 = 773;
-              break;
-            case 8:
-              goto LABEL_89;
-          }
-        }
-        glEnable(0xBE2u);
-        qglBlendFunc(v4, v6);
-      }
-      else
-      {
-        glDisable(0xBE2u);
-      }
-      LOBYTE(v2) = R_SetFogColor();
-    }
-  }
-  return v2;
-}
-#endif
 
 /* ---- GL_ClientState  0x004D5C80 ----  VERIFIED */
-int __cdecl GL_ClientState(int a1)
+int __cdecl GL_ClientState(int stateBits)
 {
-  int result;
-  __int16 v2;
-  int v3;
+  int diff;
 
-  result = a1;
-  v2 = a1 ^ glState_clientStateBits;
-  if ( a1 == glState_clientStateBits )
-    return result;
-  if ( (v2 & 1) != 0 )
+  diff = glState_clientStateBits ^ stateBits;
+  if ( !diff )
+    return stateBits;
+  if ( diff & 0x1 )
   {
-    if ( glState_currentClientTmu )
-      qglClientActiveTextureARB(33984);
-    if ( (a1 & 1) != 0 )
+    if ( glState_currentClientTmu != 0 )
+      qglClientActiveTextureARB(0x84C0);
+    if ( stateBits & 0x1 )
       glEnableClientState(0x8078u);
     else
       glDisableClientState(0x8078u);
-    v3 = glState_currentClientTmu;
-    if ( !glState_currentClientTmu )
-      goto LABEL_11;
-    qglClientActiveTextureARB(glState_currentClientTmu + 33984);
+    if ( glState_currentClientTmu != 0 )
+      qglClientActiveTextureARB(glState_currentClientTmu + 0x84C0);
   }
-  v3 = glState_currentClientTmu;
-LABEL_11:
-  if ( (v2 & 2) != 0 )
+  if ( diff & 0x2 )
   {
-    if ( v3 != 1 )
-      qglClientActiveTextureARB(33985);
-    if ( (a1 & 2) != 0 )
-      glEnableClientState(0x8078u);
-    else
-      glDisableClientState(0x8078u);
-    v3 = glState_currentClientTmu;
     if ( glState_currentClientTmu != 1 )
-    {
-      qglClientActiveTextureARB(glState_currentClientTmu + 33984);
-      v3 = glState_currentClientTmu;
-    }
-  }
-  if ( (v2 & 4) != 0 )
-  {
-    if ( v3 != 2 )
-      qglClientActiveTextureARB(33986);
-    if ( (a1 & 4) != 0 )
+      qglClientActiveTextureARB(0x84C1);
+    if ( stateBits & 0x2 )
       glEnableClientState(0x8078u);
     else
       glDisableClientState(0x8078u);
-    v3 = glState_currentClientTmu;
+    if ( glState_currentClientTmu != 1 )
+      qglClientActiveTextureARB(glState_currentClientTmu + 0x84C0);
+  }
+  if ( diff & 0x4 )
+  {
     if ( glState_currentClientTmu != 2 )
-    {
-      qglClientActiveTextureARB(glState_currentClientTmu + 33984);
-      v3 = glState_currentClientTmu;
-    }
-  }
-  if ( (v2 & 8) != 0 )
-  {
-    if ( v3 != 3 )
-      qglClientActiveTextureARB(33987);
-    if ( (a1 & 8) != 0 )
+      qglClientActiveTextureARB(0x84C2);
+    if ( stateBits & 0x4 )
       glEnableClientState(0x8078u);
     else
       glDisableClientState(0x8078u);
-    v3 = glState_currentClientTmu;
+    if ( glState_currentClientTmu != 2 )
+      qglClientActiveTextureARB(glState_currentClientTmu + 0x84C0);
+  }
+  if ( diff & 0x8 )
+  {
     if ( glState_currentClientTmu != 3 )
-    {
-      qglClientActiveTextureARB(glState_currentClientTmu + 33984);
-      v3 = glState_currentClientTmu;
-    }
-  }
-  if ( (v2 & 0x10) != 0 )
-  {
-    if ( v3 != 4 )
-      qglClientActiveTextureARB(33988);
-    if ( (a1 & 0x10) != 0 )
+      qglClientActiveTextureARB(0x84C3);
+    if ( stateBits & 0x8 )
       glEnableClientState(0x8078u);
     else
       glDisableClientState(0x8078u);
-    v3 = glState_currentClientTmu;
+    if ( glState_currentClientTmu != 3 )
+      qglClientActiveTextureARB(glState_currentClientTmu + 0x84C0);
+  }
+  if ( diff & 0x10 )
+  {
     if ( glState_currentClientTmu != 4 )
-    {
-      qglClientActiveTextureARB(glState_currentClientTmu + 33984);
-      v3 = glState_currentClientTmu;
-    }
-  }
-  if ( (v2 & 0x20) != 0 )
-  {
-    if ( v3 != 5 )
-      qglClientActiveTextureARB(33989);
-    if ( (a1 & 0x20) != 0 )
+      qglClientActiveTextureARB(0x84C4);
+    if ( stateBits & 0x10 )
       glEnableClientState(0x8078u);
     else
       glDisableClientState(0x8078u);
-    v3 = glState_currentClientTmu;
+    if ( glState_currentClientTmu != 4 )
+      qglClientActiveTextureARB(glState_currentClientTmu + 0x84C0);
+  }
+  if ( diff & 0x20 )
+  {
     if ( glState_currentClientTmu != 5 )
-    {
-      qglClientActiveTextureARB(glState_currentClientTmu + 33984);
-      v3 = glState_currentClientTmu;
-    }
-  }
-  if ( (v2 & 0x40) != 0 )
-  {
-    if ( v3 != 6 )
-      qglClientActiveTextureARB(33990);
-    if ( (a1 & 0x40) != 0 )
+      qglClientActiveTextureARB(0x84C5);
+    if ( stateBits & 0x20 )
       glEnableClientState(0x8078u);
     else
       glDisableClientState(0x8078u);
-    v3 = glState_currentClientTmu;
+    if ( glState_currentClientTmu != 5 )
+      qglClientActiveTextureARB(glState_currentClientTmu + 0x84C0);
+  }
+  if ( diff & 0x40 )
+  {
     if ( glState_currentClientTmu != 6 )
-    {
-      qglClientActiveTextureARB(glState_currentClientTmu + 33984);
-      v3 = glState_currentClientTmu;
-    }
-  }
-  if ( (char)v2 < 0 )
-  {
-    if ( v3 != 7 )
-      qglClientActiveTextureARB(33991);
-    if ( (char)a1 >= 0 )
-      glDisableClientState(0x8078u);
-    else
+      qglClientActiveTextureARB(0x84C6);
+    if ( stateBits & 0x40 )
       glEnableClientState(0x8078u);
-    if ( glState_currentClientTmu != 7 )
-      qglClientActiveTextureARB(glState_currentClientTmu + 33984);
+    else
+      glDisableClientState(0x8078u);
+    if ( glState_currentClientTmu != 6 )
+      qglClientActiveTextureARB(glState_currentClientTmu + 0x84C0);
   }
-  if ( (v2 & 0x100) != 0 )
+  if ( diff & 0x80 )
   {
-    if ( (a1 & 0x100) != 0 )
+    if ( glState_currentClientTmu != 7 )
+      qglClientActiveTextureARB(0x84C7);
+    if ( stateBits & 0x80 )
+      glEnableClientState(0x8078u);
+    else
+      glDisableClientState(0x8078u);
+    if ( glState_currentClientTmu != 7 )
+      qglClientActiveTextureARB(glState_currentClientTmu + 0x84C0);
+  }
+  if ( diff & 0x100 )
+  {
+    if ( stateBits & 0x100 )
       glEnableClientState(0x8076u);
     else
       glDisableClientState(0x8076u);
   }
-  if ( (v2 & 0x200) != 0 )
+  if ( diff & 0x200 )
   {
-    if ( (a1 & 0x200) != 0 )
+    if ( stateBits & 0x200 )
       glEnableClientState(0x8075u);
     else
       glDisableClientState(0x8075u);
   }
-  if ( (v2 & 0x400) != 0 )
+  if ( diff & 0x400 )
   {
-    if ( (a1 & 0x400) != 0 )
-    {
+    if ( stateBits & 0x400 )
       glEnableClientState(0x8074u);
-      result = a1;
-      glState_clientStateBits = a1;
-      return result;
-    }
-    glDisableClientState(0x8074u);
+    else
+      glDisableClientState(0x8074u);
   }
-  result = a1;
-  glState_clientStateBits = a1;
-  return result;
+  glState_clientStateBits = stateBits;
+  return stateBits;
 }
 
 /* ---- GL_DrawElements  0x004D5F60 ----  VERIFIED */
-void __cdecl GL_DrawElements(GLsizei a1, GLenum mode, GLenum type, GLvoid *indices)
+void __cdecl GL_DrawElements(GLsizei numIndexes, GLenum mode, GLenum type, GLvoid *indices)
 {
+  backEnd_pc_drawnIndexCount += numIndexes;
   ++backEnd_pc_drawCallCount;
-  backEnd_pc_drawnIndexCount += a1;
-  glDrawElements(mode, a1, type, indices);
+  glDrawElements(mode, numIndexes, type, indices);
 }
 
 /* ---- GL_DrawRangeElements  0x004D5FA0 ----  VERIFIED */
 void __cdecl GL_DrawRangeElements(
-        GLsizei a1,
-        const GLvoid *a2,
-        int a3,
-        GLenum a4,
-        GLenum a5,
-        int a6)
+        GLsizei numIndexes,
+        GLenum mode,
+        int end,
+        GLenum type,
+        const GLvoid *indices,
+        int start)
 {
-  if ( qglDrawRangeElementsEXT && a3 )
+  if ( qglDrawRangeElementsEXT && end )
   {
-    backEnd_pc_drawnIndexCount += a1;
+    backEnd_pc_drawnIndexCount += numIndexes;
     ++backEnd_pc_drawCallCount;
-    qglDrawRangeElementsEXT(a4, a6, a3, a1, a5, a2);
+    qglDrawRangeElementsEXT(mode, start, end, numIndexes, type, indices);
   }
   else
   {
-    backEnd_pc_drawnIndexCount += a1;
+    backEnd_pc_drawnIndexCount += numIndexes;
     ++backEnd_pc_drawCallCount;
-    glDrawElements(a4, a1, a5, a2);
+    glDrawElements(mode, numIndexes, type, indices);
   }
 }
 
 /* ---- GL_DrawElementArrayATI  0x004D6000 ----  VERIFIED */
-int __cdecl GL_DrawElementArrayATI(int a1, int a2)
+void __cdecl GL_DrawElementArrayATI(int numIndexes, int mode)
 {
-  backEnd_pc_drawnIndexCount += a1;
+  backEnd_pc_drawnIndexCount += numIndexes;
   ++backEnd_pc_drawCallCount;
-  glDrawElementArrayATI(a2, a1);
-  return 0;
+  glDrawElementArrayATI(mode, numIndexes);
 }
 
 /* ---- SetViewportAndScissor  0x004D6080 ----  VERIFIED */
@@ -984,11 +874,11 @@ void SetViewportAndScissor( void )
 }
 
 /* ---- RB_BeginDrawingView  0x004D60F0 ----  VERIFIED */
-int RB_BeginDrawingView( void )
+__declspec(noinline) static void RB_Hyperspace(void) { float grey=(float)(backEnd_refdef_time & 255) * (1.0f/255.0f); glClearColor(grey,grey,grey,1.0f);glClear(0x4000u);backEnd_isHyperspace=1;}
+void RB_BeginDrawingView( void )
 {
 	int   clearBits;      /* esi */
-	int   flags;          /* cl -- only the LOW BYTE of backEnd_refdef_rdflags */
-	int   haveWorld;      /* eax, loaded once at 0x004D615E */
+	unsigned char flags;          /* cl -- only the LOW BYTE of backEnd_refdef_rdflags */
 	float grey;
 	float one = 1.0f;
 
@@ -1006,11 +896,10 @@ int RB_BeginDrawingView( void )
 	glState_currentLightingEntity = 0;
 
 	flags     = backEnd_refdef_rdflags & 0xFF;
-	haveWorld = dword_16DCA54;
 	clearBits = 0;
 
 	if ( cg_shadows->integer == 2
-	  || ( r_measureOverdraw->integer && ( !haveWorld || ( flags & 8 ) ) ) )
+	  || ( r_measureOverdraw->integer && ( !rendererSkyboxPortal || ( flags & 8 ) ) ) )
 	{
 		clearBits = 0x400;
 	}
@@ -1018,49 +907,49 @@ int RB_BeginDrawingView( void )
 	if ( r_uifullscreen->integer )
 	{
 		clearBits = 0x100;
-		glClear( clearBits );
-		goto done;
+		goto clear;
 	}
 
 	clearBits |= 0x100;
 
-	if ( haveWorld )
+	if ( rendererSkyboxPortal )
 	{
 		if ( flags & 8 )
 		{
 			if ( !r_fastsky->integer && !( flags & 1 ) )
 			{
-				if ( dword_16C4BB0 && dword_16C4BB8 )
+				if ( tr_fogPortalView_registered && tr_fogPortalView_clearScreen )
 				{
-					glClearColor( red, green,
-					              blue, alpha);
+					glClearColor( tr_fogPortalView_colorR, tr_fogPortalView_colorG,
+					              tr_fogPortalView_colorB, tr_fogPortalView_colorA );
 					clearBits |= 0x4000;
 				}
 			}
 			else
 			{
 				clearBits |= 0x4000;
-				if ( dword_16C4BB0 )
+				if ( tr_fogPortalView_registered )
 				{
-					glClearColor( red, green,
-					              blue, alpha);
+					glClearColor( tr_fogPortalView_colorR, tr_fogPortalView_colorG,
+					              tr_fogPortalView_colorB, tr_fogPortalView_colorA );
 				}
-				else if ( glfogNum > 0 && dword_16C4C70 )
+				else if ( glfogNum > 0 && tr_fogCurrent_registered )
 				{
-					glClearColor( flt_16C4C50, flt_16C4C54,
-					              flt_16C4C58, flt_16C4C5C);
+					glClearColor( tr_fogCurrent_colorR, tr_fogCurrent_colorG,
+					              tr_fogCurrent_colorB, tr_fogCurrent_colorA);
 				}
 				else
 				{
-					goto greyClear;                     /* 0x004D6226 -> loc_4D625B */
+					grey = tr_identityLight * 0.5f;
+					glClearColor( grey, grey, grey, one );
 				}
 			}
 		}
-		else if ( glfogNum > 0 && dword_16C4C70 )
+		else if ( glfogNum > 0 && tr_fogCurrent_registered )
 		{
 			if ( flags & 0x20 )
 			{
-				if ( dword_16C4C40 == 0x2601 )
+				if ( tr_fogCurrent_mode == 0x2601 )
 					clearBits |= 0x4000;
 			}
 			else if ( !cg_skybox->integer )
@@ -1069,8 +958,8 @@ int RB_BeginDrawingView( void )
 			}
 			if ( clearBits & 0x4000 )
 			{
-				glClearColor( flt_16C4C50, flt_16C4C54,
-				              flt_16C4C58, flt_16C4C5C);
+				glClearColor( tr_fogCurrent_colorR, tr_fogCurrent_colorG,
+				              tr_fogCurrent_colorB, tr_fogCurrent_colorA);
 			}
 		}
 	}
@@ -1081,24 +970,23 @@ int RB_BeginDrawingView( void )
 	else if ( r_fastsky->integer )
 	{
 		clearBits |= 0x4000;
-		if ( !dword_16C4C70 )
-			goto greyClear;                             /* 0x004D6312 -> loc_4D625B */
-		glClearColor( flt_16C4C50, flt_16C4C54,
-		              flt_16C4C58, flt_16C4C5C);
+		if ( tr_fogCurrent_registered )
+		{
+			glClearColor( tr_fogCurrent_colorR, tr_fogCurrent_colorG,
+			              tr_fogCurrent_colorB, tr_fogCurrent_colorA);
+		}
+		else
+		{
+			grey = tr_identityLight * 0.5f;             /* VC7 cross-jumps this into the copy above */
+			glClearColor( grey, grey, grey, one );
+		}
 	}
-	else if ( dword_16C4C70 && dword_16C4C78 )
+	else if ( tr_fogCurrent_registered && tr_fogCurrent_clearScreen )
 	{
-		glClearColor( flt_16C4C50, flt_16C4C54,
-		              flt_16C4C58, flt_16C4C5C);
+		glClearColor( tr_fogCurrent_colorR, tr_fogCurrent_colorG,
+		              tr_fogCurrent_colorB, tr_fogCurrent_colorA);
 		clearBits |= 0x4000;
 	}
-
-	goto clear;
-
-greyClear:
-	grey = tr_identityLight * 0.5f;
-	glClearColor( grey, grey, grey,
-	              one);
 
 clear:
 	if ( clearBits )
@@ -1107,591 +995,408 @@ clear:
 done:
 	if ( backEnd_refdef_rdflags & 4 )
 	{
-		grey = (float)( (double)( backEnd_refdef_time & 0xFF ) * 0.003921568859368563 );
-		glClearColor( grey, grey, grey,
-		              one);
-		glClear( 0x4000u );
-		backEnd_isHyperspace = 1;
+		RB_Hyperspace();
 	}
 	else
 	{
 		backEnd_isHyperspace = 0;
 		backEnd_skyRenderedThisView = 0;
 	}
-	return 0;
+
 }
 
-#if 0
-void RB_BeginDrawingView()
-{
-  int v0;
-  GLbitfield v1;
-  GLclampf v3;
-  GLclampf v4;
-  GLclampf v5;
-  GLclampf v6;
-  GLclampf reda;
-  GLclampf red;
 
-  if ( r_finish->integer == 1 && !glState_finishCalled )
-  {
-    qglFinish();
-    glState_finishCalled = 1;
-  }
-  if ( !r_finish->integer )
-    glState_finishCalled = 1;
-  backEnd_projection2D = 0;
-  SetViewportAndScissor();
-  GL_State(256);
-  glState_currentLightingEntity = 0;
-  v0 = 0;
-  if ( cg_shadows->integer == 2 || r_measureOverdraw->integer && (!dword_16DCA54 || (backEnd_refdef_rdflags & 8) != 0) )
-    v0 = 1024;
-  if ( !r_uifullscreen->integer )
-  {
-    v1 = v0 | 0x100;
-    if ( dword_16DCA54 )
-    {
-      if ( (backEnd_refdef_rdflags & 8) != 0 )
-      {
-        if ( !r_fastsky->integer && (backEnd_refdef_rdflags & 1) == 0 )
-        {
-          if ( dword_16C4BB0 && dword_16C4BB8 )
-          {
-            v6 = alpha;
-            v5 = blue;
-            v4 = green;
-            v3 = ::red;
-LABEL_42:
-            glClearColor(v3, v4, v5, v6);
-            v1 |= 0x4000u;
-            goto LABEL_43;
-          }
-          goto LABEL_43;
-        }
-        v1 |= 0x4000u;
-        if ( dword_16C4BB0 )
-        {
-          glClearColor(::red, green, blue, alpha);
-          goto LABEL_43;
-        }
-        if ( glfogNum <= 0 || !dword_16C4C70 )
-          goto LABEL_24;
-      }
-      else
-      {
-        if ( glfogNum <= 0 )
-          goto LABEL_43;
-        if ( !dword_16C4C70 )
-          goto LABEL_43;
-        if ( (backEnd_refdef_rdflags & 0x20) != 0 ? dword_16C4C40 == 9729 : cg_skybox->integer == 0 )
-          v1 |= 0x4000u;
-        if ( (v1 & 0x4000) == 0 )
-          goto LABEL_43;
-      }
-    }
-    else
-    {
-      if ( (backEnd_refdef_rdflags & 1) != 0 )
-      {
-        v1 &= ~0x4000u;
-        goto LABEL_43;
-      }
-      if ( !r_fastsky->integer )
-      {
-        if ( dword_16C4C70 && dword_16C4C78 )
-        {
-          v6 = flt_16C4C5C;
-          v5 = flt_16C4C58;
-          v4 = flt_16C4C54;
-          v3 = flt_16C4C50;
-          goto LABEL_42;
-        }
-LABEL_43:
-        if ( !v1 )
-          goto LABEL_45;
-        goto LABEL_44;
-      }
-      v1 |= 0x4000u;
-      if ( !dword_16C4C70 )
-      {
-LABEL_24:
-        red = tr_identityLight * 0.5;
-        glClearColor(red, red, red, 1.0);
-        goto LABEL_43;
-      }
-    }
-    glClearColor(flt_16C4C50, flt_16C4C54, flt_16C4C58, flt_16C4C5C);
-    goto LABEL_43;
-  }
-  v1 = 256;
-LABEL_44:
-  glClear(v1);
-LABEL_45:
-  if ( (backEnd_refdef_rdflags & 4) != 0 )
-  {
-    reda = (double)(unsigned __int8)backEnd_refdef_time * 0.0039215689;
-    glClearColor(reda, reda, reda, 1.0);
-    glClear(0x4000u);
-    backEnd_isHyperspace = 1;
-  }
-  else
-  {
-    backEnd_isHyperspace = 0;
-    backEnd_skyRenderedThisView = 0;
-  }
-}
-#endif
-
-/* ---- RB_SetupLight  0x004D63A0 ----  VERIFIED */
-void __cdecl RB_SetupLight( float intensity, int lightIndex, int light )
+/* ---- RB_SetupLight  0x004D63A0 ----  VERIFIED
+ * GL enums: 0x1200 GL_AMBIENT, 0x1201 GL_DIFFUSE, 0x1202 GL_SPECULAR,
+ * 0x1203 GL_POSITION, 0x1204 GL_SPOT_DIRECTION, 0x1205 GL_SPOT_EXPONENT,
+ * 0x1206 GL_SPOT_CUTOFF, 0x1207/8/9 GL_{CONSTANT,LINEAR,QUADRATIC}_ATTENUATION,
+ * 0x4000 GL_LIGHT0.  Parameter order kept as decompiled (intensity, index, light). */
+void __cdecl RB_SetupLight( float intensity, int lightIndex, dlight_t *light )
 {
   GLenum lightName;
-  const GLfloat *diffusePtr;
-  float ambient[4];
-  float diffuse[4];
+  float  ambient[4];
+  float  diffuse[4];
 
   lightName = lightIndex + 0x4000;
 
-  if ( intensity == 1.0 )                           /* 0x004D63A7 */
+  if ( intensity != 1.0f )                          /* 0x004D63A7 */
   {
-    qglLightfv( lightName, 0x1200u, (const GLfloat *)( light + 0x14 ) );
-    diffusePtr = (const GLfloat *)( light + 0x24 );
+    ambient[0] = intensity * light->ambient[0];
+    ambient[1] = intensity * light->ambient[1];
+    ambient[2] = intensity * light->ambient[2];
+    ambient[3] = 1.0f;
+    diffuse[0] = intensity * light->diffuse[0];
+    diffuse[1] = intensity * light->diffuse[1];
+    diffuse[2] = intensity * light->diffuse[2];
+    diffuse[3] = 1.0f;
+    qglLightfv( lightName, 0x1200u, ambient );
+    qglLightfv( lightName, 0x1201u, diffuse );
   }
   else
   {
-    ambient[0] = intensity * *(float *)( light + 0x14 );
-    ambient[1] = intensity * *(float *)( light + 0x18 );
-    ambient[2] = intensity * *(float *)( light + 0x1C );
-    ambient[3] = 1.0f;
-    diffuse[0] = intensity * *(float *)( light + 0x24 );
-    diffuse[1] = intensity * *(float *)( light + 0x28 );
-    diffuse[2] = intensity * *(float *)( light + 0x2C );
-    diffuse[3] = 1.0f;
-    qglLightfv( lightName, 0x1200u, ambient );
-    diffusePtr = diffuse;
+    qglLightfv( lightName, 0x1200u, light->ambient );
+    qglLightfv( lightName, 0x1201u, light->diffuse );
   }
 
-  qglLightfv( lightName, 0x1201u, diffusePtr );
-  qglLightfv( lightName, 0x1202u, (const GLfloat *)( light + 0x34 ) );
-  qglLightfv( lightName, 0x1203u, (const GLfloat *)( light + 0x44 ) );
-  qglLightfv( lightName, 0x1204u, (const GLfloat *)( light + 0x54 ) );
+  qglLightfv( lightName, 0x1202u, light->specular );
+  qglLightfv( lightName, 0x1203u, light->position );
+  qglLightfv( lightName, 0x1204u, light->spotDirection );
 
-  qglLightf( lightName, 0x1205u, *(float *)( light + 0x6C ) );
-  qglLightf( lightName, 0x1206u, *(float *)( light + 0x70 ) );
-  qglLightf( lightName, 0x1207u, *(float *)( light + 0x60 ) );
-  qglLightf( lightName, 0x1208u, *(float *)( light + 0x64 ) );
-  qglLightf( lightName, 0x1209u, *(float *)( light + 0x68 ) );
+  qglLightf( lightName, 0x1205u, light->spotExponent );
+  qglLightf( lightName, 0x1206u, light->spotCutoff );
+  qglLightf( lightName, 0x1207u, light->constantAttenuation );
+  qglLightf( lightName, 0x1208u, light->linearAttenuation );
+  qglLightf( lightName, 0x1209u, light->quadraticAttenuation );
 
   if ( lightIndex >= glState_numEnabledLights )                /* 0x004D64C5 */
     glEnable( lightName );
 }
 
-/* ---- RB_EnableHWLights  0x004D64E0 ----  VERIFIED */
-int __cdecl RB_EnableHWLights(int a1, int a2, int a3)
+/* ---- RB_EnableHWLights  0x004D64E0 ----  VERIFIED
+ * Set up the fixed-function lights for backEnd.currentEntity: the light-model
+ * ambient (world base + sun-scaled contribution, optionally clamped up to
+ * r_entMinLight) plus the entity's own lights, insertion-sorted by light type
+ * then by light address.  Returns 1 if it loaded the world modelview matrix
+ * (so the caller reloads the entity matrix afterwards).
+ *
+ * The lights[] fields (0xCC count, 0xD0 array) and diffuseSunContribution
+ * (0x110) sit in trRefEntity_t's unproven interior, so they are reached by raw
+ * offset.
+ *
+ * ORIGINAL BUG (faithful): the light-model ambient is a 3-float R,G,B; its 4th
+ * (alpha) component is the aliased first sort slot and is passed to
+ * glLightModelfv uninitialized. */
+int __cdecl RB_EnableHWLights(void)
 {
-  int v4;
-  double v5;
-  double v6;
-  int v7;
-  int v8;
-  bool v9; // zf
-  float *v10;
-  int **v11;
-  int v12;
-  float *v13;
-  int *v14;
-  int i;
-  int v16;
-  int v17;
-  int v18;
-  char v19;
-  float v20;
-  float *v21;
-  int v22;
-  int v23;
-  float hwLightFrame[11];    /* [esp+18h]..[esp+40h]: R,G,B,A then lights */
-  float *const v26 = &hwLightFrame[2];
+  struct { float ambient[3];rbEntityLight_t *sortedLights[8]; } lightFrame; float *ambient=lightFrame.ambient;rbEntityLight_t **sortedLights=lightFrame.sortedLights;
+  rbEntityLight_t  *lights;
+  int               lightCount;
+  int               loadedMatrix;
+  int               i;
+  int               j;
+  rbEntityLight_t **tail;
+  float             luminance;
+  rfloat            minLight;          /* x87 stack values in retail, never rounded */
+  rfloat            scale;
 
-  if ( glState_currentLightingEntity == backEnd_currentEntity && glState_currentLightingFlags == (*(_DWORD *)(tess_shader + 84) & 0x18) )
+  if ( glState_currentLightingEntity == backEnd_currentEntity
+    && glState_currentLightingFlags == (((shader_t *)tess_shader)->lightingFlags & SHADER_LIGHTING_ENTITY_MASK) )
+  {
     return 0;
+  }
   glState_currentLightingEntity = backEnd_currentEntity;
-  glState_currentLightingFlags = *(_DWORD *)(tess_shader + 84) & 0x18;
-  v18 = a1;
-  v17 = a2;
-  v4 = 0;
-  v16 = a3;
-  hwLightFrame[0] = *(float *)(tr_world + 248) * *(float *)(backEnd_currentEntity + 272) + *(float *)(tr_world + 216);
-  hwLightFrame[1] = *(float *)(tr_world + 252) * *(float *)(backEnd_currentEntity + 272) + *(float *)(tr_world + 220);
-  v26[0] = *(float *)(tr_world + 256) * *(float *)(backEnd_currentEntity + 272) + *(float *)(tr_world + 224);
-  if ( (*(_BYTE *)(backEnd_currentEntity + 4) & 0x20) != 0 )
+  glState_currentLightingFlags  = ((shader_t *)tess_shader)->lightingFlags & SHADER_LIGHTING_ENTITY_MASK;
+
+  /* entityAmbientScale * entity->diffuseSunContribution + entityAmbientBase */
+  loadedMatrix = 0;
+  ambient[0] = (rfloat)*(float *)(tr_world + 248) * ((trRefEntity_t *)backEnd_currentEntity)->diffuseSun + *(float *)(tr_world + 216);
+  ambient[1] = (rfloat)*(float *)(tr_world + 252) * ((trRefEntity_t *)backEnd_currentEntity)->diffuseSun + *(float *)(tr_world + 220);
+  ambient[2] = (rfloat)*(float *)(tr_world + 256) * ((trRefEntity_t *)backEnd_currentEntity)->diffuseSun + *(float *)(tr_world + 224);
+
+  if ( (((refEntity_t *)backEnd_currentEntity)->renderfx & RF_FORCE_MIN_LIGHT) != 0 )
   {
-    v20 = v26[0] * 0.114 + hwLightFrame[1] * 0.58700001 + hwLightFrame[0] * 0.29899999;
-    v5 = tr_identityLight * r_entMinLight->value;
-    if ( (v20 == 0.0) | __UNORDERED__(v20, 0.0) )
+    luminance = (rfloat)ambient[2] * 0.114f + (rfloat)ambient[1] * 0.58700001f + (rfloat)ambient[0] * 0.29899999f;
+    minLight  = (rfloat)tr_identityLight * r_entMinLight->value;
+
+    if ( luminance == 0.0f )
     {
-      hwLightFrame[0] = v5;
-      hwLightFrame[1] = v5;
-      v26[0] = v5;
+      ambient[0] = minLight;
+      ambient[1] = minLight;
+      ambient[2] = minLight;
     }
-    else if ( (v20 < v5) | __UNORDERED__(v20, v5) )
+    else if ( luminance < minLight )
     {
-      v6 = v5 / v20;
-      hwLightFrame[0] = hwLightFrame[0] * v6;
-      hwLightFrame[1] = hwLightFrame[1] * v6;
-      v26[0] = v6 * v26[0];
+      scale = minLight / luminance;
+      ambient[0] = ambient[0] * scale;
+      ambient[1] = ambient[1] * scale;
+      ambient[2] = ambient[2] * scale;
     }
   }
-  glLightModelfv(0xB53u, hwLightFrame);
-  v7 = *(_DWORD *)(backEnd_currentEntity + 204);
-  v8 = 0;
-  v9 = v7 == 0;
-  v23 = v7;
-  if ( v7 > 0 )
+
+  glLightModelfv(0xB53u, ambient);   /* GL_LIGHT_MODEL_AMBIENT */
+
+  lightCount = ((trRefEntity_t *)backEnd_currentEntity)->lightCount;   /* entity->lightCount */
+  lights     = (rbEntityLight_t *)(backEnd_currentEntity + 208);  /* entity->lights */
+
+  /* insertion sort: keep lights ordered by type, then by light address */
+  tail = sortedLights - 1;
+  for ( i = 0; i < lightCount; ++i, ++tail )
   {
-    v10 = v26;
-    v21 = v26;
-    v11 = (int **)(backEnd_currentEntity + 208);
-    do
+    rbEntityLight_t  *entry = &lights[i];
+    rbEntityLight_t **walk;
+    rbEntityLight_t  *prev;
+    int               type;
+
+    j = i;
+    if ( j > 0 )
     {
-      v12 = v8;
-      if ( v8 > 0 )
+      type = entry->light->type;
+      walk = tail;
+      do
       {
-        v22 = **v11;
-        v13 = v10;
-        do
-        {
-          v14 = **(int ***)v13;
-          if ( v22 > *v14 )
-            break;
-          if ( *v11 > v14 )
-            break;
-          v13[1] = *v13;
-          --v12;
-          --v13;
-        }
-        while ( v12 > 0 );
+        prev = *walk;
+        if ( type > prev->light->type )
+          break;
+        if ( (unsigned int)entry->light > (unsigned int)prev->light )
+          break;
+        walk[1] = prev;
+        --j;
+        --walk;
       }
-      LODWORD(v26[v12 + 1]) = v11;
-      ++v8;
-      v10 = v21 + 1;
-      v11 += 2;
-      ++v21;
+      while ( j > 0 );
     }
-    while ( v8 < v23 );
-    v4 = 0;
-    v9 = v23 == 0;
+    sortedLights[j] = entry;
   }
-  if ( !v9 )
+  if ( lightCount != 0 )
   {
     glLoadMatrixf(tr_viewParms_world_modelMatrix);
-    v4 = 1;
+    loadedMatrix = 1;
   }
-  for ( i = 0; i < *(_DWORD *)(backEnd_currentEntity + 204); ++i )
-    RB_SetupLight(*(float *)(LODWORD(v26[i + 1]) + 4),
-                  i,
-                  *(int *)LODWORD(v26[i + 1]));
+
+  for ( i = 0; i < ((trRefEntity_t *)backEnd_currentEntity)->lightCount; ++i )
+    RB_SetupLight(sortedLights[i]->scale, i, sortedLights[i]->light);
   for ( ; i < glState_numEnabledLights; ++i )
     glDisable(i + 0x4000);
-  glState_numEnabledLights = *(_DWORD *)(backEnd_currentEntity + 204);
-  return v4;
+  glState_numEnabledLights = ((trRefEntity_t *)backEnd_currentEntity)->lightCount;
+  return loadedMatrix;
 }
 
 /* ---- RB_RenderDrawSurfList  0x004D6710 ----  [HIGH] */
-void __cdecl RB_RenderDrawSurfList(int a1, int a2)
+void __cdecl RB_RenderDrawSurfList(int surfCount, int surfList)
 {
-  int v3;
-  int *v4;
-  unsigned int v5;
-  void *v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  int v11;
-  double v12;
-  float *v13;
-  int *v14;
-  double v15;
-  int v16;
-  GLenum v17;
-  GLenum v18;
-  int v19;
-  bool v20; // zf
-  int v21;
-  GLclampd v22;
-  int v23;
-  int v24;
-  float v25;
-  int v26;
-  int *v27;
-  int v28;
-  int v29;
-  int v30;
-  float *v31;
-  int v32;
-  int v33;
-  int v34;
-  int v35;
+  const int   numDrawSurfs = surfCount;
+  drawSurf_t *drawSurfs    = (drawSurf_t *)surfList;
+  trRefEntity_t *currentEntity;
+  float       originalTime;
+  unsigned    oldSort;
+  int         oldShader;                 /* shader_t* as int (0 => none) */
+  int         oldEntityNum;
+  int         oldStorageMode;
+  int         oldBatchFlag0;
+  int         oldBatchFlag2;
+  int         oldDepthRange;
+  int         depthRange;                /* depth-range flags of the current entity */
+  int         shaderFlagChanges;
+  int         i;
+  drawSurf_t *drawSurf;
+  int         entityNum;
+  int         shader;
+  int         storageMode;
+  int         batchFlag0;
+  int         batchFlag2;
+  rfloat      entityTime;                /* x87 st(0): fst rounds only the floatTime copy */
 
-  v25 = backEnd_refdef_floatTime;
+  originalTime = backEnd_refdef_floatTime;
   RB_BeginDrawingView();
-  v3 = -1;
-  v30 = 0;
-  v26 = -1;
+
+  oldStorageMode        = 0;
+  oldEntityNum          = -1;
   backEnd_currentEntity = (int)&tr_worldEntity;
-  v24 = 0;
-  v31 = 0;
-  v28 = 0;
-  v23 = 0;
-  LOBYTE(v32) = 0;
-  v29 = -1;
-  backEnd_pc_surfaceCount += a1;
-  if ( a1 > 0 )
+  oldShader             = 0;
+  oldDepthRange         = 0;
+  oldBatchFlag0         = 0;
+  oldSort               = (unsigned)-1;
+  depthRange            = 0;
+  shaderFlagChanges     = 0;
+  oldBatchFlag2         = -1;
+  backEnd_pc_surfaceCount += numDrawSurfs;
+
+  for ( i = 0, drawSurf = drawSurfs; i < numDrawSurfs; i++, drawSurf++ )
   {
-    v4 = (int *)(a2 + 4);
-    v27 = (int *)(a2 + 4);
-    v33 = a1;
-    while ( 1 )
+    /* fast path: identical sort key to the previous surface */
+    if ( drawSurf->sort == oldSort )
     {
-      v5 = *(v4 - 1);
-      if ( v5 != v3 )
-        break;
-      rb_surfaceTable[*(_DWORD *)*v4]((void *)*v4);
-LABEL_78:
-      v4 += 2;
-      v20 = v33 == 1;
-      v27 = v4;
-      --v33;
-      if ( v20 )
-      {
-        if ( v24 )
-          RB_EndSurface();
-        goto LABEL_81;
-      }
+      rb_surfaceTable[*(unsigned int *)drawSurf->surface](drawSurf->surface);
+      continue;
     }
-    v7 = (v5 >> 8) & 0x3FF;
-    v8 = dword_16CF84C[(v5 >> 18) & 0xFFF];
-    v9 = v5 >> 30;
-    v10 = *(v4 - 1) & 1;
-    v11 = (v5 >> 2) & 1;
-    v34 = v5;
-    v35 = v7;
-    if ( (v5 & 2) != 0 )
+    oldSort = drawSurf->sort;
+
+    /* decompose the sort key */
+    entityNum   = (oldSort >> 8) & 0x3FF;
+    shader      = tr_sortedShaderSlots[(oldSort >> 18) & 0xFFF];   /* tr.sortedShaders[] */
+    storageMode = oldSort >> 30;
+    batchFlag0  = oldSort & 1;
+    batchFlag2  = (oldSort >> 2) & 1;
+    if ( oldSort & 2 )                                   /* world-entity flag */
+      entityNum = 1022;
+
+    /* start a new tess batch when the batch key changed, or when the
+     * entity changed and the shader is not entity-mergable */
+    if ( shader != oldShader || storageMode != oldStorageMode
+      || batchFlag0 != oldBatchFlag0 || batchFlag2 != oldBatchFlag2
+      || ( entityNum != oldEntityNum
+        && (((shader_t *)shader)->flags & SHADER_FLAG_ENTITY_MERGABLE) == 0 ) )
     {
-      v35 = 1022;
-      v7 = 1022;
-    }
-    if ( v8 != v24 || v9 != v30 || v10 != v28 || v11 != v29 )
-      goto LABEL_13;
-    if ( v7 == v26 )
-      goto LABEL_57;
-    if ( (*(_BYTE *)(v8 + 76) & 4) == 0 )
-    {
-LABEL_13:
-      if ( v24 )
+      if ( oldShader )
       {
         RB_EndSurface();
-        v7 = v35;
-        v32 = *(_DWORD *)(v24 + 76) ^ *(_DWORD *)(v8 + 76);
+        shaderFlagChanges = ((shader_t *)oldShader)->flags ^ ((shader_t *)shader)->flags;
       }
-      if ( v7 == 1022 )
-        backEnd_currentEntity = (int)&tr_worldEntity;
+
+      if ( entityNum != 1022 )
+        {currentEntity=(trRefEntity_t *)(backEnd_refdef_entities+696*entityNum);backEnd_currentEntity=(int)currentEntity;}
       else
-        backEnd_currentEntity = backEnd_refdef_entities + 696 * v7;
-      if ( v9 != glState_currentStorageMode )
+        backEnd_currentEntity = (int)&tr_worldEntity;
+
+      if ( storageMode != glState_currentStorageMode )
       {
         if ( glConfig_NVVertexArrayRange )
-        {
-          RB_SelectStorageNV(v9);
-        }
+          RB_SelectStorageNV(storageMode);
         else if ( glConfig_ATIVertexArrayObject )
-        {
-          RB_SelectStorageATI(v9);
-        }
-        glState_currentStorageMode = v9;
+          RB_SelectStorageATI(storageMode);
+        glState_currentStorageMode = storageMode;
       }
-      RB_BeginSurface((void *)v8, 3);   /* 0x004D6886: push 3 / mov ecx,ebp */
-      v7 = v35;
-      v24 = v8;
-      v28 = v10;
-      v29 = v11;
-      v30 = v9;
+      RB_BeginSurface((void *)shader, 3);   /* 0x004D6886: push 3 / mov ecx,ebp */
+      oldShader      = shader;
+      oldBatchFlag0  = batchFlag0;
+      oldBatchFlag2  = batchFlag2;
+      oldStorageMode = storageMode;
     }
-    if ( v7 != v26 )
+
+    if ( entityNum != oldEntityNum )
     {
-      v12 = v25;
-      v13 = 0;
-      v23 = 0;
-      if ( v7 == 1022 )
+      /* ---- entity changed: rebuild the modelview / lighting ---- */
+      depthRange = 0;
+      if ( entityNum != 1022 )
       {
-        backEnd_refdef_floatTime = v25;
-        backEnd_currentEntity = (int)&tr_worldEntity;
-        qmemcpy(&backEnd_or, &backEnd_viewParms_world, 0x7Cu);
-        tess_shaderTime = v12 - *(float *)(tess_shader + 380);
-        R_TransformDlights(backEnd_refdef_num_dlights, (float *)backEnd_refdef_dlights, &backEnd_or);
-        if ( glState_normalizeTarget )
+        {currentEntity=(trRefEntity_t *)(backEnd_refdef_entities+696*entityNum);backEnd_currentEntity=(int)currentEntity;}
+        entityTime = (rfloat)originalTime - *(float *)((char *)currentEntity+0x78);   /* e.shaderTime */
+        backEnd_refdef_floatTime = entityTime;
+        tess_shaderTime = entityTime - ((shader_t *)tess_shader)->timeOffset;   /* shader->timeOffset */
+
+        if ( (((shader_t *)tess_shader)->flags & SHADER_FLAG_ENTITY_MERGABLE) != 0 )
+          backEnd_or = *(tr_orientationr_t *)backEnd_viewParms_world;
+        else if ( currentEntity->e.reType != 1
+               && currentEntity->e.reType != 2
+               && currentEntity->e.reType != 0 )
+          backEnd_or = *(tr_orientationr_t *)backEnd_viewParms_world;
+        else
+          R_RotateForModelEntity((int)currentEntity, backEnd_viewParms_originX, &backEnd_or);
+
+        /* after the call retail re-reads backEnd.currentEntity (Q3 form), keeping 0 in ebp */
+        if ( ((trRefEntity_t *)backEnd_currentEntity)->dlightBits )
+          R_TransformDlights(backEnd_refdef_entityDlightCount, (float *)backEnd_refdef_dlights, &backEnd_or);
+
+        depthRange = ((trRefEntity_t *)backEnd_currentEntity)->e.renderfx & RF_DEPTH_RANGE_FLAGS;
+        if ( (((shader_t *)tess_shader)->lightingFlags & SHADER_LIGHTING_ENTITY_MASK) != 0 )
         {
-          glDisable(glState_normalizeTarget);
-          glState_normalizeTarget = 0;
-        }
-      }
-      else
-      {
-        v14 = (int *)(backEnd_refdef_entities + 696 * v7);
-        backEnd_currentEntity = (int)v14;
-        v15 = v12 - *((float *)v14 + 30);
-        backEnd_refdef_floatTime = v15;
-        tess_shaderTime = v15 - *(float *)(tess_shader + 380);
-        if ( (*(_BYTE *)(tess_shader + 76) & 4) != 0 || (v16 = *v14, *v14 != 1) && v16 != 2 && v16 )
-        {
-          qmemcpy(&backEnd_or, &backEnd_viewParms_world, 0x7Cu);
-          v14 = &backEnd_pc_surfaceCount;
+          RB_EnableHWLights();
+          GL_Normalize(((trRefEntity_t *)backEnd_currentEntity)->normalizationTarget);
         }
         else
         {
-          v13 = backEnd_viewParms_originX;
-          R_RotateForModelEntity(&backEnd_or, backEnd_viewParms_originX, (int)v14);
+          GL_Normalize(0);
         }
-        if ( *(_DWORD *)(backEnd_currentEntity + 156) )
-          R_TransformDlights(backEnd_refdef_entityDlightCount, (float *)backEnd_refdef_dlights, &backEnd_or);
-        v23 = *(_DWORD *)(backEnd_currentEntity + 4) & 0x18;
-        if ( (*(_BYTE *)(tess_shader + 84) & 0x18) != 0 )
-        {
-          RB_EnableHWLights((int)v13, 0, (int)v14);
-          v17 = *(_DWORD *)(backEnd_currentEntity + 684);
-          if ( v17 != glState_normalizeTarget )
-          {
-            if ( glState_normalizeTarget )
-              glDisable(glState_normalizeTarget);
-            glState_normalizeTarget = v17;
-            if ( v17 )
-              glEnable(v17);
-          }
-        }
-        else if ( glState_normalizeTarget )
-        {
-          glDisable(glState_normalizeTarget);
-          glState_normalizeTarget = 0;
-        }
-        v13 = (float *)v23;
       }
-      glLoadMatrixf(flt_16D8DE4);
-      if ( v31 != v13 )
+      else
       {
-        switch ( (unsigned int)v13 )
+        backEnd_refdef_floatTime = originalTime;
+        backEnd_currentEntity    = (int)&tr_worldEntity;
+        backEnd_or = *(tr_orientationr_t *)backEnd_viewParms_world;
+        tess_shaderTime = originalTime - ((shader_t *)tess_shader)->timeOffset;   /* shader->timeOffset */
+        R_TransformDlights(backEnd_refdef_num_dlights, (float *)backEnd_refdef_dlights, &backEnd_or);
+        GL_Normalize(0);
+      }
+
+      glLoadMatrixf(backEnd_or.modelMatrix);
+
+      if ( oldDepthRange != depthRange )
+      {
+        switch ( depthRange )
         {
-          case 0u:
-            HIDWORD(v22) = 1072693248;
-            goto LABEL_51;
-          case 8u:
+          case 0:
+            glDepthRange(0.0, 1.0);
+            break;
+          case 8:                                          /* RF_DEPTHHACK */
             glMatrixMode(0x1701u);
             glLoadMatrixf(backEnd_viewParms_depthHackProjectionMatrix);
             glMatrixMode(0x1700u);
-            glDepthRange(0.0, 0.2000000029802322);
+            glDepthRange(0.0, 0.20000000298023224);
             break;
-          case 0x10u:
-          case 0x18u:
-            HIDWORD(v22) = 1071644672;
-LABEL_51:
-            LODWORD(v22) = 0;
-            glDepthRange(0.0, v22);
-            break;
-          default:
+          case 0x10:                                       /* RF_CROSSHAIR */
+          case 0x18:
+            glDepthRange(0.0, 0.5);
             break;
         }
-        if ( v31 == (float *)8 )
+        if ( oldDepthRange == 8 )                          /* leaving the depth hack: restore projection */
         {
           glMatrixMode(0x1701u);
           glLoadMatrixf(backEnd_viewParms_projectionMatrix);
           glMatrixMode(0x1700u);
         }
-        v31 = v13;
+        oldDepthRange = depthRange;
       }
-      v26 = v35;
-LABEL_77:
-      /* 0x004D6BA6 -- the same dispatch on the second path. */
-      rb_surfaceTable[*(_DWORD *)*v27]((void *)*v27);
-      v3 = v34;
-      v4 = v27;
-      goto LABEL_78;
-    }
-LABEL_57:
-    if ( (*(_BYTE *)(tess_shader + 84) & 0x18) != 0 )
-    {
-      if ( RB_EnableHWLights(v10, v8, v11) )
-        glLoadMatrixf(flt_16D8DE4);
-      v18 = *(_DWORD *)(backEnd_currentEntity + 684);
-      if ( v18 != glState_normalizeTarget )
-      {
-        if ( glState_normalizeTarget )
-          glDisable(glState_normalizeTarget);
-        glState_normalizeTarget = v18;
-        if ( v18 )
-          glEnable(v18);
-      }
+
+      oldEntityNum = entityNum;
     }
     else
     {
-      if ( !glState_normalizeTarget )
-        goto LABEL_68;
-      glDisable(glState_normalizeTarget);
-      glState_normalizeTarget = 0;
-    }
-    v7 = v35;
-LABEL_68:
-    if ( v7 != 1022 && (v32 & 4) != 0 )
-    {
-      if ( (*(_BYTE *)(tess_shader + 76) & 4) != 0
-        || (v19 = *(_DWORD *)backEnd_currentEntity, *(_DWORD *)backEnd_currentEntity != 1) && v19 != 2 && v19 )
+      /* ---- entity unchanged: refresh lighting only ---- */
+      if ( (((shader_t *)tess_shader)->lightingFlags & SHADER_LIGHTING_ENTITY_MASK) != 0 )
       {
-        qmemcpy(&backEnd_or, &backEnd_viewParms_world, 0x7Cu);
+        if ( RB_EnableHWLights() )
+          glLoadMatrixf(backEnd_or.modelMatrix);
+        GL_Normalize(((trRefEntity_t *)backEnd_currentEntity)->normalizationTarget);
       }
       else
       {
-        R_RotateForModelEntity(&backEnd_or, backEnd_viewParms_originX, backEnd_currentEntity);
+        GL_Normalize(0);
       }
-      glLoadMatrixf(flt_16D8DE4);
+
+      if ( entityNum != 1022 && (shaderFlagChanges & SHADER_FLAG_ENTITY_MERGABLE) != 0 )
+      {
+        if ( (((shader_t *)tess_shader)->flags & SHADER_FLAG_ENTITY_MERGABLE) != 0 )
+          backEnd_or = *(tr_orientationr_t *)backEnd_viewParms_world;
+        else if ( ((trRefEntity_t *)backEnd_currentEntity)->e.reType != 1
+               && ((trRefEntity_t *)backEnd_currentEntity)->e.reType != 2
+               && ((trRefEntity_t *)backEnd_currentEntity)->e.reType != 0 )
+          backEnd_or = *(tr_orientationr_t *)backEnd_viewParms_world;
+        else
+          R_RotateForModelEntity(backEnd_currentEntity, backEnd_viewParms_originX, &backEnd_or);
+        glLoadMatrixf(backEnd_or.modelMatrix);
+      }
     }
-    goto LABEL_77;
+
+    rb_surfaceTable[*(unsigned int *)drawSurf->surface](drawSurf->surface);
   }
-LABEL_81:
-  v21 = storageClass;
-  if ( storageClass != glState_currentStorageMode )
+
+  if ( oldShader )
+    RB_EndSurface();
+
+  /* restore the default storage class and the world modelview (the class read
+     once into a local, as RB_DrawStretchPic does: retail holds it in edi) */
   {
-    if ( glConfig_NVVertexArrayRange )
+    int storage = storageClass;
+    if ( storageClass != glState_currentStorageMode )
     {
-      RB_SelectStorageNV(storageClass);
+      if ( glConfig_NVVertexArrayRange )
+        RB_SelectStorageNV(storageClass);
+      else if ( glConfig_ATIVertexArrayObject )
+        RB_SelectStorageATI(storageClass);
+      glState_currentStorageMode = storage;
     }
-    else if ( glConfig_ATIVertexArrayObject )
-    {
-      RB_SelectStorageATI(storageClass);
-    }
-    glState_currentStorageMode = v21;
   }
-  backEnd_refdef_floatTime = v25;
-  backEnd_currentEntity = (int)&tr_worldEntity;
-  qmemcpy(&backEnd_or, &backEnd_viewParms_world, 0x7Cu);
+  backEnd_refdef_floatTime = originalTime;
+  backEnd_currentEntity    = (int)&tr_worldEntity;
+  backEnd_or = *(tr_orientationr_t *)backEnd_viewParms_world;
   R_TransformDlights(backEnd_refdef_num_dlights, (float *)backEnd_refdef_dlights, &backEnd_or);
   glLoadMatrixf(backEnd_viewParms_worldModelMatrix);
-  if ( v23 )
+  if ( depthRange )
     glDepthRange(0.0, 1.0);
   RB_ShadowFinish();
   RB_RenderFlares();
 }
 
 /* ---- RB_SetGL2D  0x004D6CB0 ----  VERIFIED */
-int RB_SetGL2D( void )
+void RB_SetGL2D( void )
 {
-	int msec;
-
 	backEnd_projection2D = 1;
 	RB_EndMultitexture();
-	glViewport( 0, 0, dwStyle, dwExStyle );
-	glScissor( 0, 0, dwStyle, dwExStyle );
+	glViewport( 0, 0, glConfig_vidWidth, glConfig_vidHeight );
+	glScissor( 0, 0, glConfig_vidWidth, glConfig_vidHeight );
 	glMatrixMode( 0x1701u );
 	qglLoadIdentity();
-	qglOrtho( 0.0, (double)dwStyle, (double)dwExStyle,
+	qglOrtho( 0.0, (double)glConfig_vidWidth, (double)glConfig_vidHeight,
 	               0.0, 0.0, 1.0 );
 	glMatrixMode( 0x1700u );
 	qglLoadIdentity();
@@ -1709,724 +1414,615 @@ int RB_SetGL2D( void )
 	}
 	glDisable( 0x3000u );
 
-	msec = ri_Milliseconds();
-	backEnd_refdef_time = msec;
-	backEnd_refdef_floatTime = (float)( (double)msec * 0.001f );
-	return msec;
+	backEnd_refdef_time = ri.Milliseconds();
+	backEnd_refdef_floatTime = (rfloat)backEnd_refdef_time * 0.001f;
 }
 
-#if 0
-int RB_SetGL2D()
-{
-  int result;
 
-  backEnd_projection2D = 1;
-  RB_EndMultitexture();
-  glViewport(0, 0, dwStyle, dwExStyle);
-  glScissor(0, 0, dwStyle, dwExStyle);
-  glMatrixMode(0x1701u);
-  qglLoadIdentity();
-  qglOrtho(
-    0,
-    0,
-    COERCE_UNSIGNED_INT64((double)(int)dwStyle),
-    HIDWORD(COERCE_UNSIGNED_INT64((double)(int)dwStyle)),
-    COERCE_UNSIGNED_INT64((double)(int)dwExStyle),
-    HIDWORD(COERCE_UNSIGNED_INT64((double)(int)dwExStyle)),
-    0,
-    0,
-    0,
-    0,
-    0,
-    1072693248);
-  glMatrixMode(0x1700u);
-  qglLoadIdentity();
-  GL_State(65637);
-  if ( (glState_glStateBits & 0x200000) != 0 )
-  {
-    glDisable(0xB60u);
-    glState_glStateBits &= ~0x200000u;
-  }
-  if ( glState_faceCulling != 2 )
-  {
-    glDisable(0xB44u);
-    glState_faceCulling = 2;
-  }
-  glDisable(0x3000u);
-  result = ri_Milliseconds();
-  backEnd_refdef_time = result;
-  backEnd_refdef_floatTime = (double)result * 0.001;
-  return result;
-}
-#endif
-
-/* ---- RE_StretchRaw  0x004D6DB0 ----  VERIFIED */
+/* ---- RE_StretchRaw  0x004D6DB0 ----  VERIFIED
+ * Retail's Hex-Rays signature carries a leading `const char *@<ebx>`: that is
+ * only the caller's EBX leaking through (RB_ExecuteRenderCommands takes only
+ * cmds, in eax), NOT a stack argument -- the nine stack args below are what
+ * CIN_DrawCinematic pushes through re.DrawStretchRaw. */
 void __cdecl RE_StretchRaw(
-        const char *a1,
-        int a2,
-        int a3,
-        int a4,
-        int a5,
+        int destX,
+        int destY,
+        int destW,
+        int destH,
         GLsizei width,
         GLsizei height,
         GLvoid *pixels,
-        int a9,
-        int a10)
+        int scratchIndex,
+        int dirty)
 {
-  cvar_t *v10;
-  _DWORD *v11;
-  char v12;
-  char v13;
-  unsigned __int16 *v14;
-  int v15;
-  char v16;
-  double v17;
-  GLsizei v18;
-  double v19;
-  char *v20;
-  int v21;
-  double v22;
-  char *v23;
-  double v24;
-  char *v25;
-  char *v26;
-  int v27;
-  int v28;
-  int v29;
-  float v30;
-  int v31;
+  int      powW, powH;
+  int      startMsec;
+  int      fogEnabled;
+  image_t *image;
+  byte     colorByte;
+  rbImmediateVertex_t *vtx;
 
-  if ( tr_registered )
+  if ( !tr_registered[0] )
+    return;
+
+  R_SyncRenderThread();
+
+  /* the cinematics path syncs every frame */
+  qglFinish();
+  startMsec = 0;
+  if ( r_speeds->integer )
+    startMsec = ri.Milliseconds();
+
+  /* require power-of-two dimensions */
+  powW = 0;
+  if ( width > 1 )
   {
-    v10 = r_skipBackEnd;
-    v11 = (_DWORD *)(backEndData + 1636096);
-    *(_DWORD *)((char *)v11 + *(_DWORD *)(backEndData + 1898240)) = 0;
-    v11[0x10000] = 0;
-    if ( !v10->integer )
-      RB_ExecuteRenderCommands(v11, a1);
-    qglFinish();
-    v29 = 0;
-    if ( r_speeds->integer )
-      v29 = ri_Milliseconds();
-    v12 = 0;
-    if ( width > 1 )
-    {
-      do
-        ++v12;
-      while ( 1 << v12 < width );
-    }
-    v13 = 0;
-    if ( height > 1 )
-    {
-      do
-        ++v13;
-      while ( 1 << v13 < height );
-    }
-    if ( 1 << v12 != width || 1 << v13 != height )
-      ri_Error(1, "\x15" "Draw_StretchRaw: size not a power of 2: %i by %i",
-               width, height);
-    GL_Bind((GLenum *)tr_scratchImages[a9]);
-    v14 = (unsigned __int16 *)tr_scratchImages[a9];
-    if ( width == v14[32] && height == v14[33] )
-    {
-      if ( a10 )
-        glTexSubImage2D(0xDE1u, 0, 0, 0, width, height, 0x1908u, 0x1401u, pixels);
-    }
-    else
-    {
-      v14[34] = width;
-      *(_WORD *)(tr_scratchImages[a9] + 64) = width;
-      *(_WORD *)(tr_scratchImages[a9] + 70) = height;
-      *(_WORD *)(tr_scratchImages[a9] + 66) = height;
-      glTexImage2D(0xDE1u, 0, 3, width, height, 0, 0x1908u, 0x1401u, pixels);
-      glTexParameteri(0xDE1u, 0x2801u, 9729);
-      glTexParameteri(0xDE1u, 0x2800u, 9729);
-      glTexParameteri(0xDE1u, 0x2802u, 33071);
-      glTexParameteri(0xDE1u, 0x2803u, 33071);
-    }
-    if ( r_speeds->integer )
-    {
-      v15 = ri_Milliseconds();
-      ri_Printf(0, "qglTexSubImage2D %i, %i: %i msec\n", width, height, v15 - v29);
-    }
-    RB_SetGL2D();
-    RB_BeginImmediateMode();
-    v16 = (unsigned __int64)(tr_identityLight * 255.0);
-    v30 = (float)width;
-    rbDebug_immediateColorG = v16;
-    rbDebug_immediateColorB = v16;
-    v17 = 0.5 / v30;
-    v18 = rbDebug_immediateVertexCount;
-    rbDebug_immediateColorR = v16;
-    rbDebug_immediateColorA = -1;
-    mode = 7;
-    *(float *)&rbDebug_immediateTexCoordS = v17;
-    v19 = (double)height;
-    *(float *)&rbDebug_immediateTexCoordT = 0.5 / v19;
-    if ( rbDebug_immediateVertexCount < rbDebug_immediateVertexCapacity )
-    {
-      v20 = (char *)rbDebug_immediateVertices + 32 * rbDebug_immediateVertexCount;
-      v20[28] = v16;
-      v20[29] = rbDebug_immediateColorG;
-      v20[30] = rbDebug_immediateColorB;
-      v20[31] = rbDebug_immediateColorA;
-      *((_DWORD *)v20 + 3) = rbDebug_immediateTexCoordS;
-      v21 = rbDebug_immediateTexCoordT;
-      *(float *)v20 = (float)a2;
-      *((_DWORD *)v20 + 4) = v21;
-      *((_DWORD *)v20 + 2) = 0;
-      *((float *)v20 + 1) = (float)a3;
-      v16 = rbDebug_immediateColorR;
-      v18 = ++rbDebug_immediateVertexCount;
-    }
-    *(float *)&v31 = 0.5 / v19;
-    rbDebug_immediateTexCoordT = v31;
-    v22 = (v30 - 0.5) / v30;
-    *(float *)&rbDebug_immediateTexCoordS = v22;
-    if ( v18 < rbDebug_immediateVertexCapacity )
-    {
-      v23 = (char *)rbDebug_immediateVertices + 32 * v18;
-      v23[28] = v16;
-      v23[29] = rbDebug_immediateColorG;
-      v23[30] = rbDebug_immediateColorB;
-      v23[31] = rbDebug_immediateColorA;
-      *((_DWORD *)v23 + 3) = rbDebug_immediateTexCoordS;
-      *((_DWORD *)v23 + 4) = rbDebug_immediateTexCoordT;
-      *((_DWORD *)v23 + 2) = 0;
-      *(float *)v23 = (float)(a4 + a2);
-      *((float *)v23 + 1) = (float)a3;
-      v16 = rbDebug_immediateColorR;
-      v18 = ++rbDebug_immediateVertexCount;
-    }
-    *(float *)&rbDebug_immediateTexCoordS = v22;
-    v24 = (v19 - 0.5) / v19;
-    *(float *)&rbDebug_immediateTexCoordT = v24;
-    if ( v18 < rbDebug_immediateVertexCapacity )
-    {
-      v25 = (char *)rbDebug_immediateVertices + 32 * v18;
-      v25[28] = v16;
-      v25[29] = rbDebug_immediateColorG;
-      v25[30] = rbDebug_immediateColorB;
-      v25[31] = rbDebug_immediateColorA;
-      *((_DWORD *)v25 + 3) = rbDebug_immediateTexCoordS;
-      *((_DWORD *)v25 + 4) = rbDebug_immediateTexCoordT;
-      *(float *)v25 = (float)(a4 + a2);
-      *((_DWORD *)v25 + 2) = 0;
-      *((float *)v25 + 1) = (float)(a3 + a5);
-      v16 = rbDebug_immediateColorR;
-      v18 = ++rbDebug_immediateVertexCount;
-    }
-    *(float *)&rbDebug_immediateTexCoordS = v17;
-    *(float *)&rbDebug_immediateTexCoordT = v24;
-    if ( v18 < rbDebug_immediateVertexCapacity )
-    {
-      v26 = (char *)rbDebug_immediateVertices + 32 * v18;
-      v26[28] = v16;
-      v26[29] = rbDebug_immediateColorG;
-      v26[30] = rbDebug_immediateColorB;
-      v26[31] = rbDebug_immediateColorA;
-      *((_DWORD *)v26 + 3) = rbDebug_immediateTexCoordS;
-      v27 = rbDebug_immediateTexCoordT;
-      *(float *)v26 = (float)a2;
-      *((_DWORD *)v26 + 4) = v27;
-      *((_DWORD *)v26 + 2) = 0;
-      *((float *)v26 + 1) = (float)(a5 + a3);
-      v18 = ++rbDebug_immediateVertexCount;
-    }
-    glDrawArrays(mode, 0, v18);
-    rbDebug_immediateVertexCount = 0;
-    mode = 0;
-    rbDebug_immediateModeActive = 0;
-    if ( !backEnd_projection2D && (glState_glStateBits & 0x200000) == 0 )
-    {
-      if ( r_fog->integer )
-      {
-        v28 = dword_16C4BB0;
-        if ( (backEnd_refdef_rdflags & 8) == 0 )
-          v28 = glfogNum;
-        if ( v28 )
-        {
-          glEnable(0xB60u);
-          glState_glStateBits |= 0x200000u;
-        }
-      }
-    }
-    glVertexPointer(3, 0x1406u, 0, tess_xyz);
+    do
+      ++powW;
+    while ( 1 << powW < width );
   }
-}
-
-/* ---- RE_UploadCinematic  0x004D7290 ----  VERIFIED */
-void __cdecl RE_UploadCinematic(int a1, int a2, GLsizei width, GLsizei height, GLvoid *pixels, int a6, int a7)
-{
-  unsigned __int16 *v7;
-
-  GL_Bind((GLenum *)tr_scratchImages[a6]);
-  v7 = (unsigned __int16 *)tr_scratchImages[a6];
-  if ( width == v7[32] && height == v7[33] )
+  powH = 0;
+  if ( height > 1 )
   {
-    if ( a7 )
+    do
+      ++powH;
+    while ( 1 << powH < height );
+  }
+  if ( 1 << powW != width || 1 << powH != height )
+    ri.Error(1, "\x15" "Draw_StretchRaw: size not a power of 2: %i by %i", width, height);
+
+  image = (image_t *)tr_scratchImages[scratchIndex];
+  GL_Bind(image);
+  if ( width == ((image_t *)tr_scratchImages[scratchIndex])->width && height == ((image_t *)tr_scratchImages[scratchIndex])->height )
+  {
+    if ( dirty )
       glTexSubImage2D(0xDE1u, 0, 0, 0, width, height, 0x1908u, 0x1401u, pixels);
   }
   else
   {
-    v7[34] = width;
-    *(_WORD *)(tr_scratchImages[a6] + 64) = width;
-    *(_WORD *)(tr_scratchImages[a6] + 70) = height;
-    *(_WORD *)(tr_scratchImages[a6] + 66) = height;
+    ((image_t *)tr_scratchImages[scratchIndex])->uploadWidth  = width;
+    ((image_t *)tr_scratchImages[scratchIndex])->width        = width;
+    ((image_t *)tr_scratchImages[scratchIndex])->uploadHeight = height;
+    ((image_t *)tr_scratchImages[scratchIndex])->height       = height;
     glTexImage2D(0xDE1u, 0, 3, width, height, 0, 0x1908u, 0x1401u, pixels);
-    glTexParameteri(0xDE1u, 0x2801u, 9729);
-    glTexParameteri(0xDE1u, 0x2800u, 9729);
-    glTexParameteri(0xDE1u, 0x2802u, 33071);
-    glTexParameteri(0xDE1u, 0x2803u, 33071);
+    glTexParameteri(0xDE1u, 0x2801u, 9729);       /* GL_TEXTURE_MIN_FILTER, GL_LINEAR */
+    glTexParameteri(0xDE1u, 0x2800u, 9729);       /* GL_TEXTURE_MAG_FILTER, GL_LINEAR */
+    glTexParameteri(0xDE1u, 0x2802u, 33071);      /* GL_TEXTURE_WRAP_S, GL_CLAMP */
+    glTexParameteri(0xDE1u, 0x2803u, 33071);      /* GL_TEXTURE_WRAP_T, GL_CLAMP */
+  }
+  if ( r_speeds->integer )
+    ri.Printf(0, "qglTexSubImage2D %i, %i: %i msec\n", width, height, ri.Milliseconds() - startMsec);
+
+  RB_SetGL2D();
+  RB_BeginImmediateMode();
+
+  colorByte = (byte)(unsigned __int64)(tr_identityLight * 255.0f);
+  rendererDebugState.immediateColorR = colorByte;
+  rendererDebugState.immediateColorG = colorByte;
+  rendererDebugState.immediateColorB = colorByte;
+  rendererDebugState.immediateColorA = -1;
+  rendererDebugState.immediateMode = 7;           /* GL_QUADS */
+
+  /* four corners: (destX,destY) .. (destX+destW, destY+destH), texels centered by half a pixel.
+   * Retail's inlined RB_glTexCoord2f stores the texcoords as floats (fst straight to
+   * rendererDebugState, written out here; the int copy the tree's out-of-line
+   * RB_glTexCoord2f uses forces them through a stack slot), and each vertex, emitted
+   * only while the immediate buffer has room, reads them back.  The primitive mode is
+   * the rendererDebugState field: through the separate `mode` global VC7 would forward
+   * the constant 7 to glDrawArrays, where retail reloads it. */
+  rendererDebugState.immediateTexCoordS = 0.5f / width;
+  rendererDebugState.immediateTexCoordT = 0.5f / height;
+  if ( rendererDebugState.immediateVertexCount < rendererDebugState.immediateVertexCapacity )
+  {
+    vtx = &((rbImmediateVertex_t *)rendererDebugState.immediateVertices)[rendererDebugState.immediateVertexCount];
+    vtx->color[0] = rendererDebugState.immediateColorR;  vtx->color[1] = rendererDebugState.immediateColorG;
+    vtx->color[2] = rendererDebugState.immediateColorB;  vtx->color[3] = rendererDebugState.immediateColorA;
+    vtx->s = *(float *)&rendererDebugState.immediateTexCoordS;  vtx->t = *(float *)&rendererDebugState.immediateTexCoordT;
+    vtx->xyz[0] = (float)destX;  vtx->xyz[1] = (float)destY;  vtx->xyz[2] = 0.0f;
+    ++rendererDebugState.immediateVertexCount;
+  }
+  rendererDebugState.immediateTexCoordS = ( width - 0.5f ) / width;
+  rendererDebugState.immediateTexCoordT = 0.5f / height;
+  if ( rendererDebugState.immediateVertexCount < rendererDebugState.immediateVertexCapacity )
+  {
+    vtx = &((rbImmediateVertex_t *)rendererDebugState.immediateVertices)[rendererDebugState.immediateVertexCount];
+    vtx->color[0] = rendererDebugState.immediateColorR;  vtx->color[1] = rendererDebugState.immediateColorG;
+    vtx->color[2] = rendererDebugState.immediateColorB;  vtx->color[3] = rendererDebugState.immediateColorA;
+    vtx->s = *(float *)&rendererDebugState.immediateTexCoordS;  vtx->t = *(float *)&rendererDebugState.immediateTexCoordT;
+    vtx->xyz[0] = (float)(destW + destX);  vtx->xyz[1] = (float)destY;  vtx->xyz[2] = 0.0f;
+    ++rendererDebugState.immediateVertexCount;
+  }
+  rendererDebugState.immediateTexCoordS = ( width - 0.5f ) / width;
+  rendererDebugState.immediateTexCoordT = ( height - 0.5f ) / height;
+  if ( rendererDebugState.immediateVertexCount < rendererDebugState.immediateVertexCapacity )
+  {
+    vtx = &((rbImmediateVertex_t *)rendererDebugState.immediateVertices)[rendererDebugState.immediateVertexCount];
+    vtx->color[0] = rendererDebugState.immediateColorR;  vtx->color[1] = rendererDebugState.immediateColorG;
+    vtx->color[2] = rendererDebugState.immediateColorB;  vtx->color[3] = rendererDebugState.immediateColorA;
+    vtx->s = *(float *)&rendererDebugState.immediateTexCoordS;  vtx->t = *(float *)&rendererDebugState.immediateTexCoordT;
+    vtx->xyz[0] = (float)(destW + destX);  vtx->xyz[1] = (float)(destY + destH);  vtx->xyz[2] = 0.0f;
+    ++rendererDebugState.immediateVertexCount;
+  }
+  rendererDebugState.immediateTexCoordS = 0.5f / width;
+  rendererDebugState.immediateTexCoordT = ( height - 0.5f ) / height;
+  if ( rendererDebugState.immediateVertexCount < rendererDebugState.immediateVertexCapacity )
+  {
+    vtx = &((rbImmediateVertex_t *)rendererDebugState.immediateVertices)[rendererDebugState.immediateVertexCount];
+    vtx->color[0] = rendererDebugState.immediateColorR;  vtx->color[1] = rendererDebugState.immediateColorG;
+    vtx->color[2] = rendererDebugState.immediateColorB;  vtx->color[3] = rendererDebugState.immediateColorA;
+    vtx->s = *(float *)&rendererDebugState.immediateTexCoordS;  vtx->t = *(float *)&rendererDebugState.immediateTexCoordT;
+    vtx->xyz[0] = (float)destX;  vtx->xyz[1] = (float)(destH + destY);  vtx->xyz[2] = 0.0f;
+    ++rendererDebugState.immediateVertexCount;
+  }
+
+  glDrawArrays(rendererDebugState.immediateMode, 0, rendererDebugState.immediateVertexCount);
+  rendererDebugState.immediateVertexCount = 0;
+  rendererDebugState.immediateMode = 0;
+  rendererDebugState.immediateModeActive = 0;
+
+  if ( !backEnd_projection2D && (glState_glStateBits & 0x200000) == 0 )
+  {
+    if ( r_fog->integer )
+    {
+      fogEnabled = tr_fogPortalView_registered;
+      if ( (backEnd_refdef_rdflags & 8) == 0 )
+        fogEnabled = glfogNum;
+      if ( fogEnabled )
+      {
+        glEnable(0xB60u);
+        glState_glStateBits |= 0x200000u;
+      }
+    }
+  }
+  glVertexPointer(3, 0x1406u, 0, tess_xyz);
+}
+
+/* ---- RE_UploadCinematic  0x004D7290 ----  VERIFIED
+ * Upload one cinematic frame into a scratch image (w/h unused). */
+void __cdecl RE_UploadCinematic(int w, int h, GLsizei width, GLsizei height, GLvoid *pixels, int scratchIndex, int dirty)
+{
+  GL_Bind((image_t *)tr_scratchImages[scratchIndex]);
+  if ( width == ((image_t *)tr_scratchImages[scratchIndex])->width
+    && height == ((image_t *)tr_scratchImages[scratchIndex])->height )
+  {
+    if ( dirty )
+      glTexSubImage2D(0xDE1u, 0, 0, 0, width, height, 0x1908u, 0x1401u, pixels);
+  }
+  else
+  {
+    ((image_t *)tr_scratchImages[scratchIndex])->width  = ((image_t *)tr_scratchImages[scratchIndex])->uploadWidth  = width;
+    ((image_t *)tr_scratchImages[scratchIndex])->height = ((image_t *)tr_scratchImages[scratchIndex])->uploadHeight = height;
+    glTexImage2D(0xDE1u, 0, 3, width, height, 0, 0x1908u, 0x1401u, pixels);
+    glTexParameteri(0xDE1u, 0x2801u, 9729);        /* GL_TEXTURE_MIN_FILTER, GL_LINEAR */
+    glTexParameteri(0xDE1u, 0x2800u, 9729);        /* GL_TEXTURE_MAG_FILTER, GL_LINEAR */
+    glTexParameteri(0xDE1u, 0x2802u, 33071);       /* GL_TEXTURE_WRAP_S, GL_CLAMP */
+    glTexParameteri(0xDE1u, 0x2803u, 33071);       /* GL_TEXTURE_WRAP_T, GL_CLAMP */
   }
 }
 
 /* ---- RB_SetColor  0x004D7390 ----  VERIFIED */
-int __cdecl RB_SetColor(int a1)
+int __cdecl RB_SetColor(setColorCommand_t *cmd)
 {
-  backEnd_color2D = *(_DWORD *)(a1 + 4);
-  return a1 + 8;
+  backEnd_color2D = *(int *)cmd->color;
+  return (int)(cmd + 1);
 }
 
-/* ---- RB_DrawStretchPic  0x004D73A0 ----  VERIFIED */
-int __cdecl RB_DrawStretchPic(
-        int a1,
-        void *a3,
-        float a4,
-        float a5,
-        float a6,
-        float a7,
-        int a8,
-        int a9,
-        int a10,
-        int a11,
-        int *a12)
+/* ---- RB_DrawStretchPic  0x004D73A0 ----  VERIFIED
+ * Emit one screen-space quad (2 triangles) into the tess buffers; color2D is
+ * the packed RGBA.  Retail passes shader in ebx (LTCG); the dead EAX at return
+ * is the s1 bits.  Retail calls RB_CheckOverflow here (the tree inlines it). */
+void __cdecl RB_DrawStretchPic(
+        float x,
+        float y,
+        float w,
+        float h,
+        float s1,
+        float t1,
+        float s2,
+        float t2,
+        int shader,
+        int *color2D)
 {
-  int v12;
-  double v13;
-  unsigned __int16 v14;
-  int v15;
-  int v16;
-  int v17;
-  float *v18;
-  _DWORD *v19;
-  double v20;
-  int result;
+  unsigned short numVerts;
+  int            numIndexes;
+  float         *xyz;
+  float         *st;
+  int            storage;
 
   if ( !backEnd_projection2D )
     RB_SetGL2D();
 
-  if ( a1 != tess_shader )
+  if ( shader != tess_shader )
   {
     if ( tess_numIndexes )
       RB_EndSurface();
     backEnd_currentEntity = (int)&backEnd_entity2D;
-    v12 = storageClass;
+    storage = storageClass;
     if ( storageClass != glState_currentStorageMode )
     {
       if ( glConfig_NVVertexArrayRange )
-      {
         RB_SelectStorageNV(storageClass);
-      }
       else if ( glConfig_ATIVertexArrayObject )
-      {
         RB_SelectStorageATI(storageClass);
-      }
-      glState_currentStorageMode = v12;
+      glState_currentStorageMode = storage;
     }
-    RB_BeginSurface((void *)a1, 3);   /* 0x004D740B: push 3 / mov ecx,ebx */
+    RB_BeginSurface((void *)shader, 3);   /* 0x004D740B: push 3 / mov ecx,ebx */
   }
   if ( tess_numVertexes + 4 >= 0x2000 || tess_numIndexes + 6 >= 49152 )
+#pragma inline_depth(0)
     RB_CheckOverflow(4, 6);
-  v13 = a4 + a6;
-  v14 = tess_numVertexes;
+#pragma inline_depth()
+
+  numVerts   = tess_numVertexes;
+  numIndexes = tess_numIndexes;
+
   tess_numVertexes += 4;
-  v15 = tess_numIndexes;
-  tess_numIndexes += 6;
-  tess_indexes[v15] = v14 + 3;
-  word_17A7F62[v15] = v14;
-  word_17A7F68[v15] = v14;
-  word_17A7F64[v15] = v14 + 2;
-  word_17A7F66[v15] = v14 + 2;
-  word_17A7F6A[v15] = v14 + 1;
-  v16 = v14;
-  v17 = *a12;
-  dword_181FF6C[v16] = *a12;
-  dword_181FF68[v16] = v17;
-  dword_181FF64[v16] = v17;
-  dword_181FF60[v16] = v17;
-  v18 = (float *)(4 * tess_vertexComponentCount * v16 + ((int)(char *)tess_xyz));
-  *v18 = a4;
-  v18[1] = a5;
-  ++v18;
-  v18[1] = 0.0;
-  dword_17DFF60[2 * v16] = a8;
-  ++v18;
-  v19 = (_DWORD *)(8 * v16 + ((int)(char *)tess_texCoords0));
-  v19[1] = a9;
-  v18[1] = v13;
-  ++v18;
-  v18[1] = a5;
-  ++v19;
-  ++v18;
-  v18[1] = 0.0;
-  v19[1] = a10;
-  ++v18;
-  ++v19;
-  v19[1] = a9;
-  v18[1] = v13;
-  v20 = a5 + a7;
-  v18 += 3;
-  v19 += 2;
-  *(v18 - 1) = v20;
-  *v18 = 0.0;
-  *v19 = a10;
-  v19[1] = a11;
-  v18[1] = a4;
-  v19 += 2;
-  v18 += 2;
-  *v18 = v20;
-  v18[1] = 0.0;
-  result = a8;
-  *v19 = a8;
-  v19[1] = a11;
-  return result;
+  tess_numIndexes  += 6;
+
+  tess_indexes[numIndexes + 0] = numVerts + 3;
+  tess_indexes[numIndexes + 1] = numVerts;
+  tess_indexes[numIndexes + 2] = numVerts + 2;
+  tess_indexes[numIndexes + 3] = numVerts + 2;
+  tess_indexes[numIndexes + 4] = numVerts;
+  tess_indexes[numIndexes + 5] = numVerts + 1;
+
+  tess_vertexColorsPacked[numVerts + 0] =
+    tess_vertexColorsPacked[numVerts + 1] =
+    tess_vertexColorsPacked[numVerts + 2] =
+    tess_vertexColorsPacked[numVerts + 3] = *color2D;
+
+  xyz = &tess_xyz[numVerts * tess_vertexComponentCount];
+  st  = &tess_texCoords0[2 * numVerts];
+
+  *xyz++ = x;      *xyz++ = y;      *xyz++ = 0.0f;
+  *st++ = s1;      *st++ = t1;
+  *xyz++ = x + w;  *xyz++ = y;      *xyz++ = 0.0f;
+  *st++ = s2;      *st++ = t1;
+  *xyz++ = x + w;  *xyz++ = y + h;  *xyz++ = 0.0f;
+  *st++ = s2;      *st++ = t2;
+  *xyz++ = x;      *xyz++ = y + h;  *xyz++ = 0.0f;
+  *st++ = s1;      *st++ = t2;
 }
 
 /* ---- RB_StretchPic  0x004D75A0 ----  VERIFIED */
-int __cdecl RB_StretchPic(int a2)
+int __cdecl RB_StretchPic(int data)
 {
+  stretchPicCommand_t *cmd = (stretchPicCommand_t *)data;
+
   RB_DrawStretchPic(
-    *(_DWORD *)(a2 + 4),
-    *(void **)(a2 + 8),
-    *(float *)(a2 + 8),
-    *(float *)(a2 + 12),
-    *(float *)(a2 + 16),
-    *(float *)(a2 + 20),
-    *(_DWORD *)(a2 + 24),
-    *(_DWORD *)(a2 + 28),
-    *(_DWORD *)(a2 + 32),
-    *(_DWORD *)(a2 + 36),
+    cmd->x,
+    cmd->y,
+    cmd->w,
+    cmd->h,
+    cmd->s1,
+    cmd->t1,
+    cmd->s2,
+    cmd->t2,
+    (int)cmd->shader,
     &backEnd_color2D);
-  return a2 + 40;
+  return (int)(cmd + 1);
 }
 
-/* ---- RB_StretchPicGradient  0x004D75E0 ----  VERIFIED */
-int __cdecl RB_StretchPicGradient(int a1, void *a2)
+/* ---- RB_StretchPicGradient  0x004D75E0 ----  VERIFIED
+ * Like RB_StretchPic, but the bottom two vertices take the gradient color. */
+int __cdecl RB_StretchPicGradient(int data)
 {
-  int v2;
-  unsigned __int16 v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  float *v9;
-  _DWORD *v10;
+  stretchPicGradientCommand_t *cmd = (stretchPicGradientCommand_t *)data;
+  shader_t      *shader;
+  unsigned short numVerts;
+  int            numIndexes;
+  float         *xyz;
+  float         *st;
+  int            storage;
 
   if ( !backEnd_projection2D )
     RB_SetGL2D();
-  if ( *(_DWORD *)(a1 + 4) != tess_shader )
+
+  shader = cmd->shader;
+  if ( (int)shader != tess_shader )
   {
     if ( tess_numIndexes )
       RB_EndSurface();
     backEnd_currentEntity = (int)&backEnd_entity2D;
-    v2 = storageClass;
+    storage = storageClass;
     if ( storageClass != glState_currentStorageMode )
     {
       if ( glConfig_NVVertexArrayRange )
-      {
         RB_SelectStorageNV(storageClass);
-      }
       else if ( glConfig_ATIVertexArrayObject )
-      {
         RB_SelectStorageATI(storageClass);
-      }
-      glState_currentStorageMode = v2;
+      glState_currentStorageMode = storage;
     }
-    RB_BeginSurface(*(void **)(a1 + 4), 3);   /* 0x004D7650: push 3 / mov ecx,ebp; ebp = [edi+4] */
+    RB_BeginSurface(shader, 3);   /* 0x004D7650: push 3 / mov ecx,ebp; ebp = [edi+4] */
   }
   if ( tess_numVertexes + 4 >= 0x2000 || tess_numIndexes + 6 >= 49152 )
+#pragma inline_depth(0)
     RB_CheckOverflow(4, 6);
-  v3 = tess_numVertexes;
+#pragma inline_depth()
+
+  numVerts   = tess_numVertexes;
+  numIndexes = tess_numIndexes;
+
   tess_numVertexes += 4;
-  v4 = tess_numIndexes;
-  tess_numIndexes += 6;
-  word_17A7F62[v4] = v3;
-  word_17A7F68[v4] = v3;
-  tess_indexes[v4] = v3 + 3;
-  word_17A7F64[v4] = v3 + 2;
-  word_17A7F66[v4] = v3 + 2;
-  word_17A7F6A[v4] = v3 + 1;
-  v5 = v3;
-  v6 = backEnd_color2D;
-  dword_181FF64[v5] = backEnd_color2D;
-  dword_181FF60[v5] = v6;   /* +0 shard, see RB_DrawStretchPic; 0x004D76EF */
-  v7 = *(_DWORD *)(a1 + 40);
-  dword_181FF6C[v5] = v7;
-  dword_181FF68[v5] = v7;
-  v8 = tess_vertexComponentCount * v5;
-  dword_17BFF60[v8] = *(_DWORD *)(a1 + 8);
-  v9 = (float *)(4 * v8 + ((int)(char *)tess_xyz));
-  v9[1] = *(float *)(a1 + 12);
-  ++v9;
-  v9[1] = 0.0;
-  dword_17DFF60[2 * v5] = *(_DWORD *)(a1 + 24);
-  v10 = (_DWORD *)(8 * v5 + ((int)(char *)tess_texCoords0));
-  v10[1] = *(_DWORD *)(a1 + 28);
-  v9 += 4;
-  v10 += 2;
-  *(v9 - 2) = *(float *)(a1 + 16) + *(float *)(a1 + 8);
-  *(v9 - 1) = *(float *)(a1 + 12);
-  *v9 = 0.0;
-  *v10 = *(_DWORD *)(a1 + 32);
-  v10[1] = *(_DWORD *)(a1 + 28);
-  v9 += 3;
-  *(v9 - 2) = *(float *)(a1 + 16) + *(float *)(a1 + 8);
-  v10 += 4;
-  v9 += 2;
-  *(v9 - 3) = *(float *)(a1 + 12) + *(float *)(a1 + 20);
-  *(v9 - 2) = 0.0;
-  *(v10 - 2) = *(_DWORD *)(a1 + 32);
-  *(v10 - 1) = *(_DWORD *)(a1 + 36);
-  *(v9 - 1) = *(float *)(a1 + 8);
-  *v9 = *(float *)(a1 + 12) + *(float *)(a1 + 20);
-  v9[1] = 0.0;
-  *v10 = *(_DWORD *)(a1 + 24);
-  v10[1] = *(_DWORD *)(a1 + 36);
-  return a1 + 48;
+  tess_numIndexes  += 6;
+
+  tess_indexes[numIndexes + 0] = numVerts + 3;
+  tess_indexes[numIndexes + 1] = numVerts;
+  tess_indexes[numIndexes + 2] = numVerts + 2;
+  tess_indexes[numIndexes + 3] = numVerts + 2;
+  tess_indexes[numIndexes + 4] = numVerts;
+  tess_indexes[numIndexes + 5] = numVerts + 1;
+
+  tess_vertexColorsPacked[numVerts + 0] =
+    tess_vertexColorsPacked[numVerts + 1] = backEnd_color2D;
+  tess_vertexColorsPacked[numVerts + 2] =
+    tess_vertexColorsPacked[numVerts + 3] = *(int *)cmd->gradientColor;
+
+  xyz = &tess_xyz[numVerts * tess_vertexComponentCount];
+  st  = &tess_texCoords0[2 * numVerts];
+
+  *xyz++ = cmd->x;           *xyz++ = cmd->y;           *xyz++ = 0.0f;
+  *st++ = cmd->s1;           *st++ = cmd->t1;
+  *xyz++ = cmd->x + cmd->w;  *xyz++ = cmd->y;           *xyz++ = 0.0f;
+  *st++ = cmd->s2;           *st++ = cmd->t1;
+  *xyz++ = cmd->x + cmd->w;  *xyz++ = cmd->y + cmd->h;  *xyz++ = 0.0f;
+  *st++ = cmd->s2;           *st++ = cmd->t2;
+  *xyz++ = cmd->x;           *xyz++ = cmd->y + cmd->h;  *xyz++ = 0.0f;
+  *st++ = cmd->s1;           *st++ = cmd->t2;
+
+  return (int)(cmd + 1);
 }
 
-/* ---- RB_StretchPicRotate  0x004D77E0 ----  VERIFIED */
-int __cdecl RB_StretchPicRotate(int a1, void *a2)
+/* Retail's inlined fsincos block saves eax/ecx around itself (com_math.c's
+ * SinCos is /Op and has no push/pop). */
+static __inline void RB_SinCos( float radians, float *sinOut, float *cosOut )
 {
-  int v2;
-  unsigned __int16 v3;
-  int v4;
-  int v5;
-  int v6;
-  double v7;
-  int v8;
-  double v9;
-  double v10;
-  double v11;
-  double v12;
-  int v13;
-  int v14;
-  float v16; // [esp+Ch] [ebp-28h] BYREF
-  float v17[3]; // [esp+10h] [ebp-24h] BYREF
-  float v18;
-  float v19;
-  float v20;
-  float v21;
-  float v22;
-  float v23;
+  __asm {
+    push    eax
+    push    ecx
+    fld     radians
+    fsincos
+    mov     ecx, cosOut
+    mov     eax, sinOut
+    fstp    dword ptr [ecx]
+    fstp    dword ptr [eax]
+    pop     ecx
+    pop     eax
+  }
+}
+
+/* ---- RB_StretchPicRotate  0x004D77E0 ----  VERIFIED
+ * Emit a quad rotated about its center by cmd->angle (degrees). */
+int __cdecl RB_StretchPicRotate(int data)
+{
+  stretchPicRotateCommand_t *cmd = (stretchPicRotateCommand_t *)data;
+  shader_t      *shader;
+  unsigned short numVerts;
+  int            numIndexes;
+  float         *xyz;
+  int            storage;
+  struct { float halfW, halfH, centerX, centerY; } quad;
+  float          radians, s, c;
+  rfloat         cw, sw;              /* x87 stack values in retail, never rounded */
+  float          negSH, ch;
 
   if ( !backEnd_projection2D )
     RB_SetGL2D();
-  if ( *(_DWORD *)(a1 + 4) != tess_shader )
+
+  shader = cmd->shader;
+  if ( (int)shader != tess_shader )
   {
     if ( tess_numIndexes )
       RB_EndSurface();
     backEnd_currentEntity = (int)&backEnd_entity2D;
-    v2 = storageClass;
+    storage = storageClass;
     if ( storageClass != glState_currentStorageMode )
     {
       if ( glConfig_NVVertexArrayRange )
-      {
         RB_SelectStorageNV(storageClass);
-      }
       else if ( glConfig_ATIVertexArrayObject )
-      {
         RB_SelectStorageATI(storageClass);
-      }
-      glState_currentStorageMode = v2;
+      glState_currentStorageMode = storage;
     }
-    RB_BeginSurface(*(void **)(a1 + 4), 3);   /* 0x004D7852: push 3 / mov ecx,ebp; ebp = [edi+4] */
+    RB_BeginSurface(shader, 3);   /* 0x004D7852: push 3 / mov ecx,ebp; ebp = [edi+4] */
   }
   if ( tess_numVertexes + 4 >= 0x2000 || tess_numIndexes + 6 >= 49152 )
+#pragma inline_depth(0)
     RB_CheckOverflow(4, 6);
-  v3 = tess_numVertexes;
-  v4 = tess_numIndexes;
+#pragma inline_depth()
+
+  numVerts   = tess_numVertexes;
+  numIndexes = tess_numIndexes;
+
   tess_numVertexes += 4;
-  tess_numIndexes += 6;
-  tess_indexes[v4] = v3 + 3;
-  word_17A7F62[v4] = v3;
-  word_17A7F68[v4] = v3;
-  word_17A7F64[v4] = v3 + 2;
-  word_17A7F66[v4] = v3 + 2;
-  word_17A7F6A[v4] = v3 + 1;
-  v5 = v3;
-  v6 = backEnd_color2D;
-  dword_181FF6C[v5] = backEnd_color2D;
-  dword_181FF68[v5] = v6;
-  dword_181FF64[v5] = v6;
-  dword_181FF60[v5] = v6;
-  dword_17DFF60[2 * v5] = *(_DWORD *)(a1 + 24);
-  dword_17DFF64[2 * v5] = *(_DWORD *)(a1 + 28);
-  dword_17DFF68[2 * v5] = *(_DWORD *)(a1 + 32);
-  dword_17DFF6C[2 * v5] = *(_DWORD *)(a1 + 28);
-  dword_17DFF70[2 * v5] = *(_DWORD *)(a1 + 32);
-  dword_17DFF74[2 * v5] = *(_DWORD *)(a1 + 36);
-  dword_17DFF78[2 * v5] = *(_DWORD *)(a1 + 24);
-  dword_17DFF7C[2 * v5] = *(_DWORD *)(a1 + 36);
-  v7 = *(float *)(a1 + 16) * 0.5;
-  LODWORD(v17[2]) = v17;
-  LODWORD(v17[1]) = &v16;
-  v20 = v7;
-  v21 = *(float *)(a1 + 20) * 0.5;
-  v22 = v20 + *(float *)(a1 + 8);
-  v23 = v21 + *(float *)(a1 + 12);
-  v18 = *(float *)(a1 + 40) * 3.1415927 * 0.0055555557;
-  v17[0] = cos(v18);
-  v16 = sin(v18);
-  v8 = tess_vertexComponentCount * v5;
-  v9 = v17[0] * v20;
-  v10 = v16 * v20;
-  v18 = -(v16 * v21);
-  v19 = v17[0] * v21;
-  v11 = v22 - v9;
-  v17[0] = v11;
-  *(float *)&tess_xyz[v8] = v11 - v18;
-  v12 = v23 - v10;
-  v16 = v12;
-  v13 = 4 * v8 + ((int)(char *)tess_xyz + 36);
-  *(float *)(v13 - 32) = v12 - v19;
-  *(_DWORD *)(v13 - 28) = 0;
-  v14 = 4 * v8 + ((int)(char *)tess_xyz + 40);
-  *(float *)(v14 - 28) = v9 + v22 - v18;
-  *(float *)(v14 - 24) = v23 + v10 - v19;
-  *(_DWORD *)(v14 - 20) = 0;
-  *(float *)(v14 - 16) = v18 + v9 + v22;
-  *(float *)(v14 - 12) = v19 + v10 + v23;
-  *(_DWORD *)(v14 - 8) = 0;
-  *(float *)(v14 - 4) = v17[0] + v18;
-  *(float *)v14 = v16 + v19;
-  *(_DWORD *)(v14 + 4) = 0;
-  return a1 + 44;
+  tess_numIndexes  += 6;
+
+  tess_indexes[numIndexes + 0] = numVerts + 3;
+  tess_indexes[numIndexes + 1] = numVerts;
+  tess_indexes[numIndexes + 2] = numVerts + 2;
+  tess_indexes[numIndexes + 3] = numVerts + 2;
+  tess_indexes[numIndexes + 4] = numVerts;
+  tess_indexes[numIndexes + 5] = numVerts + 1;
+
+  tess_vertexColorsPacked[numVerts + 0] =
+    tess_vertexColorsPacked[numVerts + 1] =
+    tess_vertexColorsPacked[numVerts + 2] =
+    tess_vertexColorsPacked[numVerts + 3] = backEnd_color2D;
+
+  tess_texCoords0[2 * numVerts + 0] = cmd->s1;
+  tess_texCoords0[2 * numVerts + 1] = cmd->t1;
+  tess_texCoords0[2 * numVerts + 2] = cmd->s2;
+  tess_texCoords0[2 * numVerts + 3] = cmd->t1;
+  tess_texCoords0[2 * numVerts + 4] = cmd->s2;
+  tess_texCoords0[2 * numVerts + 5] = cmd->t2;
+  tess_texCoords0[2 * numVerts + 6] = cmd->s1;
+  tess_texCoords0[2 * numVerts + 7] = cmd->t2;
+
+  quad.halfW   = cmd->w * 0.5f;
+  quad.halfH   = cmd->h * 0.5f;
+  quad.centerX = quad.halfW + cmd->x;
+  quad.centerY = quad.halfH + cmd->y;
+  radians = FCAST((rfloat)cmd->angle * 3.1415927f) * 0.0055555557f;   /* deg->rad (PI/180), two fmuls */
+  RB_SinCos(radians, &s, &c);
+
+  cw    = (rfloat)c * quad.halfW;
+  sw    = (rfloat)s * quad.halfW;
+  negSH = -(s * quad.halfH);
+  ch    = c * quad.halfH;
+
+  xyz = &tess_xyz[numVerts * tess_vertexComponentCount];
+#ifdef COD1_VC7
+  /* VC7 CSEs quad.centerX - cw / quad.centerY - sw and spills them as floats for vertex 3 */
+  *xyz++ = quad.centerX - cw - negSH;
+  *xyz++ = quad.centerY - sw - ch;
+  *xyz++ = 0.0f;
+  *xyz++ = quad.centerX + cw - negSH;
+  *xyz++ = quad.centerY + sw - ch;
+  *xyz++ = 0.0f;
+  *xyz++ = quad.centerX + cw + negSH;
+  *xyz++ = quad.centerY + sw + ch;
+  *xyz++ = 0.0f;
+  *xyz++ = quad.centerX - cw + negSH;
+  *xyz++ = quad.centerY - sw + ch;
+  *xyz++ = 0.0f;
+#else
+  {
+    double x0d = quad.centerX - cw, y0d = quad.centerY - sw;
+    float  x0 = (float)x0d, y0 = (float)y0d;
+
+    *xyz++ = (float)(x0d - negSH);
+    *xyz++ = (float)(y0d - ch);
+    *xyz++ = 0.0f;
+    *xyz++ = (float)(quad.centerX + cw - negSH);
+    *xyz++ = (float)(quad.centerY + sw - ch);
+    *xyz++ = 0.0f;
+    *xyz++ = (float)(quad.centerX + cw + negSH);
+    *xyz++ = (float)(quad.centerY + sw + ch);
+    *xyz++ = 0.0f;
+    *xyz++ = x0 + negSH;
+    *xyz++ = y0 + ch;
+    *xyz++ = 0.0f;
+  }
+#endif
+
+  return (int)(cmd + 1);
 }
 
-/* ---- RB_DrawQuadPic  0x004D7AB0 ----  VERIFIED */
-_DWORD *__cdecl RB_DrawQuadPic(_DWORD *a1, void *a2)
+/* ---- RB_DrawQuadPic  0x004D7AB0 ----  VERIFIED
+ * Emit a quad from four explicit positions and texcoords.
+ * The dead EAX return is the next command pointer. */
+unsigned int *__cdecl RB_DrawQuadPic(unsigned int *data)
 {
-  int v2;
-  unsigned __int16 v3;
-  int v4;
-  int v5;
-  int v6;
-  _DWORD *v7;
+  drawQuadPicCommand_t *cmd = (drawQuadPicCommand_t *)data;
+  shader_t      *shader;
+  unsigned short numVerts;
+  int            numIndexes;
+  float         *xyz;
+  int            storage;
 
   if ( !backEnd_projection2D )
     RB_SetGL2D();
-  if ( a1[1] != tess_shader )
+
+  shader = cmd->shader;
+  if ( (int)shader != tess_shader )
   {
     if ( tess_numIndexes )
       RB_EndSurface();
     backEnd_currentEntity = (int)&backEnd_entity2D;
-    v2 = storageClass;
+    storage = storageClass;
     if ( storageClass != glState_currentStorageMode )
     {
       if ( glConfig_NVVertexArrayRange )
-      {
         RB_SelectStorageNV(storageClass);
-      }
       else if ( glConfig_ATIVertexArrayObject )
-      {
         RB_SelectStorageATI(storageClass);
-      }
-      glState_currentStorageMode = v2;
+      glState_currentStorageMode = storage;
     }
-    RB_BeginSurface((void *)a1[1], 3);   /* 0x004D7B20: push 3 / mov ecx,ebp; ebp = [edi+4] */
+    RB_BeginSurface(shader, 3);   /* 0x004D7B20: push 3 / mov ecx,ebp; ebp = [edi+4] */
   }
   if ( tess_numVertexes + 4 >= 0x2000 || tess_numIndexes + 6 >= 49152 )
+#pragma inline_depth(0)
     RB_CheckOverflow(4, 6);
-  v3 = tess_numVertexes;
+#pragma inline_depth()
+
+  numVerts   = tess_numVertexes;
+  numIndexes = tess_numIndexes;
+
   tess_numVertexes += 4;
-  v4 = tess_numIndexes;
-  tess_numIndexes += 6;
-  word_17A7F62[v4] = v3;
-  word_17A7F68[v4] = v3;
-  tess_indexes[v4] = v3 + 3;
-  word_17A7F64[v4] = v3 + 2;
-  word_17A7F66[v4] = v3 + 2;
-  word_17A7F6A[v4] = v3 + 1;
-  v5 = backEnd_color2D;
-  dword_181FF6C[v3] = backEnd_color2D;
-  dword_181FF68[v3] = v5;
-  dword_181FF64[v3] = v5;
-  dword_181FF60[v3] = v5;   /* +0 shard; 0x004D7BCE */
-  dword_17DFF60[2 * v3] = a1[10];
-  dword_17DFF64[2 * v3] = a1[11];
-  dword_17DFF68[2 * v3] = a1[12];
-  dword_17DFF6C[2 * v3] = a1[13];
-  dword_17DFF70[2 * v3] = a1[14];
-  dword_17DFF74[2 * v3] = a1[15];
-  dword_17DFF78[2 * v3] = a1[16];
-  dword_17DFF7C[2 * v3] = a1[17];
-  v6 = tess_vertexComponentCount * v3;
-  dword_17BFF60[v6] = a1[2];
-  v7 = (_DWORD *)(4 * v6 + ((int)(char *)tess_xyz));
-  v7[1] = a1[3];
-  ++v7;
-  v7[1] = 0;
-  ++v7;
-  v7[1] = a1[4];
-  ++v7;
-  v7[1] = a1[5];
-  ++v7;
-  v7[1] = 0;
-  ++v7;
-  v7[1] = a1[6];
-  ++v7;
-  v7[1] = a1[7];
-  ++v7;
-  v7[1] = 0;
-  v7 += 2;
-  *v7++ = a1[8];
-  *v7 = a1[9];
-  v7[1] = 0;
-  return a1 + 18;
+  tess_numIndexes  += 6;
+
+  tess_indexes[numIndexes + 0] = numVerts + 3;
+  tess_indexes[numIndexes + 1] = numVerts;
+  tess_indexes[numIndexes + 2] = numVerts + 2;
+  tess_indexes[numIndexes + 3] = numVerts + 2;
+  tess_indexes[numIndexes + 4] = numVerts;
+  tess_indexes[numIndexes + 5] = numVerts + 1;
+
+  tess_vertexColorsPacked[numVerts + 0] =
+    tess_vertexColorsPacked[numVerts + 1] =
+    tess_vertexColorsPacked[numVerts + 2] =
+    tess_vertexColorsPacked[numVerts + 3] = backEnd_color2D;
+
+  tess_texCoords0[2 * numVerts + 0] = cmd->texCoords[0][0];
+  tess_texCoords0[2 * numVerts + 1] = cmd->texCoords[0][1];
+  tess_texCoords0[2 * numVerts + 2] = cmd->texCoords[1][0];
+  tess_texCoords0[2 * numVerts + 3] = cmd->texCoords[1][1];
+  tess_texCoords0[2 * numVerts + 4] = cmd->texCoords[2][0];
+  tess_texCoords0[2 * numVerts + 5] = cmd->texCoords[2][1];
+  tess_texCoords0[2 * numVerts + 6] = cmd->texCoords[3][0];
+  tess_texCoords0[2 * numVerts + 7] = cmd->texCoords[3][1];
+
+  xyz = &tess_xyz[numVerts * tess_vertexComponentCount];
+  *xyz++ = cmd->positions[0][0];  *xyz++ = cmd->positions[0][1];  *xyz++ = 0.0f;
+  *xyz++ = cmd->positions[1][0];  *xyz++ = cmd->positions[1][1];  *xyz++ = 0.0f;
+  *xyz++ = cmd->positions[2][0];  *xyz++ = cmd->positions[2][1];  *xyz++ = 0.0f;
+  *xyz++ = cmd->positions[3][0];  *xyz++ = cmd->positions[3][1];  *xyz++ = 0.0f;
+
+  return data + 18;
 }
 
-/* ---- RB_Text_PaintChar  0x004D7CB0 ----  VERIFIED */
-int __cdecl RB_Text_PaintChar(
-        float a2,
-        int a3,
-        float a4,
-        float a5,
-        int a6,
-        float a7,
-        int a8,
-        int a9,
-        int a10,
-        int a11,
-        int a12,          /* glyph shader HANDLE, then reused as scratch.
-                           * Retail reads it with `mov esi, [esp+arg_28]` at
-                           * 0x004D7CBA -- an INTEGER load -- before the `fstp`
-                           * at 0x004D7CC3 overwrites the slot with a4*a7.  Must
-                           * stay int: as a float the handle round-trips x87 as
-                           * a DENORMAL (20 == 0x14 == 2.8e-44) and flushes to
-                           * zero, resolving every glyph to tr_shaders[0]. */
-        int *a13)
+/* R_GetShaderByHandle (tr_shader.c), which retail inlines into its callers. */
+static __inline char *R_GetShaderByHandle( int hShader )
 {
-  int v13;
-  char *v14;
-
-  v13 = a12;
-  *(float *)&a12 = a4 * a7;
-  a7 = a5 * a7;
-  ri_SCR_AdjustFrom640(&a2, &a3, &a12, &a7);
-  if ( v13 >= 0 && v13 < tr_numShaders[0] )
+  if ( hShader < 0 )
   {
-    v14 = (char *)tr_shaders[v13];
+    ri.Printf(2, "R_GetShaderByHandle: out of range hShader '%d'\n", hShader);
+    return tr_defaultShader;
   }
-  else
+  if ( hShader >= tr_numShaders[0] )
   {
-    ri_Printf(2, "R_GetShaderByHandle: out of range hShader '%d'\n", v13);
-    v14 = tr_defaultShader;
+    ri.Printf(2, "R_GetShaderByHandle: out of range hShader '%d'\n", hShader);
+    return tr_defaultShader;
   }
+  return (char *)tr_shaders[hShader];
+}
 
-  return RB_DrawStretchPic((int)v14, (void *)a12, a2, *(float *)&a3, *(float *)&a12, a7, a8, a9, a10, a11, a13);
+/* ---- RB_Text_PaintChar  0x004D7CB0 ----  VERIFIED
+ * w/h land in the dead hShader/scale argument slots (VC7 slot reuse). */
+void __cdecl RB_Text_PaintChar(
+        float x,
+        int y,           /* float bits */
+        float width,
+        float height,
+        int font,          /* font handle; unused here */
+        float scale,
+        int s1,
+        int t1,
+        int s2,
+        int t2,
+        int hShader,
+        int *color2D)
+{
+  float w;
+  float h;
+  char *shader;
+
+  w = width * scale;
+  h = height * scale;
+  ri.SCR_AdjustFrom640(&x, &y, &w, &h);
+  shader = R_GetShaderByHandle(hShader);
+  RB_DrawStretchPic(x, *(float *)&y, w, h, *(float *)&s1, *(float *)&t1, *(float *)&s2, *(float *)&t2,
+                    (int)shader, color2D);
 }
 
 static const unsigned int s_consoleColorTable[8] =
@@ -2437,205 +2033,205 @@ static const unsigned int s_consoleColorTable[8] =
 
 /* ---- RB_Text_PaintWithCursor  0x004D7D60 ----  VERIFIED */
 int __cdecl RB_Text_PaintWithCursor(
-        const char *a1,
-        int a2,
-        float a3,
-        int a4,
-        float a5,
-        int a6,
-        int a7,
-        unsigned __int8 a8,
-        float a9,
-        int a10)
+        float penX,
+        float penY,
+        int font,
+        float scale,
+        int colorPtr,
+        const char *text,
+        int cursorPos,
+        unsigned __int8 cursorChar,
+        float fixedWidth,
+        int style)
 {
-  int v11;
-  int v12;
-  int v13;
-  const char *v14;
-  signed int v15;
-  unsigned __int8 v16;
-  char v17;
-  unsigned int v18;
-  unsigned __int8 v19;
-  unsigned int v20;
-  unsigned __int8 v21;
-  char v22;
-  char v23;
-  int *CharacterGlyph;
-  int *v25;
-  int v26;
-  int v27;
-  double v28;
-  int v29;  /* glyph shader HANDLE (retail: mov esi, [esp+arg_28]) */
-  int v30;
-  int v31;
-  float v32;
-  int v33;
-  int v34;  /* glyph shader HANDLE */
-  int v35;
-  double v36;
-  int v37;
-  int v38;  /* glyph shader HANDLE */
-  int v39;
-  float v41;
-  int v42;
-  int v43;
-  int v44;
-  float v45;
-  float v46;
-  float v47;
-  float v48;
-  int v49;
-  float v50;
-  float v51;
-  float v52;
-  float v53;
-  float v54;
-  int v55;  /* glyph shader HANDLE */
-  float v56;
-  int v57; // [esp+44h] [ebp-2Ch] BYREF
-  float v58;
-  float v59;
-  float v60;
-  signed int v61;
+  int fontInfo;
+  int baseColor;
+  int alpha;
+  const char *str;
+  signed int len;
+  unsigned __int8 ch;
+  char trailByteA;
+  unsigned int charCode;
+  unsigned __int8 trailByte9;
+  unsigned int leadByte9;
+  unsigned __int8 trailByte8;
+  char colorCode;
+  char savedAlpha;
+  int *glyphPtr;
+  int *glyph;
+  int shadowS2;
+  int shadowT1;
+  float shadowOffset;
+  int glyphHandle;  /* glyph shader HANDLE (retail: mov esi, [esp+arg_28]) */
+  int mainT2;
+  int mainS2;
+  float glyphX;
+  int cursorOffMid;
+  int cursorHandleMid;  /* glyph shader HANDLE */
+  int cursorGlyphMid;
+  float nextX;
+  int cursorOffEnd;
+  int cursorHandleEnd;  /* glyph shader HANDLE */
+  int cursorGlyphEnd;
+  float shadowX;
+  int shadowY;
+  int mainY;
+  int cursorYMid;
+  float cursorXEnd;
+  float shadowW;
+  float mainW;
+  float cursorWMid;
+  int cursorYEnd;
+  float shadowH;
+  float mainH;
+  float cursorHMid;
+  float cursorWEnd;
+  float cursorHEnd;
+  int glyphHandleShadow;  /* glyph shader HANDLE */
+  float glyphScale;
+  int color; // [esp+44h] [ebp-2Ch] BYREF
+  float xOffset;
+  float baseScale;
+  float yOffset;
+  signed int charIndex;
   float AsianScale;
-  int v63;
-  float v64;
-  int v65; // [esp+64h] [ebp-Ch] BYREF
-  signed int v66;
-  int v67;
+  float lineStartX;
+  float asianYAdjust;
+  int shadowColor; // [esp+64h] [ebp-Ch] BYREF
+  signed int savedLen;
+  int scratch;
 
-  v11 = ri_GetFontInfo(a4, LODWORD(a5));
-  v59 = a5 * *(float *)(v11 + 20480);
+  fontInfo = ri.GetFontInfo(font, *(unsigned int *)&scale);
+  baseScale = scale * *(float *)(fontInfo + 20480);
   AsianScale = 1.0;
-  v64 = 0.0;
+  asianYAdjust = 0.0;
   if ( g_currentAsian )
   {
-    AsianScale = (float)R_GetAsianScale(v11, a5);
-    v64 = ((double)g_asianGlyph.height * AsianScale * a5 - a5 * *(float *)(v11 + 20484)) * 0.125;
+    AsianScale = (float)R_GetAsianScale(fontInfo, scale);
+    asianYAdjust = ((float)g_asianGlyph.height * AsianScale * scale - scale * *(float *)(fontInfo + 20484)) * 0.125f;
   }
-  v12 = *(_DWORD *)a6;
-  v13 = BYTE3(*(_DWORD *)a6);
-  v65 = 0;
-  BYTE3(v65) = v13;
-  v14 = a1;
-  v57 = v12;
-  v15 = strlen(a1);
-  v66 = v15;
-  v63 = a2;
-  v58 = 0.0;
-  v61 = 0;
-  while ( v14 )
+  baseColor = *(unsigned int *)colorPtr;
+  alpha=(unsigned int)baseColor >> 24;
+  shadowColor = 0;
+  ((byte *)&shadowColor)[3] = alpha;
+  str = text;
+  color = baseColor;
+  len = strlen(text);
+  savedLen = len;
+  lineStartX = penX;
+  xOffset = 0.0;
+  charIndex = 0;
+  while ( str )
   {
-    v16 = *v14;
-    if ( !*v14 || v61 >= v15 )
+    ch = *str;
+    if ( !*str || charIndex >= len )
       break;
     if ( g_currentAsian )
     {
       switch ( cl_language->integer )
       {
         case 8:
-          v21 = v14[1];
-          if ( v16 >= 0xB0u && v16 <= 0xC8u && v21 > 0xA0u && v21 != 0xFF )
+          trailByte8 = str[1];
+          if ( ch >= 0xB0u && ch <= 0xC8u && trailByte8 > 0xA0u && trailByte8 != 0xFF )
           {
-            v18 = v21 + (v16 << 8);
-            v14 += 2;
+            charCode = trailByte8 + (ch << 8);
+            str += 2;
             goto LABEL_33;
           }
           break;
         case 9:
-          v19 = v14[1];
-          v20 = (unsigned int)(v19 + (v16 << 8)) >> 8;
-          if ( ((unsigned __int8)v20 >= 0xA1u && (unsigned __int8)v20 <= 0xC6u
-             || (unsigned __int8)v20 >= 0xC9u && (unsigned __int8)v20 <= 0xF9u)
-            && (v19 >= 0x40u && v19 <= 0x7Eu || v19 >= 0xA1u && v19 != 0xFF) )
+          trailByte9 = str[1];
+          leadByte9 = (unsigned int)(trailByte9 + (ch << 8)) >> 8;
+          if ( ((unsigned __int8)leadByte9 >= 0xA1u && (unsigned __int8)leadByte9 <= 0xC6u
+             || (unsigned __int8)leadByte9 >= 0xC9u && (unsigned __int8)leadByte9 <= 0xF9u)
+            && (trailByte9 >= 0x40u && trailByte9 <= 0x7Eu || trailByte9 >= 0xA1u && trailByte9 != 0xFF) )
           {
-            v18 = *((unsigned __int8 *)v14 + 1) + (v16 << 8);
-            v14 += 2;
+            charCode = *((unsigned __int8 *)str + 1) + (ch << 8);
+            str += 2;
             goto LABEL_33;
           }
           break;
         case 0xA:
-          if ( (v17 = v14[1], v16 >= 0x81u) && v16 <= 0x9Fu || v16 >= 0xE0u && v16 <= 0xEFu )
+          if ( (trailByteA = str[1], ch >= 0x81u) && ch <= 0x9Fu || ch >= 0xE0u && ch <= 0xEFu )
           {
-            if ( (unsigned __int8)v17 >= 0x40u && (unsigned __int8)v17 <= 0x7Eu || v17 <= -4 )
+            if ( (unsigned __int8)trailByteA >= 0x40u && (unsigned __int8)trailByteA <= 0x7Eu || trailByteA <= -4 )
             {
-              v18 = (unsigned __int8)v17 + (v16 << 8);
-              v14 += 2;
+              charCode = (unsigned __int8)trailByteA + (ch << 8);
+              str += 2;
               goto LABEL_33;
             }
           }
           break;
       }
     }
-    v18 = v16;
-    ++v14;
+    charCode = ch;
+    ++str;
 LABEL_33:
-    switch ( v18 )
+    switch ( charCode )
     {
       case 0x5Eu:
-        if ( !v14 )
+        if ( !str )
           goto LABEL_47;
-        v22 = *v14;
-        if ( *v14 == 94 || (unsigned __int8)v22 < 0x30u || (unsigned __int8)v22 > 0x37u )
+        colorCode = *str;
+        if ( *str == 94 || (unsigned __int8)colorCode < 0x30u || (unsigned __int8)colorCode > 0x37u )
           goto LABEL_47;
-        if ( (v22 & 7) == 7 )
+        if ( (colorCode & 7) == 7 )
         {
-          v57 = *(_DWORD *)a6;
+          color = *(unsigned int *)colorPtr;
         }
         else
         {
-          v23 = *(_BYTE *)(a6 + 3);
-          v57 = s_consoleColorTable[v22 & 7];
-          BYTE3(v57) = v23;
+          savedAlpha = *(byte *)(colorPtr + 3);
+          color = s_consoleColorTable[colorCode & 7];
+          ((byte *)&color)[3] = savedAlpha;
         }
-        ++v14;
+        ++str;
         break;
       case 0xAu:
-        a2 = v63;
-        a3 = a5 * *(float *)(v11 + 20484) + a3;
+        penX = lineStartX;
+        penY = scale * *(float *)(fontInfo + 20484) + penY;
         if ( g_currentAsian )
-          a3 = a3 + 4.0;
+          penY = penY + 4.0f;
         break;
       case 0xDu:
-        a2 = v63;
+        penX = lineStartX;
         break;
       default:
 LABEL_47:
-        CharacterGlyph = R_GetCharacterGlyph(v18, v11);
-        v25 = CharacterGlyph;
-        v56 = v59;
-        if ( v18 > 0xFF )
-          v56 = AsianScale * v59;
-        v60 = v56 * *((float *)CharacterGlyph + 2);
-        v58 = v56 * *((float *)CharacterGlyph + 3);
-        if ( v18 > 0xFF )
-          v60 = v60 + v64;
-        if ( !((a9 == 0.0) | __UNORDERED__(a9, 0.0)) )
-          v58 = (a9 - v56 * *((float *)CharacterGlyph + 4)) * 0.5 + v58;
-        if ( a10 == 3 || a10 == 6 )
+        glyphPtr = R_GetCharacterGlyph(charCode, fontInfo);
+        glyph = glyphPtr;
+        glyphScale = baseScale;
+        if ( charCode > 0xFF )
+          glyphScale = AsianScale * baseScale;
+        yOffset = glyphScale * *((float *)glyphPtr + 2);
+        xOffset = glyphScale * *((float *)glyphPtr + 3);
+        if ( charCode > 0xFF )
+          yOffset = yOffset + asianYAdjust;
+        if ( fixedWidth != 0.0f )
+          xOffset = (fixedWidth - glyphScale * *((float *)glyphPtr + 4)) * 0.5f + xOffset;
+        if ( style == 3 || style == 6 )
         {
-          v26 = CharacterGlyph[9];
-          v55 = v25[11];
-          v27 = v25[8];
-          v67 = (a10 != 3) + 1;
-          v28 = (double)v67;
-          v50 = (float)v25[6];
-          v46 = (float)v25[5];
-          *(float *)&v42 = a3 - v60 + v28;
-          v41 = v28 + v58 + *(float *)&a2;
-          RB_Text_PaintChar(v41, v42, v46, v50, a4, v56, v25[7], v27, v26, v25[10], v55, &v65);
+          shadowS2 = glyphPtr[9];
+          glyphHandleShadow = glyph[11];
+          shadowT1 = glyph[8];
+          scratch = (style != 3) + 1;
+          shadowOffset = (double)scratch;
+          shadowH = (float)glyph[6];
+          shadowW = (float)glyph[5];
+          *(float *)&shadowY = penY - yOffset + shadowOffset;
+          shadowX = shadowOffset + xOffset + penX;
+          RB_Text_PaintChar(shadowX, shadowY, shadowW, shadowH, font, glyphScale, glyph[7], shadowT1, shadowS2, glyph[10], glyphHandleShadow, &shadowColor);
         }
-        v29 = v25[11];
-        v30 = v25[10];
-        v31 = v25[9];
-        *(float *)&v67 = v58 + *(float *)&a2;
-        v32 = *(float *)&v67;
-        v51 = (float)v25[6];
-        v47 = (float)v25[5];
-        *(float *)&v43 = a3 - v60;
-        RB_Text_PaintChar(*(float *)&v67, v43, v47, v51, a4, v56, v25[7], v25[8], v31, v30, v29, &v57);
-        if ( v61 == a7 )
+        glyphHandle = glyph[11];
+        mainT2 = glyph[10];
+        mainS2 = glyph[9];
+        *(float *)&scratch = xOffset + penX;
+        glyphX = *(float *)&scratch;
+        mainH = (float)glyph[6];
+        mainW = (float)glyph[5];
+        *(float *)&mainY = penY - yOffset;
+        RB_Text_PaintChar(*(float *)&scratch, mainY, mainW, mainH, font, glyphScale, glyph[7], glyph[8], mainS2, mainT2, glyphHandle, &color);
+        if ( charIndex == cursorPos )
         {
           if ( !sys_timeBaseInit )
           {
@@ -2644,38 +2240,38 @@ LABEL_47:
           }
           if ( (((int)(timeGetTime() - sys_timeBase) / 256) & 1) != 0 )
           {
-            v33 = 80 * a8;
-            v34 = *(int *)(v33 + v11 + 44);
-            v35 = v11 + v33;
-            v52 = (float)*(int *)(v35 + 24);
-            v48 = (float)*(int *)(v35 + 20);
-            *(float *)&v44 = a3 - v56 * *(float *)(v35 + 8);
+            cursorOffMid = 80 * cursorChar;
+            cursorHandleMid = *(int *)(cursorOffMid + fontInfo + 44);
+            cursorGlyphMid = fontInfo + cursorOffMid;
+            cursorHMid = (float)*(int *)(cursorGlyphMid + 24);
+            cursorWMid = (float)*(int *)(cursorGlyphMid + 20);
+            *(float *)&cursorYMid = penY - glyphScale * *(float *)(cursorGlyphMid + 8);
             RB_Text_PaintChar(
-              v32,
-              v44,
-              v48,
-              v52,
-              a4,
-              v59,
-              *(_DWORD *)(v35 + 28),
-              *(_DWORD *)(v35 + 32),
-              *(_DWORD *)(v35 + 36),
-              *(_DWORD *)(v35 + 40),
-              v34,
-              &v57);
+              glyphX,
+              cursorYMid,
+              cursorWMid,
+              cursorHMid,
+              font,
+              baseScale,
+              *(unsigned int *)(cursorGlyphMid + 28),
+              *(unsigned int *)(cursorGlyphMid + 32),
+              *(unsigned int *)(cursorGlyphMid + 36),
+              *(unsigned int *)(cursorGlyphMid + 40),
+              cursorHandleMid,
+              &color);
           }
         }
-        if ( (a9 == 0.0) | __UNORDERED__(a9, 0.0) )
-          v36 = v56 * *((float *)v25 + 4) + *(float *)&a2;
+        if ( fixedWidth == 0.0f )
+          nextX = glyphScale * *((float *)glyph + 4) + penX;
         else
-          v36 = *(float *)&a2 + a9;
-        *(float *)&a2 = v36;
-        ++v61;
+          nextX = penX + fixedWidth;
+        penX = nextX;
+        ++charIndex;
         break;
     }
-    v15 = v66;
+    len = savedLen;
   }
-  if ( a7 == v15 )
+  if ( cursorPos == len )
   {
     if ( !sys_timeBaseInit )
     {
@@ -2684,203 +2280,195 @@ LABEL_47:
     }
     if ( (((int)(timeGetTime() - sys_timeBase) / 256) & 1) != 0 )
     {
-      v37 = 80 * a8;
-      v38 = *(int *)(v37 + v11 + 44);
-      v39 = v11 + v37;
-      v54 = (float)*(int *)(v39 + 24);
-      v53 = (float)*(int *)(v39 + 20);
-      *(float *)&v49 = a3 - v59 * *(float *)(v39 + 8);
-      v45 = v58 + *(float *)&a2;
+      cursorOffEnd = 80 * cursorChar;
+      cursorHandleEnd = *(int *)(cursorOffEnd + fontInfo + 44);
+      cursorGlyphEnd = fontInfo + cursorOffEnd;
+      cursorHEnd = (float)*(int *)(cursorGlyphEnd + 24);
+      cursorWEnd = (float)*(int *)(cursorGlyphEnd + 20);
+      *(float *)&cursorYEnd = penY - baseScale * *(float *)(cursorGlyphEnd + 8);
+      cursorXEnd = xOffset + penX;
       RB_Text_PaintChar(
-        v45,
-        v49,
-        v53,
-        v54,
-        a4,
-        v59,
-        *(_DWORD *)(v39 + 28),
-        *(_DWORD *)(v39 + 32),
-        *(_DWORD *)(v39 + 36),
-        *(_DWORD *)(v39 + 40),
-        v38,
-        &v57);
+        cursorXEnd,
+        cursorYEnd,
+        cursorWEnd,
+        cursorHEnd,
+        font,
+        baseScale,
+        *(unsigned int *)(cursorGlyphEnd + 28),
+        *(unsigned int *)(cursorGlyphEnd + 32),
+        *(unsigned int *)(cursorGlyphEnd + 36),
+        *(unsigned int *)(cursorGlyphEnd + 40),
+        cursorHandleEnd,
+        &color);
     }
   }
   RE_SetColor(0);
-  return v15;
+  return len;
 }
 
 /* ---- RB_Text_Paint  0x004D82B0 ----  VERIFIED */
-int __cdecl RB_Text_Paint(int a1)
+int __cdecl RB_Text_Paint(int cmd)
 {
-  return a1
+  return cmd
        + ((RB_Text_PaintWithCursor(
-             (const char *)(a1 + 37),
-             *(_DWORD *)(a1 + 4),
-             *(float *)(a1 + 8),
-             *(_DWORD *)(a1 + 12),
-             *(float *)(a1 + 16),
-             a1 + 20,
-             *(_DWORD *)(a1 + 32),
-             *(_BYTE *)(a1 + 36),
-             *(float *)(a1 + 24),
-             *(_DWORD *)(a1 + 28))
+             *(float *)(cmd + 4),
+             *(float *)(cmd + 8),
+             *(unsigned int *)(cmd + 12),
+             *(float *)(cmd + 16),
+             cmd + 20,
+             (const char *)(cmd + 37),
+             *(unsigned int *)(cmd + 32),
+             *(byte *)(cmd + 36),
+             *(float *)(cmd + 24),
+             *(unsigned int *)(cmd + 28))
          + 41)
         & 0xFFFFFFFC);
 }
 
 /* ---- RB_DrawSurfs  0x004D82F0 ----  VERIFIED */
-int *__cdecl RB_DrawSurfs(void *a1, int *a2)
+int *__cdecl RB_DrawSurfs(int *data)
 {
+  drawSurfsCommand_t *cmd = (drawSurfsCommand_t *)data;
+
   if ( tess_numIndexes )
     RB_EndSurface();
-  qmemcpy(&unk_16D89C0, a2 + 1, 0x188u);
-  qmemcpy(backEnd_viewParms_originX, a2 + 99, 0x260u);
-  RB_RenderDrawSurfList(a2[252], a2[251]);
-  return a2 + 253;
+  memcpy(BACKEND, cmd->refdef, 0x188u);                    /* backEnd.refdef   = cmd->refdef   */
+  memcpy(backEnd_viewParms_originX, &cmd->viewParms, 0x260u);  /* backEnd.viewParms = cmd->viewParms */
+  RB_RenderDrawSurfList(cmd->numDrawSurfs, (int)cmd->drawSurfs);
+  return (int *)(cmd + 1);
 }
 
 /* ---- RB_DrawBuffer  0x004D8350 ----  VERIFIED */
-int __cdecl RB_DrawBuffer(int a1)
+int __cdecl RB_DrawBuffer(int data)
 {
+  drawBufferCommand_t *cmd = (drawBufferCommand_t *)data;
   GLclampf blue;
 
-  glDrawBuffer(*(_DWORD *)(a1 + 4));
+  glDrawBuffer(cmd->buffer);
   if ( r_clear->integer )
   {
-    blue = tr_identityLight * 0.5;
+    blue = tr_identityLight * 0.5f;
     glClearColor(tr_identityLight, 0.0, blue, 1.0);
-    glClear(0x4100u);
+    glClear(0x4100u);                                       /* GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT */
   }
-  return a1 + 8;
+  return (int)(cmd + 1);
 }
 
-/* ---- RB_ShowImages  0x004D83A0 ----  [HIGH] */
+/* ---- RB_ShowImages  0x004D83A0 ----  [HIGH]
+ * Draw every loaded image as a tile over the screen (texture-thrash test).
+ * Each image is bound onto the show-images shader's first stage, then a single
+ * quad is emitted directly into the (empty) tess buffers. */
 void RB_ShowImages()
 {
-  int i;
-  int v1;
-  double v2;
-  double v3;
-  double v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
+  int    i;
+  rfloat w, h, y;   /* kept on the x87 stack in retail, never rounded */
+  float  x;         /* the only fstp'd term (var_C) */
+  int    start;
+  int    end;
 
   if ( !backEnd_projection2D )
     RB_SetGL2D();
   glClear(0x4000u);
   qglFinish();
-  v8 = ri_Milliseconds();
-  GL_Bind((GLenum *)tr_screenImage);
-  glCopyTexSubImage2D(0xDE1u, 0, 0, 0, 0, 0, dwStyle, dwExStyle);
+  start = ri.Milliseconds();
+  GL_Bind((image_t *)tr_screenImage);
+  glCopyTexSubImage2D(0xDE1u, 0, 0, 0, 0, 0, glConfig_vidWidth, glConfig_vidHeight);
+
   for ( i = 0; i < tr_numImages; ++i )
   {
-    v1 = dword_16C9840[i];
-    if ( !*(_DWORD *)(v1 + 104) )
+    if ( ((image_t *)tr_imageSlots[i])->TMU )   /* only images not bound to a fixed TMU */
+      continue;
+
+    /* point the show-images shader's first stage at this image */
+    *(int *)(*(int *)(tr_showImagesShader + 340) + 4) = tr_imageSlots[i];   /* stage[0] image */
+    RB_BeginSurface((void *)tr_showImagesShader, 3);
+
+    w = (rfloat)glConfig_vidWidth  * 0.03125f;       /* / 32 */
+    h = (rfloat)glConfig_vidHeight * 0.041666668f;   /* / 24: float 1/24 = 0x3D2AAAAB (flt_569094) */
+    x = i % 32 * w;
+    y = i / 32 * h;
+    if ( r_showImages->integer == 2 )                /* proportional to upload size */
     {
-      *(_DWORD *)(*(_DWORD *)(tr_showImagesShader + 340) + 4) = v1;
-      RB_BeginSurface((void *)tr_showImagesShader, 3);   /* 0x004D8448: mov ecx,tr_showImagesShader / push edi, edi=3 from 0x004D840C */
-      v2 = (double)(int)dwStyle * 0.03125;
-      v3 = (double)(int)dwExStyle * 0.041666668;
-      *(float *)&v7 = (double)(i % 32) * v2;
-      v4 = (double)(i / 32) * v3;
-      if ( r_showImages->integer == 2 )
-      {
-        v5 = dword_16C9840[i];
-        v2 = v2 * (double)*(unsigned __int16 *)(v5 + 68) * 0.0009765625;
-        v3 = v3 * (double)*(unsigned __int16 *)(v5 + 70) * 0.0009765625;
-      }
-      flt_17BFF64[0] = v4;
-      tess_texCoords0[0] = 0;
-      dword_17DFF64[0] = 0;
-      dword_17BFF60[0] = v7;
-      flt_17BFF6C = *(float *)&v7 + v2;
-      dword_17BFF68[0] = 0;
-      dword_17DFF68[0] = 1065353216;
-      flt_17BFF70 = v4;
-      dword_17DFF6C[0] = 0;
-      dword_17BFF74 = 0;
-      flt_17BFF78 = flt_17BFF6C;
-      dword_17DFF70[0] = 1065353216;
-      dword_17DFF74[0] = 1065353216;
-      dword_17BFF80 = 0;
-      dword_17DFF78[0] = 0;
-      dword_17DFF7C[0] = 1065353216;
-      dword_17BFF84 = v7;
-      dword_17BFF8C = 0;
-      flt_17BFF7C = v4 + v3;
-      tess_indexes[0] = 0;
-      flt_17BFF88 = flt_17BFF7C;
-      word_17A7F62[0] = 1;
-      word_17A7F64[0] = 3;
-      word_17A7F66[0] = 3;
-      word_17A7F68[0] = 1;
-      word_17A7F6A[0] = 2;
-      tess_numIndexes = 6;
-      tess_numVertexes = 4;
-      RB_EndSurface();
+      w = w * ((image_t *)tr_imageSlots[i])->uploadWidth  * 0.0009765625f;   /* / 1024 */
+      h = h * ((image_t *)tr_imageSlots[i])->uploadHeight * 0.0009765625f;
     }
+
+    tess_texCoords0[0] = 0.0f;  tess_texCoords0[1] = 0.0f;
+    tess_xyz[0]  = x;           tess_xyz[1]  = y;      tess_xyz[2]  = 0.0f;
+    tess_texCoords0[2] = 1.0f;  tess_texCoords0[3] = 0.0f;
+    tess_xyz[3]  = x + w;       tess_xyz[4]  = y;      tess_xyz[5]  = 0.0f;
+    tess_texCoords0[4] = 1.0f;  tess_texCoords0[5] = 1.0f;
+    tess_xyz[6]  = x + w;       tess_xyz[7]  = y + h;  tess_xyz[8]  = 0.0f;
+    tess_texCoords0[6] = 0.0f;  tess_texCoords0[7] = 1.0f;
+    tess_xyz[9]  = x;           tess_xyz[10] = y + h;  tess_xyz[11] = 0.0f;
+
+    tess_indexes[0] = 0;  tess_indexes[1] = 1;  tess_indexes[2] = 3;
+    tess_indexes[3] = 3;  tess_indexes[4] = 1;  tess_indexes[5] = 2;
+    tess_numIndexes  = 6;
+    tess_numVertexes = 4;
+    RB_EndSurface();
   }
+
   qglFinish();
-  v6 = ri_Milliseconds();
-  ri_Printf(0, "%i msec to draw all images\n", v6 - v8);
+  end = ri.Milliseconds();
+  ri.Printf(0, "%i msec to draw all images\n", end - start);
 }
 
-/* ---- RB_SaveScreen  0x004D8620 ----  [HIGH] */
-int __cdecl RB_SaveScreen(int a3)
+/* ---- RB_SaveScreen  0x004D8620 ----  [HIGH]
+ * Copy the framebuffer into tr.screenImage and record its size ratios
+ * (SMax/TMax hold float bit patterns in int slots). */
+int __cdecl RB_SaveScreen(int data)
 {
-  void *a1;
-  int result;
+  saveScreenCommand_t *cmd = (saveScreenCommand_t *)data;
 
   if ( !backEnd_projection2D )
     RB_SetGL2D();
   if ( tess_numVertexes )
     RB_EndSurface();
   RB_EndMultitexture();
-  GL_Bind((GLenum *)tr_screenImage);
-  glCopyTexSubImage2D(0xDE1u, 0, 0, 0, 0, 0, dwStyle, dwExStyle);
+  GL_Bind((image_t *)tr_screenImage);
+  glCopyTexSubImage2D(0xDE1u, 0, 0, 0, 0, 0, glConfig_vidWidth, glConfig_vidHeight);
   tr_screenImageSaveTime = backEnd_refdef_time;
-  result = a3 + 4;
-  *(float *)&tr_screenImageSMax = (double)(int)dwStyle / (double)tr_screenImageWidth;
-  *(float *)&tr_screenImageTMax = (double)(int)dwExStyle / (double)tr_screenImageHeight;
-  return result;
+  *(float *)&tr_screenImageSMax = (double)(int)glConfig_vidWidth  / (double)tr_screenImageWidth;
+  *(float *)&tr_screenImageTMax = (double)(int)glConfig_vidHeight / (double)tr_screenImageHeight;
+  return (int)(cmd + 1);
 }
 
-/* ---- RB_BlendSavedScreen  0x004D86B0 ----  VERIFIED */
-int __cdecl RB_BlendSavedScreen(int a2)
+/* ---- RB_BlendSavedScreen  0x004D86B0 ----  VERIFIED
+ * Fade the saved screen back in over cmd->duration ms as a full-screen quad
+ * (white with a decaying alpha). */
+int __cdecl RB_BlendSavedScreen(int data)
 {
-  int v2;
-  long double v3;
-  float v5;
-  float v6;
-  int v7; // [esp+24h] [ebp-14h] BYREF
-  float v8;
-  int v9;
-  double v10;
+  blendSavedScreenCommand_t *cmd = (blendSavedScreenCommand_t *)data;
+  int    elapsed;
+  int    duration;
+  rfloat frac;
+  float  scaledAlpha;
+  byte   color[4];                     /* white, decaying alpha */
 
   if ( !backEnd_projection2D )
     RB_SetGL2D();
-  v2 = *(_DWORD *)(a2 + 4);
-  v7 = backEnd_refdef_time - tr_screenImageSaveTime;
-  v8 = *(float *)&v2;
-  if ( backEnd_refdef_time - tr_screenImageSaveTime < v2 )
+
+  elapsed  = backEnd_refdef_time - tr_screenImageSaveTime;
+  duration = cmd->duration;
+  if ( elapsed < duration )
   {
-    v3 = pow(0.009999999776482582, (double)v7 / (double)SLODWORD(v8));
-    if ( v3 > 0.99000001 )
-      v3 = 0.99000001;
-    LOWORD(v7) = -1;
-    v8 = v3 * 255.0;
-    BYTE2(v7) = -1;
-    v10 = 9.313225746154785e-10;
-    v9 = (int)(v8 + 9.313225746154785e-10);
-    BYTE3(v7) = v9;
-    v6 = (float)(int)dwExStyle;
-    v5 = (float)(int)dwStyle;
-    RB_DrawStretchPic(tr_screenImageShader, &v7, 0.0, 0.0, v5, v6, 0, tr_screenImageTMax, tr_screenImageSMax, 0, &v7);
+    frac = pow(0.009999999776482582, (double)elapsed / (double)duration);
+    if ( frac > 0.99000001f )                /* float clamp flt_569020 = 0x3F7D70A4 */
+      frac = 0.99000001f;
+    color[0] = 255;
+    color[1] = 255;
+    color[2] = 255;
+    scaledAlpha = frac * 255.0f;
+    /* FastRound (cl_console_mp.c) inlined at 0x004D8722-0x004D873A: fld float / fadd
+     * qword 2^-30 / fistp -- round-to-nearest, not the truncating __ftol2 of an (int)
+     * cast.  Spelled as the call (not a local asm copy) so this frame keeps retail's
+     * 8-byte-aligned layout. */
+    color[3] = FastRound( scaledAlpha );
+    RB_DrawStretchPic(0.0, 0.0, (float)glConfig_vidWidth, (float)glConfig_vidHeight,
+                      0.0f, tr_screenImageTMax, tr_screenImageSMax, 0.0f, tr_screenImageShader, (int *)color);
   }
-  return a2 + 8;
+  return (int)(cmd + 1);
 }
 
 static const float s_overdrawColors[14][3] =
@@ -2903,236 +2491,170 @@ static const float s_overdrawColors[14][3] =
 static const GLint s_overdrawStencilRefs[14] =
 	{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 20, 40, 80, 200 };
 
-/* ---- RB_SwapBuffers  0x004D8790 ----  VERIFIED */
-int __cdecl RB_SwapBuffers(void *a1, const char *a2, int a4)
+/* ---- RB_SwapBuffers  0x004D8790 ----  VERIFIED
+ * Flush debug geometry, optionally measure/colorize stencil overdraw, then end
+ * the frame. */
+int __cdecl RB_SwapBuffers(int data)
 {
-  int integer;
-  int v5;
-  unsigned __int8 *v6;
-  signed int v7;
-  GLint *v8;
-  float *v9;
-  double v10;
-  unsigned __int64 v11; // rax
-  double v12;
-  int v13;
-  int v15;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
+  swapBuffersCommand_t *cmd = (swapBuffersCommand_t *)data;
+  int            i;
+  long           sum;
+  unsigned char *stencilReadback;
 
   if ( tess_numIndexes )
     RB_EndSurface();
   if ( cls_rendererStarted )
   {
-    if ( dword_15CA640 )
-      dword_1432920(dword_15CA640, cls_debugStringCount);
-    if ( dword_15CA650 )
-      dword_1432924(dword_15CA650, cls_debugLineCount);
+    if ( cls_debugStrings )
+      re_LocateDebugStrings(cls_debugStrings, cls_debugStringCount);
+    if ( cls_debugLines )
+      re_LocateDebugLines(cls_debugLines, cls_debugLineCount);
   }
-  RB_DrawDebug(a2);
+  RB_DrawDebug();
   CL_FlushDebugData( 0 );
   if ( r_showImages->integer )
     RB_ShowImages();
-  integer = r_measureOverdraw->integer;
-  if ( integer )
+
+  if ( r_measureOverdraw->integer )
   {
-    v5 = 0;
-    v19 = 0;
-    if ( integer >= 2 )
+    sum = 0;
+
+    /* sum the stencil buffer to count overdraw */
+    if ( r_measureOverdraw->integer >= 2 )
     {
-      v6 = (unsigned __int8 *)ri_Hunk_AllocateTempMemory(dwStyle * dwExStyle);
-      glReadPixels(0, 0, dwStyle, dwExStyle, 0x1901u, 0x1401u, v6);
-      v7 = 0;
-      if ( (int)(dwStyle * dwExStyle) > 0 )
-      {
-        do
-          v5 += v6[v7++];
-        while ( v7 < (int)(dwStyle * dwExStyle) );
-        v19 = v5;
-      }
-      backEnd_pc_overdrawSum = (double)v19 + backEnd_pc_overdrawSum;
-      ri_Hunk_FreeTempMemory(v6);
+      stencilReadback = (unsigned char *)ri.Hunk_AllocateTempMemory(glConfig_vidWidth * glConfig_vidHeight);
+      glReadPixels(0, 0, glConfig_vidWidth, glConfig_vidHeight, 0x1901u, 0x1401u, stencilReadback);   /* GL_STENCIL_INDEX, GL_UNSIGNED_BYTE */
+      for ( i = 0; i < glConfig_vidWidth * glConfig_vidHeight; i++ )
+        sum += stencilReadback[i];
+      backEnd_pc_overdrawSum = (rfloat)sum + backEnd_pc_overdrawSum;
+      ri.Hunk_FreeTempMemory(stencilReadback);
     }
+
+    /* colorize overdraw levels as stacked full-screen quads */
     if ( r_measureOverdraw->integer != 2 )
     {
       RB_SetGL2D();
       RB_BeginImmediateMode();
       GL_State(65554);
-      GL_Bind((GLenum *)tr_whiteImage);
-      if ( glState_faceCulling != 2 )
-      {
-        glDisable(0xB44u);
-        glState_faceCulling = 2;
-      }
+      GL_Bind((image_t *)tr_whiteImage);
+      GL_Cull(2);                                    /* CT_TWO_SIDED */
       qglLoadIdentity();
-      glStencilOp(0x1E00u, 0x1E00u, 0x1E00u);
-      v8 = (GLint *)&s_overdrawStencilRefs[13];
-      v9 = (float *)&s_overdrawColors[13][2];
-      do
+      glStencilOp(0x1E00u, 0x1E00u, 0x1E00u);       /* GL_KEEP x3 */
+
+      for ( i = 13; i >= 0; i-- )
       {
-        glStencilFunc(0x206u, *v8, 0xFFFFFFFF);
-        v10 = *(v9 - 1) * 255.0;
-        rbDebug_immediateColorR = (unsigned __int64)(*(v9 - 2) * 255.0);
-        v11 = (unsigned __int64)v10;
-        v12 = *v9 * 255.0;
-        rbDebug_immediateColorG = v11;
-        rbDebug_immediateColorB = (unsigned __int64)v12;
-        rbDebug_immediateColorA = -1;
-        mode = 9;
-        RB_glVertex3f(0, 0, 0);
-        *(float *)&v15 = (float)(int)dwStyle;
-        RB_glVertex3f(v15, 0, 0);
-        *(float *)&v17 = (float)(int)dwExStyle;
-        *(float *)&v16 = (float)(int)dwStyle;
-        RB_glVertex3f(v16, v17, 0);
-        *(float *)&v18 = (float)(int)dwExStyle;
-        RB_glVertex3f(0, v18, 0);
-        glDrawArrays(mode, 0, rbDebug_immediateVertexCount);
-        v9 -= 3;
-        --v8;
-        rbDebug_immediateVertexCount = 0;
-        mode = 0;
+        glStencilFunc(0x206u, s_overdrawStencilRefs[i], 0xFFFFFFFF);   /* GL_EQUAL */
+        RB_glColor3fv(s_overdrawColors[i]);
+        RB_glBegin(9);                               /* GL_POLYGON */
+        RB_glVertex2f(0.0f, 0.0f);
+        RB_glVertex2f((float)glConfig_vidWidth, 0.0f);
+        RB_glVertex2f((float)glConfig_vidWidth, (float)glConfig_vidHeight);
+        RB_glVertex2f(0.0f, (float)glConfig_vidHeight);
+        RB_glEnd();
       }
-      while ( v9 >= &s_overdrawColors[0][2] );
-      rbDebug_immediateModeActive = 0;
-      if ( !backEnd_projection2D && (glState_glStateBits & 0x200000) == 0 )
-      {
-        if ( r_fog->integer )
-        {
-          v13 = dword_16C4BB0;
-          if ( (backEnd_refdef_rdflags & 8) == 0 )
-            v13 = glfogNum;
-          if ( v13 )
-          {
-            glEnable(0xB60u);
-            glState_glStateBits |= 0x200000u;
-          }
-        }
-      }
-      glVertexPointer(3, 0x1406u, 0, tess_xyz);
+
+      RB_EndImmediateMode();
     }
   }
+
   if ( !glState_finishCalled )
     qglFinish();
   if ( Stream )
     fprintf(Stream, "%s", (int)"***************** RB_SwapBuffers *****************\n\n\n");
-  if ( r_swapDelay->integer )
+  if ( !r_swapDelay->integer )
+  {
+    GLimp_EndFrame();
+    backEnd_projection2D = 0;
+  }
+  else
   {
     qglFlush();
     backEnd_projection2D = 0;
     backEnd_endFramePending = 1;
   }
-  else
-  {
-    GLimp_EndFrame();
-    backEnd_projection2D = 0;
-  }
-  return a4 + 4;
+  return (int)(cmd + 1);
 }
 
-/* ---- RB_ExecuteRenderCommands  0x004D8AB0 ----  [HIGH] */
-int __cdecl RB_ExecuteRenderCommands(_DWORD *a1, const char *a2)
+/* ---- RB_ExecuteRenderCommands  0x004D8AB0 ----  [HIGH]
+ * Walk the render-command list, dispatching each command to its RB_* handler
+ * until RC_END_OF_LIST (or an unknown id).  Each handler returns the pointer to
+ * the next command. */
+void __cdecl RB_ExecuteRenderCommands( const void *data )
 {
-  int v3;
-  void *v4;
-  unsigned int v5;
-  _DWORD *v6;
-  int result;
+  int t1, t2;
 
-  v3 = ri_Milliseconds();
+  t1 = ri.Milliseconds();
   if ( backEnd_endFramePending )
   {
     backEnd_endFramePending = 0;
     GLimp_EndFrame();
   }
-  v4 = (void *)tr_dynamicBufferFrameSerial;
-  backEnd_dynamicBuffer_freeBytes = backEnd_dynamicBuffer_capacity;
+
+  backEnd_dynamicBuffer_freeBytes          = backEnd_dynamicBuffer_capacity;
   backEnd_dynamicBuffer_allocationSequence = 0;
-  backEnd_dynamicBuffer_reclaimSequence = 1;
-  backEnd_dynamicBuffer_allocations[0] = -1;
-  backEnd_dynamicBuffer_currentOffset = 0;
-  backEnd_dynamicBuffer_frameSerial = tr_dynamicBufferFrameSerial;
-  v5 = *a1 - 1;
-  while ( 2 )
+  backEnd_dynamicBuffer_reclaimSequence    = 1;
+  backEnd_dynamicBuffer_allocations[0]     = -1;
+  backEnd_dynamicBuffer_currentOffset      = 0;
+  backEnd_dynamicBuffer_frameSerial        = tr_dynamicBufferFrameSerial;
+
+  while ( 1 )
   {
-    switch ( v5 )
+    switch ( *(const int *)data )
     {
-      case 0u:
-        backEnd_color2D = a1[1];
-        a1 += 2;
-        goto LABEL_17;
-      case 1u:
-        a2 = (const char *)a1[1];
-        RB_DrawStretchPic(
-          (int)a2,
-          (void *)a1[2],
-          *((float *)a1 + 2),
-          *((float *)a1 + 3),
-          *((float *)a1 + 4),
-          *((float *)a1 + 5),
-          a1[6],
-          a1[7],
-          a1[8],
-          a1[9],
-          &backEnd_color2D);
-        a1 += 10;
-        goto LABEL_17;
-      case 2u:
-        v6 = (_DWORD *)RB_StretchPicGradient((int)a1, v4);
-        goto LABEL_16;
-      case 3u:
-        v6 = (_DWORD *)RB_StretchPicRotate((int)a1, v4);
-        goto LABEL_16;
-      case 4u:
-        v6 = RB_DrawQuadPic(a1, v4);
-        goto LABEL_16;
-      case 5u:
-        a1 = (_DWORD *)((char *)a1
-                      + ((RB_Text_PaintWithCursor(
-                            (const char *)a1 + 37,
-                            a1[1],
-                            *((float *)a1 + 2),
-                            a1[3],
-                            *((float *)a1 + 4),
-                            (int)(a1 + 5),
-                            a1[8],
-                            *((_BYTE *)a1 + 36),
-                            *((float *)a1 + 6),
-                            a1[7])
-                        + 41)
-                       & 0xFFFFFFFC));
-        goto LABEL_17;
-      case 6u:
-        a2 = (const char *)a1;
-        v6 = RB_DrawSurfs(v4, a1);
-        goto LABEL_16;
-      case 7u:
-        v6 = (_DWORD *)RB_DrawBuffer((int)a1);
-        goto LABEL_16;
-      case 8u:
-        v6 = (_DWORD *)RB_SaveScreen((int)a1);
-        goto LABEL_16;
-      case 9u:
-        v6 = (_DWORD *)RB_BlendSavedScreen((int)a1);
-        goto LABEL_16;
-      case 0xAu:
-        v6 = (_DWORD *)RB_SwapBuffers(v4, a2, (int)a1);
-LABEL_16:
-        a1 = v6;
-LABEL_17:
-        v5 = *a1 - 1;
-        if ( v5 > 0xA )
-          goto LABEL_18;
-        continue;
+      case RC_SET_COLOR:
+        data = (const void *)RB_SetColor((setColorCommand_t *)data);
+        break;
+      case RC_STRETCH_PIC:
+        data = (const void *)RB_StretchPic((int)data);
+        break;
+      case RC_STRETCH_PIC_GRADIENT:
+        data = (const void *)RB_StretchPicGradient((int)data);
+        break;
+      case RC_STRETCH_PIC_ROTATE:
+        data = (const void *)RB_StretchPicRotate((int)data);
+        break;
+      case RC_DRAW_QUAD_PIC:
+        data = RB_DrawQuadPic((unsigned int *)data);
+        break;
+      case RC_TEXT_PAINT:
+        /* RB_Text_Paint, expanded: calling it gives its out-of-line copy a frame pad */
+        data = (const char *)data
+             + ((RB_Text_PaintWithCursor(
+                   ((const float *)data)[1],
+                   ((const float *)data)[2],
+                   ((const int *)data)[3],
+                   ((const float *)data)[4],
+                   (int)((const int *)data + 5),
+                   (const char *)data + 37,
+                   ((const int *)data)[8],
+                   ((const unsigned char *)data)[36],
+                   ((const float *)data)[6],
+                   ((const int *)data)[7])
+               + 41)
+              & 0xFFFFFFFC);
+        break;
+      case RC_DRAW_SURFS:
+        data = RB_DrawSurfs((int *)data);
+        break;
+      case RC_DRAW_BUFFER:
+        data = (const void *)RB_DrawBuffer((int)data);
+        break;
+      case RC_SAVE_SCREEN:
+        data = (const void *)RB_SaveScreen((int)data);
+        break;
+      case RC_BLEND_SAVED_SCREEN:
+        data = (const void *)RB_BlendSavedScreen((int)data);
+        break;
+      case RC_SWAP_BUFFERS:
+        data = (const void *)RB_SwapBuffers((int)data);
+        break;
+      case RC_END_OF_LIST:
       default:
-LABEL_18:
-        backEnd_pc_msec = ri_Milliseconds() - v3;
-        result = backEnd_dynamicBuffer_frameSerial;
+        t2 = ri.Milliseconds();
+        backEnd_pc_msec = t2 - t1;
         if ( tr_dynamicBufferMaxFrameSerial < backEnd_dynamicBuffer_frameSerial )
           tr_dynamicBufferMaxFrameSerial = backEnd_dynamicBuffer_frameSerial;
-        return result;
+        return;
     }
   }
 }

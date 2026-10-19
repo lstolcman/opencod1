@@ -89,7 +89,7 @@ typedef struct token_s {
 	int subtype;                    /* +1028 */
 	unsigned long intvalue;         /* +1032 */
 	                                /* +1036 -- alignment hole, real */
-	double floatvalue;              /* +1040 -- Q3 spells this `long double` */
+	long double floatvalue;              /* +1040 -- Q3 spells this `long double` */
 	char *whitespace_p;             /* +1048 */
 	char *endwhitespace_p;          /* +1052 */
 	int line;                       /* +1056 */
@@ -161,7 +161,7 @@ typedef struct source_s {
 	void **definehash;              /* +536  */
 	void *indentstack;              /* +540  */
 	int skip;                       /* +544  */
-	int _pad548;                    /* +548 -- alignment for the token below */
+	int pad_0x224;                  /* +548 -- alignment for the token below */
 	token_t token;                  /* +552  */
 } source_t;                         /* 1624 bytes */
 
@@ -185,13 +185,11 @@ typedef struct pc_token_s {
 
 #define MAX_SOURCEFILES 64
 
-/* l_precomp_mp.c 0x0043F660 -- __fastcall, with the define string arriving in
- * EDX and ECX dead, the same shape as StripDoubleQuotes.  Both syscall
+/* l_precomp_mp.c 0x0043F660 -- the define string arrives in EDX.  Both syscall
  * dispatchers reach it with a bare `mov edx,[ebp+4]` and no push
- * (0x00418B23, 0x00403298).  The convention has to be in the prototype: a
- * plain `extern int PC_AddGlobalDefine();` emits a call to the undecorated
- * cdecl name, which the real body does not answer. */
-int __fastcall PC_AddGlobalDefine( int unused, const char *string );
+ * (0x00418B23, 0x00403298): plain cdecl, given EDX by LTCG like
+ * PC_DefineFromString. */
+int PC_AddGlobalDefine( const char *string );
 
 /* l_precomp_pc.c -- the menu/script loader front end.  All three of these are
  * __usercall in retail and are given SOURCE order here; see that file. */
@@ -212,9 +210,9 @@ void PC_CheckOpenSourceHandles( void );
  * botlib/l_script.c and is declared here in RTCW SOURCE order; see the banner
  * in l_script_mp.c for the retail register binding of each.
  *
- * PS_ReadToken (0x00442FB0) is RTCW's PS_ReadToken with PS_ReadPrimitive
- * inlined into its SCFL_PRIMITIVE arm; there is no separate PS_ReadPrimitive
- * in the binary.
+ * PS_ReadToken (0x00442FB0) is RTCW's PS_ReadToken, whose SCFL_PRIMITIVE arm
+ * tail-calls (0x004430BA) RTCW's PS_ReadPrimitive at 0x00442F30 (IDB
+ * loc_442F30, filed as a chunk of PS_ReadToken).
  */
 void    PS_CreatePunctuationTable( script_t *script, punctuation_t *punctuations );
 char   *PunctuationFromNum( script_t *script, int num );
@@ -225,10 +223,11 @@ int     PS_ReadWhiteSpace( script_t *script );
 int     PS_ReadEscapeCharacter( script_t *script, char *ch );
 int     PS_ReadString( script_t *script, token_t *token, int quote );
 int     PS_ReadName( script_t *script, token_t *token );
-void    NumberValue( char *string, int subtype, unsigned long *intvalue, double *floatvalue );
+void    NumberValue( char *string, int subtype, unsigned long *intvalue, long double *floatvalue );
 int     PS_ReadNumber( script_t *script, token_t *token );
 int     PS_ReadLiteral( script_t *script, token_t *token );
 int     PS_ReadPunctuation( script_t *script, token_t *token );
+int     PS_ReadPrimitive( script_t *script, token_t *token );
 int     PS_ReadToken( script_t *script, token_t *token );
 int     PS_ExpectTokenString( script_t *script, char *string );
 int     PS_ExpectTokenType( script_t *script, int type, int subtype, token_t *token );
@@ -251,12 +250,13 @@ script_t *LoadScriptMemory( char *ptr, int length, char *name );
 void    FreeScript( script_t *script );
 void    PS_SetBaseFolder( char *path );
 
-/* StripDoubleQuotes / StripSingleQuotes are __fastcall in retail with the
- * string arriving in EDX and ECX dead -- see the note on their definitions in
- * l_script_mp.c.  The prototype MUST carry the convention: a plain
- * `extern int StripDoubleQuotes();` emits a call to the undecorated cdecl
- * _StripDoubleQuotes, which the real body does not answer. */
-unsigned int __fastcall StripDoubleQuotes( int unused, char *string );
-unsigned int __fastcall StripSingleQuotes( int unused, char *string );
+/* RTCW's one-parameter form; LTCG passes the string in EDX (see the note on
+ * their definitions in l_script_mp.c). */
+void    StripDoubleQuotes( char *string );
+void    StripSingleQuotes( char *string );
+
+/* the script base folder (botlib/l_precomp_mp.c, 0x01646560): PC_SetBaseFolder writes it,
+   LoadScriptFile and the precompiler read it */
+extern char pc_baseFolder[64];
 
 #endif /* __L_SCRIPT_H__ */

@@ -104,16 +104,49 @@ typedef struct {
     const void  *initial_ptr;
 } AILSOUNDINFO;
 
+/* ADPCMDATA / AILMIXINFO, the Miles SDK mixer source record that
+ * AIL_size_processed_digital_audio / AIL_process_digital_audio take (an
+ * AILSOUNDINFO followed by the ADPCM decode state).  120 bytes: retail
+ * MSS_LoadSoundFile (0x0044FC10) keeps one on the stack -- its 0x8C frame and
+ * /GS cookie come from moresamples[]. */
+typedef struct {
+    U32             blocksize;
+    U32             extrasamples;
+    U32             blockleft;
+    U32             step;
+    U32             savesrc;
+    U32             sample;
+    U32             destend;
+    U32             srcend;
+    U32             samplesL;
+    U32             samplesR;
+    unsigned short  moresamples[16];
+} ADPCMDATA;
+
+typedef struct {
+    AILSOUNDINFO    Info;
+    ADPCMDATA       mss_adpcm;
+    U32             src_fract;
+    S32             left_val;
+    S32             right_val;
+} AILMIXINFO;
+
 
 /* ---- startup, shutdown, preferences ---- */
-S32           __stdcall AIL_startup( void );
-void          __stdcall AIL_shutdown( void );
-const char *  __stdcall AIL_last_error( void );
-S32           __stdcall AIL_set_preference( U32 number, S32 value );
-void          __stdcall AIL_set_redist_directory( const char *dir );
-void          __stdcall AIL_set_file_callbacks( AIL_FILE_OPEN_CB opencb, AIL_FILE_CLOSE_CB closecb, AIL_FILE_SEEK_CB seekcb, AIL_FILE_READ_CB readcb );
-HDIGDRIVER    __stdcall AIL_open_digital_driver( U32 frequency, S32 bits, S32 channels, U32 flags );
-void          __stdcall AIL_set_DirectSound_HWND( HDIGDRIVER dig, void *hwnd );
+__declspec( dllimport ) S32           __stdcall AIL_startup( void );
+__declspec( dllimport ) void          __stdcall AIL_shutdown( void );
+/* RAD's mss32.lib also carries a small static object: MSS_auto_cleanup()
+ * registers AIL_shutdown with atexit (through a cdecl stub), and the SDK
+ * header routes AIL_startup() through it (retail MSS_Init, 0x0044FEAF).
+ * Our import library is rebuilt from mss32.def, so snd_miles.c defines it. */
+int __cdecl MSS_auto_cleanup( void );
+__declspec( dllimport ) const char *  __stdcall AIL_last_error( void );
+#define AIL_startup()   ( MSS_auto_cleanup(), AIL_startup() )
+__declspec( dllimport ) S32           __stdcall AIL_set_preference( U32 number, S32 value );
+__declspec( dllimport ) void          __stdcall AIL_set_redist_directory( const char *dir );
+__declspec( dllimport ) void          __stdcall AIL_set_file_callbacks( AIL_FILE_OPEN_CB opencb, AIL_FILE_CLOSE_CB closecb, AIL_FILE_SEEK_CB seekcb, AIL_FILE_READ_CB readcb );
+__declspec( dllimport ) HDIGDRIVER    __stdcall AIL_open_digital_driver( U32 frequency, S32 bits, S32 channels, U32 flags );
+__declspec( dllimport ) void          __stdcall AIL_set_DirectSound_HWND( HDIGDRIVER dig, void *hwnd );
 /* S32, NOT F32, and this one is worth spelling out.  Published Miles headers
  * declare AIL_digital_CPU_percent as returning F32, but retail MSS_Update does
  *
@@ -124,81 +157,81 @@ void          __stdcall AIL_set_DirectSound_HWND( HDIGDRIVER dig, void *hwnd );
  * frame and overflow it after eight, turning the whole mix into NaNs; retail's
  * sound works, so this build of Miles returns an integer percent.  The
  * decoration is @4 either way, so the link cannot catch a mistake here. */
-S32           __stdcall AIL_digital_CPU_percent( HDIGDRIVER dig );
+__declspec( dllimport ) S32           __stdcall AIL_digital_CPU_percent( HDIGDRIVER dig );
 
 /* ---- 2D samples ---- */
-HSAMPLE       __stdcall AIL_allocate_sample_handle( HDIGDRIVER dig );
-void          __stdcall AIL_release_sample_handle( HSAMPLE S );
-void          __stdcall AIL_init_sample( HSAMPLE S );
-void          __stdcall AIL_set_sample_type( HSAMPLE S, S32 format, U32 flags );
-void          __stdcall AIL_set_sample_address( HSAMPLE S, const void *start, U32 len );
-void          __stdcall AIL_set_sample_adpcm_block_size( HSAMPLE S, U32 blocksize );
-void          __stdcall AIL_set_sample_playback_rate( HSAMPLE S, S32 playback_rate );
-S32           __stdcall AIL_sample_playback_rate( HSAMPLE S );
-void          __stdcall AIL_set_sample_volume_pan( HSAMPLE S, F32 volume, F32 pan );
-void          __stdcall AIL_sample_volume_pan( HSAMPLE S, F32 *volume, F32 *pan );
-void          __stdcall AIL_set_sample_loop_count( HSAMPLE S, S32 loops );
-void          __stdcall AIL_set_sample_reverb_levels( HSAMPLE S, F32 dry_level, F32 wet_level );
-void          __stdcall AIL_set_sample_ms_position( HSAMPLE S, S32 milliseconds );
-void          __stdcall AIL_sample_ms_position( HSAMPLE S, S32 *total_ms, S32 *current_ms );
-U32           __stdcall AIL_sample_position( HSAMPLE S );
-void          __stdcall AIL_start_sample( HSAMPLE S );
-void          __stdcall AIL_stop_sample( HSAMPLE S );
-void          __stdcall AIL_resume_sample( HSAMPLE S );
-void          __stdcall AIL_end_sample( HSAMPLE S );
-S32           __stdcall AIL_sample_status( HSAMPLE S );
-S32           __stdcall AIL_sample_buffer_ready( HSAMPLE S );
-void          __stdcall AIL_load_sample_buffer( HSAMPLE S, U32 buff_num, const void *buffer, U32 len );
-S32           __stdcall AIL_minimum_sample_buffer_size( HDIGDRIVER dig, S32 playback_rate, S32 format );
+__declspec( dllimport ) HSAMPLE       __stdcall AIL_allocate_sample_handle( HDIGDRIVER dig );
+__declspec( dllimport ) void          __stdcall AIL_release_sample_handle( HSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_init_sample( HSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_set_sample_type( HSAMPLE S, S32 format, U32 flags );
+__declspec( dllimport ) void          __stdcall AIL_set_sample_address( HSAMPLE S, const void *start, U32 len );
+__declspec( dllimport ) void          __stdcall AIL_set_sample_adpcm_block_size( HSAMPLE S, U32 blocksize );
+__declspec( dllimport ) void          __stdcall AIL_set_sample_playback_rate( HSAMPLE S, S32 playback_rate );
+__declspec( dllimport ) S32           __stdcall AIL_sample_playback_rate( HSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_set_sample_volume_pan( HSAMPLE S, F32 volume, F32 pan );
+__declspec( dllimport ) void          __stdcall AIL_sample_volume_pan( HSAMPLE S, F32 *volume, F32 *pan );
+__declspec( dllimport ) void          __stdcall AIL_set_sample_loop_count( HSAMPLE S, S32 loops );
+__declspec( dllimport ) void          __stdcall AIL_set_sample_reverb_levels( HSAMPLE S, F32 dry_level, F32 wet_level );
+__declspec( dllimport ) void          __stdcall AIL_set_sample_ms_position( HSAMPLE S, S32 milliseconds );
+__declspec( dllimport ) void          __stdcall AIL_sample_ms_position( HSAMPLE S, S32 *total_ms, S32 *current_ms );
+__declspec( dllimport ) U32           __stdcall AIL_sample_position( HSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_start_sample( HSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_stop_sample( HSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_resume_sample( HSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_end_sample( HSAMPLE S );
+__declspec( dllimport ) S32           __stdcall AIL_sample_status( HSAMPLE S );
+__declspec( dllimport ) S32           __stdcall AIL_sample_buffer_ready( HSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_load_sample_buffer( HSAMPLE S, U32 buff_num, const void *buffer, U32 len );
+__declspec( dllimport ) S32           __stdcall AIL_minimum_sample_buffer_size( HDIGDRIVER dig, S32 playback_rate, S32 format );
 
 /* ---- format conversion ---- */
-S32           __stdcall AIL_WAV_info( const void *data, void *info );
-S32           __stdcall AIL_size_processed_digital_audio( U32 dest_rate, S32 dest_format, S32 num_srcs, void *src );
-S32           __stdcall AIL_process_digital_audio( void *dest_buffer, S32 dest_buffer_size, U32 dest_rate, S32 dest_format, S32 num_srcs, void *src );
+__declspec( dllimport ) S32           __stdcall AIL_WAV_info( const void *data, void *info );
+__declspec( dllimport ) S32           __stdcall AIL_size_processed_digital_audio( U32 dest_rate, S32 dest_format, S32 num_srcs, void *src );
+__declspec( dllimport ) S32           __stdcall AIL_process_digital_audio( void *dest_buffer, S32 dest_buffer_size, U32 dest_rate, S32 dest_format, S32 num_srcs, void *src );
 
 /* ---- 3D providers and room effects ---- */
-S32           __stdcall AIL_enumerate_3D_providers( S32 *next, HPROVIDER *dest, char **name );
-S32           __stdcall AIL_open_3D_provider( HPROVIDER lib );
-void          __stdcall AIL_close_3D_provider( HPROVIDER lib );
-S32           __stdcall AIL_3D_provider_attribute( HPROVIDER lib, const char *name, void *val );
-void          __stdcall AIL_set_3D_distance_factor( HPROVIDER lib, F32 factor );
-void          __stdcall AIL_set_3D_room_type( HPROVIDER lib, S32 room_type );
-void          __stdcall AIL_set_digital_master_room_type( HDIGDRIVER dig, S32 room_type );
+__declspec( dllimport ) S32           __stdcall AIL_enumerate_3D_providers( S32 *next, HPROVIDER *dest, char **name );
+__declspec( dllimport ) S32           __stdcall AIL_open_3D_provider( HPROVIDER lib );
+__declspec( dllimport ) void          __stdcall AIL_close_3D_provider( HPROVIDER lib );
+__declspec( dllimport ) S32           __stdcall AIL_3D_provider_attribute( HPROVIDER lib, const char *name, void *val );
+__declspec( dllimport ) void          __stdcall AIL_set_3D_distance_factor( HPROVIDER lib, F32 factor );
+__declspec( dllimport ) void          __stdcall AIL_set_3D_room_type( HPROVIDER lib, S32 room_type );
+__declspec( dllimport ) void          __stdcall AIL_set_digital_master_room_type( HDIGDRIVER dig, S32 room_type );
 
 /* ---- 3D samples ---- */
-H3DSAMPLE     __stdcall AIL_allocate_3D_sample_handle( HPROVIDER lib );
-S32           __stdcall AIL_set_3D_sample_info( H3DSAMPLE S, const void *info );
-void          __stdcall AIL_set_3D_position( H3DSAMPLE S, F32 X, F32 Y, F32 Z );
-void          __stdcall AIL_3D_position( H3DSAMPLE S, F32 *X, F32 *Y, F32 *Z );
-void          __stdcall AIL_set_3D_sample_volume( H3DSAMPLE S, F32 volume );
-F32           __stdcall AIL_3D_sample_volume( H3DSAMPLE S );
-void          __stdcall AIL_set_3D_sample_distances( H3DSAMPLE S, F32 max_dist, F32 min_dist );
-void          __stdcall AIL_set_3D_sample_effects_level( H3DSAMPLE S, F32 level );
-void          __stdcall AIL_set_3D_sample_playback_rate( H3DSAMPLE S, S32 playback_rate );
-S32           __stdcall AIL_3D_sample_playback_rate( H3DSAMPLE S );
-void          __stdcall AIL_set_3D_sample_loop_count( H3DSAMPLE S, U32 loops );
-void          __stdcall AIL_set_3D_sample_offset( H3DSAMPLE S, U32 offset );
-U32           __stdcall AIL_3D_sample_offset( H3DSAMPLE S );
-U32           __stdcall AIL_3D_sample_length( H3DSAMPLE S );
-S32           __stdcall AIL_3D_sample_status( H3DSAMPLE S );
-void          __stdcall AIL_start_3D_sample( H3DSAMPLE S );
-void          __stdcall AIL_stop_3D_sample( H3DSAMPLE S );
-void          __stdcall AIL_resume_3D_sample( H3DSAMPLE S );
-void          __stdcall AIL_end_3D_sample( H3DSAMPLE S );
+__declspec( dllimport ) H3DSAMPLE     __stdcall AIL_allocate_3D_sample_handle( HPROVIDER lib );
+__declspec( dllimport ) S32           __stdcall AIL_set_3D_sample_info( H3DSAMPLE S, const void *info );
+__declspec( dllimport ) void          __stdcall AIL_set_3D_position( H3DSAMPLE S, F32 X, F32 Y, F32 Z );
+__declspec( dllimport ) void          __stdcall AIL_3D_position( H3DSAMPLE S, F32 *X, F32 *Y, F32 *Z );
+__declspec( dllimport ) void          __stdcall AIL_set_3D_sample_volume( H3DSAMPLE S, F32 volume );
+__declspec( dllimport ) F32           __stdcall AIL_3D_sample_volume( H3DSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_set_3D_sample_distances( H3DSAMPLE S, F32 max_dist, F32 min_dist );
+__declspec( dllimport ) void          __stdcall AIL_set_3D_sample_effects_level( H3DSAMPLE S, F32 level );
+__declspec( dllimport ) void          __stdcall AIL_set_3D_sample_playback_rate( H3DSAMPLE S, S32 playback_rate );
+__declspec( dllimport ) S32           __stdcall AIL_3D_sample_playback_rate( H3DSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_set_3D_sample_loop_count( H3DSAMPLE S, U32 loops );
+__declspec( dllimport ) void          __stdcall AIL_set_3D_sample_offset( H3DSAMPLE S, U32 offset );
+__declspec( dllimport ) U32           __stdcall AIL_3D_sample_offset( H3DSAMPLE S );
+__declspec( dllimport ) U32           __stdcall AIL_3D_sample_length( H3DSAMPLE S );
+__declspec( dllimport ) S32           __stdcall AIL_3D_sample_status( H3DSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_start_3D_sample( H3DSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_stop_3D_sample( H3DSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_resume_3D_sample( H3DSAMPLE S );
+__declspec( dllimport ) void          __stdcall AIL_end_3D_sample( H3DSAMPLE S );
 
 /* ---- streams ---- */
-HSTREAM       __stdcall AIL_open_stream( HDIGDRIVER dig, const char *filename, S32 stream_mem );
-void          __stdcall AIL_close_stream( HSTREAM S );
-void          __stdcall AIL_start_stream( HSTREAM S );
-void          __stdcall AIL_pause_stream( HSTREAM S, S32 onoff );
-S32           __stdcall AIL_stream_status( HSTREAM S );
-void          __stdcall AIL_set_stream_playback_rate( HSTREAM S, S32 playback_rate );
-S32           __stdcall AIL_stream_playback_rate( HSTREAM S );
-void          __stdcall AIL_set_stream_volume_pan( HSTREAM S, F32 volume, F32 pan );
-void          __stdcall AIL_stream_volume_pan( HSTREAM S, F32 *volume, F32 *pan );
-void          __stdcall AIL_set_stream_loop_count( HSTREAM S, S32 count );
-void          __stdcall AIL_set_stream_ms_position( HSTREAM S, S32 milliseconds );
-void          __stdcall AIL_stream_ms_position( HSTREAM S, S32 *total_ms, S32 *current_ms );
-void          __stdcall AIL_set_stream_reverb_levels( HSTREAM S, F32 dry_level, F32 wet_level );
+__declspec( dllimport ) HSTREAM       __stdcall AIL_open_stream( HDIGDRIVER dig, const char *filename, S32 stream_mem );
+__declspec( dllimport ) void          __stdcall AIL_close_stream( HSTREAM S );
+__declspec( dllimport ) void          __stdcall AIL_start_stream( HSTREAM S );
+__declspec( dllimport ) void          __stdcall AIL_pause_stream( HSTREAM S, S32 onoff );
+__declspec( dllimport ) S32           __stdcall AIL_stream_status( HSTREAM S );
+__declspec( dllimport ) void          __stdcall AIL_set_stream_playback_rate( HSTREAM S, S32 playback_rate );
+__declspec( dllimport ) S32           __stdcall AIL_stream_playback_rate( HSTREAM S );
+__declspec( dllimport ) void          __stdcall AIL_set_stream_volume_pan( HSTREAM S, F32 volume, F32 pan );
+__declspec( dllimport ) void          __stdcall AIL_stream_volume_pan( HSTREAM S, F32 *volume, F32 *pan );
+__declspec( dllimport ) void          __stdcall AIL_set_stream_loop_count( HSTREAM S, S32 count );
+__declspec( dllimport ) void          __stdcall AIL_set_stream_ms_position( HSTREAM S, S32 milliseconds );
+__declspec( dllimport ) void          __stdcall AIL_stream_ms_position( HSTREAM S, S32 *total_ms, S32 *current_ms );
+__declspec( dllimport ) void          __stdcall AIL_set_stream_reverb_levels( HSTREAM S, F32 dry_level, F32 wet_level );
 
 #endif /* __MSS32_H__ */

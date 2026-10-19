@@ -1,5 +1,23 @@
-# build output + premake-generated projects
-/build/
+# build output (the VC7 comparator the matching tools read is kept, see below)
+/build/*
+!/build/parallel_subsystems_20261011/
+/build/parallel_subsystems_20261011/*
+!/build/parallel_subsystems_20261011/full_original_private_tools026/
+
+# retail game files, IDA databases and decompiles: supply your own copies here
+/references/
+
+# premake-generated projects (generate.bat; they hold machine-specific paths) and VS state
 /src/*.sln
 /src/*.vcxproj
 /src/*.vcxproj.*
+/src/.vs/
+*.user
+*.suo
+
+# local tool output
+__pycache__/
+tools/fidelity/cc/
+tools/fidelity/*.pkl
+*.stackdump
+/docs/build-cleanup-*

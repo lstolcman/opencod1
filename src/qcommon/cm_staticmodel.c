@@ -23,16 +23,13 @@ typedef struct cmStaticModel_t
 } cmStaticModel_t;
 COD1_ASSERT_SIZE( cmStaticModel_t, 84 );
 
-extern int cm_numStaticModels;                   /* 0x016174E0 */
-extern cmStaticModel_t *cm_staticModels;      /* 0x016174E4 */
 
-#define cm_numStaticModels  cm_numStaticModels
-#define cm_staticModels     cm_staticModels
 
-/* universal/com_math.c -- both settled there, both __usercall in retail. */
+/* universal/com_math.c -- settled there, __usercall in retail. */
 void AngleVectors( const vec3_t angles, vec3_t forward, vec3_t right,
 				   vec3_t up );
 void MatrixInverse( const float in[9], float out[9] );
+void AnglesToAxis( const vec3_t angles, vec3_t axis[3] );
 
 void CM_LinkStaticModel( void *link );
 
@@ -40,7 +37,7 @@ typedef void *( *XModelAllocFn )( int size );
 void *XModelPrecache( const char *name, int loadSurfaces, XModelAllocFn alloc,
 					  XModelAllocFn allocMesh );
 
-int XModelGetStaticBounds( void *model, float *mins, const float *axis, float *maxs );
+int XModelGetStaticBounds( void *model, const float *axis, float *mins, float *maxs );
 
 /* ---- CM_Hunk_AllocXModel  0x0041F760 ---- VERIFIED */
 void *CM_Hunk_AllocXModel( int size ) {
@@ -61,9 +58,7 @@ static int CM_StaticModelContents( void *model ) {
 void CM_CreateStaticModel( const char *name, cmStaticModel_t *sm,
 						   const vec3_t origin, const vec3_t angles,
 						   const vec3_t scale ) {
-	float axis[9];
-	vec3_t right;
-	int i;
+	vec3_t axis[3];
 
 	if ( !name || !name[0] ) {
 		Com_Error( ERR_DROP, "\x15" "Invalid static model name\n" );
@@ -88,21 +83,14 @@ void CM_CreateStaticModel( const char *name, cmStaticModel_t *sm,
 	sm->origin[1] = origin[1];
 	sm->origin[2] = origin[2];
 
-	AngleVectors( angles, &axis[0], right, &axis[6] );
+	AnglesToAxis( angles, axis );   /* inlined /Op body: axis[1] stored, then reloaded */
+	VectorScale( axis[0], scale[0], axis[0] );
+	VectorScale( axis[1], scale[1], axis[1] );
+	VectorScale( axis[2], scale[2], axis[2] );
 
-	axis[3] = 0.0f - right[0];
-	axis[4] = 0.0f - right[1];
-	axis[5] = 0.0f - right[2];
+	MatrixInverse( axis[0], sm->inverseAxis );
 
-	for ( i = 0; i < 3; i++ ) {
-		axis[0 + i] *= scale[0];
-		axis[3 + i] *= scale[1];
-		axis[6 + i] *= scale[2];
-	}
-
-	MatrixInverse( axis, sm->inverseAxis );
-
-	if ( !XModelGetStaticBounds( sm->model, sm->linkMins, axis, sm->linkMaxs ) ) {
+	if ( !XModelGetStaticBounds( sm->model, axis[0], sm->linkMins, sm->linkMaxs ) ) {
 		return;
 	}
 
@@ -118,48 +106,67 @@ void CM_CreateStaticModel( const char *name, cmStaticModel_t *sm,
 	}
 }
 
-static char *CM_ParseEntityToken( char **data_p ) {
-	if ( parseInfo->ungetReady ) {
-		parseInfo->ungetReady = qfalse;
-		*data_p = parseInfo->ungetTokenSave;
-		parseInfo->currentLine = parseInfo->ungetLineSave;
-	}
-	return Com_ParseExt( data_p, qtrue );
-}
-
 /* ---- CM_LoadStaticModels  0x0041F950 ---- VERIFIED */
 void CM_LoadStaticModels( void ) {
 	char *data_p;
 	const char *token;
+	/* Retail's key, value and modelName are three adjacent 64-byte frame
+	 * arrays in that order (esp+34h/74h/B4h, then the /GS cookie), filled by
+	 * inlined unbounded strcpy loops (0x0041FBF1, 0x0041FC43). One buffer in
+	 * the same order keeps a 64+ char token running on into the next array.
+	 * VC7 lays the three separate arrays out in retail's order. */
+#ifdef COD1_VC7
 	char key[64];
 	char value[64];
 	char modelName[64];
+#else
+	char kvBuf[3 * 64];
+	char *key = kvBuf;
+	char *value = kvBuf + 64;
+	char *modelName = kvBuf + 128;
+#endif
 	vec3_t origin, angles, scale;
 	qboolean isStaticModel;
-	int cursor;
+	int modelIndex;
 
 	data_p = cm_entityString;
 	cm_numStaticModels = 0;
 	cm_staticModels = NULL;
 
-	while ( *CM_ParseEntityToken( &data_p ) == '{' ) {
+	/* Modern build only: retail (and the VC7 build) leave modelName
+	 * uninitialised stack. Zeroing it once here keeps the never-written
+	 * tail deterministic; it is NOT re-cleared per entity (see below), and
+	 * a first-pass spill into it survives into the second pass, as in
+	 * retail. */
+#ifndef COD1_VC7
+	Com_Memset( modelName, 0, 64 );
+#endif
+
+	for ( ;; ) {
+		token = Com_Parse( &data_p );
+		if ( !token[0] ) {
+			break;
+		}
+		if ( token[0] != '{' ) {
+			break;
+		}
 		isStaticModel = qfalse;
 
 		for ( ;; ) {
-			token = CM_ParseEntityToken( &data_p );
+			token = Com_Parse( &data_p );
 			if ( !token[0] || token[0] == '}' ) {
 				break;
 			}
-			Q_strncpyz( key, token, sizeof( key ) );
+			strcpy( key, token );	/* retail: unbounded */
 
-			token = CM_ParseEntityToken( &data_p );
+			token = Com_Parse( &data_p );
 			if ( !token[0] ) {
 				break;
 			}
-			Q_strncpyz( value, token, sizeof( value ) );
+			strcpy( value, token );	/* retail: unbounded */
 
-			if ( !Q_stricmp( key, "classname" ) &&
-				 !Q_stricmp( value, "misc_model" ) ) {
+			if ( !_stricmp( key, "classname" ) &&
+				 !_stricmp( value, "misc_model" ) ) {
 				isStaticModel = qtrue;
 			}
 		}
@@ -174,49 +181,61 @@ void CM_LoadStaticModels( void ) {
 	}
 
 	cm_staticModels = ( cmStaticModel_t * )
-		Hunk_AllocAlignInternal( 84 * cm_numStaticModels, 32 );
+		CM_Hunk_AllocXModel( 84 * cm_numStaticModels );
 
 	data_p = cm_entityString;
-	cursor = 0;
+	modelIndex = 0;
 
-	while ( *CM_ParseEntityToken( &data_p ) == '{' ) {
-		Com_Memset( modelName, 0, sizeof( modelName ) );
+	for ( ;; ) {
+		token = Com_Parse( &data_p );
+		if ( !token[0] ) {
+			break;
+		}
+		if ( token[0] != '{' ) {
+			break;
+		}
+		/* Retail clears only byte 0 per entity (0x0041FB4A). The name passed
+		 * on is modelName+7, so a "model" value shorter than 7 chars reads
+		 * the stale tail left by an earlier entity, as retail does. */
+		modelName[0] = 0;
 		VectorClear( origin );
 		VectorClear( angles );
-		scale[0] = 1.0f;
-		scale[1] = 1.0f;
-		scale[2] = 1.0f;
+		scale[0] = scale[1] = scale[2] = 1.0f;
 		isStaticModel = qfalse;
 
 		for ( ;; ) {
-			token = CM_ParseEntityToken( &data_p );
+			token = Com_Parse( &data_p );
 			if ( !token[0] || token[0] == '}' ) {
 				break;
 			}
-			Q_strncpyz( key, token, sizeof( key ) );
+			strcpy( key, token );	/* retail: unbounded */
 
-			token = CM_ParseEntityToken( &data_p );
+			token = Com_Parse( &data_p );
 			if ( !token[0] ) {
 				break;
 			}
-			Q_strncpyz( value, token, sizeof( value ) );
+			strcpy( value, token );	/* retail: unbounded */
 
-			if ( !Q_stricmp( key, "classname" ) ) {
-				if ( !Q_stricmp( value, "misc_model" ) ) {
+			if ( !_stricmp( key, "classname" ) ) {
+				if ( !_stricmp( value, "misc_model" ) ) {
 					isStaticModel = qtrue;
 				}
-			} else if ( !Q_stricmp( key, "model" ) ) {
-				Q_strncpyz( modelName, value, sizeof( modelName ) );
-			} else if ( !Q_stricmp( key, "origin" ) ) {
+			} else if ( !_stricmp( key, "model" ) ) {
+				/* Plain non-padding copy: retail byte loop 0x0041FCA0-0x0041FCAE.
+				 * A value of 64+ chars has already run on into modelName, so
+				 * this overlapping copy never meets a NUL and runs off the
+				 * stack, as retail does. */
+				strcpy( modelName, value );
+			} else if ( !_stricmp( key, "origin" ) ) {
 				sscanf( value, "%f %f %f",
 						&origin[0], &origin[1], &origin[2] );
-			} else if ( !Q_stricmp( key, "angles" ) ) {
+			} else if ( !_stricmp( key, "angles" ) ) {
 				sscanf( value, "%f %f %f",
 						&angles[0], &angles[1], &angles[2] );
-			} else if ( !Q_stricmp( key, "modelscale_vec" ) ) {
+			} else if ( !_stricmp( key, "modelscale_vec" ) ) {
 				sscanf( value, "%f %f %f",
 						&scale[0], &scale[1], &scale[2] );
-			} else if ( !Q_stricmp( key, "modelscale" ) ) {
+			} else if ( !_stricmp( key, "modelscale" ) ) {
 				scale[2] = ( float ) atof( value );
 				scale[1] = scale[2];
 				scale[0] = scale[2];
@@ -224,11 +243,9 @@ void CM_LoadStaticModels( void ) {
 		}
 
 		if ( isStaticModel ) {
-			CM_CreateStaticModel( modelName + 7,
-								  ( cmStaticModel_t * )
-								  ( ( byte * ) cm_staticModels + cursor ),
+			CM_CreateStaticModel( modelName + 7, &cm_staticModels[modelIndex],
 								  origin, angles, scale );
-			cursor += 84;
+			modelIndex++;
 		}
 	}
 }
@@ -243,6 +260,8 @@ int XModelTraceLine( void *model, trace_t *work, const float *basePose,
 				int contentmask );
 
 vec_t VectorNormalize( vec3_t v );
+void _VectorSubtract( const vec3_t veca, const vec3_t vecb, vec3_t out );
+void MatrixTransformVector33_m( const vec3_t in, const float m[9], vec3_t out );
 
 /* ---- CM_TraceStaticModel  0x0041FE00 ---- VERIFIED */
 void CM_TraceStaticModel( cmStaticModel_t *sm, trace_t *results,
@@ -250,59 +269,80 @@ void CM_TraceStaticModel( cmStaticModel_t *sm, trace_t *results,
 						  int contentmask ) {
 	trace_t work;
 	vec3_t localStart, localEnd;
-	vec3_t d, n;
+	vec3_t d;
 	void *basePose;
-	int numBones;
-	int hit;
-	int i;
-
-	numBones = XModelNumBones( sm->model );
-	basePose = _alloca( numBones << 6 );
-	XModelGetBasePose( sm->model, basePose );
-
-	for ( i = 0; i < 3; i++ ) {
-		d[i] = start[i] - sm->origin[i];
-	}
-	localStart[0] = d[0] * sm->inverseAxis[0] + d[1] * sm->inverseAxis[3]
-					+ d[2] * sm->inverseAxis[6];
-	localStart[1] = d[0] * sm->inverseAxis[1] + d[1] * sm->inverseAxis[4]
-					+ d[2] * sm->inverseAxis[7];
-	localStart[2] = d[0] * sm->inverseAxis[2] + d[1] * sm->inverseAxis[5]
-					+ d[2] * sm->inverseAxis[8];
-
-	for ( i = 0; i < 3; i++ ) {
-		d[i] = end[i] - sm->origin[i];
-	}
-	localEnd[0] = d[0] * sm->inverseAxis[0] + d[1] * sm->inverseAxis[3]
-				  + d[2] * sm->inverseAxis[6];
-	localEnd[1] = d[0] * sm->inverseAxis[1] + d[1] * sm->inverseAxis[4]
-				  + d[2] * sm->inverseAxis[7];
-	localEnd[2] = d[0] * sm->inverseAxis[2] + d[1] * sm->inverseAxis[5]
-				  + d[2] * sm->inverseAxis[8];
 
 	work.fraction = results->fraction;
 
-	hit = XModelTraceLine( sm->model, &work, (const float *)basePose,
-					  localStart, localEnd, contentmask );
-	if ( hit < 0 ) {
+	basePose = _alloca( XModelNumBones( sm->model ) << 6 );
+	XModelGetBasePose( sm->model, basePose );
+
+	/* Retail association order: (d2*inv[6+j] + d1*inv[3+j]) + d0*inv[j]
+	 * (0x0041FE5A-0x0041FEA2, 0x0041FEBF-0x0041FF1C), d rounded to float by
+	 * the inlined /Op _VectorSubtract. VC7 reassociates these float sums: the
+	 * VC7 source order below is the one it turns into retail's grouping. */
+	_VectorSubtract( start, sm->origin, d );
+#ifdef COD1_VC7
+	localStart[0] = d[2] * sm->inverseAxis[6] + d[0] * sm->inverseAxis[0]
+					+ d[1] * sm->inverseAxis[3];
+	localStart[1] = d[2] * sm->inverseAxis[7] + d[0] * sm->inverseAxis[1]
+					+ d[1] * sm->inverseAxis[4];
+	localStart[2] = d[2] * sm->inverseAxis[8] + d[0] * sm->inverseAxis[2]
+					+ d[1] * sm->inverseAxis[5];
+#else
+	localStart[0] = d[2] * sm->inverseAxis[6] + d[1] * sm->inverseAxis[3]
+					+ d[0] * sm->inverseAxis[0];
+	localStart[1] = d[2] * sm->inverseAxis[7] + d[1] * sm->inverseAxis[4]
+					+ d[0] * sm->inverseAxis[1];
+	localStart[2] = d[2] * sm->inverseAxis[8] + d[1] * sm->inverseAxis[5]
+					+ d[0] * sm->inverseAxis[2];
+#endif
+
+	_VectorSubtract( end, sm->origin, d );
+#ifdef COD1_VC7
+	localEnd[0] = d[2] * sm->inverseAxis[6] + d[0] * sm->inverseAxis[0]
+				  + d[1] * sm->inverseAxis[3];
+	localEnd[1] = d[2] * sm->inverseAxis[7] + d[0] * sm->inverseAxis[1]
+				  + d[1] * sm->inverseAxis[4];
+	localEnd[2] = d[2] * sm->inverseAxis[8] + d[0] * sm->inverseAxis[2]
+				  + d[1] * sm->inverseAxis[5];
+#else
+	localEnd[0] = d[2] * sm->inverseAxis[6] + d[1] * sm->inverseAxis[3]
+				  + d[0] * sm->inverseAxis[0];
+	localEnd[1] = d[2] * sm->inverseAxis[7] + d[1] * sm->inverseAxis[4]
+				  + d[0] * sm->inverseAxis[1];
+	localEnd[2] = d[2] * sm->inverseAxis[8] + d[1] * sm->inverseAxis[5]
+				  + d[0] * sm->inverseAxis[2];
+#endif
+
+	if ( XModelTraceLine( sm->model, &work, (const float *)basePose,
+						  localStart, localEnd, contentmask ) < 0 ) {
 		return;
 	}
 
 	work.entityNum = ENTITYNUM_WORLD;               /* WORD 0x3FE at work+0x28 */
 
-	for ( i = 0; i < 3; i++ ) {
-		work.endpos[i] = start[i] + work.fraction * ( end[i] - start[i] );
-	}
+	_VectorSubtract( end, start, d );               /* float store, retail 0x0041FF32-0x0041FF51 */
+	work.endpos[0] = d[0] * work.fraction + start[0];   /* 0x0041FF54-0x0041FF74 */
+	work.endpos[1] = d[1] * work.fraction + start[1];
+	work.endpos[2] = d[2] * work.fraction + start[2];
 
-	for ( i = 0; i < 3; i++ ) {
-		n[i] = work.normal[0] * sm->inverseAxis[3 * i]
-			   + work.normal[1] * sm->inverseAxis[3 * i + 1]
-			   + work.normal[2] * sm->inverseAxis[3 * i + 2];
-	}
-	VectorNormalize( n );
-	work.normal[0] = n[0];
-	work.normal[1] = n[1];
-	work.normal[2] = n[2];
+	/* Retail association order: (N2*inv[3i+2] + N1*inv[3i+1]) + N0*inv[3i]
+	 * (0x0041FF77-0x0041FFBF); d is reused for the rotated normal. VC7 gives
+	 * retail's grouping only for the inlined com_math helper; written out it
+	 * emits the first pair as N1, N2 (same sum). */
+#ifdef COD1_VC7
+	MatrixTransformVector33_m( work.normal, sm->inverseAxis, d );
+#else
+	d[0] = work.normal[2] * sm->inverseAxis[2] + work.normal[1] * sm->inverseAxis[1]
+		   + work.normal[0] * sm->inverseAxis[0];
+	d[1] = work.normal[2] * sm->inverseAxis[5] + work.normal[1] * sm->inverseAxis[4]
+		   + work.normal[0] * sm->inverseAxis[3];
+	d[2] = work.normal[2] * sm->inverseAxis[8] + work.normal[1] * sm->inverseAxis[7]
+		   + work.normal[0] * sm->inverseAxis[6];
+#endif
+	VectorNormalize( d );
+	VectorCopy( d, work.normal );
 
-	Com_Memcpy( results, &work, sizeof( work ) );   /* rep movsd, ECX = 0x0C */
+	*results = work;                                /* rep movsd, ECX = 0x0C */
 }

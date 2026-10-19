@@ -12,33 +12,27 @@
 extern void Var_Init__Fv( void );
 extern void VM_Init__Fv( void );
 
-extern cvar_t *com_developer_script;
+/* retail keeps these as word handles and two load-flag bytes */
+#define SCR_HANDLE( g )     ( *(unsigned short *)&(g) )
+#define SCR_LOADING_SCRIPTS ( *( (unsigned char *)&scrVarPub_canonicalStrCountAndLoadFlags + 2 ) )
+#define SCR_LOADING_ANIMS   ( *( (unsigned char *)&scrVarPub_canonicalStrCountAndLoadFlags + 3 ) )
 
-extern int      scrVarPub_developer;
-extern int      scrVarPub_developerScript;
-extern int      dword_8E60BC;
-extern int      scrCompilePub_scriptsPos;
-extern int      scrCompilePub_loadedScripts;
-extern int      scrAnimPub_treeRoot;
+unsigned char   scr_inited;
 
-#define SCR_LOADING_FLAGS_MASK      0xFFFF0000
-
-qboolean        scr_inited;
-
-unsigned short  scr_timeArrayId;
+/* scr_timeArrayId is defined in scr_vm.cpp */
 
 int             scr_loading;
 
 /* ---- Scr_Init  0x004758F0 ---- VERIFIED */
-void Scr_Init( void ) {
-	scrVarPub_developer = com_developer ? com_developer->integer : 0;
-	scrVarPub_developerScript = com_developer_script ? com_developer_script->integer : 0;
+void Scr_Init( int developer, int developerScript ) {
+	scrVarPub_developer = developer;
+	scrVarPub_developerScript = developerScript;
 
 	Var_Init__Fv();
 	VM_Init__Fv();
 
-	/* retail zeroes the two bytes at 0x008E60BE/BF individually */
-	dword_8E60BC &= ~SCR_LOADING_FLAGS_MASK;
+	SCR_LOADING_SCRIPTS = 0;                    /* byte 0x008E60BE */
+	SCR_LOADING_ANIMS = 0;                      /* byte 0x008E60BF */
 	scrCompilePub_scriptsPos = 0;
 	scrCompilePub_loadedScripts = 0;
 	scrAnimPub_treeRoot = 0;

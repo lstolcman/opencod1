@@ -5,6 +5,4 @@
  * NOT YET RECONSTRUCTED.
  */
 
-#include "../qcommon/cod1_types.h"
-
 typedef int Fxexport_placeholder_t;

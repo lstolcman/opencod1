@@ -1,19 +1,5 @@
-/*
- * bg_pmove.c -- both games player movement code.
- *
- * Call of Duty 1.1 multiplayer (game_mp_x86.dll, 0x20006FF0-0x2000C7F3).  RTCW's
- * game/bg_pmove.c is the direct ancestor and most of what follows is its text;
- * CoD's changes are local and named where they appear -- prone, lean, the
- * viewheight lerp tables, foliage, ladders and the per-playerState speed scales
- * that replaced RTCW's flat pm_duckScale/pm_runScale pair.
- *
- * The movement constants below are the retail values read out of the .rdata
- * block at 0x20055D28; they are NOT RTCW's (pm_friction is 5.5, not 6, and
- * pm_accelerate is 9, not 10).  Declaration order is the order MSVC emitted
- * them in.
- *
- * @fidelity: likely
- */
+// bg_pmove.c -- both games player movement code
+// takes a playerstate and a usercmd as input and returns a modifed playerstate
 
 #include "bg_local.h"
 
@@ -21,57 +7,52 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Every symbol below is a real function or global in this DLL; no header this
- * file includes declares it. */
-float VectorNormalize2( const vec3_t v, vec3_t out );           /* 0x20013A60 */
-float VectorNormalize2D( vec3_t v );                            /* 0x200138C0 */
-float vectoyaw( const vec3_t vec );                             /* 0x20013EF0 */
-void vectoangles( const vec3_t value1, vec3_t angles );         /* 0x20014110 */
-float AngleNormalize360( float angle );                         /* 0x20015F40 */
-float AngleNormalize180( float angle );                         /* 0x20015F70 */
-float PitchOfVectorAlongYaw( float yaw, const vec3_t normal );    /* 0x20017060 */
-void ProjectPointOntoVector( const vec3_t vDir, vec3_t vProj, const vec3_t point ); /* 0x20016830 */
-float UnGetLeanFraction( float f );                             /* 0x2003F220 */
-void AddLeanToPosition( vec3_t pos, float yaw, float leanFrac, float leanDist, float scale ); /* 0x2003F240 */
-void Com_Printf( const char *fmt, ... );                        /* 0x200262E0 */
+// float bit helpers; keep: extern, not static, matches original codegen
+float PM_FloatAbs( float value ) {
+	int bits;
+
+	bits = *(int *)&value & 0x7FFFFFFF;
+	return *(float *)&bits;
+}
+
+int PM_FloatIsNegative( float value ) {
+	return *(int *)&value < 0;
+}
+
+int PM_FloatSign( float value ) {
+	return 1 - PM_FloatIsNegative( value ) * 2;
+}
+
+float VectorNormalize2( const vec3_t v, vec3_t out );
+float VectorNormalize2D( vec3_t v );
+float vectoyaw( const vec3_t vec );
+void vectoangles( const vec3_t value1, vec3_t angles );
+float AngleNormalize360( float angle );
+float AngleNormalize180( float angle );
+float AngleDelta( float angle1, float angle2 );
+vec_t Distance( const vec3_t p1, const vec3_t p2 );
+float PitchOfVectorAlongYaw( float yaw, const vec3_t normal );
+void ProjectPointOntoVector( const vec3_t vDir, vec3_t vProj, const vec3_t point );
+void Com_Printf( const char *fmt, ... );
 void trap_SnapVector( float *v );
+extern const vec4_t colorWhite;
 void trap_AddDebugLine( const vec3_t start, const vec3_t end, const vec3_t color,
 						int depthTest, int duration );
 
-/*
- * The prone view clamp draws in both builds; only the spelling differs, so the
- * split is a conditional on the symbol.  CG_DebugArc is cg_drawtools.c
- * 0x3001A3B0 and PM_UpdateViewAngles calls it at 0x3000B743; g_debugProneCheck
- * is read at 0x3000A2EF (PM_CheckDuck) and 0x3000B5EF.
- *
- * Seven parameters: five stack dwords (`add esp,14h` at 0x3000B748) plus
- * org@eax and duration@ebx; CG_DebugArc's own trap call reads depthTest from
- * arg_10 and duration from ebx (0x3001A4A9).
- */
+// the prone view clamp can draw itself in both games
 #ifdef CGAMEDLL
 #define G_DebugArc          CG_DebugArc
 #define g_debugProneCheck   cg_debugProneCheck
 #endif
 
 void G_DebugArc( const vec3_t origin, float radius, float startAngle, float endAngle,
-				 const vec3_t color, int depthTest, int duration );    /* 0x200212C0 */
+				 const vec3_t color, int depthTest, int duration );
 
-/* BG_AnimScriptAnimation 0x20003020, BG_AnimScriptEvent 0x200031F0 -- both
- * declared in bg_public.h. */
-void BG_UpdateConditionValue( int client, int condition, int value, qboolean checkConversion ); /* 0x20003290 */
-void BG_AnimUpdatePlayerStateConditions( pmove_t *pmove );      /* 0x200033E0 */
-int BG_CheckProneValid( int clientNum, const vec3_t origin, float radius, float height,
-						float yaw, float *groundOffset, float *pitchDown, float *pitchUp,
-						qboolean skipInitialTrace, qboolean allowFallback,
-						const vec3_t groundNormal,
-						void ( *traceFunc )( trace_t *, const vec3_t, const vec3_t, const vec3_t, const vec3_t, int, int ),
-						void ( *traceDownFunc )( trace_t *, const vec3_t, const vec3_t, const vec3_t, const vec3_t, int, int ),
-						qboolean useAltContentMask );           /* 0x20006010 */
+void BG_UpdateConditionValue( int client, int condition, int value, qboolean checkConversion );
+void BG_AnimUpdatePlayerStateConditions( pmove_t *pmove );
 
-/* universal/q_shared.c */
 int Q_ftol( float f );
 
-/* g_main_mp.c cvar table */
 extern vmCvar_t bg_viewheight_standing;
 extern vmCvar_t bg_duck2prone_time;
 extern vmCvar_t bg_prone2duck_time;
@@ -87,84 +68,27 @@ extern vmCvar_t bg_fallDamageMinHeight;
 extern vmCvar_t bg_fallDamageMaxHeight;
 extern vmCvar_t g_debugProneCheck;
 
-/* Constants that belong in a header. */
-#define PITCH   0
-#define YAW     1
-#define ROLL    2
-
-#define MAX_CLIENTS         64
-#define ENTITYNUM_NONE      1023
-#define ENTITYNUM_WORLD     1022
-
 #define SHORT2ANGLE( x )    ( ( x ) * ( 360.0f / 65536 ) )
 #define ANGLE2SHORT( x )    ( (int)( ( x ) * ( 65536 / 360.0f ) ) & 65535 )
 
-/* Q3/RTCW surfaceflags, unchanged in CoD; the surface type is the 5-bit field
- * at bit 20 (universal/surfaceflags.c). */
-#define SURF_NODAMAGE       0x1
-#define SURF_SLICK          0x2
-#define SURF_LADDER         0x8
-#define SURF_NOSTEPS        0x2000
-#define SURF_TYPE( flags )  ( ( ( flags ) >> 20 ) & 0x1F )
-
-#define CONTENTS_WATER      0x20
-#define CONTENTS_BODY       0x2000000
-#define MASK_PLAYERSOLID    0x2810191
-
-/* The pm_flags names live in bg_local.h -- one spelling per bit, shared with
-   bg_weapon.c. */
-
-/* eFlags bits this unit touches. */
-#define EF_FIRING           0x400
-#define EF_CROUCHING        0x20
-#define EF_PRONE            0x40
-#define EF_UPDATE_BOUNDS    0x10
-#define EF_TALK             0x40000
-#define EF_TURRET_ACTIVE_PRONE      0x4000
-#define EF_TURRET_ACTIVE_DUCK       0x8000
-#define EF_TURRET_ACTIVE_MASK       ( EF_TURRET_ACTIVE_PRONE | EF_TURRET_ACTIVE_DUCK )
-
-/* usercmd_t.buttons / .wbuttons bits used here. */
-#define BUTTON_ATTACK       0x1
+// usercmd_t button bits used here
 #define BUTTON_TALK         0x2
-#define BUTTON_ADS          0x10
-#define WBUTTON_STUNNED     0x4     /* PM_CmdScale_Walk 0x20007628 */
-#define WBUTTON_LEAN_LEFT   0x10
-#define WBUTTON_LEAN_RIGHT  0x20
-#define WBUTTON_PRONE       0x40
-#define WBUTTON_CROUCH      0x80
-#define WBUTTON_NOSTANCEEVENT   0x2 /* held-stance repeat; suppresses the blocked-stance event */
+#define WBUTTON_STUNNED     0x4
+#define WBUTTON_NOSTANCEEVENT   0x2 // held-stance repeat; suppresses the blocked-stance event
 
-/* Events this unit raises.  Only the numbers are recovered. */
-#define EV_FOOTSTEP             1   /* + surface type */
-#define EV_SWIM                 21
-#define EV_FOOTSTEP_WALKING     24  /* + surface type */
-#define EV_FOOTSTEP_WADE        44
-#define EV_FOOTSTEP_PRONE       47  /* + surface type */
-#define EV_SWIM_PRONE           67
-#define EV_JUMP                 70  /* + surface type */
-#define EV_JUMP_LADDER          83
-#define EV_LANDING_HARD         93  /* + surface type */
-#define EV_LANDING_DAMAGE       116 /* + surface type */
-#define EV_FOLIAGE_SOUND        139
-#define EV_STANCE_FORCE_STAND   140
-#define EV_STANCE_FORCE_CROUCH  141
-#define EV_STANCE_FORCE_PRONE   142
-#define EV_STEP                 143
-#define EV_WATER_TOUCH          144
-#define EV_WATER_LEAVE          145
+// PM_GetEffectiveStance results
+#define PM_EFF_STANCE_DEFAULT   0
+#define PM_EFF_STANCE_PRONE     1
+#define PM_EFF_STANCE_DUCKED    2
 
-#define MIN_WALK_NORMAL     0.7f    /* can't walk on very steep slopes */
+#define MIN_WALK_NORMAL     0.7f    // can't walk on very steep slopes
 #define STEPSIZE            18
 #define OVERCLIP            1.001f
 
-/*
- * ---- file-local state ----------------------------------------------------
- */
-pmove_t     *pm;                /* 0x2014ECD0 */
-pml_t pml;                      /* 0x2014EB20 */
+pmove_t     *pm;
+pml_t pml;
 
-/* movement parameters -- retail values, .rdata 0x20055D28..0x20055D68 */
+// movement parameters
 const float pm_stopspeed        = 100;
 const float pm_ladderScale      = 0.5f;
 const float pm_ladderPushOff    = 128;
@@ -183,10 +107,7 @@ const float pm_ladderfriction   = 16;
 const float pm_spectatorfriction = 5.0f;
 const float pm_shellshockScale  = 0.4f;
 
-/* The 26 unit-cube neighbours PM_CorrectAllSolid jitters through, .rdata
- * 0x20055D70.  RTCW built them with three nested -1..1 loops; CoD tabled them
- * and dropped the {0,0,0} centre.  The name is inferred (United Offensive's);
- * it is not a recovered symbol. */
+// the neighbours PM_CorrectAllSolid jitters through
 const vec3_t pm_correctSolidOffsets[26] = {
 	{  0,  0,  1 }, { -1,  0,  1 }, {  0, -1,  1 }, {  1,  0,  1 },
 	{  0,  1,  1 }, { -1,  0,  0 }, {  0, -1,  0 }, {  1,  0,  0 },
@@ -197,12 +118,9 @@ const vec3_t pm_correctSolidOffsets[26] = {
 	{  1,  1, -1 }, { -1,  1, -1 }
 };
 
-int c_pmove = 0;                /* 0x200A06A0 */
+int c_pmove = 0;
 
-/*
- * One row of a viewheight interpolation table.  File-local: nothing outside
- * this unit reaches the tables.
- */
+// one row of a viewheight interpolation table
 typedef struct pmLerpEntry_t
 {
 	int percent;
@@ -212,7 +130,7 @@ typedef struct pmLerpEntry_t
 
 #define PM_LERP_TABLE_END   -1
 
-static float PM_GetViewHeightLerp( int fromViewheight, int toViewheight );
+static rfloat PM_GetViewHeightLerp( int toViewheight, int fromViewheight );
 
 /*
 ===============
@@ -285,23 +203,16 @@ coming down still counts as prone.
 ==============
 */
 int PM_GetEffectiveStance( const playerState_t *ps ) {
-	if ( ps->pm_flags & PMF_PRONE ) {
-		return 1;
+	if ( ( ps->pm_flags & PMF_PRONE ) || ps->viewHeightLerpTarget == ps->proneViewHeight
+		 || ( ps->viewHeightLerpTime && ps->viewHeightLerpTarget == ps->crouchViewHeight
+			  && !ps->viewHeightLerpDown ) ) {
+		return PM_EFF_STANCE_PRONE;
 	}
-	if ( ps->viewHeightLerpTarget == ps->proneViewHeight ) {
-		return 1;
+	if ( ( ps->pm_flags & PMF_DUCKED )
+		 || ( ps->viewHeightLerpTime && ps->viewHeightLerpTarget == ps->crouchViewHeight ) ) {
+		return PM_EFF_STANCE_DUCKED;
 	}
-	if ( ps->viewHeightLerpTime && ps->viewHeightLerpTarget == ps->crouchViewHeight
-		 && !ps->viewHeightLerpDown ) {
-		return 1;
-	}
-	if ( ps->pm_flags & PMF_DUCKED ) {
-		return 2;
-	}
-	if ( ps->viewHeightLerpTime && ps->viewHeightLerpTarget == ps->crouchViewHeight ) {
-		return 2;
-	}
-	return 0;
+	return PM_EFF_STANCE_DEFAULT;
 }
 
 /*
@@ -314,8 +225,8 @@ Handles both ground friction and water friction
 static void PM_Friction( void ) {
 	vec3_t vec;
 	float   *vel;
-	float speed, newspeed, control;
-	float drop;
+	rfloat speed, newspeed, control;    // keep: rfloat temporaries match original codegen
+	rfloat drop;
 
 	vel = pm->ps->velocity;
 
@@ -324,7 +235,8 @@ static void PM_Friction( void ) {
 		vec[2] = 0; // ignore slope movement
 	}
 
-	speed = VectorLength( vec );
+	// keep: inlined VectorLength, summed z, y, x
+	speed = (rfloat)sqrt( (rfloat)vec[2] * vec[2] + (rfloat)vec[1] * vec[1] + (rfloat)vec[0] * vec[0] );
 	if ( speed < 1 ) {
 		vel[0] = 0;
 		vel[1] = 0;     // allow sinking underwater
@@ -391,7 +303,10 @@ static void PM_Accelerate( const vec3_t wishdir, float wishspeed, float accel ) 
 		accelspeed = addspeed;
 	}
 	if ( pm->ps->groundEntityNum != ENTITYNUM_NONE ) {
-		accelspeed *= 1.0f / pm->ps->friction;
+		rfloat frictionScale;
+
+		frictionScale = (rfloat)1.0f / pm->ps->friction;
+		accelspeed *= frictionScale;
 	}
 	if ( accelspeed > addspeed ) {
 		accelspeed = addspeed;
@@ -413,8 +328,7 @@ without getting a sqrt(2) distortion in speed.
 */
 static float PM_CmdScale( const usercmd_t *cmd ) {
 	int max;
-	float total;
-	float scale;
+	rfloat scale;
 
 	max = abs( cmd->forwardmove );
 	if ( abs( cmd->rightmove ) > max ) {
@@ -427,10 +341,10 @@ static float PM_CmdScale( const usercmd_t *cmd ) {
 		return 0;
 	}
 
-	total = (float)sqrt( (double)( cmd->forwardmove * cmd->forwardmove
-								   + cmd->rightmove * cmd->rightmove
-								   + cmd->upmove * cmd->upmove ) );
-	scale = (float)pm->ps->speed * max / ( total * 127.0f );
+	scale = (rfloat)pm->ps->speed * max
+			/ ( FCAST( sqrt( (double)( cmd->forwardmove * cmd->forwardmove
+									   + cmd->rightmove * cmd->rightmove
+									   + cmd->upmove * cmd->upmove ) ) ) * 127.0f );
 
 	if ( pm->ps->pm_flags & PMF_WALKING ) {
 		scale *= pm->ps->walkSpeedScale;
@@ -453,73 +367,78 @@ static float PM_CmdScale( const usercmd_t *cmd ) {
 PM_CmdScale_Walk
 
 The walking counterpart of PM_CmdScale: no upmove, and the per-axis, per-stance
-and per-weapon scales out of the playerState replace RTCW's flat pm_duckScale.
+and per-weapon scales come out of the playerState.
 ============
 */
 static float PM_CmdScale_Walk( const usercmd_t *cmd ) {
 	int fmove, smove;
-	float forwardTerm, strafeTerm, moveMag;
-	float scale;
-	float lerp;
+	rfloat forwardTerm, moveMag;    // keep: rfloat temporaries match original codegen
+	float strafeTerm;
+	float base;
+	rfloat scale;
+	rfloat lerp;
 	int effectiveStance;
 	const weaponInfo_t *weaponInfo;
 
 	fmove = cmd->forwardmove;
-	if ( fmove < 0 ) {
-		forwardTerm = fmove * pm->ps->backSpeedScale;
+	// keep: a fabs per arm matches original codegen
+	if ( cmd->forwardmove < 0 ) {
+		forwardTerm = fabs( (rfloat)fmove * pm->ps->backSpeedScale );
 	} else {
-		forwardTerm = (float)fmove;
+		forwardTerm = fabs( fmove );
 	}
 	smove = cmd->rightmove;
-	forwardTerm = PM_FloatAbs( forwardTerm );
 
-	strafeTerm = PM_FloatAbs( smove * pm->ps->strafeSpeedScale );
+	strafeTerm = (float)fabs( (rfloat)smove * pm->ps->strafeSpeedScale );
 
-	moveMag = forwardTerm;
-	if ( moveMag <= strafeTerm ) {
+	if ( forwardTerm > strafeTerm ) {
+		moveMag = forwardTerm;
+	} else {
 		moveMag = strafeTerm;
 	}
 	if ( moveMag == 0 ) {
 		return 0;
 	}
 
-	scale = (float)pm->ps->speed * moveMag
-			/ ( (float)sqrt( (double)( fmove * fmove + smove * smove ) ) * 127.0f );
+	scale = (rfloat)pm->ps->speed * moveMag
+			/ ( FCAST( sqrt( (double)( fmove * fmove + smove * smove ) ) ) * 127.0f );
 
 	if ( pm->ps->pm_flags & PMF_WALKING ) {
-		scale *= pm->ps->walkSpeedScale;
+		base = (float)( scale * pm->ps->walkSpeedScale );
 	} else {
-		scale *= pm->ps->runSpeedScale;
+		base = (float)( scale * pm->ps->runSpeedScale );
 		if ( pm->ps->leanf != 0 ) {
-			scale *= pm->ps->leanSpeedScale;
+			base = base * pm->ps->leanSpeedScale;
 		}
 	}
 
 	if ( pm->ps->pm_type == PM_NOCLIP ) {
-		scale *= 3;
+		scale = (rfloat)base * 3;
 	} else if ( pm->ps->pm_type == PM_UFO ) {
-		scale *= 6;
+		scale = (rfloat)base * 6;
 	} else {
 		effectiveStance = PM_GetEffectiveStance( pm->ps );
 
-		lerp = PM_GetViewHeightLerp( pm->ps->proneViewHeight, pm->ps->crouchViewHeight );
+		lerp = PM_GetViewHeightLerp( pm->ps->crouchViewHeight, pm->ps->proneViewHeight );
 		if ( lerp != 0 ) {
 			scale = ( ( 1.0f - lerp ) * pm->ps->crouchSpeedScale
-					  + lerp * pm->ps->proneSpeedScale ) * scale;
+					  + lerp * pm->ps->proneSpeedScale ) * base;
 		} else {
-			lerp = PM_GetViewHeightLerp( pm->ps->crouchViewHeight, pm->ps->proneViewHeight );
+			lerp = PM_GetViewHeightLerp( pm->ps->proneViewHeight, pm->ps->crouchViewHeight );
 			if ( lerp != 0 ) {
 				scale = ( ( 1.0f - lerp ) * pm->ps->proneSpeedScale
-						  + lerp * pm->ps->crouchSpeedScale ) * scale;
-			} else if ( effectiveStance == 1 ) {
-				scale *= pm->ps->proneSpeedScale;
-			} else if ( effectiveStance == 2 ) {
-				scale *= pm->ps->crouchSpeedScale;
+						  + lerp * pm->ps->crouchSpeedScale ) * base;
+			} else if ( effectiveStance == PM_EFF_STANCE_PRONE ) {
+				scale = (rfloat)base * pm->ps->proneSpeedScale;
+			} else if ( effectiveStance == PM_EFF_STANCE_DUCKED ) {
+				scale = (rfloat)base * pm->ps->crouchSpeedScale;
+			} else {
+				scale = base;
 			}
 		}
 
 		if ( pm->waterlevel ) {
-			scale *= 1.0f - pm->waterlevel * 0.33333334f * ( 1.0f - pm_waterSwimScale );
+			scale *= 1.0f - FCAST( (rfloat)pm->waterlevel * 0.33333334f ) * ( 1.0f - pm_waterSwimScale );
 		}
 	}
 
@@ -534,25 +453,24 @@ static float PM_CmdScale_Walk( const usercmd_t *cmd ) {
 		scale *= pm_shellshockScale;
 	}
 
-	return scale;
+	return (float)scale;
 }
 
 /*
 ================
 PM_SetMovementDir
 
-Determine the rotation of the legs relative to the facing dir.  RTCW picked one
-of eight compass directions; CoD stores the signed angle, clamped to +-90.
+Determine the rotation of the legs reletive
+to the facing dir
 ================
 */
 static void PM_SetMovementDir( void ) {
 	vec3_t moved;
 	vec3_t dir;
-	vec3_t angles;
 	float len;
 	int movementDir;
 
-	if ( ( pm->ps->pm_flags & PMF_PRONE ) && !( pm->ps->eFlags & EF_TURRET_ACTIVE_MASK ) ) {
+	if ( ( pm->ps->pm_flags & PMF_PRONE ) && !( pm->ps->eFlags & EF_TURRET_ACTIVE ) ) {
 		movementDir = (int)AngleNormalize180( pm->ps->proneDirection - pm->ps->viewangles[YAW] );
 		if ( abs( movementDir ) > 90 ) {
 			movementDir = movementDir > 0 ? 90 : -90;
@@ -562,8 +480,7 @@ static void PM_SetMovementDir( void ) {
 	}
 
 	if ( pm->ps->pm_flags & PMF_LADDER ) {
-		movementDir = (int)AngleNormalize180( vectoyaw( pm->ps->vLadderVec ) + 180.0f
-											  - pm->ps->viewangles[YAW] );
+		movementDir = (int)AngleDelta( vectoyaw( pm->ps->vLadderVec ) + 180.0f, pm->ps->viewangles[YAW] );
 		if ( abs( movementDir ) > 90 ) {
 			movementDir = movementDir > 0 ? 90 : -90;
 		}
@@ -571,30 +488,27 @@ static void PM_SetMovementDir( void ) {
 		return;
 	}
 
-	if ( ( !pm->cmd.forwardmove && !pm->cmd.rightmove )
-		 || pm->ps->groundEntityNum == ENTITYNUM_NONE ) {
-		pm->ps->movementDir = 0;
-		return;
-	}
-
 	VectorSubtract( pm->ps->origin, pml.previous_origin, moved );
-	len = VectorLength( moved );
-	if ( len == 0 || pml.frametime * 5.0f >= len ) {
+	// keep: inlined VectorLength and FCAST match original codegen
+	if ( ( pm->cmd.forwardmove || pm->cmd.rightmove )
+		 && pm->ps->groundEntityNum != ENTITYNUM_NONE
+		 && ( len = FCAST( (float)sqrt( moved[0] * moved[0] + moved[1] * moved[1]
+										+ moved[2] * moved[2] ) ) ) != 0
+		 && pml.frametime * 5.0f < len ) {
+		VectorNormalize2( moved, dir );
+		vectoangles( dir, dir );
+
+		movementDir = (int)AngleNormalize180( dir[YAW] - pm->ps->viewangles[YAW] );
+		if ( pm->cmd.forwardmove < 0 ) {
+			movementDir = (int)AngleNormalize180( (float)movementDir + 180.0f );
+		}
+		if ( abs( movementDir ) > 90 ) {
+			movementDir = movementDir > 0 ? 90 : -90;
+		}
+		pm->ps->movementDir = (signed char)movementDir;
+	} else {
 		pm->ps->movementDir = 0;
-		return;
 	}
-
-	VectorNormalize2( moved, dir );
-	vectoangles( dir, angles );
-
-	movementDir = (int)AngleNormalize180( angles[YAW] - pm->ps->viewangles[YAW] );
-	if ( pm->cmd.forwardmove < 0 ) {
-		movementDir = (int)AngleNormalize180( (float)movementDir + 180.0f );
-	}
-	if ( abs( movementDir ) > 90 ) {
-		movementDir = movementDir > 0 ? 90 : -90;
-	}
-	pm->ps->movementDir = (signed char)movementDir;
 }
 
 /*
@@ -618,13 +532,13 @@ static int PM_Jump( void ) {
 	int surftype;
 
 	if ( pm->ps->pm_flags & PMF_LADDER ) {
-		return EV_JUMP_LADDER;
+		return EV_JUMP_METAL;
 	}
 	surftype = PM_JumpForSurface();
 	if ( !surftype ) {
 		return 0;
 	}
-	return EV_JUMP + surftype;
+	return EV_JUMP_DEFAULT + surftype;
 }
 
 /*
@@ -635,7 +549,7 @@ PM_CheckJump
 static qboolean PM_CheckJump( void ) {
 	vec3_t flatforward;
 	vec3_t pushoff;
-	float dot;
+	rfloat dot;     // keep: rfloat matches original codegen
 
 	if ( pm->cmd.serverTime - pm->ps->jumpTime < 500 ) {
 		return qfalse;
@@ -647,7 +561,7 @@ static qboolean PM_CheckJump( void ) {
 	if ( pm->ps->pm_flags & PMF_TIME_HARDLAND ) {
 		return qfalse;
 	}
-	if ( PM_GetEffectiveStance( pm->ps ) ) {
+	if ( PM_GetEffectiveStance( pm->ps ) != PM_EFF_STANCE_DEFAULT ) {
 		return qfalse;
 	}
 	if ( pm->cmd.upmove < 10 ) {
@@ -667,7 +581,7 @@ static qboolean PM_CheckJump( void ) {
 	pm->ps->pm_flags |= PMF_JUMP_HELD;
 
 	pm->ps->groundEntityNum = ENTITYNUM_NONE;
-	pm->ps->velocity[2] = (float)sqrt( (double)( (float)pm->ps->gravity * 78.0f ) );
+	pm->ps->velocity[2] = (float)sqrt( (rfloat)pm->ps->gravity * 78.0f );
 	pm->ps->fJumpOriginZ = pm->ps->origin[2] + 39.0f;
 
 	if ( pm->ps->pm_flags & PMF_LADDER ) {
@@ -679,14 +593,17 @@ static qboolean PM_CheckJump( void ) {
 		flatforward[2] = 0;
 		VectorNormalize( flatforward );
 
-		if ( DotProduct( pml.forward, pm->ps->vLadderVec ) >= 0 ) {
-			VectorCopy( flatforward, pushoff );
-		} else {
-			dot = DotProduct( flatforward, pm->ps->vLadderVec ) * -2.0f;
+		// keep: inlined dot products match original codegen
+		if ( (rfloat)pml.forward[2] * pm->ps->vLadderVec[2] + (rfloat)pml.forward[1] * pm->ps->vLadderVec[1]
+			 + (rfloat)pml.forward[0] * pm->ps->vLadderVec[0] < 0 ) {
+			dot = ( (rfloat)flatforward[2] * pm->ps->vLadderVec[2] + (rfloat)flatforward[1] * pm->ps->vLadderVec[1]
+					+ (rfloat)flatforward[0] * pm->ps->vLadderVec[0] ) * -2.0f;
 			pushoff[0] = dot * pm->ps->vLadderVec[0] + flatforward[0];
 			pushoff[1] = dot * pm->ps->vLadderVec[1] + flatforward[1];
 			pushoff[2] = dot * pm->ps->vLadderVec[2] + flatforward[2];
 			VectorNormalize( pushoff );
+		} else {
+			VectorCopy( flatforward, pushoff );
 		}
 
 		pm->ps->velocity[0] = pm_ladderPushOff * pushoff[0];
@@ -701,8 +618,11 @@ static qboolean PM_CheckJump( void ) {
 		pm->ps->aimSpreadScale = 255.0f;
 	}
 
-	BG_AnimScriptEvent( pm->ps, pm->cmd.forwardmove < 0 ? ANIM_ET_JUMPBK : ANIM_ET_JUMP,
-						qfalse, qtrue );
+	if ( pm->cmd.forwardmove >= 0 ) {
+		BG_AnimScriptEvent( pm->ps, ANIM_ET_JUMP, qfalse, qtrue );
+	} else {
+		BG_AnimScriptEvent( pm->ps, ANIM_ET_JUMPBK, qfalse, qtrue );
+	}
 
 	if ( pm->debugLevel ) {
 		Com_Printf( "%i:jump base =%.1f top=%.1f vel=%.1f\n", c_pmove,
@@ -725,6 +645,7 @@ static void PM_FlyMove( void ) {
 	float wishspeed;
 	vec3_t wishdir;
 	float scale;
+	rfloat up;      // keep: rfloat matches original codegen
 
 	// normal slowdown
 	PM_Friction();
@@ -737,19 +658,20 @@ static void PM_FlyMove( void ) {
 	if ( !scale ) {
 		wishvel[0] = 0;
 		wishvel[1] = 0;
-		wishvel[2] = 0;
+		up = 0;
 	} else {
-		for ( i = 0 ; i < 3 ; i++ ) {
-			wishvel[i] = scale * pml.forward[i] * pm->cmd.forwardmove
-						 + scale * pml.right[i] * pm->cmd.rightmove;
+		// keep: scaling the summed move matches original codegen
+		for ( i = 0 ; i < 2 ; i++ ) {
+			wishvel[i] = ( (rfloat)pm->cmd.forwardmove * pml.forward[i]
+						   + (rfloat)pm->cmd.rightmove * pml.right[i] ) * scale;
 		}
-
-		wishvel[2] += scale * pm->cmd.upmove;
+		up = ( (rfloat)pm->cmd.forwardmove * pml.forward[2]
+			   + (rfloat)pm->cmd.rightmove * pml.right[2] ) * scale;
+		up += (rfloat)pm->cmd.upmove * scale;
 	}
 
-	wishvel[2] = wishvel[2]
-				 - (float)( ( pm->cmd.wbuttons & WBUTTON_LEAN_RIGHT ) << 4 )
-				 + (float)( ( pm->cmd.wbuttons & WBUTTON_LEAN_LEFT ) << 4 );
+	wishvel[2] = up - ( ( pm->cmd.wbuttons & WBUTTON_LEANRIGHT ) << 4 )
+				 + ( ( pm->cmd.wbuttons & WBUTTON_LEANLEFT ) << 4 );
 
 	VectorCopy( wishvel, wishdir );
 	wishspeed = VectorNormalize( wishdir );
@@ -803,8 +725,7 @@ static void PM_AirMove( void ) {
 	// though we don't have a groundentity
 	// slide along the steep plane
 	if ( pml.groundPlane ) {
-		PM_ClipVelocity( pm->ps->velocity, pml.groundTrace.normal,
-						 pm->ps->velocity, OVERCLIP );
+		PM_ClipVelocity( pm->ps->velocity, pml.groundTrace.normal, pm->ps->velocity, OVERCLIP );
 	}
 
 	PM_StepSlideMove( qtrue );
@@ -827,7 +748,7 @@ static void PM_WalkMove( void ) {
 	usercmd_t cmd;
 	float accelerate;
 	float vel;
-	vec3_t oldVelocity;
+	vec3_t oldVel;
 	int effectiveStance;
 
 	if ( PM_CheckJump() ) {
@@ -870,9 +791,9 @@ static void PM_WalkMove( void ) {
 	if ( ( pml.groundTrace.surfaceFlags & SURF_SLICK )
 		 || ( pm->ps->pm_flags & PMF_TIME_KNOCKBACK ) ) {
 		accelerate = pm_airaccelerate;
-	} else if ( effectiveStance == 1 ) {
+	} else if ( effectiveStance == PM_EFF_STANCE_PRONE ) {
 		accelerate = pm_prone_accelerate;
-	} else if ( effectiveStance == 2 ) {
+	} else if ( effectiveStance == PM_EFF_STANCE_DUCKED ) {
 		accelerate = pm_ducked_accelerate;
 	} else {
 		accelerate = pm_accelerate;
@@ -886,20 +807,23 @@ static void PM_WalkMove( void ) {
 
 	if ( ( pml.groundTrace.surfaceFlags & SURF_SLICK )
 		 || ( pm->ps->pm_flags & PMF_TIME_KNOCKBACK ) ) {
-		pm->ps->velocity[2] -= (float)pm->ps->gravity * pml.frametime;
+		// keep: matches original codegen
+		pm->ps->velocity[2] -= (rfloat)pm->ps->gravity * pml.frametime;
 	}
 
-	vel = VectorLength( pm->ps->velocity );
+	// keep: inlined VectorLength and FCAST match original codegen
+	vel = FCAST( sqrt( (rfloat)pm->ps->velocity[0] * pm->ps->velocity[0]
+					   + (rfloat)pm->ps->velocity[1] * pm->ps->velocity[1]
+					   + (rfloat)pm->ps->velocity[2] * pm->ps->velocity[2] ) );
 
-	VectorCopy( pm->ps->velocity, oldVelocity );
+	VectorCopy( pm->ps->velocity, oldVel );
 
 	// slide along the ground plane
-	PM_ClipVelocity( pm->ps->velocity, pml.groundTrace.normal,
-					 pm->ps->velocity, OVERCLIP );
+	PM_ClipVelocity( pm->ps->velocity, pml.groundTrace.normal, pm->ps->velocity, OVERCLIP );
 
 	// don't decrease velocity when going up or down a slope, but only if the
 	// clip did not turn the move around
-	if ( DotProduct( oldVelocity, pm->ps->velocity ) > 0 ) {
+	if ( DotProduct( oldVel, pm->ps->velocity ) > 0 ) {
 		VectorNormalize( pm->ps->velocity );
 		VectorScale( pm->ps->velocity, vel, pm->ps->velocity );
 	}
@@ -918,6 +842,7 @@ PM_DeadMove
 ==============
 */
 static void PM_DeadMove( void ) {
+	rfloat speed;
 	float forward;
 
 	if ( !pml.walking ) {
@@ -925,8 +850,11 @@ static void PM_DeadMove( void ) {
 	}
 
 	// extra friction
-	forward = VectorLength( pm->ps->velocity );
-	forward -= 20;
+	// keep: inlined VectorLength matches original codegen
+	speed = (rfloat)sqrt( (rfloat)pm->ps->velocity[0] * pm->ps->velocity[0]
+						  + (rfloat)pm->ps->velocity[1] * pm->ps->velocity[1]
+						  + (rfloat)pm->ps->velocity[2] * pm->ps->velocity[2] );
+	forward = (float)( speed - 20.0f );
 	if ( forward <= 0 ) {
 		VectorClear( pm->ps->velocity );
 	} else {
@@ -938,10 +866,11 @@ static void PM_DeadMove( void ) {
 /*
 ===============
 PM_NoclipMove
+
 ===============
 */
 static void PM_NoclipMove( void ) {
-	float speed, drop, friction, control, newspeed;
+	rfloat speed, drop, friction, control, newspeed;   // keep: rfloat temporaries match original codegen
 	int i;
 	vec3_t wishvel;
 	float fmove, smove;
@@ -952,16 +881,16 @@ static void PM_NoclipMove( void ) {
 	pm->ps->viewHeightTarget = bg_viewheight_standing.integer;
 	pm->ps->standViewHeight = bg_viewheight_standing.integer;
 
-	// friction
-	speed = VectorLength( pm->ps->velocity );
+	// friction (keep: inlined VectorLength)
+	speed = (rfloat)sqrt( (rfloat)pm->ps->velocity[0] * pm->ps->velocity[0]
+						  + (rfloat)pm->ps->velocity[1] * pm->ps->velocity[1]
+						  + (rfloat)pm->ps->velocity[2] * pm->ps->velocity[2] );
 	if ( speed < 1 ) {
 		VectorCopy( vec3_origin, pm->ps->velocity );
 	} else {
-		drop = 0;
-
 		friction = pm_friction * 1.5f;  // extra friction
 		control = speed < pm_stopspeed ? pm_stopspeed : speed;
-		drop += control * friction * pml.frametime;
+		drop = pml.frametime * control * friction;
 
 		// scale the velocity
 		newspeed = speed - drop;
@@ -979,6 +908,7 @@ static void PM_NoclipMove( void ) {
 	fmove = pm->cmd.forwardmove;
 	smove = pm->cmd.rightmove;
 
+	// keep: adding the upmove to wishvel[2] matches original codegen
 	for ( i = 0 ; i < 3 ; i++ ) {
 		wishvel[i] = pml.forward[i] * fmove + pml.right[i] * smove;
 	}
@@ -1016,38 +946,36 @@ static void PM_UFOMove( void ) {
 	pm->ps->viewHeightTarget = bg_viewheight_standing.integer;
 	pm->ps->standViewHeight = bg_viewheight_standing.integer;
 
-	/* The button is multiplied as a mask, not as a boolean, and the result is
-	 * truncated back into the signed char: lean right nets +32, lean left -16. */
+	// keep: the button is used as a mask, not a boolean: lean right nets +32,
+	// lean left -16
 	pm->cmd.upmove = (signed char)( pm->cmd.upmove
-									+ -127 * ( pm->cmd.wbuttons & WBUTTON_LEAN_RIGHT ) );
+									+ -127 * ( pm->cmd.wbuttons & WBUTTON_LEANRIGHT ) );
 	pm->cmd.upmove = (signed char)( pm->cmd.upmove
-									+ 127 * ( pm->cmd.wbuttons & WBUTTON_LEAN_LEFT ) );
+									+ 127 * ( pm->cmd.wbuttons & WBUTTON_LEANLEFT ) );
 
 	if ( !pm->cmd.forwardmove && !pm->cmd.rightmove ) {
 		// straight up and down: the velocity is the command
-		if ( pm->cmd.upmove == 0 ) {
-			VectorClear( pm->ps->velocity );
+		if ( (float)pm->cmd.upmove == 0 ) {
 			speed = 0;
 		} else {
-			pm->ps->velocity[0] = 0;
 			pm->ps->velocity[1] = 0;
+			pm->ps->velocity[0] = 0;
 			pm->ps->velocity[2] = (float)pm->cmd.upmove;
 			speed = 127.0f;
 		}
 	} else {
-		speed = VectorLength( pm->ps->velocity );
-		if ( speed < 1 ) {
-			VectorClear( pm->ps->velocity );
-			speed = 0;
-		}
+		// keep: FCAST matches original codegen
+		speed = FCAST( (float)sqrt( pm->ps->velocity[0] * pm->ps->velocity[0]
+							   + pm->ps->velocity[1] * pm->ps->velocity[1]
+							   + pm->ps->velocity[2] * pm->ps->velocity[2] ) );
 	}
 
-	if ( speed != 0 ) {
-		drop = 0;
-
+	if ( speed < 1 ) {
+		VectorCopy( vec3_origin, pm->ps->velocity );
+	} else {
 		friction = pm_friction * 1.5f;
 		control = speed < pm_stopspeed ? pm_stopspeed : speed;
-		drop += control * friction * pml.frametime;
+		drop = pml.frametime * control * friction;
 
 		newspeed = speed - drop;
 		if ( newspeed < 0 ) {
@@ -1071,7 +999,8 @@ static void PM_UFOMove( void ) {
 	for ( i = 0 ; i < 3 ; i++ ) {
 		wishvel[i] = pml.right[i] * smove + forward[i] * fmove;
 	}
-	wishvel[2] = wishvel[2] + (float)pm->cmd.upmove + (float)pm->cmd.upmove;
+	// keep: the doubled upmove is summed first
+	wishvel[2] = (float)pm->cmd.upmove + (float)pm->cmd.upmove + wishvel[2];
 
 	VectorCopy( wishvel, wishdir );
 	wishspeed = VectorNormalize( wishdir );
@@ -1100,12 +1029,12 @@ static int PM_FootstepForSurface( int flags ) {
 		return 0;
 	}
 	if ( flags & PMF_PRONE ) {
-		return EV_FOOTSTEP_PRONE + surftype;
+		return EV_FOOTSTEP_PRONE_DEFAULT + surftype;
 	}
 	if ( flags & PMF_WALKING ) {
-		return EV_FOOTSTEP_WALKING + surftype;
+		return EV_FOOTSTEP_WALK_DEFAULT + surftype;
 	}
-	return EV_FOOTSTEP + surftype;
+	return EV_FOOTSTEP_RUN_DEFAULT + surftype;
 }
 
 /*
@@ -1123,7 +1052,7 @@ static int PM_LightLandingForSurface( void ) {
 	if ( !surftype ) {
 		return 0;
 	}
-	return EV_FOOTSTEP_WALKING + surftype;
+	return EV_FOOTSTEP_WALK_DEFAULT + surftype;
 }
 
 /*
@@ -1141,7 +1070,7 @@ static int PM_MediumLandingForSurface( void ) {
 	if ( !surftype ) {
 		return 0;
 	}
-	return EV_FOOTSTEP + surftype;
+	return EV_FOOTSTEP_RUN_DEFAULT + surftype;
 }
 
 /*
@@ -1150,10 +1079,14 @@ PM_HardLandingForSurface
 =================
 */
 static int PM_HardLandingForSurface( void ) {
+	int surftype;
+
 	if ( pml.groundTrace.surfaceFlags & SURF_NOSTEPS ) {
-		return EV_LANDING_HARD;
+		surftype = 0;
+	} else {
+		surftype = SURF_TYPE( pml.groundTrace.surfaceFlags );
 	}
-	return EV_LANDING_HARD + SURF_TYPE( pml.groundTrace.surfaceFlags );
+	return EV_LANDING_DEFAULT + surftype;
 }
 
 /*
@@ -1162,10 +1095,14 @@ PM_DamageLandingForSurface
 =================
 */
 static int PM_DamageLandingForSurface( void ) {
+	int surftype;
+
 	if ( pml.groundTrace.surfaceFlags & SURF_NOSTEPS ) {
-		return EV_LANDING_DAMAGE;
+		surftype = 0;
+	} else {
+		surftype = SURF_TYPE( pml.groundTrace.surfaceFlags );
 	}
-	return EV_LANDING_DAMAGE + SURF_TYPE( pml.groundTrace.surfaceFlags );
+	return EV_LANDING_PAIN_DEFAULT + surftype;
 }
 
 /*
@@ -1178,13 +1115,14 @@ Check for hard landings that generate sound events
 static void PM_CrashLand( void ) {
 	float gravity;
 	float height;
-	float vel, acc;
-	float t;
-	float a, b, c, den;
-	float delta;
+	rfloat vel, acc;	// keep: rfloat temporaries match original codegen
+	rfloat t;
+	rfloat a, b, c, den;
+	rfloat delta;
 	int damage;
 	int viewKick;
 	int stunTime;
+	rfloat stunFrac;
 	float speedMult;
 
 	if ( pm->waterlevel == 3 ) {
@@ -1198,19 +1136,19 @@ static void PM_CrashLand( void ) {
 	// calculate the exact velocity on landing
 	vel = pml.previous_velocity[2];
 	gravity = (float)pm->ps->gravity;
-	acc = -gravity;
+	acc = -(rfloat)pm->ps->gravity;	// keep: negate the int, not the float
 
 	a = acc / 2;
 	b = vel;
-	c = pml.previous_origin[2] - pm->ps->origin[2];
+	c = (rfloat)pml.previous_origin[2] - pm->ps->origin[2];
 
 	den = b * b - 4 * a * c;
 	if ( den < 0 ) {
 		return;
 	}
-	t = ( -b - (float)sqrt( (double)den ) ) / ( 2 * a );
+	t = ( -b - sqrt( den ) ) / ( 2 * a );
 
-	delta = -( vel + t * acc );
+	delta = ( vel + t * acc ) * -1;
 	height = delta * delta / ( 2 * gravity );
 
 	if ( pm->debugLevel ) {
@@ -1219,38 +1157,39 @@ static void PM_CrashLand( void ) {
 
 	if ( bg_fallDamageMaxHeight.value <= bg_fallDamageMinHeight.value
 		 || bg_fallDamageMinHeight.value < 0 ) {
+#ifndef CGAMEDLL
+		// the client build skips the warning
 		Com_Printf( "bg_fallDamageMaxHeight and bg_fallDamageMinHeight have bad values\n" );
+#endif
 		damage = 0;
-	} else if ( height > bg_fallDamageMinHeight.value
-				&& !( pml.groundTrace.surfaceFlags & SURF_NODAMAGE )
-				&& pm->ps->pm_type < PM_DEAD ) {
-		if ( height >= bg_fallDamageMaxHeight.value ) {
-			damage = 100;
-		} else {
-			damage = (int)( ( height - bg_fallDamageMinHeight.value )
-							/ ( bg_fallDamageMaxHeight.value - bg_fallDamageMinHeight.value )
-							* 100.0f );
-			if ( damage < 0 ) {
-				damage = 0;
-			} else if ( damage > 100 ) {
-				damage = 100;
-			}
-		}
+	} else if ( height <= bg_fallDamageMinHeight.value
+				|| ( pml.groundTrace.surfaceFlags & SURF_NODAMAGE )
+				|| pm->ps->pm_type >= PM_DEAD ) {
+		damage = 0;
+	} else if ( height >= bg_fallDamageMaxHeight.value ) {
+		damage = 100;
 	} else {
-		damage = 0;
+		damage = (int)( ( height - bg_fallDamageMinHeight.value )
+						/ ( bg_fallDamageMaxHeight.value - bg_fallDamageMinHeight.value )
+						* 100.0f );
+		if ( damage < 0 ) {
+			damage = 0;
+		} else if ( damage > 100 ) {
+			damage = 100;
+		}
 	}
 
 	if ( pm->waterlevel == 2 ) {
 		damage = (int)( (float)damage * 0.5f );
 	}
 
-	if ( height > 12.0f ) {
+	if ( height <= 12.0f ) {
+		viewKick = 0;
+	} else {
 		viewKick = (int)( ( ( height - 12.0f ) * 0.038461540f + 1.0f ) * 4.0f );
 		if ( viewKick > 24 ) {
 			viewKick = 24;
 		}
-	} else {
-		viewKick = 0;
 	}
 
 	if ( pm->ps->fJumpOriginZ < -0.001f || pm->ps->fJumpOriginZ > 0.001f ) {
@@ -1266,15 +1205,17 @@ static void PM_CrashLand( void ) {
 			VectorScale( pm->ps->velocity, 0.67000002f, pm->ps->velocity );
 		} else {
 			stunTime = 35 * damage + 500;
+			// keep: a separate clamp matches original codegen
 			if ( stunTime > 2000 ) {
 				stunTime = 2000;
-				speedMult = 0.2f;
-			} else if ( stunTime <= 500 ) {
+			}
+			if ( stunTime <= 500 ) {
 				speedMult = 0.5f;
 			} else if ( stunTime >= 1500 ) {
 				speedMult = 0.2f;
 			} else {
-				speedMult = 0.5f - ( (float)stunTime - 500.0f ) * 0.001f * 0.30000001f;
+				stunFrac = ( (rfloat)stunTime - 500.0f ) * 0.001f;
+				speedMult = 0.5f - stunFrac * 0.30000001f;
 			}
 			if ( pm->debugLevel > 1 ) {
 				Com_Printf( "landing stun time: %i speed mult: %.2f\n", stunTime, speedMult );
@@ -1305,11 +1246,11 @@ PM_CorrectAllSolid
 =============
 */
 static qboolean PM_CorrectAllSolid( trace_t *trace ) {
-	int i;
+	unsigned int i;
 	vec3_t point;
 
 	// jitter around
-	for ( i = 0 ; i < 26 ; i++ ) {
+	for ( i = 0 ; i < sizeof( pm_correctSolidOffsets ) / sizeof( pm_correctSolidOffsets[0] ) ; i++ ) {
 		point[0] = pm->ps->origin[0] + pm_correctSolidOffsets[i][0];
 		point[1] = pm->ps->origin[1] + pm_correctSolidOffsets[i][1];
 		point[2] = pm->ps->origin[2] + pm_correctSolidOffsets[i][2];
@@ -1364,9 +1305,11 @@ static void PM_GroundTraceMissed( void ) {
 		pm->trace( &trace, pm->ps->origin, pm->mins, pm->maxs, point,
 				   pm->ps->clientNum, pm->tracemask );
 		if ( trace.fraction == 1.0 ) {
-			BG_AnimScriptEvent( pm->ps,
-								pm->cmd.forwardmove < 0 ? ANIM_ET_JUMPBK : ANIM_ET_JUMP,
-								qfalse, qtrue );
+			if ( pm->cmd.forwardmove >= 0 ) {
+				BG_AnimScriptEvent( pm->ps, ANIM_ET_JUMP, qfalse, qtrue );
+			} else {
+				BG_AnimScriptEvent( pm->ps, ANIM_ET_JUMPBK, qfalse, qtrue );
+			}
 		}
 	}
 
@@ -1389,7 +1332,7 @@ static void PM_GroundTrace( void ) {
 	start[1] = pm->ps->origin[1];
 	point[0] = pm->ps->origin[0];
 	point[1] = pm->ps->origin[1];
-	if ( pm->ps->eFlags & EF_TURRET_ACTIVE_MASK ) {
+	if ( pm->ps->eFlags & EF_TURRET_ACTIVE ) {
 		start[2] = pm->ps->origin[2];
 		point[2] = pm->ps->origin[2] - 1.0f;
 	} else {
@@ -1435,9 +1378,11 @@ static void PM_GroundTrace( void ) {
 		if ( pm->debugLevel ) {
 			Com_Printf( "%i:kickoff\n", c_pmove );
 		}
-		BG_AnimScriptEvent( pm->ps,
-							pm->cmd.forwardmove < 0 ? ANIM_ET_JUMPBK : ANIM_ET_JUMP,
-							qfalse, qfalse );
+		if ( pm->cmd.forwardmove >= 0 ) {
+			BG_AnimScriptEvent( pm->ps, ANIM_ET_JUMP, qfalse, qfalse );
+		} else {
+			BG_AnimScriptEvent( pm->ps, ANIM_ET_JUMPBK, qfalse, qfalse );
+		}
 
 		pm->ps->groundEntityNum = ENTITYNUM_NONE;
 		pml.groundPlane = qfalse;
@@ -1519,18 +1464,19 @@ How long the lerp to viewheight takes, in msec.
 */
 int PM_GetViewHeightLerpTime( const playerState_t *ps, int viewheight, int viewHeightLerpDown ) {
 	if ( viewheight == ps->proneViewHeight ) {
-		if ( ps->pm_flags & PMF_PRONE_DIVE ) {
-			return 200;
+		if ( !( ps->pm_flags & PMF_PRONE_DIVE ) ) {
+			return bg_duck2prone_time.integer;
 		}
-		return bg_duck2prone_time.integer;
+	} else if ( viewheight == ps->crouchViewHeight ) {
+		if ( viewHeightLerpDown ) {
+			if ( ps->pm_flags & PMF_PRONE_DIVE ) {
+				return 100;
+			}
+			return 150;
+		}
+		return bg_prone2duck_time.integer;
 	}
-	if ( viewheight != ps->crouchViewHeight ) {
-		return 200;
-	}
-	if ( viewHeightLerpDown ) {
-		return ( ps->pm_flags & PMF_PRONE_DIVE ) ? 100 : 150;
-	}
-	return bg_prone2duck_time.integer;
+	return 200;
 }
 
 /*
@@ -1541,21 +1487,26 @@ PM_ViewHeightTableLerp
 static float PM_ViewHeightTableLerp( int percent, float *originAdjust, const pmLerpEntry_t *table ) {
 	int i;
 	float frac;
+	const pmLerpEntry_t *cur;
+	const pmLerpEntry_t *prev;
 
 	if ( percent ) {
-		for ( i = 1 ; table[i].percent != PM_LERP_TABLE_END ; i++ ) {
-			if ( table[i].percent == percent ) {
-				*originAdjust = (float)table[i].originAdjust;
-				return table[i].height;
+		// no end test before the first entry: every table has two
+		i = 1;
+		cur = &table[1];
+		do {
+			if ( cur->percent == percent ) {
+				*originAdjust = (float)cur->originAdjust;
+				return cur->height;
 			}
-			if ( table[i].percent > percent ) {
-				frac = (float)( percent - table[i - 1].percent )
-					   / (float)( table[i].percent - table[i - 1].percent );
-				*originAdjust = ( table[i].originAdjust - table[i - 1].originAdjust ) * frac
-								+ table[i - 1].originAdjust;
-				return frac * ( table[i].height - table[i - 1].height ) + table[i - 1].height;
+			if ( cur->percent > percent ) {
+				prev = &table[i - 1];
+				frac = (float)( percent - prev->percent ) / (float)( cur->percent - prev->percent );
+				*originAdjust = ( cur->originAdjust - prev->originAdjust ) * frac + prev->originAdjust;
+				return frac * ( cur->height - prev->height ) + prev->height;
 			}
-		}
+			cur = &table[++i];
+		} while ( cur->percent != PM_LERP_TABLE_END );
 	}
 
 	*originAdjust = (float)table[0].originAdjust;
@@ -1571,10 +1522,10 @@ toViewheight, or 0 if that is not the lerp in flight.  -1 for either end means
 "whatever is running".
 =============
 */
-static float PM_GetViewHeightLerp( int fromViewheight, int toViewheight ) {
+static rfloat PM_GetViewHeightLerp( int toViewheight, int fromViewheight ) {
 	playerState_t *ps;
 	int duration;
-	float frac;
+	rfloat frac;
 
 	ps = pm->ps;
 
@@ -1582,47 +1533,42 @@ static float PM_GetViewHeightLerp( int fromViewheight, int toViewheight ) {
 		return 0;
 	}
 
-	if ( fromViewheight != -1 && toViewheight != -1 ) {
-		if ( fromViewheight != ps->viewHeightLerpTarget ) {
-			return 0;
-		}
-		if ( fromViewheight == ps->crouchViewHeight
-			 && !( toViewheight == ps->proneViewHeight && !ps->viewHeightLerpDown )
-			 && !( toViewheight == ps->standViewHeight && ps->viewHeightLerpDown ) ) {
+	if ( toViewheight != -1 && fromViewheight != -1 ) {
+		if ( fromViewheight != ps->viewHeightLerpTarget
+			 || ( fromViewheight == ps->crouchViewHeight
+				  && !( toViewheight == ps->proneViewHeight && !ps->viewHeightLerpDown )
+				  && !( toViewheight == ps->standViewHeight && ps->viewHeightLerpDown ) ) ) {
 			return 0;
 		}
 	}
 
 	duration = PM_GetViewHeightLerpTime( ps, ps->viewHeightLerpTarget, ps->viewHeightLerpDown );
 
-	frac = (float)( pm->cmd.serverTime - ps->viewHeightLerpTime ) / (float)duration;
+	frac = (rfloat)( pm->cmd.serverTime - ps->viewHeightLerpTime ) / duration;
 	if ( frac < 0 ) {
-		return 0;
-	}
-	if ( frac > 1 ) {
-		return 1;
+		frac = 0;
+	} else if ( frac > 1 ) {
+		frac = 1;
 	}
 	return frac;
 }
 
-/* .rdata 0x2006B980, 0x2006B9F0, 0x2006BA60, 0x2006BAE4, 0x2006BB08.  The first
- * four carry the spellings the UO Linux build exports; the two-point prone table
- * is CoD1-only and its name here is inferred. */
-static const pmLerpEntry_t pmViewHeightLerpCrouchedRising[9] = {
+// viewheight lerp tables
+static pmLerpEntry_t pmViewHeightLerpCrouchedRising[9] = {
 	{ 0, 60.0f, 0 },  { 1, 59.5f, 0 },  { 4, 58.5f, 0 },
 	{ 30, 56.0f, 0 }, { 80, 44.0f, 0 }, { 90, 41.5f, 0 },
 	{ 95, 40.5f, 0 }, { 100, 40.0f, 0 },
 	{ PM_LERP_TABLE_END, 0.0f, 0 }
 };
 
-static const pmLerpEntry_t pmViewHeightLerpStanding[9] = {
+static pmLerpEntry_t pmViewHeightLerpStanding[9] = {
 	{ 0, 40.0f, 0 },  { 5, 40.5f, 0 },  { 10, 41.5f, 0 },
 	{ 20, 44.0f, 0 }, { 70, 56.0f, 0 }, { 96, 58.5f, 0 },
 	{ 99, 59.5f, 0 }, { 100, 60.0f, 0 },
 	{ PM_LERP_TABLE_END, 0.0f, 0 }
 };
 
-static const pmLerpEntry_t pmViewHeightLerpProne[11] = {
+static pmLerpEntry_t pmViewHeightLerpProne[11] = {
 	{ 0, 40.0f, 0 },  { 11, 38.0f, 0 }, { 22, 33.0f, 0 },
 	{ 34, 25.0f, 0 }, { 45, 16.0f, 0 }, { 50, 15.0f, 0 },
 	{ 55, 16.0f, 0 }, { 70, 18.0f, 0 }, { 90, 17.0f, 0 },
@@ -1630,12 +1576,12 @@ static const pmLerpEntry_t pmViewHeightLerpProne[11] = {
 	{ PM_LERP_TABLE_END, 0.0f, 0 }
 };
 
-static const pmLerpEntry_t pmViewHeightLerpProneDive[3] = {
+static pmLerpEntry_t pmViewHeightLerpProneDive[3] = {
 	{ 0, 40.0f, 0 }, { 100, 11.0f, 0 },
 	{ PM_LERP_TABLE_END, 0.0f, 0 }
 };
 
-static const pmLerpEntry_t pmViewHeightLerpCrouchedFalling[8] = {
+static pmLerpEntry_t pmViewHeightLerpCrouchedFalling[8] = {
 	{ 0, 11.0f, 0 },  { 5, 10.0f, 0 },  { 30, 21.0f, 0 },
 	{ 50, 25.0f, 0 }, { 67, 31.0f, 0 }, { 83, 34.0f, 0 },
 	{ 100, 40.0f, 0 },
@@ -1660,7 +1606,6 @@ static void PM_ViewHeightAdjust( void ) {
 	float speed;
 	vec3_t saveVelocity;
 	vec3_t dir;
-	const pmLerpEntry_t *table;
 
 	target = pm->ps->viewHeightTarget;
 
@@ -1714,21 +1659,22 @@ static void PM_ViewHeightAdjust( void ) {
 		} else {
 			if ( lerpTarget == pm->ps->proneViewHeight ) {
 				if ( pm->ps->pm_flags & PMF_PRONE_DIVE ) {
-					table = pmViewHeightLerpProneDive;
+					pm->ps->viewHeightCurrent
+						= PM_ViewHeightTableLerp( percent, &originAdjust, pmViewHeightLerpProneDive );
 				} else {
-					table = pmViewHeightLerpProne;
+					pm->ps->viewHeightCurrent = PM_ViewHeightTableLerp( percent, &originAdjust, pmViewHeightLerpProne );
 				}
 			} else if ( lerpTarget == pm->ps->crouchViewHeight ) {
 				if ( pm->ps->viewHeightLerpDown ) {
-					table = pmViewHeightLerpCrouchedRising;
+					pm->ps->viewHeightCurrent
+						= PM_ViewHeightTableLerp( percent, &originAdjust, pmViewHeightLerpCrouchedRising );
 				} else {
-					table = pmViewHeightLerpCrouchedFalling;
+					pm->ps->viewHeightCurrent
+						= PM_ViewHeightTableLerp( percent, &originAdjust, pmViewHeightLerpCrouchedFalling );
 				}
 			} else {
-				table = pmViewHeightLerpStanding;
+				pm->ps->viewHeightCurrent = PM_ViewHeightTableLerp( percent, &originAdjust, pmViewHeightLerpStanding );
 			}
-
-			pm->ps->viewHeightCurrent = PM_ViewHeightTableLerp( percent, &originAdjust, table );
 
 			if ( fabs( pm->ps->viewHeightLerpPosAdj - originAdjust ) > 0.05f ) {
 				VectorCopy( pm->ps->velocity, saveVelocity );
@@ -1736,10 +1682,10 @@ static void PM_ViewHeightAdjust( void ) {
 				if ( pm->ps->groundEntityNum == ENTITYNUM_NONE ) {
 					delta = delta * 0.5f;
 				}
+				speed = delta / pml.frametime;
 				dir[0] = pml.forward[0];
 				dir[1] = pml.forward[1];
 				dir[2] = 0;
-				speed = delta / pml.frametime;
 				VectorNormalize( dir );
 				pm->ps->velocity[0] = dir[0] * speed;
 				pm->ps->velocity[1] = dir[1] * speed;
@@ -1751,7 +1697,57 @@ static void PM_ViewHeightAdjust( void ) {
 		}
 	}
 
-	if ( !pm->ps->viewHeightLerpTime ) {
+	if ( pm->ps->viewHeightLerpTime ) {
+		// the target moved the other way mid-lerp: turn the lerp around and pick up
+		// at the mirrored percentage
+		if ( pm->ps->viewHeightTarget != pm->ps->viewHeightLerpTarget
+			 && ( ( pm->ps->viewHeightTarget < pm->ps->viewHeightLerpTarget
+					&& !pm->ps->viewHeightLerpDown )
+				  || ( pm->ps->viewHeightTarget > pm->ps->viewHeightLerpTarget
+					   && pm->ps->viewHeightLerpDown ) ) ) {
+			percent = 100 - percent;
+			pm->ps->viewHeightLerpDown = pm->ps->viewHeightLerpDown ^ 1;
+
+			if ( pm->ps->viewHeightLerpDown ) {
+				if ( pm->ps->viewHeightLerpTarget == pm->ps->standViewHeight ) {
+					pm->ps->viewHeightLerpTarget = pm->ps->crouchViewHeight;
+				} else if ( pm->ps->viewHeightLerpTarget == pm->ps->crouchViewHeight ) {
+					pm->ps->viewHeightLerpTarget = pm->ps->proneViewHeight;
+				}
+			} else {
+				if ( pm->ps->viewHeightLerpTarget == pm->ps->proneViewHeight ) {
+					pm->ps->viewHeightLerpTarget = pm->ps->crouchViewHeight;
+				} else if ( pm->ps->viewHeightLerpTarget == pm->ps->crouchViewHeight ) {
+					pm->ps->viewHeightLerpTarget = pm->ps->standViewHeight;
+				}
+			}
+
+			if ( percent == 100 ) {
+				pm->ps->viewHeightCurrent = (float)pm->ps->viewHeightLerpTarget;
+				pm->ps->viewHeightLerpTime = 0;
+				pm->ps->viewHeightLerpPosAdj = 0;
+				return;
+			}
+
+			duration = PM_GetViewHeightLerpTime( pm->ps, pm->ps->viewHeightLerpTarget,
+												 pm->ps->viewHeightLerpDown );
+			pm->ps->viewHeightLerpTime = pm->cmd.serverTime
+										 - (int)( (float)duration * (float)percent * 0.0099999998f );
+
+			if ( pm->ps->viewHeightLerpTarget == pm->ps->proneViewHeight ) {
+				PM_ViewHeightTableLerp( percent, &originAdjust, pmViewHeightLerpProne );
+			} else if ( pm->ps->viewHeightLerpTarget == pm->ps->crouchViewHeight ) {
+				if ( pm->ps->viewHeightLerpDown ) {
+					PM_ViewHeightTableLerp( percent, &originAdjust, pmViewHeightLerpCrouchedRising );
+				} else {
+					PM_ViewHeightTableLerp( percent, &originAdjust, pmViewHeightLerpCrouchedFalling );
+				}
+			} else {
+				PM_ViewHeightTableLerp( percent, &originAdjust, pmViewHeightLerpStanding );
+			}
+			pm->ps->viewHeightLerpPosAdj = originAdjust;
+		}
+	} else {
 		// start a new lerp
 		if ( (float)pm->ps->viewHeightTarget == pm->ps->viewHeightCurrent ) {
 			return;
@@ -1760,83 +1756,34 @@ static void PM_ViewHeightAdjust( void ) {
 		target = pm->ps->viewHeightTarget;
 		if ( target == pm->ps->proneViewHeight ) {
 			pm->ps->viewHeightLerpDown = 1;
-			if ( (float)pm->ps->crouchViewHeight >= pm->ps->viewHeightCurrent ) {
+			if ( (float)pm->ps->crouchViewHeight < pm->ps->viewHeightCurrent ) {
+				pm->ps->viewHeightLerpTarget = pm->ps->crouchViewHeight;
+			} else {
 				pm->ps->viewHeightLerpTarget = pm->ps->proneViewHeight;
-				return;
 			}
-			pm->ps->viewHeightLerpTarget = pm->ps->crouchViewHeight;
 		} else if ( target == pm->ps->crouchViewHeight ) {
 			if ( (float)target < pm->ps->viewHeightCurrent ) {
 				pm->ps->viewHeightLerpDown = 1;
-				pm->ps->viewHeightLerpTarget = pm->ps->crouchViewHeight;
-				return;
+			} else {
+				pm->ps->viewHeightLerpDown = 0;
 			}
-			pm->ps->viewHeightLerpDown = 0;
 			pm->ps->viewHeightLerpTarget = pm->ps->crouchViewHeight;
 		} else if ( target == pm->ps->standViewHeight ) {
 			pm->ps->viewHeightLerpDown = 0;
-			if ( (float)pm->ps->crouchViewHeight <= pm->ps->viewHeightCurrent ) {
-				pm->ps->viewHeightLerpTarget = pm->ps->standViewHeight;
-				return;
-			}
-			pm->ps->viewHeightLerpTarget = pm->ps->crouchViewHeight;
-		}
-		return;
-	}
-
-	// the target moved the other way mid-lerp: turn the lerp around and pick up
-	// at the mirrored percentage
-	if ( pm->ps->viewHeightTarget != pm->ps->viewHeightLerpTarget
-		 && ( ( pm->ps->viewHeightTarget < pm->ps->viewHeightLerpTarget
-				&& !pm->ps->viewHeightLerpDown )
-			  || ( pm->ps->viewHeightTarget > pm->ps->viewHeightLerpTarget
-				   && pm->ps->viewHeightLerpDown ) ) ) {
-		pm->ps->viewHeightLerpDown = pm->ps->viewHeightLerpDown ^ 1;
-		percent = 100 - percent;
-
-		lerpTarget = pm->ps->viewHeightLerpTarget;
-		if ( !pm->ps->viewHeightLerpDown ) {
-			if ( lerpTarget == pm->ps->proneViewHeight ) {
+			if ( (float)pm->ps->crouchViewHeight > pm->ps->viewHeightCurrent ) {
 				pm->ps->viewHeightLerpTarget = pm->ps->crouchViewHeight;
-			} else if ( lerpTarget == pm->ps->crouchViewHeight ) {
-				pm->ps->viewHeightLerpTarget = pm->ps->standViewHeight;
-			}
-		} else {
-			if ( lerpTarget == pm->ps->standViewHeight ) {
-				pm->ps->viewHeightLerpTarget = pm->ps->crouchViewHeight;
-			} else if ( lerpTarget == pm->ps->crouchViewHeight ) {
-				pm->ps->viewHeightLerpTarget = pm->ps->proneViewHeight;
-			}
-		}
-
-		if ( percent == 100 ) {
-			pm->ps->viewHeightCurrent = (float)pm->ps->viewHeightLerpTarget;
-			pm->ps->viewHeightLerpTime = 0;
-			pm->ps->viewHeightLerpPosAdj = 0;
-			return;
-		}
-
-		duration = PM_GetViewHeightLerpTime( pm->ps, pm->ps->viewHeightLerpTarget,
-											 pm->ps->viewHeightLerpDown );
-		pm->ps->viewHeightLerpTime = pm->cmd.serverTime
-									 - (int)( (float)duration * (float)percent * 0.0099999998f );
-
-		if ( pm->ps->viewHeightLerpTarget == pm->ps->proneViewHeight ) {
-			table = pmViewHeightLerpProne;
-		} else if ( pm->ps->viewHeightLerpTarget == pm->ps->crouchViewHeight ) {
-			if ( pm->ps->viewHeightLerpDown ) {
-				table = pmViewHeightLerpCrouchedRising;
 			} else {
-				table = pmViewHeightLerpCrouchedFalling;
+				pm->ps->viewHeightLerpTarget = pm->ps->standViewHeight;
 			}
-		} else {
-			table = pmViewHeightLerpStanding;
 		}
-
-		PM_ViewHeightTableLerp( percent, &originAdjust, table );
-		pm->ps->viewHeightLerpPosAdj = originAdjust;
 	}
 }
+
+// keep: improve-float-consistency (/Op) code, matches original codegen
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", on )
+#endif
+
 
 /*
 ==============
@@ -1867,15 +1814,15 @@ static void PM_CheckDuck( void ) {
 			PM_AddEvent( EV_STANCE_FORCE_STAND );
 		}
 		pm->trace = pm->trace3;
-		pm->ps->eFlags |= EF_UPDATE_BOUNDS;
+		pm->ps->eFlags |= EF_CAPSULE;
 		pm->ps->viewHeightTarget = 0;
 		pm->ps->viewHeightCurrent = 0;
 		return;
 	}
 
-	pm->mins[0] = pm->ps->mins[0];
 	wasProne = pm->ps->pm_flags & PMF_PRONE;
 	wasStanding = ( pm->ps->pm_flags & ( PMF_PRONE | PMF_DUCKED ) ) == 0;
+	pm->mins[0] = pm->ps->mins[0];
 	pm->mins[1] = pm->ps->mins[1];
 	pm->maxs[0] = pm->ps->maxs[0];
 	pm->maxs[1] = pm->ps->maxs[1];
@@ -1884,10 +1831,17 @@ static void PM_CheckDuck( void ) {
 	if ( pm->ps->pm_type >= PM_DEAD ) {
 		pm->maxs[2] = pm->ps->maxs[2];
 		pm->ps->viewHeightTarget = pm->ps->deadViewHeight;
-		goto setTrace;
+		if ( pm->ps->pm_flags & PMF_PRONE ) {
+			pm->trace = pm->trace2;
+		} else {
+			pm->trace = pm->trace3;
+		}
+		pm->ps->eFlags |= EF_CAPSULE;
+		PM_ViewHeightAdjust();
+		return;
 	}
 
-	if ( pm->ps->eFlags & EF_TURRET_ACTIVE_MASK ) {
+	if ( pm->ps->eFlags & EF_TURRET_ACTIVE ) {
 		// a mounted weapon dictates the stance
 		if ( ( pm->ps->eFlags & EF_TURRET_ACTIVE_PRONE )
 			 && !( pm->ps->eFlags & EF_TURRET_ACTIVE_DUCK ) ) {
@@ -1911,12 +1865,12 @@ static void PM_CheckDuck( void ) {
 
 		if ( pm->cmd.wbuttons & WBUTTON_PRONE ) {
 			if ( ( pm->ps->pm_flags & PMF_PRONE )
-				 || BG_CheckProneValid( pm->ps->clientNum, pm->ps->origin, pm->maxs[0], 30.0f,
-										pm->ps->viewangles[YAW],
-										&pm->ps->fTorsoHeight, &pm->ps->fTorsoPitch,
-										&pm->ps->fWaistPitch, qfalse,
-										pm->ps->groundEntityNum != ENTITYNUM_NONE, NULL,
-										pm->trace3, pm->trace2, qfalse ) ) {
+				 || BG_CheckProne( pm->ps->clientNum, pm->ps->origin, pm->maxs[0], 30.0f,
+								   pm->ps->viewangles[YAW],
+								   &pm->ps->fTorsoHeight, &pm->ps->fTorsoPitch,
+								   &pm->ps->fWaistPitch, qfalse,
+								   pm->ps->groundEntityNum != ENTITYNUM_NONE, NULL,
+								   pm->trace3, pm->trace2, qfalse ) ) {
 				pm->ps->pm_flags |= PMF_PRONE;
 			} else {
 				pm->ps->pm_flags |= PMF_PRONE_BLOCKED;
@@ -1931,9 +1885,7 @@ static void PM_CheckDuck( void ) {
 			}
 		} else if ( pm->cmd.wbuttons & WBUTTON_CROUCH ) {
 			pm->ps->pm_flags &= ~PMF_PRONE_DIVE;
-			if ( !( pm->ps->pm_flags & PMF_PRONE ) ) {
-				pm->ps->pm_flags |= PMF_DUCKED;
-			} else {
+			if ( pm->ps->pm_flags & PMF_PRONE ) {
 				pm->maxs[2] = 50;
 				pm->trace3( &trace, pm->ps->origin, pm->mins, pm->maxs, pm->ps->origin,
 							pm->ps->clientNum, pm->tracemask );
@@ -1943,6 +1895,8 @@ static void PM_CheckDuck( void ) {
 				} else if ( !( pm->cmd.wbuttons & WBUTTON_NOSTANCEEVENT ) ) {
 					PM_AddEvent( EV_STANCE_FORCE_PRONE );
 				}
+			} else {
+				pm->ps->pm_flags |= PMF_DUCKED;
 			}
 		} else {
 			pm->ps->pm_flags &= ~PMF_PRONE_DIVE;
@@ -1977,18 +1931,23 @@ static void PM_CheckDuck( void ) {
 	}
 
 	if ( pm->ps->pm_flags & PMF_PRONE ) {
+#ifdef CGAMEDLL
+		if ( g_debugProneCheck.integer >= 2 ) {	// keep: the two builds differ here
+#else
 		if ( g_debugProneCheck.integer == 2 ) {
-			BG_CheckProneValid( pm->ps->clientNum, pm->ps->origin, pm->maxs[0], 30.0f,
-								pm->ps->viewangles[YAW], NULL, NULL, NULL, qfalse,
-								pm->ps->groundEntityNum != ENTITYNUM_NONE, NULL,
-								pm->trace3, pm->trace2, qfalse );
+#endif
+			BG_CheckProne( pm->ps->clientNum, pm->ps->origin, pm->maxs[0], 30.0f,
+						   pm->ps->viewangles[YAW], NULL, NULL, NULL, qfalse,
+						   pm->ps->groundEntityNum != ENTITYNUM_NONE, NULL,
+						   pm->trace3, pm->trace2, qfalse );
 		}
 		pm->ps->eFlags |= EF_PRONE;
 		pm->ps->eFlags &= ~EF_CROUCHING;
 		pm->ps->viewHeightTarget = pm->ps->proneViewHeight;
 
-		if ( pm->ps->viewHeightCurrent == (float)pm->ps->viewHeightTarget
-			 || PM_GetViewHeightLerp( -1, -1 ) > 0.5f ) {
+		if ( pm->ps->viewHeightCurrent == pm->ps->viewHeightTarget ) {
+			pm->maxs[2] = 30;
+		} else if ( PM_GetViewHeightLerp( -1, -1 ) > 0.5f ) {
 			pm->maxs[2] = 30;
 		} else {
 			pm->maxs[2] = 50;
@@ -2015,9 +1974,8 @@ static void PM_CheckDuck( void ) {
 				pm->ps->aimSpreadScale = 255.0f;
 			}
 
-			start[0] = pm->ps->origin[0];
-			start[1] = pm->ps->origin[1];
-			start[2] = pm->ps->origin[2] + 10.0f;
+			VectorCopy( pm->ps->origin, start );
+			start[2] += 10.0f;
 			pm->trace2( &trace, pm->ps->origin, pm->mins, pm->maxs, start,
 						pm->ps->clientNum, pm->tracemask );
 			VectorCopy( trace.endpos, start );
@@ -2027,16 +1985,15 @@ static void PM_CheckDuck( void ) {
 
 			pm->ps->proneDirection = pm->ps->viewangles[YAW];
 
-			end[0] = pm->ps->origin[0];
-			end[1] = pm->ps->origin[1];
-			end[2] = pm->ps->origin[2] - 0.25f;
+			VectorCopy( pm->ps->origin, end );
+			end[2] -= 0.25f;
 			pm->trace2( &trace, pm->ps->origin, pm->mins, pm->maxs, end,
 						pm->ps->clientNum, pm->tracemask );
-			if ( trace.startsolid || trace.fraction >= 1.0f ) {
-				pm->ps->proneDirectionPitch = 0;
-			} else {
+			if ( !trace.startsolid && trace.fraction < 1.0f ) {
 				pm->ps->proneDirectionPitch = PitchOfVectorAlongYaw( pm->ps->proneDirection,
 																   trace.normal );
+			} else {
+				pm->ps->proneDirectionPitch = 0;
 			}
 
 			pitch = AngleNormalize180( pm->ps->proneDirectionPitch - pm->ps->viewangles[PITCH] );
@@ -2059,29 +2016,33 @@ static void PM_CheckDuck( void ) {
 		pm->ps->viewHeightTarget = pm->ps->standViewHeight;
 	}
 
-setTrace:
 	if ( pm->ps->pm_flags & PMF_PRONE ) {
 		pm->trace = pm->trace2;
 	} else {
 		pm->trace = pm->trace3;
 	}
-	pm->ps->eFlags |= EF_UPDATE_BOUNDS;
+	pm->ps->eFlags |= EF_CAPSULE;
 
 	PM_ViewHeightAdjust();
 }
+
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", off )
+#endif
 
 /*
 ================
 PM_FootstepEvent
 
-RTCW raised this inline in PM_Footsteps; CoD split it out because the ladder and
-the step-up in PM_StepSlideMove both drive the bob cycle.
+Advances the bob cycle and raises the footstep event; the ladder and the
+step-up in PM_StepSlideMove drive it too.
 ================
 */
-void PM_FootstepEvent( int oldBobCycle, qboolean footstep, int newBobCycle ) {
+void PM_FootstepEvent( int oldBobCycle, int newBobCycle, qboolean footstep ) {
 	trace_t trace;
 	vec3_t mins, maxs, end;
 	int surftype;
+	int contents;
 
 	if ( !( ( ( newBobCycle + 64 ) ^ ( oldBobCycle + 64 ) ) & 128 ) ) {
 		return;
@@ -2091,36 +2052,46 @@ void PM_FootstepEvent( int oldBobCycle, qboolean footstep, int newBobCycle ) {
 		if ( pm->ps->groundEntityNum == ENTITYNUM_NONE ) {
 			if ( footstep && ( pm->ps->pm_flags & PMF_LADDER ) ) {
 				// the ladder is behind us; find what it is made of
-				mins[0] = pm->mins[0] + 6.0f;
-				mins[1] = pm->mins[1] + 6.0f;
+				VectorCopy( pm->mins, mins );
+				mins[0] += 6.0f;
+				mins[1] += 6.0f;
 				mins[2] = 8.0f;
-				maxs[0] = pm->maxs[0] - 6.0f;
-				maxs[1] = pm->maxs[1] - 6.0f;
-				maxs[2] = pm->maxs[2];
+				VectorCopy( pm->maxs, maxs );
+				maxs[0] -= 6.0f;
+				maxs[1] -= 6.0f;
 				if ( maxs[2] < 8.0f ) {
 					maxs[2] = 8.0f;
 				}
+				contents = pm->tracemask & ~( CONTENTS_BODY | CONTENTS_PLAYERCLIP );
 				end[0] = pm->ps->origin[0] - pm->ps->vLadderVec[0] * 31.0f;
 				end[1] = pm->ps->origin[1] - pm->ps->vLadderVec[1] * 31.0f;
 				end[2] = pm->ps->origin[2] - pm->ps->vLadderVec[2] * 31.0f;
-				pm->trace( &trace, pm->ps->origin, mins, maxs, end, pm->ps->clientNum,
-						   pm->tracemask & ~0x2010000 );
+				pm->trace( &trace, pm->ps->origin, mins, maxs, end, pm->ps->clientNum, contents );
 				surftype = SURF_TYPE( trace.surfaceFlags );
 				if ( trace.fraction == 1.0f || !surftype ) {
-					surftype = 13;      // metal
+					surftype = SURF_TYPE_METAL;
 				}
-				PM_AddEvent( EV_FOOTSTEP + surftype );
+				PM_AddEvent( EV_FOOTSTEP_RUN_DEFAULT + surftype );
 			}
 		} else if ( footstep ) {
 			PM_AddEvent( PM_FootstepForSurface( pm->ps->pm_flags ) );
 		}
-	} else if ( pm->waterlevel == 1 || pm->waterlevel == 2 ) {
+	} else if ( pm->waterlevel == 1 ) {
+		// keep: separate waterlevel 1 and 2 arms match original codegen
 		if ( pm->ps->pm_flags & PMF_PRONE ) {
-			PM_AddEvent( EV_SWIM_PRONE );
+			PM_AddEvent( EV_FOOTSTEP_PRONE_WATER );
 		} else if ( pm->ps->pm_flags & PMF_WALKING ) {
-			PM_AddEvent( EV_FOOTSTEP_WADE );
+			PM_AddEvent( EV_FOOTSTEP_WALK_WATER );
 		} else {
-			PM_AddEvent( EV_SWIM );
+			PM_AddEvent( EV_FOOTSTEP_RUN_WATER );
+		}
+	} else if ( pm->waterlevel == 2 ) {
+		if ( pm->ps->pm_flags & PMF_PRONE ) {
+			PM_AddEvent( EV_FOOTSTEP_PRONE_WATER );
+		} else if ( pm->ps->pm_flags & PMF_WALKING ) {
+			PM_AddEvent( EV_FOOTSTEP_WALK_WATER );
+		} else {
+			PM_AddEvent( EV_FOOTSTEP_RUN_WATER );
 		}
 	}
 }
@@ -2131,16 +2102,23 @@ PM_ShouldMakeFootsteps
 ================
 */
 qboolean PM_ShouldMakeFootsteps( void ) {
-	int effectiveStance;
-
-	effectiveStance = PM_GetEffectiveStance( pm->ps );
-	if ( effectiveStance == 1 || effectiveStance == 2 ) {
-		return qfalse;
+	int flags;
+	int walking;
+	int stance;
+	flags = pm->ps->pm_flags;
+	walking = flags & PMF_WALKING;
+	stance = PM_GetEffectiveStance( pm->ps );
+	if ( flags & PMF_BACKWARDS_RUN ) {
+		if ( stance == 1 || stance == 2 || walking ) {
+			return qfalse;
+		}
+		return qtrue;
 	}
-	if ( pm->ps->pm_flags & PMF_WALKING ) {
+	if ( stance == 1 || stance == 2 || walking ) {
 		return qfalse;
 	}
 	return qtrue;
+
 }
 
 /*
@@ -2149,15 +2127,18 @@ PM_Footsteps
 ================
 */
 static void PM_Footsteps( void ) {
-	float bobmove;
+	rfloat bobmove;     // keep: rfloat temporaries match original codegen
 	int old;
 	qboolean footstep;
 	int effectiveStance;
 	int walking;
 	int anim;
-	int strafing;
 	float speed;
-	float lerp;
+	float climbSpeed;
+	rfloat rate;
+	rfloat lerp;
+
+	anim = -1;
 
 	if ( pm->ps->pm_type >= PM_DEAD ) {
 		return;
@@ -2170,7 +2151,7 @@ static void PM_Footsteps( void ) {
 	pm->xyspeed = (float)sqrt( (double)( pm->ps->velocity[0] * pm->ps->velocity[0]
 										 + pm->ps->velocity[1] * pm->ps->velocity[1] ) );
 
-	if ( pm->ps->eFlags & EF_TURRET_ACTIVE_MASK ) {
+	if ( pm->ps->eFlags & EF_TURRET_ACTIVE ) {
 		if ( pm->ps->pm_flags & PMF_PRONE ) {
 			BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_IDLEPRONE, qtrue );
 		} else if ( pm->ps->pm_flags & PMF_DUCKED ) {
@@ -2188,21 +2169,22 @@ static void PM_Footsteps( void ) {
 			 && pm->cmd.serverTime - pm->ps->jumpTime >= pm_ladderJumpTime ) {
 			// airborne on a ladder: the bob cycle follows the climb speed
 			speed = pm_ladderScale * 1.5f * 127.0f;
+			climbSpeed = pm->ps->velocity[2];
 			if ( pm->ps->pm_flags & PMF_WALKING ) {
-				bobmove = pm->ps->velocity[2] / ( speed * pm->ps->walkSpeedScale ) * 0.34999999f;
+				bobmove = climbSpeed / ( speed * pm->ps->walkSpeedScale ) * 0.34999999f;
 			} else {
-				bobmove = pm->ps->velocity[2] / ( speed * pm->ps->runSpeedScale ) * 0.44999999f;
+				bobmove = climbSpeed / ( speed * pm->ps->runSpeedScale ) * 0.44999999f;
 			}
 
-			if ( pm->ps->velocity[2] < 0 ) {
-				BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_CLIMBDOWN, qtrue );
-			} else {
+			if ( climbSpeed >= 0 ) {
 				BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_CLIMBUP, qtrue );
+			} else {
+				BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_CLIMBDOWN, qtrue );
 			}
 
 			old = pm->ps->bobCycle;
 			pm->ps->bobCycle = (int)( (float)pml.msec * bobmove + (float)old ) & 255;
-			PM_FootstepEvent( old, qtrue, pm->ps->bobCycle );
+			PM_FootstepEvent( old, pm->ps->bobCycle, qtrue );
 		}
 		return;
 	}
@@ -2218,9 +2200,6 @@ static void PM_Footsteps( void ) {
 			anim = BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_IDLEPRONE, qtrue );
 		} else if ( pm->ps->viewHeightLerpTarget == pm->ps->crouchViewHeight ) {
 			anim = BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_IDLECR, qtrue );
-		} else {
-			BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_IDLE, qtrue );
-			return;
 		}
 		if ( anim < 0 ) {
 			BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_IDLE, qtrue );
@@ -2230,66 +2209,89 @@ static void PM_Footsteps( void ) {
 
 	// the animation rate is driven by the speed the command asks for, not by
 	// the speed we actually got
-	speed = (float)pm->ps->speed;
-	strafing = STRAFING_NOT;
+	rate = pm->ps->speed;
 	if ( pm->cmd.forwardmove ) {
 		if ( pm->cmd.rightmove ) {
-			speed = speed * ( ( pm->ps->strafeSpeedScale - 1.0f ) * 0.75f + 1.0f + 1.0f ) * 0.5f;
+			rate = rate * ( 1.0f + ( ( pm->ps->strafeSpeedScale - 1.0f ) * 0.75f + 1.0f ) ) * 0.5f;
 			if ( pm->cmd.forwardmove < 0 ) {
-				speed = speed * ( pm->ps->backSpeedScale + 1.0f ) * 0.5f;
+				rate = rate * ( pm->ps->backSpeedScale + 1.0f ) * 0.5f;
 			}
 		} else if ( pm->cmd.forwardmove < 0 ) {
-			speed = speed * pm->ps->backSpeedScale;
+			rate = rate * pm->ps->backSpeedScale;
 		}
-		BG_UpdateConditionValue( pm->ps->clientNum, ANIM_COND_STRAFING, strafing, qtrue );
+		BG_UpdateConditionValue( pm->ps->clientNum, ANIM_COND_STRAFING, STRAFING_NOT, qtrue );
 	} else if ( pm->cmd.rightmove ) {
-		speed = speed * ( ( pm->ps->strafeSpeedScale - 1.0f ) * 0.75f + 1.0f );
-		strafing = pm->cmd.rightmove > 0 ? STRAFING_RIGHT : STRAFING_LEFT;
-		BG_UpdateConditionValue( pm->ps->clientNum, ANIM_COND_STRAFING, strafing, qtrue );
+		rate = rate * ( ( pm->ps->strafeSpeedScale - 1.0f ) * 0.75f + 1.0f );
+		if ( pm->cmd.rightmove > 0 ) {
+			BG_UpdateConditionValue( pm->ps->clientNum, ANIM_COND_STRAFING, STRAFING_RIGHT, qtrue );
+		} else {
+			BG_UpdateConditionValue( pm->ps->clientNum, ANIM_COND_STRAFING, STRAFING_LEFT, qtrue );
+		}
 	}
 
 	if ( walking ) {
-		speed = speed * pm->ps->walkSpeedScale;
+		speed = rate * pm->ps->walkSpeedScale;
 	} else {
-		speed = speed * pm->ps->runSpeedScale;
+		speed = rate * pm->ps->runSpeedScale;
 	}
 
-	lerp = PM_GetViewHeightLerp( pm->ps->proneViewHeight, pm->ps->crouchViewHeight );
+	lerp = PM_GetViewHeightLerp( pm->ps->crouchViewHeight, pm->ps->proneViewHeight );
 	if ( lerp != 0 ) {
-		speed = ( ( 1.0f - lerp ) * pm->ps->crouchSpeedScale
-				  + lerp * pm->ps->proneSpeedScale ) * speed;
+		rate = ( ( 1.0f - lerp ) * pm->ps->crouchSpeedScale + lerp * pm->ps->proneSpeedScale ) * speed;
 	} else {
-		lerp = PM_GetViewHeightLerp( pm->ps->crouchViewHeight, pm->ps->proneViewHeight );
+		lerp = PM_GetViewHeightLerp( pm->ps->proneViewHeight, pm->ps->crouchViewHeight );
 		if ( lerp != 0 ) {
-			speed = ( ( 1.0f - lerp ) * pm->ps->proneSpeedScale
-					  + lerp * pm->ps->crouchSpeedScale ) * speed;
-		} else if ( effectiveStance == 1 ) {
-			speed = speed * pm->ps->proneSpeedScale;
-		} else if ( effectiveStance == 2 ) {
-			speed = speed * pm->ps->crouchSpeedScale;
+			rate = ( ( 1.0f - lerp ) * pm->ps->proneSpeedScale + lerp * pm->ps->crouchSpeedScale ) * speed;
+		} else if ( effectiveStance == PM_EFF_STANCE_PRONE ) {
+			rate = speed * pm->ps->proneSpeedScale;
+		} else if ( effectiveStance == PM_EFF_STANCE_DUCKED ) {
+			rate = speed * pm->ps->crouchSpeedScale;
+		} else {
+			rate = speed;
 		}
 	}
 
-	if ( effectiveStance == 1 ) {
-		bobmove = pm->xyspeed / speed;
-		bobmove *= walking ? 0.23999999f : 0.25f;
+	// keep: the goto / label blocks match original codegen
+	if ( effectiveStance == PM_EFF_STANCE_PRONE ) {
+		goto footstepRate1;
+footstepRate1:
+		bobmove = ( pm->xyspeed / rate );
+		if ( walking ) {
+			bobmove *= 0.23999999f;
+		} else {
+			bobmove *= 0.25f;
+		}
 		if ( pm->ps->pm_flags & PMF_BACKWARDS_RUN ) {
 			anim = BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_WALKPRONEBK, qtrue );
 		} else {
 			anim = BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_WALKPRONE, qtrue );
 		}
-	} else if ( effectiveStance == 2 ) {
-		bobmove = pm->xyspeed / speed;
-		bobmove *= walking ? 0.315f : 0.34f;
-		if ( pm->ps->pm_flags & PMF_BACKWARDS_RUN ) {
-			anim = BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT,
-										   walking ? ANIM_MT_WALKCRBK : ANIM_MT_RUNCRBK, qtrue );
+	} else if ( effectiveStance == PM_EFF_STANCE_DUCKED ) {
+		goto footstepRate2;
+footstepRate2:
+		bobmove = ( pm->xyspeed / rate );
+		if ( walking ) {
+			bobmove *= 0.315f;
 		} else {
-			anim = BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT,
-										   walking ? ANIM_MT_WALKCR : ANIM_MT_RUNCR, qtrue );
+			bobmove *= 0.34f;
+		}
+		if ( pm->ps->pm_flags & PMF_BACKWARDS_RUN ) {
+			if ( walking ) {
+				anim = BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_WALKCRBK, qtrue );
+			} else {
+				anim = BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_RUNCRBK, qtrue );
+			}
+		} else {
+			if ( walking ) {
+				anim = BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_WALKCR, qtrue );
+			} else {
+				anim = BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_RUNCR, qtrue );
+			}
 		}
 	} else {
-		bobmove = pm->xyspeed / speed;
+		goto footstepRate3;
+footstepRate3:
+		bobmove = ( pm->xyspeed / rate );
 		if ( pm->ps->pm_flags & PMF_BACKWARDS_RUN ) {
 			if ( walking ) {
 				bobmove *= 0.32499999f;
@@ -2334,7 +2336,7 @@ static void PM_Footsteps( void ) {
 		BG_AnimScriptAnimation( pm->ps, AISTATE_COMBAT, ANIM_MT_IDLE, qtrue );
 	}
 
-	PM_FootstepEvent( old, footstep, pm->ps->bobCycle );
+	PM_FootstepEvent( old, pm->ps->bobCycle, footstep );
 }
 
 /*
@@ -2382,8 +2384,7 @@ static void PM_FoliageSounds( void ) {
 	maxs[2] = pm->maxs[2] * 0.75f;
 	maxs[2] = pm->maxs[2] * 0.89999998f;
 
-	/* 2 is the foliage-only content bit; q_shared.h has no CONTENTS_ set yet. */
-	pm->trace( &trace, pm->ps->origin, mins, maxs, pm->ps->origin, pm->ps->clientNum, 2 );
+	pm->trace( &trace, pm->ps->origin, mins, maxs, pm->ps->origin, pm->ps->clientNum, CONTENTS_FOLIAGE );
 	if ( trace.startsolid ) {
 		PM_AddEvent( EV_FOLIAGE_SOUND );
 		pm->ps->iFoliageSoundTime = pm->cmd.serverTime;
@@ -2464,26 +2465,26 @@ void PM_UpdateLean( playerState_t *ps, const usercmd_t *cmd,
 	int effectiveStance;
 
 	leaning = 0;
-	if ( ( cmd->wbuttons & ( WBUTTON_LEAN_LEFT | WBUTTON_LEAN_RIGHT ) )
+	if ( ( cmd->wbuttons & ( WBUTTON_LEANLEFT | WBUTTON_LEANRIGHT ) )
 		 && !( ps->pm_flags & PMF_IGNORE_INPUT )
 		 && ps->pm_type < PM_DEAD
 		 && ( ps->groundEntityNum != ENTITYNUM_NONE || ps->pm_type == PM_NORMAL_LINKED ) ) {
-		if ( cmd->wbuttons & WBUTTON_LEAN_LEFT ) {
+		if ( cmd->wbuttons & WBUTTON_LEANLEFT ) {
 			leaning = -1;
 		}
-		if ( cmd->wbuttons & WBUTTON_LEAN_RIGHT ) {
+		if ( cmd->wbuttons & WBUTTON_LEANRIGHT ) {
 			leaning++;
 		}
 	}
 
-	if ( ps->eFlags & EF_TURRET_ACTIVE_MASK ) {
+	if ( ps->eFlags & EF_TURRET_ACTIVE ) {
 		leaning = 0;
 	}
 
 	effectiveStance = PM_GetEffectiveStance( ps );
-	if ( effectiveStance == 1 ) {
+	if ( effectiveStance == PM_EFF_STANCE_PRONE ) {
 		maxLean = 0.25f;
-	} else if ( effectiveStance == 2 ) {
+	} else if ( effectiveStance == PM_EFF_STANCE_DUCKED ) {
 		maxLean = 0.5f;
 	} else {
 		maxLean = 1.0f;
@@ -2493,26 +2494,26 @@ void PM_UpdateLean( playerState_t *ps, const usercmd_t *cmd,
 
 	if ( !leaning ) {
 		if ( leanFrac > 0 ) {
-			leanFrac = leanFrac - (float)pml.msec * 0.0035714286f * maxLean;
+			leanFrac = leanFrac - FCAST( (float)pml.msec * 0.0035714286f ) * maxLean;
 			if ( leanFrac < 0 ) {
 				leanFrac = 0;
 			}
 		} else if ( leanFrac < 0 ) {
-			leanFrac = leanFrac + (float)pml.msec * 0.0035714286f * maxLean;
+			leanFrac = leanFrac + FCAST( (float)pml.msec * 0.0035714286f ) * maxLean;
 			if ( leanFrac > 0 ) {
 				leanFrac = 0;
 			}
 		}
 	} else if ( leaning > 0 ) {
 		if ( leanFrac < maxLean ) {
-			leanFrac = leanFrac + (float)pml.msec * 0.0028571428f * maxLean;
+			leanFrac = leanFrac + FCAST( (float)pml.msec * 0.0028571428f ) * maxLean;
 		}
 		if ( leanFrac > maxLean ) {
 			leanFrac = maxLean;
 		}
 	} else {
 		if ( leanFrac > -maxLean ) {
-			leanFrac = leanFrac - (float)pml.msec * 0.0028571428f * maxLean;
+			leanFrac = leanFrac - FCAST( (float)pml.msec * 0.0028571428f ) * maxLean;
 		}
 		if ( leanFrac < -maxLean ) {
 			leanFrac = -maxLean;
@@ -2524,13 +2525,12 @@ void PM_UpdateLean( playerState_t *ps, const usercmd_t *cmd,
 	if ( ps->leanf != 0 && ps->pm_type != PM_NORMAL_LINKED ) {
 		// trace out to the fully leaned position and give back however much
 		// clearance there was
-		end[0] = ps->origin[0];
-		end[1] = ps->origin[1];
-		end[2] = ps->origin[2] + ps->viewHeightCurrent;
-		VectorCopy( end, start );
+		leaning = PM_FloatSign( ps->leanf );
+		VectorCopy( ps->origin, start );
+		start[2] += ps->viewHeightCurrent;
+		VectorCopy( start, end );
 
-		AddLeanToPosition( end, ps->viewangles[YAW], (float)PM_FloatSign( ps->leanf ),
-						   16.0f, 20.0f );
+		AddLeanToPosition( end, ps->viewangles[YAW], (float)leaning, 16.0f, 20.0f );
 
 		mins[0] = -8;
 		mins[1] = -8;
@@ -2539,14 +2539,19 @@ void PM_UpdateLean( playerState_t *ps, const usercmd_t *cmd,
 		maxs[1] = 8;
 		maxs[2] = 8;
 
-		trace( &leanTrace, start, mins, maxs, end, ps->clientNum, MASK_PLAYERSOLID );
+		trace( &leanTrace, start, mins, maxs, end, ps->clientNum, MASK_CLIENTSOLID );
 
 		blockedFrac = UnGetLeanFraction( leanTrace.fraction );
-		if ( blockedFrac < PM_FloatAbs( ps->leanf ) ) {
+		if ( fabs( ps->leanf ) > blockedFrac ) {
 			ps->leanf = (float)PM_FloatSign( ps->leanf ) * blockedFrac;
 		}
 	}
 }
+
+// keep: improve-float-consistency (/Op) code, matches original codegen
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", on )
+#endif
 
 /*
 ================
@@ -2564,7 +2569,6 @@ void PM_UpdateViewAngles( playerState_t *ps, const usercmd_t *cmd,
 	int i;
 	float ladderYaw;
 	float diff;
-	float yawcap;
 	float newDirection;
 	float step;
 	float limit;
@@ -2574,15 +2578,17 @@ void PM_UpdateViewAngles( playerState_t *ps, const usercmd_t *cmd,
 	}
 
 	if ( ps->pm_type >= PM_DEAD ) {
-		if ( ps->stats[1] == 999 ) {
-			ps->stats[1] = (int)SHORT2ANGLE( (short)( cmd->angles[YAW] + ps->delta_angles[YAW] ) );
+		if ( ps->stats[STAT_DEAD_YAW] == 999 ) {
+			ps->stats[STAT_DEAD_YAW] = (int)SHORT2ANGLE( (short)( cmd->angles[YAW] + ps->delta_angles[YAW] ) );
 		}
 		PM_UpdateLean( ps, cmd, trace );
 		return;
 	}
 
 	// circularly clamp the angles with deltas
-	for ( i = 0 ; i < 3 ; i++ ) {
+	// keep: do-while matches original codegen
+	i = 0;
+	do {
 		temp = (short)( cmd->angles[i] + ps->delta_angles[i] );
 		if ( i == PITCH ) {
 			// don't let the player look up or down more than 90 degrees
@@ -2595,64 +2601,67 @@ void PM_UpdateViewAngles( playerState_t *ps, const usercmd_t *cmd,
 			}
 		}
 		ps->viewangles[i] = SHORT2ANGLE( temp );
-	}
+		i++;
+	} while ( i < 3 );
 
 	// on a ladder the view is capped around the ladder's facing
 	if ( ( ps->pm_flags & PMF_LADDER ) && ps->groundEntityNum == ENTITYNUM_NONE ) {
 		if ( bg_ladder_yawcap.integer ) {
-			yawcap = (float)bg_ladder_yawcap.integer;
 			ladderYaw = vectoyaw( ps->vLadderVec ) + 180.0f;
 			diff = AngleNormalize180( ladderYaw - ps->viewangles[YAW] );
-			if ( diff > yawcap || diff < -yawcap ) {
-				if ( diff > yawcap ) {
-					diff = diff - yawcap;
+			if ( diff > bg_ladder_yawcap.integer || diff < -bg_ladder_yawcap.integer ) {
+				if ( diff > bg_ladder_yawcap.integer ) {
+					diff = diff - bg_ladder_yawcap.integer;
 				} else {
-					diff = yawcap + diff;
+					diff = bg_ladder_yawcap.integer + diff;
 				}
 				ps->delta_angles[YAW] += ANGLE2SHORT( diff );
-				if ( diff <= 0 ) {
-					ps->viewangles[YAW] = AngleNormalize360( ladderYaw + yawcap );
+				if ( diff > 0 ) {
+					ps->viewangles[YAW] = AngleNormalize360( ladderYaw - bg_ladder_yawcap.integer );
 				} else {
-					ps->viewangles[YAW] = AngleNormalize360( ladderYaw - yawcap );
+					ps->viewangles[YAW] = AngleNormalize360( bg_ladder_yawcap.integer + ladderYaw );
 				}
 			}
 		}
 	}
 
 	// prone caps the view around the direction the body is lying in
-	if ( ( ps->pm_flags & PMF_PRONE ) && !( ps->eFlags & EF_TURRET_ACTIVE_MASK ) ) {
+	if ( ( ps->pm_flags & PMF_PRONE ) && !( ps->eFlags & EF_TURRET_ACTIVE ) ) {
 		if ( g_debugProneCheck.integer ) {
-			static const vec3_t debugColor = { 1, 1, 1 };
 			vec3_t debugStart, debugEnd, debugForward;
-			float sp, cp, sy, cy, angle;
+			float angle;
+			float sr, sp, sy, cr, cp, cy;
 
-			debugStart[0] = ps->origin[0];
-			debugStart[1] = ps->origin[1];
-			debugStart[2] = (float)ps->proneViewHeight + ps->origin[2];
-
-			angle = ps->viewangles[YAW] * 0.017453292f;
-			cy = (float)cos( angle );
-			sy = (float)sin( angle );
-			angle = ps->viewangles[PITCH] * 0.017453292f;
-			cp = (float)cos( angle );
-			sp = (float)sin( angle );
-
+			VectorCopy( ps->origin, debugStart );
+			debugStart[2] += ps->proneViewHeight;
+			// keep: AngleVectors( ps->viewangles, debugForward, NULL, NULL ) inlined,
+			// matches original codegen
+			angle = ps->viewangles[YAW] * ( (float)M_PI * 2 / 360 );
+			SinCos( angle, &sy, &cy );
+			angle = ps->viewangles[PITCH] * ( (float)M_PI * 2 / 360 );
+			SinCos( angle, &sp, &cp );
 			debugForward[0] = cp * cy;
 			debugForward[1] = cp * sy;
 			debugForward[2] = -sp;
+			if ( !debugForward ) {
+				angle = ps->viewangles[ROLL] * ( (float)M_PI * 2 / 360 );
+				SinCos( angle, &sr, &cr );
+			}
 
 			debugEnd[0] = debugForward[0] * 18.0f + debugStart[0];
 			debugEnd[1] = debugForward[1] * 18.0f + debugStart[1];
 			debugEnd[2] = debugForward[2] * 18.0f + debugStart[2];
 
-			trap_AddDebugLine( debugStart, debugEnd, debugColor, 1, 1 );
+			trap_AddDebugLine( debugStart, debugEnd, colorWhite, 1, 1 );
 			G_DebugArc( debugStart, 16.0f,
 						ps->proneDirection - bg_prone_yawcap.value,
 						bg_prone_yawcap.value + ps->proneDirection,
-						debugColor, 1, 1 );
+						colorWhite, 1, 1 );
 		}
 
+		// keep: normalized twice, matches original codegen
 		diff = AngleNormalize180( ps->proneDirection - ps->viewangles[YAW] );
+		diff = AngleNormalize180( diff );
 
 		if ( ( bg_prone_softyawedge.integer
 			   && ( diff > (float)( bg_prone_yawcap.integer - 5 )
@@ -2660,18 +2669,18 @@ void PM_UpdateViewAngles( playerState_t *ps, const usercmd_t *cmd,
 			 || ( ( cmd->forwardmove || cmd->rightmove ) && diff != 0 ) ) {
 			// turn the body toward the view if there is room for it
 			step = pml.frametime * 55.0f;
-			if ( step > PM_FloatAbs( diff ) ) {
+			if ( fabs( diff ) < step ) {
 				newDirection = ps->viewangles[YAW];
-			} else if ( diff <= 0 ) {
-				newDirection = step + ps->proneDirection;
-			} else {
+			} else if ( diff > 0 ) {
 				newDirection = ps->proneDirection - step;
+			} else {
+				newDirection = step + ps->proneDirection;
 			}
 
-			if ( BG_CheckProneValid( ps->clientNum, ps->origin, ps->maxs[0], 30.0f, newDirection,
-									 &ps->fTorsoHeight, &ps->fTorsoPitch, &ps->fWaistPitch,
-									 qtrue, ps->groundEntityNum != ENTITYNUM_NONE, NULL,
-									 trace, NULL, qfalse ) ) {
+			if ( BG_CheckProne( ps->clientNum, ps->origin, ps->maxs[0], 30.0f, newDirection,
+								&ps->fTorsoHeight, &ps->fTorsoPitch, &ps->fWaistPitch,
+								qtrue, ps->groundEntityNum != ENTITYNUM_NONE, NULL,
+								trace, NULL, qfalse ) ) {
 				ps->proneDirection = newDirection;
 			} else {
 				limit = (float)bg_prone_yawcap.integer + 0.1f;
@@ -2681,33 +2690,34 @@ void PM_UpdateViewAngles( playerState_t *ps, const usercmd_t *cmd,
 			}
 		}
 
-		yawcap = (float)bg_prone_yawcap.integer;
-		if ( diff > yawcap || diff < -yawcap ) {
-			if ( diff > yawcap ) {
-				diff = diff - yawcap;
+		if ( diff > bg_prone_yawcap.integer || diff < -bg_prone_yawcap.integer ) {
+			if ( diff > bg_prone_yawcap.integer ) {
+				diff = diff - bg_prone_yawcap.integer;
 			} else {
-				diff = yawcap + diff;
+				diff = bg_prone_yawcap.integer + diff;
 			}
 			ps->delta_angles[YAW] += ANGLE2SHORT( diff );
-			if ( diff <= 0 ) {
-				ps->viewangles[YAW] = SHORT2ANGLE( ANGLE2SHORT( ps->proneDirection + yawcap ) );
+			if ( diff > 0 ) {
+				ps->viewangles[YAW] = SHORT2ANGLE( ANGLE2SHORT( ps->proneDirection - bg_prone_yawcap.integer ) );
 			} else {
-				ps->viewangles[YAW] = SHORT2ANGLE( ANGLE2SHORT( ps->proneDirection - yawcap ) );
+				ps->viewangles[YAW] = SHORT2ANGLE( ANGLE2SHORT( bg_prone_yawcap.integer + ps->proneDirection ) );
 			}
 		}
 
+		// keep: normalized twice, matches original codegen
 		diff = AngleNormalize180( ps->proneTorsoPitch - ps->viewangles[PITCH] );
+		diff = AngleNormalize180( diff );
 		if ( diff > 45.0f || diff < -45.0f ) {
-			if ( diff <= 0 ) {
-				diff = diff + 45.0f;
-			} else {
+			if ( diff > 45.0f ) {
 				diff = diff - 45.0f;
+			} else {
+				diff = diff + 45.0f;
 			}
 			ps->delta_angles[PITCH] += ANGLE2SHORT( diff );
-			if ( diff <= 0 ) {
-				ps->viewangles[PITCH] = AngleNormalize180( ps->proneTorsoPitch + 45.0f );
-			} else {
+			if ( diff > 0 ) {
 				ps->viewangles[PITCH] = AngleNormalize180( ps->proneTorsoPitch - 45.0f );
+			} else {
+				ps->viewangles[PITCH] = AngleNormalize180( ps->proneTorsoPitch + 45.0f );
 			}
 		}
 	}
@@ -2735,12 +2745,12 @@ static void PM_UpdatePronePitch( void ) {
 	}
 
 	if ( pm->ps->groundEntityNum == ENTITYNUM_NONE ) {
-		if ( !BG_CheckProneValid( pm->ps->clientNum, pm->ps->origin, pm->ps->maxs[0], 30.0f,
-								  pm->ps->proneDirection,
-								  &pm->ps->fTorsoHeight, &pm->ps->fTorsoPitch,
-								  &pm->ps->fWaistPitch, qtrue, qfalse,
-								  pml.groundPlane ? pml.groundTrace.normal : NULL,
-								  pm->trace3, pm->trace2, qfalse ) ) {
+		if ( !BG_CheckProne( pm->ps->clientNum, pm->ps->origin, pm->ps->maxs[0], 30.0f,
+							 pm->ps->proneDirection,
+							 &pm->ps->fTorsoHeight, &pm->ps->fTorsoPitch,
+							 &pm->ps->fWaistPitch, qtrue, qfalse,
+							 pml.groundPlane ? pml.groundTrace.normal : NULL,
+							 pm->trace3, pm->trace2, qfalse ) ) {
 			PM_AddEvent( EV_STANCE_FORCE_CROUCH );
 			pm->ps->pm_flags |= PMF_PRONE_BLOCKED;
 		}
@@ -2758,9 +2768,10 @@ static void PM_UpdatePronePitch( void ) {
 	if ( diff != 0 ) {
 		step = pml.frametime * 70.0f;
 		if ( PM_FloatAbs( diff ) > step ) {
-			diff = (float)PM_FloatSign( diff ) * step;
+			pm->ps->proneDirectionPitch = (float)PM_FloatSign( diff ) * step + pm->ps->proneDirectionPitch;
+		} else {
+			pm->ps->proneDirectionPitch = diff + pm->ps->proneDirectionPitch;
 		}
-		pm->ps->proneDirectionPitch = diff + pm->ps->proneDirectionPitch;
 		pm->ps->proneDirectionPitch = AngleNormalize180( pm->ps->proneDirectionPitch );
 	}
 
@@ -2774,12 +2785,17 @@ static void PM_UpdatePronePitch( void ) {
 	if ( diff != 0 ) {
 		step = pml.frametime * 70.0f;
 		if ( PM_FloatAbs( diff ) > step ) {
-			diff = (float)PM_FloatSign( diff ) * step;
+			pm->ps->proneTorsoPitch = (float)PM_FloatSign( diff ) * step + pm->ps->proneTorsoPitch;
+		} else {
+			pm->ps->proneTorsoPitch = diff + pm->ps->proneTorsoPitch;
 		}
-		pm->ps->proneTorsoPitch = diff + pm->ps->proneTorsoPitch;
 		pm->ps->proneTorsoPitch = AngleNormalize180( pm->ps->proneTorsoPitch );
 	}
 }
+
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", off )
+#endif
 
 /*
 ================
@@ -2870,19 +2886,20 @@ static void PM_CheckLadderMove( void ) {
 		return;
 	}
 
-	if ( PM_GetEffectiveStance( pm->ps ) == 1 ) {
+	if ( PM_GetEffectiveStance( pm->ps ) == PM_EFF_STANCE_PRONE ) {
 		return;
 	}
 	if ( pm->cmd.serverTime - pm->ps->jumpTime < pm_ladderJumpTime ) {
 		return;
 	}
 
-	mins[0] = pm->mins[0] + 6.0f;
-	mins[1] = pm->mins[1] + 6.0f;
+	VectorCopy( pm->mins, mins );
+	mins[0] += 6.0f;
+	mins[1] += 6.0f;
 	mins[2] = 8.0f;
-	maxs[0] = pm->maxs[0] - 6.0f;
-	maxs[1] = pm->maxs[1] - 6.0f;
-	maxs[2] = pm->maxs[2];
+	VectorCopy( pm->maxs, maxs );
+	maxs[0] -= 6.0f;
+	maxs[1] -= 6.0f;
 	if ( maxs[2] < 8.0f ) {
 		maxs[2] = 8.0f;
 	}
@@ -2898,6 +2915,11 @@ static void PM_CheckLadderMove( void ) {
 	}
 }
 
+// keep: improve-float-consistency (/Op) code, matches original codegen
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", on )
+#endif
+
 /*
 ============
 PM_LadderMove
@@ -2907,10 +2929,9 @@ static void PM_LadderMove( void ) {
 	float wishspeed, scale;
 	vec3_t wishdir, wishvel;
 	vec3_t ladder_right;
-	vec3_t rt;
 	float upscale;
 	float dot, drop;
-	float push;
+	float negDot;
 	int movementDir;
 
 	if ( PM_CheckJump() ) {
@@ -2945,10 +2966,7 @@ static void PM_LadderMove( void ) {
 
 	if ( pm->cmd.rightmove ) {
 		// strafe, so we can jump off the ladder
-		drop = (float)pm->cmd.rightmove * scale * 0.2f;
-		wishvel[0] = drop * pml.right[0];
-		wishvel[1] = drop * pml.right[1];
-		wishvel[2] = drop * pml.right[2] + wishvel[2];
+		VectorMA( wishvel, (float)pm->cmd.rightmove * scale * 0.2f, pml.right, wishvel );
 	}
 
 	wishspeed = VectorNormalize2( wishvel, wishdir );
@@ -2970,21 +2988,23 @@ static void PM_LadderMove( void ) {
 	}
 
 	if ( !pm->cmd.rightmove ) {
-		// sideways friction along the ladder
-		rt[0] = pml.right[0];
-		rt[1] = pml.right[1];
-		VectorNormalize2D( rt );
-		dot = rt[0] * pm->ps->velocity[0] + rt[1] * pm->ps->velocity[1];
+		// sideways friction along the ladder (keep: wishdir reused)
+		wishdir[0] = pml.right[0];
+		wishdir[1] = pml.right[1];
+		VectorNormalize2D( wishdir );
+		dot = wishdir[0] * pm->ps->velocity[0] + wishdir[1] * pm->ps->velocity[1];
 		if ( dot != 0 ) {
-			pm->ps->velocity[0] += -dot * rt[0];
-			pm->ps->velocity[1] += -dot * rt[1];
+			negDot = -dot;
+			pm->ps->velocity[0] += negDot * wishdir[0];
+			pm->ps->velocity[1] += negDot * wishdir[1];
 			drop = pm_ladderfriction * pml.frametime * dot;
-			if ( PM_FloatAbs( dot ) > PM_FloatAbs( drop ) ) {
-				if ( PM_FloatAbs( drop ) < 1.0f ) {
+			if ( fabs( dot ) > fabs( drop ) ) {
+				if ( fabs( drop ) < 1.0 ) {
 					drop = (float)PM_FloatSign( drop );
 				}
-				pm->ps->velocity[0] += ( dot - drop ) * rt[0];
-				pm->ps->velocity[1] += ( dot - drop ) * rt[1];
+				dot = dot - drop;
+				pm->ps->velocity[0] += dot * wishdir[0];
+				pm->ps->velocity[1] += dot * wishdir[1];
 			}
 		}
 	}
@@ -2993,24 +3013,30 @@ static void PM_LadderMove( void ) {
 		// hold on to the ladder
 		dot = pm->ps->vLadderVec[0] * pm->ps->velocity[0]
 			  + pm->ps->vLadderVec[1] * pm->ps->velocity[1];
-		pm->ps->velocity[0] += -dot * pm->ps->vLadderVec[0];
-		pm->ps->velocity[1] += -dot * pm->ps->vLadderVec[1];
+		negDot = -dot;
+		pm->ps->velocity[0] += negDot * pm->ps->vLadderVec[0];
+		pm->ps->velocity[1] += negDot * pm->ps->vLadderVec[1];
 
-		push = wishvel[2] > 0 ? -500.0f : -250.0f;
-		pm->ps->velocity[0] += push * pm->ps->vLadderVec[0];
-		pm->ps->velocity[1] += push * pm->ps->vLadderVec[1];
+		// keep: reusing dot matches original codegen
+		dot = wishvel[2] > 0 ? -500.0f : -250.0f;
+		pm->ps->velocity[0] += dot * pm->ps->vLadderVec[0];
+		pm->ps->velocity[1] += dot * pm->ps->vLadderVec[1];
 	}
 
 	PM_StepSlideMove( qfalse );     // no gravity while going up ladder
 
-	// always point the legs at the ladder
-	movementDir = (int)AngleNormalize180( vectoyaw( pm->ps->vLadderVec ) + 180.0f
-										  - pm->ps->viewangles[YAW] );
+	// always point the legs at the ladder (keep: scale reused for the yaw)
+	scale = vectoyaw( pm->ps->vLadderVec ) + 180.0f;
+	movementDir = (int)AngleNormalize180( scale - pm->ps->viewangles[YAW] );
 	if ( abs( movementDir ) > 75 ) {
-		movementDir = movementDir <= 0 ? -75 : 75;
+		movementDir = movementDir > 0 ? 75 : -75;
 	}
 	pm->ps->movementDir = (signed char)movementDir;
 }
+
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", off )
+#endif
 
 /*
 ================
@@ -3019,6 +3045,7 @@ PmoveSingle
 */
 void PmoveSingle( pmove_t *pmove ) {
 	vec3_t delta;
+	rfloat deltaX;      // keep: rfloat matches original codegen
 
 	BG_AnimUpdatePlayerStateConditions( pmove );
 
@@ -3031,12 +3058,13 @@ void PmoveSingle( pmove_t *pmove ) {
 	// by setting a conditional breakpoint for the previous frame
 	c_pmove++;
 
+	// keep: pmove-> rather than pm-> matches original codegen
 	if ( pm->ps->pm_flags & PMF_IGNORE_INPUT ) {
-		pm->cmd.buttons = 0;
-		pm->cmd.wbuttons &= ( WBUTTON_CROUCH | WBUTTON_PRONE | WBUTTON_NOSTANCEEVENT );
-		pm->cmd.forwardmove = 0;
-		pm->cmd.rightmove = 0;
-		pm->cmd.upmove = 0;
+		pmove->cmd.buttons = 0;
+		pmove->cmd.wbuttons &= ( WBUTTON_CROUCH | WBUTTON_PRONE | WBUTTON_NOSTANCEEVENT );
+		pmove->cmd.forwardmove = 0;
+		pmove->cmd.rightmove = 0;
+		pmove->cmd.upmove = 0;
 	}
 
 	pm->ps->pm_flags &= ~PMF_PRONE_BLOCKED;
@@ -3049,17 +3077,17 @@ void PmoveSingle( pmove_t *pmove ) {
 	// of whatever the weapon was doing
 	if ( pm->ps->pm_flags & PMF_PRONE ) {
 		if ( ( pm->cmd.forwardmove != pm->oldcmd.forwardmove
-			   && PM_FloatAbs( (float)pm->oldcmd.forwardmove )
-				  < PM_FloatAbs( (float)pm->cmd.forwardmove ) )
+			   && fabs( (float)pm->cmd.forwardmove ) > fabs( (float)pm->oldcmd.forwardmove ) )
 			 || ( pm->cmd.rightmove != pm->oldcmd.rightmove
-				  && PM_FloatAbs( (float)pm->oldcmd.rightmove )
-					 < PM_FloatAbs( (float)pm->cmd.rightmove ) ) ) {
+				  && fabs( (float)pm->cmd.rightmove ) > fabs( (float)pm->oldcmd.rightmove ) ) ) {
 			if ( PM_InteruptWeaponWithProneMove() ) {
 				pm->ps->pm_flags &= ~PMF_PRONE_MOVEOVERRIDE;
 				pm->ps->pm_flags &= ~PMF_ADS;
 			}
 		} else if ( !( pm->ps->pm_flags & PMF_ADS )
-					&& ( pm->ps->weaponstate <= WEAPON_DROPPING
+					&& ( pm->ps->weaponstate == WEAPON_READY
+						 || pm->ps->weaponstate == WEAPON_RAISING
+						 || pm->ps->weaponstate == WEAPON_DROPPING
 						 || pm->ps->weaponstate == WEAPON_RELOADING ) ) {
 			pm->ps->pm_flags &= ~PMF_PRONE_MOVEOVERRIDE;
 		}
@@ -3101,12 +3129,12 @@ void PmoveSingle( pmove_t *pmove ) {
 	// if talk button is down, dissallow all input
 	// this is to prevent any possible intercept proxy from
 	// adding fake talk balloons
-	if ( pm->cmd.buttons & BUTTON_TALK ) {
-		pm->cmd.buttons = BUTTON_TALK;
-		pm->cmd.wbuttons &= ( WBUTTON_CROUCH | WBUTTON_PRONE | WBUTTON_NOSTANCEEVENT );
-		pm->cmd.forwardmove = 0;
-		pm->cmd.rightmove = 0;
-		pm->cmd.upmove = 0;
+	if ( pmove->cmd.buttons & BUTTON_TALK ) {
+		pmove->cmd.buttons = BUTTON_TALK;
+		pmove->cmd.wbuttons &= ( WBUTTON_CROUCH | WBUTTON_PRONE | WBUTTON_NOSTANCEEVENT );
+		pmove->cmd.forwardmove = 0;
+		pmove->cmd.rightmove = 0;
+		pmove->cmd.upmove = 0;
 	}
 
 	// clear all pmove local vars
@@ -3119,7 +3147,7 @@ void PmoveSingle( pmove_t *pmove ) {
 	} else if ( pml.msec > 200 ) {
 		pml.msec = 200;
 	}
-	pm->ps->commandTime = pmove->cmd.serverTime;
+	pmove->ps->commandTime = pmove->cmd.serverTime;
 
 	// save old org in case we get stuck
 	VectorCopy( pm->ps->origin, pml.previous_origin );
@@ -3146,7 +3174,7 @@ void PmoveSingle( pmove_t *pmove ) {
 	// decide if backpedaling animations should be used
 	if ( pm->cmd.forwardmove < 0 ) {
 		pm->ps->pm_flags |= PMF_BACKWARDS_RUN;
-	} else if ( pm->cmd.forwardmove > 0 || pm->cmd.rightmove ) {
+	} else if ( pm->cmd.forwardmove > 0 || ( pm->cmd.forwardmove == 0 && pm->cmd.rightmove ) ) {
 		pm->ps->pm_flags &= ~PMF_BACKWARDS_RUN;
 	}
 
@@ -3195,7 +3223,7 @@ void PmoveSingle( pmove_t *pmove ) {
 		PM_CheckDuck();
 		PM_DropTimers();
 		PM_Weapon();
-		if ( pm->ps->eFlags & EF_TURRET_ACTIVE_MASK ) {
+		if ( pm->ps->eFlags & EF_TURRET_ACTIVE ) {
 			PM_Footsteps();
 		}
 		return;
@@ -3207,7 +3235,7 @@ void PmoveSingle( pmove_t *pmove ) {
 		break;
 	}
 
-	if ( pm->ps->eFlags & EF_TURRET_ACTIVE_MASK ) {
+	if ( pm->ps->eFlags & EF_TURRET_ACTIVE ) {
 		// a mounted weapon holds us in place
 		pm->ps->groundEntityNum = ENTITYNUM_NONE;
 		pml.groundPlane = qfalse;
@@ -3267,12 +3295,18 @@ void PmoveSingle( pmove_t *pmove ) {
 
 	// if the move came out a lot shorter than the velocity asked for, take the
 	// velocity from the move that actually happened
-	VectorSubtract( pm->ps->origin, pml.previous_origin, delta );
-	if ( DotProduct( pm->ps->velocity, pm->ps->velocity ) * 0.25f
-		 > DotProduct( delta, delta ) / ( pml.frametime * pml.frametime ) ) {
-		pm->ps->velocity[0] = 1.0f / pml.frametime * delta[0];
-		pm->ps->velocity[1] = 1.0f / pml.frametime * delta[1];
-		pm->ps->velocity[2] = 1.0f / pml.frametime * delta[2];
+	// keep: deltaX and the sum order match original codegen
+	deltaX = (rfloat)pm->ps->origin[0] - pml.previous_origin[0];
+	delta[1] = pm->ps->origin[1] - pml.previous_origin[1];
+	delta[2] = pm->ps->origin[2] - pml.previous_origin[2];
+	if ( ( (rfloat)delta[2] * delta[2] + (rfloat)delta[1] * delta[1] + deltaX * deltaX )
+		 / ( (rfloat)pml.frametime * pml.frametime )
+		 < ( (rfloat)pm->ps->velocity[2] * pm->ps->velocity[2]
+			 + (rfloat)pm->ps->velocity[1] * pm->ps->velocity[1]
+			 + (rfloat)pm->ps->velocity[0] * pm->ps->velocity[0] ) * 0.25f ) {
+		pm->ps->velocity[0] = FCAST( deltaX * ( 1.0f / pml.frametime ) );
+		pm->ps->velocity[1] = delta[1] * ( 1.0f / pml.frametime );
+		pm->ps->velocity[2] = delta[2] * ( 1.0f / pml.frametime );
 	}
 
 	// snap some parts of playerstate to save network bandwidth
@@ -3299,7 +3333,8 @@ void Pmove( pmove_t *pmove ) {
 		pmove->ps->commandTime = finalTime - 1000;
 	}
 
-	pmove->numtouch = 0;
+	pm = pmove;
+	pm->numtouch = 0;
 
 	// chop the move up if it is too long, to prevent framerate
 	// dependent behavior
@@ -3335,12 +3370,12 @@ ladder, the ground speed otherwise.
 ================
 */
 float BG_GetSpeed( const playerState_t *ps, int time ) {
-	if ( !( ps->pm_flags & PMF_LADDER ) ) {
-		return (float)sqrt( (double)( ps->velocity[0] * ps->velocity[0]
-									  + ps->velocity[1] * ps->velocity[1] ) );
+	if ( ps->pm_flags & PMF_LADDER ) {
+		if ( time - ps->jumpTime < 500 ) {
+			return 0;
+		}
+		return ps->velocity[2];
 	}
-	if ( time - ps->jumpTime < 500 ) {
-		return 0;
-	}
-	return ps->velocity[2];
+	return (float)sqrt( (double)( ps->velocity[0] * ps->velocity[0]
+								  + ps->velocity[1] * ps->velocity[1] ) );
 }

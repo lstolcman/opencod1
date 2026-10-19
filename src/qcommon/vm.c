@@ -11,6 +11,12 @@
 
 #include "qcommon.h"
 
+/* Called through the IAT, as with windows.h. */
+__declspec( dllimport ) int __stdcall FreeLibrary( void *hLibModule );
+
+/* win32/win_main.c, retail 0x00462450 (localization.txt key lookup) */
+extern char *SEH_GetLocalizedString_m( const char *key );
+
 #define MAX_VM  3
 
 typedef struct vm_s {
@@ -78,11 +84,13 @@ vm_t *VM_Create( const char *module, int ( *systemCalls )( int * ) ) {
 	vm->systemCall = systemCalls;
 
 	vm->dllHandle = Sys_LoadDll( module, vm->fqpath, &vm->entryPoint, VM_DllSyscall );
-	if ( !vm->dllHandle ) {
-		Com_Error( ERR_FATAL, "%s\n", SEH_GetLanguageString( "WIN_UNABLE_LOAD_DLL_BODY" ) );
+	if ( vm->dllHandle ) {
+		return vm;
 	}
 
-	return vm;
+	/* retail 0x004603C5: call SEH_GetLocalizedString_m */
+	Com_Error( ERR_FATAL, "%s\n", SEH_GetLocalizedString_m( "WIN_UNABLE_LOAD_DLL_BODY" ) );
+	return NULL;	/* retail 0x004603DC: xor eax,eax */
 }
 
 /* ---- VM_Free  0x004603E0 ---- */
@@ -115,21 +123,15 @@ void VM_Clear( void ) {
 int QDECL VM_Call( vm_t *vm, int callnum, ... ) {
 	vm_t    *oldVM;
 	int r;
-	int a[12];
-	int i;
-	va_list ap;
-
-	va_start( ap, callnum );
-	for ( i = 0 ; i < 12 ; i++ ) {
-		a[i] = va_arg( ap, int );
-	}
-	va_end( ap );
 
 	oldVM = currentVM;
 	currentVM = vm;
 
-	r = vm->entryPoint( callnum, a[0], a[1], a[2], a[3], a[4], a[5],
-						a[6], a[7], a[8], a[9], a[10], a[11] );
+	/* Q3 1.32 form: retail re-pushes the 13 words straight from its own argument area */
+	r = vm->entryPoint( ( &callnum )[0], ( &callnum )[1], ( &callnum )[2], ( &callnum )[3],
+						( &callnum )[4], ( &callnum )[5], ( &callnum )[6], ( &callnum )[7],
+						( &callnum )[8], ( &callnum )[9], ( &callnum )[10], ( &callnum )[11],
+						( &callnum )[12] );
 
 	currentVM = oldVM;
 	return r;

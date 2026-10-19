@@ -1,39 +1,18 @@
-/*
- * g_trigger_mp.c -- the trigger entities.
- *
- * Call of Duty 1.1 multiplayer (game_mp_x86.dll, 0x20039B30 .. 0x2003A7F8).
- * RTCW's game/g_trigger.c is the ancestor and trigger_multiple, trigger_once
- * and trigger_hurt survive nearly unchanged.  What CoD replaced is the firing
- * side: there is no G_UseTargets any more.  A trigger tells its script object
- * instead, through G_Trigger, which queues the trigger/toucher pair in
- * level.notifyWatch for G_RunFrame to drain.  trigger_damage, trigger_lookat
- * and the AI-less Touch_Multi are CoD's own; RTCW's push/teleport/timer/
- * aidoor/gas/flagonly triggers are gone.
- *
- * Function order is binary order.
- *
- * @fidelity: likely
- */
+// g_trigger_mp.c -- trigger entities; a trigger notifies its script object
+// (G_Trigger) instead of firing targets
 
 #include <stdlib.h>
 
 #include "g_local.h"
 
-/* Contents bits.  0x405C0008 is the value InitTrigger writes and is United
- * Offensive's MASK_TRIGGER; 0x40000000 is the "a client touching me counts"
- * bit InitSentientTrigger sets on its own.  The three spawnflag-selected bits
- * (0x40000/0x80000/0x100000) and 0x400000 have no recovered name. */
-#define CONTENTS_TRIGGER            0x40000000
+/* contents a trigger is linked with; InitSentientTrigger narrows them to the
+ * kinds of toucher its spawnflags name */
 #define CONTENTS_TRIGGER_DAMAGE     0x00400000
 #define MASK_TRIGGER                0x405C0008
 
-#define SVF_NOCLIENT                1
+#define FRAMETIME                   100     // msec
 
-/* level.time is advanced in 100 msec steps (multi_trigger 0x20039D24). */
-#define FRAMETIME                   100
-
-/* q_shared.h carries these in the original tree.  CoD divides by 32768, not
- * Q3's 32767 (the multiplier at 0x2005FB04 is exactly 1/32768). */
+/* from q_shared.h; CoD divides by 32768, not 32767 */
 #define random()                    ( (float)rand() * ( 1.0f / 32768.0f ) )
 #define crandom()                   ( 2.0f * random() - 1.0f )
 #define VectorCompare( a,b )        ( (a)[0]==(b)[0] && (a)[1]==(b)[1] && (a)[2]==(b)[2] )
@@ -64,8 +43,8 @@ void G_Trigger( gentity_t *self, gentity_t *other ) {
 	}
 
 	if ( level.numNotifyWatches == MAX_NOTIFY_WATCHES ) {
-		Scr_AddEntityNum( other->s.number, 0 );
-		Scr_NotifyNum( self->s.number, 0, scr_const.trigger, 1 );
+		Scr_AddEntityNum( other->s.number, SCR_CLASS_ENTITY );
+		Scr_NotifyNum( self->s.number, SCR_CLASS_ENTITY, scr_const.trigger, 1 );
 		return;
 	}
 
@@ -84,9 +63,9 @@ void InitTrigger( gentity_t *self ) {
 
 	trap_SetBrushModel( self );
 
-	self->s.eFlags |= 2;
-	self->r.contents = MASK_TRIGGER;        /* replaces what trap_SetBrushModel left */
+	self->r.contents = MASK_TRIGGER;        // replaces the contents from trap_SetBrushModel
 	self->r.svFlags = SVF_NOCLIENT;
+	self->s.eFlags |= EF_NONSOLID_BMODEL;
 }
 
 
@@ -95,8 +74,6 @@ void InitTrigger( gentity_t *self ) {
 InitSentientTrigger
 
 Narrows a trigger's contents to the kinds of toucher its spawnflags name.
-Exists standalone in the binary but LTCG inlined every call, so nothing
-references it.
 ==============
 */
 void InitSentientTrigger( gentity_t *self ) {
@@ -193,6 +170,7 @@ trigger_hurt
 /*QUAKED trigger_hurt (.5 .5 .5) ? START_OFF - SILENT NO_PROTECTION SLOW ONCE
 Any entity that touches this will be hurt.
 It does dmg points of damage each server frame
+Targeting the trigger will toggle its on / off state.
 
 SILENT			supresses playing the sound
 SLOW			changes the damage rate to once per second
@@ -229,15 +207,13 @@ void hurt_touch( gentity_t *self, gentity_t *other, int touchMode ) {
 		G_PlaySoundAliasAtPoint( other->r.currentOrigin, self->noise_index );
 	}
 
-	/* the bit is 0x10 -- (spawnflags & 8) << 1 at 0x20039F13 -- which is the
-	   slot g_local.h spells DAMAGE_NO_TEAM_PROTECTION; RTCW's line here reads
-	   DAMAGE_NO_PROTECTION. */
+	// NO_PROTECTION maps to DAMAGE_NO_TEAM_PROTECTION, not RTCW's DAMAGE_NO_PROTECTION
 	if ( self->spawnflags & 8 ) {
 		dflags = DAMAGE_NO_TEAM_PROTECTION;
 	} else {
 		dflags = 0;
 	}
-	G_Damage( other, self, self, NULL, NULL, self->damage, dflags, MOD_TRIGGER_HURT, 0 );
+	G_Damage( other, self, self, NULL, NULL, self->damage, dflags, MOD_TRIGGER_HURT, HITLOC_NONE );
 
 	if ( self->spawnflags & 32 ) {
 		self->touch = NULL;
@@ -276,6 +252,7 @@ SP_trigger_hurt
 */
 void SP_trigger_hurt( gentity_t *self ) {
 	char    *life, *sound;
+	float   dalife;
 
 	InitTrigger( self );
 
@@ -297,7 +274,8 @@ void SP_trigger_hurt( gentity_t *self ) {
 	}
 
 	G_SpawnString( "life", "0", &life );
-	self->delay = (float)atof( life );
+	dalife = atof( life );      // keep: matches original codegen
+	self->delay = dalife;
 }
 
 
@@ -532,9 +510,9 @@ void G_CheckHitTriggerDamage( gentity_t *attacker, const vec3_t start, const vec
 			continue;
 		}
 
-		Scr_AddEntityNum( attacker->s.number, 0 );
+		Scr_AddEntityNum( attacker->s.number, SCR_CLASS_ENTITY );
 		Scr_AddInt( damage );
-		Scr_NotifyNum( ent->s.number, 0, scr_const.damage, 2 );
+		Scr_NotifyNum( ent->s.number, SCR_CLASS_ENTITY, scr_const.damage, 2 );
 
 		Activate_trigger_damage( ent, attacker, damage, mod );
 
@@ -550,7 +528,7 @@ void G_CheckHitTriggerDamage( gentity_t *attacker, const vec3_t start, const vec
 G_GrenadeTouchTriggerDamage
 
 The same sweep for a grenade that bounced through, but only triggers that
-carry the 0x8000 flag bit answer to one.
+carry FL_GRENADE_TOUCH_DAMAGE answer to one.
 ==============
 */
 void G_GrenadeTouchTriggerDamage( gentity_t *attacker, const vec3_t start, const vec3_t end,
@@ -574,16 +552,16 @@ void G_GrenadeTouchTriggerDamage( gentity_t *attacker, const vec3_t start, const
 		if ( ent->classname != scr_const.trigger_damage ) {
 			continue;
 		}
-		if ( !( ent->flags & 0x8000 ) ) {
+		if ( !( ent->flags & FL_GRENADE_TOUCH_DAMAGE ) ) {
 			continue;
 		}
 		if ( !trap_SightTraceToEntity( start, vec3_origin, vec3_origin, end, ent->s.number, -1 ) ) {
 			continue;
 		}
 
-		Scr_AddEntityNum( attacker->s.number, 0 );
+		Scr_AddEntityNum( attacker->s.number, SCR_CLASS_ENTITY );
 		Scr_AddInt( damage );
-		Scr_NotifyNum( ent->s.number, 0, scr_const.damage, 2 );
+		Scr_NotifyNum( ent->s.number, SCR_CLASS_ENTITY, scr_const.damage, 2 );
 
 		Activate_trigger_damage( ent, attacker, damage, mod );
 
@@ -598,8 +576,8 @@ void G_GrenadeTouchTriggerDamage( gentity_t *attacker, const vec3_t start, const
 ==============
 explosive_indicator_think
 
-RTCW's trigger_objective_info marker.  CoD 1.1 kept the think but no longer
-spawns the indicator, so nothing in the module references this.
+Think for the trigger_objective_info marker: frees it once the parent
+trigger is gone.  Nothing spawns the marker any more.
 ==============
 */
 void explosive_indicator_think( gentity_t *ent ) {
@@ -624,9 +602,9 @@ notifies it when a player aims through it.
 void SP_trigger_lookat( gentity_t *ent ) {
 	trap_SetBrushModel( ent );
 
-	ent->s.eFlags |= 2;
 	ent->r.contents = 0x20000000;
 	ent->r.svFlags = SVF_NOCLIENT;
+	ent->s.eFlags |= EF_NONSOLID_BMODEL;
 
 	trap_LinkEntity( ent );
 }

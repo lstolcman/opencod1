@@ -206,7 +206,7 @@ int Unz_SetCurrentFileInfoPosition( unzFile file, unsigned long pos ) {
  *     return o[17];
  * reading unz_s+68 out of the handle it just opened.  That is
  * cur_file_info.uncompressed_size -- the same dword unzOpenCurrentFile at
- * 0x004A94A0 copies into rest_read_uncompressed (`v3[23] = a1[17]`), which is
+ * 0x004A94A0 copies into rest_read_uncompressed, which is
  * what makes it the authority on how many bytes a read can yield.
  *
  * Going through unzGetCurrentFileInfo would re-walk the central directory entry
@@ -220,9 +220,9 @@ int Unz_SetCurrentFileInfoPosition( unzFile file, unsigned long pos ) {
  */
 int Unz_GetCurrentFileUncompressedSize( unzFile file ) {
 	if ( !file ) {
-		return -102;
+		return -102;   /* UNZ_PARAMERROR */
 	}
-	return (int) ( (unsigned long *) file )[17];   /* unz_s + 68 */
+	return (int) ( (unsigned long *) file )[17];   /* unz_s + 68: cur_file_info.uncompressed_size */
 }
 
 /* VERIFIED 0x004A94A0 (unzOpenCurrentFile).  14,493 opens, all returning 0. */

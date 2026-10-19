@@ -1,73 +1,11 @@
-/*
- * @fidelity: likely
- *
- * g_client_fields_mp.c -- the script-visible fields of a player.
- *
- * clientFields[] (0x20055C00) is the client half of the entity field table in
- * g_spawn_mp.c.  GScr_AddFieldsForClient registers every entry with the VM
- * under the entity class with 0xC000 set in the field number, and
- * Scr_SetEntityField / Scr_GetEntityField index back into this table by that
- * registration order.  Unlike the entity table each entry carries a getter as
- * well as a setter, both take the gclient_t twice, and the five virtual fields
- * (sessionteam, sessionstate, statusicon, headicon, headiconteam) have offset
- * 0 -- the accessor pair does all the work.
- *
- * Function order is binary order (0x20019130 .. 0x20019850); clientFields[]
- * itself is emitted in table order.
- */
+// g_client_fields_mp.c -- the script-visible fields of a player
+// fields with offset 0 exist only through their setter / getter
 
 #include <stdlib.h>
 
 #include "g_local.h"
 
-/* A field number with both 0xC000 bits set is a client field; the remaining
- * bits index clientFields[]. */
-#define CLIENT_FIELD_MASK       0x0000C000
-
-/*
- * Status and head icons are precached into two configstring blocks by
- * GScr_GetStatusIconIndex (0x20031FF0) and GScr_GetHeadIconIndex (0x200321B0),
- * which scan CS_STATUSICONS + 0..MAX_STATUSICONS-1 and CS_HEADICONS +
- * 0..MAX_HEADICONS-1 and return a 1-based index (0 = none).  bg_public.h
- * carries these in the original tree.
- */
-#define CS_STATUSICONS          21
-#define MAX_STATUSICONS         8
-#define CS_HEADICONS            29
-#define MAX_HEADICONS           15
-
-/* playerState_t.stats[] indices; bg_public.h carries the enum in the original
- * tree.  Both are used by ClientScr_SetMaxHealth (0x20019390). */
-#define STAT_HEALTH             0
-#define STAT_MAX_HEALTH         2
-
-/*
- * The field types, duplicated from g_spawn_mp.c -- fields[] and clientFields[]
- * share them and neither table has a header of its own yet.
- */
-typedef enum {
-	F_INT,
-	F_FLOAT,
-	F_CSTRING,              /* char[] stored in place */
-	F_STRING,               /* const string id, an unsigned short */
-	F_VECTOR,
-	F_ENTITY,               /* gentity_t * in memory */
-	F_VECTOR_Y,
-	F_OBJECT,               /* script object id, an unsigned short */
-	F_MODEL,                /* model index, a byte */
-	F_IGNORE
-} fieldtype_t;
-
-typedef struct clientField_s clientField_t;
-typedef void ( *clientFieldFunc_t )( gclient_t *client, gclient_t *self, const clientField_t *field );
-
-struct clientField_s {
-	const char *name;
-	int ofs;
-	fieldtype_t type;
-	clientFieldFunc_t setter;       /* NULL falls through to Scr_SetGenericField */
-	clientFieldFunc_t getter;       /* NULL falls through to Scr_GetGenericField */
-};
+// status and head icons are 1-based indexes into CS_STATUSICONS / CS_HEADICONS (0 = none)
 
 #define CFOFS( x ) ( (int)&( ( (gclient_t *)0 )->x ) )
 
@@ -179,8 +117,7 @@ static void ClientScr_SetSpectatorClient( gclient_t *client, gclient_t *self, co
 
 	num = Scr_GetInt( 0 );
 
-	/* Scr_Error does not return, so the store below is reached only on the
-	   valid path even though the compiler shares it. */
+	// Scr_Error does not return
 	if ( num < -1 || num >= MAX_CLIENTS ) {
 		Scr_Error( "spectatorclient can only be set to -1, or a valid client number" );
 	}
@@ -200,8 +137,8 @@ static void ClientScr_GetStatusIcon( gclient_t *client, gclient_t *self, const c
 		return;
 	}
 
-	/* retail pushes nothing at all when the stored index is out of range */
-	if ( client->sess.statusIcon > MAX_STATUSICONS ) {
+	// out of range: push nothing
+	if ( client->sess.statusIcon > CS_STATUSICONS_COUNT ) {
 		return;
 	}
 
@@ -227,7 +164,7 @@ static void ClientScr_GetHeadIcon( gclient_t *client, gclient_t *self, const cli
 		return;
 	}
 
-	if ( ent->s.iHeadIcon > MAX_HEADICONS ) {
+	if ( ent->s.iHeadIcon > CS_HEADICONS_COUNT ) {
 		return;
 	}
 
@@ -249,9 +186,8 @@ static void ClientScr_SetHeadIconTeam( gclient_t *client, gclient_t *self, const
 	} else if ( string == scr_const.axis ) {
 		ent->s.iHeadIconTeam = TEAM_AXIS;
 	} else if ( string != scr_const.spectator ) {
-		/* The retail test really is inverted: "spectator" -- the one value the
-		   error message names as legal -- is the only string that errors, and
-		   every unknown string silently becomes TEAM_SPECTATOR. */
+		// keep: original behaviour -- "spectator" errors and any unknown
+		// string becomes TEAM_SPECTATOR
 		ent->s.iHeadIconTeam = TEAM_SPECTATOR;
 	} else {
 		Scr_Error( va( "'%s' is an illegal head icon team string. Must be none, allies, axis, or spectator.",
@@ -288,7 +224,7 @@ static void ClientScr_GetArchiveTime( gclient_t *client, gclient_t *self, const 
 	Scr_AddFloat( client->sess.archiveTime * 0.001f );
 }
 
-clientField_t clientFields[] = {
+const clientField_t clientFields[] = {
 	{ "name",               CFOFS( sess.name ),                     F_CSTRING,      ClientScr_ReadOnly,             NULL },
 	{ "sessionteam",        0,                                      F_STRING,       ClientScr_SetSessionTeam,       ClientScr_GetSessionTeam },
 	{ "sessionstate",       0,                                      F_STRING,       ClientScr_SetSessionState,      ClientScr_GetSessionState },
@@ -307,10 +243,9 @@ clientField_t clientFields[] = {
 };
 
 void GScr_AddFieldsForClient( unsigned short classnum ) {
-	clientField_t *f;
-	int i;
+	const clientField_t *f;
 
-	for ( i = 0, f = clientFields ; f->name ; f++, i++ ) {
+	for ( f = clientFields ; f->name ; f++ ) {
 		switch ( f->type ) {
 		case F_INT:
 		case F_FLOAT:
@@ -319,7 +254,7 @@ void GScr_AddFieldsForClient( unsigned short classnum ) {
 		case F_VECTOR:
 		case F_ENTITY:
 		case F_OBJECT:
-			Scr_AddClassField( classnum, f->name, (unsigned short)( i | CLIENT_FIELD_MASK ) );
+			Scr_AddClassField( classnum, f->name, (unsigned short)( ( f - clientFields ) | CLIENT_FIELD_MASK ) );
 			break;
 		default:
 			break;
@@ -328,7 +263,7 @@ void GScr_AddFieldsForClient( unsigned short classnum ) {
 }
 
 void Scr_SetClientField( gclient_t *client, unsigned int fieldnum ) {
-	clientField_t *f;
+	const clientField_t *f;
 
 	f = &clientFields[fieldnum];
 	if ( f->setter ) {
@@ -340,7 +275,7 @@ void Scr_SetClientField( gclient_t *client, unsigned int fieldnum ) {
 }
 
 void Scr_GetClientField( gclient_t *client, unsigned int fieldnum ) {
-	clientField_t *f;
+	const clientField_t *f;
 
 	f = &clientFields[fieldnum];
 	if ( f->getter ) {

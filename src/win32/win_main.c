@@ -3,39 +3,62 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
+#include "../qcommon/win_vars.h"
+
+/* Globals owned by this unit. */
+char sys_cdRootPath[260];
+unsigned char FileName[32];   /* 0x008E3B10, the single-instance marker file name */
+cvar_t *sys_cpuMHz;   /* 0x008E3C4C */
+cvar_t *sys_sysMB;   /* 0x008E3B30 */
+cvar_t *sys_vidMB;   /* 0x008E3C50 */
+double sys_cpuMHzValue;   /* 0x008E3B38 */
+signed __int32 sys_sysMBValue;   /* 0x008E3B40 */
+int sys_vidMBValue;   /* 0x008E3B44 */
+int sys_hasSSE;   /* 0x016BF5A0 */
+int sys_monkeySpank;   /* 0x008E3C48 */
 
 extern void         NET_Config( qboolean enableNetworking );
 extern unsigned int Sys_DetectVideoRamMegs_m( void );
 extern int          Sys_HasSSE_m( void );
 
-extern void *CreateFileA( const char *name, unsigned access, unsigned share,
-                          void *sec, unsigned disp, unsigned flags, void *tmpl );
-extern int   ReadFile( void *h, void *buf, unsigned n, unsigned *got, void *ov );
-extern int   WriteFile( void *h, const void *buf, unsigned n, unsigned *put, void *ov );
-extern int   CloseHandle( void *h );
-extern int   DeleteFileA( const char *p );
-extern int   GetDriveTypeA( const char *root );
-extern int   GetModuleFileNameA( void *m, char *buf, unsigned n );
-extern int   FreeLibrary( void *m );
-extern int   IsBadReadPtr( const void *p, unsigned n );
+/* dllimport/__stdcall as windows.h declares them: retail calls every one through its __imp_ slot */
+__declspec( dllimport ) void *   __stdcall CreateFileA( const char *name, unsigned access, unsigned share,
+                                                         void *sec, unsigned disp, unsigned flags, void *tmpl );
+__declspec( dllimport ) int      __stdcall ReadFile( void *h, void *buf, unsigned n, unsigned *got, void *ov );
+__declspec( dllimport ) int      __stdcall WriteFile( void *h, const void *buf, unsigned n, unsigned *put, void *ov );
+__declspec( dllimport ) int      __stdcall CloseHandle( void *h );
+__declspec( dllimport ) int      __stdcall DeleteFileA( const char *p );
+__declspec( dllimport ) unsigned __stdcall GetDriveTypeA( const char *root );
+__declspec( dllimport ) unsigned __stdcall GetModuleFileNameA( void *m, char *buf, unsigned n );
+__declspec( dllimport ) int      __stdcall FreeLibrary( void *m );
+__declspec( dllimport ) int      __stdcall IsBadReadPtr( const void *p, unsigned n );
+__declspec( dllimport ) int __stdcall MessageBoxA( void *h, const char *text, const char *caption, unsigned type );
 
 extern qboolean SEH_GetLanguageIndexForName( const char *name, int *languageOut );
 
 /* Com_Parse (universal/q_parse.c, 0x00449F80) comes from qcommon.h. */
 
 #define SEH_LOCALIZATION_SIZE   4096
-static char seh_localizationBuffer[SEH_LOCALIZATION_SIZE];
+
+/* retail 0x008E2700: both cursors and the file buffer are one object, so a store into
+   the buffer makes retail reload the cursors */
+static struct {
+	int  base;                              /* 0x008E2700 */
+	int  table;                             /* 0x008E2704 */
+	char buffer[SEH_LOCALIZATION_SIZE];     /* 0x008E2708 */
+} seh_localization;
+
+#define seh_localizationBase    seh_localization.base
+#define seh_localizationTable   seh_localization.table
+#define seh_localizationBuffer  seh_localization.buffer
 
 /* ---- SEH_LoadLocalizationFile_m  0x00462350 ----  VERIFIED */
 int SEH_LoadLocalizationFile_m( void )
 {
 	FILE *f;
-	long  len;
-	size_t got;
-	char *nl;
-	int   language = 0;
+	int   len;
+	int   i;
+	int   language;
 
 	seh_localizationBase = 0;
 	seh_localizationTable = 0;
@@ -49,35 +72,28 @@ int SEH_LoadLocalizationFile_m( void )
 	len = ftell( f );
 	fseek( f, 0, SEEK_SET );
 
-	if ( len < 0 ) {
-		len = 0;
-	}
-	if ( len > SEH_LOCALIZATION_SIZE - 1 ) {
-		len = SEH_LOCALIZATION_SIZE - 1;
-	}
-
-	got = fread( seh_localizationBuffer, 1, (size_t) len, f );
+	/* retail reads the whole file with no clamp to the 4096-byte buffer, and
+	   reuses len for the byte count (both in edi) */
+	seh_localizationBase = (int) seh_localizationBuffer;
+	len = (int) fread( seh_localizationBuffer, 1, len, f );
 	fclose( f );
 
-	if ( !got ) {
+	if ( !len ) {
+		seh_localizationBase = 0;
 		return 0;
 	}
 
-	seh_localizationBuffer[got] = 0;
-	seh_localizationBase = (int) seh_localizationBuffer;
-
-	if ( !seh_localizationBuffer[0] ) {
-		return 0;
+	/* every access goes through the int cursor: retail reloads it after each store */
+	( (char *) seh_localizationBase )[len] = 0;
+	language = 0;
+	for ( i = 0; ( (char *) seh_localizationBase )[i]; i++ ) {
+		if ( ( (char *) seh_localizationBase )[i] == '\n' ) {
+			( (char *) seh_localizationBase )[i] = 0;
+			seh_localizationTable = seh_localizationBase + i + 1;
+			SEH_GetLanguageIndexForName( (char *) seh_localizationBase, &language );
+			break;
+		}
 	}
-
-	nl = strchr( seh_localizationBuffer, '\n' );
-	if ( !nl ) {
-		return 0;
-	}
-	*nl = 0;
-	seh_localizationTable = (int) ( nl + 1 );
-
-	SEH_GetLanguageIndexForName( seh_localizationBuffer, &language );
 	return language;
 }
 
@@ -93,9 +109,9 @@ int SEH_ShutdownLocalization_m()
 }
 
 /* ---- SEH_LocalizeIdentity_m  0x00462440 ----  VERIFIED */
-char *__cdecl SEH_LocalizeIdentity_m(const char *a1)
+char *__cdecl SEH_LocalizeIdentity_m(const char *text)
 {
-  return va("%s", a1);
+  return va("%s", text);
 }
 
 /* ---- SEH_GetLocalizedString_m  0x00462450 ----  VERIFIED */
@@ -105,17 +121,12 @@ char *__cdecl SEH_GetLocalizedString_m( const char *key )
 	char *token;
 	int   matched;
 
-	if ( !key ) {
-		key = "";
-	}
-	if ( !seh_localizationTable ) {
-		return va( "%s", key );
-	}
-
+	/* retail opens the parse session unconditionally; with no table loaded
+	   data_p is NULL, Com_ParseExt returns "" and the key is echoed back */
 	Com_BeginParseSession( "localization" );
 	data_p = (char *) seh_localizationTable;
 
-	while ( 1 ) {
+	for ( ;; ) {
 		token = Com_Parse( &data_p );
 		if ( !*token ) {
 			break;
@@ -139,48 +150,42 @@ char *__cdecl SEH_GetLocalizedString_m( const char *key )
 /* ---- Sys_GetInfo  0x004625A0 ----  VERIFIED */
 void __cdecl Sys_GetInfo( int *out )
 {
-	if ( !out ) {
-		return;
-	}
-	*(double *) out = sys_cpuMHzValue;
-	out[2] = sys_sysMBValue;
-	out[3] = sys_vidMBValue;
-}
-
-/* ---- Sys_HeadlessNotice  no-address ---- */
-static void Sys_HeadlessNotice( const char *titleKey, const char *bodyKey )
-{
-	fprintf( stderr, "\n---- %s ----\n%s\n\n",
-	         SEH_GetLocalizedString_m( titleKey ),
-	         SEH_GetLocalizedString_m( bodyKey ) );
-	fflush( stderr );
+	/* int-pointer reads reproduce retail's 16-byte struct copy (load/store interleave) */
+	out[0] = ( (const int *) &sys_cpuMHzValue )[0];
+	out[1] = ( (const int *) &sys_cpuMHzValue )[1];
+	out[2] = *(const int *) &sys_sysMBValue;
+	out[3] = *(const int *) &sys_vidMBValue;
 }
 
 /* ---- Sys_UpdateForConfigChange  0x004625D0 ----  VERIFIED */
-BOOL Sys_UpdateForConfigChange( void )
+/* No code or data reference in retail. */
+int Sys_UpdateForConfigChange( void )
 {
-	Sys_HeadlessNotice( "WIN_CONFIGURE_UPDATED_TITLE", "WIN_CONFIGURE_UPDATED_BODY" );
-	return 0;
+	/* nested: the title is still resolved before the body (right-to-left) */
+	return MessageBoxA( 0, SEH_GetLocalizedString_m( "WIN_CONFIGURE_UPDATED_BODY" ),
+	                    SEH_GetLocalizedString_m( "WIN_CONFIGURE_UPDATED_TITLE" ),
+	                    0x44 /* MB_YESNO|MB_ICONINFORMATION */ ) == 6 /* IDYES */;
 }
 
 /* ---- Sys_ConfigureChecksumChanged  0x00462600 ----  VERIFIED */
-BOOL __cdecl Sys_ConfigureChecksumChanged( int checksum )
+int __cdecl Sys_ConfigureChecksumChanged( int checksum )
 {
-	cvar_t *sum;
-	int     archived;
+	cvar_t     *sum;
+	int        result = 0;
 
 	sum = Cvar_Get( "sys_configSum", "0", CVAR_ARCHIVE | CVAR_ROM );
-	archived = sum->integer;
-
-	if ( archived && archived != checksum ) {
-		Sys_HeadlessNotice( "WIN_CONFIGURE_UPDATED_TITLE", "WIN_CONFIGURE_UPDATED_BODY" );
+	if ( sum->integer && sum->integer != checksum ) {
+		result = MessageBoxA( 0, SEH_GetLocalizedString_m( "WIN_CONFIGURE_UPDATED_BODY" ),
+		                      SEH_GetLocalizedString_m( "WIN_CONFIGURE_UPDATED_TITLE" ),
+		                      0x44 /* MB_YESNO|MB_ICONINFORMATION */ ) == 6 /* IDYES */;
 	}
 
-	if ( !archived || archived != checksum ) {
+	/* retail re-reads sum->integer after the prompt */
+	if ( !sum->integer || sum->integer != checksum ) {
 		Cvar_Set2( "sys_configSum", va( "%i", checksum ), qtrue );
 	}
 
-	return 0;
+	return result;
 }
 
 /* ---- Sys_RegisterInfoCvars  0x00462690 ----  VERIFIED */
@@ -198,7 +203,7 @@ cvar_t *Sys_RegisterInfoCvars( void )
 /* ---- Sys_DetectHardware_m  0x004626E0 ----  VERIFIED */
 int Sys_DetectHardware_m( void )
 {
-	sys_cpuMHzValue   = (double) Sys_GetCPUSpeed();
+	sys_cpuMHzValue   = Sys_GetCPUSpeed();	/* 0x004626E6 fstp qword [0x008E3B38] */
 	sys_sysMBValue = Sys_GetSystemRam();
 	sys_vidMBValue = Sys_DetectVideoRamMegs_m();
 
@@ -207,124 +212,126 @@ int Sys_DetectHardware_m( void )
 }
 
 /* ---- Sys_IsLowMemory_m  0x00462920 ----  VERIFIED */
-BOOL Sys_IsLowMemory_m()
+int Sys_IsLowMemory_m()
 {
   return sys_sysMBValue <= 100663296;
 }
 
 /* ---- Sys_WriteCrashMarker_m  0x00462940 ----  VERIFIED */
-int Sys_WriteCrashMarker_m( void )
+void Sys_WriteCrashMarker_m( void )
 {
 	void *h;
 
 	h = CreateFileA( "crash", 0x40000000u, 0, 0, 1u, 2u, 0 );
-	if ( h == (void *) -1 ) {
-		return 0;
+	if ( h != (void *) -1 ) {
+		CloseHandle( h );
 	}
-	CloseHandle( h );
-	return 1;
 }
 
 /* ---- cand_Sys_VerifyFunctionIntegrity  0x00462970 ----  VERIFIED */
-int __fastcall cand_Sys_VerifyFunctionIntegrity(int a1, int a2)
+/* Compares two copies of a function for byte-level integrity.  It builds the
+   sentinel pattern C3 90 90 00.. (ret; nop; nop; then zeroes), follows a
+   leading E9 rel32 thunk on each argument to the real entry, then scans up to
+   1024 bytes of func2 for that pattern to locate the end of the body.  The two
+   bodies are then compared byte-for-byte over that length; a byte that begins
+   an E8 rel32 CALL counts as equal when both calls resolve to the same absolute
+   target (so relocated calls do not trip the check).  Returns 1 when the two
+   bodies are equivalent, else 0. */
+int __fastcall cand_Sys_VerifyFunctionIntegrity( const byte *code1, const byte *code2 )
 {
-  int v2;
-  int v3;
-  int i;
-  int v5;
-  char v6;
-  int v7;
-  int v8;
-  char v9;
-  char v11;
-  _BYTE v12[31];
+	byte        pattern[32];
+	const byte  *func1;
+	const byte  *func2;
+	int         i;
+	int         j;
+	int         length;
+	int         pos;
+	byte        b;
 
-  memset(v12, 144, 2);
-  v11 = -61;
-  memset(&v12[2], 0, 29);
-  if ( *(_BYTE *)a2 == 0xE9 )
-    v2 = *(_DWORD *)(a2 + 1) + a2 + 5;
-  else
-    v2 = a2;
-  if ( *(_BYTE *)a1 == 0xE9 )
-    v3 = *(_DWORD *)(a1 + 1) + a1 + 5;
-  else
-    v3 = a1;
-  for ( i = 0; i < 1024; ++i )
-  {
-    v5 = 0;
-    v6 = v11;
-    do
-    {
-      if ( *(_BYTE *)(i + v2 + v5) != v6 )
-        break;
-      v6 = v12[v5++];
-    }
-    while ( v6 );
-    if ( !v12[v5 - 1] )
-      break;
-  }
-  v7 = i + 2;
-  v8 = 0;
-  if ( v7 <= 0 )
-    return 1;
-  while ( 1 )
-  {
-    v9 = *(_BYTE *)(v8 + v2);
-    if ( v9 != -24 || v8 + *(_DWORD *)(v8 + v2 + 1) + v2 + 5 != v8 + *(_DWORD *)(v8 + v3 + 1) + v3 + 5 )
-      break;
-    v8 += 4;
-LABEL_19:
-    if ( ++v8 >= v7 )
-      return 1;
-  }
-  if ( v9 == *(_BYTE *)(v8 + v3) )
-    goto LABEL_19;
-  return 0;
+	pattern[0] = 0xC3;
+	pattern[1] = 0x90;
+	pattern[2] = 0x90;
+	pattern[3] = 0;
+	memset( &pattern[4], 0, 28 );
+
+	func2 = ( code2[0] == 0xE9 ) ? code2 + 5 + *(const int *)( code2 + 1 ) : code2;
+	func1 = ( code1[0] == 0xE9 ) ? code1 + 5 + *(const int *)( code1 + 1 ) : code1;
+
+	for ( i = 0; i < 1024; i++ ) {
+		j = 0;
+		while ( pattern[j] != 0 ) {
+			if ( func2[i + j] != pattern[j] ) {
+				break;
+			}
+			j++;
+		}
+		if ( pattern[j] == 0 ) {
+			break;
+		}
+	}
+
+	length = i + 2;
+
+	for ( pos = 0; pos < length; pos++ ) {
+		b = func2[pos];
+
+		if ( b == 0xE8
+		     && func2 + pos + 5 + *(const int *)( func2 + pos + 1 )
+		        == func1 + pos + 5 + *(const int *)( func1 + pos + 1 ) ) {
+			/* identical E8 rel32 CALL to the same absolute target: skip it */
+			pos += 4;
+		} else if ( b != func1[pos] ) {
+			return 0;
+		}
+	}
+
+	return 1;
 }
 
 /* ---- cand_Sys_ScanForInlineHook  0x00462A70 ----  VERIFIED */
-unsigned int __fastcall cand_Sys_ScanForInlineHook(int a1, _BYTE *a2)
+/* Follows a leading E9 rel32 thunk on funcStart to the real entry, scans up to
+   1024 bytes for the C3 90 90 (ret; nop; nop) end-of-body sentinel, and returns
+   a checksum of the function body up to and including it.  (LTCG passes
+   funcStart in edx; Hex-Rays' unused ecx "a1" is not a parameter.) */
+unsigned int cand_Sys_ScanForInlineHook( byte *funcStart )
 {
-  _BYTE *v2;
-  int i;
-  int v4;
-  char v5;
-  char v7;
-  _BYTE v8[31];
+	byte    pattern[32];
+	byte    *func;
+	int     i;
+	int     j;
 
-  memset(v8, 144, 2);
-  v7 = -61;
-  memset(&v8[2], 0, 29);
-  if ( *a2 == 0xE9 )
-    v2 = &a2[*(_DWORD *)(a2 + 1) + 5];
-  else
-    v2 = a2;
-  for ( i = 0; i < 1024; ++i )
-  {
-    v4 = 0;
-    v5 = v7;
-    do
-    {
-      if ( v2[i + v4] != v5 )
-        break;
-      v5 = v8[v4++];
-    }
-    while ( v5 );
-    if ( !v8[v4 - 1] )
-      break;
-  }
-  return Com_BlockChecksum(v2, i + 2);
+	pattern[0] = 0xC3;
+	pattern[1] = 0x90;
+	pattern[2] = 0x90;
+	pattern[3] = 0;
+	memset( &pattern[4], 0, 28 );
+
+	func = ( funcStart[0] == 0xE9 ) ? funcStart + 5 + *(const int *)( funcStart + 1 ) : funcStart;
+
+	for ( i = 0; i < 1024; i++ ) {
+		j = 0;
+		while ( pattern[j] != 0 ) {
+			if ( func[i + j] != pattern[j] ) {
+				break;
+			}
+			j++;
+		}
+		if ( pattern[j] == 0 ) {
+			break;
+		}
+	}
+
+	return Com_BlockChecksum( func, i + 2 );
 }
 
 /* ---- cand_Sys_GetIntegrityState  0x00462B10 ----  VERIFIED */
 int cand_Sys_GetIntegrityState()
 {
-  return dword_8E3C48;
+  return sys_monkeySpank;
 }
 
 extern void     CL_ShutdownRef( void );
-extern unsigned __stdcall timeEndPeriod( unsigned uPeriod );
+__declspec( dllimport ) unsigned __stdcall timeEndPeriod( unsigned uPeriod );
 
 /* ---- Sys_OutOfMemoryPrep  0x00462B20 ----  VERIFIED */
 void Sys_OutOfMemoryPrep( void )
@@ -344,7 +351,9 @@ void Sys_OutOfMemoryPrep( void )
 void Sys_OutOfMemoryError( void )
 {
 	Sys_OutOfMemoryPrep();
-	Sys_HeadlessNotice( "WIN_OUT_OF_MEM_TITLE", "WIN_OUT_OF_MEM_BODY" );
+	/* nested: the title is still resolved before the body (right-to-left) */
+	MessageBoxA( 0, SEH_GetLocalizedString_m( "WIN_OUT_OF_MEM_BODY" ),
+	             SEH_GetLocalizedString_m( "WIN_OUT_OF_MEM_TITLE" ), 0x10 /* MB_ICONHAND */ );
 	exit( -1 );
 }
 
@@ -357,149 +366,40 @@ void  Sys_UnableToLoadDllError_m()
   Com_Error(ERR_FATAL, "%s\n", LocalizedString_m);
 }
 
-/* ---- sub_462BF7  0x00462BF7 ----  VERIFIED */
-void sub_462BF7()
-{
-  ;
-}
+/* 0x00462BF7 is not a function: it is the unreachable `add esp,10h; retn` tail after the
+ * noreturn Com_Error call in Sys_UnableToLoadDllError_m.  The empty stub that stood
+ * here has been removed. */
+
+#define PE_DOS_LFANEW_OFFSET   0x3C          /* IMAGE_DOS_HEADER.e_lfanew */
+#define PE_NT_SIGNATURE        0x00004550    /* 'PE\0\0' */
+#define PE_NT_HEADERS_SIZE     0xF8          /* bytes covered by the read guard */
 
 /* ---- Sys_ChecksumModuleImage_m  0x00462C00 ----  VERIFIED */
-unsigned int __cdecl Sys_ChecksumModuleImage_m(int a1)
+/* Checksums a loaded module's first section (normally .text).  moduleBase is an
+   image base; e_lfanew at +0x3C locates the NT headers.  Note that ntHeaders[65]
+   and ntHeaders[66] are +260/+264 -- past the 0xF8-byte NT header, i.e.
+   section[0].VirtualAddress and section[0].SizeOfRawData -- so the IsBadReadPtr
+   guard does not cover the two fields actually read (a retail quirk kept intact).
+   Retail compiles this as __usercall (base in EDI); the tree keeps it __cdecl. */
+unsigned int __cdecl Sys_ChecksumModuleImage_m( int moduleBase )
 {
-  _DWORD *v1;
+	const unsigned int *ntHeaders;
 
-  v1 = (_DWORD *)(a1 + *(_DWORD *)(a1 + 60));
-  if ( IsBadReadPtr(v1, 0xF8u) || *v1 != 17744 )
-    return 0;
-  else
-    return Com_BlockChecksum((void *)(a1 + v1[65]), v1[66]);
+	ntHeaders = (const unsigned int *)( moduleBase + *(const int *)( moduleBase + PE_DOS_LFANEW_OFFSET ) );
+
+	if ( IsBadReadPtr( ntHeaders, PE_NT_HEADERS_SIZE ) || ntHeaders[0] != PE_NT_SIGNATURE ) {
+		return 0;
+	}
+
+	return Com_BlockChecksum( (void *)( moduleBase + ntHeaders[65] ), ntHeaders[66] );
 }
 
-/* ---- Sys_MonkeyCheck_m  0x00462C40 ----  VERIFIED */
-int Sys_MonkeyCheck_m() { return 0; }
-#if 0
-// Sys_MonkeyCheck_m -- MEDIUM 60. Formats "%s monkey %d %d \"%s\"" and reads a file in binary; 'monkey' is CoD's own name for this integrity/anti-cheat handshake.
-FILE *Sys_MonkeyCheck_m()
-{
-  int v0;
-  int v1;
-  HANDLE FileA;
-  DWORD CurrentProcessId;
-  HANDLE v4;
-  void *v5;
-  FILE *result;
-  FILE *v7;
-  signed int v8;
-  int *v9;
-  signed int v10;
-  char v11;
-  int v12;
-  char v13;
-  FILE *v14;
-  const char *v15;
-  const char *v16;
-  const char *v17;
-  const char *v18;
-  int v19;
-  int v20;
-  struct _PROCESS_INFORMATION ProcessInformation; // [esp+10h] [ebp-460h] BYREF
-  struct _STARTUPINFOA StartupInfo; // [esp+20h] [ebp-450h] BYREF
-  CHAR Buffer[260]; // [esp+64h] [ebp-40Ch] BYREF
-  CHAR Filename[260]; // [esp+168h] [ebp-308h] BYREF
-  CHAR CommandLine[512]; // [esp+26Ch] [ebp-204h] BYREF
-  unsigned int v26;
-  unsigned int retaddr;
-
-  v0 = dword_57C498;
-  v1 = *(_DWORD *)(dword_57C498 + 4);
-  v26 = retaddr ^ _security_cookie;
-  if ( !v1 || Q_stricmpn(v15, v17, v19) )
-  {
-    GetModuleFileNameA(0, Filename, 0x104u);
-    GetTempPathA(0x104u, Buffer);
-    GetTempFileNameA(Buffer, PrefixString, 0, Buffer);
-    CopyFileA(Filename, Buffer, 0);
-    FileA = CreateFileA(Buffer, 0, 1u, 0, 3u, 0x4000000u, 0);
-    CurrentProcessId = GetCurrentProcessId();
-    v4 = OpenProcess(0x100000u, 1, CurrentProcessId);
-    wsprintfA(CommandLine, "%s monkey %d %d \"%s\"", Buffer, dword_8E3708, v4, Filename);
-    memset(&StartupInfo, 0, sizeof(StartupInfo));
-    StartupInfo.cb = 68;
-    CreateProcessA(0, CommandLine, 0, 0, 1, 0, 0, 0, &StartupInfo, &ProcessInformation);
-    CloseHandle(v4);
-    CloseHandle(FileA);
-    goto LABEL_14;
-  }
-  dword_8E3708 = j__atol(*(const char **)(v0 + 8));
-  v5 = (void *)j__atol(*(const char **)(dword_57C498 + 12));
-  WaitForSingleObject(v5, 0xFFFFFFFF);
-  CloseHandle(v5);
-  result = fopen(*(const char **)(dword_57C498 + 16), "rb");
-  v7 = result;
-  if ( result )
-  {
-    fseek(result, 0, 2);
-    v8 = ftell(v7);
-    fseek(v7, 0, 0);
-    v9 = Z_MallocInternal(v8);
-    result = (FILE *)fread(v9, v8, 1u, v7);
-    if ( result == (FILE *)1 )
-    {
-      fclose(v7);
-      result = (FILE *)strlen(off_575978);
-      v10 = 0;
-      if ( v8 > 0 )
-      {
-        while ( 1 )
-        {
-          result = (FILE *)Q_strncmp(v16, v18, v20);
-          if ( !result )
-            break;
-          if ( ++v10 >= v8 )
-            return result;
-        }
-        if ( v10 < v8 )
-        {
-          v11 = BYTE2(dword_8E3708);
-          v12 = dword_57C498;
-          *((_BYTE *)v9 + v10) = HIBYTE(dword_8E3708);
-          *((_BYTE *)v9 + v10 + 1) = v11;
-          v13 = dword_8E3708;
-          *((_BYTE *)v9 + v10 + 2) = BYTE1(dword_8E3708);
-          *((_BYTE *)v9 + v10 + 3) = v13;
-          *((_BYTE *)v9 + v10 + 9) = 0;
-          *((_BYTE *)v9 + v10 + 8) = 0;
-          *((_BYTE *)v9 + v10 + 7) = 0;
-          *((_BYTE *)v9 + v10 + 6) = 0;
-          *((_BYTE *)v9 + v10 + 5) = 0;
-          *((_BYTE *)v9 + v10 + 4) = 0;
-          result = fopen(*(const char **)(v12 + 16), "wb");
-          v14 = result;
-          if ( result )
-          {
-            result = (FILE *)fwrite(v9, v8, 1u, result);
-            if ( result == (FILE *)1 )
-            {
-              fclose(v14);
-              free(v9);
-LABEL_14:
-              exit(0);
-            }
-          }
-        }
-      }
-    }
-  }
-  return result;
-}
-#endif
-
-extern unsigned __stdcall GetCurrentDirectoryA( unsigned nBufferLength, char *lpBuffer );
-extern unsigned __stdcall GetLastError( void );
-extern unsigned __stdcall FormatMessageA( unsigned dwFlags, const void *lpSource,
+__declspec( dllimport ) unsigned __stdcall GetCurrentDirectoryA( unsigned nBufferLength, char *lpBuffer );
+__declspec( dllimport ) unsigned __stdcall GetLastError( void );
+__declspec( dllimport ) unsigned __stdcall FormatMessageA( unsigned dwFlags, const void *lpSource,
                                           unsigned dwMessageId, unsigned dwLanguageId,
                                           char *lpBuffer, unsigned nSize, void *Arguments );
-extern int      __stdcall CreateProcessA( const char *lpApplicationName, char *lpCommandLine,
+__declspec( dllimport ) int      __stdcall CreateProcessA( const char *lpApplicationName, char *lpCommandLine,
                                           void *lpProcessAttributes, void *lpThreadAttributes,
                                           int bInheritHandles, unsigned dwCreationFlags,
                                           void *lpEnvironment, const char *lpCurrentDirectory,
@@ -533,6 +433,102 @@ typedef struct {
 	unsigned  dwThreadId;
 } winProcessInfo_t;
 
+__declspec( dllimport ) unsigned __stdcall GetCurrentProcessId( void );
+__declspec( dllimport ) void *   __stdcall OpenProcess( unsigned access, int inherit, unsigned pid );
+__declspec( dllimport ) unsigned __stdcall GetTempPathA( unsigned nBufferLength, char *lpBuffer );
+__declspec( dllimport ) unsigned __stdcall GetTempFileNameA( const char *lpPathName, const char *lpPrefixString,
+                                                             unsigned uUnique, char *lpTempFileName );
+__declspec( dllimport ) int      __stdcall CopyFileA( const char *lpExistingFileName, const char *lpNewFileName,
+                                                      int bFailIfExists );
+__declspec( dllimport ) unsigned __stdcall WaitForSingleObject( void *hHandle, unsigned dwMilliseconds );
+__declspec( dllimport ) int      __cdecl   wsprintfA( char *lpOut, const char *lpFmt, ... );
+
+extern int sys_exeChecksum;   /* 0x008E3708, win_main_entry.c */
+
+char *sys_monkeyId = "q3monkeyid";   /* 0x00575978 */
+
+/* ---- Sys_MonkeyCheck_m  0x00462C40 ----  VERIFIED */
+/* Unreferenced in retail.  Without "monkey" as argv[1] it copies the running exe to a
+   delete-on-close temp file, runs the copy as `<temp> monkey <checksum> <handle> "<exe>"`
+   and exits.  The copy waits for that process to end, then writes the checksum (big-endian,
+   six zero bytes after it) over the "q3monkeyid" tag in the original exe and exits. */
+void Sys_MonkeyCheck_m( void )
+{
+	winProcessInfo_t ProcessInformation;
+	winStartupInfo_t StartupInfo;
+	char             tempPath[260];
+	char             exePath[260];
+	char             CommandLine[512];
+	void            *hFile;
+	void            *hProcess;
+	FILE            *f;
+	int              len;
+	byte            *buf;
+	int              tagLen;
+	int              i;
+
+	if ( Q_stricmp( __argv[1], "monkey" ) ) {
+		GetModuleFileNameA( NULL, exePath, sizeof( exePath ) );
+		GetTempPathA( sizeof( tempPath ), tempPath );
+		GetTempFileNameA( tempPath, "Del", 0, tempPath );
+		CopyFileA( exePath, tempPath, 0 );
+		hFile = CreateFileA( tempPath, 0, 1 /* FILE_SHARE_READ */, NULL, 3 /* OPEN_EXISTING */,
+		                     0x4000000 /* FILE_FLAG_DELETE_ON_CLOSE */, NULL );
+		hProcess = OpenProcess( 0x100000 /* SYNCHRONIZE */, 1, GetCurrentProcessId() );
+		wsprintfA( CommandLine, "%s monkey %d %d \"%s\"", tempPath, sys_exeChecksum, hProcess, exePath );
+		memset( &StartupInfo, 0, sizeof( StartupInfo ) );
+		StartupInfo.cb = sizeof( StartupInfo );
+		CreateProcessA( NULL, CommandLine, NULL, NULL, 1, 0, NULL, NULL, &StartupInfo, &ProcessInformation );
+		CloseHandle( hProcess );
+		CloseHandle( hFile );
+	} else {
+		sys_exeChecksum = atoi( __argv[2] );
+		hProcess = (void *) atoi( __argv[3] );
+		WaitForSingleObject( hProcess, 0xFFFFFFFF /* INFINITE */ );
+		CloseHandle( hProcess );
+
+		f = fopen( __argv[4], "rb" );
+		if ( !f ) {
+			return;
+		}
+		fseek( f, 0, SEEK_END );
+		len = ftell( f );
+		fseek( f, 0, SEEK_SET );
+		buf = (byte *) Z_MallocInternal( len );
+		if ( fread( buf, len, 1, f ) != 1 ) {
+			return;
+		}
+		fclose( f );
+
+		tagLen = (int) strlen( sys_monkeyId );
+		for ( i = 0; i < len; i++ ) {
+			if ( !Q_strncmp( (char *) buf + i, sys_monkeyId, tagLen ) ) {
+				break;
+			}
+		}
+		if ( i >= len ) {
+			return;
+		}
+
+		buf[i]     = (byte)( sys_exeChecksum >> 24 );
+		buf[i + 1] = (byte)( sys_exeChecksum >> 16 );
+		buf[i + 2] = (byte)( sys_exeChecksum >> 8 );
+		buf[i + 3] = (byte) sys_exeChecksum;
+		buf[i + 4] = buf[i + 5] = buf[i + 6] = buf[i + 7] = buf[i + 8] = buf[i + 9] = 0;
+
+		f = fopen( __argv[4], "wb" );
+		if ( !f ) {
+			return;
+		}
+		if ( fwrite( buf, len, 1, f ) != 1 ) {
+			return;
+		}
+		fclose( f );
+		free( buf );
+	}
+	exit( 0 );
+}
+
 /* ---- Sys_StartProcess  0x00462EF0 ----  VERIFIED */
 void Sys_StartProcess( const char *cmd, int doexit )
 {
@@ -562,10 +558,12 @@ void Sys_StartProcess( const char *cmd, int doexit )
 	}
 }
 
-extern void * __stdcall ShellExecuteA( void *hwnd, const char *op, const char *file,
-                                       const char *params, const char *dir, int nShowCmd );
-extern void * __stdcall GetForegroundWindow( void );
-extern int    __stdcall ShowWindow( void *hWnd, int nCmdShow );
+/* dllimport, as windows.h declares them: retail calls all three through their __imp_ slots, and under LTCG
+   the first declaration linked decides that for every unit (win_syscon.c's ShowWindow calls too). */
+__declspec( dllimport ) void * __stdcall ShellExecuteA( void *hwnd, const char *op, const char *file,
+                                                        const char *params, const char *dir, int nShowCmd );
+__declspec( dllimport ) void * __stdcall GetForegroundWindow( void );
+__declspec( dllimport ) int    __stdcall ShowWindow( void *hWnd, int nCmdShow );
 
 #define SW_MAXIMIZE_    3
 #define SW_RESTORE_     9
@@ -607,28 +605,27 @@ int Sys_RunSetup_m( void )
 	FILE *f;
 	char  rootPath[4];
 	char  path[256];
-	int   drive;
 
-	for ( drive = 'c'; drive <= 'z'; drive++ ) {
-		rootPath[0] = (char) drive;
-		rootPath[1] = ':';
-		rootPath[2] = '\\';
-		rootPath[3] = 0;
-
-		if ( GetDriveTypeA( rootPath ) != 5 ) {
+	/* the drive letter lives in rootPath[0] itself (retail's byte inc/cmp loop) */
+	rootPath[1] = ':';
+	rootPath[2] = '\\';
+	rootPath[3] = 0;
+	for ( rootPath[0] = 'c'; rootPath[0] <= 'z'; rootPath[0]++ ) {
+		if ( GetDriveTypeA( rootPath ) != 5 /* DRIVE_CDROM */ ) {
 			continue;
 		}
 
-		Com_sprintf( (char *) sys_cdRootPath, sizeof( sys_cdRootPath ), "%s%s", rootPath, "" );
-		Com_sprintf( path, sizeof( path ), "%s\\%s", (char *) sys_cdRootPath, "setup\\setup.exe" );
+		/* both sprintf calls are bounded by their constant-length inputs */
+		sprintf( (char *) sys_cdRootPath, "%s%s", rootPath, "" );
+		sprintf( path, "%s\\%s", (char *) sys_cdRootPath, "setup\\setup.exe" );
 		f = fopen( path, "r" );
 		if ( f ) {
 			fclose( f );
 			return 1;
 		}
 
-		Com_sprintf( (char *) sys_cdRootPath, sizeof( sys_cdRootPath ), "%s%s", rootPath, "bin\\x86\\glibc-2.1" );
-		Com_sprintf( path, sizeof( path ), "%s\\%s", (char *) sys_cdRootPath, "setup\\setup" );
+		sprintf( (char *) sys_cdRootPath, "%s%s", rootPath, "bin\\x86\\glibc-2.1" );
+		sprintf( path, "%s\\%s", (char *) sys_cdRootPath, "setup\\setup" );
 		f = fopen( path, "r" );
 		if ( f ) {
 			fclose( f );
@@ -645,12 +642,12 @@ int Sys_CheckCD()
   return 1;
 }
 
-extern int      __stdcall OpenClipboard( void *hWndNewOwner );
-extern void *   __stdcall GetClipboardData( unsigned uFormat );
-extern int      __stdcall CloseClipboard( void );
-extern void *   __stdcall GlobalLock( void *hMem );
-extern unsigned __stdcall GlobalSize( void *hMem );
-extern int      __stdcall GlobalUnlock( void *hMem );
+__declspec( dllimport ) int      __stdcall OpenClipboard( void *hWndNewOwner );
+__declspec( dllimport ) void *   __stdcall GetClipboardData( unsigned uFormat );
+__declspec( dllimport ) int      __stdcall CloseClipboard( void );
+__declspec( dllimport ) void *   __stdcall GlobalLock( void *hMem );
+__declspec( dllimport ) unsigned __stdcall GlobalSize( void *hMem );
+__declspec( dllimport ) int      __stdcall GlobalUnlock( void *hMem );
 
 /* ---- Sys_GetClipboardData  0x00463300 ----  VERIFIED */
 char *Sys_GetClipboardData( void )
@@ -679,15 +676,13 @@ char *Sys_GetClipboardData( void )
 }
 
 /* ---- Sys_UnloadDll  0x00463380 ----  VERIFIED */
-HMODULE __cdecl Sys_UnloadDll(HMODULE dllHandle)
+void __cdecl Sys_UnloadDll(void *dllHandle)
 {
   if ( dllHandle )
   {
-    dllHandle = (HMODULE)FreeLibrary(dllHandle);
-    if ( !dllHandle )
+    if ( !FreeLibrary(dllHandle) )
       Com_Error(ERR_FATAL, "\x15Sys_UnloadDll FreeLibrary failed");
   }
-  return dllHandle;
 }
 
 /* Sys_LoadDll (0x004633A0) is defined in win_platform.c. */
@@ -741,8 +736,6 @@ void Sys_Net_Restart_f(void)
 
 /* Sys_Init (0x004638C0) is defined in win_platform.c. */
 
-extern unsigned __stdcall GetCurrentProcessId( void );
-extern void *   __stdcall OpenProcess( unsigned access, int inherit, unsigned pid );
 extern void *   __stdcall CreateToolhelp32Snapshot( unsigned flags, unsigned pid );
 extern int      __stdcall Module32First( void *snapshot, void *me );
 extern int      __stdcall Module32Next( void *snapshot, void *me );
@@ -762,6 +755,11 @@ typedef struct sys_moduleEntry32_s {
 
 typedef char sys_moduleEntry32_size_check[ sizeof( sys_moduleEntry32_t ) == 548 ? 1 : -1 ];
 
+__declspec(noreturn) void Sys_OutOfDiskSpaceError_m(void) {
+ MessageBoxA(0,SEH_GetLocalizedString_m("WIN_DISK_FULL_BODY"),SEH_GetLocalizedString_m("WIN_DISK_FULL_TITLE"),0x10u);
+ exit(-1);
+}
+
 /* ---- Sys_FindModuleInProcess_m  0x00463DC0 ----  VERIFIED */
 int __cdecl Sys_FindModuleInProcess_m( unsigned int pid )
 {
@@ -771,8 +769,7 @@ int __cdecl Sys_FindModuleInProcess_m( unsigned int pid )
 	char  ourPath[260];
 	const char *ourName;
 	char *p;
-	unsigned int n;
-	int   found = 0;
+	int   found;
 
 	process = OpenProcess( 0x1F0FFFu, 0, pid );
 	if ( !process ) {
@@ -785,28 +782,30 @@ int __cdecl Sys_FindModuleInProcess_m( unsigned int pid )
 		return 0;
 	}
 
-	n = (unsigned int) GetModuleFileNameA( 0, ourPath, sizeof( ourPath ) );
-	if ( n == 0 || n >= sizeof( ourPath ) ) {
-		CloseHandle( snapshot );
-		return 0;
-	}
-	ourPath[sizeof( ourPath ) - 1] = 0;
+	/* found is first assigned here: retail keeps it in ebx, its zero register */
+	found = 0;
 
-	ourName = ourPath;
-	for ( p = ourPath; *p; p++ ) {
-		if ( *p == '\\' || *p == '/' || *p == ':' ) {
-			ourName = p + 1;
-		}
-	}
-
+	/* retail 0x00463E20: dwSize is set once, and our own path is only fetched
+	   after Module32First succeeds (return value ignored, terminator forced) */
 	me.dwSize = sizeof( me );
 	if ( Module32First( snapshot, &me ) ) {
+		GetModuleFileNameA( 0, ourPath, sizeof( ourPath ) );
+		ourPath[sizeof( ourPath ) - 1] = 0;
+
+		/* retail recognises only '\\' and ':' as separators */
+		ourName = ourPath;
+		for ( p = ourPath; *p; p++ ) {
+			if ( *p == '\\' || *p == ':' ) {
+				ourName = p + 1;
+			}
+		}
+
+		/* retail 0x00463E7C compares with the CRT _stricmp */
 		do {
-			if ( !Q_stricmp( me.szModule, ourName ) ) {
+			if ( !_stricmp( me.szModule, ourName ) ) {
 				found = 1;
 				break;
 			}
-			me.dwSize = sizeof( me );
 		} while ( Module32Next( snapshot, &me ) );
 	}
 
@@ -819,32 +818,26 @@ int Sys_BuildInstanceMutexName_m( void )
 {
 	char path[260];
 	const char *base;
-	char *dot;
-	unsigned int n;
+	char *p;
 
-	FileName[0] = 0;
-
-	n = (unsigned int) GetModuleFileNameA( 0, path, (unsigned) sizeof( path ) );
-	if ( n == 0 || n >= sizeof( path ) ) {
-		strcpy( (char *)FileName, "__cod1mp" );
-		return (int) strlen( (char *)FileName );
-	}
+	/* retail ignores the return value and only forces the terminator */
+	GetModuleFileNameA( 0, path, (unsigned) sizeof( path ) );
 	path[sizeof( path ) - 1] = 0;
 
+	/* retail recognises only '\\' and ':' as separators and nulls every '.'
+	   in place, so the name stops at the base name's first '.' */
 	base = path;
-	for ( dot = path; *dot; dot++ ) {
-		if ( *dot == '\\' || *dot == '/' || *dot == ':' ) {
-			base = dot + 1;
+	for ( p = path; *p; p++ ) {
+		if ( *p == '\\' || *p == ':' ) {
+			base = p + 1;
+		} else if ( *p == '.' ) {
+			*p = 0;
 		}
 	}
 
-	_snprintf( (char *)FileName, sizeof( FileName ), "__%s", base );
-	FileName[sizeof( FileName ) - 1] = 0;
-	dot = strchr( (char *)FileName, '.' );
-	if ( dot ) {
-		*dot = 0;
-	}
-	return (int) strlen( (char *)FileName );
+	/* retail's unbounded sprintf into the 32-byte FileName (a base name over
+	   29 characters overruns it, into 0x8E3B30 in retail) */
+	return sprintf( (char *) FileName, "__%s", base );
 }
 
 /* ---- Sys_CheckCrashOrRerun  0x00463F60 ----  VERIFIED */
@@ -855,35 +848,34 @@ int Sys_CheckCrashOrRerun( void )
 	unsigned int marker;
 	unsigned int transferred;
 
-	if ( !FileName[0] ) {
-		return 1;
-	}
-
+	/* retail has no empty-FileName guard: after "allowdupe" (FileName never
+	   built) both CreateFileA calls fail and the disk-full path exits */
 	pid = GetCurrentProcessId();
 
+	/* ReadFile/WriteFile always store the byte count, and marker is only read
+	   after 4 bytes arrived: retail initialises neither */
 	h = CreateFileA( (const char *) FileName, 0x80000000u, 0, 0, 3u, 2u, 0 );
 	if ( h != (void *) -1 ) {
-		marker = 0;
-		transferred = 0;
 		if ( ReadFile( h, &marker, 4u, &transferred, 0 ) && transferred == 4 ) {
+			int answer;
+
 			CloseHandle( h );
 
+			/* retail 0x00463FD8: a live owner returns 0 silently, with no message */
 			if ( pid != marker && Sys_FindModuleInProcess_m( marker ) ) {
-				fprintf( stderr,
-				         "%s\n"
-				         "Another copy of this server (pid %u) is already using this\n"
-				         "installation.  Pass \"allowdupe\" on the command line to run a\n"
-				         "second one anyway.\n",
-				         SEH_GetLocalizedString_m( "WIN_ALREADY_RUNNING_BODY" ),
-				         marker );
 				return 0;
 			}
 
-			fprintf( stderr,
-			         "%s\n"
-			         "The previous run did not shut down cleanly.  Continuing without\n"
-			         "safe mode; retail would have asked here.\n",
-			         SEH_GetLocalizedString_m( "WIN_IMPROPER_QUIT_BODY" ) );
+			/* nested: the title is still resolved before the body (right-to-left) */
+			answer = MessageBoxA( 0, SEH_GetLocalizedString_m( "WIN_IMPROPER_QUIT_BODY" ),
+			                      SEH_GetLocalizedString_m( "WIN_IMPROPER_QUIT_TITLE" ),
+			                      0x33u /* MB_YESNOCANCEL|MB_ICONEXCLAMATION */ );
+			if ( answer == 6 ) {            /* IDYES */
+				com_safemode = 1;
+			} else if ( answer == 7 ) {     /* IDNO: retail tests it explicitly, then writes the marker */
+			} else if ( answer == 2 ) {     /* IDCANCEL; any other value falls through to the marker write */
+				return 0;
+			}
 		} else {
 			CloseHandle( h );
 		}
@@ -891,7 +883,6 @@ int Sys_CheckCrashOrRerun( void )
 
 	h = CreateFileA( (const char *) FileName, 0x40000000u, 0, 0, 2u, 2u, 0 );
 	if ( h != (void *) -1 ) {
-		transferred = 0;
 		if ( WriteFile( h, &pid, 4u, &transferred, 0 ) && transferred == 4 ) {
 			CloseHandle( h );
 			return 1;
@@ -899,17 +890,16 @@ int Sys_CheckCrashOrRerun( void )
 		CloseHandle( h );
 	}
 
-	fprintf( stderr, "%s\n", SEH_GetLocalizedString_m( "WIN_DISK_FULL_BODY" ) );
-	fprintf( stderr, "Could not write the instance marker \"%s\".\n", (const char *) FileName );
+	MessageBoxA( 0, SEH_GetLocalizedString_m( "WIN_DISK_FULL_BODY" ),
+	             SEH_GetLocalizedString_m( "WIN_DISK_FULL_TITLE" ), 0x10u /* MB_ICONHAND */ );
 	exit( -1 );
 	return 0;
 }
 
 /* ---- Sys_DeleteInstanceMarker  0x004640A0 ----  VERIFIED */
-BOOL Sys_DeleteInstanceMarker( void )
+/* retail `push 8E3B10h; call [DeleteFileA]` with no empty-FileName guard,
+   here and at every inlined copy (an empty name just fails the delete) */
+int Sys_DeleteInstanceMarker( void )
 {
-	if ( !FileName[0] ) {
-		return 0;
-	}
 	return DeleteFileA( (const char *) FileName );
 }

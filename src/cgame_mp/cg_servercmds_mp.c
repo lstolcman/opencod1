@@ -1,42 +1,15 @@
-/*
- * @fidelity: likely
- *
- * cg_servercmds.c -- reliably sequenced text commands sent by the server.
- * These are processed at snapshot transition time, so there will definitely be
- * a valid snapshot this frame.
- *
- * cgame_mp_x86.dll, CoD 1.1, imagebase 0x30000000; functions in address
- * order, 0x3002B920 .. 0x3002E580.  RTCW-MP's cg_servercmds.c is the
- * ancestor of everything here except the script-menu, reverb, local-sound and
- * fog blocks, which are CoD additions.
- *
- * Three recovered names in this file sit one slot low, because 0x3002D440
- * carries no symbol; the bodies are RTCW's and identify themselves:
- *
- *   0x3002D220  recovered as CG_GetVoiceChat           -- it is CG_HeadModelVoiceChats
- *   0x3002D390  recovered as CG_VoiceChatListForClient -- it is CG_GetVoiceChat
- *   0x3002D440  unnamed                                 -- it is CG_VoiceChatListForClient
- *
- * CG_PrecacheScriptMenu (0x3002BFC0) and CG_RegisterServerShader (0x3002C010)
- * are real functions -- LTCG hands them the index in eax / ecx, inlines them
- * into CG_SetConfigValues' loops and tail-calls them from
- * CG_ConfigStringModified.  0x30019BB0, CG_ConfigStringModified's CS_NORTHYAW
- * arm, sits among cg_drawtools' functions and belongs to this file.
- */
+// cg_servercmds.c -- reliably sequenced text commands sent by the server
+// these are processed at snapshot transition time, so there will definately
+// be a valid snapshot this frame
 
 #include "cg_local.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-/* Declarations no header carries. */
-
-/* q_shared.h's random(); the binary is rand() * (1/32768) with no mask
-   (0x3002D3E3). */
+// q_shared.h's random() without the 0x7fff mask
 #define random()                ( rand() * ( 1.0f / 32768.0f ) )
 
-/* cg_localents.c, cg_marks.c, cg_newDraw.c, cg_weapons.c, cg_shellshock.c and
-   cg_draw.c. */
 void        CG_InitLocalEntities( void );
 void        CG_InitMarkPolys( void );
 const char *CG_GetTranslatedLocationString( int location );
@@ -44,22 +17,14 @@ void        CG_RegisterItems( void );
 void        CG_FinishWeaponChange( int oldWeapon, int newWeapon );
 qboolean    CG_LoadShellShockCvars( const char *name );
 void        CG_SetShellShockParmsFromCvars( shellshockParms_t *parms );
-/* cg_main.c.  The binary hands `name` in eax; returns int. */
 int         CG_PlaySoundAliasByName( const char *name, int entnum, const vec3_t origin );
-/* game/bg_pmove.c, compiled into cgame as well. */
 void        BG_SetupWeaponInfo( void );
 
-/*
- * The configstring layout.  Every base below is read by a branch of
- * CG_ConfigStringModified (0x3002C6B0) or the precache loop of
- * CG_SetConfigValues (0x3002C060); the counts are the ranges those tests
- * span.  game_mp/g_utils_mp.c and g_scr_main_mp.c carry the same numbers on
- * the server side.
- */
-#define MAX_CONFIGSTRINGS           2048    /* the bad-index test, 0x3002C6E8 */
+// configstrings
+#define MAX_CONFIGSTRINGS           2048
 
 #define CS_SERVERINFO               0
-#define CS_MUSIC                    3       /* CG_StartAmbient */
+#define CS_MUSIC                    3
 #define CS_TEAMSCORE_AXIS           5
 #define CS_TEAMSCORE_ALLIES         6
 #define CS_ITEMS                    8
@@ -74,7 +39,7 @@ void        BG_SetupWeaponInfo( void );
 #define CS_STATUSICONS_COUNT        8
 #define CS_HEADICONS                29
 #define CS_HEADICONS_COUNT          15
-/* CG_ParseWolfinfo walks 140..203 for the names and 204..267 for the values. */
+// server cvar names and values, mirrored by CG_ParseWolfinfo
 #define CS_SERVERCVARS_NAME         140
 #define CS_SERVERCVARS_VALUE        204
 #define CS_SERVERCVARS_COUNT        64
@@ -91,47 +56,30 @@ void        BG_SetupWeaponInfo( void );
 #define CS_SHADERS                  1500
 #define CS_SHADERS_COUNT            128
 
-/* The second argument every Register trap in this unit passes, except
-   CG_ParseVoiceChats' three, which pass 2 (0x3002D05C, 0x3002D0D6, 0x3002D110)
-   like cg_main's headiconVoiceChat registration; the engine forwards it to the
-   material loader unchanged. */
+// second argument to the shader Register traps (voice chat sprites pass 2)
 #define REGISTER_SHADER_ARG2        5
 
-/* RTCW's fogType_t / FOG_CMD_SWITCHFOG, unchanged in the two values CG_ParseFog
-   uses.  The `3` of the fog-off path is RTCW's FOG_HUD slot; no CoD 1.1 access
-   confirms the spelling, so both stay numeric. */
+// RTCW's fogType_t / FOG_CMD_SWITCHFOG values; CG_ParseFog's 3 is RTCW's FOG_HUD
 #define FOG_MAP                     4
 #define FOG_CMD_SWITCHFOG           8
 
-/* g_local.h's team_t; cgame has no copy of the enum. */
 #define TEAM_AXIS                   1
 
-/* pm_flags bit gating a client that is actually playing.  bg_local.h stops at
-   PMF_FOLLOW 0x10000 and this bit has no recovered name. */
-#define PMF_INGAME                  0x00040000
+#define PMF_INGAME                  0x00040000  // name inferred
 
 
 /*
 =============================================================================
 
-		VOICE CHATS
-
-	voiceChatLists[0] is 0x302F7D80 and voiceChatLists[1] is 0x30340EC8, so
-	voiceChatList_t is 299336 == 72 + 64 * 4676.  Inside one voiceChat_t the
-	members are CG_ParseVoiceChats' stores: id at +0
-	(0x3002CDD4), numSounds at +64 (0x3002CE44), sounds at +68 (0x3002CF45),
-	chats at +324 (0x3002CFBD) and sprite at +4420 (0x3002D0F0).
+VOICE CHATS
 
 =============================================================================
 */
 
-/* voiceChat_t / voiceChatList_t and the four sizes they need are in
-   cg_local.h: cg_main_mp.c's CG_RegisterSounds reaches voiceChatLists too. */
 #define MAX_VOICEFILESIZE       16384
 #define MAX_VOICECHATBUFFER     32
 #define MAX_SAY_TEXT            150
 
-/* CG_ParseVoiceChats' gender tokens, 0x3002CD2C..0x3002CD68. */
 #define GENDER_MALE             0
 #define GENDER_FEMALE           1
 #define GENDER_NEUTER           2
@@ -148,15 +96,13 @@ typedef struct bufferedVoiceChat_s
 } bufferedVoiceChat_t;
 CG_ASSERT_SIZE( bufferedVoiceChat_t, 328 );
 
-voiceChatList_t voiceChatLists[MAX_VOICEFILES];                 /* 0x302F7D80 */
-bufferedVoiceChat_t voiceChatBuffer[MAX_VOICECHATBUFFER];       /* 0x305407C0 */
+voiceChatList_t voiceChatLists[MAX_VOICEFILES];
+bufferedVoiceChat_t voiceChatBuffer[MAX_VOICECHATBUFFER];
 
-/* CG_VoiceChatLocal's `mode`; RTCW's values, unchanged (0x3002D882). */
 #define SAY_ALL                 0
 #define SAY_TEAM                1
 #define SAY_TELL                2
 
-/* CG_VoiceChat's cg_noTaunt filter, 0x3002DA4A. */
 #define VOICECHAT_KILLINSULT    "kill_insult"
 #define VOICECHAT_TAUNT         "taunt"
 #define VOICECHAT_DEATHINSULT   "death_insult"
@@ -205,18 +151,15 @@ static void CG_ParseScores( void ) {
 		}
 		(&bg_clientinfo[ cg.scores[i].client ])->score = cg.scores[i].score;
 
-		if ( bg_clientinfo[ cg.scores[i].client ].infoValid ) {
-			cg.scores[i].team = bg_clientinfo[ cg.scores[i].client ].team;
-		} else {
-			cg.scores[i].team = 0;
-		}
+		cg.scores[i].team = bg_clientinfo[ cg.scores[i].client ].infoValid
+							? bg_clientinfo[ cg.scores[i].client ].team : 0;
 
 		cg.teamPlayers[ cg.scores[i].team ]++;
 		cg.teamPing[ cg.scores[i].team ] += cg.scores[i].ping;
 	}
 
 	for ( i = 0 ; i < 4 ; i++ ) {
-		if ( cg.teamPlayers[i] > 0 && cg.teamPing[i] > 0 ) {
+		if ( cg.teamPlayers[i] >= 1 && cg.teamPing[i] >= 1 ) {
 			cg.teamPing[i] /= cg.teamPlayers[i];
 		} else {
 			cg.teamPing[i] = 0;
@@ -228,11 +171,9 @@ static void CG_ParseScores( void ) {
 ================
 CG_ParseServerinfo
 
-This is called explicitly when the gamestate is first received, and whenever
-the server updates any serverinfo flagged cvars.
-
-Both copies are a bare strncpy, not Q_strncpyz: neither writes the terminator
-the vote-string path in CG_ConfigStringModified does (0x3002BBD6, 0x3002BBF2).
+This is called explicitly when the gamestate is first received,
+and whenever the server updates any serverinfo flagged cvars
+(keep: the bare strncpy calls, not Q_strncpyz)
 ================
 */
 void CG_ParseServerinfo( void ) {
@@ -268,23 +209,26 @@ void CG_ParseWolfinfo( void ) {
 		return;
 	}
 
-	for ( i = CS_SERVERCVARS_VALUE ; i < CS_SERVERCVARS_VALUE + CS_SERVERCVARS_COUNT ; i++ ) {
-		name = CG_ConfigString( i - ( CS_SERVERCVARS_VALUE - CS_SERVERCVARS_NAME ) );
+	for ( i = 0 ; i < CS_SERVERCVARS_COUNT ; i++ ) {
+		name = CG_ConfigString( CS_SERVERCVARS_NAME + i );
 		if ( !name[0] ) {
 			break;
 		}
-		trap_Cvar_Set( name, CG_ConfigString( i ) );
+		trap_Cvar_Set( name, CG_ConfigString( CS_SERVERCVARS_VALUE + i ) );
 	}
 }
 
 /*
 ==============
 CG_ParseFog
+	float near dist
+	float far dist
+	float density
+	float[3] r,g,b
+	int		time
 
-The fog configstring is the game module's "%g %g %g %g %g %g %.0f" -- near
-distance, far distance, density, red, green, blue and the transition time in
-milliseconds (g_cmds_mp.c G_setfog).  A string carrying only the first value
-means "fade the fog back out over that many milliseconds".
+A string carrying only the first value means "fade the fog back out over that
+many milliseconds".
 ==============
 */
 static void CG_ParseFog( void ) {
@@ -318,7 +262,7 @@ static void CG_ParseFog( void ) {
 ================
 CG_PrecacheScriptMenu
 
-0x3002BFC0; the index arrives in eax.
+Loads the script menu named by a configstring
 ================
 */
 static void CG_PrecacheScriptMenu( int index ) {
@@ -334,7 +278,7 @@ static void CG_PrecacheScriptMenu( int index ) {
 ================
 CG_RegisterServerShader
 
-0x3002C010; the index arrives in ecx.
+Registers the shader named by a configstring
 ================
 */
 static void CG_RegisterServerShader( int index ) {
@@ -373,20 +317,18 @@ void CG_SetConfigValues( void ) {
 		trap_R_RegisterShader( CG_ConfigString( i ), REGISTER_SHADER_ARG2 );
 	}
 
-	/* Slot 0 means "no shader", so the precache starts one past the base. */
+	// slot 0 means "no shader", so the precache starts one past the base
 	for ( i = CS_SHADERS + 1 ; i < CS_SHADERS + CS_SHADERS_COUNT ; i++ ) {
 		CG_RegisterServerShader( i );
 	}
 }
 
+void CG_NorthDirectionChanged( void );
+
 /*
 ================
 CG_ConfigStringModified
 
-The CS_MENUS and CS_SHADERS arms tail-call CG_PrecacheScriptMenu (0x3002C8B4)
-and CG_RegisterServerShader (0x3002C90C); the CS_NORTHYAW arm is outlined at
-0x30019BB0, a thousand functions away among cg_drawtools', and re-derives the
-string rather than reuse `str`.
 ================
 */
 static void CG_ConfigStringModified( void ) {
@@ -435,7 +377,7 @@ static void CG_ConfigStringModified( void ) {
 	} else if ( num >= CS_MODELS && num < CS_MODELS + CS_MODELS_COUNT ) {
 		cgs.gameModels[ num - CS_MODELS ] = trap_R_RegisterModel( str, 7 );
 	} else if ( num >= CS_EFFECTS && num < CS_EFFECTS + CS_EFFECTS_COUNT ) {
-		cgs.gameEffects[ num - CS_EFFECTS ] = trap_syscall_0xDE( str );
+		cgs.gameEffects[ num - CS_EFFECTS ] = trap_FX_RegisterEffect( str );
 	} else if ( num >= CS_SHELLSHOCKS && num < CS_SHELLSHOCKS + CS_SHELLSHOCKS_COUNT ) {
 		if ( str[0] && CG_LoadShellShockCvars( str ) ) {
 			CG_SetShellShockParmsFromCvars( &cgs.shellshockParms[ num - CS_SHELLSHOCKS ] );
@@ -449,7 +391,7 @@ static void CG_ConfigStringModified( void ) {
 	} else if ( num >= CS_SHADERS && num < CS_SHADERS + CS_SHADERS_COUNT ) {
 		CG_RegisterServerShader( num );
 	} else if ( num == CS_NORTHYAW ) {
-		cg.compassNorthYaw = atof( CG_ConfigString( CS_NORTHYAW ) );
+		CG_NorthDirectionChanged();
 	}
 }
 
@@ -540,34 +482,35 @@ static void CG_MapRestart( void ) {
 	}
 
 	if ( cgs.localServer ) {
-		trap_syscall_0xC8( 1 );
+		trap_FreeWeaponInfoMemory( 1 );
 		BG_SetupWeaponInfo();
 	}
 
-	cg.centerPrintTime = 0;
-	cg.itemPickupTime = 0;
-	cg.cursorHintFade = 0;
+	cg.centerPrintTime = 0; // reset centerprint counter so previous messages don't re-appear
+	cg.itemPickupTime = 0;  // reset item pickup counter so previous messages don't re-appear
+	cg.cursorHintFade = 0;  // reset cursor hint timer
 
-	cgs.unknown_0x0A430 = -1;
-	cgs.unknown_0x0A434 = 0;
+	// DHM - Nerve :: Reset complaint system
+	cgs.complaintClient = -1;
+	cgs.complaintEndTime = 0;
 
 	CG_InitLocalEntities();
 	CG_InitMarkPolys();
-	trap_syscall_0xE9();
+	trap_FX_FreeEffects();
 
 	// make sure the "3 frags left" warnings play again
 	cgs.voteTime = 0;
 
 	cg.mapRestart = qtrue;
 
-	trap_syscall_0xD3( 0 );
+	trap_MSS_StopSounds( 0 );
 	CG_StartAmbient();
 
-	cg.unknown_0x2AF58 = 0;
+	cg.latchVictorySound = qfalse;
 	cg.v_dmg_time = 0;
 	memset( cg.damageIndicators, 0, sizeof( cg.damageIndicators ) );
-	memset( cg.unknown_0x2A7EC, 0, sizeof( cg.unknown_0x2A7EC ) );
-	cg.unknown_0x2A804 = 0;
+	memset( cg.weaponSlotFade, 0, sizeof( cg.weaponSlotFade ) );
+	cg.lastWeaponSelectDrawTime = 0;
 
 	trap_Cvar_Set( "cg_thirdPerson", "0" );
 	trap_Cvar_Set( "cl_stance", "0" );
@@ -587,21 +530,16 @@ static void CG_MapRestart( void ) {
 
 	trap_Cvar_Set( "cg_objectiveText", "" );
 
-	trap_syscall_0xF1();
+	trap_CL_FirstSnapshot();
 }
 
 /*
 =================
 CG_ParseVoiceChats
 
-RTCW's parser with trap_S_RegisterSound replaced by the sound-alias lookup,
-COM_RestoreParseSession by Com_UngetToken and the "sprites/voiceChat" default
-by the headiconVoiceChat material CG_PlayVoiceChat compares against.  Both
-callers discard the qboolean, but 0x3002D1A0 still returns it.
+The sounds are sound aliases, and the default sprite is headiconVoiceChat.
 =================
 */
-/* NOT static: cg_main_mp.c's CG_RegisterSounds carries the same two calls
-   (0x30020A19, 0x30020A2A) that CG_LoadVoiceChats does. */
 int CG_ParseVoiceChats( const char *filename, voiceChatList_t *voiceChatList,
 						int maxVoiceChats ) {
 	int len, i;
@@ -625,7 +563,8 @@ int CG_ParseVoiceChats( const char *filename, voiceChatList_t *voiceChatList,
 	}
 
 	trap_FS_Read( buf, len, f );
-	buf[len] = 0;
+	// keep: unchecked terminator, written as a pointer store
+	*( buf + len ) = 0;
 	trap_FS_FCloseFile( f );
 
 	ptr = buf;
@@ -637,7 +576,7 @@ int CG_ParseVoiceChats( const char *filename, voiceChatList_t *voiceChatList,
 		voiceChats[i].id[0] = 0;
 	}
 
-	token = Com_ParseExt( p, qtrue );
+	token = Com_Parse( p );
 	if ( !token || token[0] == 0 ) {
 		return qtrue;
 	}
@@ -654,15 +593,15 @@ int CG_ParseVoiceChats( const char *filename, voiceChatList_t *voiceChatList,
 
 	voiceChatList->numVoiceChats = 0;
 	while ( 1 ) {
-		token = Com_ParseExt( p, qtrue );
+		token = Com_Parse( p );
 		if ( !token || token[0] == 0 ) {
 			return qtrue;
 		}
 		Com_sprintf( voiceChats[voiceChatList->numVoiceChats].id,
 					 sizeof( voiceChats[voiceChatList->numVoiceChats].id ), "%s", token );
 
-		token = Com_ParseExt( p, qtrue );
-		if ( !token || Q_stricmp( token, "{" ) ) {
+		token = Com_Parse( p );
+		if ( Q_stricmp( token, "{" ) ) {
 			trap_Print( va( "^1expected { found %s in voice chat file: %s\n", token, filename ) );
 			return qfalse;
 		}
@@ -671,7 +610,7 @@ int CG_ParseVoiceChats( const char *filename, voiceChatList_t *voiceChatList,
 		current = voiceChats[voiceChatList->numVoiceChats].numSounds;
 
 		while ( 1 ) {
-			token = Com_ParseExt( p, qtrue );
+			token = Com_Parse( p );
 			if ( !token || token[0] == 0 ) {
 				return qtrue;
 			}
@@ -681,7 +620,7 @@ int CG_ParseVoiceChats( const char *filename, voiceChatList_t *voiceChatList,
 			voiceChats[voiceChatList->numVoiceChats].sounds[current] =
 				(const char *)trap_Com_SoundAliasString( token );
 
-			token = Com_ParseExt( p, qtrue );
+			token = Com_Parse( p );
 			if ( !token || token[0] == 0 ) {
 				return qtrue;
 			}
@@ -689,8 +628,9 @@ int CG_ParseVoiceChats( const char *filename, voiceChatList_t *voiceChatList,
 						 "%s", token );
 
 			// specify the sprite shader to show above the player's head
-			token = Com_ParseExt( p, qfalse );
-			if ( !token || Q_stricmp( token, "}" ) == 0 || token[0] == 0 ) {
+			token = Com_ParseOnLine( p );
+			// keep: RTCW's test order
+			if ( !Q_stricmp( token, "}" ) || !token || token[0] == 0 ) {
 				voiceChats[voiceChatList->numVoiceChats].sprite[current] =
 					trap_R_RegisterShader( "headiconVoiceChat", 2 );
 				Com_UngetToken();
@@ -736,9 +676,6 @@ void CG_LoadVoiceChats( void ) {
 /*
 =================
 CG_HeadModelVoiceChats
-
-Uncalled in 1.1 -- CG_VoiceChatListForClient picks by team instead -- but the
-code is still linked in.
 =================
 */
 int CG_HeadModelVoiceChats( char *filename ) {
@@ -761,13 +698,14 @@ int CG_HeadModelVoiceChats( char *filename ) {
 	}
 
 	trap_FS_Read( buf, len, f );
-	buf[len] = 0;
+	// keep: unchecked terminator, written as a pointer store
+	*( buf + len ) = 0;
 	trap_FS_FCloseFile( f );
 
 	ptr = buf;
 	p = &ptr;
 
-	token = Com_ParseExt( p, qtrue );
+	token = Com_Parse( p );
 	if ( !token || token[0] == 0 ) {
 		return -1;
 	}
@@ -806,7 +744,7 @@ static int CG_GetVoiceChat( voiceChatList_t *voiceChatList, const char *id, cons
 =================
 CG_VoiceChatListForClient
 
-CoD dropped RTCW's head-model search: the list is the client's team.
+The voice chat list is picked by the client's team.
 =================
 */
 static voiceChatList_t *CG_VoiceChatListForClient( int clientNum ) {
@@ -826,9 +764,9 @@ CG_PlayVoiceChat
 */
 static void CG_PlayVoiceChat( bufferedVoiceChat_t *vchat ) {
 	if ( !cg_noVoiceChats.integer ) {
-		CG_PlaySoundAliasByName( vchat->snd, cg.snap->ps.clientNum, cg.snap->ps.origin );
+		CG_PlayClientSoundAliasByName( vchat->snd );
 
-		// show the icon above the head
+		// DHM - Nerve :: Show icon above head
 		if ( vchat->clientNum == cg.snap->ps.clientNum ) {
 			cg.predictedPlayerEntity.voiceChatSprite = vchat->sprite;
 			if ( vchat->sprite == cgs.media.headiconVoiceChat ) {
@@ -931,6 +869,7 @@ static void CG_VoiceChatLocal( int mode, qboolean voiceOnly, int clientNum, int 
 	qhandle_t sprite;
 	bufferedVoiceChat_t vchat;
 	const char  *loc;
+	const char  *text;
 
 	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
 		clientNum = 0;
@@ -952,20 +891,20 @@ static void CG_VoiceChatLocal( int mode, qboolean voiceOnly, int clientNum, int 
 			VectorCopy( origin, vchat.origin );
 			Q_strncpyz( vchat.cmd, cmd, sizeof( vchat.cmd ) );
 
+			// NERVE - SMF - get location
 			loc = CG_GetTranslatedLocationString( (ci)->location );
+			// keep: translated once, matches original codegen
+			text = CG_GetTranslatedVoiceChatString( chat );
 
 			if ( mode == SAY_TELL ) {
 				Com_sprintf( vchat.message, sizeof( vchat.message ), "[%s]%s[%s]: %c%c%s",
-							 ci->name, "^3", loc, '^', color,
-							 CG_GetTranslatedVoiceChatString( chat ) );
+							 ci->name, "^3", loc, '^', color, text );
 			} else if ( mode == SAY_TEAM )   {
 				Com_sprintf( vchat.message, sizeof( vchat.message ), "(%s)%s(%s): %c%c%s",
-							 ci->name, "^3", loc, '^', color,
-							 CG_GetTranslatedVoiceChatString( chat ) );
+							 ci->name, "^3", loc, '^', color, text );
 			} else {
 				Com_sprintf( vchat.message, sizeof( vchat.message ), "%s %s(%s): %c%c%s",
-							 ci->name, "^3", loc, '^', color,
-							 CG_GetTranslatedVoiceChatString( chat ) );
+							 ci->name, "^3", loc, '^', color, text );
 			}
 			CG_AddBufferedVoiceChat( &vchat );
 		}
@@ -1041,8 +980,14 @@ static void CG_OpenScriptMenu( void ) {
 	trap_Cvar_Set( "ui_newScriptMenu", menu );
 	trap_Cvar_Set( "ui_newScriptMenuIndex", va( "%i", index ) );
 
-	if ( trap_UI_Popup( noMouse ? "UIMENU_SCRIPT_POPUP_NO_MOUSE" : "UIMENU_SCRIPT_POPUP" ) ) {
-		return;
+	if ( noMouse ) {
+		if ( trap_UI_Popup( "UIMENU_SCRIPT_POPUP_NO_MOUSE" ) ) {
+			return;
+		}
+	} else {
+		if ( trap_UI_Popup( "UIMENU_SCRIPT_POPUP" ) ) {
+			return;
+		}
 	}
 
 	// the ui was busy -- park the menu and try again next frame
@@ -1051,7 +996,7 @@ static void CG_OpenScriptMenu( void ) {
 
 	trap_Cvar_VariableStringBuffer( "ui_waitingScriptMenu", waiting, sizeof( waiting ) );
 	if ( waiting[0] ) {
-		if ( !Q_stricmp( waiting, menu ) ) {
+		if ( !Q_stricmp( menu, waiting ) ) {
 			return;
 		}
 		trap_Cvar_VariableStringBuffer( "ui_waitingScriptMenuIndex", waiting, sizeof( waiting ) );
@@ -1067,12 +1012,12 @@ static void CG_OpenScriptMenu( void ) {
 =================
 CG_CheckOpenWaitingScriptMenu
 
-One buffer carries all three cvars in turn; the binary reuses the same 1024
-bytes for each read and each set (0x3002DD2E onwards).
+Pops up the script menu CG_OpenScriptMenu parked, if any.
 =================
 */
 static void CG_CheckOpenWaitingScriptMenu( void ) {
 	char string[MAX_STRING_CHARS];
+	int popped;
 
 	trap_Cvar_VariableStringBuffer( "ui_waitingScriptMenu", string, sizeof( string ) );
 	if ( !string[0] ) {
@@ -1084,7 +1029,13 @@ static void CG_CheckOpenWaitingScriptMenu( void ) {
 	trap_Cvar_Set( "ui_newScriptMenuIndex", string );
 	trap_Cvar_VariableStringBuffer( "ui_waitingScriptMenuNoMouse", string, sizeof( string ) );
 
-	if ( trap_UI_Popup( atoi( string ) ? "UIMENU_SCRIPT_POPUP_NO_MOUSE" : "UIMENU_SCRIPT_POPUP" ) ) {
+	if ( atoi( string ) ) {
+		popped = trap_UI_Popup( "UIMENU_SCRIPT_POPUP_NO_MOUSE" );
+	} else {
+		popped = trap_UI_Popup( "UIMENU_SCRIPT_POPUP" );
+	}
+
+	if ( popped ) {
 		trap_Cvar_Set( "ui_waitingScriptMenu", "" );
 		trap_Cvar_Set( "ui_waitingScriptMenuIndex", "-1" );
 		trap_Cvar_Set( "ui_waitingScriptMenuNoMouse", "0" );
@@ -1134,15 +1085,15 @@ static void CG_RemoveChatEscapeChar( char *text ) {
 =================
 CG_ReverbCmd
 
-"r <roomtype> <wetlevel> <time>".  The clamp is a MAX() macro: both arms of it
-compile to the same round-to-nearest fistp, which is why the conversion appears
-twice (0x3002DFE0 and 0x3002E010).
+"r <roomtype> <wetlevel> <time>"
+(keep: the clamp is a MAX() macro, so the conversion appears twice)
 =================
 */
 static void CG_ReverbCmd( void ) {
 	int argc;
 	float dryLevel;
 	float time;
+	const char *roomType;
 
 	argc = trap_Argc();
 	if ( argc != 4 ) {
@@ -1152,8 +1103,9 @@ static void CG_ReverbCmd( void ) {
 
 	dryLevel = atof( CG_Argv( 2 ) );
 	time = atof( CG_Argv( 3 ) );
+	roomType = CG_Argv( 1 );
 
-	trap_syscall_0xD9( CG_Argv( 1 ), dryLevel,
+	trap_MSS_SetEnvironmentEffects( roomType, dryLevel,
 					   0 > Q_ftol( time * 1000.0f ) ? 0 : Q_ftol( time * 1000.0f ) );
 }
 
@@ -1161,9 +1113,9 @@ static void CG_ReverbCmd( void ) {
 =================
 CG_LocalSound
 
-"s <index>".  The upper bound is inclusive (0x3002E084 `cmp eax,100h; jg`), so
-index 256 reaches configstring 780 -- which is CS_EFFECTS, not a sound alias.
-Retail quirk.
+"s <index>"
+(keep: the upper bound is inclusive, an original quirk; index 256 reaches
+CS_EFFECTS, not a sound alias)
 =================
 */
 static void CG_LocalSound( void ) {
@@ -1183,15 +1135,15 @@ static void CG_LocalSound( void ) {
 		return;
 	}
 
-	CG_PlaySoundAliasByName( CG_ConfigString( CS_SOUNDALIAS + index ),
-							 cg.snap->ps.clientNum, cg.snap->ps.origin );
+	CG_PlayClientSoundAliasByName( CG_ConfigString( CS_SOUNDALIAS + index ) );
 }
 
 /*
 =================
 CG_ServerCommand
 
-The string has been tokenized and can be retrieved with Cmd_Argc() / Cmd_Argv().
+The string has been tokenized and can be retrieved with
+Cmd_Argc() / Cmd_Argv()
 
 CoD replaced RTCW's named commands with single letters, so this is one switch on
 cmd[0] rather than a chain of strcmp: an empty argv(0) means the server system
@@ -1270,10 +1222,10 @@ static void CG_ServerCommand( void ) {
 		return;
 
 	case 'm':
-		cgs.unknown_0x0A434 = cg.time + 20000;
-		cgs.unknown_0x0A430 = atoi( CG_Argv( 1 ) );
-		if ( cgs.unknown_0x0A430 < 0 ) {
-			cgs.unknown_0x0A434 = cg.time + 10000;
+		cgs.complaintEndTime = cg.time + 20000;
+		cgs.complaintClient = atoi( CG_Argv( 1 ) );
+		if ( cgs.complaintClient < 0 ) {
+			cgs.complaintEndTime = cg.time + 10000;
 		}
 		return;
 
@@ -1282,15 +1234,15 @@ static void CG_ServerCommand( void ) {
 		return;
 
 	case 'o':
-		trap_syscall_0xD4( (const float *)trap_Com_PickSoundAlias( CG_Argv( 1 ) ) );
+		trap_MSS_PlayMusicAlias( trap_Com_PickSoundAlias( CG_Argv( 1 ) ) );
 		return;
 
 	case 'p':
-		trap_syscall_0xD5( atoi( CG_Argv( 1 ) ) );
+		trap_MSS_StopBackground( atoi( CG_Argv( 1 ) ) );
 		return;
 
 	case 'q':
-		trap_syscall_0xD7( atof( CG_Argv( 1 ) ), atoi( CG_Argv( 2 ) ) );
+		trap_MSS_FadeAllSounds( atof( CG_Argv( 1 ) ), atoi( CG_Argv( 2 ) ) );
 		return;
 
 	case 'r':
@@ -1332,8 +1284,9 @@ static void CG_ServerCommand( void ) {
 ====================
 CG_ExecuteNewServerCommands
 
-Execute all of the server commands that were received along with this this
-snapshot.
+Execute all of the server commands that were received along
+with this this snapshot.
+
 ====================
 */
 void CG_ExecuteNewServerCommands( int latestSequence ) {

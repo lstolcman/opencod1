@@ -1,25 +1,5 @@
-/*
- * cg_info_mp.c -- display information while data is being loaded.
- * (original source: cgame/cg_info.c)
- *
- * cgame_mp_x86.dll 0x3001F9C0 .. 0x3001FEB4, two functions.
- *
- * RTCW's cgame/cg_info.c is the ancestor of both, but CG_DrawInformation was
- * rewritten: the sound/model/graphic tallies and the "press ESC" line are all
- * gone, and what is left is the levelshot, a percent bar driven by
- * com_expectedhunkusage, and -- new in CoD -- a second `localized` mode that
- * draws the map and gametype names while the client waits for the server to
- * finish loading.
- *
- * REENTRANCY.  trap_R_RegisterModel, trap_R_RegisterShader and
- * trap_R_RegisterShaderNoMip each call CG_DrawInformation( 0 ) before issuing
- * their syscall, so the function can call itself: the two
- * trap_R_RegisterShaderNoMip calls below appear in the binary as a recursive
- * `call CG_DrawInformation` followed by `syscall( 88, ... )` (0x3001FB62 and
- * 0x3001FB7D).  cg_drawingInformation is what stops the recursion.
- *
- * @fidelity: likely
- */
+// cg_info.c -- display information while data is being loading
+// the register traps call CG_DrawInformation, so it guards against recursion
 
 #include <string.h>
 #include <stdlib.h>
@@ -28,7 +8,8 @@
 
 /*
 ======================
-CG_LoadingString       0x3001F9C0
+CG_LoadingString
+
 ======================
 */
 void CG_LoadingString( const char *s ) {
@@ -36,30 +17,27 @@ void CG_LoadingString( const char *s ) {
 	cg.infoScreenText[sizeof( cg.infoScreenText ) - 1] = 0;
 
 	if ( s && s[0] ) {
-		CG_Printf( va( "LOADING... %s\n", s ) );
+		CG_Printf( va( "LOADING... %s\n", s ) );   //----(SA)	added so you can see from the console what's going on
 	}
 
 	trap_UpdateScreen();
 }
 
-/* 0x300EEF28 -- the guard the register traps recurse through. */
-/* Not static: CG_DrawActive (0x3001895F) and CG_DrawActiveFrame (0x30033A5E)
-   read the same dword at 0x300EEF28. */
-int cg_drawingInformation;
+int cg_drawingInformation;         // reject recursive calls
 
 /*
 ====================
-CG_DrawInformation   0x3001FA10
+CG_DrawInformation
 
-Draw all the status / pacifier stuff during level loading.
+Draw all the status / pacifier stuff during level loading
 
-`localized` selects the waiting-for-the-server screen: it reads the map and
-gametype out of cl_serverloadmap / cl_serverloadgametype rather than out of
-the serverinfo, dims the levelshot and prints three lines of localized text.
+If localized is set, draw the "waiting for server" screen with the
+map and gametype names from cl_serverloadmap / cl_serverloadgametype
 ====================
 */
 void CG_DrawInformation( int localized ) {
 	const char *s;
+	const char *info;
 	char buf[MAX_STRING_CHARS];
 	char expected[64];
 	vec4_t color;
@@ -67,9 +45,10 @@ void CG_DrawInformation( int localized ) {
 	const char *dots;
 	int hunkUsed, hunkExpected;
 	float frac;
+	float w, x;
 
 	if ( ( cg.snap && !localized ) || cg_drawingInformation ) {
-		return;
+		return;     // we are in the world, no need to draw information
 	}
 	cg_drawingInformation = 1;
 
@@ -97,13 +76,12 @@ void CG_DrawInformation( int localized ) {
 	//
 	// draw the dialog background
 	//
+	info = cgs.gameState.stringData + cgs.gameState.stringOffsets[0];
 	if ( localized ) {
 		trap_Cvar_VariableStringBuffer( "cl_serverloadmap", buf, sizeof( buf ) );
 		s = buf;
 	} else {
-		/* CG_ConfigString( CS_SERVERINFO ) inlined (0x3001FB0F). */
-		s = Info_ValueForKey( cgs.gameState.stringData + cgs.gameState.stringOffsets[0],
-							  "mapname" );
+		s = Info_ValueForKey( info, "mapname" );
 	}
 
 	levelshot = 0;
@@ -115,7 +93,9 @@ void CG_DrawInformation( int localized ) {
 	}
 
 	if ( localized ) {
-		color[0] = color[1] = color[2] = 0.75f;
+		color[0] = 0.75f;
+		color[1] = 0.75f;
+		color[2] = 0.75f;
 		color[3] = 1.0f;
 		trap_R_SetColor( color );
 	} else {
@@ -125,18 +105,21 @@ void CG_DrawInformation( int localized ) {
 	CG_DrawPic( 0, 0, 640, 480, levelshot );
 
 	if ( localized ) {
-		color[0] = color[1] = color[2] = 0.75f;
+		color[0] = 0.75f;
+		color[1] = 0.75f;
+		color[2] = 0.75f;
 		color[3] = 1.0f;
 
-		s = CG_SafeTranslateString_Internal( "cgame",
-				trap_UI_GetGameTypeDisplayName( cl_serverloadgametype.string ) );
-		trap_R_Text_Paint( ( 640 - trap_R_Text_Width( s, 0, 0.5f, 0 ) ) * 0.5f, 55.0f,
-						   0, 0.5f, color, s, 0, 0, 3 );
+		s = CG_SafeTranslateString( trap_UI_GetGameTypeDisplayName( cl_serverloadgametype.string ) );
+		w = trap_R_Text_Width( s, 0, 0.5f, 0 );
+		x = ( 640 - w ) * 0.5f;
+		trap_R_Text_Paint( x, 55.0f, 0, 0.5f, color, s, 0, 0, 3 );
 
-		s = CG_SafeTranslateString_Internal( "cgame",
-				trap_UI_GetMapDisplayName( cl_serverloadmap.string ) );
-		trap_R_Text_Paint( ( 640 - trap_R_Text_Width( s, 0, 0.5f, 0 ) ) * 0.5f, 85.0f,
-						   0, 0.5f, color, s, 0, 0, 3 );
+		// the map name is not translated
+		s = trap_UI_GetMapDisplayName( cl_serverloadmap.string );
+		w = trap_R_Text_Width( s, 0, 0.5f, 0 );
+		x = ( 640 - w ) * 0.5f;
+		trap_R_Text_Paint( x, 85.0f, 0, 0.5f, color, s, 0, 0, 3 );
 
 		switch ( ( trap_Milliseconds() / 750 ) & 3 ) {
 		case 1:
@@ -153,19 +136,24 @@ void CG_DrawInformation( int localized ) {
 			break;
 		}
 
-		s = CG_SafeTranslateString_Internal( "cgame", "CGAME_WAITINGFORSERVERLOAD" );
-		trap_R_Text_Paint( ( 640 - trap_R_Text_Width( s, 0, 0.5f, 0 ) ) * 0.5f, 435.0f,
-						   0, 0.5f, color, va( "%s%s", s, dots ), 0, 0, 3 );
+		s = CG_SafeTranslateString( "CGAME_WAITINGFORSERVERLOAD" );
+		w = trap_R_Text_Width( s, 0, 0.5f, 0 );
+		s = va( "%s%s", s, dots );
+		trap_R_Text_Paint( ( 640 - w ) * 0.5f, 435.0f, 0, 0.5f, color, s, 0, 0, 3 );
 	} else {
 		trap_Cvar_VariableStringBuffer( "com_expectedhunkusage", expected, sizeof( expected ) );
 		hunkExpected = atoi( expected );
 
-		/* set and never read in 1.1 (0x3001FE11) */
-		color[0] = color[1] = color[2] = color[3] = 0.8f;
+		// show the loading progress
+		color[0] = 0.8f;
+		color[1] = 0.8f;
+		color[2] = 0.8f;
+		color[3] = 0.8f;
 
 		if ( hunkExpected > 0 ) {
 			hunkUsed = trap_hunkUsed();
-			frac = (float)hunkUsed / (float)hunkExpected;
+			// keep: matches original codegen
+			frac = (float)( (double)hunkUsed / hunkExpected );
 			if ( frac > 1.0f ) {
 				frac = 1.0f;
 			}

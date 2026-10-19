@@ -1,42 +1,15 @@
-/*
- * bg_animation.c -- the flexible animation script system, shared by the game
- * module and cgame.
- *
- * Call of Duty 1.1 multiplayer (game_mp_x86.dll, 0x20001000 .. 0x20004F4E).
- * RTCW's game/bg_animation.c is the direct ancestor and most of the text below
- * is that original, adjusted where CoD changed it:
- *
- *   - there is one player model, so RTCW's animModelInfo_t was folded into
- *     animScriptData_t and the per-client model table is gone;
- *   - the animations are XAnims out of a script anim tree rather than frame
- *     ranges out of an .animcfg, so BG_AnimParseAnimConfig is replaced by
- *     BG_FinalizePlayerAnims;
- *   - the condition list is cut from RTCW's 18 to 9, the movetypes retuned to
- *     18 and the events to 14;
- *   - BG_ParseCommands understands three new per-animation keywords
- *     (duration, blendtime, turretanim) and derives the movetype bit set, the
- *     strafe flags and the firing/death flags as it parses.
- *
- * The XAnim/DObj player layer (BG_SetNewAnimation, BG_RunLerpFrameRate,
- * BG_PlayerAngles, BG_Player_DoControllers, BG_UpdatePlayerDObj and friends)
- * has no RTCW ancestor at all; the rest still tracks RTCW's bg_animation.c /
- * cg_players.c.
- *
- * The animation_t flag bits are still nameless in bg_public.h, so they are
- * spelled numerically here with the meaning in a comment:
- *   0x001  animation came from the runtime anim list, not from the tree
- *   0x002  ladder animation (climbup/climbdown with a movespeed)
- *   0x004  turret animation
- *   0x008  firing animation
- *   0x010  strafe-left animation
- *   0x020  strafe-right animation
- *   0x040  death animation
- *   0x080  looped
- *   0x100  no animation behind this index
- * and 0x200 is RTCW's ANIM_TOGGLEBIT in ps->legsAnim / ps->torsoAnim.
- *
- * @fidelity: likely
- */
+//===========================================================================
+// bg_animation.c
+//
+//	Incorporates several elements related to the new flexible animation system.
+//
+//	This includes scripting elements, support routines for new animation set
+//	reference system and other bits and pieces.
+//
+//	animation_t flags beyond bg_public.h's ANIMFL_*: 0x001 the animation came
+//	from the runtime anim list, 0x100 there is no animation behind this index.
+//
+//===========================================================================
 
 #include <string.h>
 #include <stdlib.h>
@@ -48,8 +21,6 @@
 #include "g_public.h"
 #include "bg_public.h"
 
-/* game_mp has no header for the qcommon / q_math / q_parse half of the
- * module, so those prototypes are declared here. */
 extern parseInfo_t *parseInfo;
 
 void QDECL Com_Error( int level, const char *fmt, ... );
@@ -57,22 +28,18 @@ void Com_BeginParseSession( const char *name );
 void Com_EndParseSession( void );
 char *Com_Parse( char **data_p );
 char *Com_ParseExt( char **data_p, qboolean allowLineBreaks );
-/*
- * PARSE THROUGH THE WRAPPERS, NOT Com_ParseExt.  Com_ParseExt is the raw
- * tokenizer and does not touch parseInfo->ungetReady; Com_Parse and
- * Com_ParseOnLine consume the pushed-back token first.  Calling the raw one
- * after a Com_UngetToken leaves ungetReady set, so the next unget in the same
- * loop dies on "UngetToken called twice".  Retail calls the wrappers; the
- * compiler inlined them, with the ungetReady restore open-coded ahead of the
- * raw call (at 0x300021BA it is hoisted well above the call it belongs to).
- */
+// parse through Com_Parse / Com_ParseOnLine, not Com_ParseExt: only the
+// wrappers consume a token pushed back by Com_UngetToken
 char *Com_ParseOnLine( char **data_p );
 void Com_UngetToken( void );
+void Com_BitSet( int array[], int bitNum );
 void QDECL Com_Printf( const char *fmt, ... );
 int Q_stricmp( const char *s1, const char *s2 );
 int Q_strncmp( const char *s1, const char *s2, int n );
 void Q_strcat( char *dest, int size, const char *src );
+void Q_strncpyz( char *dest, const char *src, int destsize );
 float AngleMod( float a );
+float AngleNormalize360( float angle );
 float AngleSubtract( float a1, float a2 );
 float AngleNormalize180( float angle );
 vec_t Distance( const vec3_t p1, const vec3_t p2 );
@@ -87,31 +54,21 @@ int trap_XAnimGetLength( void *tree, unsigned short animIndex );
 int trap_XAnimGetAnimTreeSize( void *tree );
 void trap_XAnimGetRelDelta( scr_anim_t anim, float *deltaRot, float *deltaMove,
 							float startTime, float endTime );
-float trap_XAnimGetTime( void *tree, unsigned short animIndex );
-float trap_XAnimGetWeight( void *tree, unsigned short animIndex );
-void trap_XAnimSetAnimRate( void *tree, unsigned short animIndex, float rate );
-/*
- * Two traps that are NOT the same call in the two builds.
- *
- * XModelGet does not exist on the client at all: cgame's BG_GetXModel
- * (0x300046D0) is `trap_R_RegisterModel( name, 7 )` and then trap 50 on the
- * handle it returns -- two calls, not one renamed one.
- *
- * DObjCreate takes FOUR arguments on the client, not five: the cgame wrapper
- * at 0x30031BA0 issues syscall( 164, models, modelCount, tree, handle ) and the
- * engine supplies the scrNotifyId itself.  BG_DObjCreate (0x300046F0) is
- * byte-identical to that wrapper.  This is deliberately NOT hidden behind a
- * forwarder that pads a fifth zero -- the call site differs, so the conditional
- * is on the call.
- *
- * qhandle_t is cg_public.h's and a bg unit cannot see that header, so
- * trap_R_RegisterModel is declared with its underlying int here.
- */
+// the scr_anim_t traps take the handle by value; ClearGoalWeight and SetTime
+// take the anim index
+float trap_XAnimGetTime( void *tree, scr_anim_t anim );
+float trap_XAnimGetWeight( void *tree, scr_anim_t anim );
+void trap_XAnimSetAnimRate( void *tree, scr_anim_t anim, float rate );
+void trap_XAnimClearGoalWeight( void *tree, int animIndex, float goalTime );
+void trap_XAnimSetTime( void *tree, int animIndex, float time );
+
+// XModelGet doesn't exist on the client, and the client's DObjCreate takes no
+// scrNotifyId; qhandle_t is cg_public.h's, so trap_R_RegisterModel returns int here
 #ifdef CGAMEDLL
-/* cg_syscalls.c */
 int  trap_R_RegisterModel( const char *name, int arg2 );
-int  trap_R_GetXModelByHandle( int hModel );
+void *trap_R_GetXModelByHandle( int hModel );
 void trap_DObjCreate( void *models, unsigned short modelCount, void *tree, int handle );
+void *trap_XAnimCreateTree( void *anims );
 #else
 void *trap_XModelGet( const char *name );
 void trap_DObjCreate( void *models, unsigned short modelCount, void *tree,
@@ -120,53 +77,37 @@ void trap_DObjCreate( void *models, unsigned short modelCount, void *tree,
 void trap_SafeDObjFree( int handle, unsigned int releaseTree );
 #ifndef CGAMEDLL
 qboolean trap_DObjExists( gentity_t *ent );
-void *trap_XAnimCreateTree( void *anims );  /* inferred */
+void *trap_XAnimCreateTree( void *anims );
 #endif
 
-void trap_XAnimClearGoalWeight( void *tree, unsigned short animIndex, float goalTime );
-void trap_XAnimSetTime( void *tree, unsigned short animIndex, float time );
-void trap_XAnimSetCompleteGoalWeight( void *tree, unsigned short animIndex, float goalWeight,
+#define BG_ANIM_HANDLE(anim) (anim)
+#define BG_ANIM_KNOB_HANDLE(anim) (anim)
+void trap_XAnimSetCompleteGoalWeight( void *tree, scr_anim_t anim, float goalWeight,
 									  float goalTime, float rate, unsigned short notifyIndex,
 									  int notifyFlags );
-void trap_XAnimSetCompleteGoalWeightKnobAll( void *tree, unsigned short animIndex,
-											 unsigned short childIndex, float goalWeight,
+void trap_XAnimSetCompleteGoalWeightKnobAll( void *tree, scr_anim_t anim,
+											 scr_anim_t childAnim, float goalWeight,
 											 float goalTime, float rate,
 											 unsigned short notifyIndex, int notifyFlags );
 
-/*
- * ---- the one genuine client/server split in this file --------------------
- *
- * The two DObj-writing functions below (BG_Player_DoControllers and
- * BG_UpdatePlayerDObj) do not compile to the same thing in the two DLLs, and
- * the difference is not inlining.  The game build takes the gentity_t and
- * resolves the DObj itself; the cgame build is handed the DObj already
- * resolved by its caller (CG_TransitionSnapshot does Com_GetClientDObj, trap
- * 162) and only null-tests it.  Everything downstream then goes through the
- * CG_ helpers instead of the G_ ones, and through the cgame trap numbers.
- *
- *   BG_Player_DoControllers   game 0x200046B0  cgame 0x30004710
- *   BG_UpdatePlayerDObj       game 0x20004CF0  cgame 0x30004EB0
- *
- * Q3 and RTCW split their bg_ files exactly this way; RTCW's spelling of the
- * macro is CGAMEDLL, so that is the spelling here.  The game build is the
- * default.
- */
+
+// the DObj functions below are the one client/server split in this file: the
+// game build takes the entity and resolves its DObj, the client build is handed
+// the DObj
 #ifdef CGAMEDLL
 
-/* cg_ent.c */
-qboolean CG_DObjSetLocalTag( int obj, int *partBits, const char *tagName,
+qboolean CG_DObjSetLocalTag( struct DObj_s *obj, int *partBits, const char *tagName,
 							 const vec3_t origin, const vec3_t angles );
-qboolean CG_DObjSetControlTagAngles( int obj, int *partBits, const char *tagName,
+qboolean CG_DObjSetControlTagAngles( struct DObj_s *obj, int *partBits, const char *tagName,
 									 const vec3_t angles );
 
-#define BG_DOBJ_PARM                int obj
+#define BG_DOBJ_PARM                struct DObj_s *obj
 #define BG_DObjSetLocalTag          CG_DObjSetLocalTag
 #define BG_DObjSetControlTagAngles  CG_DObjSetControlTagAngles
 #define BG_DOBJ                     obj
 
 #else
 
-/* g_utils_mp.c; declared here because the bg units do not include g_local.h */
 qboolean G_DObjSetLocalTag( gentity_t *ent, int *partBits, const char *tagName,
 							const vec3_t origin, const vec3_t angles );
 qboolean G_DObjSetControlTagAngles( gentity_t *ent, int *partBits, const char *tagName,
@@ -179,76 +120,41 @@ qboolean G_DObjSetControlTagAngles( gentity_t *ent, int *partBits, const char *t
 
 #endif
 
-/* Installed by the script far-hook table (g_scr_main_mp.c).  g_local.h carries
-   the canonical block, but a bg unit does not include it, so these three stay
-   here; they are byte-identical to the canonical declarations. */
+// installed by the script far-hook table
 extern int ( *Scr_GetAnimsIndex )( int anims );
 extern void ( *Scr_FindAnim )( const char *treeName, const char *animName, scr_anim_t *anim );
 extern void *( *Scr_FindAnimTree )( const char *treeName );
 
-/* 0x200A1A70 / 74 / 78, written by G_InitGame and G_RunFrame. */
-int bgs_time;                                   /* 0x200A1A70 */
-int bgs_animTime;                               /* 0x200A1A74 */
-int bgs_frametime;                              /* 0x200A1A78 */
-
-/* The client registers the same cvar under its own prefix; the two reads
-   BG_SetNewAnimation (0x30003B0B, == 1) and BG_RunLerpFrameRate (0x30003DAF,
-   == 2) make are the two this file emits.  Conditional on the symbol only. */
-#ifdef CGAMEDLL
-#define g_debuganim     cg_debuganim
+// animation clock, written by G_InitGame and G_RunFrame
+#if defined( GAMEDLL ) || defined( CGAMEDLL )
+bgGameClock_t bg;
+#else
+int bgs_time;
+int bgs_animTime;
+int bgs_frametime;
 #endif
-extern vmCvar_t g_debuganim;                    /* 0x20237280, cgame 0x30298480 */
-extern vmCvar_t bg_swingSpeed;                  /* 0x20234580 */
 
-/*
- * 0x200A1C80.  The parse-side functions reach the script data through
- * globalScriptData, but the run-time ones address the object by name -- e.g.
- * BG_SetNewAnimation's `animations[i]` at 0x20003733 and its numAnimations
- * test at 0x200036EB are absolute, which a load through the pointer could
- * never be.  g_main_mp.c declares the same address as `bgs_animState`, a
- * 0xAC8EC byte blob, because G_InitGame clears animScriptData_t + the four
- * resolved anims + bg_clientinfo[64] with one rep stosd (0x20025EB6): the
- * retail name for all of it is `bgs`.
- */
-animScriptData_t bgs_animScriptData;
+// the client registers the same cvar under its own prefix
+#ifdef CGAMEDLL
+#define bg_debugAnim    cg_debuganim
+#endif
+extern vmCvar_t bg_debugAnim;
+extern vmCvar_t bg_swingSpeed;
 
-/* entityState_t.eFlags bits this file tests.  0x2|0x4 and 0x800 have no
- * recovered name; they are spelled numerically at their use sites. */
-#define EF_DEAD                     0x00000001
-#define EF_CROUCHING                0x00000020
-#define EF_PRONE                    0x00000040
-#define EF_AIMING_DOWN_SIGHT        0x00000200
-#define EF_FIRING                   0x00000400
-#define EF_TURRET_ACTIVE_PRONE      0x00004000
-#define EF_TURRET_ACTIVE_DUCK       0x00008000
-#define EF_TURRET_ACTIVE_MASK       ( EF_TURRET_ACTIVE_PRONE | EF_TURRET_ACTIVE_DUCK )
+// client only: the cg_debugProneCheck 4/5/6 debug poses
+#ifdef CGAMEDLL
+extern vmCvar_t cg_debugProneCheck;
+#define BG_DEBUG_PRONE_SIN()  ( (float)sin( (float)bgs_time * 0.003f + (float)debugClientNum ) )
+#endif
 
-#define BUTTON_ATTACK               0x1
+// all the animation state; G_InitGame clears it in one go
+bgs_t bgs;
 
-#define ANIM_TOGGLEBIT              0x200
-
-/* the pair of movetype bits every "is this player on a ladder" test uses */
+// the pair of movetype bits every "is this player on a ladder" test uses
 #define ANIM_MT_CLIMBING_MASK       ( ( 1 << ANIM_MT_CLIMBUP ) | ( 1 << ANIM_MT_CLIMBDOWN ) )
 
-/* q_shared.h has neither; BG_PlayerAngles open-codes the pair (0x200040BE,
- * 0x200040F1) to snap the view yaw to the wire's precision */
-#define ANGLE2SHORT( x )            ( (int)( (x) * ( 65536.0f / 360.0f ) ) & 65535 )
-#define SHORT2ANGLE( x )            ( (float)( x ) * ( 360.0f / 65536.0f ) )
-
-/* animation_t.flags, still nameless in bg_public.h (see the file header) */
-#define ANIMFL_LADDER               0x002
-#define ANIMFL_STRAFELEFT           0x010
-#define ANIMFL_STRAFERIGHT          0x020
-#define ANIMFL_DEATH                0x040
-
-/*
- * One entry of the runtime animation list BG_AnimParseAnimScript is handed.
- * 72 bytes.  The list is live on the first parse: GScr_LoadScripts passes a
- * 36864-byte stack buffer, which is exactly 512 of these, and the re-parse
- * from BG_FinalizePlayerAnims passes NULL.  The type is file-private -- the
- * callers outside this file only forward the buffer, which is why bg_public.h
- * spells the parameter void *.
- */
+// one entry of the runtime animation list BG_AnimParseAnimScript is handed;
+// file-private, so the callers outside this file pass it as void *
 typedef struct animScriptAnim_t
 {
 	scr_anim_t anim;
@@ -261,45 +167,28 @@ void BG_UpdateConditionValue( int client, int condition, int value, qboolean che
 
 #define MAX_ANIM_DEFINES 16
 
-/* this is used globally within this file to reduce redundant params */
-static animScriptData_t *globalScriptData;      /* 0x200A06A4 */
-static animScriptAnim_t *globalAnims;           /* 0x20088CC8 */
-static int *globalNumAnims;                     /* 0x200865B0 */
+// this is used globally within this file to reduce redundant params
+static animScriptData_t *globalScriptData;
+static animScriptAnim_t *globalAnims;
+static int *globalNumAnims;
 
-static char *globalFilename = "mp/playeranim.script";   /* 0x2006CBE8 */
-static qboolean animScriptLoaded;                       /* 0x200A06A8 */
-static char globalScriptText[100000];                   /* 0x2006DF10 */
+static char *globalFilename = "mp/playeranim.script";   // to prevent redundant params
+static qboolean animScriptLoaded;
+static char globalScriptText[100000];
 
-/* these are used globally during script parsing */
-static int numDefines[NUM_ANIM_CONDITIONS];                             /* 0x2006DA6C */
-static char defineStrings[10000];                                       /* 0x200865B8 */
-static int defineStringsOffset;                                         /* 0x200865B4 */
-static animStringItem_t defineStr[NUM_ANIM_CONDITIONS][MAX_ANIM_DEFINES];   /* 0x2006D5E8 */
-static int defineBits[NUM_ANIM_CONDITIONS][MAX_ANIM_DEFINES][2];            /* 0x2006DA90 */
+// these are used globally during script parsing
+static int numDefines[NUM_ANIM_CONDITIONS];
+static char defineStrings[10000];                                       // stores the actual strings
+static int defineStringsOffset;
+static animStringItem_t defineStr[NUM_ANIM_CONDITIONS][MAX_ANIM_DEFINES];
+static int defineBits[NUM_ANIM_CONDITIONS][MAX_ANIM_DEFINES][2];
 
-static scriptAnimMoveTypes_t parseMovetype;     /* 0x2006DA68 */
-static int parseEvent;                          /* 0x2006D5E0 */
+static scriptAnimMoveTypes_t parseMovetype;
+static int parseEvent;
 
-static animStringItem_t weaponStrings[MAX_WEAPONS];     /* 0x200A1A80 */
-static qboolean weaponStringsInited;                    /* 0x200A06AC */
+static animStringItem_t weaponStrings[MAX_WEAPONS];
+static qboolean weaponStringsInited;
 
-/*
- * The player anim tree BG_FindAnimTrees resolves.  Not static: cg_animtree_mp.c
- * still reads it for its inline copy of the seeding loops (retail 0x30005182).
- */
-void *bgs_animTree;                             /* 0x2013D358 */
-
-/* The four script animations BG_FindAnims resolves out of the player tree.
-   Not static: they sit inside the 0x200A1C80..0x2014E56C run G_InitGame
-   clears with one rep stosd (0x20025EB6), so g_main_mp.c writes them. */
-scr_anim_t bgs_rootAnim;                        /* 0x2013D35C */
-scr_anim_t bgs_torsoAnim;                       /* 0x2013D360 */
-scr_anim_t bgs_legsAnim;                        /* 0x2013D364 */
-scr_anim_t bgs_turningAnim;                     /* 0x2013D368 */
-
-/* The per-client animation records; bg_public.h declares them, this unit is
-   the definition.  Last member of the same cleared run. */
-clientInfo_t bg_clientinfo[MAX_CLIENTS];        /* 0x2013D36C */
 
 static animStringItem_t animStateStr[] =
 {
@@ -365,12 +254,11 @@ static animStringItem_t animBodyPartsStr[] =
 	{NULL, -1},
 };
 
-/*------------------------------------------------------------*/
-/* conditions */
+//------------------------------------------------------------
+// conditions
 
-/* 0x2006CD50.  RTCW's ENEMY_POSITION values; CoD dropped the condition but the
- * table is still compiled in, unreferenced. */
-static animStringItem_t animConditionPositionsStr[] =
+// keep: unreferenced, matches the original data layout
+animStringItem_t animConditionPositionsStr[] =
 {
 	{"** UNUSED **", -1},
 	{"BEHIND", -1},
@@ -389,9 +277,8 @@ static animStringItem_t animConditionMountedStr[] =
 	{NULL, -1},
 };
 
-/* the weapon classes, spelled the way the animation script spells them; this
- * is bg_animation.c's own table, not bg_weapon.c's bg_weaponClassNames. */
-static animStringItem_t animConditionWeaponClassStr[] =
+// the weapon classes, as the animation script spells them
+static animStringItem_t animWeaponClassStr[] =
 {
 	{"RIFLE", -1},
 	{"MG", -1},
@@ -405,7 +292,7 @@ static animStringItem_t animConditionWeaponClassStr[] =
 	{NULL, -1},
 };
 
-static animStringItem_t animConditionWeaponPositionStr[] =
+static animStringItem_t animWeaponPositionStr[] =
 {
 	{"HIP", -1},
 	{"ADS", -1},
@@ -413,7 +300,7 @@ static animStringItem_t animConditionWeaponPositionStr[] =
 	{NULL, -1},
 };
 
-static animStringItem_t animConditionStrafingStr[] =
+static animStringItem_t animStrafeStateStr[] =
 {
 	{"NOT", -1},
 	{"LEFT", -1},
@@ -446,17 +333,17 @@ static animStringItem_t animConditionsStr[] =
 static animConditionTable_t animConditionsTable[NUM_ANIM_CONDITIONS] =
 {
 	{ANIM_CONDTYPE_BITFLAGS,        weaponStrings},
-	{ANIM_CONDTYPE_BITFLAGS,        animConditionWeaponClassStr},
+	{ANIM_CONDTYPE_BITFLAGS,        animWeaponClassStr},
 	{ANIM_CONDTYPE_VALUE,           animConditionMountedStr},
 	{ANIM_CONDTYPE_BITFLAGS,        animMoveTypesStr},
 	{ANIM_CONDTYPE_VALUE,           NULL},
 	{ANIM_CONDTYPE_VALUE,           NULL},
 	{ANIM_CONDTYPE_VALUE,           NULL},
-	{ANIM_CONDTYPE_VALUE,           animConditionWeaponPositionStr},
-	{ANIM_CONDTYPE_VALUE,           animConditionStrafingStr},
+	{ANIM_CONDTYPE_VALUE,           animWeaponPositionStr},
+	{ANIM_CONDTYPE_VALUE,           animStrafeStateStr},
 };
 
-/*------------------------------------------------------------*/
+//------------------------------------------------------------
 
 /*
 ================
@@ -516,30 +403,33 @@ BG_AnimationIndexForString
 int BG_AnimationIndexForString( char *string ) {
 	int i, hash, num;
 	animation_t *anim;
+	animScriptAnim_t *newAnim;
 
-	hash = BG_StringHashValue( string );
-
-	if ( globalAnims ) {
-		num = *globalNumAnims;
-		for ( i = 0; i < num; i++ ) {
-			if ( hash == globalAnims[i].hash && !Q_stricmp( string, globalAnims[i].name ) ) {
+	if ( !globalAnims ) {
+		hash = BG_StringHashValue( string );
+		for ( i = 0, anim = globalScriptData->animations; i < globalScriptData->numAnimations; i++, anim++ ) {
+			if ( hash == anim->hash && !Q_stricmp( string, anim->name ) ) {
 				return i;
 			}
 		}
-		Scr_FindAnim( "multiplayer", string, &globalAnims[num].anim );
-		strcpy( globalAnims[num].name, string );
-		globalAnims[num].hash = hash;
-		return ( *globalNumAnims )++;
+
+		BG_AnimParseError( "BG_AnimationIndexForString: unknown player animation '%s'", string );
+		return -1;      // shutup compiler
 	}
 
-	for ( i = 0, anim = globalScriptData->animations; i < globalScriptData->numAnimations; i++, anim++ ) {
-		if ( hash == anim->hash && !Q_stricmp( string, anim->name ) ) {
+	hash = BG_StringHashValue( string );
+	num = *globalNumAnims;
+	for ( i = 0; i < num; i++ ) {
+		if ( hash == globalAnims[i].hash && !Q_stricmp( string, globalAnims[i].name ) ) {
 			return i;
 		}
 	}
-
-	BG_AnimParseError( "BG_AnimationIndexForString: unknown player animation '%s'", string );
-	return -1;      // shutup compiler
+	newAnim = &globalAnims[num];
+	Scr_FindAnim( "multiplayer", string, &newAnim->anim );
+	strcpy( newAnim->name, string );
+	newAnim->hash = hash;
+	( *globalNumAnims )++;
+	return *globalNumAnims - 1;
 }
 
 /*
@@ -649,15 +539,16 @@ BG_LoadAnimForAnimIndex
 */
 animScriptAnim_t *BG_LoadAnimForAnimIndex( unsigned int animIndex ) {
 	int i;
+	animScriptAnim_t *anim;
 
 	if ( animIndex >= (unsigned int)globalScriptData->numAnimations ) {
 		Com_Error( ERR_DROP, "\x15" "Player animation index %i out of 0 to %i range",
 				   animIndex, globalScriptData->numAnimations );
 	}
 
-	for ( i = 0; i < *globalNumAnims; i++ ) {
-		if ( animIndex == globalAnims[i].anim.index ) {
-			return &globalAnims[i];
+	for ( i = 0, anim = globalAnims; i < *globalNumAnims; i++, anim++ ) {
+		if ( animIndex == anim->anim.index ) {
+			return anim;
 		}
 	}
 
@@ -668,8 +559,8 @@ animScriptAnim_t *BG_LoadAnimForAnimIndex( unsigned int animIndex ) {
 =================
 BG_SetupAnimNoteTypes
 
-  Marks every animation the RELOAD event script plays.  +0x58 of animation_t is
-  still unknown_ in bg_public.h; the two stores are at 0x200014C1/0x200014D2.
+  Marks every animation the RELOAD event script plays, through
+  animation_t.noteType.
 =================
 */
 void BG_SetupAnimNoteTypes( animScriptData_t *scriptData ) {
@@ -701,9 +592,8 @@ void BG_SetupAnimNoteTypes( animScriptData_t *scriptData ) {
 =================
 BG_FinalizePlayerAnims
 
-  CoD's replacement for RTCW's BG_AnimParseAnimConfig: the animation table is
-  built out of the script anim tree instead of an .animcfg, then the script
-  itself is parsed on top of it.
+  Builds the animation table out of the script anim tree, then parses the
+  script itself on top of it.
 =================
 */
 void BG_FinalizePlayerAnims( void ) {
@@ -715,7 +605,7 @@ void BG_FinalizePlayerAnims( void ) {
 	int numAnims;
 	int i;
 	int len;
-	float deltaRot[2];      /* the retail frame reserves exactly two floats here */
+	float deltaRot[2];      // keep: two floats, matches original codegen
 	vec3_t deltaPos;
 
 	scriptData = globalScriptData;
@@ -726,16 +616,14 @@ void BG_FinalizePlayerAnims( void ) {
 	globalScriptData->numAnimations = numAnims;
 
 	scriptData->animations[0].flags |= 0x101;
-	strncpy( scriptData->animations[0].name, "root", 63 );
-	scriptData->animations[0].name[63] = 0;
+	Q_strncpyz( scriptData->animations[0].name, "root", sizeof( scriptData->animations[0].name ) );
 	scriptData->animations[0].hash = 0;
 
 	for ( i = 1, anim = &scriptData->animations[1]; i < numAnims; i++, anim++ ) {
 		listAnim = BG_LoadAnimForAnimIndex( i );
 		if ( !listAnim ) {
 			anim->flags |= 0x100;
-			strncpy( anim->name, "unused", 63 );
-			anim->name[63] = 0;
+			Q_strncpyz( anim->name, "unused", sizeof( anim->name ) );
 			anim->hash = 0;
 			continue;
 		}
@@ -744,8 +632,7 @@ void BG_FinalizePlayerAnims( void ) {
 
 		if ( !trap_XAnimIsPrimitive( treeAnim ) ) {
 			anim->flags |= 0x001;
-			strncpy( anim->name, listAnim->name, 63 );
-			anim->name[63] = 0;
+			Q_strncpyz( anim->name, listAnim->name, sizeof( anim->name ) );
 			anim->hash = listAnim->hash;
 			if ( !anim->blendTime ) {
 				anim->blendTime = -1;
@@ -755,8 +642,7 @@ void BG_FinalizePlayerAnims( void ) {
 			continue;
 		}
 
-		strncpy( anim->name, trap_XAnimGetAnimName( treeAnim ), 63 );
-		anim->name[63] = 0;
+		Q_strncpyz( anim->name, trap_XAnimGetAnimName( treeAnim ), sizeof( anim->name ) );
 		anim->hash = BG_StringHashValue( anim->name );
 		if ( !anim->blendTime ) {
 			anim->blendTime = -1;
@@ -765,7 +651,8 @@ void BG_FinalizePlayerAnims( void ) {
 		anim->duration = trap_XAnimGetLength( (void *)tree, (unsigned short)i );
 		if ( anim->duration ) {
 			trap_XAnimGetRelDelta( treeAnim, deltaRot, deltaPos, 0.0f, 1.0f );
-			len = (int)VectorLength( deltaPos );
+			// keep: inlined length, matches original codegen
+			len = (int)sqrt( deltaPos[0] * deltaPos[0] + deltaPos[1] * deltaPos[1] + deltaPos[2] * deltaPos[2] );
 			if ( len ) {
 				anim->moveSpeed = 1000 * len / anim->duration;
 			} else {
@@ -780,7 +667,7 @@ void BG_FinalizePlayerAnims( void ) {
 		}
 
 		if ( trap_XAnimIsLooped( treeAnim ) ) {
-			anim->flags |= 0x080;
+			anim->flags |= ANIMFL_LOOPED;
 		}
 	}
 
@@ -805,7 +692,7 @@ void BG_ParseConditionBits( char **text_pp, animStringItem_t *stringTable, int c
 	char *token;
 
 	currentString[0] = '\0';
-	memset( result, 0, sizeof( result ) );      /* RTCW quirk: clears result[0] only */
+	memset( result, 0, sizeof( result ) );      // keep: sizeof a pointer, clears result[0] only
 	memset( tempBits, 0, sizeof( tempBits ) );
 
 	while ( !endFlag ) {
@@ -981,9 +868,10 @@ void BG_ParseCommands( char **input, animScriptItem_t *scriptItem, animScriptDat
 	animScriptCommand_t *command = NULL;
 	animation_t *anim;
 	int partIndex = 0;
+	qboolean found;
 	int i;
 
-	while ( 1 ) {
+	for ( ;; ) {
 
 		// parse the body part
 		token = ( partIndex < 1 ) ? Com_Parse( input ) : Com_ParseOnLine( input );
@@ -1003,7 +891,7 @@ void BG_ParseCommands( char **input, animScriptItem_t *scriptItem, animScriptDat
 				BG_AnimParseError( "BG_ParseCommands: exceeded maximum number of animations (%i)", MAX_ANIMSCRIPT_ANIMCOMMANDS );
 			}
 			command = &scriptItem->commands[scriptItem->numCommands++];
-			memset( command, 0, sizeof( command ) );    /* RTCW quirk: clears 4 bytes */
+			memset( command, 0, sizeof( command ) );    // keep: sizeof a pointer, clears 4 bytes
 		}
 
 		command->bodyPart[partIndex] = BG_IndexForString( token, animBodyPartsStr, qtrue );
@@ -1014,8 +902,8 @@ void BG_ParseCommands( char **input, animScriptItem_t *scriptItem, animScriptDat
 				BG_AnimParseError( "BG_ParseCommands: expected animation" );
 			}
 			command->animIndex[partIndex] = BG_AnimationIndexForString( token );
+			command->animDuration[partIndex] = scriptData->animations[command->animIndex[partIndex]].duration;
 			anim = &scriptData->animations[command->animIndex[partIndex]];
-			command->animDuration[partIndex] = (short)anim->duration;
 
 			if ( !globalAnims ) {
 				// if this is a locomotion, set the movetype of the animation so we can
@@ -1025,7 +913,7 @@ void BG_ParseCommands( char **input, animScriptItem_t *scriptItem, animScriptDat
 
 					if ( parseMovetype == ANIM_MT_CLIMBUP || parseMovetype == ANIM_MT_CLIMBDOWN ) {
 						if ( scriptData->animations[command->animIndex[partIndex]].moveSpeed ) {
-							scriptData->animations[command->animIndex[partIndex]].flags |= 0x002;
+							scriptData->animations[command->animIndex[partIndex]].flags |= ANIMFL_LADDER;
 						}
 					}
 
@@ -1034,65 +922,59 @@ void BG_ParseCommands( char **input, animScriptItem_t *scriptItem, animScriptDat
 							continue;
 						}
 						if ( scriptItem->conditions[i].value[0] == STRAFING_LEFT ) {
-							scriptData->animations[command->animIndex[partIndex]].flags |= 0x010;
+							scriptData->animations[command->animIndex[partIndex]].flags |= ANIMFL_STRAFELEFT;
 						} else if ( scriptItem->conditions[i].value[0] == STRAFING_RIGHT ) {
-							scriptData->animations[command->animIndex[partIndex]].flags |= 0x020;
+							scriptData->animations[command->animIndex[partIndex]].flags |= ANIMFL_STRAFERIGHT;
 						}
 						break;
 					}
 				}
 				// if this is a fireweapon event, then this is a firing animation
 				if ( parseEvent == ANIM_ET_FIREWEAPON ) {
-					scriptData->animations[command->animIndex[partIndex]].flags |= 0x008;
+					scriptData->animations[command->animIndex[partIndex]].flags |= ANIMFL_FIRING;
 					scriptData->animations[command->animIndex[partIndex]].blendTime = 30;
 				} else if ( parseEvent == ANIM_ET_DEATH ) {
 					scriptData->animations[command->animIndex[partIndex]].moveSpeed = 0;
-					scriptData->animations[command->animIndex[partIndex]].flags |= 0x040;
+					scriptData->animations[command->animIndex[partIndex]].flags |= ANIMFL_DEATH;
 				}
 			}
 
 			// check for parameters attached to this animation instance
-			while ( 1 ) {
+			do {
+				found = qfalse;
 				token = Com_ParseOnLine( input );
-				if ( !token || !token[0] ) {
+				if ( token && token[0] ) {
+					if ( !Q_stricmp( token, "duration" ) ) {
+						found = qtrue;
+						token = Com_ParseOnLine( input );
+						if ( !token || !token[0] ) {
+							BG_AnimParseError( "BG_ParseCommands: expected duration value" );
+						}
+						command->animDuration[partIndex] = (short)atoi( token );
+					} else if ( !Q_stricmp( token, "turretanim" ) ) {
+						found = qtrue;
+						if ( !globalAnims ) {
+							scriptData->animations[command->animIndex[partIndex]].flags |= ANIMFL_TURRET;
+						}
+						if ( command->bodyPart[partIndex] != ANIM_BP_BOTH ) {
+							BG_AnimParseError( "BG_ParseCommands: Turret animations can only be played on the 'both' body part" );
+						}
+					} else if ( !Q_stricmp( token, "blendtime" ) ) {
+						found = qtrue;
+						token = Com_ParseOnLine( input );
+						if ( !token || !token[0] ) {
+							BG_AnimParseError( "BG_ParseCommands: expected blendtime value" );
+						}
+						if ( !globalAnims ) {
+							scriptData->animations[command->animIndex[partIndex]].blendTime = atoi( token );
+						}
+					} else {
+						Com_UngetToken();
+					}
+				} else {
 					Com_UngetToken();
-					break;
 				}
-
-				if ( !Q_stricmp( token, "duration" ) ) {
-					token = Com_ParseOnLine( input );
-					if ( !token || !token[0] ) {
-						BG_AnimParseError( "BG_ParseCommands: expected duration value" );
-					}
-					command->animDuration[partIndex] = (short)atoi( token );
-					continue;
-				}
-
-				if ( !Q_stricmp( token, "turretanim" ) ) {
-					if ( !globalAnims ) {
-						scriptData->animations[command->animIndex[partIndex]].flags |= 0x004;
-					}
-					if ( command->bodyPart[partIndex] != ANIM_BP_BOTH ) {
-						BG_AnimParseError( "BG_ParseCommands: Turret animations can only be played on the 'both' body part" );
-					}
-					continue;
-				}
-
-				if ( !Q_stricmp( token, "blendtime" ) ) {
-					token = Com_ParseOnLine( input );
-					if ( !token || !token[0] ) {
-						BG_AnimParseError( "BG_ParseCommands: expected blendtime value" );
-					}
-					if ( !globalAnims ) {
-						scriptData->animations[command->animIndex[partIndex]].blendTime = atoi( token );
-					}
-					continue;
-				}
-
-				// unget the token
-				Com_UngetToken();
-				break;
-			}
+			} while ( found );
 
 			if ( command->bodyPart[partIndex] != ANIM_BP_BOTH && partIndex++ < 1 ) {
 				continue;   // allow parsing of another bodypart
@@ -1104,10 +986,6 @@ void BG_ParseCommands( char **input, animScriptItem_t *scriptItem, animScriptDat
 
 		// parse optional parameters (sounds, etc)
 		while ( 1 ) {
-			/* Com_ParseOnLine, and it MUST be: the loop above ungets at end of
-			   line, and Com_ParseExt would not restore -- the data pointer is
-			   already past the newline, so the raw read returns the next line's
-			   `}` and this loop calls it an unknown parameter. */
 			token = Com_ParseOnLine( input );
 			if ( !token || !token[0] ) {
 				break;
@@ -1187,7 +1065,8 @@ void BG_AnimParseAnimScript( animScriptData_t *scriptData, void *anims, int *num
 			Com_Error( ERR_DROP, "\x15" "Couldn't load player animation script %s\n", globalFilename );
 		}
 		trap_FS_Read( globalScriptText, len, f );
-		globalScriptText[len] = 0;
+		// keep: pointer store matches original codegen
+		*( globalScriptText + len ) = 0;
 		trap_FS_FCloseFile( f );
 		animScriptLoaded = qtrue;
 	}
@@ -1589,31 +1468,31 @@ int BG_PlayAnim( playerState_t *ps, int animNum, animBodyPart_t bodyPart, int fo
 	case ANIM_BP_LEGS:
 
 		if ( ps->legsTimer < 50 || force ) {
-			if ( !isContinue || ( ps->legsAnim & ~0x200 ) != animNum ) {
+			if ( !isContinue || ( ps->legsAnim & ~ANIM_TOGGLEBIT ) != animNum ) {
 				wasSet = qtrue;
-				ps->legsAnim = ( ( ps->legsAnim & 0x200 ) ^ 0x200 ) | animNum;
+				ps->legsAnim = ( ( ps->legsAnim & ANIM_TOGGLEBIT ) ^ ANIM_TOGGLEBIT ) | animNum;
 				if ( setTimer ) {
 					ps->legsTimer = duration;
 				}
-			} else if ( setTimer && ( globalScriptData->animations[animNum].flags & 0x080 ) ) {
+			} else if ( setTimer && ( globalScriptData->animations[animNum].flags & ANIMFL_LOOPED ) ) {
 				ps->legsTimer = duration;
 			}
 		}
 
-		if ( bodyPart == ANIM_BP_LEGS ) {
+		if ( bodyPart != ANIM_BP_BOTH ) {
 			break;
 		}
-		animNum = 0;    /* the retail code falls through with the index cleared */
+		animNum = 0;    // keep: falls through with the index cleared
 
 	case ANIM_BP_TORSO:
 
 		if ( ps->torsoTimer < 50 || force ) {
-			if ( !isContinue || ( ps->torsoAnim & ~0x200 ) != animNum ) {
-				ps->torsoAnim = ( ( ps->torsoAnim & 0x200 ) ^ 0x200 ) | animNum;
+			if ( !isContinue || ( ps->torsoAnim & ~ANIM_TOGGLEBIT ) != animNum ) {
+				ps->torsoAnim = ( ( ps->torsoAnim & ANIM_TOGGLEBIT ) ^ ANIM_TOGGLEBIT ) | animNum;
 				if ( setTimer ) {
 					ps->torsoTimer = duration;
 				}
-			} else if ( setTimer && ( globalScriptData->animations[animNum].flags & 0x080 ) ) {
+			} else if ( setTimer && ( globalScriptData->animations[animNum].flags & ANIMFL_LOOPED ) ) {
 				ps->torsoTimer = duration;
 			}
 		}
@@ -1664,7 +1543,7 @@ int BG_ExecuteCommand( playerState_t *ps, animScriptCommand_t *scriptCommand,
 	}
 	if ( scriptCommand->bodyPart[1] ) {
 		duration = scriptCommand->animDuration[0] + 50;
-		/* the retail code tests bodyPart[0] here, not [1] */
+		// keep: tests bodyPart[0] here, not [1]
 		if ( scriptCommand->bodyPart[0] == ANIM_BP_LEGS || scriptCommand->bodyPart[0] == ANIM_BP_BOTH ) {
 			playedLegsAnim = ( BG_PlayAnim( ps, scriptCommand->animIndex[1], scriptCommand->bodyPart[1],
 											duration, setTimer, isContinue, force ) > -1 );
@@ -1675,10 +1554,7 @@ int BG_ExecuteCommand( playerState_t *ps, animScriptCommand_t *scriptCommand,
 	}
 
 	if ( scriptCommand->soundIndex ) {
-		/* Two arguments, clientNum first -- game 0x20002FF0 and cgame
-		   0x30003000 emit the identical `push soundIndex; push clientNum;
-		   call [+0x9B6D4]; add esp,8`.  The cast goes away once
-		   animScriptCommand_t.soundIndex is corrected to const char *. */
+		// playSound takes the sound alias name
 		globalScriptData->playSound( ps->clientNum, (const char *)scriptCommand->soundIndex );
 	}
 
@@ -1723,7 +1599,10 @@ int BG_AnimScriptAnimation( playerState_t *ps, aistateEnum_t state, scriptAnimMo
 		}
 	}
 
-	if ( !scriptItem || !scriptItem->numCommands ) {
+	if ( !scriptItem ) {
+		return -1;
+	}
+	if ( !scriptItem->numCommands ) {
 		return -1;
 	}
 
@@ -1762,7 +1641,10 @@ int BG_AnimScriptStateChange( playerState_t *ps, aistateEnum_t newState, aistate
 
 	// find the first script item, that passes all the conditions for this event
 	scriptItem = BG_FirstValidItem( ps->clientNum, script );
-	if ( !scriptItem || !scriptItem->numCommands ) {
+	if ( !scriptItem ) {
+		return -1;
+	}
+	if ( !scriptItem->numCommands ) {
 		return -1;
 	}
 
@@ -1798,7 +1680,10 @@ int BG_AnimScriptEvent( playerState_t *ps, scriptAnimEventTypes_t event, qboolea
 
 	// find the first script item, that passes all the conditions for this event
 	scriptItem = BG_FirstValidItem( ps->clientNum, script );
-	if ( !scriptItem || !scriptItem->numCommands ) {
+	if ( !scriptItem ) {
+		return -1;
+	}
+	if ( !scriptItem->numCommands ) {
 		return -1;
 	}
 
@@ -1836,7 +1721,7 @@ void BG_UpdateConditionValue( int client, int condition, int value, qboolean che
 			bg_clientinfo[client].conditions[condition][0] = 0;
 			bg_clientinfo[client].conditions[condition][1] = 0;
 
-			bg_clientinfo[client].conditions[condition][value >> 5] |= 1 << ( value & 31 );
+			Com_BitSet( bg_clientinfo[client].conditions[condition], value );
 			return;
 		}
 	}
@@ -1892,7 +1777,10 @@ int BG_GetAnimScriptEvent( playerState_t *ps, scriptAnimEventTypes_t event ) {
 	}
 
 	scriptItem = BG_FirstValidItem( ps->clientNum, script );
-	if ( !scriptItem || !scriptItem->numCommands ) {
+	if ( !scriptItem ) {
+		return -1;
+	}
+	if ( !scriptItem->numCommands ) {
 		return -1;
 	}
 
@@ -1920,9 +1808,8 @@ animation_t *BG_GetAnimationForIndex( int index ) {
 =================
 BG_AnimUpdatePlayerStateConditions
 
-  Refreshes the conditions the prediction path owns.  CoD dropped RTCW's
-  EF_CROUCHING bookkeeping from here (BG_AnimPlayerConditions does it from the
-  entity state instead) and added the weapon class and the ADS position.
+  Refreshes the conditions the prediction path owns.  Crouching is handled by
+  BG_AnimPlayerConditions, from the entity state.
 =================
 */
 void BG_AnimUpdatePlayerStateConditions( pmove_t *pmove ) {
@@ -1943,7 +1830,7 @@ void BG_AnimUpdatePlayerStateConditions( pmove_t *pmove ) {
 	}
 
 	// MOUNTED
-	if ( ps->eFlags & EF_TURRET_ACTIVE_MASK ) {
+	if ( ps->eFlags & EF_TURRET_ACTIVE ) {
 		BG_UpdateConditionValue( ps->clientNum, ANIM_COND_MOUNTED, MOUNTED_MG42, qtrue );
 	} else {
 		BG_UpdateConditionValue( ps->clientNum, ANIM_COND_MOUNTED, MOUNTED_UNUSED, qtrue );
@@ -1964,16 +1851,20 @@ void BG_AnimUpdatePlayerStateConditions( pmove_t *pmove ) {
 ===============
 BG_IsCrouchingAnim
 
-  IDLECR, WALKCR and WALKCRBK; RUNCR is deliberately not in the set.
+  IDLECR, WALKCR and WALKCRBK; RUNCR is deliberately not in the set.  `ci` is
+  unused.
 ===============
 */
-qboolean BG_IsCrouchingAnim( int anim ) {
+qboolean BG_IsCrouchingAnim( clientInfo_t *ci, int anim ) {
 	animation_t *animation;
 
-	animation = BG_GetAnimationForIndex( anim & ~0x200 );
+	animation = BG_GetAnimationForIndex( anim & ~ANIM_TOGGLEBIT );
 
-	return ( animation->movetype
-			 & ( ( 1 << ANIM_MT_IDLECR ) | ( 1 << ANIM_MT_WALKCR ) | ( 1 << ANIM_MT_WALKCRBK ) ) ) != 0;
+	if ( animation->movetype
+		 & ( ( 1 << ANIM_MT_IDLECR ) | ( 1 << ANIM_MT_WALKCR ) | ( 1 << ANIM_MT_WALKCRBK ) ) ) {
+		return qtrue;
+	}
+	return qfalse;
 }
 
 /*
@@ -1981,10 +1872,10 @@ qboolean BG_IsCrouchingAnim( int anim ) {
 BG_IsProneAnim
 ===============
 */
-qboolean BG_IsProneAnim( int anim ) {
+qboolean BG_IsProneAnim( clientInfo_t *ci, int anim ) {
 	animation_t *animation;
 
-	animation = BG_GetAnimationForIndex( anim & ~0x200 );
+	animation = BG_GetAnimationForIndex( anim & ~ANIM_TOGGLEBIT );
 
 	return ( animation->movetype
 			 & ( ( 1 << ANIM_MT_IDLEPRONE ) | ( 1 << ANIM_MT_WALKPRONE ) | ( 1 << ANIM_MT_WALKPRONEBK ) ) ) != 0;
@@ -1998,8 +1889,8 @@ BG_SetNewAnimation
   tree the goal weights, and phases looping locomotion per client so a row of
   players does not march in lockstep.
 
-  `corpse` is entityState_t.eFlags bit 0x800, which BG_RunLerpFrameRate shifts
-  out (0x20003C0E); it only changes how a death animation is started.
+  `corpse` is entityState_t.eFlags bit 0x800; it only changes how a death
+  animation is started.
 ==================
 */
 void BG_SetNewAnimation( clientInfo_t *ci, lerpFrame_t *lf, int newAnimation, qboolean corpse ) {
@@ -2007,29 +1898,36 @@ void BG_SetNewAnimation( clientInfo_t *ci, lerpFrame_t *lf, int newAnimation, qb
 	animation_t *oldAnim;
 	animation_t *anim;
 	qboolean isLegs;
-	int index;
 	int blendTime;
 	scr_anim_t sa;
 	void *tree;
 	float startTime;
+	qboolean firstAnim;
+	int treeIndex;
 
-	oldAnimation = lf->animationNumber;
-	oldAnim = lf->animation;
-	isLegs = ( lf == &ci->legs );
+	firstAnim = qfalse;
 	startTime = 0;
+	oldAnim = lf->animation;
+	oldAnimation = lf->animationNumber;
+	isLegs = ( lf == &ci->legs );
+	if ( !oldAnim ) {
+		firstAnim = qtrue;
+	}
 
 	lf->animationNumber = newAnimation;
-	index = newAnimation & ~ANIM_TOGGLEBIT;
-	if ( (unsigned int)index >= (unsigned int)bgs_animScriptData.numAnimations ) {
+	newAnimation &= ~ANIM_TOGGLEBIT;
+	if ( (unsigned int)newAnimation >= (unsigned int)bgs_animScriptData.numAnimations ) {
 		Com_Error( ERR_DROP, "\x15" "Player animation index out of range (%i): %i",
-				   bgs_animScriptData.numAnimations, index );
+				   bgs_animScriptData.numAnimations, newAnimation );
 	}
 
 	tree = ci->animTree;
-	sa.anims = (unsigned short)Scr_GetAnimsIndex( bgs_animScriptData.animTreeIndex );
+	// keep: treeIndex local matches original codegen
+	treeIndex = bgs_animScriptData.animTreeIndex;
+	sa.anims = (unsigned short)Scr_GetAnimsIndex( treeIndex );
 
-	if ( index ) {
-		anim = &bgs_animScriptData.animations[index];
+	if ( newAnimation ) {
+		anim = &bgs_animScriptData.animations[newAnimation];
 		lf->animation = anim;
 		lf->animationTime = anim->blendTime;
 	} else {
@@ -2038,13 +1936,13 @@ void BG_SetNewAnimation( clientInfo_t *ci, lerpFrame_t *lf, int newAnimation, qb
 		lf->animationTime = 200;
 	}
 
-	if ( !oldAnim && isLegs ) {
+	if ( firstAnim && isLegs ) {
 		// nothing was playing on the legs, so start the new one cold
 		lf->animationTime = 0;
 	} else if ( !anim || lf->animationTime <= 0 ) {
 		if ( anim && isLegs
-			 && ( BG_IsCrouchingAnim( index ) != BG_IsCrouchingAnim( oldAnimation )
-				  || BG_IsProneAnim( index ) != BG_IsProneAnim( oldAnimation ) ) ) {
+			 && ( BG_IsCrouchingAnim( ci, newAnimation ) != BG_IsCrouchingAnim( ci, oldAnimation )
+				  || BG_IsProneAnim( ci, newAnimation ) != BG_IsProneAnim( ci, oldAnimation ) ) ) {
 			// the stance changed under the legs
 			if ( anim->moveSpeed
 				 || ( anim->movetype & ( ( 1 << ANIM_MT_TURNRIGHT ) | ( 1 << ANIM_MT_TURNLEFT ) ) ) ) {
@@ -2065,12 +1963,12 @@ void BG_SetNewAnimation( clientInfo_t *ci, lerpFrame_t *lf, int newAnimation, qb
 	}
 
 	if ( anim && anim->moveSpeed ) {
-		sa.index = (unsigned short)index;
+		sa.index = (unsigned short)newAnimation;
 		if ( trap_XAnimIsLooped( sa ) ) {
 			sa.index = (unsigned short)( oldAnimation & ~ANIM_TOGGLEBIT );
 			if ( oldAnim && oldAnim->moveSpeed && trap_XAnimIsLooped( sa ) ) {
 				// carry the phase of the loop we are leaving
-				startTime = trap_XAnimGetTime( tree, sa.index );
+				startTime = trap_XAnimGetTime( tree, BG_ANIM_HANDLE(sa) );
 			} else {
 				startTime = (float)( ( bgs_time / 100 + ci->clientNum * 360 ) % 1000 ) * 0.001f;
 			}
@@ -2078,33 +1976,35 @@ void BG_SetNewAnimation( clientInfo_t *ci, lerpFrame_t *lf, int newAnimation, qb
 	}
 
 	if ( oldAnim ) {
-		trap_XAnimClearGoalWeight( tree, (unsigned short)( oldAnimation & ~ANIM_TOGGLEBIT ),
+		// keep: through sa, matches original codegen
+		sa.index = (unsigned short)( oldAnimation & ~ANIM_TOGGLEBIT );
+		trap_XAnimClearGoalWeight( tree, sa.index,
 								   lf->animationTime * 0.001f );
 	}
 
-	if ( index ) {
+	if ( newAnimation ) {
 		if ( !isLegs ) {
 			// the weapon hangs off the torso, so its DObj has to be rebuilt
 			ci->gunHandLeft = 0;
 			ci->dobjNeedsUpdate = 1;
 		}
 
-		sa.index = (unsigned short)index;
+		sa.index = (unsigned short)newAnimation;
 
 		if ( anim->flags & ANIMFL_DEATH ) {
 			if ( trap_XAnimIsLooped( sa ) ) {
 				Com_Error( ERR_DROP, "death animation '%s' is looping", anim->name );
 			}
 			if ( corpse ) {
-				trap_XAnimSetCompleteGoalWeight( tree, sa.index, 1.0f,
+				trap_XAnimSetCompleteGoalWeight( tree, BG_ANIM_HANDLE(sa), 1.0f,
 												 lf->animationTime * 0.001f, 1.0f, 0, 0 );
 			} else {
-				trap_XAnimSetCompleteGoalWeightKnobAll( tree, sa.index, bgs_rootAnim.index,
+				trap_XAnimSetCompleteGoalWeightKnobAll( tree, BG_ANIM_KNOB_HANDLE(sa), BG_ANIM_KNOB_HANDLE(bgs_rootAnim),
 														1.0f, 0, 1.0f, 0, 0 );
 				trap_XAnimSetTime( tree, sa.index, 1.0f );
 			}
 		} else {
-			trap_XAnimSetCompleteGoalWeight( tree, sa.index, 1.0f, lf->animationTime * 0.001f,
+			trap_XAnimSetCompleteGoalWeight( tree, BG_ANIM_HANDLE(sa), 1.0f, lf->animationTime * 0.001f,
 											 1.0f, (unsigned short)anim->noteType, 1 );
 			if ( anim->moveSpeed ) {
 				trap_XAnimSetTime( tree, sa.index, startTime );
@@ -2113,24 +2013,24 @@ void BG_SetNewAnimation( clientInfo_t *ci, lerpFrame_t *lf, int newAnimation, qb
 
 		if ( !isLegs ) {
 			// hand the torso the whole body and leave the legs tree just alive
-			trap_XAnimSetCompleteGoalWeight( tree, bgs_animScriptData.torsoAnim.index, 1.0f,
+			trap_XAnimSetCompleteGoalWeight( tree, BG_ANIM_HANDLE(bgs_animScriptData.torsoAnim), 1.0f,
 											 lf->animationTime * 0.001f, 1.0f,
 											 (unsigned short)anim->noteType, 0 );
-			trap_XAnimSetCompleteGoalWeight( tree, bgs_animScriptData.legsAnim.index, 0.01f,
+			trap_XAnimSetCompleteGoalWeight( tree, BG_ANIM_HANDLE(bgs_animScriptData.legsAnim), 0.01f,
 											 lf->animationTime * 0.001f, 1.0f,
 											 (unsigned short)anim->noteType, 0 );
 		}
 	} else if ( !isLegs ) {
 		// no torso animation: give the legs tree the body back
-		trap_XAnimSetCompleteGoalWeight( tree, bgs_animScriptData.torsoAnim.index, 0.0f,
+		trap_XAnimSetCompleteGoalWeight( tree, BG_ANIM_HANDLE(bgs_animScriptData.torsoAnim), 0.0f,
 										 lf->animationTime * 0.001f, 1.0f, 0, 0 );
-		trap_XAnimSetCompleteGoalWeight( tree, bgs_animScriptData.legsAnim.index, 1.0f,
+		trap_XAnimSetCompleteGoalWeight( tree, BG_ANIM_HANDLE(bgs_animScriptData.legsAnim), 1.0f,
 										 lf->animationTime * 0.001f, 1.0f, 0, 0 );
 	}
 
-	if ( g_debuganim.integer == 1 ) {
-		Com_Printf( "Anim-%s: %i, %s\n", isLegs ? "legs " : "torso", index,
-					bgs_animScriptData.animations[index].name );
+	if ( bg_debugAnim.integer == 1 ) {
+		Com_Printf( "Anim-%s: %i, %s\n", isLegs ? "legs " : "torso", newAnimation,
+					bgs_animScriptData.animations[newAnimation].name );
 	}
 }
 
@@ -2145,12 +2045,12 @@ BG_RunLerpFrameRate
 void BG_RunLerpFrameRate( clientInfo_t *ci, lerpFrame_t *lf, entityState_t *es, int newAnimation ) {
 	qboolean ladder;
 	void *tree;
-	int index;
 	animation_t *animation;
 	int moveSpeed;
 	float dist;
 	float speed;
 	float maxScale;
+	float *scale;
 	scr_anim_t sa;
 
 	ladder = ( lf->animation && ( lf->animation->flags & ANIMFL_LADDER ) );
@@ -2160,11 +2060,10 @@ void BG_RunLerpFrameRate( clientInfo_t *ci, lerpFrame_t *lf, entityState_t *es, 
 
 	if ( newAnimation != lf->animationNumber
 		 || ( !lf->animation && ( newAnimation & ~ANIM_TOGGLEBIT ) ) ) {
-		BG_SetNewAnimation( ci, lf, newAnimation, ( es->eFlags >> 11 ) & 1 );
+		BG_SetNewAnimation( ci, lf, newAnimation, ( (unsigned)es->eFlags >> 11 ) & 1 );
 	}
 
-	index = newAnimation & ~ANIM_TOGGLEBIT;
-	if ( !index ) {
+	if ( !( newAnimation & ~ANIM_TOGGLEBIT ) ) {
 		return;
 	}
 
@@ -2182,7 +2081,9 @@ void BG_RunLerpFrameRate( clientInfo_t *ci, lerpFrame_t *lf, entityState_t *es, 
 			dist = Distance( lf->oldFramePos, es->pos.trBase );
 		}
 		speed = dist / ( (float)( bgs_animTime - lf->oldFrameSnapshotTime ) * 0.001f );
-		lf->animSpeedScale = speed / (float)moveSpeed;
+		// keep: stored through a pointer, matches original codegen
+		scale = &lf->animSpeedScale;
+		*scale = speed / (float)moveSpeed;
 
 		lf->oldFrameSnapshotTime = bgs_animTime;
 		VectorCopy( es->pos.trBase, lf->oldFramePos );
@@ -2194,35 +2095,36 @@ void BG_RunLerpFrameRate( clientInfo_t *ci, lerpFrame_t *lf, entityState_t *es, 
 				lf->animSpeedScale = 0.1f;
 			}
 		} else if ( lf->animSpeedScale > 2.0f ) {
-			if ( animation->flags & ANIMFL_LADDER ) {
-				if ( lf->animSpeedScale > 4.0f ) {
-					lf->animSpeedScale = 4.0f;
+			if ( !( animation->flags & ANIMFL_LADDER ) ) {
+				if ( animation->moveSpeed > 150 ) {
+					lf->animSpeedScale = 2.0f;
+				} else if ( animation->moveSpeed < 20 ) {
+					if ( lf->animSpeedScale > 3.0f ) {
+						lf->animSpeedScale = 3.0f;
+					}
+				} else {
+					// 3.0 at 20 units/sec falling to 2.0 at 150
+					maxScale = 3.0f - (float)( animation->moveSpeed - 20 ) * 0.0076923077f;
+					if ( maxScale < lf->animSpeedScale ) {
+						lf->animSpeedScale = maxScale;
+					}
 				}
-			} else if ( animation->moveSpeed > 150 ) {
-				lf->animSpeedScale = 2.0f;
-			} else if ( animation->moveSpeed < 20 ) {
-				if ( lf->animSpeedScale > 3.0f ) {
-					lf->animSpeedScale = 3.0f;
-				}
-			} else {
-				// 3.0 at 20 units/sec falling to 2.0 at 150
-				maxScale = 3.0f - (float)( animation->moveSpeed - 20 ) * 0.0076923077f;
-				if ( maxScale < lf->animSpeedScale ) {
-					lf->animSpeedScale = maxScale;
-				}
+			} else if ( lf->animSpeedScale > 4.0f ) {
+				lf->animSpeedScale = 4.0f;
 			}
 		}
 
-		if ( g_debuganim.integer == 2 ) {
+		if ( bg_debugAnim.integer == 2 ) {
 			Com_Printf( "MoveSpeed: %s, %i, %4.4f : %1.4f\n",
-						bgs_animScriptData.animations[index].name,
-						bgs_animScriptData.animations[index].moveSpeed,
+						bgs_animScriptData.animations[newAnimation & ~ANIM_TOGGLEBIT].name,
+						bgs_animScriptData.animations[newAnimation & ~ANIM_TOGGLEBIT].moveSpeed,
 						speed, lf->animSpeedScale );
 		}
 	}
 
 	if ( lf->animationNumber ) {
-		trap_XAnimSetAnimRate( tree, (unsigned short)( lf->animationNumber & ~ANIM_TOGGLEBIT ),
+		sa.index = (unsigned short)(lf->animationNumber & ~ANIM_TOGGLEBIT);
+		trap_XAnimSetAnimRate( tree, BG_ANIM_HANDLE(sa),
 							   lf->animSpeedScale );
 	}
 }
@@ -2243,7 +2145,7 @@ void BG_PlayerAnimation_VerifyAnim( lerpFrame_t *lf, void *tree ) {
 
 	if ( lf->animationNumber ) {
 		sa.index = (unsigned short)( lf->animationNumber & ~ANIM_TOGGLEBIT );
-		if ( trap_XAnimGetWeight( tree, sa.index ) == 0.0f ) {
+		if ( trap_XAnimGetWeight( tree, sa ) == 0.0f ) {
 			lf->animationNumber = 0;
 			lf->animation = NULL;
 			lf->animationTime = 150;
@@ -2265,10 +2167,13 @@ void BG_SwingAngles( float destination, float swingTolerance, float clampToleran
 	if ( !*swinging ) {
 		// see if a swing should be started
 		swing = AngleSubtract( *angle, destination );
-		if ( swing <= swingTolerance && swing >= -swingTolerance ) {
-			return;
+		if ( swing > swingTolerance || swing < -swingTolerance ) {
+			*swinging = qtrue;
 		}
-		*swinging = qtrue;
+	}
+
+	if ( !*swinging ) {
+		return;
 	}
 
 	// modify the speed depending on the delta
@@ -2276,32 +2181,38 @@ void BG_SwingAngles( float destination, float swingTolerance, float clampToleran
 	swing = AngleSubtract( destination, *angle );
 	scale = fabs( swing );
 	scale *= 0.05f;
-	if ( scale < 0.5 ) {
-		scale = 0.5;
+	if ( scale < 0.5f ) {
+		scale = 0.5f;
 	}
 
 	// swing towards the destination angle
-	if ( swing < 0 ) {
-		move = -( bgs_frametime * scale * speed );
-		if ( move <= swing ) {
-			move = swing;
-			*swinging = qfalse;
-		}
-	} else {
+	// keep: AngleNormalize360, not AngleMod, matches original codegen
+	if ( swing >= 0 ) {
 		move = bgs_frametime * scale * speed;
 		if ( move >= swing ) {
 			move = swing;
 			*swinging = qfalse;
+		} else {
+			*swinging = qtrue;
 		}
+		*angle = AngleNormalize360( *angle + move );
+	} else {
+		move = -( bgs_frametime * scale * speed );
+		if ( move <= swing ) {
+			move = swing;
+			*swinging = qfalse;
+		} else {
+			*swinging = qtrue;
+		}
+		*angle = AngleNormalize360( *angle + move );
 	}
-	*angle = AngleMod( *angle + move );
 
 	// clamp to no more than tolerance
 	swing = AngleSubtract( destination, *angle );
 	if ( swing > clampTolerance ) {
-		*angle = AngleMod( destination - ( clampTolerance - 1 ) );
+		*angle = AngleNormalize360( destination - ( clampTolerance - 1 ) );
 	} else if ( swing < -clampTolerance ) {
-		*angle = AngleMod( destination + ( clampTolerance - 1 ) );
+		*angle = AngleNormalize360( destination + ( clampTolerance - 1 ) );
 	}
 }
 
@@ -2309,24 +2220,35 @@ void BG_SwingAngles( float destination, float swingTolerance, float clampToleran
 ==================
 BG_PlayerAngles
 
-  Drifts the legs and torso towards the view.  CoD1 kept RTCW's structure but
-  drives the legs from the entity's lean offset instead of its movementDir, and
-  the swing speed comes from a cvar rather than a literal.
+  Drifts the legs and torso towards the view.  The legs follow the entity's
+  lean offset, and the swing speed comes from bg_swingSpeed.
 ==================
 */
 void BG_PlayerAngles( clientInfo_t *ci, entityState_t *es ) {
-	float yaw;
+	vec3_t torsoAngles;		// keep: vec3, only [YAW] is used
+	vec3_t headAngles;
+	float lean;
 	float legsYaw;
 	float dest;
 	float clampTolerance;
 	animation_t *animation;
 
-	yaw = SHORT2ANGLE( ANGLE2SHORT( ci->viewYaw ) );
+	// keep: AngleMod read back from headAngles[YAW], matches original codegen
+	lean = ci->leanAmount;
+	headAngles[PITCH] = ci->viewPitch;
+	headAngles[YAW] = ci->viewYaw;
+	headAngles[YAW] = AngleMod( headAngles[YAW] );
 
-	if ( ( es->eFlags & EF_TURRET_ACTIVE_MASK )
-		 || ( ci->conditions[ANIM_COND_MOVETYPE][0] & ANIM_MT_CLIMBING_MASK )
-		 || !( ci->conditions[ANIM_COND_MOVETYPE][0] & 0x6 ) ) {
+	if ( es->eFlags & EF_TURRET_ACTIVE ) {
 		// always centred
+		ci->legs.yawing = qtrue;
+		ci->torso.yawing = qtrue;
+		ci->torso.pitching = qtrue;
+	} else if ( ci->conditions[ANIM_COND_MOVETYPE][0] & ANIM_MT_CLIMBING_MASK ) {
+		ci->legs.yawing = qtrue;
+		ci->torso.yawing = qtrue;
+		ci->torso.pitching = qtrue;
+	} else if ( !( ci->conditions[ANIM_COND_MOVETYPE][0] & ( ( 1 << ANIM_MT_IDLE ) | ( 1 << ANIM_MT_IDLECR ) ) ) ) {
 		ci->legs.yawing = qtrue;
 		ci->torso.yawing = qtrue;
 		ci->torso.pitching = qtrue;
@@ -2336,29 +2258,31 @@ void BG_PlayerAngles( clientInfo_t *ci, entityState_t *es ) {
 	}
 
 	// --------- yaw -------------
-	legsYaw = yaw + ci->leanAmount;
+	// keep: yaw + lean spelled out at each use, matches original codegen
+	legsYaw = headAngles[YAW] + lean;
 
 	if ( es->eFlags & EF_DEAD ) {
-		legsYaw = yaw;
-		dest = yaw;
+		torsoAngles[YAW] = headAngles[YAW];
+		legsYaw = headAngles[YAW];
 		clampTolerance = 90;
 	} else if ( ci->conditions[ANIM_COND_MOVETYPE][0] & ANIM_MT_CLIMBING_MASK ) {
-		dest = legsYaw;
+		torsoAngles[YAW] = legsYaw;
 		clampTolerance = 0;
 	} else if ( es->eFlags & EF_PRONE ) {
-		dest = yaw;
+		torsoAngles[YAW] = headAngles[YAW];
 		clampTolerance = 90;
-	} else if ( es->eFlags & EF_FIRING ) {
-		dest = yaw;
-		clampTolerance = 45;
-	} else if ( es->eFlags & EF_AIMING_DOWN_SIGHT ) {
-		dest = yaw;
+	} else if ( !( es->eFlags & EF_FIRING ) ) {
+		if ( es->eFlags & EF_AIMING_DOWN_SIGHT ) {
+			torsoAngles[YAW] = headAngles[YAW];
+		} else {
+			torsoAngles[YAW] = lean * 0.3f + headAngles[YAW];
+		}
 		clampTolerance = 90;
 	} else {
-		dest = ci->leanAmount * 0.3f + yaw;
-		clampTolerance = 90;
+		clampTolerance = 45;
+		torsoAngles[YAW] = headAngles[YAW];
 	}
-	BG_SwingAngles( dest, 0, clampTolerance, bg_swingSpeed.value,
+	BG_SwingAngles( torsoAngles[YAW], 0, clampTolerance, bg_swingSpeed.value,
 					&ci->torso.yawAngle, &ci->torso.yawing );
 
 	if ( es->eFlags & EF_DEAD ) {
@@ -2367,13 +2291,13 @@ void BG_PlayerAngles( clientInfo_t *ci, entityState_t *es ) {
 	} else if ( es->eFlags & EF_PRONE ) {
 		// prone legs are pinned; the body already points where it lies
 		ci->legs.yawing = qfalse;
-		ci->legs.yawAngle = legsYaw;
+		ci->legs.yawAngle = headAngles[YAW] + lean;
 	} else {
 		animation = &bgs_animScriptData.animations[es->legsAnim & ~ANIM_TOGGLEBIT];
 		if ( animation->flags & ( ANIMFL_STRAFELEFT | ANIMFL_STRAFERIGHT ) ) {
 			// a strafe animation already carries the offset in the model
 			ci->legs.yawing = qfalse;
-			BG_SwingAngles( yaw, 0, 150, bg_swingSpeed.value,
+			BG_SwingAngles( headAngles[YAW], 0, 150, bg_swingSpeed.value,
 							&ci->legs.yawAngle, &ci->legs.yawing );
 		} else if ( ci->legs.yawing ) {
 			BG_SwingAngles( legsYaw, 0, 150, bg_swingSpeed.value,
@@ -2384,24 +2308,27 @@ void BG_PlayerAngles( clientInfo_t *ci, entityState_t *es ) {
 		}
 	}
 
-	if ( es->eFlags & EF_TURRET_ACTIVE_MASK ) {
-		ci->torso.yawAngle = yaw;
-		ci->legs.yawAngle = yaw;
+	if ( es->eFlags & EF_TURRET_ACTIVE ) {
+		ci->torso.yawAngle = headAngles[YAW];
+		ci->legs.yawAngle = headAngles[YAW];
 	} else if ( ci->conditions[ANIM_COND_MOVETYPE][0] & ANIM_MT_CLIMBING_MASK ) {
-		ci->torso.yawAngle = legsYaw;
-		ci->legs.yawAngle = legsYaw;
+		ci->torso.yawAngle = headAngles[YAW] + lean;
+		ci->legs.yawAngle = headAngles[YAW] + lean;
 	}
 
 	// --------- pitch -------------
-	if ( ( es->eFlags & EF_DEAD )
-		 || ( es->eFlags & EF_TURRET_ACTIVE_MASK )
-		 || ( ci->conditions[ANIM_COND_MOVETYPE][0] & ANIM_MT_CLIMBING_MASK ) ) {
+	// keep: three dest = 0 arms match original codegen
+	if ( es->eFlags & EF_DEAD ) {
 		dest = 0;
-	} else if ( ci->viewPitch > 180 ) {
+	} else if ( es->eFlags & EF_TURRET_ACTIVE ) {
+		dest = 0;
+	} else if ( ci->conditions[ANIM_COND_MOVETYPE][0] & ANIM_MT_CLIMBING_MASK ) {
+		dest = 0;
+	} else if ( headAngles[PITCH] > 180 ) {
 		// only show a fraction of the pitch angle in the torso
-		dest = ( ci->viewPitch - 360 ) * 0.6f;
+		dest = ( headAngles[PITCH] - 360 ) * 0.6f;
 	} else {
-		dest = ci->viewPitch * 0.6f;
+		dest = headAngles[PITCH] * 0.6f;
 	}
 	BG_SwingAngles( dest, 0, 45, 0.15f, &ci->torso.pitchAngle, &ci->torso.pitching );
 }
@@ -2416,7 +2343,7 @@ BG_AnimPlayerConditions
 =================
 */
 void BG_AnimPlayerConditions( entityState_t *es, clientInfo_t *ci ) {
-	animation_t *animation;
+	int legsAnim;
 
 	BG_UpdateConditionValue( es->clientNum, ANIM_COND_WEAPONS, es->weapon, qtrue );
 
@@ -2429,7 +2356,7 @@ void BG_AnimPlayerConditions( entityState_t *es, clientInfo_t *ci ) {
 		BG_UpdateConditionValue( es->clientNum, ANIM_COND_WEAPON_POSITION, WEAPON_POSITION_HIP, qtrue );
 	}
 
-	if ( es->eFlags & EF_TURRET_ACTIVE_MASK ) {
+	if ( es->eFlags & EF_TURRET_ACTIVE ) {
 		BG_UpdateConditionValue( es->clientNum, ANIM_COND_MOUNTED, MOUNTED_MG42, qtrue );
 	} else {
 		BG_UpdateConditionValue( es->clientNum, ANIM_COND_MOUNTED, MOUNTED_UNUSED, qtrue );
@@ -2451,20 +2378,34 @@ void BG_AnimPlayerConditions( entityState_t *es, clientInfo_t *ci ) {
 
 	// reverse engineer the movetype and the strafe direction out of the
 	// animation BG_ParseCommands tagged them onto
-	animation = &bgs_animScriptData.animations[es->legsAnim & ~ANIM_TOGGLEBIT];
+	legsAnim = es->legsAnim & ~ANIM_TOGGLEBIT;
 
-	if ( animation->movetype ) {
-		BG_UpdateConditionValue( es->clientNum, ANIM_COND_MOVETYPE, animation->movetype, qfalse );
+	if ( bgs_animScriptData.animations[legsAnim].movetype ) {
+		BG_UpdateConditionValue( es->clientNum, ANIM_COND_MOVETYPE,
+								 bgs_animScriptData.animations[legsAnim].movetype, qfalse );
 	}
 
-	if ( animation->flags & ANIMFL_STRAFELEFT ) {
+	if ( bgs_animScriptData.animations[legsAnim].flags & ANIMFL_STRAFELEFT ) {
 		BG_UpdateConditionValue( es->clientNum, ANIM_COND_STRAFING, STRAFING_LEFT, qtrue );
-	} else if ( animation->flags & ANIMFL_STRAFERIGHT ) {
+	} else if ( bgs_animScriptData.animations[legsAnim].flags & ANIMFL_STRAFERIGHT ) {
 		BG_UpdateConditionValue( es->clientNum, ANIM_COND_STRAFING, STRAFING_RIGHT, qtrue );
 	} else {
 		BG_UpdateConditionValue( es->clientNum, ANIM_COND_STRAFING, STRAFING_NOT, qtrue );
 	}
 }
+
+#ifdef CGAMEDLL
+/*
+==================
+trap_DObjExists
+
+  The client is handed the resolved DObj, so existence is a null test.
+==================
+*/
+static qboolean trap_DObjExists( struct DObj_s *obj ) {
+	return obj != 0;
+}
+#endif
 
 /*
 ==================
@@ -2473,8 +2414,12 @@ BG_GetSurfIndex
   Surfaces are a client-side concept; the game module has none.
 ==================
 */
-short BG_GetSurfIndex( void ) {
+short BG_GetSurfIndex( const char *name ) {
+#ifdef CGAMEDLL
+	return (short)trap_R_RegisterModel( name, 7 );
+#else
 	return 0;
+#endif
 }
 
 /*
@@ -2484,10 +2429,7 @@ BG_GetXModel
 */
 void *BG_GetXModel( const char *name ) {
 #ifdef CGAMEDLL
-	/* 0x300046D0: trap_R_RegisterModel then trap 50 on the handle.  LTCG
-	   inlined the trap 50 wrapper, which is why the retail body issues the
-	   syscall itself. */
-	return (void *)trap_R_GetXModelByHandle( trap_R_RegisterModel( name, 7 ) );
+	return trap_R_GetXModelByHandle( trap_R_RegisterModel( name, 7 ) );
 #else
 	return trap_XModelGet( name );
 #endif
@@ -2500,7 +2442,7 @@ BG_DObjCreate
 */
 void BG_DObjCreate( DObjModel *models, unsigned short numModels, void *tree, int handle ) {
 #ifdef CGAMEDLL
-	trap_DObjCreate( models, numModels, tree, handle );      /* 0x300046F0 */
+	trap_DObjCreate( models, numModels, tree, handle );
 #else
 	trap_DObjCreate( models, numModels, tree, handle, 0 );
 #endif
@@ -2514,73 +2456,72 @@ BG_Player_DoControllers
   looks and leans where the player leans.  Everything is written straight into
   the DObj pose -- there is no per-client controller array.
 
-  Second argument: gentity_t * in the game build, the resolved DObj in cgame.
+  First argument: gentity_t * in the game build, the resolved DObj in cgame.
   See the CGAMEDLL block at the top of the file.
 
-  Game 0x200046B0.  TODO: the cgame build (0x30004710) carries an extra
-  client-only block, gated on dword_301E0D0C == 4/5/6, that folds
-  sin( dword_300F0310 * K + es-><+0x90> ) into the back_low/back_mid/back_up,
-  neck, head and pelvis angles (0x30004985, 0x30004AE7, 0x30004D27 and the
-  __CIsin calls around them).  That block is not present here.
+  The client build alone has the cg_debugProneCheck 4/5/6 debug poses.
 ==================
 */
-void BG_Player_DoControllers( clientInfo_t *ci, BG_DOBJ_PARM, entityState_t *es, int *partBits ) {
-	vec3_t angles;
-	vec3_t origin;
-	vec3_t waistAngles;
-	float torsoYawAngle;
-	float pitch;
-	float torsoPitch;
-	float torsoYaw;
-	float pitchDelta;
-	float yawDelta;
-	float lean;
-	float leanBase;
-	float leanSide;
-	float leanRoll;
+// keep: the lean angle as a named constant matches original codegen
+static const float bg_controllerLeanDegrees = 50.0f;
 
-	if ( es->eFlags & EF_TURRET_ACTIVE_MASK ) {
+// keep: improve-float-consistency (/Op) code, matches original codegen
+#pragma optimize("p",on)
+void BG_Player_DoControllers( BG_DOBJ_PARM, clientInfo_t *ci, entityState_t *es, int *partBits )
+{
+	vec3_t angles;
+	vec3_t torsoAngles;
+	vec3_t headAngles;
+	vec3_t origin;
+	float lean;
+#if defined(CGAMEDLL)
+	int debugClientNum;
+#endif
+
+	if ( es->eFlags & EF_TURRET_ACTIVE ) {
 		return;
 	}
 
-	angles[0] = 0;
+#if defined(CGAMEDLL)
+	debugClientNum = es->clientNum;
+#endif
+	VectorClear( angles );
+	VectorClear( torsoAngles );
+	headAngles[0] = ci->viewPitch;
+	headAngles[1] = ci->viewYaw;
 	angles[1] = ci->legs.yawAngle;
-	angles[2] = 0;
-	torsoYawAngle = ci->torso.yawAngle;
+	torsoAngles[1] = ci->torso.yawAngle;
 
-	if ( ci->conditions[ANIM_COND_MOVETYPE][0] & ANIM_MT_CLIMBING_MASK ) {
-		pitch = 0;
-	} else if ( !( es->eFlags & EF_PRONE ) ) {
-		pitch = ci->torso.pitchAngle;
-	} else {
-		pitch = AngleNormalize180( ci->torso.pitchAngle );
-		if ( pitch > 0 ) {
-			pitch = pitch * 0.5f;
-		} else {
-			pitch = pitch * 0.25f;
+	if ( !( ci->conditions[ANIM_COND_MOVETYPE][0] & ANIM_MT_CLIMBING_MASK ) ) {
+		torsoAngles[0] = ci->torso.pitchAngle;
+		if ( es->eFlags & EF_PRONE ) {
+			torsoAngles[0] = AngleNormalize180( torsoAngles[0] );
+			if ( torsoAngles[0] > 0 ) {
+				torsoAngles[0] *= 0.5f;
+			} else {
+				torsoAngles[0] *= 0.25f;
+			}
 		}
 	}
 
-	torsoPitch = AngleSubtract( ci->viewPitch, pitch );
-	torsoYaw = AngleSubtract( ci->viewYaw, torsoYawAngle );
-	pitchDelta = AngleSubtract( pitch, 0 );
-	yawDelta = AngleSubtract( torsoYawAngle, angles[1] );
+	headAngles[0] = AngleSubtract( headAngles[0], torsoAngles[0] );
+	headAngles[1] = AngleSubtract( headAngles[1], torsoAngles[1] );
+	torsoAngles[0] = AngleSubtract( torsoAngles[0], angles[0] );
+	torsoAngles[1] = AngleSubtract( torsoAngles[1], angles[1] );
 
-	origin[0] = 0;
-	origin[1] = 0;
-	origin[2] = es->fTorsoHeight;
+	VectorSet( origin, 0, 0, es->fTorsoHeight );
 
-	lean = ( 2.0f - (float)fabs( ci->leanFraction ) ) * ci->leanFraction;
+	lean = GetLeanFraction( ci->leanFraction );
 
-	if ( lean == 0.0f ) {
-		leanSide = 0;
-		leanRoll = 0;
-	} else {
-		leanBase = 50.0f * lean * 0.925f;
+	if ( lean != 0.0f ) {
 
-		leanSide = leanBase;
+		torsoAngles[2] = (float)( bg_controllerLeanDegrees * lean ) * 0.925f;
 		if ( es->eFlags & EF_CROUCHING ) {
-			leanSide = leanSide * ( lean > 0 ? 1.5f : 1.8f );
+			if ( lean > 0 ) {
+				torsoAngles[2] *= 1.5f;
+			} else {
+				torsoAngles[2] *= 1.8f;
+			}
 		}
 
 		if ( es->eFlags & EF_PRONE ) {
@@ -2591,19 +2532,26 @@ void BG_Player_DoControllers( clientInfo_t *ci, BG_DOBJ_PARM, entityState_t *es,
 			origin[1] = -lean;
 		}
 
-		leanRoll = leanBase;
+		headAngles[2] = (float)( bg_controllerLeanDegrees * lean ) * 0.925f;
 		if ( es->eFlags & EF_CROUCHING ) {
-			leanRoll = leanRoll * ( lean > 0 ? 1.5f : 1.8f );
+			if ( lean > 0 ) {
+				headAngles[2] *= 1.5f;
+			} else {
+				headAngles[2] *= 1.8f;
+			}
 		} else if ( es->eFlags & EF_PRONE ) {
-			leanRoll = leanRoll * 0.5f;
+			headAngles[2] = headAngles[2] * 0.5f;
 		}
+	} else {
+		torsoAngles[2] = 0;
+		headAngles[2] = 0;
 	}
 
 	if ( !( es->eFlags & EF_DEAD ) ) {
 		angles[1] = AngleSubtract( angles[1], ci->viewYaw );
 	}
 	if ( !( es->eFlags & EF_PRONE ) ) {
-		angles[2] = 50.0f * lean * 0.075f;
+		angles[2] = (float)( bg_controllerLeanDegrees * lean ) * 0.075f;
 	} else {
 		angles[0] = es->fTorsoPitch;
 	}
@@ -2612,84 +2560,101 @@ void BG_Player_DoControllers( clientInfo_t *ci, BG_DOBJ_PARM, entityState_t *es,
 	if ( es->eFlags & EF_PRONE ) {
 
 		angles[0] = 0;
-		angles[1] = leanSide * -1.2f;
-		angles[2] = leanSide * 0.3f;
+		angles[1] = torsoAngles[2] * -1.2f;
+		angles[2] = torsoAngles[2] * 0.3f;
+#ifdef CGAMEDLL
+		if ( cg_debugProneCheck.integer == 4 ) {
+			angles[0] = BG_DEBUG_PRONE_SIN() * 45.0f;
+		} else if ( cg_debugProneCheck.integer == 6 ) {
+			angles[0] = BG_DEBUG_PRONE_SIN() * -45.0f;
+		} else
+#endif
 		if ( es->fTorsoPitch != 0 || es->fWaistPitch != 0 ) {
 			angles[0] = AngleSubtract( es->fTorsoPitch, es->fWaistPitch );
 		}
 		BG_DObjSetControlTagAngles( BG_DOBJ, partBits, "back_low", angles );
 
 		angles[0] = 0;
-		angles[1] = yawDelta * 0.1f - leanSide * 0.2f;
-		angles[2] = leanSide * 0.2f;
+		angles[2] = torsoAngles[2] * 0.2f;
+		angles[1] = torsoAngles[1] * 0.1f - torsoAngles[2] * 0.2f;
 		BG_DObjSetControlTagAngles( BG_DOBJ, partBits, "back_mid", angles );
 
-		angles[0] = pitchDelta;
-		angles[1] = yawDelta * 0.8f + leanSide;
-		angles[2] = leanSide * -0.2f;
+		angles[0] = torsoAngles[0];
+		angles[1] = torsoAngles[1] * 0.8f - torsoAngles[2] * -1.0f;	// keep: * -1.0f matches original codegen
+		angles[2] = torsoAngles[2] * -0.2f;
 		BG_DObjSetControlTagAngles( BG_DOBJ, partBits, "back_up", angles );
 
 	} else {
 
-		angles[0] = pitchDelta * 0.2f;
-		angles[1] = yawDelta * 0.4f;
-		angles[2] = leanSide * 0.5f;
+		angles[0] = torsoAngles[0] * 0.2f;
+		angles[1] = torsoAngles[1] * 0.4f;
+		angles[2] = torsoAngles[2] * 0.5f;
+#ifdef CGAMEDLL
+		if ( cg_debugProneCheck.integer == 4 ) {
+			angles[0] += BG_DEBUG_PRONE_SIN() * 45.0f;
+		} else if ( cg_debugProneCheck.integer == 6 ) {
+			angles[0] -= BG_DEBUG_PRONE_SIN() * 45.0f;
+		} else
+#endif
 		if ( es->fTorsoPitch != 0 || es->fWaistPitch != 0 ) {
 			angles[0] += AngleSubtract( es->fTorsoPitch, es->fWaistPitch );
 		}
 		BG_DObjSetControlTagAngles( BG_DOBJ, partBits, "back_low", angles );
 
-		angles[0] = pitchDelta * 0.3f;
-		angles[1] = yawDelta * 0.4f;
-		angles[2] = leanSide * 0.5f;
+		angles[0] = torsoAngles[0] * 0.3f;
+		angles[1] = torsoAngles[1] * 0.4f;
+		angles[2] = torsoAngles[2] * 0.5f;
 		BG_DObjSetControlTagAngles( BG_DOBJ, partBits, "back_mid", angles );
 
-		angles[0] = pitchDelta * 0.5f;
-		angles[1] = yawDelta * 0.2f;
-		angles[2] = leanSide * -0.6f;
+		angles[0] = torsoAngles[0] * 0.5f;
+		angles[1] = torsoAngles[1] * 0.2f;
+		angles[2] = torsoAngles[2] * -0.6f;
 		BG_DObjSetControlTagAngles( BG_DOBJ, partBits, "back_up", angles );
 	}
 
-	angles[0] = torsoPitch * 0.3f;
-	angles[1] = torsoYaw * 0.3f;
+	angles[0] = headAngles[0] * 0.3f;
+	angles[1] = headAngles[1] * 0.3f;
 	angles[2] = 0;
 	BG_DObjSetControlTagAngles( BG_DOBJ, partBits, "neck", angles );
 
-	angles[0] = torsoPitch * 0.7f;
-	angles[1] = torsoYaw * 0.7f;
-	angles[2] = leanRoll * -0.3f;
+	angles[0] = headAngles[0] * 0.7f;
+	angles[1] = headAngles[1] * 0.7f;
+	angles[2] = headAngles[2] * -0.3f;
 	BG_DObjSetControlTagAngles( BG_DOBJ, partBits, "head", angles );
 
-	/* the retail frame folds these three onto the torsoPitch/torsoYaw/leanRoll
-	 * slots, which are dead by here */
-	waistAngles[0] = 0;
-	waistAngles[1] = 0;
-	waistAngles[2] = 0;
+	VectorClear( headAngles );
+#ifdef CGAMEDLL
+	if ( cg_debugProneCheck.integer == 5 ) {
+		headAngles[0] = BG_DEBUG_PRONE_SIN() * 45.0f;
+	} else if ( cg_debugProneCheck.integer == 6 ) {
+		headAngles[0] = BG_DEBUG_PRONE_SIN() * 45.0f;	// keep: +45 for both
+	} else
+#endif
 	if ( es->fWaistPitch != 0 || es->fTorsoPitch != 0 ) {
-		waistAngles[0] = AngleSubtract( es->fWaistPitch, es->fTorsoPitch );
+		headAngles[0] = AngleSubtract( es->fWaistPitch, es->fTorsoPitch );
 	}
-	BG_DObjSetControlTagAngles( BG_DOBJ, partBits, "pelvis", waistAngles );
+	BG_DObjSetControlTagAngles( BG_DOBJ, partBits, "pelvis", headAngles );
 }
+#pragma optimize("p",off)
+
 
 /*
 ==================
 BG_PlayerAnimation
 
   The middle parameter is passed but never read: the entity state carries
-  everything this needs.  It goes through BG_DOBJ_PARM like its two siblings
-  so the cgame build spells it `int obj` and the game build `gentity_t *ent`.
-
-  ORDER IS ( ci, obj/ent, es ).  Retail 0x30004E40 is
-  __usercall( ci@<ebx>, obj, es ): ci+0x37C and ci+0x3AC (clientInfo_t.legs
-  and .torso) go to BG_PlayerAnimation_VerifyAnim.
+  everything this needs.
 ==================
 */
-void BG_PlayerAnimation( clientInfo_t *ci, BG_DOBJ_PARM, entityState_t *es ) {
+void BG_PlayerAnimation( BG_DOBJ_PARM, entityState_t *es, clientInfo_t *ci ) {
+	void *tree;
+
 	BG_PlayerAngles( ci, es );
 	BG_AnimPlayerConditions( es, ci );
 
-	BG_PlayerAnimation_VerifyAnim( &ci->legs, ci->animTree );
-	BG_PlayerAnimation_VerifyAnim( &ci->torso, ci->animTree );
+	tree = ci->animTree;
+	BG_PlayerAnimation_VerifyAnim( &ci->legs, tree );
+	BG_PlayerAnimation_VerifyAnim( &ci->torso, tree );
 
 	BG_RunLerpFrameRate( ci, &ci->legs, es, es->legsAnim );
 	BG_RunLerpFrameRate( ci, &ci->torso, es, es->torsoAnim );
@@ -2703,45 +2668,33 @@ BG_UpdatePlayerDObj
   copied into the clientInfo_t, but only when the weapon changed or the torso
   animation asked for it.
 
-  First argument: gentity_t * in the game build, which resolves the DObj here.
-  The cgame build is handed the DObj already resolved -- CG_TransitionSnapshot
-  calls Com_GetClientDObj( es->clientNum ) (trap 162) and this only null-tests
-  the result.  See the CGAMEDLL block at the top of the file.
+  First argument: gentity_t * in the game build, which resolves the DObj here;
+  the client build is handed the DObj already resolved.
 
-  Game 0x20004CF0, cgame 0x30004EB0.
-
-  The client registers every model name through trap_R_RegisterModel before
-  asking for the XModel, Com_Errors when that fails, and keeps the shader
-  handle in DObjModel.boneName rather than 0 (0x30004F24..0x30004F66 for the
-  base model, 0x30004F85..0x30004FC5 for each attachment).  BG_GetXModel then
-  registers the name a second time (LTCG inlined that one-line wrapper).
-
-  0x30004FDA..0x30005039: a non-zero weapon appends cg_weapons[weapon].worldModel
-  at "tag_weapon_right" / "tag_weapon_left" (chosen on ci->gunHandLeft).  A bg
-  unit cannot include cg_local.h (g_public.h and cg_public.h each define
-  entityState_t), so the record is reached by its retail stride and offset
-  through CG_WEAPON_WORLDMODEL below.
+  The client also registers every model through trap_R_RegisterModel, keeps the
+  handle in DObjModel.boneName, and appends the held weapon's world model.
 ==================
 */
 #ifdef CGAMEDLL
-extern char cg_weapons[];       /* cgWeaponInfo_t[64] at 0x301A6940, 0x198 bytes each */
-#define CG_WEAPON_WORLDMODEL( w )   ( *(int *)( cg_weapons + ( w ) * 0x198 + 0xB0 ) )   /* +0xB0 worldModel */
+extern char cg_weapons[];       // cgWeaponInfo_t[64]
+#define CG_WEAPON_INFO( w )         ( cg_weapons + ( w ) * 0x198 )
+#define CG_WEAPON_WORLDMODEL( wi )  ( *(int *)( ( wi ) + 0xB0 ) )
 #endif
 void BG_UpdatePlayerDObj( BG_DOBJ_PARM, entityState_t *es, clientInfo_t *ci ) {
-	DObjModel models[MAX_ATTACHED_MODELS + 1];
+	DObjModel models[MAX_ATTACHED_MODELS + 2];  // body, attachments, the client's weapon
+	void *tree;
 	qboolean dobjExists;
 	int weapon;
+#ifdef CGAMEDLL
+	char *weaponInfo;
+#endif
 	int modelCount;
 	int i;
 
-#ifdef CGAMEDLL
-	dobjExists = ( obj != 0 );
-#else
-	dobjExists = trap_DObjExists( ent );
-#endif
+	dobjExists = trap_DObjExists( BG_DOBJ );
 
 	weapon = es->weapon;
-	if ( es->eFlags & EF_TURRET_ACTIVE_MASK ) {
+	if ( es->eFlags & EF_TURRET_ACTIVE ) {
 		// on a turret the player holds nothing
 		weapon = 0;
 	}
@@ -2757,6 +2710,8 @@ void BG_UpdatePlayerDObj( BG_DOBJ_PARM, entityState_t *es, clientInfo_t *ci ) {
 		}
 		trap_SafeDObjFree( es->number, qfalse );
 	}
+
+	tree = ci->animTree;
 
 #ifdef CGAMEDLL
 	models[0].boneName = (short)trap_R_RegisterModel( ci->modelName, 7 );
@@ -2788,18 +2743,20 @@ void BG_UpdatePlayerDObj( BG_DOBJ_PARM, entityState_t *es, clientInfo_t *ci ) {
 	}
 
 #ifdef CGAMEDLL
-	/* 0x30004FDA..0x30005039: the held weapon's world model rides on the hand
-	   tag.  cg_weapons is reached by its retail shape (imul 0x198, +0xB0)
-	   because cg_local.h cannot be included here (see the header comment). */
-	if ( weapon && CG_WEAPON_WORLDMODEL( weapon ) ) {
-		models[modelCount].model = (void *)trap_R_GetXModelByHandle( CG_WEAPON_WORLDMODEL( weapon ) );
-		models[modelCount].boneName = (short)CG_WEAPON_WORLDMODEL( weapon );
-		models[modelCount].tagName = ci->gunHandLeft ? "tag_weapon_left" : "tag_weapon_right";
-		modelCount++;
+	// the held weapon's world model rides on the hand tag; cg_weapons is reached
+	// by offset because cg_local.h can't be included here
+	if ( weapon ) {
+		weaponInfo = CG_WEAPON_INFO( weapon );
+		if ( CG_WEAPON_WORLDMODEL( weaponInfo ) ) {
+			models[modelCount].model = trap_R_GetXModelByHandle( CG_WEAPON_WORLDMODEL( weaponInfo ) );
+			models[modelCount].boneName = (short)CG_WEAPON_WORLDMODEL( weaponInfo );
+			models[modelCount].tagName = ci->gunHandLeft ? "tag_weapon_left" : "tag_weapon_right";
+			modelCount++;
+		}
 	}
 #endif
 
-	BG_DObjCreate( models, (unsigned short)modelCount, ci->animTree, es->number );
+	BG_DObjCreate( models, (unsigned short)modelCount, tree, es->number );
 
 	ci->dobjWeapon = weapon;
 	ci->dobjNeedsUpdate = 0;
@@ -2838,7 +2795,7 @@ void *BG_FindAnimTree( const char *treeName, qboolean errorIfMissing ) {
 BG_FindAnimTrees
 
   Publishes the player anim tree and the three script animations the run-time
-  code blends against.  The retail build inlines BG_FindAnimTree here.
+  code blends against.
 ==================
 */
 void BG_FindAnimTrees( void ) {
@@ -2857,18 +2814,14 @@ void BG_FindAnimTrees( void ) {
 #ifndef CGAMEDLL
 /*
 ==================
-BG_CreateClientAnimTrees
+BG_LoadAnimTreeInstances
 
-  0x20004F20 -- GScr_LoadScripts ends in a jmp to it (0x2002F16F).  The name
-  is inferred.  cgame's twin at 0x30005180 (the tail of
-  CGScr_LoadAnimTrees) goes on to seed cgs.corpseinfo[MAX_CORPSES] the same
-  way; that half is cg_animtree_mp.c's BG_CreateClientAnimTrees, because a bg
-  unit cannot reach cgs, so this build is game-only.
-  bgs_animTree is read once, before the loop (0x20004F22 mov edi), and the
-  same edi is pushed for all 64 calls.
+  Creates every client's anim tree instance.
+
+  keep: bgs_animTree read once into a local
 ==================
 */
-void BG_CreateClientAnimTrees( void ) {
+void BG_LoadAnimTreeInstances( void ) {
 	void *tree;
 	int i;
 
@@ -2876,6 +2829,36 @@ void BG_CreateClientAnimTrees( void ) {
 
 	for ( i = 0; i < MAX_CLIENTS; i++ ) {
 		bg_clientinfo[i].animTree = trap_XAnimCreateTree( tree );
+	}
+}
+#else
+/*
+==================
+BG_LoadAnimTreeInstances
+
+  Creates every client's and corpse's anim tree instance.  cg_local.h can't be
+  included in a bg unit, so cgs is reached as an incomplete struct and its
+  corpseinfo array by offset; cg_animtree_mp.c checks both constants.
+
+  keep: bgs_animTree read once into a local
+==================
+*/
+#define CGS_CORPSEINFO_OFFSET   0x0A43C
+#define CGS_MAX_CORPSES         8
+extern struct cgs_s cgs;
+#define cgs_corpseinfo          ( (clientInfo_t *)( (char *)&cgs + CGS_CORPSEINFO_OFFSET ) )
+
+void BG_LoadAnimTreeInstances( void ) {
+	void *tree;
+	int i;
+
+	tree = bgs_animTree;
+
+	for ( i = 0; i < MAX_CLIENTS; i++ ) {
+		bg_clientinfo[i].animTree = trap_XAnimCreateTree( tree );
+	}
+	for ( i = 0; i < CGS_MAX_CORPSES; i++ ) {
+		cgs_corpseinfo[i].animTree = trap_XAnimCreateTree( tree );
 	}
 }
 #endif

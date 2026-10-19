@@ -4,1041 +4,779 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "tr_records.h"
 #include "tr_gl_types.h"
 #include "tr_orientation.h"   /* backEnd.or 0x016D8DA8 -- one object, not 16 shards */
 #include "tr_tess.h"
+#include "tr_local.h"         /* typed views; include AFTER tr_records.h (needs TRG) */
 
-float rbSpecularLightOrigin = -960.0f;   /* 0x00571130 */
-float flt_571134           =  1980.0f;   /* 0x00571134 */
-float flt_571138           =    96.0f;   /* 0x00571138 */
+/* -------------------------------------------------------------------------
+ *  tr_shade_calc.c -- the tess vertex/colour/texcoord generators.
+ *
+ *  Deforms (RB_DeformTessGeometry) reshape tess.xyz/normals; the RB_Calc*Color
+ *  and RB_Calc*TexCoords helpers fill tess.vertexColors and the active texcoord
+ *  arrays for one shader stage.  Only the data passed by POINTER is retyped:
+ *  the deform stage (deformStage_t / its waveForm_t), the texture-matrix scratch
+ *  (texModInfo_t) and the current dynamic light (dlight_t, from tr_local.h).
+ *  The tess arrays and the backEnd/tr globals keep the retail storage-of-record
+ *  in tr_tess.h / tr_records.h / tr_local.h per the hybrid blob+symbol
+ *  scheme.  ftol_tempSpill is the shared myftol spill slot.  myftol (0x515940)
+ *  is a bare fld/fistp, so it rounds to nearest under the default control
+ *  word; it does not truncate like the __ftol2 an (int) cast compiles to.
+ *  The WAVEVALUE sites, RB_CalcDeformSyncNormals, the rgbGen-wave grey level
+ *  and the diffuse colour channels use myftol's return value.  The
+ *  other float->int conversions here (RB_CalcBulgeVertexes, RB_CalcWaveAlpha,
+ *  RB_CalcTurbulentTexCoords, RB_CalcRotateTexCoords, RB_CalcSpecularAlpha)
+ *  call __ftol2 in retail and truncate, so they keep plain (int) casts.
+ * ------------------------------------------------------------------------- */
+
+int ftol_tempSpill;
+
+float rbSpecularLightOrigin = -960.0f;   /* 0x00571130  specular light {-960,1980,96} */
+float rbSpecularLightOriginY           =  1980.0f;   /* 0x00571134 */
+float rbSpecularLightOriginZ           =    96.0f;   /* 0x00571138 */
+
+#define FUNCTABLE_SIZE   1024
+#define FUNCTABLE_MASK   1023
+
+/* The parenthesised (freq)/(amplitude) operands are what make VC7 load them
+ * before tess_shaderTime / the table entry, as retail does. */
+#define WAVEVALUE( table, base, amplitude, phase, freq ) \
+	( ( base ) + table[ myftol( ( ( phase ) + tess_shaderTime * ( freq ) ) * FUNCTABLE_SIZE ) & FUNCTABLE_MASK ] * ( amplitude ) )
+
+/* genFunc_t -- waveForm_t.func selector (matches RTCW). */
+typedef enum {
+	GF_NONE             = 0,
+	GF_SIN              = 1,
+	GF_SQUARE           = 2,
+	GF_TRIANGLE         = 3,
+	GF_SAWTOOTH         = 4,
+	GF_INVERSE_SAWTOOTH = 5,
+	GF_NOISE            = 6
+} genFunc_t;
+
+/* deform_t -- deformStage_t.deformation selector.  CoD renumbers RTCW's list
+ * and adds the FLAP and SYNC_NORMALS kinds; values proven by RB_DeformTessGeometry. */
+typedef enum {
+	DEFORM_NONE              = 0,
+	DEFORM_WAVE              = 1,
+	DEFORM_FLAP_S            = 2,     /* RB_CalcFlapVertexes( component 0 ) */
+	DEFORM_FLAP_T            = 3,     /* RB_CalcFlapVertexes( component 1 ) */
+	DEFORM_NORMALS           = 4,
+	DEFORM_SYNC_NORMALS      = 5,     /* CoD-specific */
+	DEFORM_BULGE             = 6,
+	DEFORM_MOVE              = 7,
+	DEFORM_PROJECTION_SHADOW = 8,
+	DEFORM_AUTOSPRITE        = 9,
+	DEFORM_AUTOSPRITE2       = 10,
+	DEFORM_TEXT0             = 11,
+	DEFORM_TEXT1             = 12,
+	DEFORM_TEXT2             = 13,
+	DEFORM_TEXT3             = 14,
+	DEFORM_TEXT4             = 15,
+	DEFORM_TEXT5             = 16,
+	DEFORM_TEXT6             = 17,
+	DEFORM_TEXT7             = 18
+} deform_t;
+
+/* waveForm_t (0x14) -- table-driven wave.  RTCW layout; func at +0. */
+typedef struct {
+	int   func;            /* +0x00  genFunc_t */
+	float base;            /* +0x04 */
+	float amplitude;       /* +0x08 */
+	float phase;           /* +0x0c */
+	float frequency;       /* +0x10 */
+} waveForm_t;
+COD1_ASSERT_SIZE(waveForm_t, 0x14);
+
+/* deformStage_t (0x34) -- one shader deform.  Identical to RTCW: proven by the
+ * reads in RB_CalcDeformVertexes/Flap/Bulge/Move and the stride 52 walk in
+ * RB_DeformTessGeometry (deforms at shader+0xb0, numDeforms at shader+0xac). */
+typedef struct {
+	int        deformation;        /* +0x00  deform_t */
+	vec3_t     moveVector;         /* +0x04 */
+	waveForm_t deformationWave;    /* +0x10 */
+	float      deformationSpread;  /* +0x24 */
+	float      bulgeWidth;         /* +0x28 */
+	float      bulgeHeight;        /* +0x2c */
+	float      bulgeSpeed;         /* +0x30 */
+} deformStage_t;
+COD1_ASSERT_SIZE(deformStage_t, 0x34);
+ASSERT_OFF(deformStage_t, deformationWave, 0x10);
+ASSERT_OFF(deformStage_t, deformationSpread, 0x24);
+ASSERT_OFF(deformStage_t, bulgeWidth, 0x28);
+ASSERT_OFF(deformStage_t, bulgeSpeed, 0x30);
+
+/* texModInfo_t (0x44) -- one tcMod.  RTCW layout: matrix (+0x18) and translate
+ * (+0x28) are proven by RB_CalcTransformTexCoords reading float indices 6..11,
+ * wave/scale/scroll by RB_ComputeTexCoords passing texMod+1/+12/+14.  Real
+ * fields, not byte padding: a byte array in the stack copies made /GS add a
+ * cookie that retail's RB_CalcStretchTexCoords/RB_CalcRotateTexCoords lack. */
+typedef struct {
+	int        type;                /* +0x00  texMod_t */
+	waveForm_t wave;                /* +0x04  TMOD_TURBULENT / TMOD_STRETCH */
+	float      matrix[2][2];        /* +0x18  TMOD_TRANSFORM */
+	float      translate[2];        /* +0x28 */
+	float      scale[2];            /* +0x30  TMOD_SCALE */
+	float      scroll[2];           /* +0x38  TMOD_SCROLL */
+	float      rotateSpeed;         /* +0x40  TMOD_ROTATE */
+} texModInfo_t;
+COD1_ASSERT_SIZE(texModInfo_t, 0x44);
+ASSERT_OFF(texModInfo_t, wave, 0x04);
+ASSERT_OFF(texModInfo_t, matrix, 0x18);
+ASSERT_OFF(texModInfo_t, translate, 0x28);
+ASSERT_OFF(texModInfo_t, scale, 0x30);
+ASSERT_OFF(texModInfo_t, scroll, 0x38);
+
 
 int __cdecl RB_AddQuadStampExt( float *origin, float *left, float *up, int *color, float s1, float t1, float s2, float t2 );
 extern int RB_ProjectionShadowDeform();
 void VectorNormalizeFast( float *v );
 
-float *__cdecl RB_CalcTransformTexCoords( float *tcMod, float *texCoords );
+float *__cdecl TableForFunc( int func );
+int __cdecl myftol( float value );
+float *__cdecl RB_CalcTransformTexCoords( texModInfo_t *tmi, float *st );
+void RB_CalcTangentSpace( void );
 
-#define tess_numVertexes             tess_numVertexes
-#define tess_shaderTime              tess_shaderTime
-#define tess_vertexComponentCount    tess_vertexComponentCount
-#define tess_xyz_base                ((float *)tess_xyz)
-#define backEnd_currentEntity        backEnd_currentEntity
-#define tr_sinTable                  tr_sinTable
-#define myftol_tmp                   ftol_tempSpill
-#define FUNCTABLE_SIZE               1024
-#define FUNCTABLE_MASK               1023
 
 /* ---- TableForFunc  0x005133D0 ----  VERIFIED */
-float *__cdecl TableForFunc(void *func)
+float *__cdecl TableForFunc( int func )
 {
-  switch ( (unsigned int)func )
-  {
-    case 1u:
-      return tr_sinTable;
-    case 2u:
-      return tr_squareTable;
-    case 3u:
-      return tr_triangleTable;
-    case 4u:
-      return tr_sawToothTable;
-    case 5u:
-      return tr_inverseSawToothTable;
-    default:
-      break;
-  }
-  ri_Error(1,"\x15" "TableForFunc called with invalid function '%d' in shader '%s'\n", func, tess_shader);
-  return NULL;
+	switch ( func )
+	{
+		case GF_SIN:              return tr_sinTable;
+		case GF_TRIANGLE:         return tr_triangleTable;
+		case GF_SQUARE:           return tr_squareTable;
+		case GF_SAWTOOTH:         return tr_sawToothTable;
+		case GF_INVERSE_SAWTOOTH: return tr_inverseSawToothTable;
+		default:                  break;
+	}
+
+	ri.Error( 1, "\x15" "TableForFunc called with invalid function '%d' in shader '%s'\n", func, tess_shader );
+	return NULL;
 }
 
 /* ---- EvalWaveForm  0x00513430 ----  VERIFIED */
-double __cdecl EvalWaveForm(int a1)
+rfloat __cdecl EvalWaveForm( const waveForm_t *wf )
 {
-  float *v1;
-  float v3;
+	float *table;
 
-  v1 = TableForFunc(*(void **)a1);
-  v3 = (*(float *)(a1 + 16) * tess_shaderTime + *(float *)(a1 + 12)) * 1024.0;
-  ftol_tempSpill = (int)v3;
-  return *(float *)(a1 + 8) * v1[(int)v3 & 0x3FF] + *(float *)(a1 + 4);
+	table = TableForFunc( wf->func );
+	return WAVEVALUE( table, wf->base, wf->amplitude, wf->phase, wf->frequency );
 }
 
 /* ---- EvalWaveFormClamped  0x00513470 ----  VERIFIED */
-double __cdecl EvalWaveFormClamped(int a1)
+rfloat __cdecl EvalWaveFormClamped( const waveForm_t *wf )
 {
-  float *v1;
-  double result;
-  float v3;
+	rfloat glow;
 
-  v1 = TableForFunc(*(void **)a1);
-  v3 = (*(float *)(a1 + 16) * tess_shaderTime + *(float *)(a1 + 12)) * 1024.0;
-  ftol_tempSpill = (int)v3;
-  result = *(float *)(a1 + 8) * v1[(int)v3 & 0x3FF] + *(float *)(a1 + 4);
-  if ( (result < 0.0) | __UNORDERED__(result, 0.0) )
-    return 0.0;
-  if ( result > 1.0 )
-    return 1.0;
-  return result;
+	glow = EvalWaveForm( wf );
+	if ( glow < 0 )
+		return 0;
+	if ( glow > 1 )
+		return 1;
+	return glow;
 }
 
 /* ---- RB_CalcStretchTexCoords  0x005134E0 ----  VERIFIED */
-float *__cdecl RB_CalcStretchTexCoords(int a1, float *a2)
+float *__cdecl RB_CalcStretchTexCoords( const waveForm_t *wf, float *st )
 {
-  float *v2;
-  double v3;
-  double v4;
-  float v6;
-  float v7[12]; // [esp+4h] [ebp-44h] BYREF -- twelve floats
+	rfloat       p;
+	texModInfo_t tmi;
 
-  v2 = TableForFunc(*(void **)a1);
-  v6 = (*(float *)(a1 + 16) * tess_shaderTime + *(float *)(a1 + 12)) * 1024.0;
-  ftol_tempSpill = (int)v6;
-  v3 = *(float *)(a1 + 8) * v2[ftol_tempSpill & 0x3FF] + *(float *)(a1 + 4);
-  v7[8] = 0.0;
-  v7[7] = 0.0;
-  v4 = 1.0 / v3;
-  v7[6] = v4;
-  v7[10] = 0.5 - 0.5 * v4;
-  v7[9] = v4;
-  v7[11] = v7[10];
-  return RB_CalcTransformTexCoords(v7, a2);
+	p = 1.0f / EvalWaveForm( wf );
+
+	tmi.matrix[0][0] = p;
+	tmi.matrix[1][0] = 0;
+	tmi.translate[0] = 0.5f - 0.5f * p;
+
+	tmi.matrix[0][1] = 0;
+	tmi.matrix[1][1] = p;
+	tmi.translate[1] = 0.5f - 0.5f * p;
+
+	return RB_CalcTransformTexCoords( &tmi, st );
 }
 
-/* ---- RB_CalcDeformVertexes  0x00513570 ----  VERIFIED */
-float *__cdecl RB_CalcDeformVertexes(int a1)
+/* ---- RB_CalcDeformVertexes  0x00513570 ----  VERIFIED
+ * Push each vertex along its normal by a wave value.  With frequency 0 the wave
+ * is constant; otherwise the phase is spread by the summed position.  (CoD has
+ * dropped the RTCW negative-frequency fire-rise branch.) */
+void __cdecl RB_CalcDeformVertexes( deformStage_t *ds )
 {
-  void *v1;
-  float *v2;
-  float *v3;
-  double v4;
-  float *result;
-  int v6;
-  double v7;
-  double v8; // rt0
-  float *v9;
-  int v10;
-  float *v11;
-  double v12;
-  float v13;
-  float v14;
-  float v15;
-  float v16;
-  float v17;
-  float v18;
+	int    i;
+	vec3_t offset;
+	float  scale;
+	float *xyz    = (float *)tess_xyz;
+	float *normal = (float *)tess_stageNormals;
+	float *table;
 
-  v1 = *(void **)(a1 + 16);
-  v2 = (float *)tess_xyz;
-  if ( (*(float *)(a1 + 32) == 0.0) | __UNORDERED__(*(float *)(a1 + 32), 0.0) )
-  {
-    v3 = TableForFunc(v1);
-    v13 = (*(float *)(a1 + 32) * tess_shaderTime + *(float *)(a1 + 28)) * 1024.0;
-    ftol_tempSpill = (int)v13;
-    v4 = *(float *)(a1 + 24) * v3[(int)v13 & 0x3FF];
-    result = (float *)tess_numVertexes;
-    v6 = 0;
-    v14 = v4 + *(float *)(a1 + 20);
-    if ( tess_numVertexes > 0 )
-    {
-      result = dword_1827F68;
-      do
-      {
-        ++v6;
-        v7 = v14 * *(result - 2);
-        result += 3;
-        v17 = v14 * *(result - 3);
-        v8 = v14 * *(result - 4);
-        *v2 = v7 + *v2;
-        v2[1] = v8 + v2[1];
-        v2[2] = v17 + v2[2];
-        v2 += tess_vertexComponentCount;
-      }
-      while ( v6 < tess_numVertexes );
-    }
-  }
-  else
-  {
-    v9 = TableForFunc(v1);
-    result = (float *)tess_numVertexes;
-    v10 = 0;
-    if ( tess_numVertexes > 0 )
-    {
-      v11 = dword_1827F68;
-      do
-      {
-        v15 = ((v2[2] + v2[1] + *v2) * *(float *)(a1 + 36) + *(float *)(a1 + 28) + tess_shaderTime * *(float *)(a1 + 32))
-            * 1024.0;
-        ftol_tempSpill = (int)v15;
-        ++v10;
-        v11 += 3;
-        v12 = v9[(int)v15 & 0x3FF] * *(float *)(a1 + 24) + *(float *)(a1 + 20);
-        v16 = v12 * *(v11 - 4);
-        v18 = v12 * *(v11 - 3);
-        *v2 = v12 * *(v11 - 5) + *v2;
-        v2[1] = v16 + v2[1];
-        v2[2] = v18 + v2[2];
-        result = (float *)tess_vertexComponentCount;
-        v2 += tess_vertexComponentCount;
-      }
-      while ( v10 < tess_numVertexes );
-    }
-  }
-  return result;
+	if ( ds->deformationWave.frequency == 0 )
+	{
+		scale = EvalWaveForm( &ds->deformationWave );
+
+		for ( i = 0; i < tess_numVertexes; i++, xyz += tess_vertexComponentCount, normal += 3 )
+		{
+			VectorScale( normal, scale, offset );
+
+			xyz[0] += offset[0];
+			xyz[1] += offset[1];
+			xyz[2] += offset[2];
+		}
+	}
+	else
+	{
+		table = TableForFunc( ds->deformationWave.func );
+
+		for ( i = 0; i < tess_numVertexes; i++, xyz += tess_vertexComponentCount, normal += 3 )
+		{
+			float off = ( xyz[2] + xyz[1] + xyz[0] ) * ds->deformationSpread;
+
+			scale = WAVEVALUE( table, ds->deformationWave.base, ds->deformationWave.amplitude,
+			                   ds->deformationWave.phase + off, ds->deformationWave.frequency );
+
+			VectorScale( normal, scale, offset );
+
+			xyz[0] += offset[0];
+			xyz[1] += offset[1];
+			xyz[2] += offset[2];
+		}
+	}
 }
 
-/* ---- RB_CalcFlapVertexes  0x005136E0 ----  VERIFIED */
-float *__cdecl RB_CalcFlapVertexes(int a1, int a2)
+/* ---- RB_CalcFlapVertexes  0x005136E0 ----  VERIFIED
+ * Like RB_CalcDeformVertexes, but the displacement is additionally scaled by one
+ * texcoord component (S when component==0, T when component==1).  CoD-specific. */
+void __cdecl RB_CalcFlapVertexes( int component, deformStage_t *ds )
 {
-  void *v2;
-  float *v3;
-  float *v4;
-  float *v5;
-  double v6;
-  float *result;
-  int v8;
-  double v9;
-  float *v10;
-  int v11;
-  float *v12;
-  double v13;
-  float v14;
-  float v15;
-  float v16;
-  float v17;
-  float v18;
-  float v19;
-  float v20;
+	int    i;
+	vec3_t offset;
+	float  scale;
+	float *xyz    = (float *)tess_xyz;
+	float *st     = (float *)tess_texCoords0 + component;
+	float *normal = (float *)tess_stageNormals;
+	float *table;
 
-  v2 = *(void **)(a2 + 16);
-  v3 = (float *)tess_xyz;
-  v4 = (float *)(4 * a1 + ((int)(char *)tess_texCoords0));
-  if ( (*(float *)(a2 + 32) == 0.0) | __UNORDERED__(*(float *)(a2 + 32), 0.0) )
-  {
-    v5 = TableForFunc(v2);
-    v14 = (*(float *)(a2 + 32) * tess_shaderTime + *(float *)(a2 + 28)) * 1024.0;
-    ftol_tempSpill = (int)v14;
-    v6 = *(float *)(a2 + 24) * v5[(int)v14 & 0x3FF];
-    result = (float *)tess_numVertexes;
-    v8 = 0;
-    v15 = v6 + *(float *)(a2 + 20);
-    if ( tess_numVertexes > 0 )
-    {
-      result = dword_1827F68;
-      do
-      {
-        ++v8;
-        v9 = v15 * *v4;
-        result += 3;
-        v4 += 2;
-        v17 = v9 * *(result - 4);
-        v19 = v9 * *(result - 3);
-        *v3 = v9 * *(result - 5) + *v3;
-        v3[1] = v17 + v3[1];
-        v3[2] = v19 + v3[2];
-        v3 += tess_vertexComponentCount;
-      }
-      while ( v8 < tess_numVertexes );
-    }
-  }
-  else
-  {
-    v10 = TableForFunc(v2);
-    result = (float *)tess_numVertexes;
-    v11 = 0;
-    if ( tess_numVertexes > 0 )
-    {
-      v12 = dword_1827F68;
-      do
-      {
-        v16 = ((*v3 + v3[2] + v3[1]) * *(float *)(a2 + 36) + *(float *)(a2 + 28) + tess_shaderTime * *(float *)(a2 + 32))
-            * 1024.0;
-        ftol_tempSpill = (int)v16;
-        ++v11;
-        v12 += 3;
-        v4 += 2;
-        v13 = (v10[(int)v16 & 0x3FF] * *(float *)(a2 + 24) + *(float *)(a2 + 20)) * *(v4 - 2);
-        v18 = v13 * *(v12 - 4);
-        v20 = v13 * *(v12 - 3);
-        *v3 = v13 * *(v12 - 5) + *v3;
-        v3[1] = v18 + v3[1];
-        v3[2] = v20 + v3[2];
-        result = (float *)tess_vertexComponentCount;
-        v3 += tess_vertexComponentCount;
-      }
-      while ( v11 < tess_numVertexes );
-    }
-  }
-  return result;
+	if ( ds->deformationWave.frequency == 0 )
+	{
+		scale = EvalWaveForm( &ds->deformationWave );
+
+		for ( i = 0; i < tess_numVertexes; i++, xyz += tess_vertexComponentCount, normal += 3, st += 2 )
+		{
+			VectorScale( normal, scale * st[0], offset );
+
+			xyz[0] += offset[0];
+			xyz[1] += offset[1];
+			xyz[2] += offset[2];
+		}
+	}
+	else
+	{
+		table = TableForFunc( ds->deformationWave.func );
+
+		for ( i = 0; i < tess_numVertexes; i++, xyz += tess_vertexComponentCount, normal += 3, st += 2 )
+		{
+			float off = ( xyz[0] + xyz[2] + xyz[1] ) * ds->deformationSpread;
+
+			scale = WAVEVALUE( table, ds->deformationWave.base, ds->deformationWave.amplitude,
+			                   ds->deformationWave.phase + off, ds->deformationWave.frequency );
+
+			VectorScale( normal, scale * st[0], offset );
+
+			xyz[0] += offset[0];
+			xyz[1] += offset[1];
+			xyz[2] += offset[2];
+		}
+	}
 }
 
-/* ---- RB_CalcDeformSyncNormals  0x00513870 ----  VERIFIED */
-int __cdecl RB_CalcDeformSyncNormals(int a1)
+/* ---- RB_CalcDeformSyncNormals  0x00513870 ----  VERIFIED
+ * Perturb each normal by the wave derivative (table[i+1]-table[i]) scaled by the
+ * summed position, then renormalize.  CoD-specific normal deform. */
+void __cdecl RB_CalcDeformSyncNormals( deformStage_t *ds )
 {
-  float *v1;
-  float *v2;
-  int result;
-  float *v4;
-  double v5;
-  double v6;
-  int v7;
-  float v8;
-  float v9;
-  float v10;
-  float v11;
+	int    i;
+	int    idx;
+	float *xyz    = (float *)tess_xyz;
+	float *normal = (float *)tess_stageNormals;
+	float *table;
+	vec3_t perp;
+	rfloat sum, scale;
 
-  v1 = (float *)tess_xyz;
-  v2 = TableForFunc(*(void **)(a1 + 16));
-  result = 0;
-  v7 = 0;
-  if ( tess_numVertexes > 0 )
-  {
-    v4 = dword_1827F68;
-    do
-    {
-      v5 = *(v4 - 1) + *v4 + *(v4 - 2);
-      v9 = 1.0 - v5 * *(v4 - 2);
-      v10 = 1.0 - v5 * *(v4 - 1);
-      v11 = 1.0 - v5 * *v4;
-      v8 = ((v1[2] + v1[1] + *v1) * *(float *)(a1 + 36) + *(float *)(a1 + 28) + tess_shaderTime * *(float *)(a1 + 32))
-         * 1024.0;
-      ftol_tempSpill = (int)v8;
-      v6 = -((v2[((unsigned __int16)(int)v8 + 1) & 0x3FF] - v2[(int)v8 & 0x3FF])
-           * *(float *)(a1 + 24)
-           * 1024.0
-           * *(float *)(a1 + 36));
-      *(v4 - 2) = v9 * v6 + *(v4 - 2);
-      *(v4 - 1) = v10 * v6 + *(v4 - 1);
-      *v4 = v6 * v11 + *v4;
-      VectorNormalizeFast(v4 - 2);
-      v1 += tess_vertexComponentCount;
-      v4 += 3;
-      ++v7;
-    }
-    while ( v7 < tess_numVertexes );
-    result = 0;
-  }
-  tess_stageTangentsValid = 0;
-  tess_stageBitangentsValid = 0;
-  return result;
+	table = TableForFunc( ds->deformationWave.func );
+
+	for ( i = 0; i < tess_numVertexes; i++, xyz += tess_vertexComponentCount, normal += 3 )
+	{
+		float off;
+
+		/* explicit grouping: VC7 then keeps retail's n1 + n2 + n0 and amp, 1024, spread order */
+		sum = ( normal[2] + normal[1] ) + normal[0];
+		perp[0] = 1.0f - sum * normal[0];
+		perp[1] = 1.0f - sum * normal[1];
+		perp[2] = 1.0f - sum * normal[2];
+
+		off = ( xyz[2] + xyz[1] + xyz[0] ) * ds->deformationSpread;
+		idx = myftol( ( ( ds->deformationWave.phase + off ) + tess_shaderTime * ( ds->deformationWave.frequency ) ) * FUNCTABLE_SIZE );
+		scale = -( ( ( ( table[ ( idx + 1 ) & FUNCTABLE_MASK ] - table[ idx & FUNCTABLE_MASK ] )
+		               * ds->deformationWave.amplitude ) * FUNCTABLE_SIZE ) * ds->deformationSpread );
+
+		normal[0] += perp[0] * scale;
+		normal[1] += perp[1] * scale;
+		normal[2] += perp[2] * scale;
+		VectorNormalizeFast( normal );
+	}
+	tess_stageTangentsValid   = 0;
+	tess_stageBitangentsValid = 0;
 }
 
-/* ---- RB_CalcDeformNormals  0x00513990 ----  VERIFIED */
-int __cdecl RB_CalcDeformNormals(int a1)
+/* ---- RB_CalcDeformNormals  0x00513990 ----  VERIFIED
+ * Wiggle the normals with 4D noise for wavy environment mapping. */
+void __cdecl RB_CalcDeformNormals( deformStage_t *ds )
 {
-  int result;
-  float *v5;
-  float *v6;
-  float x, y, z, t;
-  float noise;
-  int v22;
+	int    i;
+	rfloat scale;
+	float *xyz    = (float *)tess_xyz;
+	float *normal = (float *)tess_stageNormals;
 
-  result = 0;
-  v5 = (float *)tess_xyz;
-  v22 = 0;
-  if ( tess_numVertexes > 0 )
-  {
-    v6 = dword_1827F68;
-    do
-    {
-      t = tess_shaderTime * *(float *)(a1 + 32);
-      z = v5[2] * 0.98000002f;
-      y = v5[1] * 0.98000002f;
-      x = *v5 * 0.98000002f;
-      noise = 0.0f;
-      noise = Com_NoiseGet4f(x, y, z, t);
-      *(v6 - 2) = noise * *(float *)(a1 + 24) + *(v6 - 2);
+	for ( i = 0; i < tess_numVertexes; i++, xyz += tess_vertexComponentCount, normal += 3 )
+	{
+		scale = 0.98f;
+		scale = Com_NoiseGet4f( xyz[0] * scale, xyz[1] * scale, xyz[2] * scale,
+		                        tess_shaderTime * ds->deformationWave.frequency );
+		normal[0] += ds->deformationWave.amplitude * scale;
 
-      t = tess_shaderTime * *(float *)(a1 + 32);
-      z = v5[2] * 0.98000002f;
-      y = v5[1] * 0.98000002f;
-      x = *v5 * 0.98000002f + 100.0f;
-      noise = 0.0f;
-      noise = Com_NoiseGet4f(x, y, z, t);
-      *(v6 - 1) = noise * *(float *)(a1 + 24) + *(v6 - 1);
+		scale = 0.98f;
+		scale = Com_NoiseGet4f( 100 + xyz[0] * scale, xyz[1] * scale, xyz[2] * scale,
+		                        tess_shaderTime * ds->deformationWave.frequency );
+		normal[1] += ds->deformationWave.amplitude * scale;
 
-      t = tess_shaderTime * *(float *)(a1 + 32);
-      z = v5[2] * 0.98000002f;
-      y = v5[1] * 0.98000002f;
-      x = *v5 * 0.98000002f + 200.0f;
-      noise = 0.0f;
-      noise = Com_NoiseGet4f(x, y, z, t);
-      *v6 = noise * *(float *)(a1 + 24) + *v6;
+		scale = 0.98f;
+		scale = Com_NoiseGet4f( 200 + xyz[0] * scale, xyz[1] * scale, xyz[2] * scale,
+		                        tess_shaderTime * ds->deformationWave.frequency );
+		normal[2] += ds->deformationWave.amplitude * scale;
 
-      VectorNormalizeFast(v6 - 2);
-      v5 += tess_vertexComponentCount;
-      v6 += 3;
-      ++v22;
-    }
-    while ( v22 < tess_numVertexes );
-    result = 0;
-  }
-  tess_stageTangentsValid = 0;
-  tess_stageBitangentsValid = 0;
-  return result;
+		VectorNormalizeFast( normal );
+	}
+	tess_stageTangentsValid   = 0;
+	tess_stageBitangentsValid = 0;
 }
 
-/* ---- RB_CalcBulgeVertexes  0x00513AD0 ----  [HIGH] */
-int __cdecl RB_CalcBulgeVertexes(float *a1)
+/* ---- RB_CalcBulgeVertexes  0x00513AD0 ----  [HIGH]
+ * Bulge each vertex along its normal by a time-scrolled sine of its S texcoord. */
+void __cdecl RB_CalcBulgeVertexes( deformStage_t *ds )
 {
-  int result;
-  int v2;
-  float *v3;
-  float *v4;
-  float *v5;
-  double v6;
-  float v7;
+	int          i;
+	const float *st     = (const float *)tess_texCoords0;
+	float       *xyz    = (float *)tess_xyz;
+	float       *normal = (float *)tess_stageNormals;
+	float        now;   /* retail fstp m32 (0x513AFA), fadd m32 per vertex */
 
-  result = tess_numVertexes;
-  v2 = 0;
-  v3 = (float *)tess_texCoords0;
-  v4 = (float *)tess_xyz;
-  v7 = (double)backEnd_refdef_time * a1[12] * 0.0010000000474974513;
-  if ( tess_numVertexes > 0 )
-  {
-    v5 = dword_1827F68;
-    do
-    {
-      ++v2;
-      v6 = tr_sinTable[(unsigned __int64)((a1[10] * *v3 + v7) * 162.9746551513671875) & 0x3FF]
-         * a1[11];
-      v3 += 2;
-      v5 += 3;
-      *v4 = v6 * *(v5 - 5) + *v4;
-      v4[1] = v6 * *(v5 - 4) + v4[1];
-      v4[2] = v6 * *(v5 - 3) + v4[2];
-      result = tess_vertexComponentCount;
-      v4 += tess_vertexComponentCount;
-    }
-    while ( v2 < tess_numVertexes );
-  }
-  return result;
+	now = (rfloat)backEnd_refdef_time * ds->bulgeSpeed * 0.001f;
+
+	for ( i = 0; i < tess_numVertexes; i++, xyz += tess_vertexComponentCount, st += 2, normal += 3 )
+	{
+		int   off;
+		float scale;
+
+		/* 162.97466f = (float)( FUNCTABLE_SIZE / ( M_PI * 2 ) ) */
+		off = (int)( (rfloat)( ds->bulgeWidth * st[0] + now ) * 162.9746551513671875f );
+
+		scale = tr_sinTable[ off & FUNCTABLE_MASK ] * ds->bulgeHeight;
+
+		xyz[0] += normal[0] * scale;
+		xyz[1] += normal[1] * scale;
+		xyz[2] += normal[2] * scale;
+	}
 }
 
-/* ---- RB_CalcMoveVertexes  0x00513B70 ----  [HIGH] */
-float *__cdecl RB_CalcMoveVertexes(int a1)
+/* ---- RB_CalcMoveVertexes  0x00513B70 ----  [HIGH]
+ * Move the whole surface along a wave path (moveVector * wave value). */
+float *__cdecl RB_CalcMoveVertexes( deformStage_t *ds )
 {
-  float *v1;
-  int v2;
-  double v3;
-  float *result;
-  float v5;
-  float v6;
-  float v7;
-  float i;
+	float *table;
+	float *xyz;
+	float  scale;
+	float  offset[3];
+	int    i;
 
-  v1 = TableForFunc(*(void **)(a1 + 16));
-  v5 = (*(float *)(a1 + 32) * tess_shaderTime + *(float *)(a1 + 28)) * 1024.0;
-  ftol_tempSpill = (int)v5;
-  v2 = 0;
-  v3 = *(float *)(a1 + 24) * v1[(int)v5 & 0x3FF] + *(float *)(a1 + 20);
-  result = (float *)tess_xyz;
-  v6 = v3 * *(float *)(a1 + 4);
-  v7 = v3 * *(float *)(a1 + 8);
-  for ( i = v3 * *(float *)(a1 + 12); v2 < tess_numVertexes; result += tess_vertexComponentCount )
-  {
-    ++v2;
-    *result = v6 + *result;
-    result[1] = v7 + result[1];
-    result[2] = i + result[2];
-  }
-  return result;
+	table = TableForFunc( ds->deformationWave.func );
+	scale = WAVEVALUE( table, ds->deformationWave.base, ds->deformationWave.amplitude,
+	                   ds->deformationWave.phase, ds->deformationWave.frequency );
+
+	offset[0] = scale * ds->moveVector[0];
+	offset[1] = scale * ds->moveVector[1];
+	offset[2] = scale * ds->moveVector[2];
+
+	xyz = (float *)tess_xyz;
+	for ( i = 0; i < tess_numVertexes; i++, xyz += tess_vertexComponentCount )
+	{
+		xyz[0] += offset[0];
+		xyz[1] += offset[1];
+		xyz[2] += offset[2];
+	}
+	return xyz;   /* dead EAX (final xyz cursor) */
 }
 
-/* ---- DeformText  0x00513C20 ----  VERIFIED */
-void __cdecl DeformText(const char *a1)
+/* ---- DeformText  0x00513C20 ----  VERIFIED
+ * Replace one quad with a row of text quads, one per character.  width comes
+ * from crossing the surface normal with a down vector; height is half the quad
+ * Z extent; the row is centred on the quad midpoint. */
+void __cdecl DeformText( const char *text )
 {
-  float origin[3];        /* var_C /var_8 /var_4   [esp+40h..48h] */
-  float width[3];         /* var_18/var_14/var_10  [esp+34h..3Ch] */
-  float height[3];        /* var_24/var_20/var_1C  [esp+28h..30h]
-                           * -- holds `mid` first, `height` afterwards */
-  float step[3];
-  unsigned char color[4]; /* var_38, four 0xFF bytes at 0x00513E94-0x00513EA4 */
-  float bottom, top;
-  float t0, scale, f;
-  const float *xyz;
-  int   len, i, ch;
-  float fcol, frow;
+	float origin[3];        /* var_C /var_8 /var_4 */
+	float width[3];         /* var_18/var_14/var_10 */
+	float height[3];        /* var_24/var_20/var_1C  holds mid first, height after */
+	float step[3];
+	unsigned char color[4];
+	float bottom, top;
+	float t0, f;
+	const float *xyz;
+	int   len, i, ch;
+	int   stride;
+	float fcol, frow;
 
-  t0       = tess_stageNormals[2] * 0.0f;
-  width[0] = tess_stageNormals[1] * -1.0f - t0;
-  width[1] = t0 - tess_stageNormals[0] * -1.0f;
-  width[2] = tess_stageNormals[0] * 0.0f - tess_stageNormals[1] * 0.0f;
+	{const float down[3]={0.0f,0.0f,-1.0f};CrossProduct(tess_stageNormals,down,width);}
+	stride = tess_vertexComponentCount;
+	height[0] = tess_xyz[0];
+	height[1] = tess_xyz[1];
+	height[2] = tess_xyz[2];
+	bottom = 999999.0f;
+	top    = -999999.0f;
+	if ( tess_xyz[2] < 999999.0f )
+		bottom = tess_xyz[2];
+	if ( tess_xyz[2] > -999999.0f )
+		top = tess_xyz[2];
 
-  height[0] = tess_xyz[0];
-  height[1] = tess_xyz[1];
-  height[2] = tess_xyz[2];
-  bottom = 999999.0f;
-  top    = -999999.0f;
-  if ( tess_xyz[2] < 999999.0f )
-    bottom = tess_xyz[2];
-  if ( tess_xyz[2] > -999999.0f )
-    top = tess_xyz[2];
+	xyz = tess_xyz;
+	for ( i = 1; i < 4; i++ )
+	{
+		xyz += stride;
+		height[0] += xyz[0];
+		height[1] += xyz[1];
+		height[2] += xyz[2];
+		if ( xyz[2] < bottom )
+			bottom = xyz[2];
+		if ( xyz[2] > top )
+			top = xyz[2];
+	}
 
-  for ( i = 1; i < 4; i++ )
-  {
-    xyz = &tess_xyz[tess_vertexComponentCount * i];
-    height[0] += xyz[0];
-    height[1] += xyz[1];
-    height[2] += xyz[2];
-    if ( xyz[2] < bottom )
-      bottom = xyz[2];
-    if ( xyz[2] > top )
-      top = xyz[2];
-  }
+	origin[0] = height[0] * 0.25f;
+	height[0] = 0.0f;
+	origin[1] = height[1] * 0.25f;
+	height[1] = 0.0f;
+	origin[2] = height[2] * 0.25f;
+	height[2] = ( top - bottom ) * 0.5f;
 
-  origin[0] = height[0] * 0.25f;
-  height[0] = 0.0f;
-  origin[1] = height[1] * 0.25f;
-  height[1] = 0.0f;
-  origin[2] = height[2] * 0.25f;
-  height[2] = ( top - bottom ) * 0.5f;
+	width[0] = width[0] * ( height[2] * -0.75f );   /* VectorScale( width, height[2] * -0.75f, width ) */
+	width[1] = width[1] * ( height[2] * -0.75f );
+	width[2] = width[2] * ( height[2] * -0.75f );
 
-  scale    = height[2] * -0.75f;
-  width[0] = scale * width[0];
-  width[1] = scale * width[1];
-  width[2] = scale * width[2];
+	len = strlen( text );
+	f   = (float)( len - 1 );
 
-  len = strlen( a1 );
-  f   = (float)( len - 1 );
+	tess_numIndexes = 0;
+	tess_numVertexes = 0;
 
-  tess_numIndexes = 0;
-  tess_numVertexes = 0;
+	origin[0] = f * width[0] + origin[0];
+	origin[1] = f * width[1] + origin[1];
+	origin[2] = f * width[2] + origin[2];
 
-  origin[0] = f * width[0] + origin[0];
-  origin[1] = f * width[1] + origin[1];
-  origin[2] = f * width[2] + origin[2];
+	color[0] = color[1] = color[2] = color[3] = 0xFF;
 
-  color[0] = 0xFF;
-  color[1] = 0xFF;
-  color[2] = 0xFF;
-  color[3] = 0xFF;
+	if ( len > 0 )
+	{
+		step[0] = width[0] + width[0];
+		step[1] = width[1] + width[1];
+		step[2] = width[2] + width[2];
 
-  if ( len > 0 )
-  {
-    step[0] = width[0] + width[0];
-    step[1] = width[1] + width[1];
-    step[2] = width[2] + width[2];
-
-    for ( i = 0; i < len; i++ )
-    {
-      ch = (unsigned char)a1[i];
-      if ( ch != 32 )
-      {
-        frow = (float)( ch >> 4 ) * 0.0625f;
-        fcol = (float)( ch & 0xF ) * 0.0625f;
-        RB_AddQuadStampExt( origin, width, height, (int *)color,
-                            fcol, frow, fcol + 0.0625f, frow + 0.0625f );
-      }
-      origin[0] = origin[0] - step[0];
-      origin[1] = origin[1] - step[1];
-      origin[2] = origin[2] - step[2];
-    }
-  }
+		for ( i = 0; i < len; i++ )
+		{
+			ch = (unsigned char)text[i];
+			if ( ch != 32 )
+			{
+				frow = (float)( ch >> 4 ) * 0.0625f;
+				fcol = (float)( ch & 0xF ) * 0.0625f;
+				RB_AddQuadStampExt( origin, width, height, (int *)color,
+				                    fcol, frow, fcol + 0.0625f, frow + 0.0625f );
+			}
+			origin[0] = origin[0] - step[0];
+			origin[1] = origin[1] - step[1];
+			origin[2] = origin[2] - step[2];
+		}
+	}
 }
 
-/* ---- GlobalPositionToLocal  0x00513F90 ----  VERIFIED */
-float *__cdecl GlobalPositionToLocal(float *result, float *a2)
+/* ---- GlobalPositionToLocal  0x00513F90 ----  VERIFIED
+ * Transform a world-space point into backEnd.or local space. */
+float *__cdecl GlobalPositionToLocal( float *world, float *out )
 {
-  double v2;
-  double v3;
-  double v4;
+	float dx = world[0] - backEnd_or.origin[0];
+	float dy = world[1] - backEnd_or.origin[1];
+	float dz = world[2] - backEnd_or.origin[2];
 
-  v2 = *a2 - flt_16D8DA8;
-  v3 = a2[1] - flt_16D8DAC;
-  v4 = a2[2] - flt_16D8DB0;
-  *result = flt_16D8DBC * v4 + flt_16D8DB8 * v3 + flt_16D8DB4 * v2;
-  result[1] = flt_16D8DC8 * v4 + flt_16D8DC4 * v3 + flt_16D8DC0 * v2;
-  result[2] = flt_16D8DD4 * v4 + flt_16D8DD0 * v3 + flt_16D8DCC * v2;
-  return result;
+	out[0] = backEnd_or.axis[0][2] * dz + backEnd_or.axis[0][1] * dy + backEnd_or.axis[0][0] * dx;
+	out[1] = backEnd_or.axis[1][2] * dz + backEnd_or.axis[1][1] * dy + backEnd_or.axis[1][0] * dx;
+	out[2] = backEnd_or.axis[2][2] * dz + backEnd_or.axis[2][1] * dy + backEnd_or.axis[2][0] * dx;
+	return out;
 }
 
-/* ---- GlobalVectorToLocal  0x00514010 ----  VERIFIED */
-float *__cdecl GlobalVectorToLocal(float *result, float *a2)
+/* ---- GlobalVectorToLocal  0x00514010 ----  VERIFIED
+ * Rotate a world-space vector into backEnd.or local space (no translation). */
+float *__cdecl GlobalVectorToLocal( float *in, float *out )
 {
-  *a2 = flt_16D8DB4 * *result + flt_16D8DBC * result[2] + flt_16D8DB8 * result[1];
-  a2[1] = flt_16D8DC0 * *result + flt_16D8DC8 * result[2] + flt_16D8DC4 * result[1];
-  a2[2] = flt_16D8DCC * *result + flt_16D8DD4 * result[2] + flt_16D8DD0 * result[1];
-  return result;
+#ifdef COD1_VC7
+	out[0] = DotProduct( in, backEnd_or.axis[0] );
+	out[1] = DotProduct( in, backEnd_or.axis[1] );
+	out[2] = DotProduct( in, backEnd_or.axis[2] );
+#else
+	/* VC7 emits DotProduct in this summation order (0, 2, 1) */
+	out[0] = backEnd_or.axis[0][0] * in[0] + backEnd_or.axis[0][2] * in[2] + backEnd_or.axis[0][1] * in[1];
+	out[1] = backEnd_or.axis[1][0] * in[0] + backEnd_or.axis[1][2] * in[2] + backEnd_or.axis[1][1] * in[1];
+	out[2] = backEnd_or.axis[2][0] * in[0] + backEnd_or.axis[2][2] * in[2] + backEnd_or.axis[2][1] * in[1];
+#endif
+	return in;
 }
 
-/* ---- AutospriteDeform  0x00514080 ----  VERIFIED */
-GLint AutospriteDeform()
+/* ---- AutospriteDeform  0x00514080 ----  VERIFIED
+ * Rebuild each independent quad as a forward-facing camera sprite. */
+void AutospriteDeform( void )
 {
-  float *v0;
-  int v1;
-  GLint result;
-  float *v3;
-  int *v4;
-  unsigned int v5;
-  float *v6;
-  double v7;
-  double v8;
-  double v9;
-  double v10;
-  long double v11;
-  double v12;
-  double v13;
-  float v14[3]; /* [ebp-3Ch] BYREF */
-  float v17[3]; /* [ebp-30h] BYREF */
-  float v20[3]; /* [ebp-24h] BYREF */
-  float v23[3]; /* [ebp-18h] BYREF */
-  float v26[3]; /* [ebp-0Ch] BYREF */
+	int    i;
+	int    oldVerts;
+	float *xyz;
+	vec3_t mid;
+	float  delta[3];
+	float  radius;
+	vec3_t left, up;
+	vec3_t leftDir, upDir;
 
-  if ( (tess_numVertexes & 3) != 0 )
-    ri_Printf(2, "Autosprite shader %s had odd vertex count\n", (const char *)tess_shader);
-  if ( tess_numIndexes != 6 * (tess_numVertexes >> 2) )
-    ri_Printf(2, "Autosprite shader %s had odd index count\n", (const char *)tess_shader);
-  v0 = (float *)backEnd_currentEntity;
-  v1 = tess_numVertexes;
-  tess_numVertexes = 0;
-  tess_numIndexes = 0;
-  if ( (_UNKNOWN *)backEnd_currentEntity == &tr_worldEntity )
-  {
-    v20[0] = backEnd_viewParms_axis10;
-    v20[1] = backEnd_viewParms_axis11;
-    v20[2] = backEnd_viewParms_axis12;
-    result = LODWORD(backEnd_viewParms_axis21);
-    v23[0] = backEnd_viewParms_axis20;
-    v23[1] = backEnd_viewParms_axis21;
-    v23[2] = backEnd_viewParms_axis22;
-  }
-  else
-  {
-    GlobalVectorToLocal(&backEnd_viewParms_axis10, v20);
-    result = (GLint)GlobalVectorToLocal(&backEnd_viewParms_axis20, v23);
-  }
-  v3 = (float *)tess_xyz;
-  if ( v1 > 0 )
-  {
-    result = tess_vertexComponentCount;
-    v4 = tess_vertexColors;
-    v5 = ((unsigned int)(v1 - 1) >> 2) + 1;
-    while ( 1 )
-    {
-      v6 = &v3[3 * result];
-      v26[0] = (v3[2 * result] + v3[result] + *v3 + *v6) * 0.25;
-      v26[1] = (v3[result + 1] + v3[2 * result + 1] + v6[1] + v3[1]) * 0.25;
-      v26[2] = (v3[result + 2] + v3[2 * result + 2] + v6[2] + v3[2]) * 0.25;
-      v7 = v3[2] - v26[2];
-      v8 = v3[1] - v26[1];
-      v9 = v7 * v7 + v8 * v8;
-      v10 = *v3 - v26[0];
-      v11 = sqrt(v9 + v10 * v10);
-      v14[0] = v20[0] * (v11 * 0.70700001716613769531);
-      v14[1] = v20[1] * (v11 * 0.70700001716613769531);
-      v14[2] = v20[2] * (v11 * 0.70700001716613769531);
-      v17[0] = v23[0] * (v11 * 0.70700001716613769531);
-      v17[1] = v23[1] * (v11 * 0.70700001716613769531);
-      v17[2] = v11 * 0.70700001716613769531 * v23[2];
-      if ( backEnd_viewParms_isMirror )
-      {
-        v14[0] = 0.0 - v14[0];
-        v14[1] = 0.0 - v14[1];
-        v14[2] = 0.0 - v14[2];
-      }
-      if ( !((v0[16] == 0.0) | __UNORDERED__(v0[16], 0.0)) )
-      {
-        v12 = sqrt(v0[7] * v0[7] + v0[8] * v0[8] + v0[9] * v0[9]);
-        if ( (v12 == 0.0) | __UNORDERED__(v12, 0.0) )
-          v13 = 0.0;
-        else
-          v13 = 1.0 / v12;
-        v14[0] = v14[0] * v13;
-        v14[1] = v14[1] * v13;
-        v14[2] = v14[2] * v13;
-        v17[0] = v17[0] * v13;
-        v17[1] = v17[1] * v13;
-        v17[2] = v13 * v17[2];
-      }
-      RB_AddQuadStampExt(v26, v14, v17, v4, 0.0f, 0.0f, 1.0f, 1.0f);
-      result = tess_vertexComponentCount;
-      v4 += 4;
-      v3 += 4 * tess_vertexComponentCount;
-      if ( !--v5 )
-        break;
-      v0 = (float *)backEnd_currentEntity;
-    }
-  }
-  return result;
+	if ( tess_numVertexes & 3 )
+		ri.Printf( 2, "Autosprite shader %s had odd vertex count\n", (const char *)tess_shader );
+	if ( tess_numIndexes != ( tess_numVertexes >> 2 ) * 6 )
+		ri.Printf( 2, "Autosprite shader %s had odd index count\n", (const char *)tess_shader );
+
+	oldVerts = tess_numVertexes;
+	tess_numVertexes = 0;
+	tess_numIndexes = 0;
+
+	if ( (int *)backEnd_currentEntity != &tr_worldEntity )
+	{
+		GlobalVectorToLocal( &backEnd_viewParms_axis10, leftDir );
+		GlobalVectorToLocal( &backEnd_viewParms_axis20, upDir );
+	}
+	else
+	{
+		VectorCopy( &backEnd_viewParms_axis10, leftDir );
+		VectorCopy( &backEnd_viewParms_axis20, upDir );
+	}
+
+	xyz = tess_xyz;
+	for ( i = 0; i < oldVerts; i += 4, xyz += 4 * tess_vertexComponentCount )
+	{
+		/* find the midpoint (sums in the order VC7 emits them, so the modern build adds alike) */
+		mid[0] = ( xyz[2 * tess_vertexComponentCount] + xyz[tess_vertexComponentCount] + xyz[0] + xyz[3 * tess_vertexComponentCount] ) * 0.25f;
+		mid[1] = ( xyz[tess_vertexComponentCount + 1] + xyz[2 * tess_vertexComponentCount + 1] + xyz[3 * tess_vertexComponentCount + 1] + xyz[1] ) * 0.25f;
+		mid[2] = ( xyz[tess_vertexComponentCount + 2] + xyz[2 * tess_vertexComponentCount + 2] + xyz[3 * tess_vertexComponentCount + 2] + xyz[2] ) * 0.25f;
+
+		VectorSubtract( xyz, mid, delta );
+		radius = FCAST( sqrt( delta[2] * delta[2] + delta[1] * delta[1] + delta[0] * delta[0] ) ) * 0.707f;   /* / sqrt(2) */
+
+		VectorScale( leftDir, radius, left );
+		VectorScale( upDir, radius, up );
+
+		if ( backEnd_viewParms_isMirror )
+			VectorSubtract( vec3_origin, left, left );
+
+		/* compensate for scale in the axes if necessary */
+		if ( *(float *)( backEnd_currentEntity + 0x40 ) )            /* e.nonNormalizedAxes */
+		{
+			float *axis0 = (float *)( backEnd_currentEntity + 0x1C ); /* e.axis[0] */
+			float  axisLength;
+
+			axisLength = FCAST( sqrt( axis0[0] * axis0[0] + axis0[1] * axis0[1] + axis0[2] * axis0[2] ) );
+			if ( !axisLength )
+				axisLength = 0;
+			else
+				axisLength = 1.0f / axisLength;
+			VectorScale( left, axisLength, left );
+			VectorScale( up, axisLength, up );
+		}
+
+		RB_AddQuadStampExt( mid, left, up, (int *)&tess_vertexColors[i * 4], 0, 0, 1, 1 );
+	}
 }
 
-/* ---- Autosprite2Deform  0x00514330 ----  [HIGH] */
-int Autosprite2Deform()
-{
-  int v0;
-  int result;
-  float *v2;
-  float *v3;
-  float *v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  float v9;
-  int v10;
-  double v11;
-  float *v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  double v17;
-  float *v18;
-  float *v19;
-  float v20;
-  float v21;
-  float v22;
-  float v23;
-  float v24;
-  float v25;
-  float v26;
-  float v27;
-  float *v28;
-  float *v29;
-  float v30;
-  float v31;
-  int v32;
-  float v33;
-  float v34;
-  float v35;
-  float v36;
-  float v37;
-  float v38;
-  float v39;
-  float v40;
-  float v41;
-  float v42;
-  float v43;
-  float v44;
-  float v45;
-  float v46;
-  float v47;
-  float v48;
-  float v49;
-  float v50;
-  float v51;
-  float v52;
-  float v53[3]; // [ebp-0x4c] BYREF  -- retail vec3_t
-  float v56[3]; // [esp+2Ch..34h] BYREF -- ONE vec3
-  float v59;
-  float v60;
-  float v61;
-  float *v62;
-  float *v63;
-  float *v64;
-  float *v65;
-  float v66;
-  float v67;
-  float v68;
-  float v69;
-  float v70;
-  float v71;
+/* one candidate edge of the quad's two triangles, between the vertices of
+ * index-buffer entries base+ia and base+ib, for Autosprite2Deform's
+ * two-shortest search (retail: a loop over an edge table, fully unrolled; the
+ * first test against FLT_MAX is kept) */
+#define AS2_EDGE( ia, ib ) \
+	{ \
+		float *from_ = &tess_xyz[tess_vertexComponentCount * tess_indexes[base + (ia)]]; \
+		float *to_   = &tess_xyz[tess_vertexComponentCount * tess_indexes[base + (ib)]]; \
+		edge[0] = to_[0] - from_[0]; \
+		edge[1] = to_[1] - from_[1]; \
+		edge[2] = to_[2] - from_[2]; \
+		len = edge[2] * edge[2] + edge[1] * edge[1] + edge[0] * edge[0]; \
+		if ( len < shortLen )       { secondLen = shortLen; tp0 = sp0; tp1 = sp1; shortLen = len; sp0 = from_; sp1 = to_; } \
+		else if ( len < secondLen ) { secondLen = len; tp0 = from_; tp1 = to_; } \
+	}
 
-  v0 = tess_numVertexes;
-  if ( (tess_numVertexes & 3) != 0 )
-  {
-    ri_Printf(2, "Autosprite2 shader %s had odd vertex count\n", (const char *)tess_shader);
-    v0 = tess_numVertexes;
-  }
-  if ( tess_numIndexes != 6 * (v0 >> 2) )
-    ri_Printf(2, "Autosprite2 shader %s had odd index count\n", (const char *)tess_shader);
-  if ( (_UNKNOWN *)backEnd_currentEntity == &tr_worldEntity )
-  {
-    v56[0] = backEnd_viewParms_axis00;
-    v56[1] = backEnd_viewParms_axis01;
-    v56[2] = backEnd_viewParms_axis02;
-  }
-  else
-  {
-    GlobalVectorToLocal(&backEnd_viewParms_axis00, v56);
-  }
-  result = 0;
-  v32 = 0;
-  if ( tess_numIndexes > 0 )
-  {
-    v2 = v63;
-    v3 = v64;
-    v4 = v62;
-    while ( 1 )
-    {
-      v5 = (unsigned __int16)tess_indexes[result];
-      v6 = tess_vertexComponentCount * (unsigned __int16)word_17A7F62[result];
-      v7 = tess_vertexComponentCount * v5;
-      v35 = *(float *)&tess_xyz[v6] - *(float *)&tess_xyz[v7];
-      v41 = flt_17BFF64[v6] - flt_17BFF64[v7];
-      v47 = *(float *)&dword_17BFF68[v6] - *(float *)&dword_17BFF68[v7];
-      v8 = 4 * v7 + ((int)(char *)tess_xyz);
-      v9 = 3.4028234663852885981e38;
-      v34 = 3.4028234663852885981e38;
-      v33 = 3.4028234663852885981e38;
-      v28 = (float *)v8;
-      v20 = v47 * v47 + v41 * v41 + v35 * v35;
-      if ( (v20 < 3.4028234663852885981e38) | __UNORDERED__(v20, 3.4028234663852885981e38) )
-      {
-        v34 = 3.4028234663852885981e38;
-        v9 = v47 * v47 + v41 * v41 + v35 * v35;
-        v3 = v4;
-        v65 = v2;
-        v4 = (float *)v8;
-        v2 = (float *)(4 * v6 + ((int)(char *)tess_xyz));
-        v33 = v9;
-      }
-      v10 = tess_vertexComponentCount * (unsigned __int16)word_17A7F64[v32];
-      v36 = *(float *)&tess_xyz[v10] - *(float *)&tess_xyz[v6];
-      v11 = flt_17BFF64[v10] - flt_17BFF64[v6];
-      v12 = (float *)(4 * v10 + ((int)(char *)tess_xyz));
-      v42 = v11;
-      v48 = v12[2] - *(float *)&dword_17BFF68[v6];
-      v21 = v48 * v48 + v42 * v42 + v36 * v36;
-      if ( (v21 < (double)v33) | __UNORDERED__(v21, v33) )
-      {
-        v34 = v9;
-        v9 = v48 * v48 + v42 * v42 + v36 * v36;
-        v3 = v4;
-        v65 = v2;
-        v4 = (float *)(4 * v6 + ((int)(char *)tess_xyz));
-        v2 = v12;
-        v33 = v9;
-      }
-      else if ( (v21 < 3.4028234663852885981e38) | __UNORDERED__(v21, 3.4028234663852885981e38) )
-      {
-        v3 = (float *)(4 * v6 + ((int)(char *)tess_xyz));
-        v65 = v12;
-        v34 = v48 * v48 + v42 * v42 + v36 * v36;
-      }
-      v37 = *v28 - *v12;
-      v43 = v28[1] - v12[1];
-      v49 = v28[2] - v12[2];
-      v22 = v49 * v49 + v43 * v43 + v37 * v37;
-      if ( (v22 < (double)v33) | __UNORDERED__(v22, v33) )
-      {
-        v34 = v9;
-        v9 = v49 * v49 + v43 * v43 + v37 * v37;
-        v3 = v4;
-        v65 = v2;
-        v4 = v12;
-        v2 = v28;
-        v33 = v9;
-      }
-      else if ( (v22 < (double)v34) | __UNORDERED__(v22, v34) )
-      {
-        v3 = v12;
-        v65 = v28;
-        v34 = v49 * v49 + v43 * v43 + v37 * v37;
-      }
-      v13 = tess_vertexComponentCount * (unsigned __int16)word_17A7F68[v32];
-      v14 = tess_vertexComponentCount * (unsigned __int16)word_17A7F66[v32];
-      v38 = *(float *)&tess_xyz[v13] - *(float *)&tess_xyz[v14];
-      v44 = flt_17BFF64[v13] - flt_17BFF64[v14];
-      v50 = *(float *)&dword_17BFF68[v13] - *(float *)&dword_17BFF68[v14];
-      v15 = 4 * v14 + ((int)(char *)tess_xyz);
-      v29 = (float *)v15;
-      v23 = v50 * v50 + v44 * v44 + v38 * v38;
-      if ( (v23 < (double)v33) | __UNORDERED__(v23, v33) )
-      {
-        v34 = v9;
-        v9 = v50 * v50 + v44 * v44 + v38 * v38;
-        v3 = v4;
-        v65 = v2;
-        v4 = (float *)v15;
-        v2 = (float *)(4 * v13 + ((int)(char *)tess_xyz));
-        v33 = v9;
-      }
-      else if ( (v23 < (double)v34) | __UNORDERED__(v23, v34) )
-      {
-        v3 = (float *)v15;
-        v65 = (float *)(4 * v13 + ((int)(char *)tess_xyz));
-        v34 = v50 * v50 + v44 * v44 + v38 * v38;
-      }
-      v16 = tess_vertexComponentCount * (unsigned __int16)word_17A7F6A[v32];
-      v39 = *(float *)&tess_xyz[v16] - *(float *)&tess_xyz[v13];
-      v17 = flt_17BFF64[v16] - flt_17BFF64[v13];
-      v18 = (float *)(4 * v16 + ((int)(char *)tess_xyz));
-      v45 = v17;
-      v51 = v18[2] - *(float *)&dword_17BFF68[v13];
-      v24 = v51 * v51 + v45 * v45 + v39 * v39;
-      if ( (v24 < (double)v33) | __UNORDERED__(v24, v33) )
-      {
-        v34 = v9;
-        v9 = v51 * v51 + v45 * v45 + v39 * v39;
-        v3 = v4;
-        v65 = v2;
-        v4 = (float *)(4 * v13 + ((int)(char *)tess_xyz));
-        v2 = v18;
-        v33 = v9;
-      }
-      else if ( (v24 < (double)v34) | __UNORDERED__(v24, v34) )
-      {
-        v3 = (float *)(4 * v13 + ((int)(char *)tess_xyz));
-        v65 = v18;
-        v34 = v51 * v51 + v45 * v45 + v39 * v39;
-      }
-      v40 = *v29 - *v18;
-      v46 = v29[1] - v18[1];
-      v52 = v29[2] - v18[2];
-      v25 = v52 * v52 + v46 * v46 + v40 * v40;
-      if ( (v25 < (double)v33) | __UNORDERED__(v25, v33) )
-      {
-        v3 = v4;
-        v65 = v2;
-        v4 = v18;
-        v2 = v29;
-        v33 = v52 * v52 + v46 * v46 + v40 * v40;
-      }
-      else
-      {
-        if ( !((v25 < (double)v34) | __UNORDERED__(v25, v34)) )
-          goto LABEL_34;
-        v9 = v52 * v52 + v46 * v46 + v40 * v40;
-        v3 = v18;
-        v65 = v29;
-      }
-      v34 = v9;
-LABEL_34:
-      v66 = (*v2 + *v4) * 0.5;
-      v67 = (v4[1] + v2[1]) * 0.5;
-      v68 = (v4[2] + v2[2]) * 0.5;
-      v69 = (*v65 + *v3) * 0.5;
-      v70 = (v65[1] + v3[1]) * 0.5;
-      v71 = (v65[2] + v3[2]) * 0.5;
-      v59 = v69 - v66;
-      v60 = v70 - v67;
-      v61 = v71 - v68;
-      v53[0] = v60 * v56[2] - v61 * v56[1];
-      v53[1] = v61 * v56[0] - v59 * v56[2];
-      v53[2] = v59 * v56[1] - v60 * v56[0];
-      VectorNormalize(v53);
-      v26 = sqrt(v33) * 0.5;
-      v30 = -v26;
-      *v4 = v30 * v53[0] + v66;
-      v4[1] = v30 * v53[1] + v67;
-      v4[2] = v30 * v53[2] + v68;
-      *v2 = v53[0] * v26 + v66;
-      v2[1] = v53[1] * v26 + v67;
-      v2[2] = v53[2] * v26 + v68;
-      v27 = sqrt(v34) * 0.5;
-      v19 = v65;
-      *v3 = v53[0] * v27 + v69;
-      v3[1] = v53[1] * v27 + v70;
-      v3[2] = v53[2] * v27 + v71;
-      v31 = -v27;
-      *v19 = v31 * v53[0] + v69;
-      v19[1] = v31 * v53[1] + v70;
-      v19[2] = v31 * v53[2] + v71;
-      result = v32 + 6;
-      v32 += 6;
-      if ( v32 >= tess_numIndexes )
-        return result;
-      result = v32;
-    }
-  }
-  return result;
+/* ---- Autosprite2Deform  0x00514330 ----  [HIGH]
+ * Pivot each quad about its long axis to face the camera.  Of the six triangle
+ * edges the two shortest are found; each is re-projected along the minor axis
+ * (its perpendicular in the view plane) by half its length. */
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", on )
+#endif
+void Autosprite2Deform(void)
+{
+	float  forward[3];
+	float  minor[3];
+	float  major[3];
+	float  midShort[3], midSecond[3];
+	float *sp0, *sp1;    /* shortest edge endpoints      (retail v4, v2) */
+	float *tp0, *tp1;    /* second-shortest edge endpoints (retail v3, v65) */
+	float  shortLen, secondLen;
+	float  halfShort, halfSecond;
+	float  edge[3];
+	float  len;
+	int    base;
+	int    e;
+	static const unsigned char edges[6][2] = {{0,1},{1,2},{2,0},{3,4},{4,5},{5,3}};
+
+	if ( ( tess_numVertexes & 3 ) != 0 )
+		ri.Printf( 2, "Autosprite2 shader %s had odd vertex count\n", (const char *)tess_shader );
+	if ( tess_numIndexes != 6 * ( tess_numVertexes >> 2 ) )
+		ri.Printf( 2, "Autosprite2 shader %s had odd index count\n", (const char *)tess_shader );
+
+	if ( (int *)backEnd_currentEntity != &tr_worldEntity )
+	{
+		GlobalVectorToLocal( &backEnd_viewParms_axis00, forward );
+	}
+	else
+	{
+		forward[0] = backEnd_viewParms_axis00;
+		forward[1] = backEnd_viewParms_axis01;
+		forward[2] = backEnd_viewParms_axis02;
+	}
+
+	for ( base = 0; base < tess_numIndexes; base += 6 )
+	{
+		/* the two shortest of the six triangle edges */
+		shortLen = secondLen = 3.4028234663852885981e38f;
+		for (e=0;e<6;++e)
+		{
+			AS2_EDGE(edges[e][0],edges[e][1]);
+		}
+
+		midShort[0]  = ( sp1[0] + sp0[0] ) * 0.5f;
+		midShort[1]  = ( sp0[1] + sp1[1] ) * 0.5f;
+		midShort[2]  = ( sp0[2] + sp1[2] ) * 0.5f;
+		midSecond[0] = ( tp1[0] + tp0[0] ) * 0.5f;
+		midSecond[1] = ( tp1[1] + tp0[1] ) * 0.5f;
+		midSecond[2] = ( tp1[2] + tp0[2] ) * 0.5f;
+
+		major[0] = midSecond[0] - midShort[0];
+		major[1] = midSecond[1] - midShort[1];
+		major[2] = midSecond[2] - midShort[2];
+
+		minor[0] = major[1] * forward[2] - major[2] * forward[1];
+		minor[1] = major[2] * forward[0] - major[0] * forward[2];
+		minor[2] = major[0] * forward[1] - major[1] * forward[0];
+		VectorNormalize( minor );
+
+		halfShort = sqrt( shortLen ) * 0.5f;
+		sp0[0] = -halfShort * minor[0] + midShort[0];
+		sp0[1] = -halfShort * minor[1] + midShort[1];
+		sp0[2] = -halfShort * minor[2] + midShort[2];
+		sp1[0] = minor[0] * halfShort + midShort[0];
+		sp1[1] = minor[1] * halfShort + midShort[1];
+		sp1[2] = minor[2] * halfShort + midShort[2];
+
+		halfSecond = sqrt( secondLen ) * 0.5f;
+		tp0[0] = minor[0] * halfSecond + midSecond[0];
+		tp0[1] = minor[1] * halfSecond + midSecond[1];
+		tp0[2] = minor[2] * halfSecond + midSecond[2];
+		tp1[0] = -halfSecond * minor[0] + midSecond[0];
+		tp1[1] = -halfSecond * minor[1] + midSecond[1];
+		tp1[2] = -halfSecond * minor[2] + midSecond[2];
+	}
+	return;
 }
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", off )
+#endif
 
-/* ---- RB_DeformTessGeometry  0x005149B0 ----  VERIFIED */
-int __cdecl RB_DeformTessGeometry(void)
+/* ---- RB_DeformTessGeometry  0x005149B0 ----  VERIFIED
+ * Run every deform of the current shader over the tessellated geometry. */
+int __cdecl RB_DeformTessGeometry( void )
 {
-  int result;
-  int v4;
-  float *v5;
-  int i;
+	deformStage_t *ds;
+	int i;
 
-  result = tess_shader;
-  v4 = 0;
-  for ( i = 0; i < *(_DWORD *)(tess_shader + 172); ++i )
-  {
-    v5 = (float *)(result + v4 + 176);
-    switch ( *(_DWORD *)v5 )
-    {
-      case 1:
-        RB_CalcDeformVertexes((int)v5);
-        break;
-      case 2:
-        RB_CalcFlapVertexes(0, (int)v5);
-        break;
-      case 3:
-        RB_CalcFlapVertexes(1, (int)v5);
-        break;
-      case 4:
-        RB_CalcDeformNormals((int)v5);
-        break;
-      case 5:
-        RB_CalcDeformSyncNormals((int)v5);
-        break;
-      case 6:
-        RB_CalcBulgeVertexes(v5);
-        break;
-      case 7:
-        RB_CalcMoveVertexes((int)v5);
-        break;
-      case 8:
-        RB_ProjectionShadowDeform();
-        break;
-      case 9:
-        AutospriteDeform();
-        break;
-      case 0xA:
-        Autosprite2Deform();
-        break;
-      case 0xB:
-      case 0xC:
-      case 0xD:
-      case 0xE:
-      case 0xF:
-      case 0x10:
-      case 0x11:
-      case 0x12:
-        DeformText(&backEnd_refdef_text[32 * *(_DWORD *)v5 - 352]);
-        break;
-      default:
-        break;
-    }
-    result = tess_shader;
-    v4 += 52;
-  }
-  return result;
+	for ( i = 0; i < *(int *)( tess_shader + 172 ); i++ )   /* shader.numDeforms */
+	{
+		ds = (deformStage_t *)( tess_shader + 176 + 52 * i );   /* shader.deforms[i] */
+		switch ( ds->deformation )
+		{
+			case DEFORM_NONE:                                                  break;
+			case DEFORM_NORMALS:           RB_CalcDeformNormals( ds );         break;
+			case DEFORM_SYNC_NORMALS:      RB_CalcDeformSyncNormals( ds );     break;
+			case DEFORM_WAVE:              RB_CalcDeformVertexes( ds );        break;
+			case DEFORM_FLAP_S:            RB_CalcFlapVertexes( 0, ds );       break;
+			case DEFORM_FLAP_T:            RB_CalcFlapVertexes( 1, ds );       break;
+			case DEFORM_BULGE:             RB_CalcBulgeVertexes( ds );         break;
+			case DEFORM_MOVE:              RB_CalcMoveVertexes( ds );          break;
+			case DEFORM_PROJECTION_SHADOW: RB_ProjectionShadowDeform();        break;
+			case DEFORM_AUTOSPRITE:        AutospriteDeform();                 break;
+			case DEFORM_AUTOSPRITE2:       Autosprite2Deform();                break;
+			case DEFORM_TEXT0:
+			case DEFORM_TEXT1:
+			case DEFORM_TEXT2:
+			case DEFORM_TEXT3:
+			case DEFORM_TEXT4:
+			case DEFORM_TEXT5:
+			case DEFORM_TEXT6:
+			case DEFORM_TEXT7:
+				DeformText( ( (char (*)[32])backEnd_refdef_text )[ ds->deformation - DEFORM_TEXT0 ] );
+				break;
+		}
+	}
+	return tess_shader;   /* dead EAX */
 }
 
 /* ---- RB_CalcColorFromEntity  0x00514AC0 ----  [HIGH] */
 void __fastcall RB_CalcColorFromEntity( unsigned char *dstColors )
 {
-	int i;
+	int  i;
 	int *pColors = ( int * ) dstColors;
-	int c;
+	int  c;
 
-	if ( !backEnd_currentEntity ) {
+	if ( !backEnd_currentEntity )
 		return;
-	}
 
-	c = *( int * )( backEnd_currentEntity + 108 );
+	c = *( int * )( backEnd_currentEntity + 108 );   /* e.shaderRGBA */
 
 	for ( i = 0; i < tess_numVertexes; i++, pColors++ )
-	{
 		*pColors = c;
-	}
 }
 
 /* ---- RB_CalcColorFromOneMinusEntity  0x00514B00 ----  [HIGH] */
-int __fastcall RB_CalcColorFromOneMinusEntity(_DWORD *a1)
+void __fastcall RB_CalcColorFromOneMinusEntity( unsigned char *dstColors )
 {
-  int result;
-  int v2;
+	int           i;
+	int          *pColors = ( int * ) dstColors;
+	unsigned char invModulate[4];
 
-  result = backEnd_currentEntity;
-  if ( backEnd_currentEntity )
-  {
-    LOBYTE(v2) = -1 - *(_BYTE *)(backEnd_currentEntity + 108);
-    BYTE1(v2) = -1 - *(_BYTE *)(backEnd_currentEntity + 109);
-    BYTE2(v2) = -1 - *(_BYTE *)(backEnd_currentEntity + 110);
-    BYTE3(v2) = -1 - *(_BYTE *)(backEnd_currentEntity + 111);
-    for ( result = 0; result < tess_numVertexes; ++a1 )
-    {
-      *a1 = v2;
-      ++result;
-    }
-  }
-  return result;
+	if ( !backEnd_currentEntity )
+		return;
+
+	invModulate[0] = 255 - *( unsigned char * )( backEnd_currentEntity + 108 );
+	invModulate[1] = 255 - *( unsigned char * )( backEnd_currentEntity + 109 );
+	invModulate[2] = 255 - *( unsigned char * )( backEnd_currentEntity + 110 );
+	invModulate[3] = 255 - *( unsigned char * )( backEnd_currentEntity + 111 );
+	for ( i = 0; i < tess_numVertexes; i++, pColors++ )
+		*pColors = *( int * )invModulate;
 }
 
 /* ---- RB_CalcAlphaFromEntity  0x00514B70 ----  [HIGH] */
@@ -1046,16 +784,13 @@ void __cdecl RB_CalcAlphaFromEntity( unsigned char *dstColors )
 {
 	int i;
 
-	if ( !backEnd_currentEntity ) {
+	if ( !backEnd_currentEntity )
 		return;
-	}
 
 	dstColors += 3;
 
 	for ( i = 0; i < tess_numVertexes; i++, dstColors += 4 )
-	{
-		*dstColors = *( unsigned char * )( backEnd_currentEntity + 111 );
-	}
+		*dstColors = *( unsigned char * )( backEnd_currentEntity + 111 );   /* e.shaderRGBA[3] */
 }
 
 /* ---- RB_CalcAlphaFromOneMinusEntity  0x00514BB0 ----  [HIGH] */
@@ -1063,407 +798,237 @@ void __cdecl RB_CalcAlphaFromOneMinusEntity( unsigned char *dstColors )
 {
 	int i;
 
-	if ( !backEnd_currentEntity ) {
+	if ( !backEnd_currentEntity )
 		return;
-	}
 
 	dstColors += 3;
 
 	for ( i = 0; i < tess_numVertexes; i++, dstColors += 4 )
-	{
 		*dstColors = 0xff - *( unsigned char * )( backEnd_currentEntity + 111 );
-	}
 }
 
-/* ---- RB_CalcWaveColor  0x00514C00 ----  VERIFIED */
-int __cdecl RB_CalcWaveColor(_DWORD *a1, int a2)
+/* ---- RB_CalcWaveColor  0x00514C00 ----  VERIFIED
+ * Fill every vertex colour with a shared grey level driven by the waveform
+ * (noise or table-driven), scaled by identityLight and clamped to [0,1]. */
+int __cdecl RB_CalcWaveColor( unsigned char *dstColors, const waveForm_t *wf )
 {
-  double v4;
-  float *v5;
-  int result;
-  float t;
-  float noise;
-  float v9;
-  float v10;
-  int v11;
+	int           i;
+	int           v;
+	rfloat        glow;
+	int          *colors = ( int * ) dstColors;
+	unsigned char color[4];
 
-  if ( *(_DWORD *)a2 == 6 )
-  {
-    t = (tess_shaderTime + *(float *)(a2 + 12)) * *(float *)(a2 + 16);
-    noise = 0.0f;
-    noise = Com_NoiseGet4f(0.0f, 0.0f, 0.0f, t);
-    v4 = noise * *(float *)(a2 + 8) + *(float *)(a2 + 4);
-  }
-  else
-  {
-    v5 = TableForFunc(*(void **)a2);
-    v9 = (*(float *)(a2 + 16) * tess_shaderTime + *(float *)(a2 + 12)) * 1024.0;
-    ftol_tempSpill = (int)v9;
-    v4 = (*(float *)(a2 + 8) * v5[ftol_tempSpill & 0x3FF] + *(float *)(a2 + 4)) * tr_identityLight;
-  }
-  if ( v4 < 0.0 )
-  {
-    v4 = 0.0;
-  }
-  else if ( v4 > 1.0 )
-  {
-    v4 = 1.0;
-  }
-  v10 = v4 * 255.0;
-  ftol_tempSpill = (int)v10;
-  BYTE2(v11) = ftol_tempSpill;
-  BYTE1(v11) = BYTE2(v11);
-  LOBYTE(v11) = BYTE2(v11);
-  result = 0;
-  for ( BYTE3(v11) = -1; result < tess_numVertexes; ++a1 )
-  {
-    *a1 = v11;
-    ++result;
-  }
-  return result;
+	if ( wf->func == GF_NOISE )
+		glow = wf->base + Com_NoiseGet4f( 0.0f, 0.0f, 0.0f, ( tess_shaderTime + wf->phase ) * wf->frequency ) * wf->amplitude;
+	else
+		glow = EvalWaveForm( wf ) * tr_identityLight;
+
+	if ( glow < 0 )
+		glow = 0;
+	else if ( glow > 1 )
+		glow = 1;
+
+	v = myftol( 255 * glow );
+	color[0] = color[1] = color[2] = v;
+	color[3] = 255;
+	v = *( int * )color;
+
+	for ( i = 0; i < tess_numVertexes; i++, colors++ )
+		*colors = v;
+	return i;
 }
 
 /* ---- RB_CalcWaveAlpha  0x00514D00 ----  VERIFIED */
-int __cdecl RB_CalcWaveAlpha(int a1, int a2)
+int __cdecl RB_CalcWaveAlpha( const waveForm_t *wf, unsigned char *dstColors )
 {
-  unsigned __int64 v2; // rax
-  int v3;
+	int    i;
+	int    v;
+	rfloat glow;
 
-  v2 = (unsigned __int64)(EvalWaveFormClamped(a1) * 255.0);
-  v3 = 0;
-  if ( tess_numVertexes > 0 )
-  {
-    HIDWORD(v2) = a2 + 3;
-    do
-    {
-      *(_BYTE *)HIDWORD(v2) = v2;
-      ++v3;
-      HIDWORD(v2) += 4;
-    }
-    while ( v3 < tess_numVertexes );
-  }
-  return v2;
+	glow = EvalWaveFormClamped( wf );
+	v = (int)( 255 * glow );
+	for ( i = 0; i < tess_numVertexes; i++, dstColors += 4 )
+		dstColors[3] = v;
+	return v;   /* dead EAX (shared alpha byte) */
 }
 
-/* ---- RB_CalcEnvironmentTexCoords  0x00514D40 ----  [HIGH] */
-int __cdecl RB_CalcEnvironmentTexCoords(int a1)
+/* ---- RB_CalcEnvironmentTexCoords  0x00514D40 ----  [HIGH]
+ * Sphere-map environment coords from the reflected view vector. */
+void __cdecl RB_CalcEnvironmentTexCoords( float *st )
 {
-  int result;
-  int v3;
-  float *v4;
-  float *v5;
-  double v6;
-  double v7;
-  double v8;
-  float v9[3]; // [esp+Ch..14h] BYREF -- ONE vec3
-  float v12;
+	int    i;
+	float *v, *normal;
+	vec3_t viewer, reflected;
+	float  d;
 
-  result = tess_numVertexes;
-  v3 = 0;
-  v4 = (float *)tess_xyz;
-  if ( tess_numVertexes > 0 )
-  {
-    v5 = dword_1827F68;
-    do
-    {
-      v9[0] = flt_16D8DD8 - *v4;
-      v9[1] = flt_16D8DDC - v4[1];
-      v9[2] = flt_16D8DE0 - v4[2];
-      VectorNormalizeFast(v9);
-      ++v3;
-      v6 = v9[0] * *(v5 - 2);
-      v5 += 3;
-      a1 += 8;
-      v7 = v6 + v9[1] * *(v5 - 4) + v9[2] * *(v5 - 3);
-      v8 = v7 * *(v5 - 4) + v7 * *(v5 - 4) - v9[1];
-      v12 = v7 * *(v5 - 3) + v7 * *(v5 - 3) - v9[2];
-      *(float *)(a1 - 8) = (v8 + 1.0) * 0.5;
-      *(float *)(a1 - 4) = 0.5 - v12 * 0.5;
-      result = tess_vertexComponentCount;
-      v4 += tess_vertexComponentCount;
-    }
-    while ( v3 < tess_numVertexes );
-  }
-  return result;
+	v = (float *)tess_xyz;
+	normal = (float *)tess_stageNormals;
+
+	for ( i = 0; i < tess_numVertexes; i++, v += tess_vertexComponentCount, normal += 3, st += 2 )
+	{
+		VectorSubtract( backEnd_or.viewOrigin, v, viewer );
+		VectorNormalizeFast( viewer );
+
+		d = DotProduct( normal, viewer );
+
+		reflected[0] = normal[0] * 2 * d - viewer[0];
+		reflected[1] = normal[1] * 2 * d - viewer[1];
+		reflected[2] = normal[2] * 2 * d - viewer[2];
+
+		st[0] = ( reflected[1] + 1.0f ) * 0.5f;
+		st[1] = 0.5f - reflected[2] * 0.5f;
+	}
 }
 
-/* ---- RB_CalcCubeMapEyeToVertexTexCoords  0x00514E10 ----  VERIFIED */
-int __fastcall RB_CalcCubeMapEyeToVertexTexCoords(int a1)
+/* ---- RB_CalcCubeMapEyeToVertexTexCoords  0x00514E10 ----  VERIFIED
+ * Cube-map coords along the eye-to-vertex direction (vertex - eye). */
+void __fastcall RB_CalcCubeMapEyeToVertexTexCoords( float *st )
 {
-  __int64 v1; // rax
+	float *xyz;
+	int    i;
 
-  v1 = (unsigned int)tess_xyz;
-  if ( tess_numVertexes > 0 )
-  {
-    do
-    {
-      ++HIDWORD(v1);
-      a1 += 12;
-      *(float *)(a1 - 12) = *(float *)v1 - flt_16D8DD8;
-      *(float *)(a1 - 8) = *(float *)(v1 + 4) - flt_16D8DDC;
-      *(float *)(a1 - 4) = *(float *)(v1 + 8) - flt_16D8DE0;
-      LODWORD(v1) = v1 + 4 * tess_vertexComponentCount;
-    }
-    while ( SHIDWORD(v1) < tess_numVertexes );
-  }
-  return v1;
+	xyz = (float *)tess_xyz;
+	for ( i = 0; i < tess_numVertexes; i++, st += 3, xyz += tess_vertexComponentCount )
+		VectorSubtract( xyz, backEnd_or.viewOrigin, st );
 }
 
-/* ---- RB_CalcCubeMapVertexToEyeTexCoords  0x00514E60 ----  [HIGH] */
-int __fastcall RB_CalcCubeMapVertexToEyeTexCoords(int a1)
+/* ---- RB_CalcCubeMapVertexToEyeTexCoords  0x00514E60 ----  [HIGH]
+ * Cube-map coords along the vertex-to-eye direction (eye - vertex). */
+void __fastcall RB_CalcCubeMapVertexToEyeTexCoords( float *st )
 {
-  __int64 v1; // rax
+	float *xyz;
+	int    i;
 
-  v1 = (unsigned int)tess_xyz;
-  if ( tess_numVertexes > 0 )
-  {
-    do
-    {
-      ++HIDWORD(v1);
-      a1 += 12;
-      *(float *)(a1 - 12) = flt_16D8DD8 - *(float *)v1;
-      *(float *)(a1 - 8) = flt_16D8DDC - *(float *)(v1 + 4);
-      *(float *)(a1 - 4) = flt_16D8DE0 - *(float *)(v1 + 8);
-      LODWORD(v1) = v1 + 4 * tess_vertexComponentCount;
-    }
-    while ( SHIDWORD(v1) < tess_numVertexes );
-  }
-  return v1;
+	xyz = (float *)tess_xyz;
+	for ( i = 0; i < tess_numVertexes; i++, st += 3, xyz += tess_vertexComponentCount )
+		VectorSubtract( backEnd_or.viewOrigin, xyz, st );
 }
 
-/* ---- RB_CalcCubeMapReflectionTexCoords  0x00514EB0 ----  [HIGH] */
-float *__fastcall RB_CalcCubeMapReflectionTexCoords(int a1, int a2)
+/* ---- RB_CalcCubeMapReflectionTexCoords  0x00514EB0 ----  [HIGH]
+ * Cube-map coords along the view vector reflected about the surface normal. */
+void __cdecl RB_CalcCubeMapReflectionTexCoords( float *st )
 {
-  float *result;
-  int v3;
-  float *v4;
-  double v5;
-  double v6;
-  double v7;
-  double v8;
-  float v9;
-  float v10;
-  float v11;
+	int    i;
+	float *xyz, *normal;
+	vec3_t viewer, reflected;
+	float  d;
 
-  result = (float *)tess_numVertexes;
-  v3 = 0;
-  v4 = (float *)tess_xyz;
-  if ( tess_numVertexes > 0 )
-  {
-    result = dword_1827F68;
-    do
-    {
-      ++v3;
-      v5 = flt_16D8DD8 - *v4;
-      result += 3;
-      a2 += 12;
-      v6 = flt_16D8DDC - v4[1];
-      v11 = flt_16D8DE0 - v4[2];
-      v7 = v6 * *(result - 4) + v5 * *(result - 5) + v11 * *(result - 3);
-      v8 = v7 + v7;
-      v9 = v8 * *(result - 4);
-      v10 = v8 * *(result - 3);
-      *(float *)(a2 - 12) = v8 * *(result - 5) - v5;
-      *(float *)(a2 - 8) = v9 - v6;
-      *(float *)(a2 - 4) = v10 - v11;
-      v4 += tess_vertexComponentCount;
-    }
-    while ( v3 < tess_numVertexes );
-  }
-  return result;
+	xyz = (float *)tess_xyz;
+	normal = (float *)tess_stageNormals;
+	for ( i = 0; i < tess_numVertexes; i++, xyz += tess_vertexComponentCount, normal += 3, st += 3 )
+	{
+		VectorSubtract( backEnd_or.viewOrigin, xyz, viewer );
+		d = DotProduct( viewer, normal );
+		VectorScale( normal, 2 * d, reflected );
+		VectorSubtract( reflected, viewer, st );
+	}
 }
 
-/* ---- RB_CalcCubeMapLightVectorTexCoords  0x00514F60 ----  VERIFIED */
-int __fastcall RB_CalcCubeMapLightVectorTexCoords(int a1)
+/* ---- RB_CalcCubeMapLightVectorTexCoords  0x00514F60 ----  VERIFIED
+ * Cube-map coords along the current light vector in local space. */
+void __fastcall RB_CalcCubeMapLightVectorTexCoords( float *st )
 {
-  double v2;
-  double v5;
-  double v6;
-  __int64 v7; // rax
-  float v9;
-  float v10;
-  float v11;
+	dlight_t *dl = (dlight_t *)backEnd_currentDlight;
+	float    *xyz;
+	vec3_t    lv;
+	vec3_t    local;
+	int       i;
 
-  v2 = *(float *)(backEnd_currentDlight + 68);
-  if ( *(float *)(backEnd_currentDlight + 80) == 0.0f )
-  {
-    v5 = *(float *)(backEnd_currentDlight + 72);
-    v6 = *(float *)(backEnd_currentDlight + 76);
-  }
-  else
-  {
-    v2 = v2 - flt_16D8DA8;
-    v5 = *(float *)(backEnd_currentDlight + 72) - flt_16D8DAC;
-    v6 = *(float *)(backEnd_currentDlight + 76) - flt_16D8DB0;
-  }
-  v7 = (unsigned int)tess_xyz;
-  v9 = flt_16D8DBC * v6 + flt_16D8DB8 * v5 + flt_16D8DB4 * v2;
-  v10 = flt_16D8DC8 * v6 + flt_16D8DC4 * v5 + flt_16D8DC0 * v2;
-  v11 = flt_16D8DD4 * v6 + flt_16D8DD0 * v5 + flt_16D8DCC * v2;
-  if ( tess_numVertexes > 0 )
-  {
-    do
-    {
-      ++HIDWORD(v7);
-      a1 += 12;
-      *(float *)(a1 - 12) = v9 - *(float *)v7;
-      *(float *)(a1 - 8) = v10 - *(float *)(v7 + 4);
-      *(float *)(a1 - 4) = v11 - *(float *)(v7 + 8);
-      LODWORD(v7) = v7 + 4 * tess_vertexComponentCount;
-    }
-    while ( SHIDWORD(v7) < tess_numVertexes );
-  }
-  return v7;
+	if ( dl->position[3] != 0 )
+		VectorSubtract( dl->position, backEnd_or.origin, lv );
+	else
+		VectorCopy( dl->position, lv );
+
+	local[0] = backEnd_or.axis[0][2] * lv[2] + backEnd_or.axis[0][1] * lv[1] + backEnd_or.axis[0][0] * lv[0];
+	local[1] = backEnd_or.axis[1][2] * lv[2] + backEnd_or.axis[1][1] * lv[1] + backEnd_or.axis[1][0] * lv[0];
+	local[2] = backEnd_or.axis[2][2] * lv[2] + backEnd_or.axis[2][1] * lv[1] + backEnd_or.axis[2][0] * lv[0];
+
+	xyz = (float *)tess_xyz;
+	for ( i = 0; i < tess_numVertexes; i++, st += 3, xyz += tess_vertexComponentCount )
+		VectorSubtract( local, xyz, st );
 }
 
-/* ---- RB_CalcCubeMapLightHalfAngleTexCoords  0x00515050 ----  VERIFIED */
-int __cdecl RB_CalcCubeMapLightHalfAngleTexCoords(int a1)
+/* ---- RB_CalcCubeMapLightHalfAngleTexCoords  0x00515050 ----  VERIFIED
+ * Cube-map coords along the half-angle vector (normalized light + eye). */
+void __cdecl RB_CalcCubeMapLightHalfAngleTexCoords( float *st )
 {
-  double v2;
-  double v6;
-  double v7;
-  int result;
-  int v9;
-  float *v10;
-  float v11[3]; // [esp+Ch..14h]  BYREF -- ONE vec3 (light vector)
-  float v14[3]; // [esp+18h..20h] BYREF -- ONE vec3 (eye vector)
-  float v17;
-  float v18;
-  float i;
+	dlight_t *dl = (dlight_t *)backEnd_currentDlight;
+	float    *xyz;
+	vec3_t    lv;
+	vec3_t    local;
+	vec3_t    light, eye;
+	int       i;
 
-  v2 = *(float *)(backEnd_currentDlight + 68);
-  if ( *(float *)(backEnd_currentDlight + 80) == 0.0f )
-  {
-    v6 = *(float *)(backEnd_currentDlight + 72);
-    v7 = *(float *)(backEnd_currentDlight + 76);
-  }
-  else
-  {
-    v2 = v2 - flt_16D8DA8;
-    v6 = *(float *)(backEnd_currentDlight + 72) - flt_16D8DAC;
-    v7 = *(float *)(backEnd_currentDlight + 76) - flt_16D8DB0;
-  }
-  result = tess_numVertexes;
-  v9 = 0;
-  v10 = (float *)tess_xyz;
-  v17 = flt_16D8DBC * v7 + flt_16D8DB8 * v6 + flt_16D8DB4 * v2;
-  v18 = flt_16D8DC8 * v7 + flt_16D8DC4 * v6 + flt_16D8DC0 * v2;
-  for ( i = flt_16D8DD4 * v7 + flt_16D8DD0 * v6 + flt_16D8DCC * v2; v9 < tess_numVertexes; v10 += tess_vertexComponentCount )
-  {
-    v14[0] = flt_16D8DD8 - *v10;
-    v14[1] = flt_16D8DDC - v10[1];
-    v14[2] = flt_16D8DE0 - v10[2];
-    VectorNormalizeFast(v14);
-    v11[0] = v17 - *v10;
-    v11[1] = v18 - v10[1];
-    v11[2] = i - v10[2];
-    VectorNormalizeFast(v11);
-    ++v9;
-    a1 += 12;
-    *(float *)(a1 - 12) = v11[0] + v14[0];
-    *(float *)(a1 - 8) = v11[1] + v14[1];
-    *(float *)(a1 - 4) = v11[2] + v14[2];
-    result = tess_vertexComponentCount;
-  }
-  return result;
+	if ( dl->position[3] != 0 )
+		VectorSubtract( dl->position, backEnd_or.origin, lv );
+	else
+		VectorCopy( dl->position, lv );
+
+	local[0] = backEnd_or.axis[0][2] * lv[2] + backEnd_or.axis[0][1] * lv[1] + backEnd_or.axis[0][0] * lv[0];
+	local[1] = backEnd_or.axis[1][2] * lv[2] + backEnd_or.axis[1][1] * lv[1] + backEnd_or.axis[1][0] * lv[0];
+	local[2] = backEnd_or.axis[2][2] * lv[2] + backEnd_or.axis[2][1] * lv[1] + backEnd_or.axis[2][0] * lv[0];
+
+	xyz = (float *)tess_xyz;
+	for ( i = 0; i < tess_numVertexes; i++, st += 3, xyz += tess_vertexComponentCount )
+	{
+		VectorSubtract( backEnd_or.viewOrigin, xyz, eye );
+		VectorNormalizeFast( eye );
+		VectorSubtract( local, xyz, light );
+		VectorNormalizeFast( light );
+		VectorAdd( light, eye, st );
+	}
 }
 
-/* ---- RB_CalcCubeMapSunHalfAngleTexCoords  0x005151B0 ----  [HIGH] */
-int __cdecl RB_CalcCubeMapSunHalfAngleTexCoords(int a1)
+/* ---- RB_CalcCubeMapSunHalfAngleTexCoords  0x005151B0 ----  [HIGH]
+ * Cube-map coords along the half-angle vector for the (directional) sun. */
+void __cdecl RB_CalcCubeMapSunHalfAngleTexCoords( float *st )
 {
-  int result;
-  int v3;
-  float *i;
-  float v5[3]; // [esp+Ch..14h] BYREF -- ONE vec3
+	int    i;
+	float *xyz;
+	vec3_t eye;
 
-  result = tess_numVertexes;
-  v3 = 0;
-  for ( i = (float *)tess_xyz; v3 < tess_numVertexes; i += tess_vertexComponentCount )
-  {
-    v5[0] = flt_16D8DD8 - *i;
-    v5[1] = flt_16D8DDC - i[1];
-    v5[2] = flt_16D8DE0 - i[2];
-    VectorNormalizeFast(v5);
-    ++v3;
-    a1 += 12;
-    *(float *)(a1 - 12) = *(float *)&tr_sunDirection + v5[0];
-    *(float *)(a1 - 8) = *(float *)&dword_16C57D4 + v5[1];
-    *(float *)(a1 - 4) = *(float *)&dword_16C57D8 + v5[2];
-    result = tess_vertexComponentCount;
-  }
-  return result;
+	xyz = (float *)tess_xyz;
+	for ( i = 0; i < tess_numVertexes; i++, st += 3, xyz += tess_vertexComponentCount )
+	{
+		VectorSubtract( backEnd_or.viewOrigin, xyz, eye );
+		VectorNormalizeFast( eye );
+		VectorAdd( tr_sunDirection, eye, st );
+	}
 }
 
-/* ---- RB_CalcCubeMapTbnTexCoords  0x00515250 ----  VERIFIED */
-_DWORD *__cdecl RB_CalcCubeMapTbnTexCoords(_DWORD *a1, int a2)
+/* ---- RB_CalcCubeMapTbnTexCoords  0x00515250 ----  VERIFIED
+ * Pass the per-vertex tangent/bitangent/normal basis through as three coords. */
+void __cdecl RB_CalcCubeMapTbnTexCoords( float *out, int startIndex )
 {
-  _DWORD *result;  /* the bitangent cursor; retail's EAX */
-  int v4;
-  _DWORD *tan;
-  _DWORD *nrm;
+	int i;
 
-  if ( !tess_stageTangentsValid || !tess_stageBitangentsValid )
-    RB_CalcTangentSpace();
-  result = (_DWORD *)tess_numVertexes;
-  v4 = 0;
-  if ( tess_numVertexes > 0 )
-  {
-    result = (_DWORD *)((char *)tess_stageBitangents + 4 * a2);
-    tan    = (_DWORD *)((char *)tess_stageTangents   + 4 * a2);
-    nrm    = (_DWORD *)((char *)tess_stageNormals    + 4 * a2);
-    do
-    {
-      *a1 = *tan;
-      a1[1] = *result;
-      a1[2] = *nrm;
-      ++v4;
-      result += 3;
-      tan += 3;
-      nrm += 3;
-      a1 += 3;
-    }
-    while ( v4 < tess_numVertexes );
-  }
-  return result;
+	if ( !tess_stageTangentsValid || !tess_stageBitangentsValid )
+		RB_CalcTangentSpace();
+
+	for ( i = 0; i < tess_numVertexes; i++, out += 3 )
+	{
+		out[0] = tess_stageTangents[ i * 3 + startIndex ];
+		out[1] = tess_stageBitangents[ i * 3 + startIndex ];
+		out[2] = tess_stageNormals[ i * 3 + startIndex ];
+	}
 }
 
-/* ---- RB_CalcCubeMapDot3ReflectTexCoords  0x005152B0 ----  VERIFIED */
-float *__cdecl RB_CalcCubeMapDot3ReflectTexCoords(int a1, float *a2)
+/* ---- RB_CalcCubeMapDot3ReflectTexCoords  0x005152B0 ----  VERIFIED
+ * Emit the tangent/bitangent/normal basis plus the eye-X delta in the 4th coord. */
+void __cdecl RB_CalcCubeMapDot3ReflectTexCoords( float *out, int startIndex )
 {
-  float *result;  /* the bitangent cursor; retail's EAX */
-  int v5;
-  double v6;
-  float *tan;
-  float *nrm;
-  float *xyz;
+	int i;
 
-  if ( !tess_stageTangentsValid || !tess_stageBitangentsValid )
-    RB_CalcTangentSpace();
-  result = (float *)tess_numVertexes;
-  v5 = 0;
-  if ( tess_numVertexes > 0 )
-  {
-    result = (float *)((char *)tess_stageBitangents + 4 * a1);
-    tan    = (float *)((char *)tess_stageTangents   + 4 * a1);
-    nrm    = (float *)((char *)tess_stageNormals    + 4 * a1);
-    xyz    = (float *)((char *)tess_xyz             + 4 * a1);
-    do
-    {
-      *a2 = *tan;
-      a2[1] = *result;
-      a2[2] = *nrm;
-      v6 = backEnd_viewParms_originX[a1] - *xyz;
-      ++v5;
-      result += 3;
-      tan += 3;
-      nrm += 3;
-      xyz += 3;
-      a2 += 4;
-      *(a2 - 1) = v6;
-    }
-    while ( v5 < tess_numVertexes );
-  }
-  return result;
+	if ( !tess_stageTangentsValid || !tess_stageBitangentsValid )
+		RB_CalcTangentSpace();
+
+	for ( i = 0; i < tess_numVertexes; i++, out += 4 )
+	{
+		out[0] = tess_stageTangents[ i * 3 + startIndex ];
+		out[1] = tess_stageBitangents[ i * 3 + startIndex ];
+		out[2] = tess_stageNormals[ i * 3 + startIndex ];
+		out[3] = backEnd_viewParms_originX[ startIndex ] - tess_xyz[ i * 3 + startIndex ];
+	}
 }
 
 /* ---- RB_CalcSwapTexCoords  0x00515320 ----  [HIGH] */
@@ -1482,48 +1047,49 @@ void __cdecl RB_CalcSwapTexCoords( float *st )
 }
 
 /* ---- RB_CalcTurbulentTexCoords  0x00515360 ----  [HIGH] */
-void __cdecl RB_CalcTurbulentTexCoords( float *st, const float *wf )
+void __cdecl RB_CalcTurbulentTexCoords( float *st, waveForm_t *wf )
 {
-	int i;
-	float now;
+	int    i;
+	float  now;
 	const float *xyz;
 
-	now = wf[3]  + tess_shaderTime * wf[4] ;
+	now = ( wf->phase + tess_shaderTime * wf->frequency );
 
-	xyz = tess_xyz_base;
+	xyz = (float *)tess_xyz;
 	for ( i = 0; i < tess_numVertexes; i++, st += 2, xyz += tess_vertexComponentCount )
 	{
-		st[0] += tr_sinTable[ (int)( ( ( xyz[0] + xyz[2] ) * ( 1.0f / 1024.0f ) + now )
-		                             * FUNCTABLE_SIZE ) & FUNCTABLE_MASK ] * wf[2] ;
-		st[1] += tr_sinTable[ (int)( ( xyz[1] * ( 1.0f / 1024.0f ) + now )
-		                             * FUNCTABLE_SIZE ) & FUNCTABLE_MASK ] * wf[2];
+		float s = st[0];
+		float t = st[1];
+
+		st[0] = s + tr_sinTable[ ( (int)( ( ( xyz[0] + xyz[2] ) * 1.0 / 128 * 0.125 + now ) * FUNCTABLE_SIZE ) ) & ( FUNCTABLE_MASK ) ] * wf->amplitude;
+		st[1] = t + tr_sinTable[ ( (int)( ( xyz[1] * 1.0 / 128 * 0.125 + now ) * FUNCTABLE_SIZE ) ) & ( FUNCTABLE_MASK ) ] * wf->amplitude;
 	}
 }
 
 /* ---- RB_CalcScaleTexCoords  0x00515410 ----  VERIFIED */
-void __cdecl RB_CalcScaleTexCoords( float *st, const float *scale )
+void __cdecl RB_CalcScaleTexCoords( const float *scale, float *st )
 {
 	int i;
 
 	for ( i = 0; i < tess_numVertexes; i++, st += 2 )
 	{
-		st[0] *= scale[0];
-		st[1] *= scale[1];
+		st[0] = scale[0] * st[0];
+		st[1] = scale[1] * st[1];
 	}
 }
 
 /* ---- RB_CalcScrollTexCoords  0x00515440 ----  [HIGH] */
 void __cdecl RB_CalcScrollTexCoords( const float *scrollSpeed, float *st )
 {
-	int i;
+	int   i;
 	float timeScale = tess_shaderTime;
 	float adjustedScrollS, adjustedScrollT;
 
 	adjustedScrollS = scrollSpeed[0] * timeScale;
 	adjustedScrollT = scrollSpeed[1] * timeScale;
 
-	adjustedScrollS = adjustedScrollS - floor( adjustedScrollS );
-	adjustedScrollT = adjustedScrollT - floor( adjustedScrollT );
+	adjustedScrollS = adjustedScrollS - (float)floor( adjustedScrollS );
+	adjustedScrollT = adjustedScrollT - (float)floor( adjustedScrollT );
 
 	for ( i = 0; i < tess_numVertexes; i++, st += 2 )
 	{
@@ -1533,368 +1099,356 @@ void __cdecl RB_CalcScrollTexCoords( const float *scrollSpeed, float *st )
 }
 
 /* ---- RB_CalcTransformTexCoords  0x005154C0 ----  VERIFIED */
-float *__cdecl RB_CalcTransformTexCoords(float *result, float *a2)
+float *__cdecl RB_CalcTransformTexCoords( texModInfo_t *tmi, float *st )
 {
-  int i;
-  double v3;
-  double v4;
+	int   i;
+	float s, t;
 
-  for ( i = 0; i < tess_numVertexes; *(a2 - 1) = v4 * result[9] + v3 * result[7] + result[11] )
-  {
-    v3 = *a2;
-    ++i;
-    v4 = a2[1];
-    a2 += 2;
-    *(a2 - 2) = v4 * result[8] + v3 * result[6] + result[10];
-  }
-  return result;
+	for ( i = 0; i < tess_numVertexes; i++, st += 2 )
+	{
+		s = st[0];
+		t = st[1];
+		st[0] = t * tmi->matrix[1][0] + s * tmi->matrix[0][0] + tmi->translate[0];
+		st[1] = t * tmi->matrix[1][1] + s * tmi->matrix[0][1] + tmi->translate[1];
+	}
+	return (float *)tmi;
 }
 
 /* ---- RB_CalcRotateTexCoords  0x00515510 ----  [HIGH] */
-float *__cdecl RB_CalcRotateTexCoords(float a1, float *a2)
+float *__cdecl RB_CalcRotateTexCoords( float degsPerSecond, float *st )
 {
-  unsigned __int64 v2; // rax
-  double v3;
-  double v4;
-  float v6;
-  float v7[17]; // [esp+4h] [ebp-44h] BYREF
-  float v8;
+	rfloat       timeScale = tess_shaderTime;
+	rfloat       degs;
+	int          index;
+	rfloat       sinValue, cosValue;
+	texModInfo_t tmi;
 
-  v2 = (unsigned __int64)(-(tess_shaderTime * a1) * 2.8444445133209228516);
-  v3 = tr_sinTable[v2 & 0x3FF];
-  LODWORD(v2) = ((_WORD)v2 + 256) & 0x3FF;
-  v4 = tr_sinTable[(_DWORD)v2];
-  v7[6] = tr_sinTable[(_DWORD)v2];
-  v7[8] = -v3;
-  v6 = 0.5 * v4;
-  v8 = v3 * 0.5;
-  v7[10] = 0.5 - v6 + v8;
-  v7[7] = v3;
-  v7[9] = v4;
-  v7[11] = 0.5 - v8 - v6;
-  return RB_CalcTransformTexCoords(v7, a2);
+	degs = -degsPerSecond * timeScale;
+	index = (int)( degs * ( FUNCTABLE_SIZE / 360.0f ) );
+
+	sinValue = tr_sinTable[ index & FUNCTABLE_MASK ];
+	cosValue = tr_sinTable[ ( index + FUNCTABLE_SIZE / 4 ) & FUNCTABLE_MASK ];
+
+	tmi.matrix[0][0] = cosValue;
+	tmi.matrix[1][0] = -sinValue;
+	tmi.translate[0] = 0.5f - 0.5f * cosValue + 0.5f * sinValue;
+
+	tmi.matrix[0][1] = sinValue;
+	tmi.matrix[1][1] = cosValue;
+	tmi.translate[1] = 0.5f - 0.5f * sinValue - 0.5f * cosValue;
+
+	return RB_CalcTransformTexCoords( &tmi, st );
 }
 
-/* ---- RB_CalcCubeMapNegateTexCoords  0x005155B0 ----  VERIFIED */
-float *__cdecl RB_CalcCubeMapNegateTexCoords(float *result)
+/* ---- RB_CalcCubeMapNegateTexCoords  0x005155B0 ----  VERIFIED
+ * Negate every component of the 3-float cube-map coords in place. */
+float *__cdecl RB_CalcCubeMapNegateTexCoords( float *st )
 {
-  int v1;
-  double v2;
+	int count = 3 * tess_numVertexes;
 
-  v1 = 3 * tess_numVertexes;
-  if ( 3 * tess_numVertexes > 0 )
-  {
-    do
-    {
-      v2 = *result++;
-      --v1;
-      *(result - 1) = -v2;
-    }
-    while ( v1 );
-  }
-  return result;
+	if ( count > 0 )
+	{
+		do
+		{
+			*st = -*st;
+			++st;
+			--count;
+		}
+		while ( count );
+	}
+	return st;
 }
 
-/* ---- GetSTVectors  0x005155D0 ----  VERIFIED */
-double __cdecl GetSTVectors(float *result, int a2, int a3, int a4)
+/* ---- GetSTVectors  0x005155D0 ----  VERIFIED
+ * S-tangent of a triangle: the vertex positions weighted by their T deltas.
+ * bitangent is never written, but retail's caller still pushes it. */
+void __cdecl GetSTVectors( int i0, int i1, int i2, float *tangent, float *bitangent )
 {
-  double v4;
-  double v5;
-  int v6;
-  double v7;
-  int v8;
-  int v9;
-  double v10;
+	rfloat d0, d1, d2;
+	int    b0, b1, b2;
 
-  v4 = *(float *)&dword_17DFF64[2 * a3] - *(float *)&dword_17DFF64[2 * a4];
-  v5 = *(float *)&dword_17DFF64[2 * a4] - *(float *)&dword_17DFF64[2 * a2];
-  v6 = a2 * tess_vertexComponentCount;
-  v7 = *(float *)&dword_17DFF64[2 * a2] - *(float *)&dword_17DFF64[2 * a3];
-  v8 = a3 * tess_vertexComponentCount;
-  v9 = a4 * tess_vertexComponentCount;
-  *result = v4 * *(float *)&tess_xyz[v6]
-          + v5 * *(float *)&tess_xyz[a3 * tess_vertexComponentCount]
-          + v7 * *(float *)&tess_xyz[a4 * tess_vertexComponentCount];
-  result[1] = v4 * flt_17BFF64[v6] + v5 * flt_17BFF64[v8] + v7 * flt_17BFF64[v9];
-  v10 = v4 * *(float *)&dword_17BFF68[v6] + v5 * *(float *)&dword_17BFF68[v8] + v7 * *(float *)&dword_17BFF68[v9];
-  result[2] = v10;
-  VectorNormalizeFast(result);
-  return v10;
+	d0 = tess_texCoords0[2 * i1 + 1] - tess_texCoords0[2 * i2 + 1];
+	d1 = tess_texCoords0[2 * i2 + 1] - tess_texCoords0[2 * i0 + 1];
+	d2 = tess_texCoords0[2 * i0 + 1] - tess_texCoords0[2 * i1 + 1];
+	b0 = i0 * tess_vertexComponentCount;
+	b1 = i1 * tess_vertexComponentCount;
+	b2 = i2 * tess_vertexComponentCount;
+
+	tangent[0] = d0 * tess_xyz[b0]     + d1 * tess_xyz[b1]     + d2 * tess_xyz[b2];
+	tangent[1] = d0 * tess_xyz[b0 + 1] + d1 * tess_xyz[b1 + 1] + d2 * tess_xyz[b2 + 1];
+	tangent[2] = d0 * tess_xyz[b0 + 2] + d1 * tess_xyz[b1 + 2] + d2 * tess_xyz[b2 + 2];
+	VectorNormalizeFast( tangent );
 }
 
-/* ---- RB_CalcTangentSpace  0x00515680 ----  [HIGH] */
-int RB_CalcTangentSpace()
+/* ---- RB_CalcTangentSpace  0x00515680 ----  [HIGH]
+ * Accumulate a per-vertex tangent frame from the triangles, normalize the
+ * tangents shared by more than one triangle, then set the bitangent to
+ * normal x tangent. */
+void RB_CalcTangentSpace( void )
 {
-  int i;
-  int v1;
-  int v2;
-  int v3;
-  double v4;
-  int v5;
-  int v6;
-  int v7;
-  int result;
-  int v9;
-  float *v10;
-  float v11[3]; // [esp+10h..18h] BYREF -- ONE vec3
-  int v14;
-  _DWORD v15[8192]; // [esp+20h] [ebp-8000h] BYREF
-  float *nrm;
-  float *bit;
+	vec3_t tangent;
+	int    counts[8192];
+	int    i;
+	int    i0, i1, i2;
 
-  memset(tess_stageTangents, 0, 12 * tess_numVertexes);
-  memset(tess_stageBitangents, 0, 12 * tess_numVertexes);
-  memset(v15, 0, 4 * tess_numVertexes);
-  for ( i = 0; i < tess_numIndexes; *(float *)(v7 + ((int)(char *)tess_stageTangents + 8)) = v11[2] + flt_1857F68[3 * v2] )
-  {
-    v1 = (unsigned __int16)tess_indexes[i];
-    v2 = (unsigned __int16)word_17A7F64[i];
-    v3 = (unsigned __int16)word_17A7F62[i];
-    v14 = v2;
-    GetSTVectors(v11, v1, v3, v2);
-    v4 = v11[0];
-    ++v15[v1];
-    ++v15[v3];
-    ++v15[v2];
-    v5 = 12 * v1;
-    i += 3;
-    *(float *)(v5 + ((int)(char *)tess_stageTangents)) = v4 + *(float *)&tess_stageTangents[3 * v1];
-    *(float *)(v5 + ((int)(char *)tess_stageTangents + 4)) = v11[1] + *((float *)&unk_1857F64 + 3 * v1);
-    *(float *)(v5 + ((int)(char *)tess_stageTangents + 8)) = v11[2] + flt_1857F68[3 * v1];
-    v6 = 12 * v3;
-    *(float *)(v6 + ((int)(char *)tess_stageTangents)) = v11[0] + *(float *)&tess_stageTangents[3 * v3];
-    *(float *)(v6 + ((int)(char *)tess_stageTangents + 4)) = v11[1] + *((float *)&unk_1857F64 + 3 * v3);
-    *(float *)(v6 + ((int)(char *)tess_stageTangents + 8)) = v11[2] + flt_1857F68[3 * v3];
-    v7 = 12 * v2;
-    *(float *)(v7 + ((int)(char *)tess_stageTangents)) = v11[0] + *(float *)&tess_stageTangents[3 * v2];
-    *(float *)(v7 + ((int)(char *)tess_stageTangents + 4)) = v11[1] + *((float *)&unk_1857F64 + 3 * v2);
-  }
-  result = tess_numVertexes;
-  v9 = 0;
-  if ( tess_numVertexes > 0 )
-  {
-    v10 = flt_1857F68;
-    nrm = tess_stageNormals;
-    bit = tess_stageBitangents;
-    do
-    {
-      if ( (int)v15[v9] > 1 )
-        VectorNormalize(v10 - 2);
-      bit[0] = *v10 * nrm[1] - nrm[2] * *(v10 - 1);
-      bit[1] = *(v10 - 2) * nrm[2] - nrm[0] * *v10;
-      bit[2] = nrm[0] * *(v10 - 1) - *(v10 - 2) * nrm[1];
-      VectorNormalize(bit);
-      result = tess_numVertexes;
-      ++v9;
-      v10 += 3;
-      nrm += 3;
-      bit += 3;
-    }
-    while ( v9 < tess_numVertexes );
-  }
-  tess_stageTangentsValid = 1;
-  tess_stageBitangentsValid = 1;
-  return result;
+	memset( tess_stageTangents, 0, 12 * tess_numVertexes );
+	memset( tess_stageBitangents, 0, 12 * tess_numVertexes );
+	memset( counts, 0, 4 * tess_numVertexes );
+
+	for ( i = 0; i < tess_numIndexes; i += 3 )
+	{
+		i0 = tess_indexes[i];
+		i1 = tess_indexes[i + 1];
+		i2 = tess_indexes[i + 2];
+		GetSTVectors( i0, i1, i2, tangent, tangent );
+		counts[i0]++;
+		counts[i1]++;
+		counts[i2]++;
+		tess_stageTangents[3 * i0 + 0] += tangent[0];
+		tess_stageTangents[3 * i0 + 1] += tangent[1];
+		tess_stageTangents[3 * i0 + 2] += tangent[2];
+		tess_stageTangents[3 * i1 + 0] += tangent[0];
+		tess_stageTangents[3 * i1 + 1] += tangent[1];
+		tess_stageTangents[3 * i1 + 2] += tangent[2];
+		tess_stageTangents[3 * i2 + 0] += tangent[0];
+		tess_stageTangents[3 * i2 + 1] += tangent[1];
+		tess_stageTangents[3 * i2 + 2] += tangent[2];
+	}
+
+	for ( i = 0; i < tess_numVertexes; i++ )
+	{
+		if ( counts[i] > 1 )
+			VectorNormalize( &tess_stageTangents[3 * i] );
+		CrossProduct( &tess_stageNormals[3 * i], &tess_stageTangents[3 * i], &tess_stageBitangents[3 * i] );
+		VectorNormalize( &tess_stageBitangents[3 * i] );
+	}
+	tess_stageTangentsValid   = 1;
+	tess_stageBitangentsValid = 1;
 }
 
-/* ---- RB_CalcCubeMapBumpmapFrameTexCoords  0x005158A0 ----  [HIGH] */
-float *__cdecl RB_CalcCubeMapBumpmapFrameTexCoords(float *a1)
+/* ---- RB_CalcCubeMapBumpmapFrameTexCoords  0x005158A0 ----  [HIGH]
+ * Rotate each source coord vector into the per-vertex tangent frame. */
+void __cdecl RB_CalcCubeMapBumpmapFrameTexCoords( float *st )
 {
-  float *result;  /* the tangent cursor; retail's EAX */
-  int v3;
-  double v4;
-  double v5;
-  double v6;
-  float *bit;
-  float *nrm;
+	vec3_t v;
+	int    i;
 
-  if ( !tess_stageTangentsValid || !tess_stageBitangentsValid )
-    RB_CalcTangentSpace();
-  result = (float *)tess_numVertexes;
-  v3 = 0;
-  if ( tess_numVertexes > 0 )
-  {
-    result = tess_stageTangents;
-    bit    = tess_stageBitangents;
-    nrm    = tess_stageNormals;
-    do
-    {
-      v4 = *a1;
-      ++v3;
-      v5 = a1[1];
-      v6 = a1[2];
-      a1 += 3;
-      *(a1 - 3) = v6 * result[2] + v4 * result[0] + v5 * result[1];
-      *(a1 - 2) = v6 * bit[2]    + v5 * bit[1]    + v4 * bit[0];
-      *(a1 - 1) = v6 * nrm[2]    + v5 * nrm[1]    + v4 * nrm[0];
-      result += 3;
-      bit += 3;
-      nrm += 3;
-    }
-    while ( v3 < tess_numVertexes );
-  }
-  return result;
+	if ( !tess_stageTangentsValid || !tess_stageBitangentsValid )
+		RB_CalcTangentSpace();
+
+	for ( i = 0; i < tess_numVertexes; i++, st += 3 )
+	{
+		VectorCopy( st, v );
+		st[0] = DotProduct( v, &tess_stageTangents[3 * i] );
+		st[1] = DotProduct( v, &tess_stageBitangents[3 * i] );
+		st[2] = DotProduct( v, &tess_stageNormals[3 * i] );
+	}
 }
 
-/* ---- myftol  0x00515940 ----  VERIFIED */
-int __cdecl myftol(float a1)
+/* ---- myftol  0x00515940 ----  VERIFIED
+ * fld value / fistp ftol_tempSpill / mov eax, ftol_tempSpill: round to nearest
+ * under the default control word (retail only sets _PC_53), not a truncation.
+ * Retail inlines this body at every call site.  Under VC7 the result is
+ * returned in EAX by the asm itself (no C return), so an inlined call leaves
+ * the value in EAX the way retail's WAVEVALUE sites use it. */
+int __cdecl myftol( float value )
 {
-  ftol_tempSpill = (int)a1;
-  return (int)a1;
+	__asm fld   value
+	__asm fistp ftol_tempSpill
+#ifdef COD1_VC7
+	__asm mov   eax, ftol_tempSpill
+#else
+	return ftol_tempSpill;
+#endif
 }
 
-/* ---- RB_CalcSpecularAlpha  0x00515950 ----  VERIFIED */
-int __cdecl RB_CalcSpecularAlpha(int a1)
+#ifdef COD1_VC7
+/* Q_rsqrt: a static copy of com_math.c's (non-/Op) __fsqrt, which retail
+ * inlines into RB_CalcSpecularAlpha. */
+static __inline float Q_rsqrt( float number )
 {
-  unsigned __int64 v2; // rax
-  _BYTE *v3;
-  float *v4;
-  float *v5;
-  int v6;
-  double v7;  /* normal . lightDir */
-  double v8;  /* reflected[0] */
-  double v9;
-  double v10;  /* reflected[1] */
-  double v11;  /* reflected[2] */
-  double v12;  /* viewer[0], never spilled by retail */
-  double v13;
-  int v15;  /* viewer.viewer, read as bits for Q_rsqrt */
-  float v16;
-  float lightDir[3]; // [esp+14h] [ebp-18h] BYREF -- ONE vec3
-  float v20;  /* viewer[1] */
-  float v21;  /* viewer[2] */
-  int   rsqBits;  /* the Q_rsqrt seed, stored then reread */
-  float rsq;
+	long  i;
+	float x2, y;
 
-  LODWORD(v2) = tess_numVertexes;
-  v3 = (_BYTE *)(a1 + 3);
-  v4 = (float *)tess_xyz;
-  if ( tess_numVertexes > 0 )
-  {
-    v5 = dword_1827F68;
-    v6 = tess_numVertexes;
-    do
-    {
-      lightDir[0] = rbSpecularLightOrigin - *v4;
-      lightDir[1] = flt_571134 - v4[1];
-      lightDir[2] = flt_571138 - v4[2];
-      VectorNormalizeFast(lightDir);
+	x2 = number * 0.5f;
+	y  = number;
+	i  = *(long *)&y;
+	i  = 0x5f3759df - ( i >> 1 );
+	y  = *(float *)&i;
+	y  = y * ( 1.5f - ( x2 * y * y ) );
 
-      v7 = lightDir[2] * *v5 + lightDir[1] * *(v5 - 1) + lightDir[0] * *(v5 - 2);
-      v8 = v7 * *(v5 - 2) + v7 * *(v5 - 2) - lightDir[0];
-      v9 = v7;
-      v10 = v7 * *(v5 - 1) + v7 * *(v5 - 1) - lightDir[1];
-      v11 = v9 * *v5 + v9 * *v5 - lightDir[2];
-
-      v12 = flt_16D8DD8 - *v4;
-      v20 = flt_16D8DDC - v4[1];
-      v13 = flt_16D8DE0 - v4[2];
-      v21 = v13;
-      *(float *)&v15 = v13 * v21 + v20 * v20 + v12 * v12;
-
-      rsqBits = 1597463007 - (v15 >> 1);             /* 0x5F3759DF */
-      rsq = COERCE_FLOAT(rsqBits);
-      v16 = (1.5 - *(float *)&v15 * 0.5 * rsq * rsq) * rsq
-          * (v21 * v11 + v20 * v10 + v12 * v8);
-
-      if ( v16 < 0.0 )
-      {
-        LODWORD(v2) = 0;
-      }
-      else
-      {
-        v2 = (unsigned __int64)(v16 * v16 * (v16 * v16) * 255.0);
-        if ( (int)v2 > 255 )
-          LODWORD(v2) = 255;
-      }
-      *v3 = v2;
-      v5 += 3;
-      v3 += 4;
-      --v6;
-      v4 += tess_vertexComponentCount;
-    }
-    while ( v6 );
-  }
-  return v2;
+	return y;
 }
+#endif
 
-/* ---- RB_CalcDiffuseColor  0x00515AD0 ----  [HIGH] */
-int __cdecl RB_CalcDiffuseColor(int a1)
+/* ---- RB_CalcSpecularAlpha  0x00515950 ----  VERIFIED
+ * Specular coefficient (dot of the reflected light vector and the view vector,
+ * raised to the 4th power) into the alpha channel.  The view length uses the
+ * Q_rsqrt fast inverse square root.  VC7: the Q3 text (retail's bytes); the
+ * modern build keeps the hand-expanded form below, whose doubles reproduce the
+ * values retail keeps unrounded on the x87 stack. */
+#ifndef COD1_VC7
+void __cdecl RB_CalcSpecularAlpha( unsigned char *alphas )
 {
-  int v1;
-  int result;
-  float *v3;
-  _BYTE *v4;
-  int v5;
-  double v6;
-  int v11;
-  int v12;
-  float v13;
-  float v14;
-  float v15;
-  float v16;
-  float v17;
-  float v18;
-  float v19;
-  float v20;
-  float v21;
-  float v22;
-  float v23;
-  float v24;
-  float v25;
+	float *xyz = (float *)tess_xyz;
+	float *normal;
+	unsigned char *dst;
+	float  lightDir[3];
+	float  viewer[3];
+	float  l, lensq, rsq;
+	double d, v0, v2;      /* kept on the x87 stack in retail, never rounded to float */
+	int    rsqBits;
+	int    b;
+	int    i;
 
-  v23 = *(float *)(backEnd_currentEntity + 176);
-  v24 = *(float *)(backEnd_currentEntity + 180);
-  v25 = *(float *)(backEnd_currentEntity + 184);
-  v20 = *(float *)(backEnd_currentEntity + 192);
-  v1 = *(_DWORD *)(backEnd_currentEntity + 188);
-  v21 = *(float *)(backEnd_currentEntity + 196);
-  v22 = *(float *)(backEnd_currentEntity + 200);
-  v19 = *(float *)(backEnd_currentEntity + 172);
-  result = tess_numVertexes;
-  v17 = *(float *)(backEnd_currentEntity + 164);
-  v18 = *(float *)(backEnd_currentEntity + 168);
-  if ( tess_numVertexes > 0 )
-  {
-    v3 = flt_1827F64;
-    v4 = (_BYTE *)(a1 + 2);
-    v5 = tess_numVertexes;
-    do
-    {
-      v6 = v19 * v3[1] + v17 * *(v3 - 1) + v18 * *v3;
-      v13 = v6;
-      if ( v6 > 0.0 )
-      {
-        v14 = v13 * v20 + v23;
-        ftol_tempSpill = (int)v14;
-        v11 = (int)v14;
-        if ( v11 > 255 )
-          LOBYTE(v11) = -1;
-        *(v4 - 2) = v11;
-        v15 = v13 * v21 + v24;
-        ftol_tempSpill = (int)v15;
-        v12 = (int)v15;
-        if ( v12 > 255 )
-          LOBYTE(v12) = -1;
-        *(v4 - 1) = v12;
-        v16 = v13 * v22 + v25;
-        ftol_tempSpill = (int)v16;
-        result = (int)v16;
-        if ( result > 255 )
-          result = 255;
-        *v4 = result;
-        v4[1] = -1;
-      }
-      else
-      {
-        *(_DWORD *)(v4 - 2) = v1;
-      }
-      v4 += 4;
-      v3 += 3;
-      --v5;
-    }
-    while ( v5 );
-  }
-  return result;
+	dst = alphas + 3;
+	if ( tess_numVertexes > 0 )
+	{
+		normal = (float *)tess_stageNormals;
+		for ( i = 0; i < tess_numVertexes; i++ )
+		{
+			lightDir[0] = rbSpecularLightOrigin - xyz[0];
+			lightDir[1] = rbSpecularLightOriginY - xyz[1];
+			lightDir[2] = rbSpecularLightOriginZ - xyz[2];
+			VectorNormalizeFast( lightDir );
+
+			d = lightDir[2] * normal[2] + lightDir[1] * normal[1] + lightDir[0] * normal[0];
+
+			/* only viewer[1] is stored (fstp m32); viewer[2] is fst to a float
+			   and the extended value is multiplied by that float copy
+			   (0x515A0A/0x515A0E); viewer[0] never leaves the FPU stack */
+			v0        = backEnd_or.viewOrigin[0] - xyz[0];
+			viewer[1] = backEnd_or.viewOrigin[1] - xyz[1];
+			v2        = backEnd_or.viewOrigin[2] - xyz[2];
+			viewer[2] = (float)v2;
+			lensq = v2 * viewer[2] + viewer[1] * viewer[1] + v0 * v0;
+
+			rsqBits = 0x5F3759DF - ( *(int *)&lensq >> 1 );   /* Q_rsqrt seed */
+			rsq = *(float *)&rsqBits;
+			l = ( 1.5f - lensq * 0.5f * rsq * rsq ) * rsq
+			  * ( viewer[2] * ( d * normal[2] + d * normal[2] - lightDir[2] )
+			    + viewer[1] * ( d * normal[1] + d * normal[1] - lightDir[1] )
+			    + v0        * ( d * normal[0] + d * normal[0] - lightDir[0] ) );
+
+			if ( l < 0.0f )
+			{
+				b = 0;
+			}
+			else
+			{
+				b = (int)( l * l * ( l * l ) * 255.0f );
+				if ( b > 255 )
+					b = 255;
+			}
+			*dst = b;
+			normal += 3;
+			dst    += 4;
+			xyz    += tess_vertexComponentCount;
+		}
+	}
 }
+#else
+void __cdecl RB_CalcSpecularAlpha( unsigned char *alphas )
+{
+	int    i;
+	float *v, *normal;
+	vec3_t viewer, reflected;
+	float  l, d;
+	int    b;
+	vec3_t lightDir;
+	int    numVertexes;
 
+	v = tess_xyz;
+	normal = tess_stageNormals;
+
+	alphas += 3;
+
+	numVertexes = tess_numVertexes;
+	for ( i = 0; i < numVertexes; i++, v += tess_vertexComponentCount, normal += 3, alphas += 4 )
+	{
+		float ilength;
+
+		lightDir[0] = rbSpecularLightOrigin - v[0];
+		lightDir[1] = rbSpecularLightOriginY - v[1];
+		lightDir[2] = rbSpecularLightOriginZ - v[2];
+		VectorNormalizeFast( lightDir );
+
+		d = DotProduct( normal, lightDir );
+
+		reflected[0] = normal[0] * 2 * d - lightDir[0];
+		reflected[1] = normal[1] * 2 * d - lightDir[1];
+		reflected[2] = normal[2] * 2 * d - lightDir[2];
+
+		VectorSubtract( backEnd_or.viewOrigin, v, viewer );
+		ilength = Q_rsqrt( DotProduct( viewer, viewer ) );
+		l = DotProduct( reflected, viewer );
+		l *= ilength;
+
+		if ( l < 0 )
+		{
+			b = 0;
+		}
+		else
+		{
+			l = l * l;
+			l = l * l;
+			b = l * 255;
+			if ( b > 255 )
+				b = 255;
+		}
+
+		*alphas = b;
+	}
+}
+#endif
+
+/* ---- RB_CalcDiffuseColor  0x00515AD0 ----  [HIGH]
+ * Basic vertex lighting: ambient plus N.L directed light, or the packed ambient
+ * colour where the surface faces away from the light. */
+void __cdecl RB_CalcDiffuseColor( unsigned char *colors )
+{
+	int    i, j;
+	float *normal;
+	float  incoming;
+	byte  *ent;
+	int    ambientLightInt;
+	vec3_t ambientLight;
+	vec3_t lightDir;
+	vec3_t directedLight;
+	int    numVertexes;
+
+	ent = (byte *)backEnd_currentEntity;
+	ambientLightInt = *(int *)( ent + 0xBC );
+	VectorCopy( (float *)( ent + 0xB0 ), ambientLight );
+	VectorCopy( (float *)( ent + 0xC0 ), directedLight );
+	VectorCopy( (float *)( ent + 0xA4 ), lightDir );
+
+	normal = tess_stageNormals;
+
+	numVertexes = tess_numVertexes;
+	for ( i = 0; i < numVertexes; i++, normal += 3 )
+	{
+		incoming = lightDir[2] * normal[2] + lightDir[0] * normal[0] + lightDir[1] * normal[1];   /* retail's order */
+		if ( incoming <= 0 )
+		{
+			*(int *)&colors[i * 4] = ambientLightInt;
+			continue;
+		}
+		j = myftol( ambientLight[0] + incoming * directedLight[0] );
+		if ( j > 255 )
+			j = 255;
+		colors[i * 4 + 0] = j;
+
+		j = myftol( ambientLight[1] + incoming * directedLight[1] );
+		if ( j > 255 )
+			j = 255;
+		colors[i * 4 + 1] = j;
+
+		j = myftol( ambientLight[2] + incoming * directedLight[2] );
+		if ( j > 255 )
+			j = 255;
+		colors[i * 4 + 2] = j;
+
+		colors[i * 4 + 3] = 255;
+	}
+}

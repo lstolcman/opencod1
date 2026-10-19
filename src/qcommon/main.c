@@ -10,6 +10,10 @@ extern int __stdcall WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
 extern void Cod1_InstallCrashReporter( void );
 
+/* Tree-only console entry: retail CoDMP.exe has no main().  Under VC7 /GL LTCG the
+ * extra main -> WinMain call edge changes whole-program stack-alignment decisions
+ * in the renderer backend, so the retail-matching VC7 build leaves it out. */
+#if !defined( _MSC_VER ) || _MSC_VER >= 1310
 int main( int argc, char **argv ) {
 	char *cmd;
 	HMODULE k32;
@@ -61,3 +65,4 @@ int main( int argc, char **argv ) {
 
 	return WinMain( GetModuleHandleA( NULL ), NULL, cmd, SW_SHOWNORMAL );
 }
+#endif

@@ -1,164 +1,223 @@
 /*
  * @fidelity: verified
+ *
+ * tr_marks.c -- projection of decal/mark polygons onto the world surfaces
+ * (RTCW's R_MarkFragments and its clipping helpers).  RE_MarkFragments gathers
+ * the world surfaces overlapping the mark box, triangulates each, chops the
+ * triangles against the projected polygon's bounding planes and writes the
+ * surviving fragments (markFragment_t) plus their projected texcoords into the
+ * caller's buffers.
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/cod1_globals.h"
+#include "tr_records.h"
 #include "tr_shaderregistry.h"
+#include "tr_local.h"
 
 
-typedef struct markVert_s {
+/* ------------------------------------------------------------------------- *
+ *  File-local mark structs.
+ *
+ *  The surface handle (msurface_t), BSP node (mnode_t) and the SF_INDEXED_FIRST
+ *  sentinel come from tr_local.h.  The types below are the mark unit's own view
+ *  of the polymorphic data those handles point at -- the projected vertex, the
+ *  fragment record, the world cell / AABB tree / cull group hierarchy and the
+ *  indexed world surface -- and are defined here because they are specific to
+ *  this unit.  Every offset touched by the decompiled code is pinned with an
+ *  assert.
+ * ------------------------------------------------------------------------- */
+
+/* markVert_t (0x14) -- clip vertex: position + carried lightmap coords */
+typedef struct {
 	vec3_t	xyz;			/* +0x00 */
-	float	lightmapCoords[2];	/* +0x0C  carried through the chop */
+	float	lightmapCoords[2];	/* +0x0c  carried through the chop */
 } markVert_t;
+COD1_ASSERT_SIZE(markVert_t, 0x14);
 
-typedef struct polyVert_s {
-	vec3_t		xyz;			/* +0x00  R_AddMarkFragment */
-	float		st[2];			/* +0x0C  RE_MarkFragments projects these */
-	float		lightmapCoords[2];	/* +0x14  R_AddMarkFragment */
-	unsigned char	modulate[4];		/* +0x1C  not touched here */
+/* polyVert_t (0x20) -- output vertex written to the caller's point buffer */
+typedef struct {
+	vec3_t	xyz;			/* +0x00 */
+	float	st[2];			/* +0x0c  projected decal texcoords */
+	float	lightmapCoords[2];	/* +0x14 */
+	byte	modulate[4];		/* +0x1c  untouched here */
 } polyVert_t;
+COD1_ASSERT_SIZE(polyVert_t, 0x20);
+ASSERT_OFF(polyVert_t, st, 0x0c);
+ASSERT_OFF(polyVert_t, lightmapCoords, 0x14);
 
-typedef struct markFragment_s {
-	int	shaderHandle;	/* +0x00  fragmentShader->index */
-	int	firstPoint;	/* +0x04  index into pointBuffer */
-	int	numPoints;	/* +0x08  written by R_AddMarkFragment */
+/* markFragment_t (0x0c) -- one returned fragment */
+typedef struct {
+	int	shaderHandle;		/* +0x00  fragmentShader->index */
+	int	firstPoint;		/* +0x04  index into the point buffer */
+	int	numPoints;		/* +0x08 */
 } markFragment_t;
+COD1_ASSERT_SIZE(markFragment_t, 0x0c);
+ASSERT_OFF(markFragment_t, firstPoint, 0x04);
+ASSERT_OFF(markFragment_t, numPoints, 0x08);
 
-typedef struct markShader_s {
+/* markShader_t -- the fields of shader_t the mark unit reads.  tr_local.h's
+ * shader_t leaves surfaceParmFlags (0x5c) inside padding, so this partial view
+ * exposes it (promotion candidate for shader_t). */
+typedef struct {
 	char		name[64];		/* +0x00 */
-	int		lightmapIndex;		/* +0x40  < 0 == surface has no lightmap */
+	int		lightmapIndex;		/* +0x40  < 0 => surface has no lightmap */
 	int		index;			/* +0x44  -> markFragment_t::shaderHandle */
-	int		unk_48[5];		/* +0x48  sortedIndex, sort, ... unread here */
-	unsigned int	surfaceParmFlags;	/* +0x5C  bit 0x20 == nomarks */
+	int		sortedIndex;		/* +0x48 */
+	unsigned int	flags;			/* +0x4c */
+	unsigned int	surfaceFlags;		/* +0x50 */
+	unsigned int	lightingFlags;		/* +0x54 */
+	float		sort;			/* +0x58 */
+	unsigned int	surfaceParmFlags;	/* +0x5c  bit 0x20 == nomarks */
 } markShader_t;
+ASSERT_OFF(markShader_t, lightmapIndex, 0x40);
+ASSERT_OFF(markShader_t, index, 0x44);
+ASSERT_OFF(markShader_t, surfaceParmFlags, 0x5c);
 
 #define SURF_NOMARKS	0x20u
 
-typedef struct msurface_s {
-	int			viewCount;	/* +0x00  not read by this unit */
-	markShader_t		*shader;	/* +0x04 */
-	struct markSurface_s	*data;		/* +0x08 */
-} msurface_t;
-
-typedef struct markSurface_s {
+/* markSurface_t -- the indexed world surface an msurface_t::data points at when
+ * surfaceType >= SF_INDEXED_FIRST.  Only the fields this unit reads are named;
+ * the unread interior ranges are reserved so every named field lands on a
+ * verified offset. */
+typedef struct {
 	int		surfaceType;		/* +0x00 */
 	int		storageMode;		/* +0x04  unread here */
 	unsigned int	dlightBits;		/* +0x08  unread here */
-	vec3_t		boundsMin;		/* +0x0C */
+	vec3_t		boundsMin;		/* +0x0c */
 	vec3_t		boundsMax;		/* +0x18 */
-	int		vertexCount;		/* +0x24  unread here */
-	vec3_t		*tangents;		/* +0x28  unread here */
-	vec3_t		*bitangents;		/* +0x2C  unread here */
-	vec3_t		*normals;		/* +0x30  unread here */
-	float		(*texCoords)[2];	/* +0x34  unread here */
-	float		(*lightmapCoords)[2];	/* +0x38 */
-	unsigned char	(*colors)[4];		/* +0x3C  unread here */
+	int		numVerts;		/* +0x24  (tr_surface.c worldMeshSurf_t) */
+	vec3_t		*tangents;		/* +0x28 */
+	vec3_t		*bitangents;		/* +0x2c */
+	vec3_t		*normals;		/* +0x30 */
+	float		( *texCoords )[2];	/* +0x34 */
+	float		( *lightmapCoords )[2];	/* +0x38 */
+	unsigned int	*colors;		/* +0x3c */
 	vec3_t		*positions;		/* +0x40 */
 	int		indexCount;		/* +0x44 */
 	unsigned short	indices[1];		/* +0x48  runs to indexCount */
 } markSurface_t;
+ASSERT_OFF(markSurface_t, boundsMin, 0x0c);
+ASSERT_OFF(markSurface_t, boundsMax, 0x18);
+ASSERT_OFF(markSurface_t, lightmapCoords, 0x38);
+ASSERT_OFF(markSurface_t, positions, 0x40);
+ASSERT_OFF(markSurface_t, indexCount, 0x44);
+ASSERT_OFF(markSurface_t, indices, 0x48);
 
-typedef struct markCullGroup_s {
-	vec3_t		mins;		/* +0x00 */
-	vec3_t		maxs;		/* +0x0C */
-	msurface_t	*surfaces;	/* +0x18 */
-	int		surfaceCount;	/* +0x1C */
-	int		viewCount;	/* +0x20  DPVS only; unread here */
+/* markCullGroup_t -- a DPVS cull group; holds a run of msurface_t handles */
+typedef struct {
+	vec3_t		mins;			/* +0x00 */
+	vec3_t		maxs;			/* +0x0c */
+	msurface_t	*surfaces;		/* +0x18  stride 0x0c */
+	int		surfaceCount;		/* +0x1c */
+	int		viewCount;		/* +0x20  DPVS only; unread here */
 } markCullGroup_t;
+ASSERT_OFF(markCullGroup_t, surfaces, 0x18);
+ASSERT_OFF(markCullGroup_t, surfaceCount, 0x1c);
 
+/* markAabbTree_t (0x28) -- per-cell surface AABB tree */
 typedef struct markAabbTree_s markAabbTree_t;
 struct markAabbTree_s {
-	vec3_t		mins;		/* +0x00 */
-	vec3_t		maxs;		/* +0x0C */
-	msurface_t	*surfaces;	/* +0x18 */
-	int		surfaceCount;	/* +0x1C */
-	markAabbTree_t	*children;	/* +0x20 */
-	int		childCount;	/* +0x24 */
+	vec3_t		mins;			/* +0x00 */
+	vec3_t		maxs;			/* +0x0c */
+	msurface_t	*surfaces;		/* +0x18  stride 0x0c */
+	int		surfaceCount;		/* +0x1c */
+	markAabbTree_t	*children;		/* +0x20  stride 0x28 */
+	int		childCount;		/* +0x24 */
 };
+COD1_ASSERT_SIZE(markAabbTree_t, 0x28);
+ASSERT_OFF(markAabbTree_t, surfaces, 0x18);
+ASSERT_OFF(markAabbTree_t, surfaceCount, 0x1c);
+ASSERT_OFF(markAabbTree_t, children, 0x20);
+ASSERT_OFF(markAabbTree_t, childCount, 0x24);
 
-typedef struct markCell_s {
-	vec3_t			mins;			/* +0x00  unread here */
-	vec3_t			maxs;			/* +0x0C  unread here */
-	markAabbTree_t		*aabbTree;		/* +0x18 */
-	void			*portals;		/* +0x1C  unread here */
-	int			portalCount;		/* +0x20  unread here */
-	markCullGroup_t		**cullGroups;		/* +0x24 */
-	int			cullGroupCount;		/* +0x28 */
-	void			**occluders;		/* +0x2C  unread here */
-	int			occluderCount;		/* +0x30  unread here */
-	int			markViewCount;		/* +0x34 */
-	void			*modelLinks;		/* +0x38  unread here */
-	void			*entityLinks;		/* +0x3C  unread here */
+/* markCell_t (0x40) -- one world cell; addressed by mnode_t::cellIndex */
+typedef struct {
+	vec3_t			mins;		/* +0x00  unread here */
+	vec3_t			maxs;		/* +0x0c  unread here */
+	markAabbTree_t		*aabbTree;	/* +0x18 */
+	void			*portals;	/* +0x1c  unread here */
+	int			portalCount;	/* +0x20  unread here */
+	markCullGroup_t		**cullGroups;	/* +0x24 */
+	int			cullGroupCount;	/* +0x28 */
+	void			**occluders;	/* +0x2c  unread here */
+	int			occluderCount;	/* +0x30  unread here */
+	int			markViewCount;	/* +0x34 */
+	void			*modelLinks;	/* +0x38  unread here */
+	void			*entityLinks;	/* +0x3c  unread here */
 } markCell_t;
-
-typedef struct mnode_s mnode_t;
-struct mnode_s {
-	int		unk_00[2];	/* +0x00 */
-	int		cellIndex;	/* +0x08 */
-	cplane_t	*plane;		/* +0x0C */
-	mnode_t		*children[2];	/* +0x10 */
-};
-
-#define MNODE_INTERNAL	(-2)
-#define MNODE_NO_CELL	(-1)
+COD1_ASSERT_SIZE(markCell_t, 0x40);
+ASSERT_OFF(markCell_t, aabbTree, 0x18);
+ASSERT_OFF(markCell_t, cullGroups, 0x24);
+ASSERT_OFF(markCell_t, cullGroupCount, 0x28);
+ASSERT_OFF(markCell_t, markViewCount, 0x34);
 
 
-#define TR_WORLD_NODES	(*(mnode_t **)(tr_world + 152))
-#define TR_WORLD_CELLS	(*(markCell_t **)(tr_world + 292))
+/* tr.world blobs reached through the tr_world pointer (as in tr_world.c) */
+#define TR_WORLD_NODES	(*(mnode_t   **)(tr_world + 152))   /* tr.world->nodes */
+#define TR_WORLD_CELLS	(*(markCell_t **)(tr_world + 292))  /* tr.world->cells */
 
+/* mnode_t::cellIndex (0x08) sentinels used to walk the tree in R_BoxSurfaces_r */
+#define MNODE_INTERNAL	(-2)	/* internal (decision) node */
+#define MNODE_NO_CELL	(-1)	/* leaf with no cell */
+
+/* projection plane -- retail's bestnormal/bestdist at 0x011DBE40, touched only
+ * by RE_MarkFragments (written and negated, never read), i.e. dead stores kept
+ * faithfully.  No other function references them, so they live here. */
 static struct {
 	vec3_t	normal;
 	float	dist;
 } tr_markProjectionPlane;
 
 
-#define MAX_VERTS_ON_POLY	64	/* 0x004E9070: cmp ebp, 40h            */
-#define MARK_CLIP_SIDES		2
-#define MAX_MARK_SURFACES	4096	/* 0x004E9234: push 1000h              */
-#define MARK_EXTRA_PLANES	2
-#define MARK_SHADER_USAGE	9	/* 0x004E9363: push 9 to R_FindShader  */
+#define MAX_VERTS_ON_POLY	64	/* 0x004E86BC guard cmp 3Eh (62); 0x004E9073 clamp cmp 40h */
+#define MARK_CLIP_SIDES		2	/* clip ping-pong buffers */
+#define MAX_MARK_SURFACES	4096	/* 0x004E9261: push 1000h to R_BoxSurfaces_r */
+#define MARK_EXTRA_PLANES	2	/* near + far projection planes */
+#define MARK_SHADER_USAGE	9	/* 0x004E936C: R_FindShader usage arg */
 
 #define MARK_SIDE_FRONT	0
 #define MARK_SIDE_BACK	1
 #define MARK_SIDE_ON	2
 
-#define BOX_SIDE_FRONT	1
-#define BOX_SIDE_BACK	2
+#define BOX_SIDE_FRONT	1	/* BoxOnPlaneSide: box entirely in front of plane */
+#define BOX_SIDE_BACK	2	/* box entirely behind plane */
 
 
-extern char *R_FindShader( char *name, int lightmapIndex, int mipRawImage, const char *usage );
-extern int   BoxOnPlaneSide( const vec3_t emins, const vec3_t emaxs, cplane_t *p );
+extern int R_FindShader();
+extern int BoxOnPlaneSide();
 
 
-/* ---- R_ChopPolyBehindPlane  0x004E86A0 ----  VERIFIED */
-static void R_ChopPolyBehindPlane( int numInPoints, const markVert_t *inPoints,
-                                   int *numOutPoints, markVert_t *outPoints,
-                                   const vec3_t normal, float dist, float epsilon ) {
-	float	dists[MAX_VERTS_ON_POLY + 4];
-	int	sides[MAX_VERTS_ON_POLY + 4];
-	int	counts[3];
-	int	i, j;
+/* ---- R_ChopPolyBehindPlane  0x004E86A0 ----  VERIFIED
+ * Clip inPoints against a plane, keeping the front side.  numOutPoints arrives
+ * in EAX in retail (LTCG).  Clip vertices are five floats (xyz + lightmap st),
+ * stride 20 -- not vec3_t as in Q3/RTCW. */
+static void R_ChopPolyBehindPlane( int numInPoints, const markVert_t *inPoints, int *numOutPoints,
+                                   markVert_t *outPoints, const vec3_t normal, float dist, float epsilon ) {
+	float			dists[MAX_VERTS_ON_POLY + 4];
+	int			sides[MAX_VERTS_ON_POLY + 4];
+	int			counts[3];
+	rfloat			dot;	/* x87 stack in retail: fcom'd unrounded, only fst'd to dists[] */
+	int			i, j;
+	const markVert_t	*p1, *p2;
+	markVert_t		*clip;
+	rfloat			d;
 
-	/* Q3's `MAX_VERTS_ON_POLY - 2` guard.  0x004E86B7: cmp edi, 3Eh. */
+	/* don't clip if it might overflow  (0x004E86BC: cmp edi, 3Eh) */
 	if ( numInPoints >= MAX_VERTS_ON_POLY - 2 ) {
 		*numOutPoints = 0;
 		return;
 	}
 
-	counts[MARK_SIDE_FRONT] = 0;
-	counts[MARK_SIDE_BACK] = 0;
-	counts[MARK_SIDE_ON] = 0;
+	counts[MARK_SIDE_FRONT] = counts[MARK_SIDE_BACK] = counts[MARK_SIDE_ON] = 0;
 
 	for ( i = 0 ; i < numInPoints ; i++ ) {
-		float d;
-
-		d = inPoints[i].xyz[2] * normal[2] + inPoints[i].xyz[0] * normal[0]
-		  + normal[1] * inPoints[i].xyz[1] - dist;
-		dists[i] = d;
-		if ( d > epsilon ) {
+		dot = inPoints[i].xyz[2] * normal[2] + inPoints[i].xyz[0] * normal[0]
+		    + normal[1] * inPoints[i].xyz[1];
+		dot -= dist;
+		dists[i] = dot;
+		if ( dot > epsilon ) {
 			sides[i] = MARK_SIDE_FRONT;
-		} else if ( d < -epsilon ) {
+		} else if ( dot < -epsilon ) {
 			sides[i] = MARK_SIDE_BACK;
 		} else {
 			sides[i] = MARK_SIDE_ON;
@@ -175,23 +234,30 @@ static void R_ChopPolyBehindPlane( int numInPoints, const markVert_t *inPoints,
 	}
 	if ( !counts[MARK_SIDE_BACK] ) {
 		*numOutPoints = numInPoints;
-		/* 0x004E878A: rep movsd of 20 * numInPoints bytes. */
-		memcpy( outPoints, inPoints, (unsigned int)numInPoints * sizeof( *outPoints ) );
+		memcpy( outPoints, inPoints, numInPoints * sizeof( *outPoints ) );
 		return;
 	}
 
 	for ( i = 0 ; i < numInPoints ; i++ ) {
-		const markVert_t	*p1 = &inPoints[i];
-		markVert_t		*clip = &outPoints[*numOutPoints];
+		p1 = &inPoints[i];
+		clip = &outPoints[*numOutPoints];
 
 		if ( sides[i] == MARK_SIDE_ON ) {
-			*clip = *p1;
+			clip->xyz[0] = p1->xyz[0];
+			clip->xyz[1] = p1->xyz[1];
+			clip->xyz[2] = p1->xyz[2];
+			clip->lightmapCoords[0] = p1->lightmapCoords[0];
+			clip->lightmapCoords[1] = p1->lightmapCoords[1];
 			( *numOutPoints )++;
 			continue;
 		}
 
 		if ( sides[i] == MARK_SIDE_FRONT ) {
-			*clip = *p1;
+			clip->xyz[0] = p1->xyz[0];
+			clip->xyz[1] = p1->xyz[1];
+			clip->xyz[2] = p1->xyz[2];
+			clip->lightmapCoords[0] = p1->lightmapCoords[0];
+			clip->lightmapCoords[1] = p1->lightmapCoords[1];
 			( *numOutPoints )++;
 			clip = &outPoints[*numOutPoints];
 		}
@@ -200,35 +266,33 @@ static void R_ChopPolyBehindPlane( int numInPoints, const markVert_t *inPoints,
 			continue;
 		}
 
-		{
-			const markVert_t	*p2 = &inPoints[( i + 1 ) % numInPoints];
-			float			d = dists[i] - dists[i + 1];
-			float			frac;
+		/* generate a split point */
+		p2 = &inPoints[( i + 1 ) % numInPoints];
 
-			if ( d == 0.0f ) {
-				frac = 0.0f;
-			} else {
-				frac = dists[i] / d;
-			}
-
-			for ( j = 0 ; j < 3 ; j++ ) {
-				clip->xyz[j] = p1->xyz[j] + frac * ( p2->xyz[j] - p1->xyz[j] );
-			}
-			for ( j = 0 ; j < 2 ; j++ ) {
-				clip->lightmapCoords[j] = p1->lightmapCoords[j]
-					+ frac * ( p2->lightmapCoords[j] - p1->lightmapCoords[j] );
-			}
-			( *numOutPoints )++;
+		d = dists[i] - dists[i + 1];
+		if ( d == 0 ) {
+			dot = 0;
+		} else {
+			dot = dists[i] / d;
 		}
+
+		for ( j = 0 ; j < 3 ; j++ ) {
+			clip->xyz[j] = (float)( p1->xyz[j] + dot * ( p2->xyz[j] - p1->xyz[j] ) );
+		}
+		for ( j = 0 ; j < 2 ; j++ ) {
+			clip->lightmapCoords[j] = (float)( p1->lightmapCoords[j]
+				+ dot * ( p2->lightmapCoords[j] - p1->lightmapCoords[j] ) );
+		}
+		( *numOutPoints )++;
 	}
 }
 
 
-/* ---- R_AABBTreeSurfaces_r  0x004E8900 ----  VERIFIED */
-static void R_AABBTreeSurfaces_r( const markAabbTree_t *tree,
-                                  const vec3_t mins, const vec3_t maxs,
-                                  msurface_t **surfaces, int maxSurfaces,
-                                  int *numSurfaces ) {
+/* ---- R_AABBTreeSurfaces_r  0x004E8900 ----  VERIFIED
+ * Recursively gather the mark surfaces of one cell's AABB tree that overlap the
+ * mark box, skipping nomarks shaders and bounds-rejecting each surface. */
+static void R_AABBTreeSurfaces_r( const markAabbTree_t *tree, const vec3_t mins, const vec3_t maxs,
+                                  msurface_t **surfaces, int maxSurfaces, int *numSurfaces ) {
 	int	i;
 
 	if ( tree->maxs[0] < mins[0] || tree->mins[0] > maxs[0]
@@ -246,34 +310,34 @@ static void R_AABBTreeSurfaces_r( const markAabbTree_t *tree,
 	}
 
 	for ( i = 0 ; i < tree->surfaceCount ; i++ ) {
-		msurface_t		*surf;
 		const markSurface_t	*data;
 
 		if ( *numSurfaces >= maxSurfaces ) {
 			break;
 		}
 
-		surf = &tree->surfaces[i];
-		if ( ( surf->shader->surfaceParmFlags & SURF_NOMARKS ) != 0 ) {
+		/* indexed, no surf local: a msurface_t * local moves retail's registers */
+		if ( ( ( (markShader_t *)tree->surfaces[i].shader )->surfaceParmFlags & SURF_NOMARKS ) != 0 ) {
 			continue;
 		}
 
-		data = surf->data;
+		data = (const markSurface_t *)tree->surfaces[i].data;
 		if ( data->boundsMax[0] < mins[0] || data->boundsMin[0] > maxs[0]
 		  || data->boundsMax[1] < mins[1] || data->boundsMin[1] > maxs[1]
 		  || data->boundsMax[2] < mins[2] || data->boundsMin[2] > maxs[2] ) {
 			continue;
 		}
 
-		surfaces[( *numSurfaces )++] = surf;
+		surfaces[( *numSurfaces )++] = &tree->surfaces[i];
 	}
 }
 
 
-/* ---- R_CellSurfaces  0x004E8A80 ----  VERIFIED */
+/* ---- R_CellSurfaces  0x004E8A80 ----  VERIFIED
+ * Visit one world cell once per view: gather the overlapping mark surfaces of
+ * its cull groups (with a linear duplicate check), then its AABB tree. */
 static void R_CellSurfaces( markCell_t *cell, const vec3_t mins, const vec3_t maxs,
-                            msurface_t **surfaces, int maxSurfaces,
-                            int *numSurfaces ) {
+                            msurface_t **surfaces, int maxSurfaces, int *numSurfaces ) {
 	int	i, j, k;
 
 	if ( cell->markViewCount == tr_viewCount ) {
@@ -298,12 +362,12 @@ static void R_CellSurfaces( markCell_t *cell, const vec3_t mins, const vec3_t ma
 				break;
 			}
 
-			surf = &group->surfaces[j];
-			if ( ( surf->shader->surfaceParmFlags & SURF_NOMARKS ) != 0 ) {
+			if ( ( ( (markShader_t *)group->surfaces[j].shader )->surfaceParmFlags & SURF_NOMARKS ) != 0 ) {
 				continue;
 			}
 
-			data = surf->data;
+			surf = &group->surfaces[j];
+			data = (const markSurface_t *)surf->data;
 			if ( data->boundsMax[0] < mins[0] || data->boundsMin[0] > maxs[0]
 			  || data->boundsMax[1] < mins[1] || data->boundsMin[1] > maxs[1]
 			  || data->boundsMax[2] < mins[2] || data->boundsMin[2] > maxs[2] ) {
@@ -322,27 +386,27 @@ static void R_CellSurfaces( markCell_t *cell, const vec3_t mins, const vec3_t ma
 		}
 	}
 
-	R_AABBTreeSurfaces_r( cell->aabbTree, mins, maxs,
-	                      surfaces, maxSurfaces, numSurfaces );
+	R_AABBTreeSurfaces_r( cell->aabbTree, mins, maxs, surfaces, maxSurfaces, numSurfaces );
 }
 
 
-/* ---- R_BoxSurfaces_r  0x004E8C50 ----  VERIFIED */
+/* ---- R_BoxSurfaces_r  0x004E8C50 ----  VERIFIED
+ * Descend the BSP against the mark box (cellIndex == -2 marks a decision node),
+ * then hand each reached cell to R_CellSurfaces. */
 static void R_BoxSurfaces_r( mnode_t *node, const vec3_t mins, const vec3_t maxs,
-                             msurface_t **surfaces, int maxSurfaces,
-                             int *numSurfaces ) {
+                             msurface_t **surfaces, int maxSurfaces, int *numSurfaces ) {
 	while ( node->cellIndex == MNODE_INTERNAL ) {
-		int	s = BoxOnPlaneSide( mins, maxs, node->plane );
+		int	s = BoxOnPlaneSide( mins, maxs, node->u.node.plane );
 
 		if ( s == BOX_SIDE_FRONT ) {
-			node = node->children[0];
+			node = node->u.node.children[0];
 			continue;
 		}
 		if ( s != BOX_SIDE_BACK ) {
-			R_BoxSurfaces_r( node->children[0], mins, maxs,
+			R_BoxSurfaces_r( node->u.node.children[0], mins, maxs,
 			                 surfaces, maxSurfaces, numSurfaces );
 		}
-		node = node->children[1];
+		node = node->u.node.children[1];
 	}
 
 	if ( node->cellIndex != MNODE_NO_CELL ) {
@@ -352,10 +416,14 @@ static void R_BoxSurfaces_r( mnode_t *node, const vec3_t mins, const vec3_t maxs
 }
 
 
-/* ---- R_AddMarkFragment  0x004E8CF0 ----  VERIFIED */
-static qboolean R_AddMarkFragment( int numClipPoints,
-                                   markVert_t clipPoints[MARK_CLIP_SIDES][MAX_VERTS_ON_POLY],
-                                   int numPlanes, const vec3_t *normals, const float *dists,
+/* ---- R_AddMarkFragment  0x004E8CF0 ----  VERIFIED
+ * Chop one triangle against all the projection planes and, if anything
+ * survives, copy the result into the point buffer as one fragment.  clipPoints
+ * arrives in EBX in retail; the trailing mins/maxs stack args are dead
+ * (inherited from the Q3 ancestor) and kept only for the 1:1 mapping. */
+static qboolean R_AddMarkFragment( markVert_t clipPoints[MARK_CLIP_SIDES][MAX_VERTS_ON_POLY],
+                                   int numClipPoints, int numPlanes,
+                                   const vec3_t *normals, const float *dists,
                                    int maxPoints, polyVert_t *pointBuffer,
                                    markFragment_t *fragment,
                                    const vec3_t mins, const vec3_t maxs ) {
@@ -366,9 +434,8 @@ static qboolean R_AddMarkFragment( int numClipPoints,
 	(void)maxs;
 
 	for ( i = 0 ; i < numPlanes ; i++ ) {
-		R_ChopPolyBehindPlane( numClipPoints, clipPoints[pingPong],
-		                       &numClipPoints, clipPoints[!pingPong],
-		                       normals[i], dists[i], 0.5f );
+		R_ChopPolyBehindPlane( numClipPoints, clipPoints[pingPong], &numClipPoints,
+		                       clipPoints[!pingPong], normals[i], dists[i], 0.5f );
 		pingPong ^= 1;
 		if ( numClipPoints == 0 ) {
 			return qfalse;
@@ -395,12 +462,13 @@ static qboolean R_AddMarkFragment( int numClipPoints,
 }
 
 
-/* ---- RE_MarkFragments  0x004E8DB0 ----  VERIFIED */
-int RE_MarkFragments( int numPoints, const vec3_t *points,
-                      const vec3_t projectionOrigin, const vec3_t projectionAxis[3],
-                      float projectionRadius, int maxPoints, polyVert_t *pointBuffer,
-                      int maxFragments, markFragment_t *fragmentBuffer,
-                      int hShader ) {
+/* ---- RE_MarkFragments  0x004E8DB0 ----  VERIFIED
+ * Project the polygon `points' (extruded along projectionAxis[0]) onto the
+ * world surfaces it overlaps, returning the resulting fragments. */
+int __cdecl RE_MarkFragments( int numPoints, const vec3_t *points,
+                              const vec3_t projectionOrigin, const vec3_t projectionAxis[3],
+                              float projectionRadius, int maxPoints, polyVert_t *pointBuffer,
+                              int maxFragments, markFragment_t *fragmentBuffer, int hShader ) {
 	msurface_t	*surfaces[MAX_MARK_SURFACES];
 	markVert_t	clipPoints[MARK_CLIP_SIDES][MAX_VERTS_ON_POLY];
 	vec3_t		normals[MAX_VERTS_ON_POLY + MARK_EXTRA_PLANES];
@@ -408,7 +476,6 @@ int RE_MarkFragments( int numPoints, const vec3_t *points,
 	vec3_t		mins, maxs;
 	int		numsurfaces;
 	int		numPlanes;
-	int		numSourcePoints;
 	int		returnedPoints;
 	int		returnedFragments;
 	markShader_t	*shader;
@@ -416,56 +483,36 @@ int RE_MarkFragments( int numPoints, const vec3_t *points,
 
 	tr_viewCount++;
 
+	for ( i = 0 ; i < numPoints ; i++ ) {
+		vec3_t	temp;
+		VectorCopy( points[i], temp );
+	}
+
 	tr_markProjectionPlane.normal[0] = -projectionAxis[0][0];
 	tr_markProjectionPlane.normal[1] = -projectionAxis[0][1];
 	tr_markProjectionPlane.normal[2] = -projectionAxis[0][2];
 	tr_markProjectionPlane.dist = 0.0f;
 
-	mins[0] = mins[1] = mins[2] =  262144.0f;
-	maxs[0] = maxs[1] = maxs[2] = -262144.0f;
-
+	ClearBounds( mins, maxs );
 	for ( i = 0 ; i < numPoints ; i++ ) {
-		vec3_t	projected;
-		vec3_t	extended;
+		vec3_t	temp;
 
-		for ( j = 0 ; j < 3 ; j++ ) {
-			if ( points[i][j] < mins[j] ) {
-				mins[j] = points[i][j];
-			}
-			if ( points[i][j] > maxs[j] ) {
-				maxs[j] = points[i][j];
-			}
-			projected[j] = points[i][j] + projectionRadius * projectionAxis[0][j];
-			extended[j]  = points[i][j] + ( projectionRadius * -20.0f ) * projectionAxis[0][j];
-		}
-
-		for ( j = 0 ; j < 3 ; j++ ) {
-			if ( projected[j] < mins[j] ) {
-				mins[j] = projected[j];
-			}
-			if ( projected[j] > maxs[j] ) {
-				maxs[j] = projected[j];
-			}
-			if ( extended[j] < mins[j] ) {
-				mins[j] = extended[j];
-			}
-			if ( extended[j] > maxs[j] ) {
-				maxs[j] = extended[j];
-			}
-		}
+		AddPointToBounds( points[i], mins, maxs );
+		VectorMA( points[i], projectionRadius, projectionAxis[0], temp );
+		AddPointToBounds( temp, mins, maxs );
+		VectorMA( points[i], projectionRadius * -20.0f, projectionAxis[0], temp );
+		AddPointToBounds( temp, mins, maxs );
 	}
 
-	numSourcePoints = numPoints;
-	if ( numSourcePoints > MAX_VERTS_ON_POLY ) {
-		numSourcePoints = MAX_VERTS_ON_POLY;
+	if ( numPoints > MAX_VERTS_ON_POLY ) {
+		numPoints = MAX_VERTS_ON_POLY;
 	}
 
-	for ( i = 0 ; i < numSourcePoints ; i++ ) {
+	/* one bounding plane per polygon edge */
+	for ( i = 0 ; i < numPoints ; i++ ) {
 		vec3_t	edge;
 
-		for ( j = 0 ; j < 3 ; j++ ) {
-			edge[j] = points[( i + 1 ) % numSourcePoints][j] - points[i][j];
-		}
+		VectorSubtract( points[( i + 1 ) % numPoints], points[i], edge );
 
 		normals[i][0] = edge[1] * projectionAxis[0][2] - edge[2] * projectionAxis[0][1];
 		normals[i][1] = edge[2] * projectionAxis[0][0] - edge[0] * projectionAxis[0][2];
@@ -477,27 +524,25 @@ int RE_MarkFragments( int numPoints, const vec3_t *points,
 		         + normals[i][0] * points[i][0];
 	}
 
-	normals[numSourcePoints][0] = projectionAxis[0][0];
-	normals[numSourcePoints][1] = projectionAxis[0][1];
-	normals[numSourcePoints][2] = projectionAxis[0][2];
-	dists[numSourcePoints] = projectionAxis[0][2] * points[0][2]
-	                       + projectionAxis[0][1] * points[0][1]
-	                       + projectionAxis[0][0] * points[0][0]
-	                       - projectionRadius;
+	/* near and far projection planes */
+	VectorCopy( projectionAxis[0], normals[numPoints] );
+	dists[numPoints] = normals[numPoints][2] * points[0][2]
+	                 + normals[numPoints][1] * points[0][1]
+	                 + normals[numPoints][0] * points[0][0]
+	                 - projectionRadius;
+	VectorCopy( projectionAxis[0], normals[numPoints + 1] );
+	normals[numPoints + 1][0] = -normals[numPoints + 1][0];
+	normals[numPoints + 1][1] = -normals[numPoints + 1][1];
+	normals[numPoints + 1][2] = -normals[numPoints + 1][2];
+	dists[numPoints + 1] = normals[numPoints + 1][0] * points[0][0]
+	                     + normals[numPoints + 1][1] * points[0][1]
+	                     + normals[numPoints + 1][2] * points[0][2]
+	                     - projectionRadius;
 
-	normals[numSourcePoints + 1][0] = -projectionAxis[0][0];
-	normals[numSourcePoints + 1][1] = -projectionAxis[0][1];
-	normals[numSourcePoints + 1][2] = -projectionAxis[0][2];
-	dists[numSourcePoints + 1] = normals[numSourcePoints + 1][0] * points[0][0]
-	                           + normals[numSourcePoints + 1][1] * points[0][1]
-	                           + normals[numSourcePoints + 1][2] * points[0][2]
-	                           - projectionRadius;
-
-	numPlanes = numSourcePoints + MARK_EXTRA_PLANES;
+	numPlanes = numPoints + MARK_EXTRA_PLANES;
 
 	numsurfaces = 0;
-	R_BoxSurfaces_r( TR_WORLD_NODES, mins, maxs,
-	                 surfaces, MAX_MARK_SURFACES, &numsurfaces );
+	R_BoxSurfaces_r( TR_WORLD_NODES, mins, maxs, surfaces, MAX_MARK_SURFACES, &numsurfaces );
 
 	tr_markProjectionPlane.normal[0] = -tr_markProjectionPlane.normal[0];
 	tr_markProjectionPlane.normal[1] = -tr_markProjectionPlane.normal[1];
@@ -507,7 +552,7 @@ int RE_MarkFragments( int numPoints, const vec3_t *points,
 	returnedFragments = 0;
 
 	if ( hShader < 0 || hShader >= tr_numShaders[0] ) {
-		ri_Printf( 2, "R_GetShaderByHandle: out of range hShader '%d'\n", hShader );
+		ri.Printf( 2, "R_GetShaderByHandle: out of range hShader '%d'\n", hShader );
 		shader = (markShader_t *)tr_defaultShader;
 	} else {
 		shader = (markShader_t *)tr_shaders[hShader];
@@ -520,22 +565,22 @@ int RE_MarkFragments( int numPoints, const vec3_t *points,
 		float		( *lightmapCoords )[2];
 		int		baseIndex;
 
-		surf = surfaces[i]->data;
+		surf = (markSurface_t *)surfaces[i]->data;
 
-		if ( surf->surfaceType < 24 ) {
+		if ( surf->surfaceType < SF_INDEXED_FIRST ) {
 			continue;
 		}
 
+		/* the indices are absolute; rebase the vertex arrays through indices[0] */
 		baseIndex = surf->indices[0];
 		positions = surf->positions - baseIndex;
 		lightmapCoords = surf->lightmapCoords - baseIndex;
 
 		if ( shader != (markShader_t *)tr_defaultShader
-		  && surfaces[i]->shader->lightmapIndex >= 0 ) {
+		  && ( (markShader_t *)surfaces[i]->shader )->lightmapIndex >= 0 ) {
 			fragmentShader = (markShader_t *)R_FindShader( shader->name,
-			                                               surfaces[i]->shader->lightmapIndex,
-			                                               1,
-			                                               (const char *)MARK_SHADER_USAGE );
+			                                               ( (markShader_t *)surfaces[i]->shader )->lightmapIndex,
+			                                               1, (const char *)MARK_SHADER_USAGE );
 		} else {
 			fragmentShader = shader;
 		}
@@ -558,6 +603,7 @@ int RE_MarkFragments( int numPoints, const vec3_t *points,
 			normal[2] = v2[1] * v1[0] - v2[0] * v1[1];
 			VectorNormalize( normal );
 
+			/* keep only triangles facing along the projection axis */
 			if ( !( normal[0] * projectionAxis[0][0]
 			      + normal[2] * projectionAxis[0][2]
 			      + normal[1] * projectionAxis[0][1] > 0.5f ) ) {
@@ -572,7 +618,7 @@ int RE_MarkFragments( int numPoints, const vec3_t *points,
 			clipPoints[0][2].lightmapCoords[1] = lightmapCoords[tri[2]][1];
 
 			mf = &fragmentBuffer[returnedFragments];
-			if ( !R_AddMarkFragment( 3, clipPoints, numPlanes, normals, dists,
+			if ( !R_AddMarkFragment( clipPoints, 3, numPlanes, normals, dists,
 			                         maxPoints - returnedPoints,
 			                         &pointBuffer[returnedPoints], mf,
 			                         mins, maxs ) ) {

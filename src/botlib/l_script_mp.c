@@ -49,16 +49,19 @@
  * byte-for-byte work.
  *
  * ---------------------------------------------------------------------------
- * PS_ReadToken CARRIES PS_ReadPrimitive INLINED
+ * PS_ReadToken TAIL-CALLS PS_ReadPrimitive
  * ---------------------------------------------------------------------------
  *
- * 0x00442FB0 is RTCW's PS_ReadToken with PS_ReadPrimitive INLINED into its
- * SCFL_PRIMITIVE branch: it tests script->tokenavailable and copies out of
- * script->token, which only PS_ReadToken does; its SCFL_PRIMITIVE arm contains
- * PS_ReadPrimitive's whole body rather than a call; and every one of its ten
- * callers is a function that calls PS_ReadToken in RTCW (PC_ReadSourceToken,
- * PS_Expect*, PS_Check*, PS_SkipUntilString, ReadSigned*).  There is no
- * separate PS_ReadPrimitive in the binary.
+ * 0x00442FB0 is RTCW's PS_ReadToken: it tests script->tokenavailable and
+ * copies out of script->token, which only PS_ReadToken does; and every one of
+ * its ten callers is a function that calls PS_ReadToken in RTCW
+ * (PC_ReadSourceToken, PS_Expect*, PS_Check*, PS_SkipUntilString,
+ * ReadSigned*).  Its SCFL_PRIMITIVE arm is a TAIL JUMP (`jmp` at 0x004430BA)
+ * to PS_ReadPrimitive's body at 0x00442F30, laid out just before it with its
+ * own prologue/epilogue; that jump is its only reference, so the IDB keeps it
+ * as loc_442F30, a chunk of PS_ReadToken.  The tree keeps RTCW's separate
+ * PS_ReadPrimitive and `return PS_ReadPrimitive( script, token );`, which VC7
+ * emits as that tail jump.
  *
  * ---------------------------------------------------------------------------
  * THREE RETAIL BUGS THAT MUST STAY -- ALL THREE ARE RTCW's, NOT CoD's
@@ -97,8 +100,8 @@
  * LIVE:
  * PS_CreatePunctuationTable, ScriptError, ScriptWarning, PS_ReadWhiteSpace,
  * PS_ReadEscapeCharacter, PS_ReadString, PS_ReadName, NumberValue,
- * PS_ReadNumber, PS_ReadPunctuation, PS_ReadToken, LoadScriptMemory,
- * StripDoubleQuotes (plus LoadScriptFile, in l_precomp_pc.c).
+ * PS_ReadNumber, PS_ReadPunctuation, PS_ReadPrimitive, PS_ReadToken,
+ * LoadScriptMemory, StripDoubleQuotes (plus LoadScriptFile, in l_precomp_pc.c).
  *
  * DEAD -- zero xrefs, kept by the linker only: PunctuationFromNum,
  * SetScriptPunctuations (LoadScriptFile and LoadScriptMemory inline it),
@@ -112,42 +115,21 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "l_script.h"
+#include "l_memory.h"
+/* ---- module-owned globals ---- */
+
 
 /* universal/q_parse.c 0x00449AB0. */
 extern int Com_Compress( char *data_p );
 
 /*
- * Retail inlines botlib's GetMemory/GetClearedMemory/FreeMemory at every site
- * in this unit: allocate four bytes more than asked, stamp 0x12345678 into the
- * first dword, return the payload; free only if the magic matches.  The bodies
- * at 0x0043D6B0 are never called from here, so calling them would emit a call
- * retail does not have.  Same choice, same reason, as PC_GetMemory in
- * l_precomp_pc.c.
+ * Retail inlines botlib's GetMemory/GetClearedMemory/FreeMemory (l_memory_mp.c
+ * 0x0043D6B0 / 0x0043D6D0 / 0x0043D770) at every site in this unit.  Calling
+ * the externs reproduces that: LTCG inlines them across units, so no call is
+ * emitted.  Tree-only static copies (the former PS_GetMemory & co.) would be
+ * emitted as dead functions retail does not have.
  */
-#define Z_MAGIC  0x12345678
-
-static void *PS_GetMemory( int size ) {
-	int *block;
-
-	block = (int *) Z_MallocInternal( size + 4 );
-	if ( !block ) {
-		return NULL;
-	}
-	*block = Z_MAGIC;
-	return block + 1;
-}
-
-static void PS_FreeMemory( void *ptr ) {
-	int *block;
-
-	block = (int *) ptr - 1;
-	if ( *block == Z_MAGIC ) {
-		free( block );
-	}
-}
 
 /*
  * The module-static base folder, 0x01646560, 64 bytes.  Retail compiled the
@@ -194,7 +176,7 @@ void PS_CreatePunctuationTable( script_t *script, punctuation_t *punctuations ) 
 	/* get memory for the table */
 	if ( !script->punctuationtable ) {
 		script->punctuationtable = (punctuation_t **)
-			PS_GetMemory( 256 * sizeof( punctuation_t * ) );
+			GetMemory( 256 * sizeof( punctuation_t * ) );
 	}
 	memset( script->punctuationtable, 0, 256 * sizeof( punctuation_t * ) );
 
@@ -323,9 +305,12 @@ RETAIL: __usercall( p@<edi>, script@<esi> ).  SWAPPED; source order here.
 void SetScriptPunctuations( script_t *script, punctuation_t *p ) {
 	if ( p ) {
 		PS_CreatePunctuationTable( script, p );
-		script->punctuations = p;
 	} else {
 		PS_CreatePunctuationTable( script, default_punctuations );
+	}
+	if ( p ) {
+		script->punctuations = p;
+	} else {
 		script->punctuations = default_punctuations;
 	}
 }
@@ -685,18 +670,21 @@ From the listing:
   - octal `lea edx,[ecx+edx*8-30h]`, binary `lea edx,[ecx+edx*2-30h]`;
   - the `movsx` on every digit is retail's, so a high-bit byte sign-extends.
 
-SPELLING: retail converts the float result with `__ftol2`, a SIGNED truncation,
-and stores it into the unsigned intvalue slot.  RTCW spells that
-`(unsigned long)*floatvalue`.  Written signed-then-unsigned below so the bit
-pattern matches retail at and above 2^31.
+SPELLING: retail converts the float result with `call __ftol2` at 0x442A3C and
+stores EAX into the unsigned intvalue slot.  VC7's __ftol2 (0x538BE0) is a
+64-bit truncation (`fistp qword`, result in EDX:EAX), so EAX is the low dword:
+4e9 stores 4000000000 and 5e9 stores 705032704.  RTCW spells that
+`(unsigned long)*floatvalue`.  A plain `(long)` cast here compiles to
+__ftol2_sse, a 32-bit conversion that gives 0x80000000 at and above 2^31, so
+the cast goes through __int64 to keep retail's low-dword result.
 
 RTCW declares this void and its one caller discards EAX; void here.  RTCW's
-parameter is `long double *floatvalue`, which MSVC makes a 64-bit double --
+parameter is `long long double *floatvalue`, which MSVC makes a 64-bit double --
 token_t's field is 8 bytes, so `double` is the honest spelling.
 ===============================================================================
 */
 void NumberValue( char *string, int subtype, unsigned long *intvalue,
-				  double *floatvalue ) {
+				  long double *floatvalue ) {
 	unsigned long dotfound = 0;
 
 	*intvalue = 0;
@@ -721,7 +709,7 @@ void NumberValue( char *string, int subtype, unsigned long *intvalue,
 			}
 			string++;
 		}
-		*intvalue = (unsigned long) (long) *floatvalue;   /* __ftol2 */
+		*intvalue = (unsigned long) (__int64) *floatvalue;   /* __ftol2, low dword */
 	} else if ( subtype & TT_DECIMAL ) {
 		while ( *string ) {
 			*intvalue = *intvalue * 10 + ( *string++ - '0' );
@@ -989,10 +977,39 @@ int PS_ReadPunctuation( script_t *script, token_t *token ) {
 
 /*
 ===============================================================================
-PS_ReadToken                       0x00442FB0    DIVERGED (inlining only)
+PS_ReadPrimitive                   0x00442F30    VERBATIM
 
-RTCW l_script.c:862 -- PS_ReadToken, with RTCW's PS_ReadPrimitive (l_script.c:838)
-INLINED into the SCFL_PRIMITIVE arm; see the unit banner.
+RTCW l_script.c:838.  Its only reference is PS_ReadToken's SCFL_PRIMITIVE arm,
+a tail jump (0x004430BA), so the IDB files it as loc_442F30, a chunk of
+PS_ReadToken.
+
+RETAIL: __usercall( script@<eax>, token@<ecx> ).  Source order.
+===============================================================================
+*/
+int PS_ReadPrimitive( script_t *script, token_t *token ) {
+	int len;
+
+	len = 0;
+	while ( *script->script_p > ' ' && *script->script_p != ';' ) {
+		if ( len >= MAX_TOKEN ) {
+			ScriptError( script, "primitive token longer than MAX_TOKEN = %d", MAX_TOKEN );
+			return 0;
+		}
+		token->string[len++] = *script->script_p++;
+	}
+	token->string[len] = 0;
+	/* copy the token */
+	memcpy( &script->token, token, sizeof( token_t ) );
+	/* primitive reading successfull */
+	return 1;
+}
+
+/*
+===============================================================================
+PS_ReadToken                       0x00442FB0    VERBATIM
+
+RTCW l_script.c:862.  The SCFL_PRIMITIVE arm tail-jumps to PS_ReadPrimitive
+(0x00442F30); see the unit banner.
 
 Everything else is verbatim: the tokenavailable fast path, the lastscript_p /
 lastline save, the memset of the whole 1072-byte token, the whitespace bracket
@@ -1017,8 +1034,6 @@ here too.  Digits and the `.`-followed-by-digit case follow at 0x443082.
 ===============================================================================
 */
 int PS_ReadToken( script_t *script, token_t *token ) {
-	int len;
-
 	/* if there is a token available (from UnreadToken) */
 	if ( script->tokenavailable ) {
 		script->tokenavailable = 0;
@@ -1068,22 +1083,9 @@ int PS_ReadToken( script_t *script, token_t *token ) {
 			return 0;
 		}
 	}
-	/* if this is a primitive script -- RTCW calls PS_ReadPrimitive here; the
-	 * retail compiler inlined it, so the whole body is spelled out. */
+	/* if this is a primitive script */
 	else if ( script->flags & SCFL_PRIMITIVE ) {
-		len = 0;
-		while ( *script->script_p > ' ' && *script->script_p != ';' ) {
-			if ( len >= MAX_TOKEN ) {
-				ScriptError( script, "primitive token longer than MAX_TOKEN = %d", MAX_TOKEN );
-				return 0;
-			}
-			token->string[len++] = *script->script_p++;
-		}
-		token->string[len] = 0;
-		/* copy the token into the script structure */
-		memcpy( &script->token, token, sizeof( token_t ) );
-		/* primitive reading successfull */
-		return 1;
+		return PS_ReadPrimitive( script, token );
 	}
 	/* if there is a name */
 	else if ( ( *script->script_p >= 'a' && *script->script_p <= 'z' ) ||
@@ -1357,54 +1359,36 @@ StripSingleQuotes                   0x00443760    VERBATIM   (VERIFIED)
 
 RTCW l_script.c:1144 / :1158.
 
-CONVENTION -- MUST STAY __fastcall.  The retail bodies read the string out of
-EDX and never touch ECX; the `lea ecx, [ecx+0]` at 0x0044371D and 0x0044376D is
-a three-byte NOP, not a use.  So this is __usercall(string@<edx>), which MSVC
-spells as __fastcall with a dead first parameter.  A __fastcall definition
-decorates as @StripDoubleQuotes@8; an `extern int StripDoubleQuotes();` would
-emit a call to the cdecl spelling _StripDoubleQuotes, which nothing defines, so
-both callers take the prototype from l_script.h.
+CONVENTION.  RTCW's one-parameter void form; LTCG passes the string in EDX
+(retail never touches ECX: the `lea ecx, [ecx+0]` at 0x0044371D and 0x0044376D
+is a three-byte NOP) and the bodies end with a plain `ret`.
 
 CONSTNESS.  Retail writes through the parameter -- `mov [esi+eax], cl` at
 0x00443722 and `mov [eax+edx-1], cl` at 0x0044374E -- so it is `char *`, not
-`const char *`.  RETURN VALUE: EAX holds strlen measured AFTER the opening quote
-is shifted out and BEFORE the closing one is overwritten.  Neither caller uses
-it and RTCW declares these void; kept as unsigned int to match the binary.
+`const char *`.
 
-DIVERGENCE (deliberate, one instruction).  Retail tests the last character with
-`cmp byte ptr [eax+edx-1], 22h` using the measured length unguarded, so an empty
-string reads -- and can then write a NUL to -- the byte before the buffer.
-RTCW has the identical unguarded `string[strlen(string) - 1]`.  Unreachable
-today: both callers gate on token.type == TT_STRING and PS_ReadString always
-deposits at least the opening quote.  The `len > 0` guard below therefore cannot
-change behaviour on any input retail could produce, and it removes a one-byte
-underflow from a parser that eats untrusted files.  Remove it if bit-exactness
-ever matters more than that.
+LAST CHARACTER.  Retail (and RTCW) test `string[strlen(string) - 1]` unguarded,
+so an empty string would read the byte before the buffer.  Unreachable: both
+callers gate on token.type == TT_STRING, and PS_ReadString only returns a string
+token with both quotes, so at least the closing quote is left after the shift.
 ===============================================================================
 */
-unsigned int __fastcall StripDoubleQuotes( int unused, char *string ) {
-	char *p;
-	unsigned int len;
-
-	(void)unused;
-
-	if ( string[0] == '\"' ) {
-		/* shift the whole string down one byte, NUL included.  RTCW spells
-		 * this `strcpy(string, string + 1)`, an overlapping strcpy; retail
-		 * emits the byte loop, which is what MSVC's intrinsic becomes. */
-		for ( p = string + 1; ; p++ ) {
-			p[-1] = p[0];
-			if ( !p[0] ) {
-				break;
-			}
+void StripDoubleQuotes( char *string ) {
+	if ( *string == '\"' ) {
+		/* shift the whole string down one byte, NUL included: RTCW's overlapping
+		 * strcpy, which VC7's intrinsic turns into retail's byte loop */
+#ifdef COD1_VC7
+		strcpy( string, string + 1 );
+#else
+		char *d = string, *s = string + 1;
+		while ( ( *d++ = *s++ ) != 0 ) {
 		}
+#endif
 	}
 
-	len = strlen( string );
-	if ( len > 0 && string[len - 1] == '\"' ) {
-		string[len - 1] = 0;
+	if ( string[strlen( string ) - 1] == '\"' ) {
+		string[strlen( string ) - 1] = '\0';
 	}
-	return len;
 }
 
 /* VERIFIED 0x00443760.  StripDoubleQuotes with 0x27 for 0x22 throughout:
@@ -1413,28 +1397,22 @@ unsigned int __fastcall StripDoubleQuotes( int unused, char *string ) {
  * last-character test is the same unguarded `cmp byte ptr [eax+edx-1],27h`.
  *
  * Retail recomputes strlen a THIRD time at 0x00443790 before the terminating
- * store, where `len` is reused below; the string cannot change between the
- * two. */
-unsigned int __fastcall StripSingleQuotes( int unused, char *string ) {
-	char *p;
-	unsigned int len;
-
-	(void)unused;
-
-	if ( string[0] == '\'' ) {
-		for ( p = string + 1; ; p++ ) {
-			p[-1] = p[0];
-			if ( !p[0] ) {
-				break;
-			}
+ * store, as RTCW's `string[strlen(string)-1] = '\0'` does; so does the code
+ * below. */
+void StripSingleQuotes( char *string ) {
+	if ( *string == '\'' ) {
+#ifdef COD1_VC7
+		strcpy( string, string + 1 );
+#else
+		char *d = string, *s = string + 1;
+		while ( ( *d++ = *s++ ) != 0 ) {
 		}
+#endif
 	}
 
-	len = strlen( string );
-	if ( len > 0 && string[len - 1] == '\'' ) {
-		string[len - 1] = 0;
+	if ( string[strlen( string ) - 1] == '\'' ) {
+		string[strlen( string ) - 1] = '\0';
 	}
-	return len;
 }
 
 /*
@@ -1619,8 +1597,7 @@ script_t *LoadScriptMemory( char *ptr, int length, char *name ) {
 	void *buffer;
 	script_t *script;
 
-	buffer = PS_GetMemory( sizeof( script_t ) + length + 1 );
-	memset( buffer, 0, sizeof( script_t ) + length + 1 );
+	buffer = GetClearedMemory( sizeof( script_t ) + length + 1 );
 	script = (script_t *) buffer;
 	memset( script, 0, sizeof( script_t ) );
 	strcpy( script->filename, name );
@@ -1659,9 +1636,9 @@ RETAIL: __usercall( script@<esi> ).
 */
 void FreeScript( script_t *script ) {
 	if ( script->punctuationtable ) {
-		PS_FreeMemory( script->punctuationtable );
+		FreeMemory( script->punctuationtable );
 	}
-	PS_FreeMemory( script );
+	FreeMemory( script );
 }
 
 /*

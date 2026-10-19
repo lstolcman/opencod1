@@ -4,627 +4,919 @@
  * @fidelity: likely
  */
 
+#ifdef __cplusplus
+/* retail built this unit as C++ (GP2 classes, EH frames); every name keeps C linkage */
+extern "C" {
+#endif
+
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
+/* zlib/zlib_rdata.c (this unit carries its own deflate types, so not zlib_types.h) */
+extern const unsigned char _dist_code[512];   /* 0x00540CB8 */
+extern const unsigned char _length_code[256];   /* 0x00540EB8 */
+extern int z_errmsg;   /* 0x00571BA8 == &z_errmsg[2] */
+extern unsigned char fxMemBlocks[0x200000];   /* EffectsCore/FxMemMgr.cpp, the FX arena */
+extern unsigned int theFxScheduler[5409];   /* EffectsCore/fx_rdata.c */
+extern unsigned char theFxHelper[132];   /* EffectsCore/fx_rdata.c */
+
+/* Called through the IAT, as with windows.h. */
+__declspec( dllimport ) int __stdcall MessageBoxA( void *hWnd, const char *text, const char *caption, unsigned type );
+
+/* Owned by this unit.
+ *
+ * zlib 1.1.4 crc32.c's `local const uLongf crc_table[256]`, the precomputed
+ * CRC-32 table (polynomial 0xEDB88320), which get_crc_table hands out and
+ * crc32 indexes.  Retail 0x005413D0 in .rdata, 1024 bytes; IDA's [272] was
+ * only the distance to the next label.  Every entry was read out of the
+ * retail PE and matches zlib's make_crc_table() output.  It used to be a
+ * zeroed `int crc_table[272]` here, with crc32 reading a private copy built
+ * at run time instead. */
+const unsigned long crc_table[256] = {   /* 0x005413D0 */
+	0x00000000UL, 0x77073096UL, 0xee0e612cUL, 0x990951baUL,
+	0x076dc419UL, 0x706af48fUL, 0xe963a535UL, 0x9e6495a3UL,
+	0x0edb8832UL, 0x79dcb8a4UL, 0xe0d5e91eUL, 0x97d2d988UL,
+	0x09b64c2bUL, 0x7eb17cbdUL, 0xe7b82d07UL, 0x90bf1d91UL,
+	0x1db71064UL, 0x6ab020f2UL, 0xf3b97148UL, 0x84be41deUL,
+	0x1adad47dUL, 0x6ddde4ebUL, 0xf4d4b551UL, 0x83d385c7UL,
+	0x136c9856UL, 0x646ba8c0UL, 0xfd62f97aUL, 0x8a65c9ecUL,
+	0x14015c4fUL, 0x63066cd9UL, 0xfa0f3d63UL, 0x8d080df5UL,
+	0x3b6e20c8UL, 0x4c69105eUL, 0xd56041e4UL, 0xa2677172UL,
+	0x3c03e4d1UL, 0x4b04d447UL, 0xd20d85fdUL, 0xa50ab56bUL,
+	0x35b5a8faUL, 0x42b2986cUL, 0xdbbbc9d6UL, 0xacbcf940UL,
+	0x32d86ce3UL, 0x45df5c75UL, 0xdcd60dcfUL, 0xabd13d59UL,
+	0x26d930acUL, 0x51de003aUL, 0xc8d75180UL, 0xbfd06116UL,
+	0x21b4f4b5UL, 0x56b3c423UL, 0xcfba9599UL, 0xb8bda50fUL,
+	0x2802b89eUL, 0x5f058808UL, 0xc60cd9b2UL, 0xb10be924UL,
+	0x2f6f7c87UL, 0x58684c11UL, 0xc1611dabUL, 0xb6662d3dUL,
+	0x76dc4190UL, 0x01db7106UL, 0x98d220bcUL, 0xefd5102aUL,
+	0x71b18589UL, 0x06b6b51fUL, 0x9fbfe4a5UL, 0xe8b8d433UL,
+	0x7807c9a2UL, 0x0f00f934UL, 0x9609a88eUL, 0xe10e9818UL,
+	0x7f6a0dbbUL, 0x086d3d2dUL, 0x91646c97UL, 0xe6635c01UL,
+	0x6b6b51f4UL, 0x1c6c6162UL, 0x856530d8UL, 0xf262004eUL,
+	0x6c0695edUL, 0x1b01a57bUL, 0x8208f4c1UL, 0xf50fc457UL,
+	0x65b0d9c6UL, 0x12b7e950UL, 0x8bbeb8eaUL, 0xfcb9887cUL,
+	0x62dd1ddfUL, 0x15da2d49UL, 0x8cd37cf3UL, 0xfbd44c65UL,
+	0x4db26158UL, 0x3ab551ceUL, 0xa3bc0074UL, 0xd4bb30e2UL,
+	0x4adfa541UL, 0x3dd895d7UL, 0xa4d1c46dUL, 0xd3d6f4fbUL,
+	0x4369e96aUL, 0x346ed9fcUL, 0xad678846UL, 0xda60b8d0UL,
+	0x44042d73UL, 0x33031de5UL, 0xaa0a4c5fUL, 0xdd0d7cc9UL,
+	0x5005713cUL, 0x270241aaUL, 0xbe0b1010UL, 0xc90c2086UL,
+	0x5768b525UL, 0x206f85b3UL, 0xb966d409UL, 0xce61e49fUL,
+	0x5edef90eUL, 0x29d9c998UL, 0xb0d09822UL, 0xc7d7a8b4UL,
+	0x59b33d17UL, 0x2eb40d81UL, 0xb7bd5c3bUL, 0xc0ba6cadUL,
+	0xedb88320UL, 0x9abfb3b6UL, 0x03b6e20cUL, 0x74b1d29aUL,
+	0xead54739UL, 0x9dd277afUL, 0x04db2615UL, 0x73dc1683UL,
+	0xe3630b12UL, 0x94643b84UL, 0x0d6d6a3eUL, 0x7a6a5aa8UL,
+	0xe40ecf0bUL, 0x9309ff9dUL, 0x0a00ae27UL, 0x7d079eb1UL,
+	0xf00f9344UL, 0x8708a3d2UL, 0x1e01f268UL, 0x6906c2feUL,
+	0xf762575dUL, 0x806567cbUL, 0x196c3671UL, 0x6e6b06e7UL,
+	0xfed41b76UL, 0x89d32be0UL, 0x10da7a5aUL, 0x67dd4accUL,
+	0xf9b9df6fUL, 0x8ebeeff9UL, 0x17b7be43UL, 0x60b08ed5UL,
+	0xd6d6a3e8UL, 0xa1d1937eUL, 0x38d8c2c4UL, 0x4fdff252UL,
+	0xd1bb67f1UL, 0xa6bc5767UL, 0x3fb506ddUL, 0x48b2364bUL,
+	0xd80d2bdaUL, 0xaf0a1b4cUL, 0x36034af6UL, 0x41047a60UL,
+	0xdf60efc3UL, 0xa867df55UL, 0x316e8eefUL, 0x4669be79UL,
+	0xcb61b38cUL, 0xbc66831aUL, 0x256fd2a0UL, 0x5268e236UL,
+	0xcc0c7795UL, 0xbb0b4703UL, 0x220216b9UL, 0x5505262fUL,
+	0xc5ba3bbeUL, 0xb2bd0b28UL, 0x2bb45a92UL, 0x5cb36a04UL,
+	0xc2d7ffa7UL, 0xb5d0cf31UL, 0x2cd99e8bUL, 0x5bdeae1dUL,
+	0x9b64c2b0UL, 0xec63f226UL, 0x756aa39cUL, 0x026d930aUL,
+	0x9c0906a9UL, 0xeb0e363fUL, 0x72076785UL, 0x05005713UL,
+	0x95bf4a82UL, 0xe2b87a14UL, 0x7bb12baeUL, 0x0cb61b38UL,
+	0x92d28e9bUL, 0xe5d5be0dUL, 0x7cdcefb7UL, 0x0bdbdf21UL,
+	0x86d3d2d4UL, 0xf1d4e242UL, 0x68ddb3f8UL, 0x1fda836eUL,
+	0x81be16cdUL, 0xf6b9265bUL, 0x6fb077e1UL, 0x18b74777UL,
+	0x88085ae6UL, 0xff0f6a70UL, 0x66063bcaUL, 0x11010b5cUL,
+	0x8f659effUL, 0xf862ae69UL, 0x616bffd3UL, 0x166ccf45UL,
+	0xa00ae278UL, 0xd70dd2eeUL, 0x4e048354UL, 0x3903b3c2UL,
+	0xa7672661UL, 0xd06016f7UL, 0x4969474dUL, 0x3e6e77dbUL,
+	0xaed16a4aUL, 0xd9d65adcUL, 0x40df0b66UL, 0x37d83bf0UL,
+	0xa9bcae53UL, 0xdebb9ec5UL, 0x47b2cf7fUL, 0x30b5ffe9UL,
+	0xbdbdf21cUL, 0xcabac28aUL, 0x53b39330UL, 0x24b4a3a6UL,
+	0xbad03605UL, 0xcdd70693UL, 0x54de5729UL, 0x23d967bfUL,
+	0xb3667a2eUL, 0xc4614ab8UL, 0x5d681b02UL, 0x2a6f2b94UL,
+	0xb40bbe37UL, 0xc30c8ea1UL, 0x5a05df1bUL, 0x2d02ef8dUL
+};
 
 extern void MakeNormalVectors( const float *forward, float *right, float *up );
-extern int SEH_GetLocalizedString_m();
-extern int SL_FindLowercaseString();
+extern int SEH_GetLocalizedString_m( const char *key );
+extern int SL_FindLowercaseString( const char *text );
 extern void Sys_OutOfMemoryPrep( void );
-extern int DObjFindPartIndex();   /* 0x00481230, defined in xanim/dobj.cpp */
-extern int FxMem_ClaimBlock_m();
-extern int sub_4920B0();
-extern int sub_492110();
-extern int sub_492170();
-extern int sub_4921D0();
-extern int sub_492230();
-extern int sub_492290();
-extern int sub_4922F0();
-extern int sub_492350();
-extern int sub_4923B0();
-extern int CFxScheduler__RegisterEffect();
-extern int CFxScheduler__PlayEffect_id_simple_m();
-extern int CFxScheduler__PlayEffect_name_bolt_m();
-extern int CFxScheduler__PlayEffect_id_axis();
-extern int CFxScheduler__PlayEffect_name_simple_m();
-extern int CFxScheduler__PlayEffect_name_m();
-extern int CFxScheduler__AddScheduledEffects();
-extern int SFxHelper__AdjustTime();
-extern void SFxHelper__AdjustCamera( int self, int view, float zfar );
-extern int FX_Free();
+extern int DObjFindPartIndex( int dobj, unsigned short nameHandle );   /* 0x00481230, defined in xanim/dobj.cpp */
+struct fxPool_s;
+struct fxPoolBlock_s;
+extern struct fxPoolBlock_s *FxMem_ClaimBlock_m( int count, int elemSize, struct fxPoolBlock_s *prev );
+extern int FxPool_MakeBlockCurrentLight( struct fxPool_s *pool, struct fxPoolBlock_s *block );
+extern int FxPool_MakeBlockCurrentParticle( struct fxPool_s *pool, struct fxPoolBlock_s *block );
+extern int FxPool_MakeBlockCurrentLine( struct fxPool_s *pool, struct fxPoolBlock_s *block );
+extern int FxPool_MakeBlockCurrentElectricity( struct fxPool_s *pool, struct fxPoolBlock_s *block );
+extern int FxPool_MakeBlockCurrentOrientedParticle( struct fxPool_s *pool, struct fxPoolBlock_s *block );
+extern int FxPool_MakeBlockCurrentTail( struct fxPool_s *pool, struct fxPoolBlock_s *block );
+extern int FxPool_MakeBlockCurrentCylinder( struct fxPool_s *pool, struct fxPoolBlock_s *block );
+extern int FxPool_MakeBlockCurrentEmitter( struct fxPool_s *pool, struct fxPoolBlock_s *block );
+extern int FxPool_MakeBlockCurrentDecal( struct fxPool_s *pool, struct fxPoolBlock_s *block );
+struct CFxScheduler { int RegisterEffect( const char *file, bool isPath ); };   /* EffectsCore: __thiscall member */
+extern void __stdcall CFxScheduler__PlayEffect_id_simple_m( int effectId, float *origin, void *self );
+extern void __stdcall CFxScheduler__PlayEffect_name_bolt_m( char *name, void *self, float *origin, int *axis, int *bolt );
+extern void __stdcall CFxScheduler__PlayEffect_id_axis(void *self, int id, float *origin, void *axis, void *bolt);
+extern void __stdcall CFxScheduler__PlayEffect_name_simple_m( char *name, void *self, float *origin );
+extern void __stdcall CFxScheduler__PlayEffect_name_m( int *direction, char *name, void *self, float *origin );
+extern int CFxScheduler__AddScheduledEffects( void *self );
+extern int SFxHelper__AdjustTime( void *self, int realTime );
+extern void __stdcall SFxHelper__AdjustCamera( void *self, int view, float zfar );
+extern int FX_Free( int freeAll );
 extern int FX_Init();
-extern int _tr_init();
-extern int _tr_stored_block();
-extern int _tr_align();
-extern int _tr_flush_block();
+extern int _tr_init( struct internal_state *s );
+extern int _tr_stored_block( struct internal_state *s, int eof, char *buf, int stored_len );
+extern int _tr_align( struct internal_state *s );
+extern void __cdecl _tr_flush_block(struct internal_state *s, char *buf, unsigned int stored_len, int eof);
 extern int zcalloc();
 extern int zcfree();
 
-int __cdecl FxPool_MakeBlockCurrent( int block, int pool );
+inline struct fxPoolBlock_s *__cdecl FxPool_MakeBlockCurrent( struct fxPool_s *pool, struct fxPoolBlock_s *block );  /* see definition */
 
+/* GenericParser2 classes (defined below as textPool_t, gpObject_t, gpValue_t, gpGroup_t, genericParser2_t) */
+struct textPool_s;
+struct gpObject_s;
+struct gpValue_s;
+struct gpGroup_s;
+struct genericParser2_s;
 char *__cdecl GP2_GetToken( char allowLineBreaks, char readUntilNewline, char **text );
-void **__cdecl CTextPool__CTextPool( size_t initSize, void **this_ );
-int __cdecl CTextPool__AllocText( int *this_, const char *text, int addNULL, int poolPtr );
-char __cdecl CGPObject__WriteText( const char *text, int **textPool, int this_ );
-int __cdecl CGPValue__AddValue( int textPool, const char *newValue, int this_ );
-int *__cdecl CGPValue__Duplicate( int this_, int **textPool );
-char __cdecl CGPValue__Parse( int **textPool, int this_, char **dataPtr );
-char __cdecl CGPValue__Write( int this_, int **textPool, int depth );
-int __cdecl CGPGroup__Clean( int this_ );
-int *__cdecl CGPGroup__Duplicate( int this_, int **textPool, int initParent );
-_DWORD *__cdecl CGP_InsertInOrder( _DWORD *listHead, int newObj, int parent,
-                                   _DWORD *inOrderHead, int currentSlot );
-int __cdecl CGPGroup__AddPair( const char *value, int **textPool, int this_, const char *name );
-int __cdecl CGPGroup__AddGroup( int **textPool, const char *name, int this_ );
-char __cdecl CGPGroup__Parse( _BYTE *this_, char **dataPtr, int **textPool );
-char __cdecl CGPGroup__Write( const char **this_, int **textPool, int depth );
-void __cdecl CGenericParser2__CleanTextPool( int this_ );
+struct textPool_s *__cdecl CTextPool__CTextPool( size_t initSize, struct textPool_s *this_ );
+#ifndef __cplusplus
+char *__stdcall CTextPool__AllocText( struct textPool_s *this_, const char *text, int addNULL, struct textPool_s **poolPtr );
+#endif
+void *__cdecl CTextPool__operator_new( size_t size );
+struct textPool_s *__cdecl CTextPool__GetNext( struct textPool_s *this_ );
+struct textPool_s *__cdecl CTextPool__SetNext( struct textPool_s *this_, struct textPool_s *which );
+char __stdcall CGPObject__WriteText( const char *text, struct textPool_s **textPool, struct gpObject_s *this_ );
+__declspec(noinline) void __cdecl CGPValue__AddValue( struct textPool_s **textPool, const char *newValue, struct gpValue_s *this_ );
+char __stdcall CGPValue__Parse( struct textPool_s **textPool, struct gpValue_s *this_, char **dataPtr );
+char __stdcall CGPValue__Write( struct gpValue_s *this_, struct textPool_s **textPool, int depth );
+/* __stdcall/__fastcall below: retail's C++ methods keep thiscall's callee-pop
+ * (and Clean its ecx `this`) under LTCG. */
+void __fastcall CGPGroup__Clean( struct gpGroup_s *this_ );
+typedef struct { void *value; } GpPointerArgument;
+struct gpGroup_s *__fastcall CGPGroup__Duplicate(struct gpGroup_s *receiver, GpPointerArgument poolReference, GpPointerArgument parentReference);
+/* thiscall method: the receiver in ecx, the pool pointer on the stack */
+struct gpValue_s *__fastcall CGPValue__Duplicate( struct gpValue_s *receiver, GpPointerArgument poolReference );
+#ifdef __cplusplus
+/* retail drops the EH state store before every SortObject call: it cannot throw */
+#define GP_NOTHROW throw()
+#else
+#define GP_NOTHROW
+#endif
+void __stdcall CGP_InsertInOrder( struct gpGroup_s *this_, struct gpObject_s *object, struct gpObject_s **unsortedList,
+                                  struct gpObject_s **sortedList, struct gpObject_s **lastObject ) GP_NOTHROW;
+struct gpValue_s *__stdcall CGPGroup__AddPair( const char *value, struct textPool_s **textPool, struct gpGroup_s *this_, const char *name );
+struct gpGroup_s *__stdcall CGPGroup__AddGroup( const char *name, struct textPool_s **textPool, struct gpGroup_s *this_ );
+char __fastcall CGPGroup__Parse(struct gpGroup_s *receiver, GpPointerArgument dataReference, GpPointerArgument poolReference);
+void __cdecl CGenericParser2__CleanTextPool( struct genericParser2_s *this_ );
 
-int __cdecl adler32( unsigned int adler, unsigned __int8 *buf, unsigned int len );
-int __cdecl crc32( int crc, unsigned int len, _BYTE *buf );
+int __cdecl adler32( unsigned int adler, unsigned char *buf, unsigned int len );
+int __cdecl crc32( int crc, const unsigned char *buf, unsigned int len );
 unsigned int __cdecl compress2( int sourceLen, int dest, int destLen, int *source, unsigned int level );
-int __cdecl deflateInit2_( _BYTE *version, _DWORD *strm, int windowBits, unsigned int level,
-                           int method, int memLevel, unsigned int strategy, int stream_size );
-int __cdecl deflateParams( int strm, unsigned int level, unsigned int strategy );
-int __cdecl putShortMSB( int s, __int16 b );
-int __cdecl flush_pending( int strm );
-int __cdecl deflate( int strm, int flush );
-unsigned int __cdecl deflateEnd( int strm );
-unsigned int __cdecl deflate_read_buf( int strm, void *buf, unsigned int size );
-int __fastcall lm_init( int unused, int s );
-unsigned int __cdecl longest_match( unsigned int cur_match, _DWORD *s );
-int __cdecl deflate_fill_window( int s );
-int __cdecl deflate_stored( int *s, int flush );
-int __cdecl deflate_fast( int s, int flush );
-int __cdecl deflate_slow( _DWORD *s, int flush );
+int __cdecl deflateInit2_( struct z_stream_s *strm, int level, int method, int windowBits, int memLevel,
+                           int strategy, const char *version, int stream_size );
+int __cdecl deflateReset( struct z_stream_s *strm );
+
+/* ---- zlib 1.1.4 zlib.h / deflate.h (the deflate.c part of this unit) ---- */
+typedef unsigned char   Byte;
+typedef unsigned int    uInt;
+typedef unsigned long   uLong;
+typedef unsigned char   uch;
+typedef unsigned short  ush;
+typedef unsigned long   ulg;
+typedef ush             Pos;
+typedef unsigned        IPos;
+
+typedef struct z_stream_s {
+	Byte   *next_in;    /* +0x00 */
+	uInt    avail_in;   /* +0x04 */
+	uLong   total_in;   /* +0x08 */
+	Byte   *next_out;   /* +0x0C */
+	uInt    avail_out;  /* +0x10 */
+	uLong   total_out;  /* +0x14 */
+	char   *msg;        /* +0x18 */
+	struct internal_state *state;   /* +0x1C */
+	void *( __cdecl *zalloc )( void *opaque, uInt items, uInt size );   /* +0x20 */
+	void  ( __cdecl *zfree )( void *opaque, void *address );            /* +0x24 */
+	void   *opaque;     /* +0x28 */
+	int     data_type;  /* +0x2C */
+	uLong   adler;      /* +0x30 */
+	uLong   reserved;   /* +0x34 */
+} z_stream;
+typedef z_stream *z_streamp;
+typedef void *( __cdecl *alloc_func )( void *opaque, uInt items, uInt size );
+typedef void  ( __cdecl *free_func )( void *opaque, void *address );
+
+typedef struct ct_data_s {
+	union { ush freq; ush code; } fc;
+	union { ush dad;  ush len;  } dl;
+} ct_data;
+
+typedef struct tree_desc_s {
+	ct_data *dyn_tree;
+	int      max_code;
+	void    *stat_desc;
+} tree_desc;
+
+#define Z_PARTIAL_FLUSH 1
+#define Z_FULL_FLUSH    3
+#define Z_FINISH        4
+#define Z_OK            0
+#define Z_STREAM_END    1
+#define Z_NEED_DICT     2
+#define Z_STREAM_ERROR  (-2)
+#define Z_DATA_ERROR    (-3)
+#define Z_MEM_ERROR     (-4)
+#define Z_BUF_ERROR     (-5)
+#define Z_FILTERED      1
+#define Z_HUFFMAN_ONLY  2
+#define Z_DEFLATED      8
+#define Z_DEFAULT_COMPRESSION (-1)
+#define Z_NO_FLUSH      0
+
+#define LENGTH_CODES 29
+#define LITERALS     256
+#define L_CODES      ( LITERALS + 1 + LENGTH_CODES )
+#define D_CODES      30
+#define BL_CODES     19
+#define HEAP_SIZE    ( 2 * L_CODES + 1 )
+#define MAX_BITS     15
+#define INIT_STATE   42
+#define BUSY_STATE   113
+#define FINISH_STATE 666
+#define MIN_MATCH    3
+#define MAX_MATCH    258
+#define MIN_LOOKAHEAD ( MAX_MATCH + MIN_MATCH + 1 )
+#define MAX_DIST( s ) ( ( s )->w_size - MIN_LOOKAHEAD )
+#define NIL          0
+#define TOO_FAR      4096
+#define PRESET_DICT  0x20
+
+typedef struct internal_state {
+	z_streamp strm;          /* +0x0000 */
+	int       status;        /* +0x0004 */
+	Byte     *pending_buf;   /* +0x0008 */
+	ulg       pending_buf_size; /* +0x000C */
+	Byte     *pending_out;   /* +0x0010 */
+	int       pending;       /* +0x0014 */
+	int       noheader;      /* +0x0018 */
+	Byte      data_type;     /* +0x001C */
+	Byte      method;        /* +0x001D */
+	int       last_flush;    /* +0x0020 */
+	uInt      w_size;        /* +0x0024 */
+	uInt      w_bits;        /* +0x0028 */
+	uInt      w_mask;        /* +0x002C */
+	Byte     *window;        /* +0x0030 */
+	ulg       window_size;   /* +0x0034 */
+	Pos      *prev;          /* +0x0038 */
+	Pos      *head;          /* +0x003C */
+	uInt      ins_h;         /* +0x0040 */
+	uInt      hash_size;     /* +0x0044 */
+	uInt      hash_bits;     /* +0x0048 */
+	uInt      hash_mask;     /* +0x004C */
+	uInt      hash_shift;    /* +0x0050 */
+	long      block_start;   /* +0x0054 */
+	uInt      match_length;  /* +0x0058 */
+	IPos      prev_match;    /* +0x005C */
+	int       match_available; /* +0x0060 */
+	uInt      strstart;      /* +0x0064 */
+	uInt      match_start;   /* +0x0068 */
+	uInt      lookahead;     /* +0x006C */
+	uInt      prev_length;   /* +0x0070 */
+	uInt      max_chain_length; /* +0x0074 */
+	uInt      max_lazy_match;   /* +0x0078 */
+	int       level;         /* +0x007C */
+	int       strategy;      /* +0x0080 */
+	uInt      good_match;    /* +0x0084 */
+	int       nice_match;    /* +0x0088 */
+	ct_data   dyn_ltree[HEAP_SIZE];     /* +0x008C */
+	ct_data   dyn_dtree[2 * D_CODES + 1];  /* +0x0980 */
+	ct_data   bl_tree[2 * BL_CODES + 1];   /* +0x0A74 */
+	tree_desc l_desc;        /* +0x0B10 */
+	tree_desc d_desc;        /* +0x0B1C */
+	tree_desc bl_desc;       /* +0x0B28 */
+	ush       bl_count[MAX_BITS + 1];   /* +0x0B34 */
+	int       heap[2 * L_CODES + 1];    /* +0x0B54 */
+	int       heap_len;      /* +0x1448 */
+	int       heap_max;      /* +0x144C */
+	uch       depth[2 * L_CODES + 1];   /* +0x1450 */
+	uch      *l_buf;         /* +0x1690 */
+	uInt      lit_bufsize;   /* +0x1694 */
+	uInt      last_lit;      /* +0x1698 */
+	ush      *d_buf;         /* +0x169C */
+	ulg       opt_len;       /* +0x16A0 */
+	ulg       static_len;    /* +0x16A4 */
+	uInt      matches;       /* +0x16A8 */
+	int       last_eob_len;  /* +0x16AC */
+	ush       bi_buf;        /* +0x16B0 */
+	int       bi_valid;      /* +0x16B4 */
+} deflate_state;
+typedef char deflate_state_size_check[ sizeof( deflate_state ) == 5816 ? 1 : -1 ];
+
+typedef enum { need_more, block_done, finish_started, finish_done } block_state;
+
+int __cdecl deflateParams( z_streamp strm, int level, int strategy );
+void __cdecl putShortMSB( deflate_state *s, uInt b );
+void __cdecl flush_pending( z_streamp strm );
+int __cdecl deflate( z_streamp strm, int flush );
+int __cdecl deflateEnd( z_streamp strm );
+unsigned int __cdecl deflate_read_buf( z_streamp strm, Byte *buf, unsigned int size );
+void __cdecl lm_init( deflate_state *s );
+uInt __cdecl longest_match( deflate_state *s, IPos cur_match );
+void __cdecl deflate_fill_window( deflate_state *s );
+int __cdecl deflate_stored( deflate_state *s, int flush );
+int __cdecl deflate_fast( deflate_state *s, int flush );
+int __cdecl deflate_slow( deflate_state *s, int flush );
 
 #define GP2_MAX_TOKEN_SIZE  1024
 static char gp2_token[ GP2_MAX_TOKEN_SIZE + 4 ];
-
-static int   zlib_tablesBuilt;
-static unsigned int  zlib_crcTable[256];
-static unsigned char zlib_distCode[512];    /* 0x00540CB8, d_code() lookup   */
-static unsigned char zlib_lengthCode[256];  /* 0x00540EB8, length_code[]     */
-
-static void zlib_BuildTables( void ) {
-	static const int extra_lbits[29] = { 0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,
-	                                     3,3,3,3,4,4,4,4,5,5,5,5,0 };
-	static const int extra_dbits[30] = { 0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,
-	                                     7,7,8,8,9,9,10,10,11,11,12,12,13,13 };
-	unsigned int c;
-	int n, k, code, length, dist;
-
-	if ( zlib_tablesBuilt ) {
-		return;
-	}
-
-	for ( n = 0; n < 256; n++ ) {
-		c = (unsigned int)n;
-		for ( k = 0; k < 8; k++ ) {
-			c = ( c & 1 ) ? ( 0xEDB88320u ^ ( c >> 1 ) ) : ( c >> 1 );
-		}
-		zlib_crcTable[n] = c;
-	}
-
-	length = 0;
-	for ( code = 0; code < 28; code++ ) {
-		for ( n = 0; n < ( 1 << extra_lbits[code] ); n++ ) {
-			zlib_lengthCode[length++] = (unsigned char)code;
-		}
-	}
-	zlib_lengthCode[255] = 28;
-
-	dist = 0;
-	for ( code = 0; code < 16; code++ ) {
-		for ( n = 0; n < ( 1 << extra_dbits[code] ); n++ ) {
-			zlib_distCode[dist++] = (unsigned char)code;
-		}
-	}
-	dist >>= 7;
-	for ( ; code < 30; code++ ) {
-		for ( n = 0; n < ( 1 << ( extra_dbits[code] - 7 ) ); n++ ) {
-			zlib_distCode[256 + dist++] = (unsigned char)code;
-		}
-	}
-
-	zlib_tablesBuilt = 1;
-}
 
 typedef struct {
 	unsigned short good_length;
 	unsigned short max_lazy;
 	unsigned short nice_length;
 	unsigned short max_chain;
-	int ( __cdecl *func )( int s, int flush );
+	int ( __cdecl *func )( deflate_state *s, int flush );
 } deflate_config_t;
 
-static int __cdecl deflate_stored_thunk( int s, int flush ) { return deflate_stored( (int *)s, flush ); }
-static int __cdecl deflate_slow_thunk  ( int s, int flush ) { return deflate_slow( (_DWORD *)s, flush ); }
-
 static const deflate_config_t deflate_configuration_table[10] = {
-	{  0,   0,   0,    0, deflate_stored_thunk },
-	{  4,   4,   8,    4, deflate_fast         },
-	{  4,   5,  16,    8, deflate_fast         },
-	{  4,   6,  32,   32, deflate_fast         },
-	{  4,   4,  16,   16, deflate_slow_thunk   },
-	{  8,  16,  32,   32, deflate_slow_thunk   },
-	{  8,  16, 128,  128, deflate_slow_thunk   },
-	{  8,  32, 128,  256, deflate_slow_thunk   },
-	{ 32, 128, 258, 1024, deflate_slow_thunk   },
-	{ 32, 258, 258, 4096, deflate_slow_thunk   }
+	{  0,   0,   0,    0, deflate_stored },  /* store only */
+	{  4,   4,   8,    4, deflate_fast   },  /* maximum speed, no lazy matches */
+	{  4,   5,  16,    8, deflate_fast   },
+	{  4,   6,  32,   32, deflate_fast   },
+	{  4,   4,  16,   16, deflate_slow   },  /* lazy matches */
+	{  8,  16,  32,   32, deflate_slow   },
+	{  8,  16, 128,  128, deflate_slow   },
+	{  8,  32, 128,  256, deflate_slow   },
+	{ 32, 128, 258, 1024, deflate_slow   },
+	{ 32, 258, 258, 4096, deflate_slow   }   /* maximum compression */
 };
 
-/* ---- FxPool_AllocPrimType14  0x004A10E0 ---- VERIFIED */
-int *__cdecl FxPool_AllocPrimType14(int *a1, int a2)
-{
-  int v3;
-  int *v4;
-  int *result;
-  int *v6;
-  int v7;
+/* zlib 1.1.4 deflate.c macros (no DEBUG: the inline _tr_tally forms) */
+#define ERR_MSG( err ) ( ( (char **)&z_errmsg )[Z_NEED_DICT - ( err )] )
+#define ERR_RETURN( strm, err ) return ( ( strm )->msg = ERR_MSG( err ), ( err ) )
+#define ZALLOC( strm, items, size ) ( *( ( strm )->zalloc ) )( ( strm )->opaque, ( items ), ( size ) )
+#define ZFREE( strm, addr ) ( *( ( strm )->zfree ) )( ( strm )->opaque, (void *)( addr ) )
+#define TRY_FREE( s, p ) { if ( p ) ZFREE( s, p ); }
+#define UPDATE_HASH( s, h, c ) ( h = ( ( ( h ) << s->hash_shift ) ^ ( c ) ) & s->hash_mask )
+#define INSERT_STRING( s, str, match_head ) \
+	( UPDATE_HASH( s, s->ins_h, s->window[( str ) + ( MIN_MATCH - 1 )] ), \
+	  s->prev[( str ) & s->w_mask] = match_head = s->head[s->ins_h], \
+	  s->head[s->ins_h] = (Pos)( str ) )
+#define CLEAR_HASH( s ) \
+	s->head[s->hash_size - 1] = NIL; \
+	memset( (Byte *)s->head, 0, (unsigned)( s->hash_size - 1 ) * sizeof( *s->head ) );
+#define d_code( dist ) \
+	( ( dist ) < 256 ? (int)_dist_code[dist] : (int)_dist_code[256 + ( ( dist ) >> 7 )] )
+#define _tr_tally_lit( s, c, flush ) \
+	{ uch cc = ( c ); \
+	  s->d_buf[s->last_lit] = 0; \
+	  s->l_buf[s->last_lit++] = cc; \
+	  s->dyn_ltree[cc].fc.freq++; \
+	  flush = ( s->last_lit == s->lit_bufsize - 1 ); \
+	}
+#define _tr_tally_dist( s, distance, length, flush ) \
+	{ uch len = ( length ); \
+	  ush dist = ( distance ); \
+	  s->d_buf[s->last_lit] = dist; \
+	  s->l_buf[s->last_lit++] = len; \
+	  dist--; \
+	  s->dyn_ltree[_length_code[len] + LITERALS + 1].fc.freq++; \
+	  s->dyn_dtree[d_code( dist )].fc.freq++; \
+	  flush = ( s->last_lit == s->lit_bufsize - 1 ); \
+	}
+#define FLUSH_BLOCK_ONLY( s, eof ) { \
+	_tr_flush_block( s, ( s->block_start >= 0L ? \
+	                 (char *)&s->window[(unsigned)s->block_start] : \
+	                 (char *)NULL ), \
+	                 (ulg)( (long)s->strstart - s->block_start ), \
+	                 ( eof ) ); \
+	s->block_start = s->strstart; \
+	flush_pending( s->strm ); \
+}
+#define FLUSH_BLOCK( s, eof ) { \
+	FLUSH_BLOCK_ONLY( s, eof ); \
+	if ( s->strm->avail_out == 0 ) return ( eof ) ? finish_started : need_more; \
+}
 
-  v3 = a1[1];
-  v4 = (int *)v3;
-  if ( v3 )
+/* ------------------------------------------------------------------------ *
+ *  File-local typed views for the data this unit manipulates.
+ *
+ *  The field offsets below are taken from the decompiled bodies (they are
+ *  internally consistent across every function in this file) but were NOT
+ *  re-verified against IDA -- the MCP server was unavailable for this pass.
+ *  The COD1_STATIC_ASSERTs turn any layout mistake into a build error.
+ * ------------------------------------------------------------------------ */
+#define MT_ASSERT_OFF(type, field, off) \
+	COD1_STATIC_ASSERT(offsetof(type, field) == (off), \
+	                   #type "." #field " must be at " #off)
+
+/* FX primitive pool.  Objects are carved from 32 KiB, 32 KiB-aligned slabs;
+ * the per-slab bookkeeping lives in the last 16 bytes of each slab.  A slab's
+ * free list is intrusive: each free object's first dword points at the next. */
+#define FXPOOL_SLAB_SIZE  0x8000
+
+typedef struct fxPoolBlock_s {
+	byte                  storage[FXPOOL_SLAB_SIZE - 16];
+	int                   freeCount;   /* +0x7FF0 (idx 8188) */
+	void                 *freeList;    /* +0x7FF4 (idx 8189) */
+	struct fxPoolBlock_s *next;        /* +0x7FF8 (idx 8190) */
+	struct fxPoolBlock_s *prev;        /* +0x7FFC (idx 8191) */
+} fxPoolBlock_t;
+COD1_ASSERT_SIZE( fxPoolBlock_t, FXPOOL_SLAB_SIZE );
+MT_ASSERT_OFF( fxPoolBlock_t, freeCount, 32752 );
+MT_ASSERT_OFF( fxPoolBlock_t, freeList,  32756 );
+MT_ASSERT_OFF( fxPoolBlock_t, next,      32760 );
+MT_ASSERT_OFF( fxPoolBlock_t, prev,      32764 );
+
+typedef struct fxPool_s {
+	int            blockCapacity;   /* +0x00 objects a full slab holds */
+	fxPoolBlock_t *currentBlock;    /* +0x04 slab currently handing out objects */
+} fxPool_t;
+MT_ASSERT_OFF( fxPool_t, blockCapacity, 0 );
+MT_ASSERT_OFF( fxPool_t, currentBlock,  4 );
+
+/* GenericParser2 object model (Ravensoft GP2).  CGPObject is the common base;
+ * CGPValue and CGPGroup extend it. */
+typedef struct textPool_s {
+	char               *base;   /* +0x00 allocation base */
+	struct textPool_s  *next;   /* +0x04 */
+	int                 size;   /* +0x08 capacity in bytes */
+	int                 used;   /* +0x0C */
+} textPool_t;
+MT_ASSERT_OFF( textPool_t, base, 0 );
+MT_ASSERT_OFF( textPool_t, next, 4 );
+MT_ASSERT_OFF( textPool_t, size, 8 );
+MT_ASSERT_OFF( textPool_t, used, 12 );
+COD1_ASSERT_SIZE( textPool_t, 16 );
+
+#ifdef __cplusplus
+/*
+ * Raven's CTextPool (GP2's string arena) as a C++ class over textPool_t.  Its
+ * operator new is CTextPool__operator_new (retail 0x004A1900, inlined); its
+ * operator delete (retail 0x004A1910) only serves the unwind funclets of the
+ * `new CTextPool` expressions.
+ */
+struct CTextPool : textPool_t
+{
+  CTextPool( int initSize = 10240 ) { CTextPool__CTextPool( initSize, this ); }
+  static void *operator new( size_t size ) { return CTextPool__operator_new( size ); }
+  static void operator delete( void *block );
+  char *AllocText( const char *text, bool addNULL, CTextPool **poolPtr );
+};
+/* AllocText on the current pool *textPool, chaining a new pool through textPool when it is full. */
+#define GP2_AllocText( textPool, text, addNULL ) \
+  ( ( (CTextPool *)*(textPool) )->AllocText( (text), (addNULL) != 0, (CTextPool **)(textPool) ) )
+#else
+#define GP2_AllocText( textPool, text, addNULL ) CTextPool__AllocText( *(textPool), (text), (addNULL), (textPool) )
+#endif
+
+typedef struct gpObject_s {
+	const char        *name;             /* +0x00 */
+	struct gpObject_s *next;             /* +0x04 sibling list                        */
+	struct gpObject_s *inOrderNext;      /* +0x08 (reused as list tail on a list head) */
+	struct gpObject_s *inOrderPrevious;  /* +0x0C */
+} gpObject_t;
+MT_ASSERT_OFF( gpObject_t, name, 0 );
+MT_ASSERT_OFF( gpObject_t, next, 4 );
+MT_ASSERT_OFF( gpObject_t, inOrderNext, 8 );
+MT_ASSERT_OFF( gpObject_t, inOrderPrevious, 12 );
+COD1_ASSERT_SIZE( gpObject_t, 16 );
+
+typedef struct gpValue_s {
+	gpObject_t  base;   /* +0x00 */
+	gpObject_t *list;   /* +0x10 value list (a single value or a [ ... ] list) */
+} gpValue_t;
+MT_ASSERT_OFF( gpValue_t, list, 16 );
+COD1_ASSERT_SIZE( gpValue_t, 20 );
+
+#ifdef __cplusplus
+/* Raven's CGPObject allocation: operator new is Z_Malloc (retail 0x004A1960,
+ * CGPObject__operator_new, inlined); operator delete (retail 0x004A1970) only
+ * serves the unwind funclets of `new CGPValue`. */
+struct CGPObject : gpObject_t
+{
+  static void *operator new( size_t size ) { return Z_MallocInternal( size ); }
+  static void operator delete( void *block );
+};
+#endif
+
+typedef struct gpGroup_s {
+	gpObject_t         base;              /* +0x00 */
+	gpValue_t         *pairs;             /* +0x10 */
+	gpValue_t         *pairsInOrder;      /* +0x14 */
+	gpValue_t         *currentPair;       /* +0x18 */
+	struct gpGroup_s  *subGroups;         /* +0x1C */
+	struct gpGroup_s  *subGroupsInOrder;  /* +0x20 */
+	struct gpGroup_s  *currentSubGroup;   /* +0x24 */
+	struct gpGroup_s  *parent;            /* +0x28 */
+	char               writeable;         /* +0x2C */
+} gpGroup_t;
+MT_ASSERT_OFF( gpGroup_t, pairs, 16 );
+MT_ASSERT_OFF( gpGroup_t, subGroups, 28 );
+MT_ASSERT_OFF( gpGroup_t, parent, 40 );
+MT_ASSERT_OFF( gpGroup_t, writeable, 44 );
+COD1_ASSERT_SIZE( gpGroup_t, 48 );
+
+typedef struct genericParser2_s {
+	gpGroup_t    topLevel;    /* +0x00 */
+	textPool_t  *textPool;    /* +0x30 */
+	char         writeable;   /* +0x34 */
+} genericParser2_t;
+MT_ASSERT_OFF( genericParser2_t, textPool, 48 );
+MT_ASSERT_OFF( genericParser2_t, writeable, 52 );
+
+#ifdef __cplusplus
+/* Raven's CGPGroup as a C++ class over gpGroup_t: its destructor
+ * (retail 0x004A2230) is Clean(). */
+struct CGPGroup : gpGroup_t
+{
+  ~CGPGroup();
+  char Write( textPool_t **textPool, int depth );
+};
+/* Raven's CGenericParser2 over genericParser2_t: the top-level group is a
+ * CGPGroup member, so its destructor runs after the body's CleanTextPool,
+ * whose unwind action destroys it too. */
+struct CGenericParser2
+{
+  CGPGroup    mTopLevel;    /* +0x00 */
+  textPool_t *mTextPool;    /* +0x30 */
+  char        mWriteable;   /* +0x34 */
+  ~CGenericParser2();
+};
+#endif
+
+/* ---- FxPool_AllocPrimType14  0x004A10E0 ---- VERIFIED */
+/* The original pool template's Alloc: scan the slab list for a free object,
+ * moving that slab to the front, else claim a new slab. */
+void *__stdcall FxPool_AllocPrimType14(fxPool_t *pool, int elemSize)
+{
+  fxPoolBlock_t *block;
+  void          *obj;
+
+  for ( block = pool->currentBlock; block; block = block->next )
   {
-    while ( !v4[8189] )
+    if ( block->freeList )
     {
-      v4 = (int *)v4[8190];
-      if ( !v4 )
-        goto LABEL_4;
+      if ( block != pool->currentBlock )
+        FxPool_MakeBlockCurrent( pool, block );
+      goto pop;
     }
-    if ( v4 != (int *)v3 )
-      FxPool_MakeBlockCurrent((int)v4, (int)a1);
-    goto LABEL_9;
   }
-LABEL_4:
-  result = FxMem_ClaimBlock_m(*a1, a2, v3);
-  v4 = result;
-  if ( result )
-  {
-    a1[1] = (int)result;
-LABEL_9:
-    v6 = (int *)v4[8189];
-    v7 = v4[8188] - 1;
-    v4[8189] = *v6;
-    v4[8188] = v7;
-    Com_Memset(v6, 0, 560);
-    return v6;
-  }
-  return result;
+  block = FxMem_ClaimBlock_m( pool->blockCapacity, elemSize, pool->currentBlock );
+  if ( !block )
+    return NULL;
+  pool->currentBlock = block;
+pop:
+  obj = block->freeList;
+  block->freeList = *(void **)obj;
+  block->freeCount--;
+  Com_Memset( obj, 0, 560 );
+  return obj;
+}
+
+/* ---- FxMem_ReleaseBlock  0x0048D370 ---- HIGH
+ * Unnamed in the retail IDB (between FxMem_UnlinkBlock and FxMem_FreeElem);
+ * every FxPool_Free* tail-jumps to it: unlink the slab, mark it unclaimed. */
+fxPoolBlock_t *__cdecl FxMem_ReleaseBlock( fxPoolBlock_t *block )
+{
+  if ( block->prev )
+    block->prev->next = block->next;
+  if ( block->next )
+    block->next->prev = block->prev;
+  block->prev = NULL;
+  block->next = NULL;
+  block->freeCount = -1;
+  return block;
 }
 
 /* ---- FxPool_FreePrimType14  0x004A1170 ---- VERIFIED */
-_DWORD *__fastcall FxPool_FreePrimType14(char *a1, int *a2)
+fxPoolBlock_t *__fastcall FxPool_FreePrimType14(fxPool_t *pool, char *elem)
 {
-  int v2;
-  int v3;
-  _DWORD *result;
-  int v5;
-  int v6;
-  _DWORD *v7;
-  int v8;
+  fxPoolBlock_t *block;
+  fxPoolBlock_t *next;
 
-  result = (_DWORD *)((char *)&unk_A9CE58 + ((a1 - (char *)&unk_A9CE58) & 0xFFFF8000));
-  *(_DWORD *)a1 = result[8189];
-  result[8189] = a1;
-  v5 = result[8188] + 1;
-  result[8188] = v5;
-  v6 = v5;
-  v7 = (_DWORD *)a2[1];
-  if ( !v7[8189] )
-    return (_DWORD *)FxPool_MakeBlockCurrent((int)result, (int)a2);
-  if ( v6 >= *a2 )
+  block = (fxPoolBlock_t *)( (char *)&fxMemBlocks
+                             + ( ( elem - (char *)&fxMemBlocks ) & 0xFFFF8000 ) );
+  *(void **)elem = block->freeList;   /* push the freed object onto the slab free list */
+  block->freeList = elem;
+  block->freeCount++;
+
+  if ( !pool->currentBlock->freeList )
+    return FxPool_MakeBlockCurrent( pool, block );
+
+  if ( block->freeCount >= pool->blockCapacity )
   {
-    if ( result != v7 )
+    if ( block == pool->currentBlock )
     {
-LABEL_10:
-      v2 = result[0x1FFF];
-      if ( v2 )
-        *(_DWORD *)(v2 + 32760) = result[8190];
-      v3 = result[8190];
-      if ( v3 )
-        *(_DWORD *)(v3 + 32764) = result[0x1FFF];
-      result[0x1FFF] = 0;
-      result[8190] = 0;
-      result[8188] = -1;
-      return result;
+      next = block->next;
+      if ( !next || !next->freeCount )
+        return block;
+      pool->currentBlock = next;
     }
-    v8 = result[8190];
-    if ( v8 && *(_DWORD *)(v8 + 32752) )
-    {
-      a2[1] = v8;
-      goto LABEL_10;
-    }
+    return FxMem_ReleaseBlock( block );
   }
-  return result;
+  return block;
 }
 
 /* ---- FxPool_AllocLight  0x004A11E0 ---- HIGH */
-int *__cdecl FxPool_AllocLight(int *a1, int a2)
+void *__stdcall FxPool_AllocLight(fxPool_t *pool, int elemSize)
 {
-  int v3;
-  int *v4;
-  int *result;
-  int *v6;
-  int v7;
+  fxPoolBlock_t *block;
+  void          *obj;
 
-  v3 = a1[1];
-  v4 = (int *)v3;
-  if ( v3 )
+  /* same pool-template body as FxPool_AllocPrimType14; matches once the
+   * EffectsCore FxPool_MakeBlockCurrent* helpers are inline (pool, block)
+   * like FxPool_MakeBlockCurrent (verified on FxPool_AllocLight) */
+  for ( block = pool->currentBlock; block; block = block->next )
   {
-    while ( !v4[8189] )
+    if ( block->freeList )
     {
-      v4 = (int *)v4[8190];
-      if ( !v4 )
-        goto LABEL_4;
+      if ( block != pool->currentBlock )
+        FxPool_MakeBlockCurrentLight( pool, block );
+      goto pop;
     }
-    if ( v4 != (int *)v3 )
-      sub_4920B0((int)v4, (int)a1);
-    goto LABEL_9;
   }
-LABEL_4:
-  result = FxMem_ClaimBlock_m(*a1, a2, v3);
-  v4 = result;
-  if ( result )
-  {
-    a1[1] = (int)result;
-LABEL_9:
-    v6 = (int *)v4[8189];
-    v7 = v4[8188] - 1;
-    v4[8189] = *v6;
-    v4[8188] = v7;
-    Com_Memset(v6, 0, 260);
-    return v6;
-  }
-  return result;
+  block = FxMem_ClaimBlock_m( pool->blockCapacity, elemSize, pool->currentBlock );
+  if ( !block )
+    return NULL;
+  pool->currentBlock = block;
+pop:
+  obj = block->freeList;
+  block->freeList = *(void **)obj;
+  block->freeCount--;
+  Com_Memset( obj, 0, 260 );
+  return obj;
 }
 
 /* ---- FxPool_AllocParticle  0x004A1270 ---- HIGH */
-int *__cdecl FxPool_AllocParticle(int *a1, int a2)
+void *__stdcall FxPool_AllocParticle(fxPool_t *pool, int elemSize)
 {
-  int v3;
-  int *v4;
-  int *result;
-  int *v6;
-  int v7;
+  fxPoolBlock_t *block;
+  void          *obj;
 
-  v3 = a1[1];
-  v4 = (int *)v3;
-  if ( v3 )
+  /* same pool-template body as FxPool_AllocPrimType14; matches once the
+   * EffectsCore FxPool_MakeBlockCurrent* helpers are inline (pool, block)
+   * like FxPool_MakeBlockCurrent (verified on FxPool_AllocLight) */
+  for ( block = pool->currentBlock; block; block = block->next )
   {
-    while ( !v4[8189] )
+    if ( block->freeList )
     {
-      v4 = (int *)v4[8190];
-      if ( !v4 )
-        goto LABEL_4;
+      if ( block != pool->currentBlock )
+        FxPool_MakeBlockCurrentParticle( pool, block );
+      goto pop;
     }
-    if ( v4 != (int *)v3 )
-      sub_492110((int)v4, (int)a1);
-    goto LABEL_9;
   }
-LABEL_4:
-  result = FxMem_ClaimBlock_m(*a1, a2, v3);
-  v4 = result;
-  if ( result )
-  {
-    a1[1] = (int)result;
-LABEL_9:
-    v6 = (int *)v4[8189];
-    v7 = v4[8188] - 1;
-    v4[8189] = *v6;
-    v4[8188] = v7;
-    Com_Memset(v6, 0, 316);
-    return v6;
-  }
-  return result;
+  block = FxMem_ClaimBlock_m( pool->blockCapacity, elemSize, pool->currentBlock );
+  if ( !block )
+    return NULL;
+  pool->currentBlock = block;
+pop:
+  obj = block->freeList;
+  block->freeList = *(void **)obj;
+  block->freeCount--;
+  Com_Memset( obj, 0, 316 );
+  return obj;
 }
 
 /* ---- FxPool_AllocLine  0x004A1300 ---- HIGH */
-int *__cdecl FxPool_AllocLine(int *a1, int a2)
+void *__stdcall FxPool_AllocLine(fxPool_t *pool, int elemSize)
 {
-  int v3;
-  int *v4;
-  int *result;
-  int *v6;
-  int v7;
+  fxPoolBlock_t *block;
+  void          *obj;
 
-  v3 = a1[1];
-  v4 = (int *)v3;
-  if ( v3 )
+  /* same pool-template body as FxPool_AllocPrimType14; matches once the
+   * EffectsCore FxPool_MakeBlockCurrent* helpers are inline (pool, block)
+   * like FxPool_MakeBlockCurrent (verified on FxPool_AllocLight) */
+  for ( block = pool->currentBlock; block; block = block->next )
   {
-    while ( !v4[8189] )
+    if ( block->freeList )
     {
-      v4 = (int *)v4[8190];
-      if ( !v4 )
-        goto LABEL_4;
+      if ( block != pool->currentBlock )
+        FxPool_MakeBlockCurrentLine( pool, block );
+      goto pop;
     }
-    if ( v4 != (int *)v3 )
-      sub_492170((int)v4, (int)a1);
-    goto LABEL_9;
   }
-LABEL_4:
-  result = FxMem_ClaimBlock_m(*a1, a2, v3);
-  v4 = result;
-  if ( result )
-  {
-    a1[1] = (int)result;
-LABEL_9:
-    v6 = (int *)v4[8189];
-    v7 = v4[8188] - 1;
-    v4[8189] = *v6;
-    v4[8188] = v7;
-    Com_Memset(v6, 0, 328);
-    return v6;
-  }
-  return result;
+  block = FxMem_ClaimBlock_m( pool->blockCapacity, elemSize, pool->currentBlock );
+  if ( !block )
+    return NULL;
+  pool->currentBlock = block;
+pop:
+  obj = block->freeList;
+  block->freeList = *(void **)obj;
+  block->freeCount--;
+  Com_Memset( obj, 0, 328 );
+  return obj;
 }
 
 /* ---- FxPool_AllocElectricity  0x004A1390 ---- HIGH */
-int *__cdecl FxPool_AllocElectricity(int *a1, int a2)
+void *__stdcall FxPool_AllocElectricity(fxPool_t *pool, int elemSize)
 {
-  int v3;
-  int *v4;
-  int *result;
-  int *v6;
-  int v7;
+  fxPoolBlock_t *block;
+  void          *obj;
 
-  v3 = a1[1];
-  v4 = (int *)v3;
-  if ( v3 )
+  /* same pool-template body as FxPool_AllocPrimType14; matches once the
+   * EffectsCore FxPool_MakeBlockCurrent* helpers are inline (pool, block)
+   * like FxPool_MakeBlockCurrent (verified on FxPool_AllocLight) */
+  for ( block = pool->currentBlock; block; block = block->next )
   {
-    while ( !v4[8189] )
+    if ( block->freeList )
     {
-      v4 = (int *)v4[8190];
-      if ( !v4 )
-        goto LABEL_4;
+      if ( block != pool->currentBlock )
+        FxPool_MakeBlockCurrentElectricity( pool, block );
+      goto pop;
     }
-    if ( v4 != (int *)v3 )
-      sub_4921D0((int)v4, (int)a1);
-    goto LABEL_9;
   }
-LABEL_4:
-  result = FxMem_ClaimBlock_m(*a1, a2, v3);
-  v4 = result;
-  if ( result )
-  {
-    a1[1] = (int)result;
-LABEL_9:
-    v6 = (int *)v4[8189];
-    v7 = v4[8188] - 1;
-    v4[8189] = *v6;
-    v4[8188] = v7;
-    Com_Memset(v6, 0, 716);
-    return v6;
-  }
-  return result;
+  block = FxMem_ClaimBlock_m( pool->blockCapacity, elemSize, pool->currentBlock );
+  if ( !block )
+    return NULL;
+  pool->currentBlock = block;
+pop:
+  obj = block->freeList;
+  block->freeList = *(void **)obj;
+  block->freeCount--;
+  Com_Memset( obj, 0, 716 );
+  return obj;
 }
 
 /* ---- FxPool_AllocOrientedParticle  0x004A1420 ---- HIGH */
-int *__cdecl FxPool_AllocOrientedParticle(int *a1, int a2)
+void *__stdcall FxPool_AllocOrientedParticle(fxPool_t *pool, int elemSize)
 {
-  int v3;
-  int *v4;
-  int *result;
-  int *v6;
-  int v7;
+  fxPoolBlock_t *block;
+  void          *obj;
 
-  v3 = a1[1];
-  v4 = (int *)v3;
-  if ( v3 )
+  /* same pool-template body as FxPool_AllocPrimType14; matches once the
+   * EffectsCore FxPool_MakeBlockCurrent* helpers are inline (pool, block)
+   * like FxPool_MakeBlockCurrent (verified on FxPool_AllocLight) */
+  for ( block = pool->currentBlock; block; block = block->next )
   {
-    while ( !v4[8189] )
+    if ( block->freeList )
     {
-      v4 = (int *)v4[8190];
-      if ( !v4 )
-        goto LABEL_4;
+      if ( block != pool->currentBlock )
+        FxPool_MakeBlockCurrentOrientedParticle( pool, block );
+      goto pop;
     }
-    if ( v4 != (int *)v3 )
-      sub_492230((int)v4, (int)a1);
-    goto LABEL_9;
   }
-LABEL_4:
-  result = FxMem_ClaimBlock_m(*a1, a2, v3);
-  v4 = result;
-  if ( result )
-  {
-    a1[1] = (int)result;
-LABEL_9:
-    v6 = (int *)v4[8189];
-    v7 = v4[8188] - 1;
-    v4[8189] = *v6;
-    v4[8188] = v7;
-    Com_Memset(v6, 0, 328);
-    return v6;
-  }
-  return result;
+  block = FxMem_ClaimBlock_m( pool->blockCapacity, elemSize, pool->currentBlock );
+  if ( !block )
+    return NULL;
+  pool->currentBlock = block;
+pop:
+  obj = block->freeList;
+  block->freeList = *(void **)obj;
+  block->freeCount--;
+  Com_Memset( obj, 0, 328 );
+  return obj;
 }
 
 /* ---- FxPool_AllocTail  0x004A14B0 ---- HIGH */
-int *__cdecl FxPool_AllocTail(int *a1, int a2)
+void *__stdcall FxPool_AllocTail(fxPool_t *pool, int elemSize)
 {
-  int v3;
-  int *v4;
-  int *result;
-  int *v6;
-  int v7;
+  fxPoolBlock_t *block;
+  void          *obj;
 
-  v3 = a1[1];
-  v4 = (int *)v3;
-  if ( v3 )
+  /* same pool-template body as FxPool_AllocPrimType14; matches once the
+   * EffectsCore FxPool_MakeBlockCurrent* helpers are inline (pool, block)
+   * like FxPool_MakeBlockCurrent (verified on FxPool_AllocLight) */
+  for ( block = pool->currentBlock; block; block = block->next )
   {
-    while ( !v4[8189] )
+    if ( block->freeList )
     {
-      v4 = (int *)v4[8190];
-      if ( !v4 )
-        goto LABEL_4;
+      if ( block != pool->currentBlock )
+        FxPool_MakeBlockCurrentTail( pool, block );
+      goto pop;
     }
-    if ( v4 != (int *)v3 )
-      sub_492290((int)v4, (int)a1);
-    goto LABEL_9;
   }
-LABEL_4:
-  result = FxMem_ClaimBlock_m(*a1, a2, v3);
-  v4 = result;
-  if ( result )
-  {
-    a1[1] = (int)result;
-LABEL_9:
-    v6 = (int *)v4[8189];
-    v7 = v4[8188] - 1;
-    v4[8189] = *v6;
-    v4[8188] = v7;
-    Com_Memset(v6, 0, 344);
-    return v6;
-  }
-  return result;
+  block = FxMem_ClaimBlock_m( pool->blockCapacity, elemSize, pool->currentBlock );
+  if ( !block )
+    return NULL;
+  pool->currentBlock = block;
+pop:
+  obj = block->freeList;
+  block->freeList = *(void **)obj;
+  block->freeCount--;
+  Com_Memset( obj, 0, 344 );
+  return obj;
 }
 
 /* ---- FxPool_AllocCylinder  0x004A1540 ---- HIGH */
-int *__cdecl FxPool_AllocCylinder(int *a1, int a2)
+void *__stdcall FxPool_AllocCylinder(fxPool_t *pool, int elemSize)
 {
-  int v3;
-  int *v4;
-  int *result;
-  int *v6;
-  int v7;
+  fxPoolBlock_t *block;
+  void          *obj;
 
-  v3 = a1[1];
-  v4 = (int *)v3;
-  if ( v3 )
+  /* same pool-template body as FxPool_AllocPrimType14; matches once the
+   * EffectsCore FxPool_MakeBlockCurrent* helpers are inline (pool, block)
+   * like FxPool_MakeBlockCurrent (verified on FxPool_AllocLight) */
+  for ( block = pool->currentBlock; block; block = block->next )
   {
-    while ( !v4[8189] )
+    if ( block->freeList )
     {
-      v4 = (int *)v4[8190];
-      if ( !v4 )
-        goto LABEL_4;
+      if ( block != pool->currentBlock )
+        FxPool_MakeBlockCurrentCylinder( pool, block );
+      goto pop;
     }
-    if ( v4 != (int *)v3 )
-      sub_4922F0((int)v4, (int)a1);
-    goto LABEL_9;
   }
-LABEL_4:
-  result = FxMem_ClaimBlock_m(*a1, a2, v3);
-  v4 = result;
-  if ( result )
-  {
-    a1[1] = (int)result;
-LABEL_9:
-    v6 = (int *)v4[8189];
-    v7 = v4[8188] - 1;
-    v4[8189] = *v6;
-    v4[8188] = v7;
-    Com_Memset(v6, 0, 344);
-    return v6;
-  }
-  return result;
+  block = FxMem_ClaimBlock_m( pool->blockCapacity, elemSize, pool->currentBlock );
+  if ( !block )
+    return NULL;
+  pool->currentBlock = block;
+pop:
+  obj = block->freeList;
+  block->freeList = *(void **)obj;
+  block->freeCount--;
+  Com_Memset( obj, 0, 344 );
+  return obj;
 }
 
 /* ---- FxPool_AllocEmitter  0x004A15D0 ---- HIGH */
-int *__cdecl FxPool_AllocEmitter(int *a1, int a2)
+void *__stdcall FxPool_AllocEmitter(fxPool_t *pool, int elemSize)
 {
-  int v3;
-  int *v4;
-  int *result;
-  int *v6;
-  int v7;
+  fxPoolBlock_t *block;
+  void          *obj;
 
-  v3 = a1[1];
-  v4 = (int *)v3;
-  if ( v3 )
+  /* same pool-template body as FxPool_AllocPrimType14; matches once the
+   * EffectsCore FxPool_MakeBlockCurrent* helpers are inline (pool, block)
+   * like FxPool_MakeBlockCurrent (verified on FxPool_AllocLight) */
+  for ( block = pool->currentBlock; block; block = block->next )
   {
-    while ( !v4[8189] )
+    if ( block->freeList )
     {
-      v4 = (int *)v4[8190];
-      if ( !v4 )
-        goto LABEL_4;
+      if ( block != pool->currentBlock )
+        FxPool_MakeBlockCurrentEmitter( pool, block );
+      goto pop;
     }
-    if ( v4 != (int *)v3 )
-      sub_492350((int)v4, (int)a1);
-    goto LABEL_9;
   }
-LABEL_4:
-  result = FxMem_ClaimBlock_m(*a1, a2, v3);
-  v4 = result;
-  if ( result )
-  {
-    a1[1] = (int)result;
-LABEL_9:
-    v6 = (int *)v4[8189];
-    v7 = v4[8188] - 1;
-    v4[8189] = *v6;
-    v4[8188] = v7;
-    Com_Memset(v6, 0, 396);
-    return v6;
-  }
-  return result;
+  block = FxMem_ClaimBlock_m( pool->blockCapacity, elemSize, pool->currentBlock );
+  if ( !block )
+    return NULL;
+  pool->currentBlock = block;
+pop:
+  obj = block->freeList;
+  block->freeList = *(void **)obj;
+  block->freeCount--;
+  Com_Memset( obj, 0, 396 );
+  return obj;
 }
 
 /* ---- FxPool_AllocFlash  0x004A1660 ---- HIGH */
-int *__cdecl FxPool_AllocFlash(int *a1, int a2)
+void *__stdcall FxPool_AllocFlash(fxPool_t *pool, int elemSize)
 {
-  int v3;
-  int *v4;
-  int *result;
-  int *v6;
-  int v7;
+  fxPoolBlock_t *block;
+  void          *obj;
 
-  v3 = a1[1];
-  v4 = (int *)v3;
-  if ( v3 )
+  /* same pool-template body as FxPool_AllocPrimType14; matches once the
+   * EffectsCore FxPool_MakeBlockCurrent* helpers are inline (pool, block)
+   * like FxPool_MakeBlockCurrent (verified on FxPool_AllocLight) */
+  for ( block = pool->currentBlock; block; block = block->next )
   {
-    while ( !v4[8189] )
+    if ( block->freeList )
     {
-      v4 = (int *)v4[8190];
-      if ( !v4 )
-        goto LABEL_4;
+      if ( block != pool->currentBlock )
+        FxPool_MakeBlockCurrentDecal( pool, block );
+      goto pop;
     }
-    if ( v4 != (int *)v3 )
-      sub_4923B0((int)v4, (int)a1);
-    goto LABEL_9;
   }
-LABEL_4:
-  result = FxMem_ClaimBlock_m(*a1, a2, v3);
-  v4 = result;
-  if ( result )
-  {
-    a1[1] = (int)result;
-LABEL_9:
-    v6 = (int *)v4[8189];
-    v7 = v4[8188] - 1;
-    v4[8189] = *v6;
-    v4[8188] = v7;
-    Com_Memset(v6, 0, 436);
-    return v6;
-  }
-  return result;
+  block = FxMem_ClaimBlock_m( pool->blockCapacity, elemSize, pool->currentBlock );
+  if ( !block )
+    return NULL;
+  pool->currentBlock = block;
+pop:
+  obj = block->freeList;
+  block->freeList = *(void **)obj;
+  block->freeCount--;
+  Com_Memset( obj, 0, 436 );
+  return obj;
 }
 
 /* ---- FxPool_MakeBlockCurrent  0x004A16F0 ---- VERIFIED */
-int __cdecl FxPool_MakeBlockCurrent(int result, int a2)
+/* A member of the original pool template (`this` = pool first, implicitly
+ * inline).  As an inline (COMDAT) function LTCG compiles it after its callers,
+ * so FxPool_AllocPrimType14 does not see its register usage and keeps
+ * block/pool in esi/edi across the call like retail. */
+inline fxPoolBlock_t *__cdecl FxPool_MakeBlockCurrent(fxPool_t *pool, fxPoolBlock_t *block)
 {
-  int v2;
-  int v3;
+  /* unlink the slab from whatever list it is on ... */
+  if ( block->prev )
+    block->prev->next = block->next;
+  if ( block->next )
+    block->next->prev = block->prev;
+  block->next = NULL;
+  block->prev = NULL;
 
-  v2 = *(_DWORD *)(result + 32764);
-  if ( v2 )
-    *(_DWORD *)(v2 + 32760) = *(_DWORD *)(result + 32760);
-  v3 = *(_DWORD *)(result + 32760);
-  if ( v3 )
-    *(_DWORD *)(v3 + 32764) = *(_DWORD *)(result + 32764);
-  *(_DWORD *)(result + 32760) = 0;
-  *(_DWORD *)(result + 32764) = 0;
-  *(_DWORD *)(result + 32760) = *(_DWORD *)(a2 + 4);
-  *(_DWORD *)(*(_DWORD *)(a2 + 4) + 32764) = result;
-  *(_DWORD *)(a2 + 4) = result;
-  return result;
+  /* ... then push it to the front of the pool's current list. */
+  block->next = pool->currentBlock;
+  pool->currentBlock->prev = block;
+  pool->currentBlock = block;
+  return block;
 }
 
 /* ---- FX_RegisterEffect  0x004A1750 ---- VERIFIED */
-int __cdecl FX_RegisterEffect(char *a1)
+int __cdecl FX_RegisterEffect(char *name)
 {
-  return CFxScheduler__RegisterEffect(dword_14075A0, a1, 0);
+  return ( (CFxScheduler *)theFxScheduler )->RegisterEffect( name, false );
 }
 
 /* ---- FX_GetBoneIndex  0x004A1760 ---- VERIFIED */
@@ -634,77 +926,73 @@ int __cdecl FX_GetBoneIndex(int entnum, const char *boneName)
   int   dobj;
   short nameHandle;
 
+  /* Com_GetClientDObj inlined: retail jumps from the zero-handle test straight
+   * into the !dobj return.  retail 0x004A1774 `add esi, offset dobj_pool`:
+   * dobj_pool IS com_dobjPool, the table common.c defines. */
   handle = (short)com_clientDObjHandles[entnum];
-  if ( !handle )
-    return -1;
-
-  /* retail 0x004A1774 `add esi, offset dobj_pool`: dobj_pool IS com_dobjPool,
-   * the table common.c defines. */
-  dobj = (int)( (char *)com_dobjPool + (int)handle * 0x58 );
-  if ( !dobj )       /* retail 0x004A177A tests a base+offset too -- dead there as here */
+  if ( handle )
+    dobj = (int)&com_dobjPool[handle * 0x58];
+  else
+    dobj = 0;
+  if ( !dobj )
     return -1;
 
   nameHandle = (short)SL_FindLowercaseString(boneName);
-  if ( !nameHandle )
-    return -1;
-
-  return DObjFindPartIndex( dobj, nameHandle );
+  if ( nameHandle )
+    return DObjFindPartIndex( dobj, nameHandle );
+  return -1;
 }
 
 /* ---- FX_PlaySimpleEffect  0x004A17B0 ---- HIGH */
-void __cdecl FX_PlaySimpleEffect(float *a1, char *a2)
+void __cdecl FX_PlaySimpleEffect(float *origin, char *name)
 {
-  CFxScheduler__PlayEffect_name_simple_m(a2, dword_14075A0, a1);
+  CFxScheduler__PlayEffect_name_simple_m(name, theFxScheduler, origin);
 }
 
 /* ---- FX_PlayEffect  0x004A17C0 ---- HIGH */
-void __cdecl FX_PlayEffect(float *a1, char *a2, int *a3)
+void __cdecl FX_PlayEffect(float *origin, char *name, int *direction)
 {
-  CFxScheduler__PlayEffect_name_m(a3, a2, dword_14075A0, a1);
+  CFxScheduler__PlayEffect_name_m(direction, name, theFxScheduler, origin);
 }
 
 /* ---- FX_PlayEntityEffect  0x004A17D0 ---- HIGH */
-void __cdecl FX_PlayEntityEffect(int *a1, float *a2, int *a3, char *a4)
+void __cdecl FX_PlayEntityEffect(int *bolt, float *origin, int *axis, char *name)
 {
-  CFxScheduler__PlayEffect_name_bolt_m(a4, dword_14075A0, a2, a3, a1);
+  CFxScheduler__PlayEffect_name_bolt_m(name, theFxScheduler, origin, axis, bolt);
 }
 
 /* ---- FX_PlaySimpleEffectID  0x004A17F0 ---- HIGH */
-void __fastcall FX_PlaySimpleEffectID(float *a1, int a2)
+void __fastcall FX_PlaySimpleEffectID(float *origin, int effectId)
 {
-  CFxScheduler__PlayEffect_id_simple_m(a1, a2, dword_14075A0);
+  CFxScheduler__PlayEffect_id_simple_m(effectId, origin, theFxScheduler);
 }
 
 /* ---- FX_PlayEffectID  0x004A1800 ---- VERIFIED */
-void __cdecl FX_PlayEffectID(int *a1, int a2, float *a3)
+void __cdecl FX_PlayEffectID(int *forward, int effectId, float *origin)
 {
-  int v3;
-  int v4;
   /* retail var_24/var_20/var_1C + right + up occupy ONE contiguous 36-byte
    * slot, frame 0x08..0x2C, and 0x004A1832 hands that base to
-   * PlayEffect_id_axis as axis[3][3].  Three separate locals let MSVC place
-   * rows 1 and 2 anywhere, so the callee read them off the frame. */
-  int v5[9]; // [esp+8h] [ebp-24h] BYREF   (retail var_24 = axis[3][3])
+   * PlayEffect_id_axis as axis[3][3].  Keeping the three forward rows in one
+   * array reproduces that contiguous stack slot. */
+  int axis[9];   /* forward, right, up: retail var_24, one axis[3][3] slot at ebp-24h */
 
-  v3 = a1[1];
-  v4 = a1[2];
-  v5[0] = *a1;
-  v5[1] = v3;
-  v5[2] = v4;
-  MakeNormalVectors((const float *)a1, (float *)&v5[3], (float *)&v5[6]);
-  CFxScheduler__PlayEffect_id_axis(dword_14075A0, a2, a3, v5, 0);
+  axis[0] = forward[0];
+  axis[1] = forward[1];
+  axis[2] = forward[2];
+  MakeNormalVectors((const float *)forward, (float *)&axis[3], (float *)&axis[6]);
+  CFxScheduler__PlayEffect_id_axis(theFxScheduler, effectId, origin, axis, 0);
 }
 
 /* ---- FX_PlayEntityEffectID  0x004A1850 ---- HIGH */
-void __cdecl FX_PlayEntityEffectID(int *a1, float *a2, int *a3, int a4)
+void __cdecl FX_PlayEntityEffectID(int *bolt, float *origin, int *axis, int effectId)
 {
-  CFxScheduler__PlayEffect_id_axis(dword_14075A0, a4, a2, a3, a1);
+  CFxScheduler__PlayEffect_id_axis(theFxScheduler, effectId, origin, axis, bolt);
 }
 
 /* ---- FX_AddScheduledEffects  0x004A1870 ---- HIGH */
 void FX_AddScheduledEffects()
 {
-  CFxScheduler__AddScheduledEffects(dword_14075A0);
+  CFxScheduler__AddScheduledEffects(theFxScheduler);
 }
 
 /* ---- FX_InitSystem  0x004A1880 ---- HIGH */
@@ -716,2720 +1004,2098 @@ int __fastcall FX_InitSystem()
 /* ---- FX_FreeSystem  0x004A1890 ---- HIGH */
 int FX_FreeSystem()
 {
-  return (unsigned __int8)FX_Free(1);
+  return (unsigned char)FX_Free(1);
 }
 
 /* ---- FX_FreeActive  0x004A18A0 ---- HIGH */
 int FX_FreeActive()
 {
-  return (unsigned __int8)FX_Free(0);
+  return (unsigned char)FX_Free(0);
 }
 
 /* ---- FX_AdjustCamera  0x004A18B0 ---- HIGH */
 void __cdecl FX_AdjustCamera(int view, float zfar)
 {
-  SFxHelper__AdjustCamera((int)&theFxHelper, view, zfar);
+  SFxHelper__AdjustCamera(&theFxHelper, view, zfar);
 }
 
 /* ---- FX_AdjustTime  0x004A18D0 ---- HIGH */
-int *__cdecl FX_AdjustTime(int a1)
+int __cdecl FX_AdjustTime(int realTime)
 {
-  return SFxHelper__AdjustTime(&theFxHelper, a1);
+  return SFxHelper__AdjustTime(&theFxHelper, realTime);
 }
 
 /* ---- CTextPool__GetNext  0x004A18E0 ---- VERIFIED */
-int __cdecl CTextPool__GetNext(int a1)
+textPool_t *__cdecl CTextPool__GetNext(textPool_t *this_)
 {
-  return *(_DWORD *)(a1 + 4);
+  return this_->next;
 }
 
 /* ---- CTextPool__SetNext  0x004A18F0 ---- HIGH */
-int __cdecl CTextPool__SetNext(int result, int a2)
+textPool_t *__cdecl CTextPool__SetNext(textPool_t *this_, textPool_t *which)
 {
-  *(_DWORD *)(result + 4) = a2;
-  return result;
+  this_->next = which;
+  return this_;
 }
 
 /* ---- CTextPool__operator_new  0x004A1900 ---- HIGH */
-int *__cdecl CTextPool__operator_new(size_t a1)
+void *__cdecl CTextPool__operator_new(size_t size)
 {
-  return Z_MallocInternal(a1);
+  return Z_MallocInternal(size);
 }
 
-/* ---- CGPObject__SetNext  0x004A1920 ---- HIGH */
-int __cdecl CGPObject__SetNext(int result, int a2)
+#ifdef __cplusplus
+/* ---- CTextPool::operator delete  0x004A1910 ---- */
+void CTextPool::operator delete( void *block )
 {
-  *(_DWORD *)(result + 4) = a2;
-  return result;
+  free( block );
+}
+#endif
+
+/* ---- CGPObject__SetNext  0x004A1920 ---- HIGH */
+gpObject_t *__cdecl CGPObject__SetNext(gpObject_t *this_, gpObject_t *which)
+{
+  this_->next = which;
+  return this_;
 }
 
 /* ---- CGPObject__GetInOrderNext  0x004A1930 ---- HIGH */
-int __cdecl CGPObject__GetInOrderNext(int a1)
+gpObject_t *__cdecl CGPObject__GetInOrderNext(gpObject_t *this_)
 {
-  return *(_DWORD *)(a1 + 8);
+  return this_->inOrderNext;
 }
 
 /* ---- CGPObject__SetInOrderNext  0x004A1940 ---- HIGH */
-int __cdecl CGPObject__SetInOrderNext(int result, int a2)
+gpObject_t *__cdecl CGPObject__SetInOrderNext(gpObject_t *this_, gpObject_t *which)
 {
-  *(_DWORD *)(result + 8) = a2;
-  return result;
+  this_->inOrderNext = which;
+  return this_;
 }
 
 /* ---- CGPObject__SetInOrderPrevious  0x004A1950 ---- HIGH */
-int __cdecl CGPObject__SetInOrderPrevious(int result, int a2)
+gpObject_t *__cdecl CGPObject__SetInOrderPrevious(gpObject_t *this_, gpObject_t *which)
 {
-  *(_DWORD *)(result + 12) = a2;
-  return result;
+  this_->inOrderPrevious = which;
+  return this_;
 }
 
 /* ---- CGPObject__operator_new  0x004A1960 ---- HIGH */
-int *__cdecl CGPObject__operator_new(size_t a1)
+void *__cdecl CGPObject__operator_new(size_t size)
 {
-  return Z_MallocInternal(a1);
+  return Z_MallocInternal(size);
 }
 
-/* ---- CGPGroup__SetWriteable  0x004A1980 ---- HIGH */
-int __cdecl CGPGroup__SetWriteable(int result, char a2)
+#ifdef __cplusplus
+/* ---- CGPObject::operator delete  0x004A1970 ---- */
+void CGPObject::operator delete( void *block )
 {
-  *(_BYTE *)(result + 44) = a2;
-  return result;
+  free( block );
+}
+#endif
+
+/* ---- CGPGroup__SetWriteable  0x004A1980 ---- HIGH */
+gpGroup_t *__cdecl CGPGroup__SetWriteable(gpGroup_t *this_, char writeable)
+{
+  this_->writeable = writeable;
+  return this_;
 }
 
 /* ---- CGenericParser2__SetWriteable  0x004A1990 ---- HIGH */
-int __cdecl CGenericParser2__SetWriteable(int result, char a2)
+genericParser2_t *__cdecl CGenericParser2__SetWriteable(genericParser2_t *this_, char writeable)
 {
-  *(_BYTE *)(result + 52) = a2;
-  return result;
+  this_->writeable = writeable;
+  return this_;
 }
 
 /* ---- GP2_GetToken  0x004A19A0 ---- CONFIRMED */
-char *__cdecl GP2_GetToken(char allowLineBreaks, char readUntilNewline, char **text)
+/* GP2 GetToken (Raven genericparser2.cpp) with SkipWhiteSpace written inline;
+ * CoD adds the quote stripping before the terminator. */
+char *__cdecl GP2_GetToken( char allowLineBreaks, char readUntilNewline, char **text )
 {
-  char *p;
-  int   len;
-  char  c;
-  int   newLine;
+  char *pointer = *text;
+  int   length = 0;
+  char  c = 0;
+  char  foundLineBreak;
 
-  p = *text;
-  len = 0;
   gp2_token[0] = 0;
-  if ( !p )
-    return gp2_token;
-
-  for ( ;; )
+  if ( !pointer )
   {
-    c = *p;
-    newLine = 0;
-    if ( c <= 32 )
-    {
-      do
-      {
-        if ( !c )
-        {
-          *text = 0;
-          return gp2_token;
-        }
-        if ( c == '\n' )
-          newLine = 1;
-        c = *++p;
-      }
-      while ( c <= 32 );
-
-      if ( newLine && !allowLineBreaks )
-        break;
-    }
-
-    c = *p;
-    if ( c == '/' && p[1] == '/' )
-    {
-      c = p[2];
-      p += 2;
-      while ( c && c != '\n' )
-        c = *++p;
-      continue;
-    }
-    if ( c == '/' && p[1] == '*' )
-    {
-      c = p[2];
-      p += 2;
-      if ( c )
-      {
-        while ( c != '*' || p[1] != '/' )
-        {
-          c = *++p;
-          if ( !c )
-            goto nextToken;
-        }
-        if ( *p )
-          p += 2;
-      }
-      continue;
-    }
-
-    if ( c == '"' && !readUntilNewline )
-    {
-      c = p[1];
-      p += 2;
-      if ( c != '"' )
-      {
-        do
-        {
-          if ( !c )
-            break;
-          if ( len < GP2_MAX_TOKEN_SIZE )
-            gp2_token[len++] = c;
-          c = *p++;
-        }
-        while ( c != '"' );
-        goto trimQuotes;
-      }
-      goto terminate;
-    }
-
-    if ( !readUntilNewline )
-    {
-      if ( c > 32 )
-      {
-        do
-        {
-          if ( len < GP2_MAX_TOKEN_SIZE )
-            gp2_token[len++] = c;
-          c = *++p;
-        }
-        while ( c > 32 );
-        goto trimQuotes;
-      }
-      goto terminate;
-    }
-
-    if ( c == '\n' )
-      goto terminate;
-    do
-    {
-      if ( c == '\r' )
-        break;
-      if ( c == '/' && ( p[1] == '/' || p[1] == '*' ) )
-        break;
-      if ( len < GP2_MAX_TOKEN_SIZE )
-        gp2_token[len++] = c;
-      c = *++p;
-    }
-    while ( c != '\n' );
-
-    while ( len && gp2_token[len - 1] < 32 )
-      --len;
-
-trimQuotes:
-    if ( gp2_token[0] == '"' )
-    {
-      --len;
-      memcpy( gp2_token, gp2_token + 1, len );
-      if ( len && gp2_token[len - 1] == '"' )
-        --len;
-    }
-    if ( len >= GP2_MAX_TOKEN_SIZE )
-      len = 0;
-
-terminate:
-    gp2_token[len] = 0;
-    break;
-
-nextToken:
-    ;
+    return gp2_token;
   }
 
-  *text = p;
+  while ( 1 )
+  {
+    /* SkipWhiteSpace */
+    foundLineBreak = 0;
+    while ( 1 )
+    {
+      c = *pointer;
+      if ( c > ' ' )
+      {
+        break;
+      }
+      if ( !c )
+      {
+        *text = 0;
+        return gp2_token;
+      }
+      if ( c == '\n' )
+      {
+        foundLineBreak = 1;
+      }
+      pointer++;
+    }
+    if ( foundLineBreak && !allowLineBreaks )
+    {
+      *text = pointer;
+      return gp2_token;
+    }
+
+    c = *pointer;
+    if ( c == '/' && pointer[1] == '/' )
+    {  /* skip // comments */
+      pointer += 2;
+      while ( *pointer && *pointer != '\n' )
+      {
+        pointer++;
+      }
+    }
+    else if ( c == '/' && pointer[1] == '*' )
+    {  /* skip slash-star comments */
+      pointer += 2;
+      while ( *pointer && ( *pointer != '*' || pointer[1] != '/' ) )
+      {
+        pointer++;
+      }
+      if ( *pointer )
+      {
+        pointer += 2;
+      }
+    }
+    else
+    {  /* found the start of a token */
+      break;
+    }
+  }
+
+  if ( c == '\"' && !readUntilNewline )
+  {  /* handle a string */
+    pointer++;
+    while ( 1 )
+    {
+      c = *pointer++;
+      if ( c == '\"' )
+      {
+        break;
+      }
+      else if ( !c )
+      {
+        break;
+      }
+      else if ( length < GP2_MAX_TOKEN_SIZE )
+      {
+        gp2_token[length++] = c;
+      }
+    }
+  }
+  else if ( readUntilNewline )
+  {
+    /* absorb all characters until EOL */
+    while ( c != '\n' && c != '\r' )
+    {
+      if ( c == '/' && ( ( *( pointer + 1 ) ) == '/' || ( *( pointer + 1 ) ) == '*' ) )
+      {
+        break;
+      }
+
+      if ( length < GP2_MAX_TOKEN_SIZE )
+      {
+        gp2_token[length++] = c;
+      }
+      pointer++;
+      c = *pointer;
+    }
+    /* remove trailing white space */
+    while ( length && gp2_token[length - 1] < ' ' )
+    {
+      length--;
+    }
+  }
+  else
+  {
+    while ( c > ' ' )
+    {
+      if ( length < GP2_MAX_TOKEN_SIZE )
+      {
+        gp2_token[length++] = c;
+      }
+      pointer++;
+      c = *pointer;
+    }
+  }
+
+  if ( gp2_token[0] == '\"' )
+  {  /* strip the quotes of a quoted value read to end of line */
+    length--;
+    memmove( gp2_token, gp2_token + 1, length );
+    if ( length && gp2_token[length - 1] == '\"' )
+    {
+      length--;
+    }
+  }
+  if ( length >= GP2_MAX_TOKEN_SIZE )
+  {
+    length = 0;
+  }
+  gp2_token[length] = 0;
+  *text = pointer;
+
   return gp2_token;
 }
 
 /* ---- CTextPool__CTextPool  0x004A1B40 ---- HIGH */
-void **__cdecl CTextPool__CTextPool(size_t a1, void **a2)
+textPool_t *__cdecl CTextPool__CTextPool(size_t initSize, textPool_t *this_)
 {
-  a2[1] = 0;
-  a2[2] = (void *)a1;
-  a2[3] = 0;
-  *a2 = Z_MallocInternal(a1);
-  return a2;
+  textPool_t *pool = this_;
+
+  pool->next = NULL;
+  pool->size = (int)initSize;
+  pool->used = 0;
+  pool->base = (char *)Z_MallocInternal( initSize );
+  return this_;
 }
 
 /* ---- CTextPool__dtor  0x004A1B60 ---- HIGH */
-void __cdecl CTextPool__dtor(void **a1)
+void __cdecl CTextPool__dtor(textPool_t *this_)
 {
-  free(*a1);
+  free( this_->base );
 }
 
-/* ---- CTextPool__AllocText  0x004A1B70 ---- CONFIRMED */
-int __cdecl CTextPool__AllocText(int *this, const char *a2, int a3, int a4)
+/* ---- CTextPool::AllocText  0x004A1B70 ---- CONFIRMED */
+#ifdef __cplusplus
+/*
+ * Copies text (and, with addNULL, one more NUL) into this pool.  When it does
+ * not fit and poolPtr is given, a new pool of the same size is chained after
+ * *poolPtr, becomes *poolPtr and takes the text; without poolPtr it fails (NULL).
+ */
+char *CTextPool::AllocText( const char *text, bool addNULL, CTextPool **poolPtr )
 {
-  const char *v5;
-  int v6;
-  int v7;
-  int *v8;
-  int *v9;
-  int v11;
-  int v12;
-  size_t v13;
+  int length = (int)strlen( text ) + ( addNULL ? 1 : 0 );
 
-  v5 = &a2[strlen(a2) + 1];
-  v6 = v5 - (a2 + 1) + ((_BYTE)a3 != 0);
-  v7 = this[3];
-  if ( v7 + v5 - a2 + ((_BYTE)a3 != 0) <= this[2] )
+  if ( used + length + 1 > size )   /* the extra 1 puts a NUL on the end */
   {
-    strcpy((char *)(v7 + *this), a2);
-    v11 = *this;
-    v12 = v6 + this[3];
-    this[3] = v12;
-    *(_BYTE *)(v12 + v11) = 0;
-    return *this + this[3] - v6;
-  }
-  else if ( a4 )
-  {
-    v8 = Z_MallocInternal(0x10u);
-    if ( v8 )
+    if ( poolPtr )
     {
-      v13 = this[2];
-      v8[1] = 0;
-      v8[2] = v13;
-      v8[3] = 0;
-      *v8 = (int)Z_MallocInternal(v13);
+      CTextPool__SetNext( *poolPtr, new CTextPool( size ) );
+      *poolPtr = (CTextPool *)CTextPool__GetNext( *poolPtr );
+      return ( *poolPtr )->AllocText( text, addNULL, NULL );
     }
-    else
-    {
-      v8 = 0;
-    }
-    *(_DWORD *)(*(_DWORD *)a4 + 4) = v8;
-    v9 = *(int **)(*(_DWORD *)a4 + 4);
-    *(_DWORD *)a4 = v9;
-    return CTextPool__AllocText(v9, a2, a3, 0);
+    return NULL;
   }
-  else
+
+  strcpy( base + used, text );
+  used += length;
+  base[used] = 0;
+  return base + used - length;
+}
+#else
+char *__stdcall CTextPool__AllocText(textPool_t *this_, const char *text, int addNULL, textPool_t **poolPtr)
+{
+  textPool_t  *pool    = this_;
+  int          len     = (int)strlen( text );
+  int          addNull = ( (char)addNULL != 0 );
+  int          advance = len + addNull;   /* bytes this string consumes in the pool */
+  textPool_t  *fresh;
+  textPool_t **current;
+  int          start;
+
+  if ( pool->used + len + 1 + addNull <= pool->size )
   {
+    strcpy( pool->base + pool->used, text );
+    start = pool->used;
+    pool->used += advance;
+    pool->base[pool->used] = 0;
+    return pool->base + start;
+  }
+
+  /* copied before the test: keeps poolPtr a stack argument, as in retail's EH-framed thiscall */
+  current = poolPtr;
+  if ( !current )
     return 0;
+
+  /* The current pool is full: allocate another of the same size and chain it. */
+  fresh = (textPool_t *)Z_MallocInternal( 0x10u );
+  if ( fresh )
+  {
+    fresh->next = NULL;
+    fresh->size = pool->size;
+    fresh->used = 0;
+    fresh->base = (char *)Z_MallocInternal( pool->size );
   }
+
+  ( *current )->next = fresh;
+  *current = ( *current )->next;
+  return CTextPool__AllocText( *current, text, addNULL, NULL );
 }
+#endif
 
 /* ---- CTextPool__DeleteChain  0x004A1C60 ---- HIGH */
-void __cdecl CTextPool__DeleteChain(int a1)
+void __cdecl CTextPool__DeleteChain(textPool_t *first)
 {
-  int v1;
-  int v2;
+  textPool_t *pool = first;
+  textPool_t *next;
 
-  v1 = a1;
-  if ( a1 )
+  if ( pool )
   {
     do
     {
-      v2 = *(_DWORD *)(v1 + 4);
-      free(*(void **)v1);
-      free((void *)v1);
-      v1 = v2;
+      next = pool->next;
+      free( pool->base );
+      free( pool );
+      pool = next;
     }
-    while ( v2 );
+    while ( next );
   }
 }
 
 /* ---- CTextPool__scalar_dtor  0x004A1C90 ---- HIGH */
-void **__cdecl CTextPool__scalar_dtor(void **a1, char a2)
+textPool_t *__stdcall CTextPool__scalar_dtor(textPool_t *this_, char deleteFlags)
 {
-  free(*a1);
-  if ( (a2 & 1) != 0 )
-    free(a1);
-  return a1;
+  free( this_->base );
+  if ( (deleteFlags & 1) != 0 )
+    free( this_ );
+  return this_;
 }
 
 /* ---- CGPObject__CGPObject  0x004A1CC0 ---- HIGH */
-_DWORD *__cdecl CGPObject__CGPObject(_DWORD *result, int a2)
+gpObject_t *__cdecl CGPObject__CGPObject(gpObject_t *this_, const char *initName)
 {
-  *result = a2;
-  result[1] = 0;
-  result[2] = 0;
-  result[3] = 0;
-  return result;
+  this_->name = initName;
+  this_->next = NULL;
+  this_->inOrderNext = NULL;
+  this_->inOrderPrevious = NULL;
+  return this_;
 }
 
 /* ---- CGPObject__WriteText  0x004A1CD0 ---- HIGH */
-char __cdecl CGPObject__WriteText(const char *a1, int **a2, int a3)
+char __stdcall CGPObject__WriteText(const char *text, textPool_t **textPool, gpObject_t *this_)
 {
-  if ( strchr(a1, 32) || !*a1 )
+  if ( strchr(text, 32) || !*text )
   {
-    CTextPool__AllocText(*a2, "\"", 0, (int)a2);
-    CTextPool__AllocText(*a2, a1, 0, (int)a2);
-    CTextPool__AllocText(*a2, "\"", 0, (int)a2);
+    GP2_AllocText( textPool, "\"", 0 );
+    GP2_AllocText( textPool, text, 0 );
+    GP2_AllocText( textPool, "\"", 0 );
     return 1;
   }
   else
   {
-    CTextPool__AllocText(*a2, a1, 0, (int)a2);
+    GP2_AllocText( textPool, text, 0 );
     return 1;
   }
 }
 
 /* ---- CGPValue__CGPValue  0x004A1D30 ---- HIGH */
-_DWORD *__cdecl CGPValue__CGPValue(int a1, _DWORD *a2, const char *a3)
+gpValue_t *__cdecl CGPValue__CGPValue(const char *initName, gpValue_t *this_, const char *initValue)
 {
-  *a2 = a1;
-  a2[1] = 0;
-  a2[2] = 0;
-  a2[3] = 0;
-  a2[4] = 0;
-  if ( a3 )
-    CGPValue__AddValue(0, a3, (int)a2);
-  return a2;
+  gpValue_t *self = this_;
+
+  self->base.name = initName;
+  self->base.next = NULL;
+  self->base.inOrderNext = NULL;
+  self->base.inOrderPrevious = NULL;
+  self->list = NULL;
+  if ( initValue )
+    CGPValue__AddValue( NULL, initValue, this_ );
+  return this_;
 }
 
 /* ---- CGPValue__Clean  0x004A1D50 ---- HIGH */
-int __cdecl CGPValue__Clean(int a1)
+void __cdecl CGPValue__Clean(gpValue_t *this_)
 {
-  int result;
-  int v2;
-
-  result = *(_DWORD *)(a1 + 16);
-  if ( result )
-  {
-    do
-    {
-      v2 = *(_DWORD *)(*(_DWORD *)(a1 + 16) + 4);
-      free(*(void **)(a1 + 16));
-      result = v2;
-      *(_DWORD *)(a1 + 16) = v2;
-    }
-    while ( v2 );
-  }
-  return result;
+ gpValue_t *self=this_;
+ gpObject_t *next;
+ while(self->list) {
+   next=self->list->next;
+   free(self->list);
+   self->list=next;
+ }
 }
+
+/* GP2's inline CGPObject::GetName(); the accessor's temporaries give retail's registers. */
+static __inline const char *CGPObject_GetName( gpObject_t *obj ) { return obj->name; }
 
 /* ---- CGPValue__Duplicate  0x004A1D80 ---- HIGH */
-int *__cdecl CGPValue__Duplicate(int this, int **a2)
-{
-  int **v2;
-  const char *v4;
-  int *v5;
-  int *v6;
-  const char **v7;
-  int v9;
-  int *v10;
-  int *v11;
-  int *v12;
-  int *v13;
-  char *v14;
-  char *LocalizedString_m;
-  const char **v16;
-
-  v2 = a2;
-  if ( a2 )
-    v4 = (const char *)CTextPool__AllocText(*a2, *(const char **)this, 1, (int)a2);
-  else
-    v4 = *(const char **)this;
-  v5 = Z_MallocInternal(0x14u);
-  if ( v5 )
+#ifdef __cplusplus
+/* Retail CGPValue::Duplicate is C++: `new CGPValue(name)` inlines the class
+ * operator new (Z_Malloc) and the constructor, whose optional initial-value
+ * AddValue gives the new-expression an EH state (fs:0 frame, /EHs) even though
+ * the call is dead here; each copied value is a `new CGPObject(name)` through
+ * the out-of-memory-checked malloc, inlined with AddValue's list append. */
+struct CGPValue : CGPObject {
+  gpObject_t *list;   /* gpValue_t.list */
+  CGPValue( const char *initName, const char *initValue = 0 )
   {
-    *v5 = (int)v4;
-    v5[1] = 0;
-    v5[2] = 0;
-    v5[3] = 0;
-    v5[4] = 0;
-    v6 = v5;
+    name = initName; next = NULL; inOrderNext = NULL; inOrderPrevious = NULL; list = NULL;
+    if ( initValue )
+      CGPValue__AddValue( NULL, initValue, (gpValue_t *)this );
   }
-  else
+};
+struct GpNewListObject : gpObject_t {
+  GpNewListObject( const char *initName ) { name = initName; next = NULL; inOrderNext = NULL; inOrderPrevious = NULL; }
+  void *operator new( size_t size )
   {
-    v6 = 0;
-  }
-  v7 = *(const char ***)(this + 16);
-  v16 = v7;
-  if ( v7 )
-  {
-    while ( 1 )
+    void *block = malloc( size );
+    if ( !block )
     {
-      v9 = v2 ? CTextPool__AllocText(*v2, *v7, 1, (int)v2) : (int)*v7;
-      if ( v6[4] )
-      {
-        v12 = (int *)malloc(0x10u);
-        v13 = v12;
-        if ( !v12 )
-        {
-LABEL_20:
-          Sys_OutOfMemoryPrep();
-          LocalizedString_m = SEH_GetLocalizedString_m("WIN_OUT_OF_MEM_TITLE");
-          v14 = SEH_GetLocalizedString_m("WIN_OUT_OF_MEM_BODY");
-          MessageBoxA(0, v14, LocalizedString_m, 0x10u);
-          exit(-1);
-        }
-        Com_Memset(v12, 0, 16);
-        *v13 = v9;
-        v13[1] = 0;
-        v13[2] = 0;
-        v13[3] = 0;
-        *(_DWORD *)(*(_DWORD *)(v6[4] + 8) + 4) = v13;
-        *(_DWORD *)(v6[4] + 8) = *(_DWORD *)(*(_DWORD *)(v6[4] + 8) + 4);
-      }
-      else
-      {
-        v10 = (int *)malloc(0x10u);
-        v11 = v10;
-        if ( !v10 )
-          goto LABEL_20;
-        Com_Memset(v10, 0, 16);
-        *v11 = v9;
-        v11[1] = 0;
-        v11[2] = 0;
-        v11[3] = 0;
-        v6[4] = (int)v11;
-        v11[2] = (int)v11;
-      }
-      v16 = (const char **)v16[1];
-      if ( !v16 )
-        break;
-      v7 = v16;
-      v2 = a2;
+      Sys_OutOfMemoryPrep();
+      MessageBoxA( 0, (const char *)SEH_GetLocalizedString_m( "WIN_OUT_OF_MEM_BODY" ),
+                   (const char *)SEH_GetLocalizedString_m( "WIN_OUT_OF_MEM_TITLE" ), 0x10u );
+      exit( -1 );
     }
+    Com_Memset( block, 0, size );
+    return block;
   }
-  return v6;
-}
-
-/* ---- CGPValue__IsList  0x004A1EE0 ---- HIGH */
-bool __cdecl CGPValue__IsList(int a1)
+  void operator delete( void *block ) { free( block ); }
+};
+gpValue_t *__fastcall CGPValue__Duplicate( gpValue_t *self, GpPointerArgument poolReference )
 {
-  int v1;
+  CGPValue    *newValue;
+  gpObject_t  *iterator;
+  const char  *name;   /* Raven's three locals: the pool stays the argument (a fourth local moves the EH temporary's slot) */
 
-  v1 = *(_DWORD *)(a1 + 16);
-  return v1 && *(_DWORD *)(v1 + 4);
-}
+  /* taking the address keeps the declared receiver-in-ecx convention under LTCG */
+  (void)&CGPValue__Duplicate;
 
-/* ---- CGPValue__GetTopValue  0x004A1F00 ---- HIGH */
-int __cdecl CGPValue__GetTopValue(int a1)
-{
-  int v1;
-
-  v1 = *(_DWORD *)(a1 + 16);
-  if ( v1 )
-    return *(_DWORD *)v1;
+  if ( poolReference.value )
+    name = GP2_AllocText( (textPool_t **)poolReference.value, self->base.name, 1 );
   else
-    return 0;
-}
+    name = self->base.name;
 
-/* ---- CGPValue__AddValue  0x004A1F10 ---- HIGH */
-int __cdecl CGPValue__AddValue(int textPool, const char *newValue, int this_)
-{
-  int *obj;
-  int *list;
-
-  if ( textPool )
-    newValue = (const char *)CTextPool__AllocText( *(int **)textPool, newValue, 1, textPool );
-
-  obj = Z_MallocInternal( 0x10u );
-  if ( obj )
+  newValue = new CGPValue( name );
+  iterator = self->list;
+  while ( iterator )
   {
-    obj[0] = (int)newValue;
-    obj[1] = 0;
-    obj[2] = 0;
-    obj[3] = 0;
-  }
+    if ( poolReference.value )
+      name = GP2_AllocText( (textPool_t **)poolReference.value, CGPObject_GetName( iterator ), 1 );
+    else
+      name = CGPObject_GetName( iterator );
 
-  list = *(int **)( this_ + 16 );
-  if ( list )
-  {
-    *(_DWORD *)( list[2] + 4 ) = (int)obj;
-    list[2] = *(_DWORD *)( list[2] + 4 );
-    return (int)list;
-  }
-
-  *(_DWORD *)( this_ + 16 ) = (int)obj;
-  if ( obj )
-    obj[2] = (int)obj;
-  return (int)obj;
-}
-
-/* ---- CGPValue__Parse  0x004A1F90 ---- CONFIRMED */
-char __cdecl CGPValue__Parse(int **a1, int a2, char **a3)
-{
-  char *v3;
-  const char *v4;
-
-  v3 = GP2_GetToken(1, 1, a3);
-  if ( !*v3 )
-    return 0;
-  while ( _stricmp(v3, "]") )
-  {
-    v4 = (const char *)CTextPool__AllocText(*a1, v3, 1, (int)a1);
-    CGPValue__AddValue(0, v4, a2);
-    v3 = GP2_GetToken(1, 1, a3);
-    if ( !*v3 )
-      return 0;
-  }
-  return 1;
-}
-
-/* ---- CGPValue__Write  0x004A2000 ---- CONFIRMED */
-char __cdecl CGPValue__Write(int a1, int **a2, int a3)
-{
-  int v4;
-  int v5;
-  const char *v6;
-  int *v7;
-  const char *v8;
-  int v10;
-  int v11;
-  int v12;
-  const char *v13;
-  int v14;
-  const char *v15;
-  const char *v16;
-  int **v17;
-  int **v18;
-
-  if ( !*(_DWORD *)(a1 + 16) )
-    return 1;
-  v4 = a3;
-  if ( a3 > 0 )
-  {
-    v5 = a3;
-    do
+    /* newValue->AddValue( name ) */
+    if ( !newValue->list )
     {
-      CTextPool__AllocText(*a2, "\t", 0, (int)a2);
-      --v5;
-    }
-    while ( v5 );
-  }
-  v6 = *(const char **)a1;
-  if ( strchr(*(const char **)a1, 32) || !*v6 )
-  {
-    CTextPool__AllocText(*a2, "\"", 0, (int)a2);
-    CTextPool__AllocText(*a2, v6, 0, (int)a2);
-    v17 = a2;
-    v15 = "\"";
-  }
-  else
-  {
-    v17 = a2;
-    v15 = v6;
-  }
-  CTextPool__AllocText(*a2, v15, 0, (int)v17);
-  v7 = *a2;
-  if ( *(_DWORD *)(*(_DWORD *)(a1 + 16) + 4) )
-  {
-    CTextPool__AllocText(v7, "\r\n", 0, (int)a2);
-    if ( a3 > 0 )
-    {
-      v10 = a3;
-      do
-      {
-        CTextPool__AllocText(*a2, "\t", 0, (int)a2);
-        --v10;
-      }
-      while ( v10 );
-    }
-    CTextPool__AllocText(*a2, "[\r\n", 0, (int)a2);
-    v11 = *(_DWORD *)(a1 + 16);
-    if ( v11 )
-    {
-      do
-      {
-        if ( a3 + 1 > 0 )
-        {
-          v12 = a3 + 1;
-          do
-          {
-            CTextPool__AllocText(*a2, "\t", 0, (int)a2);
-            --v12;
-          }
-          while ( v12 );
-        }
-        v13 = *(const char **)v11;
-        if ( strchr(*(const char **)v11, 32) || !*v13 )
-        {
-          CTextPool__AllocText(*a2, "\"", 0, (int)a2);
-          CTextPool__AllocText(*a2, v13, 0, (int)a2);
-          v18 = a2;
-          v16 = "\"";
-        }
-        else
-        {
-          v18 = a2;
-          v16 = v13;
-        }
-        CTextPool__AllocText(*a2, v16, 0, (int)v18);
-        CTextPool__AllocText(*a2, "\r\n", 0, (int)a2);
-        v11 = *(_DWORD *)(v11 + 4);
-      }
-      while ( v11 );
-      v4 = a3;
-    }
-    if ( v4 > 0 )
-    {
-      v14 = v4;
-      do
-      {
-        CTextPool__AllocText(*a2, "\t", 0, (int)a2);
-        --v14;
-      }
-      while ( v14 );
-    }
-    CTextPool__AllocText(*a2, "]\r\n", 0, (int)a2);
-    return 1;
-  }
-  CTextPool__AllocText(v7, "\t\t", 0, (int)a2);
-  v8 = **(const char ***)(a1 + 16);
-  if ( strchr(v8, 32) || !*v8 )
-  {
-    CTextPool__AllocText(*a2, "\"", 0, (int)a2);
-    CTextPool__AllocText(*a2, v8, 0, (int)a2);
-    CTextPool__AllocText(*a2, "\"", 0, (int)a2);
-    CTextPool__AllocText(*a2, "\r\n", 0, (int)a2);
-    return 1;
-  }
-  else
-  {
-    CTextPool__AllocText(*a2, v8, 0, (int)a2);
-    CTextPool__AllocText(*a2, "\r\n", 0, (int)a2);
-    return 1;
-  }
-}
-
-/* ---- CGPGroup__CGPGroup  0x004A2200 ---- HIGH */
-int __cdecl CGPGroup__CGPGroup(int result, int a2, int a3)
-{
-  *(_DWORD *)result = a3;
-  *(_DWORD *)(result + 4) = 0;
-  *(_DWORD *)(result + 8) = 0;
-  *(_DWORD *)(result + 12) = 0;
-  *(_DWORD *)(result + 16) = 0;
-  *(_DWORD *)(result + 20) = 0;
-  *(_DWORD *)(result + 24) = 0;
-  *(_DWORD *)(result + 28) = 0;
-  *(_DWORD *)(result + 32) = 0;
-  *(_DWORD *)(result + 36) = 0;
-  *(_DWORD *)(result + 40) = a2;
-  *(_BYTE *)(result + 44) = 0;
-  return result;
-}
-
-/* ---- CGPGroup__dtor  0x004A2230 ---- HIGH */
-int __cdecl CGPGroup__dtor(int this)
-{
-  return CGPGroup__Clean(this);
-}
-
-/* ---- CGPGroup__GetNumSubGroups  0x004A2240 ---- HIGH */
-int __cdecl CGPGroup__GetNumSubGroups(_DWORD *this)
-{
-  int v1;
-  int result;
-
-  v1 = this[7];
-  result = 0;
-  do
-  {
-    v1 = *(_DWORD *)(v1 + 4);
-    ++result;
-  }
-  while ( v1 );
-  return result;
-}
-
-/* ---- CGPGroup__GetNumPairs  0x004A2250 ---- HIGH */
-int __cdecl CGPGroup__GetNumPairs(_DWORD *this)
-{
-  int v1;
-  int result;
-
-  v1 = this[4];
-  result = 0;
-  do
-  {
-    v1 = *(_DWORD *)(v1 + 4);
-    ++result;
-  }
-  while ( v1 );
-  return result;
-}
-
-/* ---- CGPGroup__Clean  0x004A2260 ---- HIGH */
-int __cdecl CGPGroup__Clean(int this)
-{
-  int result;
-  int v3;
-  int v4;
-  _DWORD *v5;
-
-  for ( result = *(_DWORD *)(this + 16); result; *(_DWORD *)(this + 16) = result )
-  {
-    v3 = *(_DWORD *)(this + 16);
-    *(_DWORD *)(this + 24) = *(_DWORD *)(v3 + 4);
-    if ( v3 )
-    {
-      if ( *(_DWORD *)(v3 + 16) )
-      {
-        do
-        {
-          v4 = *(_DWORD *)(*(_DWORD *)(v3 + 16) + 4);
-          free(*(void **)(v3 + 16));
-          *(_DWORD *)(v3 + 16) = v4;
-        }
-        while ( v4 );
-      }
-      free((void *)v3);
-    }
-    result = *(_DWORD *)(this + 24);
-  }
-  if ( *(_DWORD *)(this + 28) )
-  {
-    do
-    {
-      v5 = *(_DWORD **)(this + 28);
-      *(_DWORD *)(this + 36) = v5[1];
-      if ( v5 )
-      {
-        CGPGroup__Clean((int)v5);
-        free(v5);
-      }
-      result = *(_DWORD *)(this + 36);
-      *(_DWORD *)(this + 28) = result;
-    }
-    while ( result );
-  }
-  *(_DWORD *)(this + 24) = 0;
-  *(_DWORD *)(this + 20) = 0;
-  *(_DWORD *)(this + 16) = 0;
-  *(_DWORD *)(this + 36) = 0;
-  *(_DWORD *)(this + 32) = 0;
-  *(_DWORD *)(this + 28) = 0;
-  *(_DWORD *)(this + 40) = 0;
-  *(_BYTE *)(this + 44) = 0;
-  return result;
-}
-
-/* ---- CGPValue__scalar_dtor  0x004A2300 ---- HIGH */
-void **__cdecl CGPValue__scalar_dtor(void **a1, char a2)
-{
-  void *v2;
-
-  if ( a1[4] )
-  {
-    do
-    {
-      v2 = (void *)*((_DWORD *)a1[4] + 1);
-      free(a1[4]);
-      a1[4] = v2;
-    }
-    while ( v2 );
-  }
-  if ( (a2 & 1) != 0 )
-    free(a1);
-  return a1;
-}
-
-/* ---- CGPGroup__scalar_dtor  0x004A2340 ---- HIGH */
-void *__cdecl CGPGroup__scalar_dtor(void *a1, char a2)
-{
-  CGPGroup__Clean((int)a1);
-  if ( (a2 & 1) != 0 )
-    free(a1);
-  return a1;
-}
-
-/* ---- CGPGroup__Duplicate  0x004A2360 ---- CONFIRMED */
-int *__cdecl CGPGroup__Duplicate(int this, int **a2, int a3)
-{
-  const char *v4;
-  int *v5;
-  int *v6;
-  int i;
-  int *v8;
-  int j;
-  int *v10;
-
-  if ( a2 )
-    v4 = (const char *)CTextPool__AllocText(*a2, *(const char **)this, 1, (int)a2);
-  else
-    v4 = *(const char **)this;
-  v5 = Z_MallocInternal(0x30u);
-  if ( v5 )
-  {
-    *v5 = (int)v4;
-    v5[1] = 0;
-    v5[2] = 0;
-    v5[3] = 0;
-    v5[4] = 0;
-    v5[5] = 0;
-    v5[6] = 0;
-    v5[7] = 0;
-    v5[8] = 0;
-    v5[9] = 0;
-    v5[10] = 0;
-    *((_BYTE *)v5 + 44) = 0;
-    v6 = v5;
-  }
-  else
-  {
-    v6 = 0;
-  }
-  for ( i = *(_DWORD *)(this + 28); i; i = *(_DWORD *)(i + 4) )
-  {
-    v8 = CGPGroup__Duplicate(i, a2, (int)v6);
-    CGP_InsertInOrder(v6 + 7, (int)v8, (int)v6, v6 + 8, (int)(v6 + 9));
-  }
-  for ( j = *(_DWORD *)(this + 16); j; j = *(_DWORD *)(j + 4) )
-  {
-    v10 = CGPValue__Duplicate(j, a2);
-    CGP_InsertInOrder(v6 + 4, (int)v10, (int)v6, v6 + 5, (int)(v6 + 6));
-  }
-  return v6;
-}
-
-/* ---- CGP_InsertInOrder  0x004A2430 ---- HIGH */
-_DWORD *__cdecl CGP_InsertInOrder(_DWORD *listHead, int newObj, int parent,
-                                  _DWORD *inOrderHead, int currentSlot)
-{
-  _DWORD *result;
-  int walk;
-  int prev;
-
-  if ( !*listHead )
-  {
-    *inOrderHead = newObj;
-    *listHead = newObj;
-    *(_DWORD *)currentSlot = newObj;
-    return listHead;
-  }
-
-  result = inOrderHead;
-  *(_DWORD *)( *(_DWORD *)currentSlot + 4 ) = newObj;
-
-  walk = *inOrderHead;
-  prev = 0;
-  if ( walk )
-  {
-    for ( ;; )
-    {
-      result = (_DWORD *)_stricmp( *(const char **)newObj, *(const char **)walk );
-      if ( (int)result < 0 )
-      {
-        *(_DWORD *)( walk + 12 ) = newObj;
-        *(_DWORD *)( newObj + 8 ) = walk;
-        break;
-      }
-      prev = walk;
-      walk = *(_DWORD *)( walk + 8 );
-      if ( !walk )
-        break;
-    }
-  }
-
-  if ( prev )
-  {
-    *(_DWORD *)( prev + 8 ) = newObj;
-    *(_DWORD *)( newObj + 12 ) = prev;
-    *(_DWORD *)currentSlot = newObj;
-  }
-  else
-  {
-    *inOrderHead = newObj;
-    *(_DWORD *)currentSlot = newObj;
-  }
-  return result;
-}
-
-/* ---- CGPGroup__AddPair  0x004A24B0 ---- HIGH */
-int __cdecl CGPGroup__AddPair(const char *a1, int **a2, int a3, const char *a4)
-{
-  const char *v4;
-  int *v6;
-  int v7;
-
-  v4 = a4;
-  if ( a2 )
-  {
-    v4 = (const char *)CTextPool__AllocText(*a2, a4, 1, (int)a2);
-    if ( a1 )
-      a1 = (const char *)CTextPool__AllocText(*a2, a1, 1, (int)a2);
-  }
-  v6 = Z_MallocInternal(0x14u);
-  if ( v6 )
-  {
-    *v6 = (int)v4;
-    v6[1] = 0;
-    v6[2] = 0;
-    v6[3] = 0;
-    v6[4] = 0;
-    if ( a1 )
-      CGPValue__AddValue(0, a1, (int)v6);
-    v7 = (int)v6;
-  }
-  else
-  {
-    v7 = 0;
-  }
-  CGP_InsertInOrder((_DWORD *)(a3 + 16), v7, a3, (_DWORD *)(a3 + 20), a3 + 24);
-  return v7;
-}
-
-/* ---- CGPGroup__AddPairObject  0x004A2560 ---- HIGH */
-_DWORD *__cdecl CGPGroup__AddPairObject(int a1, int a2)
-{
-  return CGP_InsertInOrder((_DWORD *)(a1 + 16), a2, a1, (_DWORD *)(a1 + 20), a1 + 24);
-}
-
-/* ---- CGPGroup__AddGroup  0x004A2580 ---- HIGH */
-int __cdecl CGPGroup__AddGroup(int **a1, const char *a2, int a3)
-{
-  const char *v3;
-  int *v4;
-  int v5;
-
-  v3 = a2;
-  if ( a1 )
-    v3 = (const char *)CTextPool__AllocText(*a1, a2, 1, (int)a1);
-  v4 = Z_MallocInternal(0x30u);
-  if ( v4 )
-  {
-    *v4 = (int)v3;
-    v4[1] = 0;
-    v4[2] = 0;
-    v4[3] = 0;
-    v4[4] = 0;
-    v4[5] = 0;
-    v4[6] = 0;
-    v4[7] = 0;
-    v4[8] = 0;
-    v4[9] = 0;
-    v4[10] = 0;
-    *((_BYTE *)v4 + 44) = 0;
-    v5 = (int)v4;
-  }
-  else
-  {
-    v5 = 0;
-  }
-  CGP_InsertInOrder((_DWORD *)(a3 + 28), v5, a3, (_DWORD *)(a3 + 32), a3 + 36);
-  return v5;
-}
-
-/* ---- CGPGroup__AddGroupObject  0x004A25F0 ---- HIGH */
-_DWORD *__cdecl CGPGroup__AddGroupObject(int a1, int a2)
-{
-  return CGP_InsertInOrder((_DWORD *)(a1 + 28), a2, a1, (_DWORD *)(a1 + 32), a1 + 36);
-}
-
-/* ---- CGPGroup__FindSubGroup  0x004A2610 ---- HIGH */
-int __cdecl CGPGroup__FindSubGroup(int a1, const char *a2)
-{
-  int v2;
-
-  v2 = *(_DWORD *)(a1 + 28);
-  if ( !v2 )
-    return 0;
-  while ( _stricmp(a2, *(const char **)v2) )
-  {
-    v2 = *(_DWORD *)(v2 + 4);
-    if ( !v2 )
-      return 0;
-  }
-  return v2;
-}
-
-/* ---- CGPGroup__Parse  0x004A2640 ---- CONFIRMED */
-char __cdecl CGPGroup__Parse(_BYTE *this, char **a2, int **a3)
-{
-  _BYTE *v3;
-  char *v4;
-  char *v5;
-  _BYTE *v6;
-  int v8;
-  char v10[1024];
-
-  v3 = this;
-  v4 = GP2_GetToken(1, 0, a2);
-  if ( *v4 )
-  {
-    while ( _stricmp(v4, "}") )
-    {
-      strcpy(v10, v4);
-      v5 = GP2_GetToken(1, 1, a2);
-      if ( !_stricmp(v5, "{") )
-      {
-        v6 = (_BYTE *)CGPGroup__AddGroup(a3, v10, (int)v3);
-        v6[44] = v3[44];
-        if ( !CGPGroup__Parse(v6, a2, a3) )
-          return 0;
-      }
-      else if ( !_stricmp(v5, "[") )
-      {
-        v8 = CGPGroup__AddPair(0, a3, (int)v3, v10);
-        if ( !CGPValue__Parse(a3, v8, a2) )
-          return 0;
-        v3 = this;
-      }
-      else
-      {
-        CGPGroup__AddPair(v5, a3, (int)v3, v10);
-      }
-      v4 = GP2_GetToken(1, 0, a2);
-      if ( !*v4 )
-        goto LABEL_11;
-    }
-  }
-  else
-  {
-LABEL_11:
-    if ( *((_DWORD *)v3 + 10) )
-      return 0;
-  }
-  return 1;
-}
-
-/* ---- CGPGroup__Write  0x004A2790 ---- CONFIRMED */
-char __cdecl CGPGroup__Write(const char **this, int **a2, int a3)
-{
-  int v3;
-  char *v6;
-  const char *v7;
-  const char *v8;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  const char *v14;
-  int **v15;
-  int v16;
-
-  v3 = a3;
-  v6 = (char *)this[7];
-  v7 = this[4];
-  if ( a3 >= 0 )
-  {
-    if ( a3 > 0 )
-    {
-      v16 = a3;
-      do
-      {
-        CTextPool__AllocText(*a2, "\t", 0, (int)a2);
-        --v16;
-      }
-      while ( v16 );
-    }
-    v8 = *this;
-    if ( strchr(v8, 32) || !*v8 )
-    {
-      CTextPool__AllocText(*a2, "\"", 0, (int)a2);
-      CTextPool__AllocText(*a2, v8, 0, (int)a2);
-      v15 = a2;
-      v14 = "\"";
+      newValue->list = new GpNewListObject( name );
+      newValue->list->inOrderNext = newValue->list;
     }
     else
     {
-      v15 = a2;
-      v14 = v8;
+      newValue->list->inOrderNext->next = new GpNewListObject( name );
+      newValue->list->inOrderNext = newValue->list->inOrderNext->next;
     }
-    CTextPool__AllocText(*a2, v14, 0, (int)v15);
-    CTextPool__AllocText(*a2, "\r\n", 0, (int)a2);
-    v9 = a3;
-    if ( a3 > 0 )
-    {
-      do
-      {
-        CTextPool__AllocText(*a2, "\t", 0, (int)a2);
-        --v9;
-      }
-      while ( v9 );
-    }
-    CTextPool__AllocText(*a2, "{\r\n", 0, (int)a2);
-    v3 = a3;
+    iterator = iterator->next;
   }
-  if ( v7 )
+  return (gpValue_t *)newValue;
+}
+#else
+gpValue_t *__fastcall CGPValue__Duplicate( gpValue_t *receiver, GpPointerArgument poolReference )
+{
+  gpValue_t  *src = receiver;
+  textPool_t **textPool = (textPool_t **)poolReference.value;
+  gpValue_t  *dest;
+  gpObject_t *srcNode;
+  gpObject_t *node;
+  gpObject_t *tail;
+  const char *dupName;
+  const char *dupValue;
+  const char *title;
+  const char *body;
+
+  /* taking the address keeps the declared receiver-in-ecx convention under LTCG */
+  (void)&CGPValue__Duplicate;
+
+  if ( textPool )
+    dupName = GP2_AllocText( textPool, src->base.name, 1 );
+  else
+    dupName = src->base.name;
+
+  dest = (gpValue_t *)Z_MallocInternal( 0x14u );
+  if ( dest )
   {
-    v10 = v3 + 1;
+    dest->base.name = dupName;
+    dest->base.next = NULL;
+    dest->base.inOrderNext = NULL;
+    dest->base.inOrderPrevious = NULL;
+    dest->list = NULL;
+  }
+
+  for ( srcNode = src->list; srcNode; srcNode = srcNode->next )
+  {
+    dupValue = textPool ? GP2_AllocText( textPool, srcNode->name, 1 )
+                  : srcNode->name;
+
+    node = (gpObject_t *)malloc( 0x10u );
+    if ( !node )
+      goto outOfMemory;
+    Com_Memset( node, 0, 16 );
+    node->name = dupValue;
+
+    if ( dest->list )
+    {
+      /* the list head's inOrderNext doubles as the tail pointer */
+      tail = dest->list->inOrderNext;
+      tail->next = node;
+      dest->list->inOrderNext = node;
+    }
+    else
+    {
+      dest->list = node;
+      node->inOrderNext = node;
+    }
+  }
+  return dest;
+
+outOfMemory:
+  Sys_OutOfMemoryPrep();
+  title = (const char *)SEH_GetLocalizedString_m( "WIN_OUT_OF_MEM_TITLE" );
+  body  = (const char *)SEH_GetLocalizedString_m( "WIN_OUT_OF_MEM_BODY" );
+  MessageBoxA( 0, body, title, 0x10u );
+  exit( -1 );
+}
+#endif
+
+/* ---- CGPValue__IsList  0x004A1EE0 ---- HIGH */
+char __cdecl CGPValue__IsList(gpValue_t *this_)
+{
+  gpValue_t *self = this_;
+
+  if ( self->list && self->list->next )
+    return 1;
+  return 0;
+}
+
+/* ---- CGPValue__GetTopValue  0x004A1F00 ---- HIGH */
+const char *__cdecl CGPValue__GetTopValue(gpValue_t *this_)
+{
+  gpValue_t *self = this_;
+
+  if ( self->list )
+    return self->list->name;
+  else
+    return NULL;
+}
+
+/* ---- CGPValue__AddValue  0x004A1F10 ---- HIGH */
+__declspec(noinline) void __cdecl CGPValue__AddValue(textPool_t **textPool, const char *newValue, gpValue_t *this_)
+{
+ gpValue_t *self=this_;
+ gpObject_t *mem;
+ gpObject_t *node;
+ if(textPool) newValue=GP2_AllocText( textPool, newValue, 1 );
+ if(!self->list) {
+  /* new CGPObject(newValue) */
+  mem=(gpObject_t*)Z_MallocInternal(16);
+  if(mem) {mem->name=newValue;mem->next=0;mem->inOrderNext=0;mem->inOrderPrevious=0;node=mem;}
+  else node=0;
+  self->list=node;
+  node->inOrderNext=node;
+  return;
+ }
+ mem=(gpObject_t*)Z_MallocInternal(16);
+ if(mem) {mem->name=newValue;mem->next=0;mem->inOrderNext=0;mem->inOrderPrevious=0;node=mem;}
+ else node=0;
+ self->list->inOrderNext->next=node;
+ self->list->inOrderNext=self->list->inOrderNext->next;
+}
+
+/* ---- CGPValue__Parse  0x004A1F90 ---- CONFIRMED */
+char __stdcall CGPValue__Parse(textPool_t **textPool, gpValue_t *this_, char **dataPtr)
+{
+ char *token;
+ const char *pooled;
+ for (;;) {
+  token=GP2_GetToken(1,1,dataPtr);
+  if(!*token) return 0;
+  if(!_stricmp(token,"]")) return 1;
+  pooled=GP2_AllocText( textPool, token, 1 );
+  CGPValue__AddValue(NULL,pooled,this_);
+ }
+}
+
+/* ---- CGPValue__Write  0x004A2000 ---- CONFIRMED */
+char __stdcall CGPValue__Write(gpValue_t *this_, textPool_t **textPool, int depth)
+{
+  gpValue_t  *self = this_;
+  gpObject_t *next;
+  int         i;
+
+  if ( !self->list )
+    return 1;
+
+  for ( i = 0; i < depth; i++ )
+    GP2_AllocText( textPool, "\t", 0 );
+
+  CGPObject__WriteText( self->base.name, textPool, &this_->base );
+
+  if ( !self->list->next )
+  {
+    GP2_AllocText( textPool, "\t\t", 0 );
+    CGPObject__WriteText( self->list->name, textPool, self->list );
+    GP2_AllocText( textPool, "\r\n", 0 );
+  }
+  else
+  {
+    GP2_AllocText( textPool, "\r\n", 0 );
+
+    for ( i = 0; i < depth; i++ )
+      GP2_AllocText( textPool, "\t", 0 );
+    GP2_AllocText( textPool, "[\r\n", 0 );
+
+    next = self->list;
+    while ( next )
+    {
+      for ( i = 0; i < depth + 1; i++ )
+        GP2_AllocText( textPool, "\t", 0 );
+      CGPObject__WriteText( next->name, textPool, self->list );
+      GP2_AllocText( textPool, "\r\n", 0 );
+
+      next = next->next;
+    }
+
+    for ( i = 0; i < depth; i++ )
+      GP2_AllocText( textPool, "\t", 0 );
+    GP2_AllocText( textPool, "]\r\n", 0 );
+  }
+
+  return 1;
+}
+
+/* ---- CGPGroup__CGPGroup  0x004A2200 ---- HIGH */
+gpGroup_t *__cdecl CGPGroup__CGPGroup(gpGroup_t *this_, gpGroup_t *initParent, const char *initName)
+{
+  gpGroup_t *self = this_;
+
+  self->base.name = initName;
+  self->base.next = NULL;
+  self->base.inOrderNext = NULL;
+  self->base.inOrderPrevious = NULL;
+  self->pairs = NULL;
+  self->pairsInOrder = NULL;
+  self->currentPair = NULL;
+  self->subGroups = NULL;
+  self->subGroupsInOrder = NULL;
+  self->currentSubGroup = NULL;
+  self->parent = initParent;
+  self->writeable = 0;
+  return this_;
+}
+
+/* ---- CGPGroup::~CGPGroup  0x004A2230 ---- HIGH */
+CGPGroup::~CGPGroup()
+{
+  CGPGroup__Clean( this );
+}
+
+/* ---- CGPGroup__GetNumSubGroups  0x004A2240 ---- HIGH */
+int __cdecl CGPGroup__GetNumSubGroups(gpGroup_t *self_)
+{
+  int        count;
+  gpGroup_t *node;
+
+  count = 0;
+  node = self_->subGroups;
+
+  /* NOTE: pre-advances the walker -- reproduces the retail body verbatim,
+   * which walks node->next before counting and dereferences an empty list. */
+  do
+  {
+    node = (gpGroup_t *)node->base.next;
+    ++count;
+  }
+  while ( node );
+  return count;
+}
+
+/* ---- CGPGroup__GetNumPairs  0x004A2250 ---- HIGH */
+int __cdecl CGPGroup__GetNumPairs(gpGroup_t *self_)
+{
+  int        count;
+  gpValue_t *node;
+
+  count = 0;
+  node = self_->pairs;
+
+  do
+  {
+    node = (gpValue_t *)node->base.next;
+    ++count;
+  }
+  while ( node );
+  return count;
+}
+
+/* ---- CGPGroup__Clean  0x004A2260 ---- HIGH */
+void __fastcall CGPGroup__Clean(gpGroup_t *self_)
+{
+  gpGroup_t  *self = self_;
+  gpValue_t  *pair;
+  gpObject_t *nextValue;
+  gpGroup_t  *sub;
+
+  
+  while ( self->pairs )
+  {
+    self->currentPair = (gpValue_t *)self->pairs->base.next;
+    /* delete mPairs */
+    pair = self->pairs;
+    if ( pair )
+    {
+      CGPValue__Clean(pair);
+      free( pair );
+    }
+    self->pairs = self->currentPair;
+  }
+
+  while ( self->subGroups )
+  {
+    self->currentSubGroup = (gpGroup_t *)self->subGroups->base.next;
+    /* delete mSubGroups */
+    sub = self->subGroups;
+    if ( sub )
+    {
+      CGPGroup__Clean( sub );
+      free( sub );
+    }
+    self->subGroups = self->currentSubGroup;
+  }
+
+  self->currentPair = NULL;
+  self->pairsInOrder = NULL;
+  self->pairs = NULL;
+  self->currentSubGroup = NULL;
+  self->subGroupsInOrder = NULL;
+  self->subGroups = NULL;
+  self->parent = NULL;
+  self->writeable = 0;
+  return;
+}
+
+/* ---- CGPValue__scalar_dtor  0x004A2300 ---- HIGH */
+gpValue_t *__stdcall CGPValue__scalar_dtor(gpValue_t *this_, char deleteFlags)
+{
+  gpValue_t  *self = this_;
+  gpObject_t *next;
+
+  CGPValue__Clean(this_);
+  if ( (deleteFlags & 1) != 0 )
+    free( this_ );
+  return this_;
+}
+
+/* ---- CGPGroup__scalar_dtor  0x004A2340 ---- HIGH */
+gpGroup_t *__stdcall CGPGroup__scalar_dtor(gpGroup_t *this_, char deleteFlags)
+{
+  CGPGroup__Clean(this_);
+  if ( (deleteFlags & 1) != 0 )
+    free(this_);
+  return this_;
+}
+
+/* ---- CGPGroup__Duplicate  0x004A2360 ---- CONFIRMED */
+gpGroup_t *__fastcall CGPGroup__Duplicate(gpGroup_t *receiver, GpPointerArgument poolReference, GpPointerArgument parentReference)
+{
+  gpGroup_t *src = receiver;
+  textPool_t **textPool = (textPool_t **)poolReference.value;
+  const char *dupName;
+  gpGroup_t  *mem;
+  gpGroup_t  *dest;
+  gpGroup_t  *srcSub;
+  gpValue_t  *srcPair;
+
+  (void)parentReference;   
+
+  if ( textPool )
+    dupName = GP2_AllocText( textPool, src->base.name, 1 );
+  else
+    dupName = src->base.name;
+
+  /* new CGPGroup(dupName) */
+  mem = (gpGroup_t *)Z_MallocInternal( 0x30u );
+  if ( mem )
+  {
+    mem->base.name = dupName;
+    mem->base.next = NULL;
+    mem->base.inOrderNext = NULL;
+    mem->base.inOrderPrevious = NULL;
+    mem->pairs = NULL;
+    mem->pairsInOrder = NULL;
+    mem->currentPair = NULL;
+    mem->subGroups = NULL;
+    mem->subGroupsInOrder = NULL;
+    mem->currentSubGroup = NULL;
+    mem->parent = NULL;
+    mem->writeable = 0;
+    dest = mem;
+  }
+  else dest=0;
+
+  for ( srcSub = src->subGroups; srcSub; srcSub = (gpGroup_t *)srcSub->base.next )
+  {
+    GpPointerArgument poolArg = { textPool };
+    GpPointerArgument parentArg = { dest };
+    gpGroup_t *copy = CGPGroup__Duplicate(srcSub, poolArg, parentArg);
+    CGP_InsertInOrder( dest, &copy->base, (gpObject_t **)&dest->subGroups,
+                       (gpObject_t **)&dest->subGroupsInOrder, (gpObject_t **)&dest->currentSubGroup );
+  }
+  for ( srcPair = src->pairs; srcPair; srcPair = (gpValue_t *)srcPair->base.next )
+  {
+    GpPointerArgument poolArg = { textPool };
+    gpValue_t *copy = CGPValue__Duplicate( srcPair, poolArg );
+    CGP_InsertInOrder( dest, &copy->base, (gpObject_t **)&dest->pairs,
+                       (gpObject_t **)&dest->pairsInOrder, (gpObject_t **)&dest->currentPair );
+  }
+  return dest;
+}
+
+
+/* ---- CGP_InsertInOrder  0x004A2430 ---- HIGH */
+/* GP2 CGPGroup::SortObject: `this` is forwarded but never read. */
+void __stdcall CGP_InsertInOrder(gpGroup_t *this_, struct gpObject_s *object, struct gpObject_s **unsortedList,
+                                 struct gpObject_s **sortedList, struct gpObject_s **lastObject) GP_NOTHROW
+{
+  gpObject_t *test;
+  gpObject_t *last;
+
+  (void)this_;
+
+  if ( !*unsortedList )
+  {
+    *unsortedList = *sortedList = object;
+  }
+  else
+  {
+    ( *lastObject )->next = object;   /* link after the sibling tail */
+
+    /* walk the alphabetically ordered list; insert before the first larger name */
+    test = *sortedList;
+    last = NULL;
+    while ( test )
+    {
+      if ( _stricmp( CGPObject_GetName( object ), CGPObject_GetName( test ) ) < 0 )
+        break;
+      last = test;
+      test = test->inOrderNext;
+    }
+
+    if ( test )
+    {
+      test->inOrderPrevious = object;
+      object->inOrderNext = test;
+    }
+    if ( last )
+    {
+      last->inOrderNext = object;
+      object->inOrderPrevious = last;
+    }
+    else
+    {
+      *sortedList = object;
+    }
+  }
+
+  *lastObject = object;
+}
+
+/* ---- CGPGroup__AddPair  0x004A24B0 ---- HIGH */
+gpValue_t *__stdcall CGPGroup__AddPair(const char *value, textPool_t **textPool, gpGroup_t *this_, const char *initName)
+{
+  gpGroup_t  *group = this_;
+  const char *name = initName;
+  gpValue_t  *pair;
+  gpValue_t  *result;
+
+  if ( textPool )
+  {
+    name = GP2_AllocText( textPool, initName, 1 );
+    if ( value )
+      value = GP2_AllocText( textPool, value, 1 );
+  }
+
+#ifdef __cplusplus
+  /* retail `new CGPValue(name, value)`: the constructor's AddValue runs in EH state 0 */
+  result = (gpValue_t *)new CGPValue( name, value );
+  (void)pair;
+#else
+  pair = (gpValue_t *)Z_MallocInternal( 0x14u );
+  if ( pair )
+  {
+    pair->base.name = name;
+    pair->base.next = NULL;
+    pair->base.inOrderNext = NULL;
+    pair->base.inOrderPrevious = NULL;
+    pair->list = NULL;
+    if ( value )
+      CGPValue__AddValue( NULL, value, pair );
+    result = pair;
+  }
+  else
+  {
+    result = NULL;
+  }
+#endif
+
+  CGP_InsertInOrder( this_, &result->base, (gpObject_t **)&group->pairs,
+                     (gpObject_t **)&group->pairsInOrder, (gpObject_t **)&group->currentPair );
+  return result;
+}
+
+/* ---- CGPGroup__AddPairObject  0x004A2560 ---- HIGH */
+void __cdecl CGPGroup__AddPairObject(gpGroup_t *this_, gpValue_t *pair)
+{
+  gpGroup_t *group = this_;
+
+  CGP_InsertInOrder( this_, &pair->base, (gpObject_t **)&group->pairs,
+                     (gpObject_t **)&group->pairsInOrder, (gpObject_t **)&group->currentPair );
+}
+
+/* ---- CGPGroup__AddGroup  0x004A2580 ---- HIGH */
+gpGroup_t *__stdcall CGPGroup__AddGroup(const char *initName, textPool_t **textPool, gpGroup_t *this_)
+{
+  gpGroup_t  *parent = this_;
+  const char *name = initName;
+  gpGroup_t  *group;
+  gpGroup_t  *result;
+
+  if ( textPool )
+    name = GP2_AllocText( textPool, initName, 1 );
+
+  group = (gpGroup_t *)Z_MallocInternal( 0x30u );
+  if ( group )
+  {
+    group->base.name = name;
+    group->base.next = NULL;
+    group->base.inOrderNext = NULL;
+    group->base.inOrderPrevious = NULL;
+    group->pairs = NULL;
+    group->pairsInOrder = NULL;
+    group->currentPair = NULL;
+    group->subGroups = NULL;
+    group->subGroupsInOrder = NULL;
+    group->currentSubGroup = NULL;
+    group->parent = NULL;
+    group->writeable = 0;
+    result = group;
+  }
+  else
+  {
+    result = NULL;
+  }
+
+  CGP_InsertInOrder( this_, &result->base, (gpObject_t **)&parent->subGroups,
+                     (gpObject_t **)&parent->subGroupsInOrder, (gpObject_t **)&parent->currentSubGroup );
+  return result;
+}
+
+/* ---- CGPGroup__AddGroupObject  0x004A25F0 ---- HIGH */
+void __cdecl CGPGroup__AddGroupObject(gpGroup_t *this_, gpGroup_t *subGroup)
+{
+  gpGroup_t *group = this_;
+
+  CGP_InsertInOrder( this_, &subGroup->base, (gpObject_t **)&group->subGroups,
+                     (gpObject_t **)&group->subGroupsInOrder, (gpObject_t **)&group->currentSubGroup );
+}
+
+/* ---- CGPGroup__FindSubGroup  0x004A2610 ---- HIGH */
+gpGroup_t *__cdecl CGPGroup__FindSubGroup(gpGroup_t *this_, const char *name)
+{
+  gpGroup_t *sub = this_->subGroups;
+
+  while ( sub )
+  {
+    if ( !_stricmp( name, CGPObject_GetName( &sub->base ) ) )
+      return sub;
+    sub = (gpGroup_t *)sub->base.next;
+  }
+  return NULL;
+}
+
+/* ---- CGPGroup__Parse  0x004A2640 ---- CONFIRMED */
+char __fastcall CGPGroup__Parse(gpGroup_t *receiver, GpPointerArgument dataReference, GpPointerArgument poolReference)
+{
+  gpGroup_t *group = receiver;
+  char **dataPtr = (char**)dataReference.value;
+  textPool_t **textPool = (textPool_t **)poolReference.value;
+  gpGroup_t *sub;
+  gpValue_t *pair;
+  char      *token;
+  char      *next;
+  char       key[1024];
+
+  for (;;) {
+    token = GP2_GetToken(1,0,dataPtr);
+    if (!*token) {
+      /* end of data: an error inside a nested group */
+      if (group->parent) return 0;
+      break;
+    } else if (!_stricmp(token,"}")) {
+      break;
+    }
+    strcpy(key,token);
+    next = GP2_GetToken(1,1,dataPtr);
+    if (!_stricmp(next,"{")) {
+      sub=CGPGroup__AddGroup(key,textPool,group);
+      sub->writeable=group->writeable;
+      if (!CGPGroup__Parse(sub,dataReference,poolReference)) return 0;
+    } else if (!_stricmp(next,"[")) {
+      pair=CGPGroup__AddPair(NULL,textPool,group,key);
+      if (!CGPValue__Parse(textPool,pair,dataPtr)) return 0;
+    } else CGPGroup__AddPair(next,textPool,group,key);
+  }
+  return 1;
+}
+
+/* ---- CGPGroup::Write  0x004A2790 ---- CONFIRMED */
+char CGPGroup::Write(textPool_t **poolReference, int depthReference)
+{
+  gpGroup_t *group = this;
+  textPool_t **textPool = poolReference;
+  int startDepth = depthReference;
+  gpValue_t  *pair;
+  gpGroup_t  *sub;
+  const char *name;
+  const char *writeStr;
+  int         depth = startDepth;
+  int         i;
+
+  pair = group->pairs;
+  sub  = group->subGroups;
+
+  
+  if ( startDepth >= 0 )
+  {
+    for ( i = startDepth; i > 0; i-- )
+      GP2_AllocText( textPool, "\t", 0 );
+
+    name = group->base.name;
+    if (strchr(name,32) || !*name) {
+      GP2_AllocText( textPool, "\"", 0 );
+      GP2_AllocText( textPool, name, 0 );
+      GP2_AllocText( textPool, "\"", 0 );
+    } else GP2_AllocText( textPool, name, 0 );
+    GP2_AllocText( textPool, "\r\n", 0 );
+
+    for ( i = startDepth; i > 0; i-- )
+      GP2_AllocText( textPool, "\t", 0 );
+    GP2_AllocText( textPool, "{\r\n", 0 );
+    depth = startDepth;
+  }
+
+  if ( pair )
+  {
     do
     {
-      CGPValue__Write((int)v7, a2, v10);
-      v7 = (const char *)*((_DWORD *)v7 + 1);
+      CGPValue__Write( pair, textPool, depth + 1 );
+      pair = (gpValue_t *)pair->base.next;
     }
-    while ( v7 );
-    v3 = a3;
+    while ( pair );
+    depth = startDepth;
   }
-  if ( v6 )
+
+  if ( sub )
   {
-    v11 = v3 + 1;
     do
     {
-      CGPGroup__Write((const char **)v6, a2, v11);
-      v6 = (char *)*((_DWORD *)v6 + 1);
+      ((CGPGroup *)sub)->Write( poolReference, depth + 1 );
+      sub = (gpGroup_t *)sub->base.next;
     }
-    while ( v6 );
-    v3 = a3;
+    while ( sub );
+    depth = startDepth;
   }
-  if ( v3 >= 0 )
+
+  if ( depth >= 0 )
   {
-    if ( v3 > 0 )
-    {
-      v12 = v3;
-      do
-      {
-        CTextPool__AllocText(*a2, "\t", 0, (int)a2);
-        --v12;
-      }
-      while ( v12 );
-    }
-    CTextPool__AllocText(*a2, "}\r\n", 0, (int)a2);
+    for ( i = depth; i > 0; i-- )
+      GP2_AllocText( textPool, "\t", 0 );
+    GP2_AllocText( textPool, "}\r\n", 0 );
   }
   return 1;
 }
 
 /* ---- CGPGroup__FindPair  0x004A28C0 ---- HIGH */
-int __cdecl CGPGroup__FindPair(int a1, const char *a2)
+gpValue_t *__cdecl CGPGroup__FindPair(gpGroup_t *this_, const char *key)
 {
-  int v2;
-
-  v2 = *(_DWORD *)(a1 + 16);
-  if ( !v2 )
-    return 0;
-  while ( _stricmp(*(const char **)v2, a2) )
-  {
-    v2 = *(_DWORD *)(v2 + 4);
-    if ( !v2 )
-      return 0;
-  }
-  return v2;
+ gpValue_t *pair;
+ for (pair=this_->pairs; pair; pair=(gpValue_t *)pair->base.next) {
+  if (!_stricmp(CGPObject_GetName( &pair->base ),key)) { return pair; }
+ }
+ return NULL;
 }
 
 /* ---- CGPGroup__FindPairValue  0x004A28F0 ---- HIGH */
-int __cdecl CGPGroup__FindPairValue(int a1, const char *a2, int a3)
+const char *__stdcall CGPGroup__FindPairValue(gpGroup_t *this_, const char *key, const char *defaultVal)
 {
-  int v3;
-  int v5;
-
-  v3 = *(_DWORD *)(a1 + 16);
-  if ( !v3 )
-    return a3;
-  while ( _stricmp(*(const char **)v3, a2) )
-  {
-    v3 = *(_DWORD *)(v3 + 4);
-    if ( !v3 )
-      return a3;
-  }
-  v5 = *(_DWORD *)(v3 + 16);
-  if ( v5 )
-    return *(_DWORD *)v5;
-  else
-    return 0;
+ gpValue_t *pair=this_->pairs;
+ for (;;) {
+  if (!pair) return defaultVal;
+  if (!_stricmp(CGPObject_GetName( &pair->base ),key)) break;
+  pair=(gpValue_t *)pair->base.next;
+ }
+ if (pair->list) return pair->list->name;
+ return NULL;
 }
 
 /* ---- CGenericParser2__CGenericParser2  0x004A2930 ---- CONFIRMED */
-int __cdecl CGenericParser2__CGenericParser2(int result)
+genericParser2_t *__cdecl CGenericParser2__CGenericParser2(genericParser2_t *this_)
 {
-  *(_DWORD *)result = "Top Level";
-  *(_DWORD *)(result + 4) = 0;
-  *(_DWORD *)(result + 8) = 0;
-  *(_DWORD *)(result + 12) = 0;
-  *(_DWORD *)(result + 16) = 0;
-  *(_DWORD *)(result + 20) = 0;
-  *(_DWORD *)(result + 24) = 0;
-  *(_DWORD *)(result + 28) = 0;
-  *(_DWORD *)(result + 32) = 0;
-  *(_DWORD *)(result + 36) = 0;
-  *(_DWORD *)(result + 40) = 0;
-  *(_BYTE *)(result + 44) = 0;
-  *(_DWORD *)(result + 48) = 0;
-  *(_BYTE *)(result + 52) = 0;
-  return result;
+  genericParser2_t *self = this_;
+
+  self->topLevel.base.name = "Top Level";
+  self->topLevel.base.next = NULL;
+  self->topLevel.base.inOrderNext = NULL;
+  self->topLevel.base.inOrderPrevious = NULL;
+  self->topLevel.pairs = NULL;
+  self->topLevel.pairsInOrder = NULL;
+  self->topLevel.currentPair = NULL;
+  self->topLevel.subGroups = NULL;
+  self->topLevel.subGroupsInOrder = NULL;
+  self->topLevel.currentSubGroup = NULL;
+  self->topLevel.parent = NULL;
+  self->topLevel.writeable = 0;
+  self->textPool = NULL;
+  self->writeable = 0;
+  return this_;
 }
 
 /* ---- CGenericParser2__Clean  0x004A2960 ---- HIGH */
-int __cdecl CGenericParser2__Clean(int a1)
+#ifdef __cplusplus
+/* ~CGenericParser2 (this on the stack under LTCG): the body cleans the text
+ * pool, then the top-level CGPGroup member's destructor runs, so
+ * CleanTextPool sits in EH state 0 of an fs:0 frame (/EHs). */
+CGenericParser2::~CGenericParser2()
 {
-  CGenericParser2__CleanTextPool(a1);
-  return CGPGroup__Clean(a1);
+  CGenericParser2__CleanTextPool( (genericParser2_t *)this );
 }
+#else
+void __stdcall CGenericParser2__Clean(GpPointerArgument receiverReference)
+{
+  genericParser2_t *self=(genericParser2_t *)receiverReference.value;
+  CGenericParser2__CleanTextPool(self);
+  CGPGroup__Clean(&self->topLevel);
+}
+#endif
 
 /* ---- CGenericParser2__Parse  0x004A29B0 ---- HIGH */
-char __cdecl CGenericParser2__Parse(int a1, char **a2, int a3, char a4)
+char __stdcall CGenericParser2__Parse(genericParser2_t *this_, char **dataPtr, char cleanFirst, char writeable)
 {
-  int *v4;
-  int *v5;
-  char v6;
+  genericParser2_t *self = this_;
+  textPool_t       *poolArg;
 
-  if ( (_BYTE)a3 )
-    CGenericParser2__CleanTextPool(a1);
-  if ( !*(_DWORD *)(a1 + 48) )
-  {
-    v4 = Z_MallocInternal(0x10u);
-    v5 = v4;
-    if ( v4 )
-    {
-      v4[1] = 0;
-      v4[2] = 10240;
-      v4[3] = 0;
-      *v4 = (int)Z_MallocInternal(0x2800u);
-    }
-    else
-    {
-      v5 = 0;
-    }
-    *(_DWORD *)(a1 + 48) = v5;
-  }
-  v6 = a4;
-  *(_BYTE *)(a1 + 52) = a4;
-  *(_BYTE *)(a1 + 44) = v6;
-  a3 = *(_DWORD *)(a1 + 48);
-  return CGPGroup__Parse((_BYTE *)a1, a2, (int **)&a3);
+  if ( (char)cleanFirst )
+    CGenericParser2__CleanTextPool( self );
+
+  if ( !self->textPool )
+    self->textPool = new CTextPool;   /* `new CTextPool`: operator delete runs if the constructor throws */
+
+  self->writeable = writeable;
+  self->topLevel.writeable = writeable;
+  poolArg = self->textPool;
+  { GpPointerArgument dataArg = { dataPtr };
+    GpPointerArgument poolArgRef = { &poolArg };
+    return CGPGroup__Parse(&self->topLevel, dataArg, poolArgRef); }
 }
 
 /* ---- CGenericParser2__CleanTextPool  0x004A2A60 ---- HIGH */
-void __cdecl CGenericParser2__CleanTextPool(int this_)
+void __cdecl CGenericParser2__CleanTextPool(genericParser2_t *this_)
 {
-  int pool;
-  int next;
+  genericParser2_t *self = this_;
+  textPool_t       *pool;
+  textPool_t       *next;
 
-  CGPGroup__Clean( this_ );
+  CGPGroup__Clean( &this_->topLevel );
 
-  pool = *(_DWORD *)( this_ + 48 );
+  pool = self->textPool;
   if ( pool )
   {
     do
     {
-      next = *(_DWORD *)( pool + 4 );
-      free( *(void **)pool );
-      free( (void *)pool );
+      next = pool->next;
+      free( pool->base );
+      free( pool );
       pool = next;
     }
     while ( next );
   }
-  *(_DWORD *)( this_ + 48 ) = 0;
+  self->textPool = NULL;
 }
 
 /* ---- CGenericParser2__Write  0x004A2AA0 ---- HIGH */
-char __cdecl CGenericParser2__Write(int a1, int *a2)
+char __stdcall CGenericParser2__Write(genericParser2_t *this_, textPool_t *textPool)
 {
-  int v2;
-  int i;
+  genericParser2_t *self = this_;
 
-  v2 = *(_DWORD *)(a1 + 28);
-  for ( i = *(_DWORD *)(a1 + 16); i; i = *(_DWORD *)(i + 4) )
-    CGPValue__Write(i, &a2, 0);
-  for ( ; v2; v2 = *(_DWORD *)(v2 + 4) )
-    CGPGroup__Write((const char **)v2, &a2, 0);
-  return 1;
+  return ((CGPGroup *)&self->topLevel)->Write( &textPool, -1 );   /* mTopLevel.Write(&textPool, -1) */
 }
 
 /* ---- adler32  0x004A2AF0 ---- VERIFIED */
-int __cdecl adler32(unsigned int a1, unsigned __int8 *a2, unsigned int a3)
+int __cdecl adler32(unsigned int adler, unsigned char *buf, unsigned int len)
 {
-  unsigned __int8 *v3;
-  unsigned int v4;
-  unsigned int v5;
-  unsigned int i;
-  int v8;
-  unsigned int v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  int v20;
-  int v21;
-  int v22;
-  int v23;
-  int v24;
-  int v25;
-  int v26;
-  int v27;
-  int v28;
-  int v29;
-  int v30;
-  int v31;
-  int v32;
-  int v33;
-  int v34;
-  int v35;
-  int v36;
-  int v37;
-  int v38;
-  int v39;
-
-  v3 = a2;
-  v4 = (unsigned __int16)a1;
-  v5 = HIWORD(a1);
-  if ( !a2 )
-    return 1;
-  for ( i = a3; i; v5 %= 0xFFF1u )
-  {
-    v8 = i;
-    if ( i >= 0x15B0 )
-      v8 = 5552;
-    i -= v8;
-    if ( v8 >= 16 )
-    {
-      v9 = (unsigned int)v8 >> 4;
-      v8 += -16 * ((unsigned int)v8 >> 4);
-      do
-      {
-        v10 = *v3 + v4;
-        v11 = v10 + v5;
-        v12 = v3[1] + v10;
-        v13 = v12 + v11;
-        v14 = v3[2] + v12;
-        v15 = v14 + v13;
-        v16 = v3[3] + v14;
-        v17 = v16 + v15;
-        v18 = v3[4] + v16;
-        v19 = v18 + v17;
-        v20 = v3[5] + v18;
-        v21 = v20 + v19;
-        v22 = v3[6] + v20;
-        v23 = v22 + v21;
-        v24 = v3[7] + v22;
-        v25 = v24 + v23;
-        v26 = v3[8] + v24;
-        v27 = v26 + v25;
-        v28 = v3[9] + v26;
-        v29 = v28 + v27;
-        v30 = v3[10] + v28;
-        v31 = v30 + v29;
-        v32 = v3[11] + v30;
-        v33 = v32 + v31;
-        v34 = v3[12] + v32;
-        v35 = v34 + v33;
-        v36 = v3[13] + v34;
-        v37 = v36 + v35;
-        v38 = v3[14] + v36;
-        v39 = v38 + v37;
-        v4 = v3[15] + v38;
-        v5 = v4 + v39;
-        v3 += 16;
-        --v9;
-      }
-      while ( v9 );
-    }
-    for ( ; v8; --v8 )
-    {
-      v4 += *v3++;
-      v5 += v4;
-    }
-    v4 %= 0xFFF1u;
-  }
-  return v4 | (v5 << 16);
+ unsigned int s1=adler&0xffffu,s2=adler>>16;int count;if(!buf)return 1;
+while(len>0){count=(len<5552u)?(int)len:5552; len-=count; while(count>=16){s1 += buf[0]; s2 += s1;
+s1 += buf[1]; s2 += s1;
+s1 += buf[2]; s2 += s1;
+s1 += buf[3]; s2 += s1;
+s1 += buf[4]; s2 += s1;
+s1 += buf[5]; s2 += s1;
+s1 += buf[6]; s2 += s1;
+s1 += buf[7]; s2 += s1;
+s1 += buf[8]; s2 += s1;
+s1 += buf[9]; s2 += s1;
+s1 += buf[10]; s2 += s1;
+s1 += buf[11]; s2 += s1;
+s1 += buf[12]; s2 += s1;
+s1 += buf[13]; s2 += s1;
+s1 += buf[14]; s2 += s1;
+s1 += buf[15]; s2 += s1;
+ buf += 16; count-=16;} if(count!=0)do{s1+=*buf++;s2+=s1;}while(--count);s1%=65521u;s2%=65521u;}
+return s1|(s2<<16);
 }
 
 /* ---- compress2  0x004A2C20 ---- VERIFIED */
-unsigned int __cdecl compress2(int a1, int a2, int a3, int *a4, unsigned int a5)
+unsigned int __cdecl compress2(int source, int dest, int sourceLen, int *destLen, unsigned int level)
 {
-  int v5;
+  z_stream     stream;
   unsigned int result;
-  int v7;
-  _DWORD v8[14];
+  int          ret;
 
-  v8[0] = a1;
-  v5 = *a4;
-  v8[1] = a3;
-  v8[3] = a2;
-  v8[4] = v5;
-  memset(&v8[8], 0, 12);
-  result = deflateInit2_("1.1.4", v8, 15, a5, 8, 8, 0, 56);
-  if ( !result )
-  {
-    v7 = deflate((int)v8, 4u);
-    if ( v7 == 1 )
-    {
-      *a4 = v8[5];
-      return deflateEnd((int)v8);
-    }
-    else
-    {
-      deflateEnd((int)v8);
-      result = -5;
-      if ( v7 )
-        return v7;
-    }
-  }
-  return result;
+  stream.next_in   = (Byte *)source;
+  stream.avail_in  = (uInt)sourceLen;
+  stream.next_out  = (Byte *)dest;
+  stream.avail_out = (uInt)*destLen;
+  stream.zalloc = NULL; stream.zfree = NULL; stream.opaque = NULL;
+
+  result = deflateInit2_( &stream, level, Z_DEFLATED, 15, 8, 0, "1.1.4", sizeof( z_stream ) );   /* deflateInit(&stream, level) */
+  if ( result ) return result;
+  ret = deflate( &stream, Z_FINISH );
+  if ( ret != Z_STREAM_END ) { deflateEnd( &stream ); return ret == Z_OK ? Z_BUF_ERROR : ret; }
+  *destLen = stream.total_out;
+  return deflateEnd( &stream );
 }
 
 /* ---- compress  0x004A2CC0 ---- CONFIRMED */
-unsigned int __cdecl compress(int *a1, int a2, int a3, int a4)
+unsigned int __cdecl compress(int *destLen, int dest, int sourceLen, int source)
 {
-  return compress2(a4, a2, a3, a1, 0xFFFFFFFF);
+  return compress2(source, dest, sourceLen, destLen, 0xFFFFFFFF);
 }
 
 /* ---- get_crc_table  0x004A2CD0 ---- CONFIRMED */
 int *get_crc_table()
 {
-  return dword_5413D0;
+  return (int *)crc_table;
 }
 
 /* ---- crc32  0x004A2CE0 ---- VERIFIED */
-int __cdecl crc32(int crc, unsigned int len, _BYTE *buf)
+/* zlib 1.1.4 crc32.c (the caller-visible argument order is the tree's). */
+#define CRC_DO1(buf) c = crc_table[((int)c ^ (*buf++)) & 0xff] ^ (c >> 8);
+#define CRC_DO2(buf) CRC_DO1(buf); CRC_DO1(buf);
+#define CRC_DO4(buf) CRC_DO2(buf); CRC_DO2(buf);
+#define CRC_DO8(buf) CRC_DO4(buf); CRC_DO4(buf);
+int __cdecl crc32(int crc, const unsigned char *buf, unsigned int len)
 {
-  unsigned int c;
+    unsigned int c;
 
-  if ( !buf )
-    return 0;
-
-  zlib_BuildTables();
-
-  c = ~(unsigned int)crc;
-  while ( len-- )
-    c = zlib_crcTable[(unsigned __int8)(c ^ *buf++)] ^ (c >> 8);
-
-  return (int)~c;
+    if (buf == NULL) return 0;
+    c = (unsigned int)crc ^ 0xffffffffUL;
+    while (len >= 8)
+    {
+      CRC_DO8(buf);
+      len -= 8;
+    }
+    if (len) do {
+      CRC_DO1(buf);
+    } while (--len);
+    return (int)(c ^ 0xffffffffUL);
 }
 
 /* ---- deflateInit_  0x004A2E00 ---- VERIFIED */
-int __cdecl deflateInit_(int a1, _DWORD *a2, unsigned int a3, _BYTE *a4)
+int __cdecl deflateInit_(int stream_size, z_streamp strm, unsigned int level, const char *version)
 {
-  return deflateInit2_(a4, a2, 15, a3, 8, 8, 0, a1);
+  return deflateInit2_(strm, level, Z_DEFLATED, 15, 8, 0, version, stream_size);
 }
+
+/* deflate.c: `static const char* my_version = ZLIB_VERSION;` (retail 0x00572D58) */
+static const char *my_version = "1.1.4";
 
 /* ---- deflateInit2_  0x004A2E20 ---- CONFIRMED */
 int __cdecl deflateInit2_(
-        _BYTE *a1,
-        _DWORD *a2,
-        int a3,
-        unsigned int a4,
-        int a5,
-        int a6,
-        unsigned int a7,
-        int a8)
+        z_streamp strm,
+        int level,
+        int method,
+        int windowBits,
+        int memLevel,
+        int strategy,
+        const char *version,
+        int stream_size)
 {
-  int v9;
-  bool v11;
-  unsigned int v12;
-  _DWORD *v13;
-  _DWORD *v14;
-  int v15;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  unsigned int v20;
-  int v21;
-  _DWORD *v23;
-  bool v24;
-  int v27;
+  deflate_state *s;
+  int            noheader = 0;
+  ush           *overlay;
 
-  zlib_BuildTables();
-  v9 = 0;
-  if ( !a1 || *a1 != '1' || a8 != 56 )
-    return -6;
-  if ( !a2 )
-    return -2;
-  v11 = a2[8] == 0;
-  a2[6] = 0;
-  if ( v11 )
+  if ( version == NULL || version[0] != my_version[0] || stream_size != sizeof( z_stream ) )
+    return -6;                     /* Z_VERSION_ERROR */
+  if ( strm == NULL )
+    return Z_STREAM_ERROR;
+
+  strm->msg = NULL;
+  if ( !strm->zalloc )
   {
-    a2[8] = (int)zcalloc;
-    a2[10] = 0;
+    strm->zalloc = (alloc_func)zcalloc;
+    strm->opaque = NULL;
   }
-  if ( !a2[9] )
-    a2[9] = (int)zcfree;
-  v12 = a4;
-  if ( a4 == -1 )
+  if ( !strm->zfree )
+    strm->zfree = (free_func)zcfree;
+
+  if ( level == Z_DEFAULT_COMPRESSION )
+    level = 6;
+
+  if ( windowBits < 0 )            /* undocumented feature: suppress zlib header */
   {
-    a4 = 6;
-    v12 = 6;
+    noheader = 1;
+    windowBits = -windowBits;
   }
-  if ( a3 < 0 )
+  if ( memLevel < 1 || memLevel > 9 || method != Z_DEFLATED ||
+       windowBits < 9 || windowBits > 15 || level < 0 || level > 9 ||
+       strategy < 0 || strategy > Z_HUFFMAN_ONLY )
+    return Z_STREAM_ERROR;
+
+  s = (deflate_state *)ZALLOC( strm, 1, sizeof( deflate_state ) );
+  if ( s == NULL )
+    return Z_MEM_ERROR;
+  strm->state = s;
+  s->strm = strm;
+
+  s->noheader = noheader;
+  s->w_bits = windowBits;
+  s->w_size = 1 << s->w_bits;
+  s->w_mask = s->w_size - 1;
+
+  s->hash_bits = memLevel + 7;
+  s->hash_size = 1 << s->hash_bits;
+  s->hash_mask = s->hash_size - 1;
+  s->hash_shift = ( s->hash_bits + MIN_MATCH - 1 ) / MIN_MATCH;
+
+  s->window = (Byte *)ZALLOC( strm, s->w_size, 2 * sizeof( Byte ) );
+  s->prev   = (Pos *)ZALLOC( strm, s->w_size, sizeof( Pos ) );
+  s->head   = (Pos *)ZALLOC( strm, s->hash_size, sizeof( Pos ) );
+
+  s->lit_bufsize = 1 << ( memLevel + 6 );   /* 16K elements by default */
+
+  overlay = (ush *)ZALLOC( strm, s->lit_bufsize, sizeof( ush ) + 2 );
+  s->pending_buf = (uch *)overlay;
+  s->pending_buf_size = (ulg)s->lit_bufsize * ( sizeof( ush ) + 2L );
+
+  if ( s->window == NULL || s->prev == NULL || s->head == NULL || s->pending_buf == NULL )
   {
-    v9 = 1;
-    a3 = -a3;
+    strm->msg = ERR_MSG( Z_MEM_ERROR );
+    deflateEnd( strm );
+    return Z_MEM_ERROR;
   }
-  if ( a6 < 1 || a6 > 9 || a5 != 8 || a3 < 9 || a3 > 15 || v12 > 9 || a7 > 2 )
-    return -2;
-  v13 = (_DWORD *)((int (__cdecl *)(_DWORD, int, int))a2[8])(a2[10], 1, 5816);
-  v14 = v13;
-  if ( !v13 )
-    return -4;
-  a2[7] = v13;
-  v13[6] = v9;
-  v13[10] = a3;
-  v13[11] = (1 << a3) - 1;
-  v13[18] = a6 + 7;
-  v13[17] = 1 << (a6 + 7);
-  v13[19] = (1 << (a6 + 7)) - 1;
-  *v13 = a2;
-  v13[9] = 1 << a3;
-  v13[20] = (a6 + 9) / 3u;
-  v15 = ((int (__cdecl *)(_DWORD, int, int))a2[8])(a2[10], 1 << a3, 2);
-  v16 = v14[9];
-  v14[12] = v15;
-  v17 = ((int (__cdecl *)(_DWORD, int, int))a2[8])(a2[10], v16, 2);
-  v18 = v14[17];
-  v14[14] = v17;
-  v14[15] = ((int (__cdecl *)(_DWORD, int, int))a2[8])(a2[10], v18, 2);
-  v27 = 1 << (a6 + 6);
-  v14[1445] = v27;
-  v19 = ((int (__cdecl *)(_DWORD, int, int))a2[8])(a2[10], v27, 4);
-  v20 = v14[1445];
-  v14[3] = 4 * v20;
-  v21 = v14[12];
-  v14[2] = v19;
-  if ( !v21 || !v14[14] || !v14[15] || !v19 )
-  {
-    a2[6] = "insufficient memory";
-    deflateEnd((int)a2);
-    return -4;
-  }
-  v14[1447] = v19 + 2 * (v20 >> 1);
-  v14[1444] = v19 + 2 * v20 + v20;
-  v14[31] = a4;
-  v14[32] = a7;
-  *((_BYTE *)v14 + 29) = 8;
-  v23 = (_DWORD *)a2[7];
-  if ( !v23 || !a2[8] || !a2[9] )
-    return -2;
-  a2[5] = 0;
-  a2[2] = 0;
-  a2[6] = 0;
-  a2[11] = 2;
-  v23[4] = v23[2];
-  v24 = (int)v23[6] < 0;
-  v23[5] = 0;
-  if ( v24 )
-    v23[6] = 0;
-  v23[1] = v23[6] != 0 ? 113 : 42;
-  a2[12] = 1;
-  v23[8] = 0;
-  _tr_init(0, (int)v23);
-  lm_init(0, (int)v23);
-  return 0;
+  s->d_buf = overlay + s->lit_bufsize / sizeof( ush );
+  s->l_buf = s->pending_buf + ( 1 + sizeof( ush ) ) * s->lit_bufsize;
+
+  s->level = level;
+  s->strategy = strategy;
+  s->method = (Byte)method;
+
+  return deflateReset( strm );
+}
+
+/* ---- deflateReset  0x004A3120 ---- */
+/* Missing from the retail function list: its body is the tail of the
+ * deflateInit2_ span (0x004A2E20..0x004A3188), after deflateSetDictionary. */
+int __cdecl deflateReset(z_streamp strm)
+{
+  deflate_state *s;
+
+  if ( strm == NULL || strm->state == NULL || !strm->zalloc || !strm->zfree )
+    return Z_STREAM_ERROR;
+
+  strm->total_in = strm->total_out = 0;
+  strm->msg = NULL;
+  strm->data_type = 2;             /* Z_UNKNOWN */
+
+  s = strm->state;
+  s->pending = 0;
+  s->pending_out = s->pending_buf;
+
+  if ( s->noheader < 0 )
+    s->noheader = 0;               /* was set to -1 by deflate(..., Z_FINISH) */
+  s->status = s->noheader ? BUSY_STATE : INIT_STATE;
+  strm->adler = 1;
+  s->last_flush = Z_NO_FLUSH;
+
+  _tr_init( s );
+  lm_init( s );
+  return Z_OK;
 }
 
 /* ---- deflateParams  0x004A3190 ---- CONFIRMED */
-int __cdecl deflateParams(int a1, unsigned int a2, unsigned int a3)
+/* zlib 1.1.4 deflate.c (LTCG inlines deflate() into it) */
+int __cdecl deflateParams( z_streamp strm, int level, int strategy )
 {
-  int result;
-  _DWORD *v4;
-  int v6;
-  int v7;
-  unsigned int v8;
-  unsigned int v9;
-  int v10;
-  char *v11;
-  int v12;
-  int v13;
-  int v14;
+	deflate_state *s;
+	int ( __cdecl *func )( deflate_state *s, int flush );
+	int err = Z_OK;
 
-  result = 0;
-  if ( !a1 )
-    return -2;
-  v4 = *(_DWORD **)(a1 + 28);
-  if ( !v4 )
-    return -2;
-  if ( a2 == -1 )
-  {
-    a2 = 6;
-  }
-  else if ( a2 > 9 )
-  {
-    return -2;
-  }
-  if ( a3 > 2 )
-    return -2;
-  if ( deflate_configuration_table[v4[31]].func == deflate_configuration_table[a2].func || !*(_DWORD *)(a1 + 8) )
-    goto LABEL_47;
-  if ( !*(_DWORD *)(a1 + 12) || !*(_DWORD *)a1 && *(_DWORD *)(a1 + 4) || (v6 = v4[1], v6 == 666) )
-  {
-    v11 = "stream error";
-    result = -2;
-    goto LABEL_46;
-  }
-  if ( *(_DWORD *)(a1 + 16) )
-  {
-    v7 = v4[8];
-    *v4 = a1;
-    v4[8] = 1;
-    if ( v6 == 42 )
-    {
-      v8 = (v4[31] - 1) >> 1;
-      if ( v8 > 3 )
-        v8 = 3;
-      v9 = (v8 << 6) | (((v4[10] - 8) << 12) + 2048);
-      if ( v4[25] )
-        v9 |= 0x20u;
-      v4[1] = 113;
-      putShortMSB((int)v4, v9 - v9 % 0x1F + 31);
-      if ( v4[25] )
-      {
-        v10 = putShortMSB((int)v4, *(_WORD *)(a1 + 50));
-        putShortMSB(v10, *(_DWORD *)(a1 + 48));
-      }
-      *(_DWORD *)(a1 + 48) = 1;
-    }
-    if ( v4[5] )
-    {
-      flush_pending(a1);
-      if ( !*(_DWORD *)(a1 + 16) )
-      {
-        v4[8] = -1;
-        result = 0;
-        goto LABEL_47;
-      }
-LABEL_29:
-      v12 = v4[1];
-      v13 = *(_DWORD *)(a1 + 4);
-      if ( v12 == 666 )
-      {
-        if ( v13 )
-        {
-          *(char **)(a1 + 24) = "buffer error";
-          result = -5;
-          goto LABEL_47;
-        }
-      }
-      else if ( v13 )
-      {
-        goto LABEL_35;
-      }
-      if ( !v4[27] && v12 == 666 )
-        goto LABEL_44;
-LABEL_35:
-      v14 = deflate_configuration_table[v4[31]].func((int)v4, 1);
-      if ( v14 == 2 || v14 == 3 )
-        v4[1] = 666;
-      if ( v14 && v14 != 2 )
-      {
-        if ( v14 != 1 )
-        {
-LABEL_44:
-          result = 0;
-          goto LABEL_47;
-        }
-        _tr_align((int)v4);
-        flush_pending(a1);
-      }
-      if ( !*(_DWORD *)(a1 + 16) )
-        v4[8] = -1;
-      goto LABEL_44;
-    }
-    if ( *(_DWORD *)(a1 + 4) || v7 < 1 )
-      goto LABEL_29;
-    v11 = "buffer error";
-    result = -5;
-LABEL_46:
-    *(_DWORD *)(a1 + 24) = v11;
-    goto LABEL_47;
-  }
-  *(char **)(a1 + 24) = "buffer error";
-  result = -5;
-LABEL_47:
-  if ( v4[31] != a2 )
-  {
-    v4[31] = a2;
-    v4[30] = deflate_configuration_table[a2].max_lazy;
-    v4[33] = deflate_configuration_table[a2].good_length;
-    v4[34] = deflate_configuration_table[a2].nice_length;
-    v4[29] = deflate_configuration_table[a2].max_chain;
-  }
-  v4[32] = a3;
-  return result;
+	if ( strm == NULL || strm->state == NULL ) return Z_STREAM_ERROR;
+	s = strm->state;
+
+	if ( level == Z_DEFAULT_COMPRESSION ) {
+		level = 6;
+	}
+	if ( level < 0 || level > 9 || strategy < 0 || strategy > Z_HUFFMAN_ONLY ) {
+		return Z_STREAM_ERROR;
+	}
+	func = deflate_configuration_table[s->level].func;
+
+	if ( func != deflate_configuration_table[level].func && strm->total_in != 0 ) {
+		/* Flush the last buffer: */
+		err = deflate( strm, Z_PARTIAL_FLUSH );
+	}
+	if ( s->level != level ) {
+		s->level = level;
+		s->max_lazy_match   = deflate_configuration_table[level].max_lazy;
+		s->good_match       = deflate_configuration_table[level].good_length;
+		s->nice_match       = deflate_configuration_table[level].nice_length;
+		s->max_chain_length = deflate_configuration_table[level].max_chain;
+	}
+	s->strategy = strategy;
+	return err;
 }
 
 /* ---- putShortMSB  0x004A3410 ---- CONFIRMED */
-int __cdecl putShortMSB(int result, __int16 a2)
+/* zlib 1.1.4 deflate.c: put_byte( s, c ) is s->pending_buf[s->pending++] = c */
+void __cdecl putShortMSB( deflate_state *s, uInt b )
 {
-  int v2;
-  int v3;
-
-  *(_BYTE *)(*(_DWORD *)(result + 8) + *(_DWORD *)(result + 20)) = HIBYTE(a2);
-  v2 = *(_DWORD *)(result + 8);
-  v3 = *(_DWORD *)(result + 20) + 1;
-  *(_DWORD *)(result + 20) = v3;
-  *(_BYTE *)(v3 + v2) = a2;
-  ++*(_DWORD *)(result + 20);
-  return result;
+	s->pending_buf[s->pending++] = (Byte)( b >> 8 );
+	s->pending_buf[s->pending++] = (Byte)( b & 0xff );
 }
 
 /* ---- flush_pending  0x004A3440 ---- CONFIRMED */
-int __cdecl flush_pending(int result)
+/* zlib 1.1.4 deflate.c */
+void __cdecl flush_pending( z_streamp strm )
 {
-  int v1;
-  unsigned int v2;
-  int v3;
-  int v4;
-  int v5;
+	unsigned len = strm->state->pending;
 
-  v1 = *(_DWORD *)(result + 28);
-  v2 = *(_DWORD *)(v1 + 20);
-  if ( v2 > *(_DWORD *)(result + 16) )
-    v2 = *(_DWORD *)(result + 16);
-  if ( v2 )
-  {
-    qmemcpy(*(void **)(result + 12), *(const void **)(v1 + 16), v2);
-    v3 = *(_DWORD *)(result + 28);
-    *(_DWORD *)(result + 12) += v2;
-    *(_DWORD *)(v3 + 16) += v2;
-    v4 = *(_DWORD *)(result + 16);
-    v5 = *(_DWORD *)(result + 28);
-    *(_DWORD *)(result + 20) += v2;
-    *(_DWORD *)(result + 16) = v4 - v2;
-    *(_DWORD *)(v5 + 20) -= v2;
-    result = *(_DWORD *)(result + 28);
-    if ( !*(_DWORD *)(result + 20) )
-      *(_DWORD *)(result + 16) = *(_DWORD *)(result + 8);
-  }
-  return result;
+	if ( len > strm->avail_out ) len = strm->avail_out;
+	if ( len == 0 ) return;
+
+	memcpy( strm->next_out, strm->state->pending_out, len );
+	strm->next_out  += len;
+	strm->state->pending_out  += len;
+	strm->total_out += len;
+	strm->avail_out  -= len;
+	strm->state->pending -= len;
+	if ( strm->state->pending == 0 ) {
+		strm->state->pending_out = strm->state->pending_buf;
+	}
 }
 
 /* ---- deflate  0x004A34B0 ---- CONFIRMED */
-int __cdecl deflate(int a1, int a2)
+/* zlib 1.1.4 deflate.c */
+int __cdecl deflate( z_streamp strm, int flush )
 {
-  int v2;
-  int v3;
-  signed int v4;
-  unsigned int v5;
-  unsigned int v6;
-  int v7;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  signed int v14;
+	int old_flush; /* value of flush param for previous deflate call */
+	deflate_state *s;
 
-  if ( !a1 )
-    return -2;
-  v2 = *(_DWORD *)(a1 + 28);
-  if ( !v2 || (unsigned int)a2 > 4 )
-    return -2;
-  if ( !*(_DWORD *)(a1 + 12)
-    || !*(_DWORD *)a1 && *(_DWORD *)(a1 + 4)
-    || (v3 = *(_DWORD *)(v2 + 4), v3 == 666) && a2 != 4 )
-  {
-    *(char **)(a1 + 24) = "stream error";
-    return -2;
-  }
-  if ( !*(_DWORD *)(a1 + 16) )
-  {
-LABEL_27:
-    *(char **)(a1 + 24) = "buffer error";
-    return -5;
-  }
-  v4 = *(_DWORD *)(v2 + 32);
-  *(_DWORD *)v2 = a1;
-  v14 = v4;
-  *(_DWORD *)(v2 + 32) = a2;
-  if ( v3 == 42 )
-  {
-    v5 = (*(_DWORD *)(v2 + 124) - 1) >> 1;
-    if ( v5 > 3 )
-      v5 = 3;
-    v6 = (v5 << 6) | (((*(_DWORD *)(v2 + 40) - 8) << 12) + 2048);
-    if ( *(_DWORD *)(v2 + 100) )
-      v6 |= 0x20u;
-    *(_DWORD *)(v2 + 4) = 113;
-    putShortMSB(v2, v6 - v6 % 0x1F + 31);
-    if ( *(_DWORD *)(v2 + 100) )
-    {
-      v7 = putShortMSB(v2, *(_WORD *)(a1 + 50));
-      putShortMSB(v7, *(_DWORD *)(a1 + 48));
-    }
-    *(_DWORD *)(a1 + 48) = 1;
-  }
-  if ( *(_DWORD *)(v2 + 20) )
-  {
-    flush_pending(a1);
-    if ( !*(_DWORD *)(a1 + 16) )
-    {
-      *(_DWORD *)(v2 + 32) = -1;
-      return 0;
-    }
-  }
-  else if ( !*(_DWORD *)(a1 + 4) && a2 <= v14 && a2 != 4 )
-  {
-    *(char **)(a1 + 24) = "buffer error";
-    return -5;
-  }
-  v9 = *(_DWORD *)(v2 + 4);
-  v10 = *(_DWORD *)(a1 + 4);
-  if ( v9 == 666 )
-  {
-    if ( v10 )
-      goto LABEL_27;
-  }
-  else if ( v10 )
-  {
-    goto LABEL_32;
-  }
-  if ( *(_DWORD *)(v2 + 108) || a2 && v9 != 666 )
-  {
-LABEL_32:
-    v11 = deflate_configuration_table[*(_DWORD *)(v2 + 124)].func(v2, a2);
-    if ( v11 == 2 || v11 == 3 )
-      *(_DWORD *)(v2 + 4) = 666;
-    if ( !v11 || v11 == 2 )
-    {
-      if ( *(_DWORD *)(a1 + 16) )
-        return 0;
-    }
-    else
-    {
-      if ( v11 != 1 )
-        goto LABEL_43;
-      if ( a2 == 1 )
-      {
-        _tr_align(v2);
-      }
-      else
-      {
-        _tr_stored_block(v2, 0, 0, 0);
-        if ( a2 == 3 )
-        {
-          *(_WORD *)(*(_DWORD *)(v2 + 60) + 2 * *(_DWORD *)(v2 + 68) - 2) = 0;
-          memset(*(void **)(v2 + 60), 0, 2 * *(_DWORD *)(v2 + 68) - 2);
-        }
-      }
-      flush_pending(a1);
-      if ( *(_DWORD *)(a1 + 16) )
-        goto LABEL_43;
-    }
-    *(_DWORD *)(v2 + 32) = -1;
-    return 0;
-  }
-LABEL_43:
-  if ( a2 != 4 )
-    return 0;
-  if ( *(_DWORD *)(v2 + 24) )
-    return 1;
-  v12 = putShortMSB(v2, *(_WORD *)(a1 + 50));
-  putShortMSB(v12, *(_DWORD *)(a1 + 48));
-  flush_pending(a1);
-  v13 = *(_DWORD *)(v2 + 20);
-  *(_DWORD *)(v2 + 24) = -1;
-  return v13 == 0;
+	if ( strm == NULL || strm->state == NULL ||
+		flush > Z_FINISH || flush < 0 ) {
+		return Z_STREAM_ERROR;
+	}
+	s = strm->state;
+
+	if ( strm->next_out == NULL ||
+		( strm->next_in == NULL && strm->avail_in != 0 ) ||
+		( s->status == FINISH_STATE && flush != Z_FINISH ) ) {
+		ERR_RETURN( strm, Z_STREAM_ERROR );
+	}
+	if ( strm->avail_out == 0 ) ERR_RETURN( strm, Z_BUF_ERROR );
+
+	s->strm = strm; /* just in case */
+	old_flush = s->last_flush;
+	s->last_flush = flush;
+
+	/* Write the zlib header */
+	if ( s->status == INIT_STATE ) {
+
+		uInt header = ( Z_DEFLATED + ( ( s->w_bits - 8 ) << 4 ) ) << 8;
+		uInt level_flags = ( s->level - 1 ) >> 1;
+
+		if ( level_flags > 3 ) level_flags = 3;
+		header |= ( level_flags << 6 );
+		if ( s->strstart != 0 ) header |= PRESET_DICT;
+		header += 31 - ( header % 31 );
+
+		s->status = BUSY_STATE;
+		putShortMSB( s, header );
+
+		/* Save the adler32 of the preset dictionary: */
+		if ( s->strstart != 0 ) {
+			putShortMSB( s, (uInt)( strm->adler >> 16 ) );
+			putShortMSB( s, (uInt)( strm->adler & 0xffff ) );
+		}
+		strm->adler = 1L;
+	}
+
+	/* Flush as much pending output as possible */
+	if ( s->pending != 0 ) {
+		flush_pending( strm );
+		if ( strm->avail_out == 0 ) {
+			/* Since avail_out is 0, deflate will be called again with
+			 * more output space, but possibly with both pending and
+			 * avail_in equal to zero. There won't be anything to do,
+			 * but this is not an error situation so make sure we
+			 * return OK instead of BUF_ERROR at next call of deflate: */
+			s->last_flush = -1;
+			return Z_OK;
+		}
+
+	/* Make sure there is something to do and avoid duplicate consecutive
+	 * flushes. For repeated and useless calls with Z_FINISH, we keep
+	 * returning Z_STREAM_END instead of Z_BUFF_ERROR. */
+	} else if ( strm->avail_in == 0 && flush <= old_flush &&
+		flush != Z_FINISH ) {
+		ERR_RETURN( strm, Z_BUF_ERROR );
+	}
+
+	/* User must not provide more input after the first FINISH: */
+	if ( s->status == FINISH_STATE && strm->avail_in != 0 ) {
+		ERR_RETURN( strm, Z_BUF_ERROR );
+	}
+
+	/* Start a new block or continue the current one. */
+	if ( strm->avail_in != 0 || s->lookahead != 0 ||
+		( flush != Z_NO_FLUSH && s->status != FINISH_STATE ) ) {
+		int bstate;
+
+		bstate = ( *( deflate_configuration_table[s->level].func ) )( s, flush );
+
+		if ( bstate == finish_started || bstate == finish_done ) {
+			s->status = FINISH_STATE;
+		}
+		if ( bstate == need_more || bstate == finish_started ) {
+			if ( strm->avail_out == 0 ) {
+				s->last_flush = -1; /* avoid BUF_ERROR next call, see above */
+			}
+			return Z_OK;
+		}
+		if ( bstate == block_done ) {
+			if ( flush == Z_PARTIAL_FLUSH ) {
+				_tr_align( s );
+			} else { /* FULL_FLUSH or SYNC_FLUSH */
+				_tr_stored_block( s, 0, (char *)0, 0 );
+				/* For a full flush, this empty block will be recognized
+				 * as a special marker by inflate_sync(). */
+				if ( flush == Z_FULL_FLUSH ) {
+					CLEAR_HASH( s );             /* forget history */
+				}
+			}
+			flush_pending( strm );
+			if ( strm->avail_out == 0 ) {
+				s->last_flush = -1; /* avoid BUF_ERROR at next call, see above */
+				return Z_OK;
+			}
+		}
+	}
+
+	if ( flush != Z_FINISH ) return Z_OK;
+	if ( s->noheader ) return Z_STREAM_END;
+
+	/* Write the zlib trailer (adler32) */
+	putShortMSB( s, (uInt)( strm->adler >> 16 ) );
+	putShortMSB( s, (uInt)( strm->adler & 0xffff ) );
+	flush_pending( strm );
+	/* If avail_out is zero, the application will call deflate again
+	 * to flush the rest. */
+	s->noheader = -1; /* write the trailer only once! */
+	return s->pending != 0 ? Z_OK : Z_STREAM_END;
 }
 
 /* ---- deflateEnd  0x004A3730 ---- CONFIRMED */
-unsigned int __cdecl deflateEnd(int a1)
+/* zlib 1.1.4 deflate.c */
+int __cdecl deflateEnd( z_streamp strm )
 {
-  int v1;
-  int v2;
-  int v3;
-  int v4;
-  int v5;
+	int status;
 
-  if ( !a1 )
-    return -2;
-  v1 = *(_DWORD *)(a1 + 28);
-  if ( !v1 )
-    return -2;
-  v2 = *(_DWORD *)(v1 + 4);
-  if ( v2 != 42 && v2 != 113 && v2 != 666 )
-    return -2;
-  v3 = *(_DWORD *)(v1 + 8);
-  if ( v3 )
-    (*(void (__cdecl **)(_DWORD, int))(a1 + 36))(*(_DWORD *)(a1 + 40), v3);
-  v4 = *(_DWORD *)(a1 + 28);
-  if ( *(_DWORD *)(v4 + 60) )
-    (*(void (__cdecl **)(_DWORD, _DWORD))(a1 + 36))(*(_DWORD *)(a1 + 40), *(_DWORD *)(v4 + 60));
-  if ( *(_DWORD *)(*(_DWORD *)(a1 + 28) + 56) )
-    (*(void (__cdecl **)(_DWORD, _DWORD))(a1 + 36))(*(_DWORD *)(a1 + 40), *(_DWORD *)(*(_DWORD *)(a1 + 28) + 56));
-  v5 = *(_DWORD *)(a1 + 28);
-  if ( *(_DWORD *)(v5 + 48) )
-    (*(void (__cdecl **)(_DWORD, _DWORD))(a1 + 36))(*(_DWORD *)(a1 + 40), *(_DWORD *)(v5 + 48));
-  (*(void (__cdecl **)(_DWORD, _DWORD))(a1 + 36))(*(_DWORD *)(a1 + 40), *(_DWORD *)(a1 + 28));
-  *(_DWORD *)(a1 + 28) = 0;
-  return v2 != 113 ? 0 : 0xFFFFFFFD;
+	if ( strm == NULL || strm->state == NULL ) return Z_STREAM_ERROR;
+
+	status = strm->state->status;
+	if ( status != INIT_STATE && status != BUSY_STATE &&
+		status != FINISH_STATE ) {
+		return Z_STREAM_ERROR;
+	}
+
+	/* Deallocate in reverse order of allocations: */
+	TRY_FREE( strm, strm->state->pending_buf );
+	TRY_FREE( strm, strm->state->head );
+	TRY_FREE( strm, strm->state->prev );
+	TRY_FREE( strm, strm->state->window );
+
+	ZFREE( strm, strm->state );
+	strm->state = NULL;
+
+	return status == BUSY_STATE ? Z_DATA_ERROR : Z_OK;
 }
 
 /* ---- deflateCopy  0x004A37E0 ---- CONFIRMED */
-int __cdecl deflateCopy(_DWORD *a1, int a2)
+/* zlib 1.1.4 deflate.c */
+int __cdecl deflateCopy( z_streamp dest, z_streamp source )
 {
-  _DWORD *v2;
-  _DWORD *v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  void *v10;
-  int v11;
-  int v12;
-  int v14;
+	deflate_state *ds;
+	deflate_state *ss;
+	ush *overlay;
 
-  if ( !a1 )
-    return -2;
-  if ( !a2 )
-    return -2;
-  v14 = a1[7];
-  if ( !v14 )
-    return -2;
-  qmemcpy((void *)a2, a1, 0x38u);
-  v2 = (_DWORD *)(*(int (__cdecl **)(_DWORD, int, int))(a2 + 32))(*(_DWORD *)(a2 + 40), 1, 5816);
-  v3 = v2;
-  if ( v2 )
-  {
-    *(_DWORD *)(a2 + 28) = v2;
-    qmemcpy(v2, (const void *)v14, 0x16B8u);
-    v4 = v2[9];
-    *v2 = a2;
-    v2[12] = (*(int (__cdecl **)(_DWORD, int, int))(a2 + 32))(*(_DWORD *)(a2 + 40), v4, 2);
-    v5 = (*(int (__cdecl **)(_DWORD, _DWORD, int))(a2 + 32))(*(_DWORD *)(a2 + 40), v3[9], 2);
-    v6 = v3[17];
-    v3[14] = v5;
-    v7 = (*(int (__cdecl **)(_DWORD, int, int))(a2 + 32))(*(_DWORD *)(a2 + 40), v6, 2);
-    v8 = v3[1445];
-    v3[15] = v7;
-    v9 = (*(int (__cdecl **)(_DWORD, int, int))(a2 + 32))(*(_DWORD *)(a2 + 40), v8, 4);
-    v10 = (void *)v3[12];
-    v3[2] = v9;
-    if ( v10 && v3[14] && v3[15] && v9 )
-    {
-      qmemcpy(v10, *(const void **)(v14 + 48), 2 * v3[9]);
-      qmemcpy((void *)v3[14], *(const void **)(v14 + 56), 2 * v3[9]);
-      qmemcpy((void *)v3[15], *(const void **)(v14 + 60), 2 * v3[17]);
-      qmemcpy((void *)v3[2], *(const void **)(v14 + 8), v3[3]);
-      v11 = v3[2];
-      v3[4] = v11 + *(_DWORD *)(v14 + 16) - *(_DWORD *)(v14 + 8);
-      v12 = v11 + 2 * v3[1445] + v3[1445];
-      v3[1447] = v9 + 2 * (v3[1445] >> 1);
-      v3[1444] = v12;
-      v3[708] = v3 + 35;
-      v3[711] = v3 + 608;
-      v3[714] = v3 + 669;
-      return 0;
-    }
-    deflateEnd(a2);
-  }
-  return -4;
+	if ( source == NULL || dest == NULL || source->state == NULL ) {
+		return Z_STREAM_ERROR;
+	}
+
+	ss = source->state;
+
+	*dest = *source;
+
+	ds = (deflate_state *)ZALLOC( dest, 1, sizeof( deflate_state ) );
+	if ( ds == NULL ) return Z_MEM_ERROR;
+	dest->state = (struct internal_state *)ds;
+	*ds = *ss;
+	ds->strm = dest;
+
+	ds->window = (Byte *)ZALLOC( dest, ds->w_size, 2 * sizeof( Byte ) );
+	ds->prev   = (Pos *)ZALLOC( dest, ds->w_size, sizeof( Pos ) );
+	ds->head   = (Pos *)ZALLOC( dest, ds->hash_size, sizeof( Pos ) );
+	overlay = (ush *)ZALLOC( dest, ds->lit_bufsize, sizeof( ush ) + 2 );
+	ds->pending_buf = (uch *)overlay;
+
+	if ( ds->window == NULL || ds->prev == NULL || ds->head == NULL ||
+		ds->pending_buf == NULL ) {
+		deflateEnd( dest );
+		return Z_MEM_ERROR;
+	}
+	/* following zmemcpy do not work for 16-bit MSDOS */
+	memcpy( ds->window, ss->window, ds->w_size * 2 * sizeof( Byte ) );
+	memcpy( ds->prev, ss->prev, ds->w_size * sizeof( Pos ) );
+	memcpy( ds->head, ss->head, ds->hash_size * sizeof( Pos ) );
+	memcpy( ds->pending_buf, ss->pending_buf, (uInt)ds->pending_buf_size );
+
+	ds->pending_out = ds->pending_buf + ( ss->pending_out - ss->pending_buf );
+	ds->d_buf = overlay + ds->lit_bufsize / sizeof( ush );
+	ds->l_buf = ds->pending_buf + ( 1 + sizeof( ush ) ) * ds->lit_bufsize;
+
+	ds->l_desc.dyn_tree = ds->dyn_ltree;
+	ds->d_desc.dyn_tree = ds->dyn_dtree;
+	ds->bl_desc.dyn_tree = ds->bl_tree;
+
+	return Z_OK;
 }
 
 /* ---- deflate_read_buf  0x004A3990 ---- CONFIRMED */
-unsigned int __cdecl deflate_read_buf(int a1, void *a2, unsigned int size)
+/* zlib 1.1.4 deflate.c read_buf */
+unsigned int __cdecl deflate_read_buf( z_streamp strm, Byte *buf, unsigned int size )
 {
-  unsigned int v3;
-  unsigned int v5;
+  unsigned int len = strm->avail_in;
 
-  v3 = *(_DWORD *)(a1 + 4);
-  if ( v3 > size )
-    v3 = size;
-  if ( !v3 )
+  if ( len > size )
+    len = size;
+  if ( !len )
     return 0;
-  *(_DWORD *)(a1 + 4) -= v3;
-  if ( !*(_DWORD *)(*(_DWORD *)(a1 + 28) + 24) )
-    *(_DWORD *)(a1 + 48) = adler32(*(_DWORD *)(a1 + 48), *(unsigned __int8 **)a1, v3);
-  qmemcpy(a2, *(const void **)a1, v3);
-  v5 = v3 + *(_DWORD *)a1;
-  *(_DWORD *)(a1 + 8) += v3;
-  *(_DWORD *)a1 = v5;
-  return v3;
+  strm->avail_in -= len;
+  if ( !strm->state->noheader )   /* only checksum when writing a header */
+    strm->adler = adler32( strm->adler, strm->next_in, len );
+  memcpy( buf, strm->next_in, len );
+  strm->next_in  += len;
+  strm->total_in += len;
+  return len;
 }
 
 /* ---- lm_init  0x004A3A00 ---- CONFIRMED */
-int __fastcall lm_init(int unused, int s)
+/* zlib 1.1.4 deflate.c */
+void __cdecl lm_init( deflate_state *s )
 {
   int level;
 
-  (void)unused;
+  s->window_size = (ulg)2L * s->w_size;
 
-  *(_DWORD *)( s + 52 ) = 2 * *(_DWORD *)( s + 36 );
+  CLEAR_HASH( s );
 
-  *(_WORD *)( *(_DWORD *)( s + 60 ) + 2 * *(_DWORD *)( s + 68 ) - 2 ) = 0;
-  memset( *(void **)( s + 60 ), 0, 2 * *(_DWORD *)( s + 68 ) - 2 );
+  level = s->level;
+  s->max_lazy_match   = deflate_configuration_table[level].max_lazy;
+  s->good_match       = deflate_configuration_table[level].good_length;
+  s->nice_match       = deflate_configuration_table[level].nice_length;
+  s->max_chain_length = deflate_configuration_table[level].max_chain;
 
-  level = *(_DWORD *)( s + 124 );
-  *(_DWORD *)( s + 120 ) = deflate_configuration_table[level].max_lazy;
-  *(_DWORD *)( s + 132 ) = deflate_configuration_table[level].good_length;
-  *(_DWORD *)( s + 136 ) = deflate_configuration_table[level].nice_length;
-  *(_DWORD *)( s + 116 ) = deflate_configuration_table[level].max_chain;
-
-  *(_DWORD *)( s + 100 ) = 0;
-  *(_DWORD *)( s +  84 ) = 0;
-  *(_DWORD *)( s + 108 ) = 0;
-  *(_DWORD *)( s +  96 ) = 0;
-  *(_DWORD *)( s +  64 ) = 0;
-  *(_DWORD *)( s + 112 ) = 2;
-  *(_DWORD *)( s +  88 ) = 2;
-  return 2;
+  s->strstart = 0;
+  s->block_start = 0L;
+  s->lookahead = 0;
+  s->match_length = s->prev_length = MIN_MATCH - 1;
+  s->match_available = 0;
+  s->ins_h = 0;
 }
 
 /* ---- longest_match  0x004A3A90 ---- CONFIRMED */
-unsigned int __cdecl longest_match(unsigned int a1, _DWORD *a2)
+/* zlib 1.1.4 deflate.c (no ASM_OBJ, no UNALIGNED_OK) */
+uInt __cdecl longest_match( deflate_state *s, IPos cur_match )
 {
-  unsigned int v2;
-  unsigned int v3;
-  int v4;
-  _BYTE *v5;
-  _BYTE *v6;
-  _BYTE *v7;
-  char v8;
-  _BYTE *v9;
-  _BYTE *v10;
-  _BYTE *v11;
-  char v12;
-  _BYTE *v13;
-  char v14;
-  _BYTE *v15;
-  char v16;
-  _BYTE *v17;
-  char v18;
-  _BYTE *v19;
-  char v20;
-  _BYTE *v21;
-  char v22;
-  _BYTE *v23;
-  char v24;
-  _BYTE *v25;
-  char v26;
-  int v27;
-  unsigned int result;
-  char v29;
-  char v30;
-  unsigned int v31;
-  unsigned int v32;
-  unsigned int v33;
-  unsigned int v34;
+	unsigned chain_length = s->max_chain_length;/* max hash chain length */
+	register Byte *scan = s->window + s->strstart; /* current string */
+	register Byte *match;                       /* matched string */
+	register int len;                           /* length of current match */
+	int best_len = s->prev_length;              /* best match length so far */
+	int nice_match = s->nice_match;             /* stop if match long enough */
+	IPos limit = s->strstart > (IPos)MAX_DIST( s ) ?
+		s->strstart - (IPos)MAX_DIST( s ) : NIL;
+	/* Stop when cur_match becomes <= limit. To simplify the code,
+	 * we prevent matches with the string of window index 0. */
+	Pos *prev = s->prev;
+	uInt wmask = s->w_mask;
 
-  v2 = a2[25];
-  v3 = a2[28];
-  v31 = a2[29];
-  v32 = a2[34];
-  v4 = a2[9];
-  v5 = (_BYTE *)(v2 + a2[12]);
-  if ( v2 <= v4 - 262 )
-    v33 = 0;
-  else
-    v33 = v2 - v4 + 262;
-  v29 = v5[v3 - 1];
-  v30 = v5[v3];
-  v6 = v5 + 258;
-  if ( v3 >= a2[33] )
-    v31 >>= 2;
-  v34 = a2[27];
-  if ( v32 > v34 )
-    v32 = a2[27];
-  do
-  {
-    v7 = (_BYTE *)(a1 + a2[12]);
-    if ( v7[v3] == v30 && v7[v3 - 1] == v29 && *v7 == *v5 )
-    {
-      v8 = v7[1];
-      v9 = v7 + 1;
-      if ( v8 == v5[1] )
-      {
-        v10 = v5 + 2;
-        v11 = v9 + 1;
-        do
-        {
-          v12 = *++v10;
-          v13 = v11 + 1;
-          if ( v12 != *v13 )
-            break;
-          v14 = *++v10;
-          v15 = v13 + 1;
-          if ( v14 != *v15 )
-            break;
-          v16 = *++v10;
-          v17 = v15 + 1;
-          if ( v16 != *v17 )
-            break;
-          v18 = *++v10;
-          v19 = v17 + 1;
-          if ( v18 != *v19 )
-            break;
-          v20 = *++v10;
-          v21 = v19 + 1;
-          if ( v20 != *v21 )
-            break;
-          v22 = *++v10;
-          v23 = v21 + 1;
-          if ( v22 != *v23 )
-            break;
-          v24 = *++v10;
-          v25 = v23 + 1;
-          if ( v24 != *v25 )
-            break;
-          v26 = *++v10;
-          v11 = v25 + 1;
-          if ( v26 != *v11 )
-            break;
-        }
-        while ( v10 < v6 );
-        v27 = v10 - v6 + 258;
-        v5 = v6 - 258;
-        if ( v27 > (int)v3 )
-        {
-          a2[26] = a1;
-          v3 = v27;
-          if ( v27 >= (int)v32 )
-            break;
-          v29 = v5[v27 - 1];
-          v30 = v5[v27];
-        }
-      }
-    }
-    a1 = *(unsigned __int16 *)(a2[14] + 2 * (a1 & a2[11]));
-    if ( a1 <= v33 )
-      break;
-    --v31;
-  }
-  while ( v31 );
-  result = v34;
-  if ( v3 <= v34 )
-    return v3;
-  return result;
+	register Byte *strend = s->window + s->strstart + MAX_MATCH;
+	register Byte scan_end1  = scan[best_len - 1];
+	register Byte scan_end   = scan[best_len];
+
+	/* Do not waste too much time if we already have a good match: */
+	if ( s->prev_length >= s->good_match ) {
+		chain_length >>= 2;
+	}
+	/* Do not look for matches beyond the end of the input. This is necessary
+	 * to make deflate deterministic. */
+	if ( (uInt)nice_match > s->lookahead ) nice_match = s->lookahead;
+
+	do {
+		match = s->window + cur_match;
+
+		/* Skip to next match if the match length cannot increase
+		 * or if the match length is less than 2: */
+		if ( match[best_len]   != scan_end  ||
+			match[best_len - 1] != scan_end1 ||
+			*match            != *scan     ||
+			*++match          != scan[1] )      continue;
+
+		/* It is not necessary to compare scan[2] and match[2] since they
+		 * are always equal when the other bytes match, given that
+		 * the hash keys are equal and that HASH_BITS >= 8. */
+		scan += 2, match++;
+
+		/* We check for insufficient lookahead only every 8th comparison;
+		 * the 256th check will be made at strstart+258. */
+		do {
+		} while ( *++scan == *++match && *++scan == *++match &&
+			*++scan == *++match && *++scan == *++match &&
+			*++scan == *++match && *++scan == *++match &&
+			*++scan == *++match && *++scan == *++match &&
+			scan < strend );
+
+		len = MAX_MATCH - (int)( strend - scan );
+		scan = strend - MAX_MATCH;
+
+		if ( len > best_len ) {
+			s->match_start = cur_match;
+			best_len = len;
+			if ( len >= nice_match ) break;
+			scan_end1  = scan[best_len - 1];
+			scan_end   = scan[best_len];
+		}
+	} while ( ( cur_match = prev[cur_match & wmask] ) > limit
+		&& --chain_length != 0 );
+
+	if ( (uInt)best_len <= s->lookahead ) return (uInt)best_len;
+	return s->lookahead;
 }
 
 /* ---- deflate_fill_window  0x004A3C00 ---- CONFIRMED */
-int __cdecl deflate_fill_window(int a1)
+/* zlib 1.1.4 deflate.c fill_window */
+void __cdecl deflate_fill_window( deflate_state *s )
 {
-  unsigned int v1;  /* wsize */
-  unsigned int v2;  /* strstart */
-  int v3;  /* lookahead */
-  unsigned int more;  /* free space at the end of the window */
-  int v5;
-  unsigned int v6;
-  int v7;
-  int v8;
-  _WORD *v9;
-  unsigned int v10;
-  __int16 v11;
-  unsigned int v12;
-  _WORD *v13;
-  unsigned int v14;
-  __int16 v15;
-  int result;
-  unsigned int v17;
-  unsigned __int8 *v18;
-  int v19;
-  int v20;
+	register unsigned n, m;
+	register Pos *p;
+	unsigned more;    /* Amount of free space at the end of the window. */
+	uInt wsize = s->w_size;
 
-  v1 = *(_DWORD *)(a1 + 36);
-  do
-  {
-    v2 = *(_DWORD *)(a1 + 100);
-    v3 = *(_DWORD *)(a1 + 108);
-    more = *(_DWORD *)(a1 + 52) - v2 - v3;
-    if ( more )
-    {
-      if ( more == (unsigned int)-1 )
-      {
-        --more;
-        goto LABEL_18;
-      }
-LABEL_7:
-      if ( v2 >= *(_DWORD *)(a1 + 36) + v1 - 262 )
-      {
-        qmemcpy(*(void **)(a1 + 48), (const void *)(*(_DWORD *)(a1 + 48) + v1), v1);
-        v5 = *(_DWORD *)(a1 + 84);
-        v6 = *(_DWORD *)(a1 + 104) - v1;
-        *(_DWORD *)(a1 + 100) -= v1;
-        v7 = *(_DWORD *)(a1 + 60);
-        *(_DWORD *)(a1 + 104) = v6;
-        v8 = *(_DWORD *)(a1 + 68);
-        *(_DWORD *)(a1 + 84) = v5 - v1;
-        v9 = (_WORD *)(v7 + 2 * v8);
-        do
-        {
-          v10 = (unsigned __int16)*--v9;
-          if ( v10 < v1 )
-            v11 = 0;
-          else
-            v11 = v10 - v1;
-          --v8;
-          *v9 = v11;
-        }
-        while ( v8 );
-        v12 = v1;
-        v13 = (_WORD *)(*(_DWORD *)(a1 + 56) + 2 * v1);
-        do
-        {
-          v14 = (unsigned __int16)*--v13;
-          if ( v14 < v1 )
-            v15 = 0;
-          else
-            v15 = v14 - v1;
-          --v12;
-          *v13 = v15;
-        }
-        while ( v12 );
-        more += v1;
-      }
-      goto LABEL_18;
-    }
-    if ( v2 || v3 )
-      goto LABEL_7;
-    more = v1;
-LABEL_18:
-    result = *(_DWORD *)a1;
-    if ( !*(_DWORD *)(*(_DWORD *)a1 + 4) )
-      break;
-    result = deflate_read_buf(result, (void *)(*(_DWORD *)(a1 + 48) + *(_DWORD *)(a1 + 100) + *(_DWORD *)(a1 + 108)), more);
-    v17 = result + *(_DWORD *)(a1 + 108);
-    *(_DWORD *)(a1 + 108) = v17;
-    if ( v17 >= 3 )
-    {
-      v18 = (unsigned __int8 *)(*(_DWORD *)(a1 + 100) + *(_DWORD *)(a1 + 48));
-      v19 = *v18;
-      v20 = *(_DWORD *)(a1 + 80);
-      *(_DWORD *)(a1 + 64) = v19;
-      result = *(_DWORD *)(a1 + 76) & (v18[1] ^ (v19 << v20));
-      *(_DWORD *)(a1 + 64) = result;
-    }
-    if ( v17 >= 0x106 )
-      break;
-    result = *(_DWORD *)(*(_DWORD *)a1 + 4);
-  }
-  while ( result );
-  return result;
+	do {
+		more = (unsigned)( s->window_size - (ulg)s->lookahead - (ulg)s->strstart );
+
+		/* Deal with !@#$% 64K limit: */
+		if ( more == 0 && s->strstart == 0 && s->lookahead == 0 ) {
+			more = wsize;
+
+		} else if ( more == (unsigned)( -1 ) ) {
+			/* Very unlikely, but possible on 16 bit machine if strstart == 0
+			 * and lookahead == 1 (input done one byte at time) */
+			more--;
+
+		/* If the window is almost full and there is insufficient lookahead,
+		 * move the upper half to the lower one to make room in the upper half. */
+		} else if ( s->strstart >= wsize + MAX_DIST( s ) ) {
+
+			memcpy( s->window, s->window + wsize, (unsigned)wsize );
+			s->match_start -= wsize;
+			s->strstart    -= wsize; /* we now have strstart >= MAX_DIST */
+			s->block_start -= (long)wsize;
+
+			/* Slide the hash table (could be avoided with 32 bit values
+			 * at the expense of memory usage). */
+			n = s->hash_size;
+			p = &s->head[n];
+			do {
+				m = *--p;
+				*p = (Pos)( m >= wsize ? m - wsize : NIL );
+			} while ( --n );
+
+			n = wsize;
+			p = &s->prev[n];
+			do {
+				m = *--p;
+				*p = (Pos)( m >= wsize ? m - wsize : NIL );
+				/* If n is not on any hash chain, prev[n] is garbage but
+				 * its value will never be used. */
+			} while ( --n );
+			more += wsize;
+		}
+		if ( s->strm->avail_in == 0 ) return;
+
+		n = deflate_read_buf( s->strm, s->window + s->strstart + s->lookahead, more );
+		s->lookahead += n;
+
+		/* Initialize the hash value now that we have some input: */
+		if ( s->lookahead >= MIN_MATCH ) {
+			s->ins_h = s->window[s->strstart];
+			UPDATE_HASH( s, s->ins_h, s->window[s->strstart + 1] );
+		}
+		/* If the whole input has less than MIN_MATCH bytes, ins_h is garbage,
+		 * but this is not important since only literal bytes will be emitted. */
+
+	} while ( s->lookahead < MIN_LOOKAHEAD && s->strm->avail_in != 0 );
 }
 
 /* ---- deflate_stored  0x004A3D20 ---- CONFIRMED */
-int __cdecl deflate_stored(int *a1, int a2)
+/* zlib 1.1.4 deflate.c */
+int __cdecl deflate_stored( deflate_state *s, int flush )
 {
-  unsigned int v2;
-  int v3;
-  bool v4;
-  int v5;
-  unsigned int v6;
-  unsigned int v7;
-  _BYTE *v8;
-  int v9;
-  int v10;
-  unsigned int v11;
-  int v12;
-  int v13;
-  int v14;
-  _DWORD *v15;
-  int v16;
-  unsigned int v17;
-  _BYTE *v18;
-  int v19;
-  int v21;
-  _BYTE *v22;
-  int v23;
-  int v24;
-  int v25;
+	/* Stored blocks are limited to 0xffff bytes, pending_buf is limited
+	 * to pending_buf_size, and each stored block has a 5 byte header: */
+	ulg max_block_size = 0xffff;
+	ulg max_start;
 
-  v25 = 0xFFFF;
-  if ( (unsigned int)(a1[3] - 5) < 0xFFFF )
-    v25 = a1[3] - 5;
-  while ( 1 )
-  {
-    v2 = a1[27];
-    if ( v2 <= 1 )
-    {
-      deflate_fill_window((int)a1);
-      v2 = a1[27];
-      if ( !v2 )
-        break;
-    }
-    v3 = a1[25];
-    v4 = v2 + v3 == 0;
-    a1[25] = v2 + v3;
-    v5 = a1[21];
-    v6 = a1[25];
-    a1[27] = 0;
-    v7 = v5 + v25;
-    if ( !v4 && v6 < v7 )
-      goto LABEL_31;
-    a1[27] = v6 - v7;
-    a1[25] = v7;
-    v8 = v5 < 0 ? 0 : (_BYTE *)(v5 + a1[12]);
-    _tr_flush_block(v25, (int)a1, 0, v8);
-    v9 = *a1;
-    a1[21] = a1[25];
-    v10 = *(_DWORD *)(v9 + 28);
-    v11 = *(_DWORD *)(v10 + 20);
-    if ( v11 > *(_DWORD *)(v9 + 16) )
-      v11 = *(_DWORD *)(v9 + 16);
-    if ( v11 )
-    {
-      qmemcpy(*(void **)(v9 + 12), *(const void **)(v10 + 16), v11);
-      v12 = *(_DWORD *)(v9 + 28);
-      *(_DWORD *)(v9 + 12) += v11;
-      *(_DWORD *)(v12 + 16) += v11;
-      v13 = *(_DWORD *)(v9 + 16);
-      v14 = *(_DWORD *)(v9 + 28);
-      *(_DWORD *)(v9 + 20) += v11;
-      *(_DWORD *)(v9 + 16) = v13 - v11;
-      *(_DWORD *)(v14 + 20) -= v11;
-      v15 = *(_DWORD **)(v9 + 28);
-      if ( !v15[5] )
-        v15[4] = v15[2];
-    }
-    if ( *(_DWORD *)(*a1 + 16) )
-    {
-LABEL_31:
-      v16 = a1[21];
-      v17 = a1[25] - v16;
-      if ( v17 < a1[9] - 262 )
-        continue;
-      v18 = v16 < 0 ? 0 : (_BYTE *)(v16 + a1[12]);
-      _tr_flush_block(v17, (int)a1, 0, v18);
-      v19 = *a1;
-      a1[21] = a1[25];
-      flush_pending(v19);
-      if ( *(_DWORD *)(*a1 + 16) )
-        continue;
-    }
-    return 0;
-  }
-  if ( !a2 )
-    return 0;
-  v21 = a1[21];
-  if ( v21 < 0 )
-    v22 = 0;
-  else
-    v22 = (_BYTE *)(v21 + a1[12]);
-  _tr_flush_block(a1[25] - v21, (int)a1, a2 == 4, v22);
-  v23 = *a1;
-  a1[21] = a1[25];
-  flush_pending(v23);
-  v24 = 0;
-  if ( !*(_DWORD *)(*a1 + 16) )
-    return a2 != 4 ? 0 : 2;
-  LOBYTE(v24) = a2 == 4;
-  return 2 * v24 + 1;
+	if ( max_block_size > s->pending_buf_size - 5 ) {
+		max_block_size = s->pending_buf_size - 5;
+	}
+
+	/* Copy as much as possible from input to output: */
+	for ( ;; ) {
+		/* Fill the window as much as possible: */
+		if ( s->lookahead <= 1 ) {
+
+			deflate_fill_window( s );
+			if ( s->lookahead == 0 && flush == Z_NO_FLUSH ) return need_more;
+
+			if ( s->lookahead == 0 ) break; /* flush the current block */
+		}
+
+		s->strstart += s->lookahead;
+		s->lookahead = 0;
+
+		/* Emit a stored block if pending_buf will be full: */
+		max_start = s->block_start + max_block_size;
+		if ( s->strstart == 0 || (ulg)s->strstart >= max_start ) {
+			/* strstart == 0 is possible when wraparound on 16-bit machine */
+			s->lookahead = (uInt)( s->strstart - max_start );
+			s->strstart = (uInt)max_start;
+			FLUSH_BLOCK( s, 0 );
+		}
+		/* Flush if we may have to slide, otherwise block_start may become
+		 * negative and the data will be gone: */
+		if ( s->strstart - (uInt)s->block_start >= MAX_DIST( s ) ) {
+			FLUSH_BLOCK( s, 0 );
+		}
+	}
+	FLUSH_BLOCK( s, flush == Z_FINISH );
+	return flush == Z_FINISH ? finish_done : block_done;
 }
 
 /* ---- deflate_fast  0x004A3EE0 ---- CONFIRMED */
-int __cdecl deflate_fast(int a1, int a2)
+/* zlib 1.1.4 deflate.c */
+int __cdecl deflate_fast( deflate_state *s, int flush )
 {
-  unsigned int v2;
-  unsigned int v3;
-  int v4;
-  int v5;
-  int v6;
-  __int16 v7;
-  unsigned __int8 v8;
-  unsigned __int16 v9;
-  int v10;
-  unsigned int v11;
-  BOOL v12;
-  unsigned int v13;
-  unsigned int v14;
-  int v15;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  int v20;
-  int v21;
-  unsigned int v23;
-  unsigned __int8 *v24;
-  int v25;
-  int v26;
-  unsigned __int8 v27;
-  BOOL v28;
-  int v29;
-  _BYTE *v30;
-  int v32;
-  _BYTE *v33;
+	IPos hash_head = NIL; /* head of the hash chain */
+	int bflush;           /* set if current block must be flushed */
 
-  zlib_BuildTables();
-  v2 = 0;
-  while ( 1 )
-  {
-    v3 = *(_DWORD *)(a1 + 108);
-    if ( v3 < 0x106 )
-    {
-      deflate_fill_window(a1);
-      v3 = *(_DWORD *)(a1 + 108);
-      if ( v3 < 0x106 && !a2 )
-        return 0;
-      if ( !v3 )
-        break;
-    }
-    if ( v3 >= 3 )
-    {
-      v4 = *(_DWORD *)(a1 + 100);
-      v5 = *(_DWORD *)(a1 + 60);
-      v6 = *(_DWORD *)(a1 + 76)
-         & (*(unsigned __int8 *)(*(_DWORD *)(a1 + 48) + v4 + 2)
-          ^ (*(_DWORD *)(a1 + 64) << *(_DWORD *)(a1 + 80)));
-      *(_DWORD *)(a1 + 64) = v6;
-      v2 = *(unsigned __int16 *)(v5 + 2 * v6);
-      *(_WORD *)(*(_DWORD *)(a1 + 56) + 2 * (v4 & *(_DWORD *)(a1 + 44))) = v2;
-      *(_WORD *)(*(_DWORD *)(a1 + 60) + 2 * *(_DWORD *)(a1 + 64)) = *(_WORD *)(a1 + 100);
-    }
-    if ( v2 )
-    {
-      if ( *(_DWORD *)(a1 + 100) - v2 <= *(_DWORD *)(a1 + 36) - 262 && *(_DWORD *)(a1 + 128) != 2 )
-        *(_DWORD *)(a1 + 88) = longest_match(v2, (_DWORD *)a1);
-    }
-    if ( *(_DWORD *)(a1 + 88) < 3u )
-    {
-      v27 = *(_BYTE *)(*(_DWORD *)(a1 + 100) + *(_DWORD *)(a1 + 48));
-      *(_WORD *)(*(_DWORD *)(a1 + 5788) + 2 * *(_DWORD *)(a1 + 5784)) = 0;
-      *(_BYTE *)(*(_DWORD *)(a1 + 5776) + (*(_DWORD *)(a1 + 5784))++) = v27;
-      ++*(_WORD *)(a1 + 4 * v27 + 140);
-      v28 = *(_DWORD *)(a1 + 5784) == *(_DWORD *)(a1 + 5780) - 1;
-      --*(_DWORD *)(a1 + 108);
-      v12 = v28;
-    }
-    else
-    {
-      v7 = *(_WORD *)(a1 + 100) - *(_WORD *)(a1 + 104);
-      v8 = *(_DWORD *)(a1 + 88) - 3;
-      *(_WORD *)(*(_DWORD *)(a1 + 5788) + 2 * *(_DWORD *)(a1 + 5784)) = v7;
-      *(_BYTE *)(*(_DWORD *)(a1 + 5776) + (*(_DWORD *)(a1 + 5784))++) = v8;
-      v9 = v7 - 1;
-      ++*(_WORD *)(a1 + 4 * (unsigned __int8)zlib_lengthCode[v8] + 1168);
-      if ( v9 >= 0x100u )
-        v10 = (unsigned __int8)zlib_distCode[256 + (v9 >> 7)];
-      else
-        v10 = (unsigned __int8)zlib_distCode[v9];
-      ++*(_WORD *)(a1 + 4 * v10 + 2432);
-      v11 = *(_DWORD *)(a1 + 120);
-      v12 = *(_DWORD *)(a1 + 5784) == *(_DWORD *)(a1 + 5780) - 1;
-      v13 = *(_DWORD *)(a1 + 88);
-      v14 = *(_DWORD *)(a1 + 108) - v13;
-      *(_DWORD *)(a1 + 108) = v14;
-      if ( v13 > v11 || v14 < 3 )
-      {
-        v23 = v13 + *(_DWORD *)(a1 + 100);
-        v24 = (unsigned __int8 *)(v23 + *(_DWORD *)(a1 + 48));
-        *(_DWORD *)(a1 + 100) = v23;
-        v25 = *(_DWORD *)(a1 + 80);
-        *(_DWORD *)(a1 + 88) = 0;
-        v26 = *v24;
-        *(_DWORD *)(a1 + 64) = v26;
-        *(_DWORD *)(a1 + 64) = *(_DWORD *)(a1 + 76) & (v24[1] ^ (v26 << v25));
-        goto LABEL_24;
-      }
-      *(_DWORD *)(a1 + 88) = v13 - 1;
-      do
-      {
-        v15 = *(_DWORD *)(a1 + 48);
-        v16 = *(_DWORD *)(a1 + 64);
-        v17 = *(_DWORD *)(a1 + 100) + 1;
-        *(_DWORD *)(a1 + 100) = v17;
-        v18 = v17;
-        v19 = *(unsigned __int8 *)(v17 + v15 + 2);
-        v20 = *(_DWORD *)(a1 + 60);
-        v21 = *(_DWORD *)(a1 + 76) & ((v16 << *(_DWORD *)(a1 + 80)) ^ v19);
-        *(_DWORD *)(a1 + 64) = v21;
-        v2 = *(unsigned __int16 *)(v20 + 2 * v21);
-        *(_WORD *)(*(_DWORD *)(a1 + 56) + 2 * (*(_DWORD *)(a1 + 44) & v18)) = v2;
-        *(_WORD *)(*(_DWORD *)(a1 + 60) + 2 * *(_DWORD *)(a1 + 64)) = *(_WORD *)(a1 + 100);
-      }
-      while ( (*(_DWORD *)(a1 + 88))-- != 1 );
-    }
-    ++*(_DWORD *)(a1 + 100);
-LABEL_24:
-    if ( v12 )
-    {
-      v29 = *(_DWORD *)(a1 + 84);
-      v30 = v29 < 0 ? 0 : (_BYTE *)(v29 + *(_DWORD *)(a1 + 48));
-      _tr_flush_block(*(_DWORD *)(a1 + 100) - v29, a1, 0, v30);
-      *(_DWORD *)(a1 + 84) = *(_DWORD *)(a1 + 100);
-      flush_pending(*(_DWORD *)a1);
-      if ( !*(_DWORD *)(*(_DWORD *)a1 + 16) )
-        return 0;
-    }
-  }
-  v32 = *(_DWORD *)(a1 + 84);
-  if ( v32 < 0 )
-    v33 = 0;
-  else
-    v33 = (_BYTE *)(v32 + *(_DWORD *)(a1 + 48));
-  _tr_flush_block(*(_DWORD *)(a1 + 100) - v32, a1, a2 == 4, v33);
-  *(_DWORD *)(a1 + 84) = *(_DWORD *)(a1 + 100);
-  flush_pending(*(_DWORD *)a1);
-  if ( *(_DWORD *)(*(_DWORD *)a1 + 16) )
-    return 2 * (a2 == 4) + 1;
-  else
-    return a2 != 4 ? 0 : 2;
+	for ( ;; ) {
+		/* Make sure that we always have enough lookahead, except
+		 * at the end of the input file. We need MAX_MATCH bytes
+		 * for the next match, plus MIN_MATCH bytes to insert the
+		 * string following the next match. */
+		if ( s->lookahead < MIN_LOOKAHEAD ) {
+			deflate_fill_window( s );
+			if ( s->lookahead < MIN_LOOKAHEAD && flush == Z_NO_FLUSH ) {
+				return need_more;
+			}
+			if ( s->lookahead == 0 ) break; /* flush the current block */
+		}
+
+		/* Insert the string window[strstart .. strstart+2] in the
+		 * dictionary, and set hash_head to the head of the hash chain: */
+		if ( s->lookahead >= MIN_MATCH ) {
+			INSERT_STRING( s, s->strstart, hash_head );
+		}
+
+		/* Find the longest match, discarding those <= prev_length.
+		 * At this point we have always match_length < MIN_MATCH */
+		if ( hash_head != NIL && s->strstart - hash_head <= MAX_DIST( s ) ) {
+			/* To simplify the code, we prevent matches with the string
+			 * of window index 0 (in particular we have to avoid a match
+			 * of the string with itself at the start of the input file). */
+			if ( s->strategy != Z_HUFFMAN_ONLY ) {
+				s->match_length = longest_match( s, hash_head );
+			}
+			/* longest_match() sets match_start */
+		}
+		if ( s->match_length >= MIN_MATCH ) {
+			_tr_tally_dist( s, s->strstart - s->match_start,
+				s->match_length - MIN_MATCH, bflush );
+
+			s->lookahead -= s->match_length;
+
+			/* Insert new strings in the hash table only if the match length
+			 * is not too large. This saves time but degrades compression. */
+			if ( s->match_length <= s->max_lazy_match &&
+				s->lookahead >= MIN_MATCH ) {
+				s->match_length--; /* string at strstart already in hash table */
+				do {
+					s->strstart++;
+					INSERT_STRING( s, s->strstart, hash_head );
+					/* strstart never exceeds WSIZE-MAX_MATCH, so there are
+					 * always MIN_MATCH bytes ahead. */
+				} while ( --s->match_length != 0 );
+				s->strstart++;
+			} else {
+				s->strstart += s->match_length;
+				s->match_length = 0;
+				s->ins_h = s->window[s->strstart];
+				UPDATE_HASH( s, s->ins_h, s->window[s->strstart + 1] );
+				/* If lookahead < MIN_MATCH, ins_h is garbage, but it does not
+				 * matter since it will be recomputed at next deflate call. */
+			}
+		} else {
+			/* No match, output a literal byte */
+			_tr_tally_lit( s, s->window[s->strstart], bflush );
+			s->lookahead--;
+			s->strstart++;
+		}
+		if ( bflush ) FLUSH_BLOCK( s, 0 );
+	}
+	FLUSH_BLOCK( s, flush == Z_FINISH );
+	return flush == Z_FINISH ? finish_done : block_done;
 }
 
 /* ---- deflate_slow  0x004A41E0 ---- CONFIRMED */
-int __cdecl deflate_slow(_DWORD *a1, int a2)
+/* zlib 1.1.4 deflate.c */
+int __cdecl deflate_slow( deflate_state *s, int flush )
 {
-  unsigned int v2;
-  unsigned int v3;
-  int v4;
-  int v5;
-  int v6;
-  unsigned int v7;
-  int v8;
-  unsigned int v9;
-  unsigned int v10;
-  unsigned int v11;
-  unsigned __int8 v12;
-  __int16 v13;
-  unsigned __int16 v14;
-  int v15;
-  int v16;
-  BOOL v17;
-  unsigned int v18;
-  int v19;
-  int v20;
-  int v22;
-  int v23;
-  int v24;
-  _BYTE *v25;
-  int v26;
-  unsigned __int8 v28;
-  int v29;
-  _BYTE *v30;
-  int v31;
-  int v32;
-  int v33;
-  int v34;
-  unsigned __int8 v35;
-  int v36;
-  _BYTE *v37;
+	IPos hash_head = NIL;    /* head of hash chain */
+	int bflush;              /* set if current block must be flushed */
 
-  zlib_BuildTables();
-  v2 = 0;
-  while ( 1 )
-  {
-    v3 = a1[27];
-    if ( v3 < 0x106 )
-    {
-      deflate_fill_window((int)a1);
-      v3 = a1[27];
-      if ( v3 < 0x106 && !a2 )
-        return 0;
-      if ( !v3 )
-        break;
-    }
-    if ( v3 >= 3 )
-    {
-      v4 = a1[25];
-      v5 = a1[15];
-      v6 = a1[19] & (*(unsigned __int8 *)(a1[12] + v4 + 2) ^ (a1[16] << a1[20]));
-      a1[16] = v6;
-      v2 = *(unsigned __int16 *)(v5 + 2 * v6);
-      *(_WORD *)(a1[14] + 2 * (v4 & a1[11])) = v2;
-      *(_WORD *)(a1[15] + 2 * a1[16]) = *((_WORD *)a1 + 50);
-    }
-    v7 = a1[22];
-    v8 = a1[26];
-    a1[28] = v7;
-    a1[23] = v8;
-    a1[22] = 2;
-    if ( v2 )
-    {
-      if ( v7 < a1[30] && a1[25] - v2 <= a1[9] - 262 )
-      {
-        if ( a1[32] != 2 )
-          a1[22] = longest_match(v2, a1);
-        v9 = a1[22];
-        if ( v9 <= 5 && (a1[32] == 1 || v9 == 3 && (unsigned int)(a1[25] - a1[26]) > 0x1000) )
-          a1[22] = 2;
-      }
-    }
-    v10 = a1[28];
-    if ( v10 < 3 || a1[22] > v10 )
-    {
-      if ( a1[24] )
-      {
-        v28 = *(_BYTE *)(a1[25] + a1[12] - 1);
-        *(_WORD *)(a1[1447] + 2 * a1[1446]) = 0;
-        *(_BYTE *)(a1[1444] + a1[1446]++) = v28;
-        ++LOWORD(a1[v28 + 35]);
-        if ( a1[1446] == a1[1445] - 1 )
-        {
-          v29 = a1[21];
-          if ( v29 < 0 )
-            v30 = 0;
-          else
-            v30 = (_BYTE *)(v29 + a1[12]);
-          _tr_flush_block(a1[25] - v29, (int)a1, 0, v30);
-          v31 = *a1;
-          a1[21] = a1[25];
-          flush_pending(v31);
-        }
-        v32 = a1[27] - 1;
-        ++a1[25];
-        a1[27] = v32;
-        goto LABEL_32;
-      }
-      v33 = a1[25] + 1;
-      v34 = a1[27] - 1;
-      a1[24] = 1;
-      a1[25] = v33;
-      a1[27] = v34;
-    }
-    else
-    {
-      v11 = a1[25] + a1[27] - 3;
-      v12 = *((_BYTE *)a1 + 112) - 3;
-      v13 = a1[25] - *((_WORD *)a1 + 46) - 1;
-      *(_WORD *)(a1[1447] + 2 * a1[1446]) = v13;
-      *(_BYTE *)(a1[1444] + a1[1446]++) = v12;
-      v14 = v13 - 1;
-      ++LOWORD(a1[(unsigned __int8)zlib_lengthCode[v12] + 292]);
-      if ( v14 >= 0x100u )
-        v15 = (unsigned __int8)zlib_distCode[256 + (v14 >> 7)];
-      else
-        v15 = (unsigned __int8)zlib_distCode[v14];
-      ++LOWORD(a1[v15 + 608]);
-      v16 = a1[28];
-      v17 = a1[1446] == a1[1445] - 1;
-      a1[27] += 1 - v16;
-      a1[28] = v16 - 2;
-      do
-      {
-        v18 = a1[25] + 1;
-        a1[25] = v18;
-        if ( v18 <= v11 )
-        {
-          v19 = a1[15];
-          v20 = a1[19] & (*(unsigned __int8 *)(a1[12] + v18 + 2) ^ (a1[16] << a1[20]));
-          a1[16] = v20;
-          v2 = *(unsigned __int16 *)(v19 + 2 * v20);
-          *(_WORD *)(a1[14] + 2 * (v18 & a1[11])) = v2;
-          *(_WORD *)(a1[15] + 2 * a1[16]) = *((_WORD *)a1 + 50);
-        }
-      }
-      while ( a1[28]-- != 1 );
-      v22 = a1[25] + 1;
-      a1[24] = 0;
-      a1[22] = 2;
-      a1[25] = v22;
-      v23 = v22;
-      if ( v17 )
-      {
-        v24 = a1[21];
-        if ( v24 < 0 )
-          v25 = 0;
-        else
-          v25 = (_BYTE *)(v24 + a1[12]);
-        _tr_flush_block(v23 - v24, (int)a1, 0, v25);
-        v26 = *a1;
-        a1[21] = a1[25];
-        flush_pending(v26);
-LABEL_32:
-        if ( !*(_DWORD *)(*a1 + 16) )
-          return 0;
-      }
-    }
-  }
-  if ( a1[24] )
-  {
-    v35 = *(_BYTE *)(a1[25] + a1[12] - 1);
-    *(_WORD *)(a1[1447] + 2 * a1[1446]) = 0;
-    *(_BYTE *)(a1[1444] + a1[1446]++) = v35;
-    ++LOWORD(a1[v35 + 35]);
-    a1[24] = 0;
-  }
-  v36 = a1[21];
-  if ( v36 < 0 )
-    v37 = 0;
-  else
-    v37 = (_BYTE *)(v36 + a1[12]);
-  _tr_flush_block(a1[25] - v36, (int)a1, a2 == 4, v37);
-  a1[21] = a1[25];
-  flush_pending(*a1);
-  if ( *(_DWORD *)(*a1 + 16) )
-    return 2 * (a2 == 4) + 1;
-  else
-    return a2 != 4 ? 0 : 2;
+	/* Process the input block. */
+	for ( ;; ) {
+		/* Make sure that we always have enough lookahead, except
+		 * at the end of the input file. We need MAX_MATCH bytes
+		 * for the next match, plus MIN_MATCH bytes to insert the
+		 * string following the next match. */
+		if ( s->lookahead < MIN_LOOKAHEAD ) {
+			deflate_fill_window( s );
+			if ( s->lookahead < MIN_LOOKAHEAD && flush == Z_NO_FLUSH ) {
+				return need_more;
+			}
+			if ( s->lookahead == 0 ) break; /* flush the current block */
+		}
+
+		/* Insert the string window[strstart .. strstart+2] in the
+		 * dictionary, and set hash_head to the head of the hash chain: */
+		if ( s->lookahead >= MIN_MATCH ) {
+			INSERT_STRING( s, s->strstart, hash_head );
+		}
+
+		/* Find the longest match, discarding those <= prev_length. */
+		s->prev_length = s->match_length, s->prev_match = s->match_start;
+		s->match_length = MIN_MATCH - 1;
+
+		if ( hash_head != NIL && s->prev_length < s->max_lazy_match &&
+			s->strstart - hash_head <= MAX_DIST( s ) ) {
+			/* To simplify the code, we prevent matches with the string
+			 * of window index 0 (in particular we have to avoid a match
+			 * of the string with itself at the start of the input file). */
+			if ( s->strategy != Z_HUFFMAN_ONLY ) {
+				s->match_length = longest_match( s, hash_head );
+			}
+			/* longest_match() sets match_start */
+
+			if ( s->match_length <= 5 && ( s->strategy == Z_FILTERED ||
+				( s->match_length == MIN_MATCH &&
+				  s->strstart - s->match_start > TOO_FAR ) ) ) {
+
+				/* If prev_match is also MIN_MATCH, match_start is garbage
+				 * but we will ignore the current match anyway. */
+				s->match_length = MIN_MATCH - 1;
+			}
+		}
+		/* If there was a match at the previous step and the current
+		 * match is not better, output the previous match: */
+		if ( s->prev_length >= MIN_MATCH && s->match_length <= s->prev_length ) {
+			uInt max_insert = s->strstart + s->lookahead - MIN_MATCH;
+			/* Do not insert strings in hash table beyond this. */
+
+			_tr_tally_dist( s, s->strstart - 1 - s->prev_match,
+				s->prev_length - MIN_MATCH, bflush );
+
+			/* Insert in hash table all strings up to the end of the match.
+			 * strstart-1 and strstart are already inserted. If there is not
+			 * enough lookahead, the last two strings are not inserted in
+			 * the hash table. */
+			s->lookahead -= s->prev_length - 1;
+			s->prev_length -= 2;
+			do {
+				if ( ++s->strstart <= max_insert ) {
+					INSERT_STRING( s, s->strstart, hash_head );
+				}
+			} while ( --s->prev_length != 0 );
+			s->match_available = 0;
+			s->match_length = MIN_MATCH - 1;
+			s->strstart++;
+
+			if ( bflush ) FLUSH_BLOCK( s, 0 );
+
+		} else if ( s->match_available ) {
+			/* If there was no match at the previous position, output a
+			 * single literal. If there was a match but the current match
+			 * is longer, truncate the previous match to a single literal. */
+			_tr_tally_lit( s, s->window[s->strstart - 1], bflush );
+			if ( bflush ) {
+				FLUSH_BLOCK_ONLY( s, 0 );
+			}
+			s->strstart++;
+			s->lookahead--;
+			if ( s->strm->avail_out == 0 ) return need_more;
+		} else {
+			/* There is no previous match to compare with, wait for
+			 * the next step to decide. */
+			s->match_available = 1;
+			s->strstart++;
+			s->lookahead--;
+		}
+	}
+	if ( s->match_available ) {
+		_tr_tally_lit( s, s->window[s->strstart - 1], bflush );
+		s->match_available = 0;
+	}
+	FLUSH_BLOCK( s, flush == Z_FINISH );
+	return flush == Z_FINISH ? finish_done : block_done;
 }
 
 
-int __cdecl sub_4A2AF0( unsigned int adler, unsigned __int8 *buf, unsigned int len )
-{
-	return adler32( adler, buf, len );
+#ifdef __cplusplus
 }
-int __cdecl sub_4A2CE0( int crc, unsigned int len, _BYTE *buf )
-{
-	return crc32( crc, len, buf );
-}
+#endif

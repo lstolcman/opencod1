@@ -1,35 +1,6 @@
-/*
- * cg_newDraw_mp.c -- the ownerdraw handlers the menu system dispatches into
- * cgame, plus the small "selected player" helpers that feed them.
- * (original source: cgame/cg_newDraw.c -- capital D)
- *
- * cgame_mp_x86.dll 0x30023AE0 .. 0x30027304, 50 functions in binary order.
- * RTCW's cgame/cg_newDraw.c is the ancestor.  What CoD changed:
- *
- *   - EVERY drawing handler gained a `font` argument.  CoD's displayContextDef
- *     ownerDrawItem is ( x, y, w, h, text_x, text_y, ownerDraw, ownerDrawFlags,
- *     align, special, FONT, scale, color, shader, textStyle ) -- one slot more
- *     than RTCW's -- and CG_OwnerDraw hands the font down to each handler.
- *     CG_OwnerDraw's stack offsets: arg_28 font, arg_2C scale, arg_30 color,
- *     arg_34 shader, arg_38 textStyle.
- *   - the bitmap font is gone, so RTCW's CG_Text_Paint/CG_Text_Width/
- *     CG_Text_Height wrappers do not exist here: every handler issues
- *     trap_R_Text_Paint / trap_R_Text_Width / trap_R_Text_Height itself, and
- *     CG_LoadHudMenu wires the traps straight into cgDC.
- *   - the whole CTF/flag/powerup/head/armour half of RTCW's file is gone.  In
- *     its place: the compass ownerdraws, the stance widget, the cursor hint,
- *     the weapon-name pair and the health bar -- all CoD additions.
- *   - CG_OwnerDraw is gated on cg_drawStatus.integer (0x30026BB0); RTCW has no
- *     such gate.
- *
- * CG_ClientNumFromName (0x300271F0) is unnamed in retail; it sits exactly
- * where RTCW puts it (between CG_KeyEvent and CG_ShowResponseHead) and is
- * RTCW's function with Q_stricmp replaced by Q_stricmpn( .., .., 99999 ).
- *
- * Sizes and offsets in comments are addresses in that DLL.
- *
- * @fidelity: likely
- */
+// cg_newDraw.c -- the ownerdraw handlers the menu-driven hud calls into
+// every handler takes the item's font; the compass, stance, cursor hint,
+// weapon name and health bar draws are new
 
 #define _CRT_SECURE_NO_WARNINGS
 
@@ -38,12 +9,7 @@
 
 #include "cg_local.h"
 
-/*
- * ui_shared.h cannot be included here: it re-declares qhandle_t and defines
- * its own refdef_t / refEntity_t, which collide with cg_public.h's.  The one
- * type this unit needs from it is rectDef_t, so it is repeated under that
- * header's guard.
- */
+// ui_shared.h collides with cg_public.h, so repeat the one type needed from it
 #ifndef __UI_SHARED_H__
 typedef struct {
 	float x;
@@ -53,7 +19,7 @@ typedef struct {
 } rectDef_t;
 #endif
 
-/* ui/ui_shared.c, statically linked into this DLL.  menuDef_t is opaque here. */
+// ui_shared.c
 struct menuDef_s;
 struct menuDef_s *Menus_FindByName( const char *p );
 void        Menus_Open( struct menuDef_s *menu );
@@ -61,15 +27,11 @@ void        Controls_GetConfig( void );
 qboolean    GetCommandHasBinding( const char *name );
 int         GetKeyBindingLocalizedString( const char *name, char **out );
 
-/* cg_draw_mp.c / cg_scoreboard_mp.c.  CG_DrawField keeps RTCW's declaration --
-   it is the one cg_newDraw.c already carried at its head. */
 int         CG_DrawField( int x, int y, int width, int value, int charWidth, int charHeight,
-						  qboolean dodrawpic, qboolean leftAlign );
+						  qboolean dodrawpic, qboolean leftAlign );      // NERVE - SMF
 void        CG_ScrollScoreboardDown( void );
-/* CG_DrawTeamBackground and CG_CheckForCursorHints are cg_draw_mp.c's and
-   cg_local.h already declares them. */
 
-/* game_mp/bg_weapon.c; bg_public.h does not declare this one. */
+// bg_weapon.c
 int         BG_GetTotalAmmoReserve( const playerState_t *ps, int weapon );
 
 #ifndef PITCH
@@ -78,20 +40,17 @@ int         BG_GetTotalAmmoReserve( const playerState_t *ps, int weapon );
 #define ROLL    2
 #endif
 
-/* playerState_t.pm_flags.  game_mp/bg_local.h owns these four and cg_local.h
-   does not pull it in, so they are repeated here under a guard; the values and
-   addresses are bg_local.h's. */
+// pmove_t->pm_flags, from bg_local.h
 #ifndef PMF_PRONE
 #define PMF_PRONE               0x00000001
 #define PMF_DUCKED              0x00000002
 #define PMF_PRONE_BLOCKED       0x00008000
 #endif
 #ifndef PMF_INWORLD
-#define PMF_INWORLD             0x00040000  /* g_client_mp.c's inferred name */
+#define PMF_INWORLD             0x00040000  // name inferred
 #endif
 
-/* keycodes.h.  ui_mp/ui_shared.h carries the same six values, recovered from
-   the engine's keynames[]; that header cannot be included here (see above). */
+// keycodes.h
 #ifndef K_PGDN
 #define K_PGDN              163
 #define K_PGUP              164
@@ -104,38 +63,27 @@ int         BG_GetTotalAmmoReserve( const playerState_t *ps, int weapon );
 #ifndef STAT_HEALTH
 #define STAT_HEALTH         0
 #endif
-#define STAT_MAX_HEALTH     2       /* ps.stats[2] (CG_DrawPlayerBarHealth 0x300248DC) */
+#define STAT_MAX_HEALTH     2
 
 #define ANGLE2SHORT( x )    ( (int)( (x) * ( 65536.0f / 360.0f ) ) & 65535 )
 #define SHORT2ANGLE( x )    ( (float)( x ) * ( 360.0f / 65536.0f ) )
-#define DEG2RAD( a )        ( ( ( a ) * (float)M_PI ) / 180.0F )
 
 #ifndef M_PI
 #define M_PI    3.14159265358979323846
 #endif
 
-/* g_local.h's team_t, which cgame cannot see; the two the colour tables
-   distinguish are the two playing teams (CG_GetTeamColor 0x300272B3). */
+// team_t from g_local.h
 #ifndef TEAM_AXIS
 #define TEAM_FREE       0
 #define TEAM_AXIS       1
 #define TEAM_ALLIES     2
 #endif
 
-/* RTCW's cg_local.h constant; CoD's sortedTeamPlayers is the same 8 entries
-   (0x3019E800 .. 0x3019E820). */
 #define TEAM_MAXOVERLAY 8
 
-/* SCORE_NOT_PRESENT, unchanged from RTCW (0x3002637A compares -9999). */
 #define SCORE_NOT_PRESENT   -9999
 
-/*
- * menudef.h's ownerdraw ids.  Every value below is the one CG_OwnerDraw
- * (0x30026BB0) and CG_GetValue (0x30026590) switch on.  4..79 keep RTCW's
- * numbering except where CoD reused a slot -- 5/6/70 became the ammo trio and
- * 20 became the stance widget (RTCW's CG_PLAYER_SCORE moved to 21).  81..91
- * are CoD's own and their names are inferred from what they draw.
- */
+// menudef.h ownerdraw ids (the names of 81 and up are inferred)
 #define CG_PLAYER_HEALTH                4
 #define CG_PLAYER_AMMO_VALUE            5
 #define CG_PLAYER_AMMO_BACKDROP         6
@@ -171,81 +119,57 @@ int         BG_GetTotalAmmoReserve( const playerState_t *ps, int weapon );
 #define CG_PLAYER_BAR_HEALTH_TITLE      90
 #define CG_MENU_SHADER                  91
 
-/* menudef.h's ownerdrawflags, unchanged from RTCW (CG_OwnerDrawVisible). */
+// menudef.h ownerdrawflags
 #define CG_SHOW_HEALTHCRITICAL          0x00000080
 #define CG_SHOW_HEALTHOK                0x00004000
 #define CG_SHOW_TEAMINFO                0x00008000
 #define CG_SHOW_NOTEAMINFO              0x00010000
+#define CG_SHOW_2DONLY                  0x10000000
 
-#define HINT_HEALTH             7       /* 0x30025926 */
-
-/*
- * cg_weapons[] fields this unit reads.  cg_local.h holds +0x0A4.. open as one
- * `unknown_0x0A4[244]` hole; CG_RegisterWeapon (0x30035CF4 / 0x30035D56 /
- * 0x30035CB3) writes these three.
- */
-#define CGWEAP_DISPLAYNAME( w ) ( *(const char **)( (byte *)&cg_weapons[w] + 0x0A4 ) )
-#define CGWEAP_MODENAME( w )    ( *(const char **)( (byte *)&cg_weapons[w] + 0x0A8 ) )
-#define CGWEAP_MODEICON( w )    ( *(qhandle_t *)( (byte *)&cg_weapons[w] + 0x11C ) )
+#define HINT_HEALTH             7
 
 
-/* Configstring bases.  cgame has no CS_ enum; both are the constant the
-   inlined CG_ConfigString call adds (0x30024BCC, 0x30025773, 0x30025EF3). */
-/* RTCW's q3print_t.  Only SYSTEM_PRINT is provable from this module --
-   CG_SetPrintString compares `type` against zero and nothing else. */
+// q3print_t
 #define SYSTEM_PRINT        0
 
+// configstring bases
 #define CS_SHADERS          1500
 #define CS_HINTSTRINGS      1212
 #define CS_LOCATIONS        44
 
-/*
-=============================================================================
+// keep: declaration order matches the original data layout
+int         sortedTeamPlayers[TEAM_MAXOVERLAY];
+static char teamChat1[256];
+int         numSortedTeamPlayers;
+static char systemChat[256];
+static char teamChat2[256];
 
-    FILE-SCOPE STATE
-
-    sortedTeamPlayers / numSortedTeamPlayers live in RTCW's cg_draw.c; in CoD
-    nothing outside this file touches them, so they are this unit's.  The three
-    chat lines are RTCW's statics at the head of cg_newDraw.c and keep their
-    retail order in memory: teamChat1, then numSortedTeamPlayers, then
-    systemChat and teamChat2.
-
-=============================================================================
-*/
-
-int         sortedTeamPlayers[TEAM_MAXOVERLAY];         /* 0x3019E800 */
-static char teamChat1[256];                             /* 0x3019E820 */
-int         numSortedTeamPlayers;                       /* 0x3019E920 */
-static char systemChat[256];                            /* 0x3019E940 */
-static char teamChat2[256];                             /* 0x3019EA40 */
-
-/* CG_DrawPlayerStance's latches (0x30074984, 0x30074988, 0x3007498C). */
+// CG_DrawPlayerStance state; stanceUnused is never read
+static int  stanceUnused = -1;
 static int  stanceHintTime = -1;
 static int  stanceLast = -1;
 static int  proneBlockedTime = -1;
 
-/* CG_DrawPlayerBarHealth's lagging-damage bar (0x30074990, 0x30074994,
-   0x30074998, 0x300EEF1C).  barHoldTime is never written by retail. */
+// CG_DrawPlayerBarHealth's trailing damage bar; barHoldTime is never written
 static int      barHoldTime = 1;
 static int      barLagHoldTime = 1;
 static int      barLastClient = -1;
 static float    barLagFrac;
 
-/* CG_GetTranslatedLocationString's return buffer, 0x400 bytes (0x30095B20). */
+// CG_GetTranslatedLocationString's return buffer
 static char locationString[MAX_STRING_CHARS];
 
 /*
 ================
-CG_SetPrintString             0x30023A80  (unnamed in retail)
+CG_InitTeamChat
+================
+*/
+void CG_InitTeamChat( void ) {
+}
 
-RTCW's function verbatim, and the only writer of the three chat buffers.  Both
-strcpy calls are expanded inline, and the else branch got its own out-of-line
-head at 0x30023A9B (teamChat2 <- teamChat1 at 0x30023AA0, teamChat1 <- p at
-0x30023AB8).  Dead in 1.1: nothing references it.
-
-`type` reaches the body in ecx and is only ever tested against zero, so
-RTCW's SYSTEM_PRINT is the 0 the comparison tests and the other two
-q3print_t values are not distinguishable from here.
+/*
+================
+CG_SetPrintString
 ================
 */
 void CG_SetPrintString( int type, const char *p ) {
@@ -259,9 +183,15 @@ void CG_SetPrintString( int type, const char *p ) {
 
 /*
 ================
-CG_SetSelectedPlayerName      0x30023AE0
+CG_CheckOrderPending
+================
+*/
+void CG_CheckOrderPending( void ) {
+}
 
-RTCW also pushes cg_selectedPlayerName; CoD sets only the index.
+/*
+================
+CG_SetSelectedPlayerName
 ================
 */
 static void CG_SetSelectedPlayerName( void ) {
@@ -272,7 +202,7 @@ static void CG_SetSelectedPlayerName( void ) {
 
 /*
 ================
-CG_GetSelectedPlayer          0x30023B20
+CG_GetSelectedPlayer
 ================
 */
 int CG_GetSelectedPlayer( void ) {
@@ -284,10 +214,7 @@ int CG_GetSelectedPlayer( void ) {
 
 /*
 ================
-CG_SelectNextPlayer           0x30023B40
-
-RTCW's function without its leading CG_CheckOrderPending (CoD has no order
-system).  CG_SetSelectedPlayerName is inlined at the tail of both selectors.
+CG_SelectNextPlayer
 ================
 */
 void CG_SelectNextPlayer( void ) {
@@ -301,7 +228,7 @@ void CG_SelectNextPlayer( void ) {
 
 /*
 ================
-CG_SelectPrevPlayer           0x30023B90
+CG_SelectPrevPlayer
 ================
 */
 void CG_SelectPrevPlayer( void ) {
@@ -315,10 +242,9 @@ void CG_SelectPrevPlayer( void ) {
 
 /*
 ================
-CG_DrawPlayerAmmoBackdrop     0x30023BE0
+CG_DrawPlayerAmmoBackdrop
 
-RETAIL: __usercall( rect@<esi>, color, shader ).
-RTCW's CG_DrawPlayerAmmoIcon; the icon became a plain backdrop.
+The plate behind the ammo counter, drawn while a weapon is held
 ================
 */
 static void CG_DrawPlayerAmmoBackdrop( rectDef_t *rect, vec4_t color, qhandle_t shader ) {
@@ -331,16 +257,16 @@ static void CG_DrawPlayerAmmoBackdrop( rectDef_t *rect, vec4_t color, qhandle_t 
 
 /*
 ================
-CG_DrawPlayerWeaponName       0x30023C30
+CG_DrawPlayerWeaponName
 
-RETAIL: __usercall( rect@<edi>, font@<ebx>, color@<eax>, scale, textStyle ).
-Right-aligned, 28 units in from the right edge.
+The selected weapon's name, right-aligned 28 units in from the right edge
 ================
 */
 static void CG_DrawPlayerWeaponName( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
 	float       *fade;
 	vec4_t      drawColor;
 	weaponInfo_t *weapDef;
+	cgWeaponInfo_t *cgWeap;
 	const char  *text;
 	int         width;
 	int         weap;
@@ -366,11 +292,11 @@ static void CG_DrawPlayerWeaponName( rectDef_t *rect, int font, float scale, vec
 		return;
 	}
 
+	cgWeap = &cg_weapons[weapDef->weapIndex];
 	if ( weapDef->modeName[0] ) {
-		text = va( "%s / %s", CGWEAP_DISPLAYNAME( weapDef->weapIndex ),
-				   CGWEAP_MODENAME( weapDef->weapIndex ) );
+		text = va( "%s / %s", cgWeap->displayName, cgWeap->modeName );
 	} else {
-		text = va( "%s", CGWEAP_DISPLAYNAME( weapDef->weapIndex ) );
+		text = va( "%s", cgWeap->displayName );
 	}
 
 	width = trap_R_Text_Width( text, font, scale, 0 );
@@ -380,9 +306,8 @@ static void CG_DrawPlayerWeaponName( rectDef_t *rect, int font, float scale, vec
 
 /*
 ================
-CG_DrawPlayerWeaponNameBack   0x30023D50
+CG_DrawPlayerWeaponNameBack
 
-RETAIL: __usercall( rect@<esi>, color@<eax>, font, scale, shader ).
 The plate behind CG_DrawPlayerWeaponName: same right edge, sized to the text
 plus 36.
 ================
@@ -391,6 +316,7 @@ static void CG_DrawPlayerWeaponNameBack( rectDef_t *rect, int font, float scale,
 	float       *fade;
 	vec4_t      drawColor;
 	weaponInfo_t *weapDef;
+	cgWeaponInfo_t *cgWeap;
 	const char  *text;
 	float       width, x;
 	int         weap;
@@ -416,11 +342,11 @@ static void CG_DrawPlayerWeaponNameBack( rectDef_t *rect, int font, float scale,
 		return;
 	}
 
+	cgWeap = &cg_weapons[weapDef->weapIndex];
 	if ( weapDef->modeName[0] ) {
-		text = va( "%s / %s", CGWEAP_DISPLAYNAME( weapDef->weapIndex ),
-				   CGWEAP_MODENAME( weapDef->weapIndex ) );
+		text = va( "%s / %s", cgWeap->displayName, cgWeap->modeName );
 	} else {
-		text = va( "%s", CGWEAP_DISPLAYNAME( weapDef->weapIndex ) );
+		text = va( "%s", cgWeap->displayName );
 	}
 
 	width = trap_R_Text_Width( text, font, scale, 0 ) + 36.0f;
@@ -433,14 +359,14 @@ static void CG_DrawPlayerWeaponNameBack( rectDef_t *rect, int font, float scale,
 
 /*
 ================
-CG_DrawPlayerWeaponModeIcon   0x30023E90
+CG_DrawPlayerWeaponModeIcon
 
-RETAIL: __usercall( rect@<esi>, color ).
+The fire mode icon of the selected weapon
 ================
 */
 static void CG_DrawPlayerWeaponModeIcon( rectDef_t *rect, vec4_t color ) {
 	weaponInfo_t *weapDef;
-	qhandle_t   shader;
+	cgWeaponInfo_t *weapon;
 	int         weap;
 
 	if ( !cg.predictedPlayerState.weapon && !CG_FadeColor( cg.weaponSelectTime, 1800 ) ) {
@@ -458,48 +384,40 @@ static void CG_DrawPlayerWeaponModeIcon( rectDef_t *rect, vec4_t color ) {
 		return;
 	}
 
-	shader = CGWEAP_MODEICON( weapDef->weapIndex );
-	if ( !shader ) {
+	weapon = &cg_weapons[weapDef->weapIndex];
+	if ( !weapon->modeIcon ) {
 		return;
 	}
 
 	trap_R_SetColor( color );
-	CG_DrawPic( rect->x, rect->y, rect->w, rect->h, shader );
+	CG_DrawPic( rect->x, rect->y, rect->w, rect->h, weapon->modeIcon );
 	trap_R_SetColor( NULL );
 }
 
 /*
 ================
-CG_DrawPlayerStance           0x30023F50
+CG_DrawPlayerStance
 
-CoD addition, no RTCW counterpart.  Three jobs in one ownerdraw: the
-"prone blocked" flash across the middle of the screen, the four stance-change
-key hints beside the widget, and the stance icon itself (plus the colour flash
-that follows a stance change).
+Three jobs in one ownerdraw: the "prone blocked" flash across the middle of
+the screen, the four stance-change key hints beside the widget, and the stance
+icon itself (plus the colour flash that follows a stance change).
 
-The three command tables are the ones the retail function builds on the stack;
-the row index is the hint being offered (jump / stand / crouch / prone) and the
-first command in the row with a real binding is the one whose key is shown.
+In the command tables the row is the hint being offered (jump / stand /
+crouch / prone); the first bound command in the row is the one whose key is shown.
 ================
 */
+#define STANCE_CMD( i, j )  (char *)( ( stanceLast & PMF_PRONE ) ? proneCmds[i][j] \
+								: ( stanceLast & PMF_DUCKED ) ? duckCmds[i][j] : standCmds[i][j] )
+
 static void CG_DrawPlayerStance( rectDef_t *rect, vec4_t color, int font, float scale, int textStyle ) {
-	const char *hintNames[4] = {
-		"CGAME_STANCEHINT_JUMP",
-		"CGAME_STANCEHINT_STAND",
-		"CGAME_STANCEHINT_CROUCH",
-		"CGAME_STANCEHINT_PRONE"
-	};
-	const char  *proneCmds[4][6];
-	const char  *duckCmds[4][6];
-	const char  *standCmds[4][6];
-	const char  *( *cmds )[6];
 	const char  *bind[4];
 	char        *keyString;
 	const char  *text;
 	vec4_t      drawColor;
 	qhandle_t   shader;
 	float       xBase, y;
-	int         textHeight;
+	rfloat      halfWidth;
+	float       textHeight;
 	int         count;
 	int         i, j;
 
@@ -510,12 +428,12 @@ static void CG_DrawPlayerStance( rectDef_t *rect, vec4_t color, int font, float 
 		stanceHintTime = cg.time;
 	}
 
+	// keep: statement order matches original codegen
+	xBase = ( cg_hudCompassSize.value - 1.0f ) * 112.0f + rect->x;
+	stanceLast = cg.predictedPlayerState.pm_flags & ( PMF_PRONE | PMF_DUCKED );
 	drawColor[0] = color[0];
 	drawColor[1] = color[1];
 	drawColor[2] = color[2];
-
-	xBase = ( cg_hudCompassSize.value - 1.0f ) * 112.0f + rect->x;
-	stanceLast = cg.predictedPlayerState.pm_flags & ( PMF_PRONE | PMF_DUCKED );
 
 	if ( cg.predictedPlayerState.pm_flags & PMF_PRONE_BLOCKED ) {
 		if ( proneBlockedTime < cg.time ) {
@@ -523,95 +441,49 @@ static void CG_DrawPlayerStance( rectDef_t *rect, vec4_t color, int font, float 
 		}
 	}
 	if ( proneBlockedTime > cg.time ) {
-		text = CG_SafeTranslateString_Internal( "cgame", "CGAME_PRONE_BLOCKED" );
-		i = trap_R_Text_Width( text, font, scale, 0 );
-		drawColor[3] = (float)fabs( sin( DEG2RAD( ( ( proneBlockedTime - cg.time ) / 1500.0f ) * 540.0f ) ) );
-		trap_R_Text_Paint( 320.0f - i * 0.5f, 270.0f, font, scale,
+		text = CG_SafeTranslateString( "CGAME_PRONE_BLOCKED" );
+		halfWidth = ( trap_R_Text_Width( text, font, scale, 0 ) * 0.5f );
+		// keep: constant order and parentheses match original codegen
+		drawColor[3] = (float)fabs( sin( ( ( ( ( proneBlockedTime - cg.time ) * ( 1.0f / 1500.0f ) ) * 540.0f ) * M_PI ) * ( 1.0f / 180.0f ) ) );
+		// keep: y set here and the extra parentheses match original codegen
+		y = 270.0f;
+		trap_R_Text_Paint( ( ( ( ( ( 320.0f - halfWidth ) ) ) ) ), y, font, scale,
 						   drawColor, text, 0, 0, textStyle );
 	}
 
 	if ( stanceHintTime + 3000 > cg.time ) {
-		standCmds[0][0] = "+gostand";
-		standCmds[0][1] = "+moveup";
-		standCmds[0][2] = NULL;
-		standCmds[0][3] = NULL;
-		standCmds[0][4] = NULL;
-		standCmds[0][5] = NULL;
-		standCmds[1][0] = NULL;
-		standCmds[1][1] = NULL;
-		standCmds[1][2] = NULL;
-		standCmds[1][3] = NULL;
-		standCmds[1][4] = NULL;
-		standCmds[1][5] = NULL;
-		standCmds[2][0] = "gocrouch";
-		standCmds[2][1] = "togglecrouch";
-		standCmds[2][2] = "lowerstance";
-		standCmds[2][3] = "+movedown";
-		standCmds[2][4] = NULL;
-		standCmds[2][5] = NULL;
-		standCmds[3][0] = "goprone";
-		standCmds[3][1] = "+prone";
-		standCmds[3][2] = NULL;
-		standCmds[3][3] = NULL;
-		standCmds[3][4] = NULL;
-		standCmds[3][5] = NULL;
-
-		duckCmds[0][0] = NULL;
-		duckCmds[0][1] = NULL;
-		duckCmds[0][2] = NULL;
-		duckCmds[0][3] = NULL;
-		duckCmds[0][4] = NULL;
-		duckCmds[0][5] = NULL;
-		duckCmds[1][0] = "+gostand";
-		duckCmds[1][1] = "raisestance";
-		duckCmds[1][2] = "+moveup";
-		duckCmds[1][3] = NULL;
-		duckCmds[1][4] = NULL;
-		duckCmds[1][5] = NULL;
-		duckCmds[2][0] = NULL;
-		duckCmds[2][1] = NULL;
-		duckCmds[2][2] = NULL;
-		duckCmds[2][3] = NULL;
-		duckCmds[2][4] = NULL;
-		duckCmds[2][5] = NULL;
-		duckCmds[3][0] = "goprone";
-		duckCmds[3][1] = "lowerstance";
-		duckCmds[3][2] = "toggleprone";
-		duckCmds[3][3] = "+prone";
-		duckCmds[3][4] = NULL;
-		duckCmds[3][5] = NULL;
-
-		proneCmds[0][0] = NULL;
-		proneCmds[0][1] = NULL;
-		proneCmds[0][2] = NULL;
-		proneCmds[0][3] = NULL;
-		proneCmds[0][4] = NULL;
-		proneCmds[0][5] = NULL;
-		proneCmds[1][0] = "+gostand";
-		proneCmds[1][1] = "toggleprone";
-		proneCmds[1][2] = NULL;
-		proneCmds[1][3] = NULL;
-		proneCmds[1][4] = NULL;
-		proneCmds[1][5] = NULL;
-		proneCmds[2][0] = "gocrouch";
-		proneCmds[2][1] = "togglecrouch";
-		proneCmds[2][2] = "raisestance";
-		proneCmds[2][3] = "+movedown";
-		proneCmds[2][4] = "+moveup";
-		proneCmds[2][5] = NULL;
-		proneCmds[3][0] = NULL;
-		proneCmds[3][1] = NULL;
-		proneCmds[3][2] = NULL;
-		proneCmds[3][3] = NULL;
-		proneCmds[3][4] = NULL;
-		proneCmds[3][5] = NULL;
+		// keep: explicit NULL terminators match original codegen
+		const char *standCmds[4][6] = {
+			{ "+gostand", "+moveup", NULL },
+			{ NULL },
+			{ "gocrouch", "togglecrouch", "lowerstance", "+movedown", NULL },
+			{ "goprone", "+prone", NULL }
+		};
+		const char *duckCmds[4][6] = {
+			{ NULL },
+			{ "+gostand", "raisestance", "+moveup", NULL },
+			{ NULL },
+			{ "goprone", "lowerstance", "toggleprone", "+prone", NULL }
+		};
+		const char *proneCmds[4][6] = {
+			{ NULL },
+			{ "+gostand", "toggleprone", NULL },
+			{ "gocrouch", "togglecrouch", "raisestance", "+movedown", "+moveup", NULL },
+			{ NULL }
+		};
+		const char *hintNames[4] = {
+			"CGAME_STANCEHINT_JUMP",
+			"CGAME_STANCEHINT_STAND",
+			"CGAME_STANCEHINT_CROUCH",
+			"CGAME_STANCEHINT_PRONE"
+		};
 
 		Controls_GetConfig();
 
 		if ( stanceHintTime + 2000 > cg.time ) {
 			drawColor[3] = 1.0f;
 		} else {
-			drawColor[3] = ( stanceHintTime - cg.time + 3000 ) / 1000.0f;
+			drawColor[3] = ( stanceHintTime - cg.time + 3000 ) * 0.001f;
 		}
 
 		textHeight = trap_R_Text_Height( font, scale );
@@ -619,16 +491,13 @@ static void CG_DrawPlayerStance( rectDef_t *rect, vec4_t color, int font, float 
 		count = 0;
 		for ( i = 0; i < 4; i++ ) {
 			bind[i] = NULL;
-			if ( stanceLast & PMF_PRONE ) {
-				cmds = proneCmds;
-			} else if ( stanceLast & PMF_DUCKED ) {
-				cmds = duckCmds;
-			} else {
-				cmds = standCmds;
-			}
-			for ( j = 0; j < 6 && cmds[i][j]; j++ ) {
-				if ( GetCommandHasBinding( cmds[i][j] ) ) {
-					bind[i] = cmds[i][j];
+			// keep: the last step reads one entry past the row, as the original does
+			for ( j = 0, keyString = STANCE_CMD( i, j ); j < 6; j++, keyString = STANCE_CMD( i, j ) ) {
+				if ( !keyString ) {
+					break;
+				}
+				if ( GetCommandHasBinding( keyString ) ) {
+					bind[i] = keyString;
 					count++;
 					break;
 				}
@@ -636,21 +505,23 @@ static void CG_DrawPlayerStance( rectDef_t *rect, vec4_t color, int font, float 
 		}
 
 		y = rect->y + rect->h * 0.5f - 1.5f;
-		if ( count == 1 ) {
+		switch ( count ) {
+		case 1:
 			y = y + textHeight * 0.5f;
-		} else if ( count == 3 ) {
+			break;
+		case 3:
 			y = y - ( textHeight * 0.5f + 1.5f );
+			break;
 		}
 
 		for ( i = 0; i < 4; i++ ) {
-			if ( !bind[i] ) {
-				continue;
+			if ( bind[i] ) {
+				GetKeyBindingLocalizedString( bind[i], &keyString );
+				text = va( CG_SafeTranslateString( hintNames[i] ), keyString );
+				trap_R_Text_Paint( xBase + rect->w, y, font, scale,
+								   drawColor, text, 0, 0, textStyle );
+				y = y + textHeight + 1.5f;
 			}
-			GetKeyBindingLocalizedString( bind[i], &keyString );
-			text = va( CG_SafeTranslateString_Internal( "cgame", hintNames[i] ), keyString );
-			trap_R_Text_Paint( xBase + rect->w, y, font, scale,
-							   drawColor, text, 0, 0, textStyle );
-			y = y + textHeight + 1.5f;
 		}
 	}
 
@@ -664,7 +535,7 @@ static void CG_DrawPlayerStance( rectDef_t *rect, vec4_t color, int font, float 
 
 	drawColor[3] = color[3];
 	trap_R_SetColor( drawColor );
-	trap_R_DrawStretchPic( cgs.screenXScale * xBase, cgs.screenYScale * rect->y,
+	trap_R_DrawStretchPic( ( cgs.screenXScale * xBase ), cgs.screenYScale * rect->y,
 						   cgs.screenXScale * rect->w, cgs.screenYScale * rect->h,
 						   0, 0, 1, 1, shader );
 
@@ -690,10 +561,10 @@ static void CG_DrawPlayerStance( rectDef_t *rect, vec4_t color, int font, float 
 		} else {
 			drawColor[2] = cg_hudStanceFlash_b.value;
 		}
-		drawColor[3] = ( ( stanceHintTime - cg.time + 1000 ) / 1000.0f ) * 0.8f;
+		drawColor[3] = FCAST( ( stanceHintTime - cg.time + 1000 ) * 0.001f ) * 0.8f;	// keep: matches original codegen
 
 		trap_R_SetColor( drawColor );
-		trap_R_DrawStretchPic( cgs.screenXScale * xBase, cgs.screenYScale * rect->y,
+		trap_R_DrawStretchPic( ( cgs.screenXScale * xBase ), cgs.screenYScale * rect->y,
 							   cgs.screenXScale * rect->w, cgs.screenYScale * rect->h,
 							   0, 0, 1, 1, cgs.media.hudStanceFlash );
 	}
@@ -703,9 +574,8 @@ static void CG_DrawPlayerStance( rectDef_t *rect, vec4_t color, int font, float 
 
 /*
 ================
-CG_DrawPlayerCompass          0x30024800
+CG_DrawPlayerCompass
 
-RETAIL: __usercall( rect@<eax>, shader, color ).
 The rose scales about ( -25, 345 ) and slides up as cg_hudCompassSize grows.
 ================
 */
@@ -727,31 +597,44 @@ static void CG_DrawPlayerCompass( rectDef_t *rect, qhandle_t shader, vec4_t colo
 
 /*
 ================
-CG_DrawPlayerBarHealth        0x300248C0
+CG_DrawPlayerBarHealth
 
-RETAIL: __usercall( rect@<edi>, color@<esi>, shader ).  `color` is written
-through: the bar tints itself red as it empties, and the trailing damage bar
-overwrites it outright.
+The health bar.  color is written through: the bar tints itself red as it
+empties, and the trailing damage bar overwrites it outright.
 ================
 */
 static void CG_DrawPlayerBarHealth( rectDef_t *rect, vec4_t color, qhandle_t shader ) {
 	playerState_t *ps;
 	float frac;
+	double dfrac;
+	float x, y, w, h;
 
 	ps = &cg.snap->ps;
 
-	if ( ps->stats[STAT_HEALTH] && ps->stats[STAT_MAX_HEALTH] ) {
-		frac = (float)ps->stats[STAT_HEALTH] / ps->stats[STAT_MAX_HEALTH];
-		if ( frac < 0 ) {
-			frac = 0;
-		} else if ( frac > 1 ) {
-			frac = 1.0f;
-		}
-	} else {
-		frac = 0;
+	// missing or negative health gives an empty bar; keep: the gotos match original codegen
+	if ( !ps->stats[STAT_HEALTH] || !ps->stats[STAT_MAX_HEALTH] ) {
+		goto noHealthFraction;
 	}
+	frac = (float)ps->stats[STAT_HEALTH] / ps->stats[STAT_MAX_HEALTH];
+	if ( frac < 0 ) {
+		goto noHealthFraction;
+	}
+	if ( frac > 1 ) {
+		frac = 1.0f;
+	}
+	goto healthFractionReady;
+noHealthFraction:
+	frac = 0;
+healthFractionReady:
 
-	if ( frac > 0 ) {
+	// keep: the round trip through a double matches original codegen
+	dfrac = frac;
+	if ( (float)dfrac > 0 ) {
+		x = rect->x;
+		y = rect->y;
+		w = frac * rect->w;
+		h = rect->h;
+		CG_AdjustFrom640( &x, &y, &w, &h );
 		if ( frac > 0.5f ) {
 			color[0] = ( 1.0f - frac ) * color[0] * 2;
 			color[2] = ( 1.0f - frac ) * color[2] * 2;
@@ -759,9 +642,7 @@ static void CG_DrawPlayerBarHealth( rectDef_t *rect, vec4_t color, qhandle_t sha
 			color[1] = ( frac + 0.2f ) * color[1] + 0.3f;
 		}
 		trap_R_SetColor( color );
-		trap_R_DrawStretchPic( cgs.screenXScale * rect->x, rect->y * cgs.screenYScale,
-							   frac * rect->w * cgs.screenXScale, rect->h * cgs.screenYScale,
-							   0, 0, frac, 1.0f, shader );
+		trap_R_DrawStretchPic( x, y, w, h, 0, 0, frac, 1.0f, shader );
 	}
 
 	// the trailing bar that drains down to the new value after damage
@@ -788,15 +669,16 @@ static void CG_DrawPlayerBarHealth( rectDef_t *rect, vec4_t color, qhandle_t sha
 	}
 
 	if ( barLagFrac > frac ) {
+		x = frac * rect->w + rect->x;
+		y = rect->y;
+		w = ( barLagFrac - frac ) * rect->w;
+		h = rect->h;
+		CG_AdjustFrom640( &x, &y, &w, &h );
 		color[0] = 1.0f;
 		color[1] = 0;
 		color[2] = 0;
 		trap_R_SetColor( color );
-		trap_R_DrawStretchPic( ( frac * rect->w + rect->x ) * cgs.screenXScale,
-							   rect->y * cgs.screenYScale,
-							   ( barLagFrac - frac ) * rect->w * cgs.screenXScale,
-							   rect->h * cgs.screenYScale,
-							   frac, 0, barLagFrac, 1.0f, shader );
+		trap_R_DrawStretchPic( x, y, w, h, frac, 0, barLagFrac, 1.0f, shader );
 	}
 
 	trap_R_SetColor( NULL );
@@ -804,27 +686,23 @@ static void CG_DrawPlayerBarHealth( rectDef_t *rect, vec4_t color, qhandle_t sha
 
 /*
 ================
-CG_DrawPlayerBarHealthTitle   0x30024B50
-
-RETAIL: __usercall( rect@<esi>, font, scale, color, textStyle ).
+CG_DrawPlayerBarHealthTitle
 ================
 */
 static void CG_DrawPlayerBarHealthTitle( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
 	const char *text;
 
-	text = CG_SafeTranslateString_Internal( "cgame", "CGAME_HEALTH" );
+	text = CG_SafeTranslateString( "CGAME_HEALTH" );
 	trap_R_Text_Paint( rect->x, rect->y, font, scale, color, text, 0, 0, textStyle );
 }
 
 /*
 ================
-CG_ServerShaderName           0x30024BC0
+CG_ServerShaderName
 
-RETAIL: __usercall( index@<eax>, buffer, bufferSize ).  CG_ConfigString is
-inlined at 0x30024BD2.
+Copy out the name of a shader the server registered in CS_SHADERS
 ================
 */
-/* NOT static: cg_hudelem_mp.c's clock and shader elements call it. */
 qboolean CG_ServerShaderName( int index, char *buffer, int bufferSize ) {
 	const char *s;
 
@@ -846,24 +724,28 @@ qboolean CG_ServerShaderName( int index, char *buffer, int bufferSize ) {
 
 /*
 ================
-CG_ObjectiveIcon              0x30024C40
+CG_ObjectiveIcon
 
-RETAIL: __usercall( dir@<ecx>, shaderIndex ).  `dir` is 0 for level, 1 for an
-objective above the player and 2 for one below; the suffix is appended to the
-server-supplied shader name, and the three cgs.media handles are the fallback.
-trap_R_RegisterShaderNoMip is inlined (0x30024CDA is its CG_DrawInformation).
+dir is 0 for level, 1 for an objective above the player and 2 for one below;
+the suffix is appended to the server-supplied shader name, and the three
+cgs.media handles are the fallback.
 ================
 */
 static qhandle_t CG_ObjectiveIcon( int dir, int shaderIndex ) {
 	const char *suffix[3] = { "", "_up", "_down" };
 	char name[MAX_QPATH];
-	char *s;
+	const char *in;
+	char *out;
 
 	if ( shaderIndex ) {
 		if ( CG_ServerShaderName( shaderIndex, name, sizeof( name ) ) ) {
-			for ( s = name; *s && *s != '.'; s++ ) {
+			// Com_StripExtension( name, name )
+			in = name;
+			out = name;
+			while ( *in && *in != '.' ) {
+				*out++ = *in++;
 			}
-			*s = '\0';
+			*out = 0;
 			strcat( name, suffix[dir] );
 			return trap_R_RegisterShaderNoMip( name, 5 );
 		}
@@ -872,101 +754,96 @@ static qhandle_t CG_ObjectiveIcon( int dir, int shaderIndex ) {
 	return ( &cgs.media.hudObjective )[dir];
 }
 
+
+// keep: improve float consistency here, as the original does
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", on )
+#endif
+
 /*
 ================
-CG_DrawPlayerCompassPointers  0x30024D20
+CG_DrawPlayerCompassPointers
 
-RETAIL: __usercall( rect@<eax>, shader, color ) -- the shader argument is never
-read; the icon comes from CG_ObjectiveIcon.
+The objective markers around the compass.  shader is unused; the icons
+come from CG_ObjectiveIcon.
 ================
 */
 static void CG_DrawPlayerCompassPointers( rectDef_t *rect, qhandle_t shader, vec4_t color ) {
-	playerState_t *ps;
 	objective_t *obj;
 	centity_t   *cent;
 	vec4_t      drawColor;
 	vec3_t      pos, dir;
 	qhandle_t   icon;
 	float       centerX, centerY;
-	float       x, y, size, radius, dist, alpha, angle, t;
+	float       x, y, w, h, radius, dist, angle, t, frac;
 	float       s, c;
 	int         i;
 
 	CG_UpdateCompPointerOrientation();
 
-	centerX = cg_hudCompassSize.value * rect->w * 0.5f + rect->x;
+	// keep: FCAST matches original codegen
+	centerX = FCAST( cg_hudCompassSize.value * rect->w * 0.5f ) + rect->x;
 	centerY = cg_hudCompassSize.value * rect->h * 0.5f + rect->y
 			  - ( cg_hudCompassSize.value - 1.0f ) * 160.0f;
 
-	ps = &cg.snap->ps;
-	if ( !bg_clientinfo[ps->clientNum].infoValid ) {
+	if ( !bg_clientinfo[cg.snap->ps.clientNum].infoValid ) {
 		return;
 	}
 
 	for ( i = 0; i < 16; i++ ) {
-		obj = &ps->objective[i];
+		obj = &cg.snap->ps.objective[i];
 		if ( obj->state != 4 ) {
 			continue;
 		}
 
 		if ( obj->entNum != ENTITYNUM_NONE ) {
 			cent = &cg_entities[obj->entNum];
-			pos[0] = cent->lerpOrigin[0];
-			pos[1] = cent->lerpOrigin[1];
-			pos[2] = cent->lerpOrigin[2];
+			VectorCopy( cent->lerpOrigin, pos );
 		} else {
-			pos[0] = obj->origin[0];
-			pos[1] = obj->origin[1];
-			pos[2] = obj->origin[2];
+			VectorCopy( obj->origin, pos );
 		}
-
-		dir[0] = pos[0] - cg.refdef.vieworg[0];
-		dir[1] = pos[1] - cg.refdef.vieworg[1];
-		dir[2] = pos[2] - cg.refdef.vieworg[2];
+		VectorSubtract( pos, cg.refdef.vieworg, dir );
 
 		angle = (float)SHORT2ANGLE( ANGLE2SHORT( vectoyaw( dir ) - cg.compassPointerAngle ) );
-		dist = (float)sqrt( dir[1] * dir[1] + dir[0] * dir[0] );
+		// keep: FCAST matches original codegen
+		dist = FCAST( (float)sqrt( dir[1] * dir[1] + dir[0] * dir[0] ) );
 
-		drawColor[0] = color[0];
-		drawColor[1] = color[1];
-		drawColor[2] = color[2];
+		VectorCopy( color, drawColor );
 
 		if ( dist <= cg_hudCompassMaxRange.value ) {
-			alpha = 1.0f;
-		} else if ( dist < cg_hudObjectiveMaxRange.value ) {
+			drawColor[3] = 1.0f;
+		} else if ( dist >= cg_hudObjectiveMaxRange.value ) {
+			drawColor[3] = cg_hudObjectiveMinAlpha.value;
+		} else {
 			t = 0;
 			if ( cg_hudObjectiveMaxRange.value - cg_hudCompassMaxRange.value != 0 ) {
 				t = ( dist - cg_hudCompassMaxRange.value )
 					/ ( cg_hudObjectiveMaxRange.value - cg_hudCompassMaxRange.value );
 			}
-			alpha = 1.0f - ( 1.0f - cg_hudObjectiveMinAlpha.value ) * t;
-		} else {
-			alpha = cg_hudObjectiveMinAlpha.value;
+			drawColor[3] = 1.0f - ( 1.0f - cg_hudObjectiveMinAlpha.value ) * t;
 		}
-		drawColor[3] = alpha;
 
 		if ( dist <= cg_hudCompassMinRange.value ) {
 			radius = cg_hudCompassMinRadius.value;
-		} else if ( dist < cg_hudCompassMaxRange.value ) {
-			t = 0;
+		} else if ( dist >= cg_hudCompassMaxRange.value ) {
+			radius = 1.0f;
+		} else {
+			frac = 0;
 			if ( cg_hudCompassMaxRange.value - cg_hudCompassMinRange.value != 0 ) {
-				t = ( cg_hudCompassMaxRange.value - dist )
+				frac = ( cg_hudCompassMaxRange.value - dist )
 					/ ( cg_hudCompassMaxRange.value - cg_hudCompassMinRange.value );
 			}
-			radius = 1.0f - ( 1.0f - cg_hudCompassMinRadius.value ) * t;
-		} else {
-			radius = 1.0f;
+			radius = 1.0f - ( 1.0f - cg_hudCompassMinRadius.value ) * frac;
 		}
-		/* 43.75 is a double in retail (dbl_30069728), not a float literal. */
+		// keep: a double constant, as in the original
 		radius = (float)( cg_hudCompassSize.value * radius * 43.75 );
 
-		angle = angle * (float)M_PI / 180.0f;
-		c = (float)cos( angle );
-		s = (float)sin( angle );
+		SinCos( angle * (float)M_PI / 180.0f, &s, &c );
 
-		size = cg_hudCompassSize.value * 20.0f;
-		x = centerX - size * 0.5f - s * radius;
-		y = centerY - size * 0.5f - c * radius;
+		w = cg_hudCompassSize.value * 20.0f;
+		h = cg_hudCompassSize.value * 20.0f;
+		x = centerX - w * 0.5f - s * radius;
+		y = centerY - h * 0.5f - c * radius;
 
 		if ( dir[2] > cg_hudObjectiveMaxHeight.value ) {
 			icon = CG_ObjectiveIcon( 1, obj->icon );
@@ -977,20 +854,21 @@ static void CG_DrawPlayerCompassPointers( rectDef_t *rect, qhandle_t shader, vec
 		}
 
 		trap_R_SetColor( drawColor );
-		trap_R_DrawStretchPic( cgs.screenXScale * x, cgs.screenYScale * y,
-							   cgs.screenXScale * size, cgs.screenYScale * size,
-							   0, 0, 1.0f, 1.0f, icon );
+		CG_DrawPic( x, y, w, h, icon );
 	}
 
 	trap_R_SetColor( NULL );
 }
 
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", off )
+#endif
+
 /*
 ================
-CG_DrawPlayerCompassBack      0x30025120
+CG_DrawPlayerCompassBack
 
-RETAIL: __usercall( rect@<eax>, shader, color ).  CG_DrawPlayerCompass's
-geometry, drawn unrotated and in screen space.
+CG_DrawPlayerCompass's geometry, drawn unrotated and in screen space.
 ================
 */
 static void CG_DrawPlayerCompassBack( rectDef_t *rect, qhandle_t shader, vec4_t color ) {
@@ -999,8 +877,9 @@ static void CG_DrawPlayerCompassBack( rectDef_t *rect, qhandle_t shader, vec4_t 
 	x = ( ( rect->x - -25.0f ) * cg_hudCompassSize.value - 25.0f ) * cgs.screenXScale;
 	y = ( ( rect->y - 345.0f ) * cg_hudCompassSize.value + 345.0f
 		  - ( cg_hudCompassSize.value - 1.0f ) * 160.0f ) * cgs.screenYScale;
-	w = cg_hudCompassSize.value * rect->w * cgs.screenXScale;
-	h = cg_hudCompassSize.value * rect->h * cgs.screenYScale;
+	// keep: operand order matches original codegen
+	w = cgs.screenXScale * ( cg_hudCompassSize.value * rect->w );
+	h = cgs.screenYScale * ( cg_hudCompassSize.value * rect->h );
 
 	trap_R_SetColor( color );
 	trap_R_DrawStretchPic( x, y, w, h, 0, 0, 1.0f, 1.0f, shader );
@@ -1008,29 +887,37 @@ static void CG_DrawPlayerCompassBack( rectDef_t *rect, qhandle_t shader, vec4_t 
 }
 
 /*
-================
-CG_DrawCursorhint             0x300251F0
+==============
+CG_DrawCursorHints
 
-CoD addition.  cg.cursorHintIcon selects both the icon and the message: 2..9
-are the fixed hints, 10..73 a weapon pickup, 74..137 an ammo pickup, and
-anything else falls back on cg.cursorHintString (a configstring) or the health
-pickup.  The icon pulses or grows with cg_cursorHints.
-================
+  cg_cursorHints.integer ==
+	0:	no hints
+	1:	sin size pulse
+	2:	one way size pulse
+	3:	alpha pulse
+	4+:	static image
+
+  cg.cursorHintIcon selects both the icon and the message: 2..9 are the
+  fixed hints, 10..73 a weapon pickup, 74..137 an ammo pickup, and anything
+  else falls back on cg.cursorHintString or the health pickup.
+==============
 */
 static void CG_DrawCursorhint( rectDef_t *rect, int font, float scale, int textStyle ) {
 	float       *fade;
 	qhandle_t   shader;
 	weaponInfo_t *weapDef;
+	cgWeaponInfo_t *wi;
 	const char  *s;
 	const char  *text;
 	char        *keyString;
-	char        buffer[MAX_STRING_CHARS];   /* ebp-0x804, 0x400 bytes */
-	char        lower[MAX_STRING_CHARS];    /* ebp-0x404 */
+	char        buffer[MAX_STRING_CHARS];
+	char        lower[MAX_STRING_CHARS];
 	float       widthScale, xOfs, grow, halfGrow;
-	int         icon, weapon, slot;
-	int         width, height;
+	int         weapon, slot;
+	float       width, height;
 	char        *p;
 	int         n;
+	double      dh;
 
 	widthScale = 1.0f;
 	xOfs = 0;
@@ -1041,9 +928,8 @@ static void CG_DrawCursorhint( rectDef_t *rect, int font, float scale, int textS
 
 	CG_CheckForCursorHints();
 
-	icon = cg.cursorHintIcon;
-	shader = cgs.media.hintShaders[icon];
-	if ( icon >= 0 && icon <= 1 ) {
+	shader = cgs.media.hintShaders[cg.cursorHintIcon];
+	if ( cg.cursorHintIcon >= 0 && cg.cursorHintIcon <= 1 ) {
 		return;
 	}
 	if ( !shader ) {
@@ -1072,9 +958,10 @@ static void CG_DrawCursorhint( rectDef_t *rect, int font, float scale, int textS
 		halfGrow = grow * 0.5f;
 	}
 
-	if ( icon >= HINT_WEAPON_FIRST && icon <= HINT_WEAPON_LAST ) {
-		weapon = icon - ( HINT_WEAPON_FIRST - 1 );
+	if ( cg.cursorHintIcon >= HINT_WEAPON_FIRST && cg.cursorHintIcon <= HINT_WEAPON_LAST ) {
+		weapon = cg.cursorHintIcon - ( HINT_WEAPON_FIRST - 1 );
 		weapDef = bg_weaponInfo[weapon];
+		wi = &cg_weapons[weapon];
 
 		if ( weapDef->wideListIcon ) {
 			widthScale = 2.0f;
@@ -1091,35 +978,37 @@ static void CG_DrawCursorhint( rectDef_t *rect, int font, float scale, int textS
 					return;
 				}
 				text = va( "%s %s %s %s",
-						   va( CG_SafeTranslateString_Internal( "cgame", "CGAME_SWAPWEAPONS" ), keyString ),
-						   CGWEAP_DISPLAYNAME( cg.predictedPlayerState.weapon ),
-						   CG_SafeTranslateString_Internal( "cgame", "CGAME_FOR" ),
-						   CGWEAP_DISPLAYNAME( weapon ) );
+						   va( CG_SafeTranslateString( "CGAME_SWAPWEAPONS" ), keyString ),
+						   cg_weapons[ cg.predictedPlayerState.weapon ].displayName,
+						   CG_SafeTranslateString( "CGAME_FOR" ),
+						   wi->displayName );
 			} else {
-				if ( cg.predictedPlayerState.weaponslots[slot] == weapon ) {
+				// keep: the slot is read as a signed byte
+				if ( (signed char)cg.predictedPlayerState.weaponslots[slot] == weapon ) {
 					return;
 				}
 				text = va( "%s %s %s %s",
-						   va( CG_SafeTranslateString_Internal( "cgame", "CGAME_SWAPWEAPONS" ), keyString ),
-						   CGWEAP_DISPLAYNAME( cg.predictedPlayerState.weaponslots[weapDef->weaponSlot] ),
-						   CG_SafeTranslateString_Internal( "cgame", "CGAME_FOR" ),
-						   CGWEAP_DISPLAYNAME( weapon ) );
+						   va( CG_SafeTranslateString( "CGAME_SWAPWEAPONS" ), keyString ),
+						   cg_weapons[ (signed char)cg.predictedPlayerState.weaponslots[weapDef->weaponSlot] ].displayName,
+						   CG_SafeTranslateString( "CGAME_FOR" ),
+						   wi->displayName );
 			}
 		} else {
-			s = CG_SafeTranslateString_Internal( "cgame", "CGAME_PICKUPNEWWEAPON" );
+			s = CG_SafeTranslateString( "CGAME_PICKUPNEWWEAPON" );
 			p = strstr( s, "[%s]" );
 			if ( p && *p ) {
 				Controls_GetConfig();
 				GetKeyBindingLocalizedString( "+activate", &keyString );
 				p++;
 				strncpy( buffer, s, p - s );
-				buffer[p - s] = '\0';
+				// keep: pointer store, not an index (no bound check)
+				*( buffer + ( p - s ) ) = '\0';
 				strcat( buffer, keyString );
 				strcat( buffer, p + 2 );
 			} else {
 				strcpy( buffer, s );
 			}
-			text = va( buffer, CGWEAP_DISPLAYNAME( weapon ) );
+			text = va( buffer, wi->displayName );
 		}
 
 		width = trap_R_Text_Width( text, font, scale, 0 );
@@ -1127,23 +1016,24 @@ static void CG_DrawCursorhint( rectDef_t *rect, int font, float scale, int textS
 		trap_R_Text_Paint( rect->x + ( rect->w - width ) * 0.5f, rect->y - height,
 						   font, scale, fade, text, 0, 0, textStyle );
 
-	} else if ( icon >= HINT_AMMO_FIRST && icon <= HINT_AMMO_LAST ) {
-		weapon = icon - ( HINT_AMMO_FIRST - 1 );
+	} else if ( cg.cursorHintIcon >= HINT_AMMO_FIRST && cg.cursorHintIcon <= HINT_AMMO_LAST ) {
+		wi = &cg_weapons[cg.cursorHintIcon - ( HINT_AMMO_FIRST - 1 )];
 
-		s = CG_SafeTranslateString_Internal( "cgame", "CGAME_PICKUPAMMO" );
+		s = CG_SafeTranslateString( "CGAME_PICKUPAMMO" );
 		p = strstr( s, "[%s]" );
 		if ( p && *p ) {
 			Controls_GetConfig();
 			GetKeyBindingLocalizedString( "+activate", &keyString );
 			p++;
 			strncpy( buffer, s, p - s );
-			buffer[p - s] = '\0';
+			// keep: pointer store, not an index (no bound check)
+			*( buffer + ( p - s ) ) = '\0';
 			strcat( buffer, keyString );
 			strcat( buffer, p + 2 );
 		} else {
 			strcpy( buffer, s );
 		}
-		text = va( buffer, CGWEAP_DISPLAYNAME( weapon ) );
+		text = va( buffer, wi->displayName );
 
 		width = trap_R_Text_Width( text, font, scale, 0 );
 		height = trap_R_Text_Height( font, scale );
@@ -1153,8 +1043,8 @@ static void CG_DrawCursorhint( rectDef_t *rect, int font, float scale, int textS
 	} else if ( cg.cursorHintString >= 0 ) {
 		s = CG_ConfigString( CS_HINTSTRINGS + cg.cursorHintString );
 		if ( s && s[0] ) {
-			/* the "[%s]" is found in a lowercased copy but spliced out of the
-			   translated original */
+			// the "[%s]" is found in a lowercased copy but spliced out of the
+			// translated original
 			s = CG_TranslateMessage( s, "Hint String" );
 			strcpy( lower, s );
 			Q_strlwr( lower );
@@ -1163,13 +1053,14 @@ static void CG_DrawCursorhint( rectDef_t *rect, int font, float scale, int textS
 			if ( p ) {
 				n = p - lower;
 				strncpy( lower, s, n + 1 );
-				lower[n + 1] = '\0';
+				// keep: pointer store, not an index (no bound check)
+				*( lower + n + 1 ) = '\0';
 				n += 3;
 				Controls_GetConfig();
-				if ( GetKeyBindingLocalizedString( "+activate", &keyString ) ) {
-					text = keyString;
+				if ( !GetKeyBindingLocalizedString( "+activate", &keyString ) ) {
+					text = CG_SafeTranslateString( "KEY_USE" );
 				} else {
-					text = CG_SafeTranslateString_Internal( "cgame", "KEY_USE" );
+					text = keyString;
 				}
 				strcat( lower, text );
 				strcat( lower, s + n );
@@ -1180,14 +1071,15 @@ static void CG_DrawCursorhint( rectDef_t *rect, int font, float scale, int textS
 
 			width = trap_R_Text_Width( text, font, scale, 0 );
 			height = trap_R_Text_Height( font, scale );
-			trap_R_Text_Paint( rect->x + ( rect->w - width ) * 0.5f, rect->y - height,
+			// keep: parentheses match original codegen
+			trap_R_Text_Paint( rect->x + ( rect->w - width ) * 0.5f, ( rect->y - height ),
 							   font, scale, fade, text, 0, 0, textStyle );
 		}
 
-	} else if ( icon == HINT_HEALTH ) {
+	} else if ( cg.cursorHintIcon == HINT_HEALTH ) {
 		Controls_GetConfig();
 		GetKeyBindingLocalizedString( "+activate", &keyString );
-		text = va( CG_SafeTranslateString_Internal( "cgame", "CGAME_PICKUPHEALTH" ), keyString );
+		text = va( CG_SafeTranslateString( "CGAME_PICKUPHEALTH" ), keyString );
 
 		width = trap_R_Text_Width( text, font, scale, 0 );
 		height = trap_R_Text_Height( font, scale );
@@ -1196,8 +1088,10 @@ static void CG_DrawCursorhint( rectDef_t *rect, int font, float scale, int textS
 	}
 
 	trap_R_SetColor( fade );
+	// keep: the double copy matches original codegen
+	dh = rect->h;
 	CG_DrawPic( rect->x - halfGrow + xOfs, rect->y - halfGrow,
-				widthScale * rect->w + grow, rect->h + grow, shader );
+				widthScale * rect->w + grow, (float)dh + grow, shader );
 	trap_R_SetColor( NULL );
 
 	if ( cg.cursorHintValue ) {
@@ -1211,14 +1105,14 @@ static void CG_DrawCursorhint( rectDef_t *rect, int font, float scale, int textS
 }
 
 /*
-================
-CG_DrawPlayerAmmoValue        0x30025AB0
+==============
+CG_DrawPlayerAmmoValue
+	0 - ammo
+	1 - clip
 
-RETAIL: __usercall( rect@<esi>, font@<edi>, scale, color, shader, textStyle,
-type ).  `shader` and `type` are both dead here -- CoD prints the clip on the
-left, the reserve on the right and a '|' between them, and neither ownerdraw
-5 nor 70 changes that.
-================
+	both draw the clip on the left, the reserve on the right and a '|'
+	between them; shader and type are unused
+==============
 */
 static void CG_DrawPlayerAmmoValue( rectDef_t *rect, int font, float scale, vec4_t color,
 									qhandle_t shader, int textStyle, int type ) {
@@ -1228,7 +1122,7 @@ static void CG_DrawPlayerAmmoValue( rectDef_t *rect, int font, float scale, vec4
 	const char  *ammoText;
 	int         weapon, clip, reserve;
 	qboolean    showClip, showAmmo;
-	int         width;
+	float       x;
 
 	clipText = NULL;
 	ammoText = NULL;
@@ -1257,12 +1151,11 @@ static void CG_DrawPlayerAmmoValue( rectDef_t *rect, int font, float scale, vec4
 
 	if ( weapDef->clipOnly ) {
 		clip = -1;
-		showClip = qfalse;
 	} else {
 		clip = cg.predictedPlayerState.ammoclip[weapDef->clipIndex];
-		if ( clip < 0 ) {
-			showClip = qfalse;
-		}
+	}
+	if ( clip < 0 ) {
+		showClip = qfalse;
 	}
 	if ( clip > 999 ) {
 		clip = 999;
@@ -1281,46 +1174,38 @@ static void CG_DrawPlayerAmmoValue( rectDef_t *rect, int font, float scale, vec4
 		ammoText = va( "%i", reserve );
 	}
 
-	if ( showClip ) {
-		if ( showAmmo ) {
-			trap_R_Text_Paint( rect->x, rect->y, font, scale,
-							   color, clipText, 0, 0, textStyle );
+	// keep: one flat if / else if chain matches original codegen
+	if ( showClip && showAmmo ) {
+		trap_R_Text_Paint( rect->x, rect->y, font, scale,
+						   color, clipText, 0, 0, textStyle );
 
-			width = trap_R_Text_Width( ammoText, font, scale, 0 );
-			trap_R_Text_Paint( rect->x + rect->w - width, rect->y, font, scale,
-							   color, ammoText, 0, 0, textStyle );
+		x = rect->x + rect->w - trap_R_Text_Width( ammoText, font, scale, 0 );
+		trap_R_Text_Paint( x, rect->y, font, scale, color, ammoText, 0, 0, textStyle );
 
-			width = trap_R_Text_Width( "|", font, scale, 0 );
-			trap_R_Text_Paint( rect->x + ( rect->w - width ) * 0.5f, rect->y, font, scale,
-							   color, "|", 0, 0, textStyle );
-		} else {
-			width = trap_R_Text_Width( clipText, font, scale, 0 );
-			trap_R_Text_Paint( rect->x + ( rect->w - width ) * 0.5f, rect->y, font, scale,
-							   color, clipText, 0, 0, textStyle );
-		}
+		x = rect->x + ( rect->w - trap_R_Text_Width( "|", font, scale, 0 ) ) * 0.5f;
+		trap_R_Text_Paint( x, rect->y, font, scale, color, "|", 0, 0, textStyle );
+	} else if ( showClip ) {
+		x = rect->x + ( rect->w - trap_R_Text_Width( clipText, font, scale, 0 ) ) * 0.5f;
+		trap_R_Text_Paint( x, rect->y, font, scale, color, clipText, 0, 0, textStyle );
 	} else if ( showAmmo ) {
-		width = trap_R_Text_Width( ammoText, font, scale, 0 );
-		trap_R_Text_Paint( rect->x + ( rect->w - width ) * 0.5f, rect->y, font, scale,
-						   color, ammoText, 0, 0, textStyle );
+		x = rect->x + ( rect->w - trap_R_Text_Width( ammoText, font, scale, 0 ) ) * 0.5f;
+		trap_R_Text_Paint( x, rect->y, font, scale, color, ammoText, 0, 0, textStyle );
 	}
 }
 
 /*
 ================
-CG_DrawSelectedPlayerHealth   0x30025D40
-
-RETAIL: __usercall( rect@<ebx>, shader@<ecx>, font, scale, color, textStyle ).
-CG_GetSelectedPlayer is inlined at 0x30025D55.
+CG_DrawSelectedPlayerHealth
 ================
 */
 static void CG_DrawSelectedPlayerHealth( rectDef_t *rect, int font, float scale, vec4_t color,
 										 qhandle_t shader, int textStyle ) {
-	int  client;
-	char num[16];
-	int  width;
+	clientInfo_t *ci;
+	char         num[16];
+	int          width;
 
-	client = sortedTeamPlayers[CG_GetSelectedPlayer()];
-	if ( !bg_clientinfo[client].infoValid ) {
+	ci = &bg_clientinfo[sortedTeamPlayers[CG_GetSelectedPlayer()]];
+	if ( !ci->infoValid ) {
 		return;
 	}
 
@@ -1329,7 +1214,7 @@ static void CG_DrawSelectedPlayerHealth( rectDef_t *rect, int font, float scale,
 		CG_DrawPic( rect->x, rect->y, rect->w, rect->h, shader );
 		trap_R_SetColor( NULL );
 	} else {
-		Com_sprintf( num, sizeof( num ), "%i", bg_clientinfo[client].health );
+		Com_sprintf( num, sizeof( num ), "%i", ci->health );
 		width = trap_R_Text_Width( num, font, scale, 0 );
 		trap_R_Text_Paint( rect->x + ( rect->w - width ) * 0.5f, rect->y + rect->h,
 						   font, scale, color, num, 0, 0, textStyle );
@@ -1338,34 +1223,31 @@ static void CG_DrawSelectedPlayerHealth( rectDef_t *rect, int font, float scale,
 
 /*
 ================
-CG_DrawSelectedPlayerName     0x30025E60
+CG_DrawSelectedPlayerName
 
-RETAIL: __usercall( rect@<ecx>, font, scale, color, voice, textStyle ).
-`voice` is what tells ownerdraw 63 from ownerdraw 8, and CoD never reads it.
+voice is unused
 ================
 */
 static void CG_DrawSelectedPlayerName( rectDef_t *rect, int font, float scale, vec4_t color,
 									   qboolean voice, int textStyle ) {
-	int client;
+	clientInfo_t *ci;
 
-	client = sortedTeamPlayers[CG_GetSelectedPlayer()];
-	if ( !bg_clientinfo[client].infoValid ) {
+	ci = &bg_clientinfo[sortedTeamPlayers[CG_GetSelectedPlayer()]];
+	if ( !ci->infoValid ) {
 		return;
 	}
 
 	trap_R_Text_Paint( rect->x, rect->y + rect->h, font, scale,
-					   color, bg_clientinfo[client].name, 0, 0, textStyle );
+					   color, ci->name, 0, 0, textStyle );
 }
 
 /*
 ================
-CG_GetTranslatedLocationString    0x30025EF0
+CG_GetTranslatedLocationString
 
-RETAIL: __usercall( location@<eax> ).  CG_ConfigString and the two
-trap_SE_TranslateReference failure paths are inlined.
+Translate a location configstring, flagging it if there is no translation
 ================
 */
-/* NOT static: cg_servercmds_mp.c's CG_VoiceChatLocal calls it. */
 const char *CG_GetTranslatedLocationString( int location ) {
 	const char *s;
 	const char *t;
@@ -1398,56 +1280,47 @@ const char *CG_GetTranslatedLocationString( int location ) {
 
 /*
 ================
-CG_DrawSelectedPlayerLocation 0x30026030
-
-RETAIL: __usercall( rect@<esi>, font, scale, color, textStyle ).
+CG_DrawSelectedPlayerLocation
 ================
 */
 static void CG_DrawSelectedPlayerLocation( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
-	int         client;
-	const char  *s;
+	clientInfo_t *ci;
+	const char   *s;
 
-	client = sortedTeamPlayers[CG_GetSelectedPlayer()];
-	if ( !bg_clientinfo[client].infoValid ) {
+	ci = &bg_clientinfo[sortedTeamPlayers[CG_GetSelectedPlayer()]];
+	if ( !ci->infoValid ) {
 		return;
 	}
 
-	s = CG_GetTranslatedLocationString( bg_clientinfo[client].location );
+	s = CG_GetTranslatedLocationString( ci->location );
 	trap_R_Text_Paint( rect->x, rect->y + rect->h, font, scale,
 					   color, s, 0, 0, textStyle );
 }
 
 /*
 ================
-CG_DrawPlayerLocation         0x300260C0
-
-RETAIL: __usercall( rect@<esi>, font, scale, color, textStyle ).
+CG_DrawPlayerLocation
 ================
 */
 static void CG_DrawPlayerLocation( rectDef_t *rect, int font, float scale, vec4_t color, int textStyle ) {
-	int         client;
-	const char  *s;
+	clientInfo_t *ci;
+	const char   *s;
 
-	client = cg.snap->ps.clientNum;
-	if ( !bg_clientinfo[client].infoValid ) {
+	ci = &bg_clientinfo[cg.snap->ps.clientNum];
+	if ( !ci->infoValid ) {
 		return;
 	}
 
-	s = CG_GetTranslatedLocationString( bg_clientinfo[client].location );
+	s = CG_GetTranslatedLocationString( ci->location );
 	trap_R_Text_Paint( rect->x, rect->y + rect->h, font, scale,
 					   color, s, 0, 0, textStyle );
 }
 
 /*
 ================
-CG_DrawPlayerHealth           0x30026140
+CG_DrawPlayerHealth
 
-RETAIL: __usercall( rect, color@<edx>, shader@<ecx>, scale, textStyle ).
-RTCW's function with the follow test replaced (CoD has no PMF_FOLLOW arm here,
-it compares the snapshot's client against the local one) and everything after
-the CG_DrawField call dropped -- no lives counter, no invulnerability icon.
-CG_DrawField (cg_draw.c 0x30014530) is LTCG-inlined at 0x30026229, specialised
-for width 3 and leftAlign qtrue.
+When following another player, show that player's health
 ================
 */
 static void CG_DrawPlayerHealth( rectDef_t *rect, float scale, vec4_t color, qhandle_t shader, int textStyle ) {
@@ -1465,7 +1338,7 @@ static void CG_DrawPlayerHealth( rectDef_t *rect, float scale, vec4_t color, qha
 		value = ps->stats[STAT_HEALTH];
 	}
 
-	// Don't show negative health
+	// DHM - Nerve :: Don't show negative health
 	if ( value < 0 ) {
 		value = 0;
 	}
@@ -1476,15 +1349,13 @@ static void CG_DrawPlayerHealth( rectDef_t *rect, float scale, vec4_t color, qha
 		trap_R_SetColor( NULL );
 	} else {
 		trap_R_SetColor( color );
-		CG_DrawField( rect->x, rect->y, 3, value, 20 * scale, 32 * scale, qtrue, qtrue );
+		CG_DrawField( rect->x, rect->y, 3, value, 20 * scale, 32 * scale, qtrue, qtrue );           // NERVE - SMF
 	}
 }
 
 /*
 ================
-CG_DrawRedScore               0x30026360
-
-RETAIL: __usercall( rect@<ebx>, font, scale, color, shader, textStyle ).
+CG_DrawRedScore
 ================
 */
 static void CG_DrawRedScore( rectDef_t *rect, int font, float scale, vec4_t color,
@@ -1504,7 +1375,7 @@ static void CG_DrawRedScore( rectDef_t *rect, int font, float scale, vec4_t colo
 
 /*
 ================
-CG_DrawBlueScore              0x30026440
+CG_DrawBlueScore
 ================
 */
 static void CG_DrawBlueScore( rectDef_t *rect, int font, float scale, vec4_t color,
@@ -1524,9 +1395,7 @@ static void CG_DrawBlueScore( rectDef_t *rect, int font, float scale, vec4_t col
 
 /*
 ================
-CG_DrawTeamColor              0x30026520
-
-RETAIL: __usercall( rect@<ecx>, color ).
+CG_DrawTeamColor
 ================
 */
 static void CG_DrawTeamColor( rectDef_t *rect, vec4_t color ) {
@@ -1543,13 +1412,8 @@ static void CG_DrawTeamColor( rectDef_t *rect, vec4_t color ) {
 
 /*
 ================
-CG_DrawAreaHoldable           0x30026570
-CG_DrawAreaWeapons            0x30026580
-
-Both survive as empty bodies -- CoD kept the symbols and dropped RTCW's
-inventory strips.  CG_OwnerDraw still dispatches CG_AREA_WEAPON (78) and
-CG_AREA_HOLDABLE (79) to them; the calls fold into the epilogue (slot 21 of
-the 33-entry switch table at 0x300270F0).
+CG_DrawAreaHoldable
+CG_DrawAreaWeapons
 ================
 */
 static void CG_DrawAreaHoldable( rectDef_t *rect, int align, float spacing, float scale, vec4_t color ) {
@@ -1560,10 +1424,9 @@ static void CG_DrawAreaWeapons( rectDef_t *rect, int align, float spacing, float
 
 /*
 ================
-CG_GetValue                   0x30026590
+CG_GetValue
 
-cgDC.getValue.  BG_GetAmmoTypeMax / BG_GetAmmoClipSize are inlined at
-0x30026627 / 0x30026668.
+cgDC.getValue
 ================
 */
 float CG_GetValue( int ownerDraw, int type ) {
@@ -1571,40 +1434,37 @@ float CG_GetValue( int ownerDraw, int type ) {
 	playerState_t *ps;
 	int           client;
 	int           weapon;
-	weaponInfo_t  *weapDef;
+	clientInfo_t  *ci;
 
 	ps = &cg.snap->ps;
-	cent = &cg_entities[ps->clientNum];
+	cent = &cg_entities[cg.snap->ps.clientNum];
 
 	switch ( ownerDraw ) {
 	case CG_SELECTEDPLAYER_HEALTH:
-		client = sortedTeamPlayers[CG_GetSelectedPlayer()];
-		/* retail quirk (0x300265ef): health only when info is INVALID, -1 when
-		   valid -- inverted vs CG_PLAYER_HEALTH below. Reproduced faithfully. */
-		if ( !bg_clientinfo[client].infoValid ) {
-			return (float)bg_clientinfo[client].health;
+		ci = &bg_clientinfo[sortedTeamPlayers[CG_GetSelectedPlayer()]];
+		// keep: the inverted infoValid test is the original's
+		if ( !ci->infoValid ) {
+			return (float)ci->health;
 		}
 		break;
 
 	case CG_PLAYER_AMMO_VALUE:
-		weapon = cent->currentState.weapon;
-		if ( weapon ) {
-			weapDef = bg_weaponInfo[weapon];
-			if ( type == 1 ) {
-				return (float)ps->ammo[weapDef->ammoIndex];
+		if ( cent->currentState.weapon ) {
+			if ( type == 1 ) {  // RANGETYPE_RELATIVE
+				weapon = BG_AmmoForWeapon( cent->currentState.weapon );
+				return (float)ps->ammo[weapon] / BG_GetAmmoTypeMax( weapon );
 			}
-			return (float)ps->ammo[weapDef->ammoIndex] / BG_GetAmmoTypeMax( weapDef->ammoIndex );
+			return (float)ps->ammo[BG_AmmoForWeapon( cent->currentState.weapon )];
 		}
 		break;
 
 	case CG_PLAYER_AMMOCLIP_VALUE:
-		weapon = cent->currentState.weapon;
-		if ( weapon ) {
-			weapDef = bg_weaponInfo[weapon];
-			if ( type == 1 ) {
-				return (float)ps->ammoclip[weapDef->clipIndex];
+		if ( cent->currentState.weapon ) {
+			if ( type == 1 ) {  // RANGETYPE_RELATIVE
+				weapon = BG_ClipForWeapon( cent->currentState.weapon );
+				return (float)ps->ammoclip[weapon] / BG_GetAmmoClipSize( weapon );
 			}
-			return (float)ps->ammoclip[weapDef->clipIndex] / BG_GetAmmoClipSize( weapDef->clipIndex );
+			return (float)ps->ammoclip[BG_ClipForWeapon( cent->currentState.weapon )];
 		}
 		break;
 
@@ -1634,12 +1494,13 @@ float CG_GetValue( int ownerDraw, int type ) {
 
 /*
 ================
-CG_OwnerDrawVisible           0x30026740
+CG_OwnerDrawVisible
 
-cgDC.ownerDrawVisible.  RTCW's HEALTHOK arm is `>= 25`; retail compares `> 25`
-(0x3002679F is a jg).
+cgDC.ownerDrawVisible
 ================
 */
+// THINKABOUTME: should these be exclusive or inclusive..
+//
 qboolean CG_OwnerDrawVisible( int flags ) {
 	if ( flags & CG_SHOW_TEAMINFO ) {
 		return ( cg_currentSelectedPlayer.integer == numSortedTeamPlayers );
@@ -1661,15 +1522,19 @@ qboolean CG_OwnerDrawVisible( int flags ) {
 		}
 	}
 
+	// keep: dead test matches original codegen
+	if ( flags & CG_SHOW_2DONLY ) {
+		return qfalse;
+	}
+
 	return qfalse;
 }
 
 /*
 ================
-CG_DrawAreaSystemChat         0x300267B0
+CG_DrawAreaSystemChat
 
-RETAIL: __usercall( rect@<eax>, font, scale, color, shader ).  All three chat
-ownerdraws paint with style 0, not the item's textStyle.
+All three chat ownerdraws paint with style 0, not the item's textStyle
 ================
 */
 static void CG_DrawAreaSystemChat( rectDef_t *rect, int font, float scale, vec4_t color, qhandle_t shader ) {
@@ -1679,7 +1544,7 @@ static void CG_DrawAreaSystemChat( rectDef_t *rect, int font, float scale, vec4_
 
 /*
 ================
-CG_DrawAreaTeamChat           0x30026810
+CG_DrawAreaTeamChat
 ================
 */
 static void CG_DrawAreaTeamChat( rectDef_t *rect, int font, float scale, vec4_t color, qhandle_t shader ) {
@@ -1689,7 +1554,7 @@ static void CG_DrawAreaTeamChat( rectDef_t *rect, int font, float scale, vec4_t 
 
 /*
 ================
-CG_DrawAreaChat               0x30026870
+CG_DrawAreaChat
 ================
 */
 static void CG_DrawAreaChat( rectDef_t *rect, int font, float scale, vec4_t color, qhandle_t shader ) {
@@ -1699,7 +1564,7 @@ static void CG_DrawAreaChat( rectDef_t *rect, int font, float scale, vec4_t colo
 
 /*
 ================
-CG_GetKillerText              0x300268D0
+CG_GetKillerText
 ================
 */
 const char *CG_GetKillerText( void ) {
@@ -1713,10 +1578,7 @@ const char *CG_GetKillerText( void ) {
 
 /*
 ================
-CG_DrawKiller                 0x30026900
-
-RETAIL: __usercall( rect@<esi>, font@<ebx>, scale, color, shader, textStyle ).
-CG_GetKillerText is inlined twice, exactly as RTCW calls it twice.
+CG_DrawKiller
 ================
 */
 static void CG_DrawKiller( rectDef_t *rect, int font, float scale, vec4_t color,
@@ -1734,9 +1596,7 @@ static void CG_DrawKiller( rectDef_t *rect, int font, float scale, vec4_t color,
 
 /*
 ================
-CG_Draw1stPlace               0x300269D0
-
-RETAIL: __usercall( rect@<esi>, font, scale, color, shader, textStyle ).
+CG_Draw1stPlace
 ================
 */
 static void CG_Draw1stPlace( rectDef_t *rect, int font, float scale, vec4_t color,
@@ -1749,7 +1609,7 @@ static void CG_Draw1stPlace( rectDef_t *rect, int font, float scale, vec4_t colo
 
 /*
 ================
-CG_Draw2ndPlace               0x30026A40
+CG_Draw2ndPlace
 ================
 */
 static void CG_Draw2ndPlace( rectDef_t *rect, int font, float scale, vec4_t color,
@@ -1762,10 +1622,9 @@ static void CG_Draw2ndPlace( rectDef_t *rect, int font, float scale, vec4_t colo
 
 /*
 ================
-CG_GameTypeString             0x30026AB0
+CG_GameTypeString
 
-RTCW maps the gametype enum onto a display string; CoD's g_gametype is already
-a string, so this is one instruction.
+cgs.gametype is already a string
 ================
 */
 const char *CG_GameTypeString( void ) {
@@ -1774,10 +1633,7 @@ const char *CG_GameTypeString( void ) {
 
 /*
 ================
-CG_DrawGameType               0x30026AC0
-
-RETAIL: __usercall( rect@<eax>, font, scale, color, shader, textStyle ).
-CG_GameTypeString is inlined.
+CG_DrawGameType
 ================
 */
 static void CG_DrawGameType( rectDef_t *rect, int font, float scale, vec4_t color,
@@ -1788,28 +1644,31 @@ static void CG_DrawGameType( rectDef_t *rect, int font, float scale, vec4_t colo
 
 /*
 ================
-CG_DrawMenuShader             0x30026B20
+CG_DrawMenuShader
 
-RETAIL: __usercall( rect@<eax>, shader, color ).  CoD addition: a plain
-screen-space blit of the item's shader.
+The item's shader, stretched to its rect in screen space
 ================
 */
 static void CG_DrawMenuShader( rectDef_t *rect, qhandle_t shader, vec4_t color ) {
+	float x, y, w, h;
+
+	x = rect->x;
+	y = rect->y;
+	w = rect->w;
+	h = rect->h;
+	CG_AdjustFrom640( &x, &y, &w, &h );
 	trap_R_SetColor( color );
-	trap_R_DrawStretchPic( cgs.screenXScale * rect->x, rect->y * cgs.screenYScale,
-						   rect->w * cgs.screenXScale, rect->h * cgs.screenYScale,
-						   0, 0, 1.0f, 1.0f, shader );
+	trap_R_DrawStretchPic( x, y, w, h, 0, 0, 1.0f, 1.0f, shader );
 	trap_R_SetColor( NULL );
 }
 
 /*
-================
-CG_OwnerDraw                  0x30026BB0
+==============
+CG_OwnerDraw
 
-cgDC.ownerDrawItem.  `font` is CoD's extra argument, between `special` and
-`scale`; every handler below takes it.  The whole function is gated on
-cg_drawStatus.
-================
+cgDC.ownerDrawItem.  font is passed down to every handler.
+Keep the case order: it matches the original.
+==============
 */
 void CG_OwnerDraw( float x, float y, float w, float h, float text_x, float text_y,
 				   int ownerDraw, int ownerDrawFlags, int align, float special,
@@ -1826,14 +1685,23 @@ void CG_OwnerDraw( float x, float y, float w, float h, float text_x, float text_
 	rect.h = h;
 
 	switch ( ownerDraw ) {
-	case CG_PLAYER_HEALTH:
-		CG_DrawPlayerHealth( &rect, scale, color, shader, textStyle );
+	case CG_PLAYER_AMMO_BACKDROP:
+		CG_DrawPlayerAmmoBackdrop( &rect, color, shader );
 		break;
 	case CG_PLAYER_AMMO_VALUE:
 		CG_DrawPlayerAmmoValue( &rect, font, scale, color, shader, textStyle, 0 );
 		break;
-	case CG_PLAYER_AMMO_BACKDROP:
-		CG_DrawPlayerAmmoBackdrop( &rect, color, shader );
+	case CG_CURSORHINT:
+		CG_DrawCursorhint( &rect, font, scale, textStyle );
+		break;
+	case CG_PLAYER_AMMOCLIP_VALUE:
+		CG_DrawPlayerAmmoValue( &rect, font, scale, color, shader, textStyle, 1 );
+		break;
+	case CG_VOICE_NAME:
+		CG_DrawSelectedPlayerName( &rect, font, scale, color, qtrue, textStyle );
+		break;
+	case CG_SELECTEDPLAYER_HEALTH:
+		CG_DrawSelectedPlayerHealth( &rect, font, scale, color, shader, textStyle );
 		break;
 	case CG_SELECTEDPLAYER_NAME:
 		CG_DrawSelectedPlayerName( &rect, font, scale, color, qfalse, textStyle );
@@ -1844,23 +1712,20 @@ void CG_OwnerDraw( float x, float y, float w, float h, float text_x, float text_
 	case CG_PLAYER_STANCE:
 		CG_DrawPlayerStance( &rect, color, font, scale, textStyle );
 		break;
-	case CG_BLUE_SCORE:
-		CG_DrawBlueScore( &rect, font, scale, color, shader, textStyle );
+	case CG_PLAYER_HEALTH:
+		CG_DrawPlayerHealth( &rect, scale, color, shader, textStyle );
 		break;
 	case CG_RED_SCORE:
 		CG_DrawRedScore( &rect, font, scale, color, shader, textStyle );
+		break;
+	case CG_BLUE_SCORE:
+		CG_DrawBlueScore( &rect, font, scale, color, shader, textStyle );
 		break;
 	case CG_PLAYER_LOCATION:
 		CG_DrawPlayerLocation( &rect, font, scale, color, textStyle );
 		break;
 	case CG_TEAM_COLOR:
 		CG_DrawTeamColor( &rect, color );
-		break;
-	case CG_GAME_TYPE:
-		CG_DrawGameType( &rect, font, scale, color, shader, textStyle );
-		break;
-	case CG_SELECTEDPLAYER_HEALTH:
-		CG_DrawSelectedPlayerHealth( &rect, font, scale, color, shader, textStyle );
 		break;
 	case CG_AREA_SYSTEMCHAT:
 		CG_DrawAreaSystemChat( &rect, font, scale, color, shader );
@@ -1871,23 +1736,11 @@ void CG_OwnerDraw( float x, float y, float w, float h, float text_x, float text_
 	case CG_AREA_CHAT:
 		CG_DrawAreaChat( &rect, font, scale, color, shader );
 		break;
+	case CG_GAME_TYPE:
+		CG_DrawGameType( &rect, font, scale, color, shader, textStyle );
+		break;
 	case CG_KILLER:
 		CG_DrawKiller( &rect, font, scale, color, shader, textStyle );
-		break;
-	case CG_VOICE_NAME:
-		CG_DrawSelectedPlayerName( &rect, font, scale, color, qtrue, textStyle );
-		break;
-	case CG_1STPLACE:
-		CG_Draw1stPlace( &rect, font, scale, color, shader, textStyle );
-		break;
-	case CG_2NDPLACE:
-		CG_Draw2ndPlace( &rect, font, scale, color, shader, textStyle );
-		break;
-	case CG_PLAYER_AMMOCLIP_VALUE:
-		CG_DrawPlayerAmmoValue( &rect, font, scale, color, shader, textStyle, 1 );
-		break;
-	case CG_CURSORHINT:
-		CG_DrawCursorhint( &rect, font, scale, textStyle );
 		break;
 	case CG_AREA_WEAPON:
 		CG_DrawAreaWeapons( &rect, align, special, scale, color );
@@ -1913,14 +1766,20 @@ void CG_OwnerDraw( float x, float y, float w, float h, float text_x, float text_
 	case CG_PLAYER_COMPASS_POINTERS:
 		CG_DrawPlayerCompassPointers( &rect, shader, color );
 		break;
-	case CG_PLAYER_COMPASS_FRIENDLIES:
-		CG_DrawCompassFriendlies( (float *)&rect, shader, color );
-		break;
 	case CG_PLAYER_BAR_HEALTH:
 		CG_DrawPlayerBarHealth( &rect, color, shader );
 		break;
 	case CG_PLAYER_BAR_HEALTH_TITLE:
 		CG_DrawPlayerBarHealthTitle( &rect, font, scale, color, textStyle );
+		break;
+	case CG_PLAYER_COMPASS_FRIENDLIES:
+		CG_DrawCompassFriendlies( (float *)&rect, shader, color );
+		break;
+	case CG_1STPLACE:
+		CG_Draw1stPlace( &rect, font, scale, color, shader, textStyle );
+		break;
+	case CG_2NDPLACE:
+		CG_Draw2ndPlace( &rect, font, scale, color, shader, textStyle );
 		break;
 	case CG_MENU_SHADER:
 		CG_DrawMenuShader( &rect, shader, color );
@@ -1932,12 +1791,11 @@ void CG_OwnerDraw( float x, float y, float w, float h, float text_x, float text_
 
 /*
 ================
-CG_MouseEvent                 0x30027150
-CG_EventHandling              0x30027160
-CG_KeyEvent                   0x30027170
+CG_MouseEvent
+CG_EventHandling
+CG_KeyEvent
 
-All three survive as empty bodies: CoD's in-game menus are driven by the engine
-side, not by cgame.
+All three are empty: the in-game menus are driven by the engine, not by cgame
 ================
 */
 void CG_MouseEvent( int x, int y ) {
@@ -1951,33 +1809,27 @@ void CG_KeyEvent( int key, qboolean down ) {
 
 /*
 ================
-CG_KeyInterceptEvent          0x30027180
+CG_KeyInterceptEvent
 
-RETAIL: __usercall( key@<eax>, down@<ecx> ).  CoD addition: the scoreboard's
-own scroll wheel, which has to run before the key reaches the binding system.
+The scoreboard's own scroll wheel, which has to run before the key reaches the binding system.
 ================
 */
 qboolean CG_KeyInterceptEvent( int key, qboolean down ) {
-	if ( !down ) {
-		return qfalse;
-	}
-	if ( !cg.showScores ) {
-		return qfalse;
-	}
-
-	if ( key == K_MWHEELUP || key == K_PGUP || key == K_KP_PGUP ) {
-		if ( cg.scoreboardScrollPos > 0 ) {
-			cg.scoreboardScrollPos -= cg_scoreboardScrollStep.integer;
-			if ( cg.scoreboardScrollPos < 0 ) {
-				cg.scoreboardScrollPos = 0;
+	if ( down && cg.showScores ) {
+		if ( key == K_MWHEELUP || key == K_PGUP || key == K_KP_PGUP ) {
+			if ( cg.scoreboardScrollPos > 0 ) {
+				cg.scoreboardScrollPos -= cg_scoreboardScrollStep.integer;
+				if ( cg.scoreboardScrollPos < 0 ) {
+					cg.scoreboardScrollPos = 0;
+				}
 			}
+			return qtrue;
 		}
-		return qtrue;
-	}
 
-	if ( key == K_MWHEELDOWN || key == K_PGDN || key == K_KP_PGDN ) {
-		CG_ScrollScoreboardDown();
-		return qtrue;
+		if ( key == K_MWHEELDOWN || key == K_PGDN || key == K_KP_PGDN ) {
+			CG_ScrollScoreboardDown();
+			return qtrue;
+		}
 	}
 
 	return qfalse;
@@ -1985,18 +1837,14 @@ qboolean CG_KeyInterceptEvent( int key, qboolean down ) {
 
 /*
 ================
-CG_ClientNumFromName          0x300271F0  (unnamed in retail)
-
-RETAIL: __usercall( p@<ebx> ).  RTCW's function with Q_stricmp replaced by
-Q_stricmpn( .., .., 99999 ) and cgs.clientinfo replaced by bg_clientinfo.
+CG_ClientNumFromName
 ================
 */
 int CG_ClientNumFromName( const char *p ) {
 	int i;
 
 	for ( i = 0; i < cgs.maxclients; i++ ) {
-		if ( bg_clientinfo[i].infoValid && bg_clientinfo[i].name && p
-			 && Q_stricmpn( bg_clientinfo[i].name, p, 99999 ) == 0 ) {
+		if ( bg_clientinfo[i].infoValid && Q_stricmp( bg_clientinfo[i].name, p ) == 0 ) {
 			return i;
 		}
 	}
@@ -2005,9 +1853,9 @@ int CG_ClientNumFromName( const char *p ) {
 
 /*
 ================
-CG_ShowResponseHead           0x30027240
+CG_ShowResponseHead
 
-Menus_OpenByName is inlined (0x30027246).
+Menus_OpenByName( "voiceMenu" ), open-coded
 ================
 */
 void CG_ShowResponseHead( void ) {
@@ -2023,9 +1871,9 @@ void CG_ShowResponseHead( void ) {
 
 /*
 ================
-CG_RunMenuScript              0x30027280
+CG_RunMenuScript
 
-cgDC.runScript.  Empty: cgame runs no menu scripts of its own.
+cgDC.runScript
 ================
 */
 void CG_RunMenuScript( char **args ) {
@@ -2033,10 +1881,9 @@ void CG_RunMenuScript( char **args ) {
 
 /*
 ================
-CG_GetTeamColor               0x30027290
+CG_GetTeamColor
 
-cgDC.getTeamColor.  RTCW reads ps.persistant[PERS_TEAM]; CoD reads the shared
-clientInfo_t.
+cgDC.getTeamColor
 ================
 */
 void CG_GetTeamColor( vec4_t *color ) {
@@ -2044,20 +1891,23 @@ void CG_GetTeamColor( vec4_t *color ) {
 
 	client = cg.snap->ps.clientNum;
 
-	if ( bg_clientinfo[client].infoValid && bg_clientinfo[client].team == TEAM_AXIS ) {
-		( *color )[0] = 1.0f;
-		( *color )[1] = 0;
-		( *color )[2] = 0;
-		( *color )[3] = .25f;
-	} else if ( bg_clientinfo[client].infoValid && bg_clientinfo[client].team == TEAM_ALLIES ) {
-		( *color )[0] = 0;
-		( *color )[1] = 0;
-		( *color )[2] = 1.0f;
-		( *color )[3] = .25f;
-	} else {
-		( *color )[0] = 0;
-		( *color )[1] = .17f;
-		( *color )[2] = 0;
-		( *color )[3] = .25f;
+	if ( bg_clientinfo[client].infoValid ) {
+		if ( bg_clientinfo[client].team == TEAM_AXIS ) {
+			( *color )[0] = 1.0f;
+			( *color )[1] = 0;
+			( *color )[2] = 0;
+			( *color )[3] = .25f;
+			return;
+		}
+		if ( bg_clientinfo[client].team == TEAM_ALLIES ) {
+			( *color )[0] = ( *color )[1] = 0;
+			( *color )[2] = 1.0f;
+			( *color )[3] = .25f;
+			return;
+		}
 	}
+	( *color )[0] = 0;
+	( *color )[1] = .17f;
+	( *color )[2] = 0;
+	( *color )[3] = .25f;
 }

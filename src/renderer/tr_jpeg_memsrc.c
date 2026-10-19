@@ -9,14 +9,28 @@
 /* 0x005163DE `mov ecx, 400h / rep movsd` -- 1024 dwords. */
 #define COD_JPEG_INPUT_BUF_SIZE  4096
 
+/*
+ * CoD's in-memory decompression source manager -- libjpeg's jdatasrc.c
+ * `my_source_mgr` pattern, except `infile` is a raw byte pointer into the
+ * already-loaded file image rather than a FILE*.  Layout is IDA-verified
+ * against CoDMP.exe: pub at +0x00 (the 28-byte jpeg_source_mgr), infile at
+ * +0x1c, buffer at +0x20, start_of_file at +0x24 (a 1-byte boolean), for a
+ * total of 0x28 (40) bytes -- matching the alloc_small(cinfo, JPOOL_PERMANENT,
+ * 40) at 0x00516440.
+ */
 typedef struct {
-  struct jpeg_source_mgr pub;
-  const JOCTET *infile;
-  JOCTET *buffer;
-  boolean start_of_file;
+  struct jpeg_source_mgr pub;   /* +0x00  base source-mgr (jpeglib.h) */
+  const JOCTET *infile;         /* +0x1c  next byte in the source image */
+  JOCTET *buffer;               /* +0x20  4 KiB staging buffer */
+  boolean start_of_file;        /* +0x24  set by init_source, cleared by fill */
 } cod_source_mgr;
 
 typedef cod_source_mgr *cod_src_ptr;
+
+/* Pin the subclass size to the retail allocation.  Self-contained (this TU is
+ * the libjpeg boundary and deliberately pulls in no q_shared.h), so a header-
+ * free negative-array guard stands in for COD1_ASSERT_SIZE. */
+typedef char cod_source_mgr_size_check[ SIZEOF( cod_source_mgr ) == 40 ? 1 : -1 ];
 
 
 /* ---- CoD_jpeg_init_source  0x00516360 ----  VERIFIED */

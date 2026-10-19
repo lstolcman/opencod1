@@ -4,15 +4,11 @@
  * The retail tree had a qcommon/cm_local.h; this is it, rebuilt from
  * CoDMP.exe.  Only the cm_*.c units include it.
  *
- * WHY THIS FILE EXISTS SEPARATELY FROM cod1_types.h
- * -------------------------------------------------
- * cod1_types.h still declares every collision record as an opaque blob of a
- * proven size (COD1_OPAQUE_TYPE).  Nothing here contradicts those sizes --
- * each real layout below is asserted to be exactly the size cod1_types.h
- * already proves.  The opaque names are renamed aside for the duration of the
- * cod1_types.h include so both can coexist; when these layouts move into
- * cod1_types.h the whole #define block at the top of this file is deleted in
- * one step and no .c file needs to change.
+ * As in RTCW, this header pulls in the patch-collide records
+ * (cm_patch_local.h, RTCW's cm_patch.h); the work records the server's
+ * sector walkers share with sv_world_mp.c are in cm_public.h (via qcommon.h).
+ * Every size asserted below is the one the retail code's array strides and
+ * stack frames prove.
  *
  * Every struct is corroborated by opencoduo (coduo-server-master/
  * dedicated-engine/src/physics_collision/): CoD1 and CoD:UO load each other's
@@ -25,38 +21,8 @@
 #ifndef __CM_LOCAL_H__
 #define __CM_LOCAL_H__
 
-/* ------------------------------------------------------------------------- *
- * Rename cod1_types.h's opaque placeholders aside.  Delete this block (and
- * the matching #undef block) once the real layouts live in cod1_types.h.
- * ------------------------------------------------------------------------- */
-#define cbrush_t            cod1_opaque_cbrush_t
-#define cLeaf_t             cod1_opaque_cLeaf_t
-#define cmodel_t            cod1_opaque_cmodel_t
-#define cPatch_t            cod1_opaque_cPatch_t
-#define leafList_t          cod1_opaque_leafList_t
-#define traceWork_t         cod1_opaque_traceWork_t
-#define moveclip_t          cod1_opaque_moveclip_t
-#define pointtrace_t        cod1_opaque_pointtrace_t
-#define sightclip_t         cod1_opaque_sightclip_t
-#define sightpointtrace_t   cod1_opaque_sightpointtrace_t
-
 #include "qcommon.h"
-
-#undef cbrush_t
-#undef cLeaf_t
-#undef cmodel_t
-#undef cPatch_t
-#undef leafList_t
-#undef traceWork_t
-#undef moveclip_t
-#undef pointtrace_t
-#undef sightclip_t
-#undef sightpointtrace_t
-
-/* Each real layout must come out at exactly the size cod1_types.h proves. */
-#define CM_ASSERT_MATCHES_OPAQUE( real, opaque ) \
-	COD1_STATIC_ASSERT( sizeof( real ) == sizeof( opaque ), \
-	                    #real " must match the proven size of " #opaque )
+#include "cm_patch_local.h"
 
 /*
 =============================================================================
@@ -64,7 +30,7 @@
 						ON-DISK BSP RECORDS
 
 	CoD's lump_t is { int filelen; int fileofs; } -- REVERSED from Q3/RTCW.
-	It is declared that way in cod1_types.h; do not "fix" it.  Proof:
+	It is declared that way in qcommon.h; do not "fix" it.  Proof:
 	CM_LoadLump_m (0x0041A180) reads the 272-byte header and then seeks
 	FS_Seek(f, lumps[2i+1] - 272, FS_SEEK_CUR), i.e. the SECOND dword is the
 	file offset, while the FIRST is used as both the allocation size and the
@@ -95,8 +61,8 @@ enum
 {
 	LUMP_MATERIALS      = 0,    /* CMod_LoadShaders                 */
 	LUMP_PLANES         = 2,    /* CMod_LoadPlanes                  */
-	LUMP_BRUSHSIDES     = 3,    /* CMod_LoadBrushes, first  arg     */
-	LUMP_BRUSHES        = 4,    /* CMod_LoadBrushes, second arg     */
+	LUMP_BRUSHSIDES     = 3,    /* CMod_LoadBrushes, second arg     */
+	LUMP_BRUSHES        = 4,    /* CMod_LoadBrushes, first  arg     */
 	LUMP_COLLISIONVERTS = 25,   /* CMod_LoadLeafCurvesAndTerrain    */
 	LUMP_COLLISIONINDEX = 26,
 	LUMP_LEAFSURFACES_D = 24,   /* the 16-byte curve/terrain records */
@@ -197,7 +163,6 @@ typedef struct cbrush_t
 	short axialMaterialNum[6];      /* +0x28  [0..2] mins planes, [3..5] maxs */
 } cbrush_t;
 COD1_ASSERT_SIZE( cbrush_t, 52 );
-CM_ASSERT_MATCHES_OPAQUE( cbrush_t, cod1_opaque_cbrush_t );
 
 /*
  * 16 bytes.  CMod_LoadLeafs allocates `16 * count` and writes every field
@@ -221,7 +186,6 @@ typedef struct cLeaf_t
 	short cellnum;                  /* +0x0E */
 } cLeaf_t;
 COD1_ASSERT_SIZE( cLeaf_t, 16 );
-CM_ASSERT_MATCHES_OPAQUE( cLeaf_t, cod1_opaque_cLeaf_t );
 
 /*
  * 40 bytes = 12 + 12 + sizeof(cLeaf_t).  CONFIRMED three ways:
@@ -242,7 +206,6 @@ typedef struct cmodel_t
 	cLeaf_t leaf;                   /* +0x18  submodels are a single leaf */
 } cmodel_t;
 COD1_ASSERT_SIZE( cmodel_t, 40 );
-CM_ASSERT_MATCHES_OPAQUE( cmodel_t, cod1_opaque_cmodel_t );
 
 /*
  * 8 bytes.  CMod_LoadNodes allocates `8 * count`, stores a plane POINTER
@@ -287,7 +250,6 @@ typedef struct cPatch_t
 	void            *tc;            /* +0x28  terrain, or NULL     */
 } cPatch_t;
 COD1_ASSERT_SIZE( cPatch_t, 44 );
-CM_ASSERT_MATCHES_OPAQUE( cPatch_t, cod1_opaque_cPatch_t );
 
 /*
  * 48 bytes.  CONFIRMED field by field from CM_BoxLeafnums (0x00421E10), which
@@ -314,7 +276,6 @@ typedef struct leafList_t
 	void ( *storeLeafs )( struct leafList_t *ll, int nodenum );  /* +0x2C */
 } leafList_t;
 COD1_ASSERT_SIZE( leafList_t, 48 );
-CM_ASSERT_MATCHES_OPAQUE( leafList_t, cod1_opaque_leafList_t );
 
 /*
  * 24 bytes.  The capsule/sphere used by the capsule trace paths.  opencoduo
@@ -355,126 +316,6 @@ typedef struct traceWork_t
 	vec3_t sphereExtents;           /* +0x10C */
 } traceWork_t;
 COD1_ASSERT_SIZE( traceWork_t, 280 );
-CM_ASSERT_MATCHES_OPAQUE( traceWork_t, cod1_opaque_traceWork_t );
-
-/*
-=============================================================================
-
-			SERVER-SIDE WORK RECORDS PASSED THROUGH THE SECTOR TREE
-
-	These are built on a caller's stack and handed to the CM_*ToEntities_r
-	walkers.  They are declared here because the walkers live in cm_world.c.
-
-=============================================================================
-*/
-
-/*
- * 124 bytes (0x7C).  Built by SV_Trace and consumed by
- * CM_ClipMoveToEntities_r / SV_ClipMoveToEntity.  Matches opencoduo's
- * cmClipMoveWork_t exactly, whose 0x7c also matches the proven CoD1 size.
- *
- * expandedHalfSize is (maxs - mins) * 0.5 + 1.0 and is what the sector walker
- * reads at +0x18 + axis*4 to decide whether to descend a branch.
- */
-typedef struct moveclip_t
-{
-	vec3_t mins;                    /* +0x00 */
-	vec3_t maxs;                    /* +0x0C */
-	vec3_t expandedHalfSize;        /* +0x18 */
-	vec3_t start;                   /* +0x24 */
-	vec3_t end;                     /* +0x30 */
-	trace_t trace;                  /* +0x3C */
-	int passEntityNum;              /* +0x6C */
-	int passOwnerNum;               /* +0x70 */
-	int contentmask;                /* +0x74 */
-	qboolean capsule;               /* +0x78 */
-} moveclip_t;
-COD1_ASSERT_SIZE( moveclip_t, 124 );
-CM_ASSERT_MATCHES_OPAQUE( moveclip_t, cod1_opaque_moveclip_t );
-
-/*
- * 100 bytes.  DIVERGENCE FROM opencoduo, and the binary wins.
- *
- * opencoduo's cmPointTraceWork_t is 0x5C (92): start, end, trace,
- * passEntityNum, passOwnerNum, contentmask, useDObj, dobjTracePartState.
- * CoD1's proven size is 100 (0x64), eight bytes longer.  The prefix through
- * +0x54 is common to both -- CM_PointTraceToEntities_r reads start +0x00,
- * end +0x0C, trace +0x18, pass entity +0x48, pass owner +0x4C and contents
- * +0x50 -- so the extra two dwords are at the tail, where UO has the DObj
- * pair.  They are left named as unknowns rather than guessed.
- */
-typedef struct pointtrace_t
-{
-	vec3_t start;                   /* +0x00 */
-	vec3_t end;                     /* +0x0C */
-	trace_t trace;                  /* +0x18 */
-	int passEntityNum;              /* +0x48 */
-	int passOwnerNum;               /* +0x4C */
-	int contentmask;                /* +0x50 */
-	qboolean useDObj;               /* +0x54 */
-	const byte      *dobjTracePartState; /* +0x58 */
-	int unknown_0x5C;               /* +0x5C  TODO: not in UO's 0x5C-byte form */
-	int unknown_0x60;               /* +0x60 */
-} pointtrace_t;
-COD1_ASSERT_SIZE( pointtrace_t, 100 );
-CM_ASSERT_MATCHES_OPAQUE( pointtrace_t, cod1_opaque_pointtrace_t );
-
-/*
- * 84 bytes (0x54).
- *
- * SV_SightTrace (0x0045FCA0) builds sightclip_t and sightpointtrace_t in ONE
- * stack buffer across its two mutually exclusive branches, so neither is
- * bounded by its own construction alone.  What settles it is that the shared
- * buffer starts at esp+0x1C in a frame whose return address sits at 0x70:
- * the box branch's last field is written at buffer+0x50, so the record runs
- * to buffer+0x54 and 0x1C + 0x54 = 0x70 exactly fills the frame.
- *
- * 0x54 is also precisely the size of opencoduo's cmClipSightTraceWork_t, and
- * the field-by-field writes at 0x0045FE01..0x0045FF85 reproduce its layout:
- *   +0x00 -halfsize   +0x0C +halfsize   +0x18 halfsize + 1
- *   +0x24 start + centre   +0x30 end + centre
- *   +0x3C/+0x40 the two skip entities, +0x44/+0x48 their owners
- *   +0x4C contentmask, +0x50 the trailing flag
- * SV_SightTrace's last parameter, `locational`, lands in the slot opencoduo
- * calls capsule; kept as capsule, the consumer being
- * CM_ClipSightTraceToEntities_r either way.
- */
-typedef struct sightclip_t
-{
-	vec3_t mins;                    /* +0x00 */
-	vec3_t maxs;                    /* +0x0C */
-	vec3_t expandedHalfSize;        /* +0x18 */
-	vec3_t start;                   /* +0x24 */
-	vec3_t end;                     /* +0x30 */
-	int passEntityNum;              /* +0x3C */
-	int passOwnerNum;               /* +0x40 */
-	int passEntityOwnerNum;         /* +0x44 */
-	int passOwnerOwnerNum;          /* +0x48 */
-	int contentmask;                /* +0x4C */
-	qboolean capsule;               /* +0x50 */
-} sightclip_t;
-COD1_ASSERT_SIZE( sightclip_t, 84 );
-
-/*
- * 44 bytes (0x2C).
- *
- * SV_SightTrace's point branch (0x0045FD2E..0x0045FDDD) writes start +0x00,
- * end +0x0C, the two skip entities +0x18/+0x1C, their owners +0x20/+0x24 and
- * the contents mask +0x28, then calls CM_PointSightTraceToEntities_r.  The
- * highest byte touched is +0x2B.  Identical to opencoduo's
- * cmPointSightTraceWork_t.
- */
-typedef struct sightpointtrace_t
-{
-	vec3_t start;                   /* +0x00 */
-	vec3_t end;                     /* +0x0C */
-	int passEntityNum;              /* +0x18 */
-	int passOwnerNum;               /* +0x1C */
-	int passEntityOwnerNum;         /* +0x20 */
-	int passOwnerOwnerNum;          /* +0x24 */
-	int contentmask;                /* +0x28 */
-} sightpointtrace_t;
-COD1_ASSERT_SIZE( sightpointtrace_t, 44 );
 
 /*
  * There is no TraceExtents struct.  The first stack argument of CM_TraceBox
@@ -491,10 +332,10 @@ COD1_ASSERT_SIZE( sightpointtrace_t, 44 );
 						COLLISION GLOBALS
 
 	Retail kept all of these in one `clipMap_t cm` at 0x016174A0 -- CM_LoadMap
-	clears the lot with a single Com_Memset(qpath, 0, 0xA15C), and 0x016174A0
-	+ 0xA15C lands exactly on cmod_base.  They are separate objects here, so
-	CM_LoadMap clears them one at a time instead, which is behaviourally
-	identical.
+	clears the lot with a single Com_Memset(&cm, 0, 0xA15C), and 0x016174A0
+	+ 0xA15C lands exactly on cmod_base.  The world sectors cm_world.c walks
+	are its tail.  CM_ClearMap clears the same fields one by one (see
+	CM_ClearWorldSectors), which is behaviourally identical.
 
 	Addresses are the retail ones.
 
@@ -503,94 +344,133 @@ COD1_ASSERT_SIZE( sightpointtrace_t, 44 );
 
 #define MAX_SUBMODELS       512     /* CMod_LoadSubmodels; also the two box
                                      * handles 511 and 510 */
+#define CM_MAX_WORLD_SECTORS    1024
+
+typedef struct worldSector_t
+{
+	int axis;                               /* +0x00  0 = x, 1 = y     */
+	int staticModelContents;                /* +0x04 */
+	int sightStaticModelContents;           /* +0x08  big models only  */
+	int entityContents;                     /* +0x0C */
+	float dist;                             /* +0x10  split plane      */
+	struct cmEntityLink_t   *entities;      /* +0x14 */
+	struct cmStaticModelLink_t *staticModels; /* +0x18 */
+	struct worldSector_t    *parent;        /* +0x1C  also the free list link */
+	struct worldSector_t    *children[2];   /* +0x20  [0] above, [1] below */
+} worldSector_t;
+COD1_ASSERT_SIZE( worldSector_t, 40 );
+
 #define BOX_MODEL_HANDLE    511
 #define CAPSULE_MODEL_HANDLE 510
 
 /*
  * WHERE THE STORAGE ACTUALLY LIVES
  * --------------------------------
- * Most of these objects are defined by cod1_globals.c, which types every one
- * of them `int`.  They are re-declared here at the real type and the
- * cod1_globals.c name is aliased to the retail one, so there stays exactly ONE
- * object per retail address and every unit sees the same storage.  cm_trace.c
- * in particular reads cm_leafs, cm_leafbrushes, cm_brushes, cm_patches, the
- * node array and the box model directly through the cod1_globals.c names.
+ * One clipMap_t object, `cm` (cm_load.c).  Retail addresses it as a whole, so a
+ * store through any of its arrays may alias the counters and pointers; the
+ * per-field names the collision code uses are macros onto the members.
  *
- * NOTE the cod1_globals.c `cm_planes` / `cm_numPlanes` are NOT these: they sit at
- * 0x0087C7DC/0x0087C7E0, next to the CM_LoadLump_m scratch, and have nothing
- * to do with the collision plane array at 0x016174FC.  Aliasing the dword_
- * names is what keeps that distinction straight.
+ * NOTE the patch plane pool at 0x0087C7DC/0x0087C7E0 (cm_patch.c's
+ * cm_numPatchPlanes / cm_patchPlanes) is NOT cm.planes (0x016174FC).
  */
+typedef struct clipMap_s {
+	char                    name[MAX_QPATH];    /* +0x00 0x016174A0 */
+	int                     numStaticModels;    /* +0x40 */
+	struct cmStaticModel_t *staticModels;       /* +0x44 cm_staticmodel.c */
+	int                     numMaterials;       /* +0x48 0x016174E8 */
+	dmaterial_t            *materials;          /* +0x4C */
+	int                     numBrushSides;      /* +0x50 */
+	cbrushside_t           *brushsides;         /* +0x54 */
+	int                     numPlanes;          /* +0x58 */
+	cplane_t               *planes;             /* +0x5C 0x016174FC */
+	int                     numNodes;           /* +0x60 */
+	cNode_t                *nodes;              /* +0x64 */
+	int                     numLeafs;           /* +0x68 */
+	cLeaf_t                *leafs;              /* +0x6C */
+	int                     numLeafBrushes;     /* +0x70 */
+	int                    *leafbrushes;        /* +0x74 */
+	int                     numLeafSurfaces;    /* +0x78 */
+	int                    *leafsurfaces;       /* +0x7C */
+	int                     numSubModels;       /* +0x80 0x01617520 */
+	cmodel_t               *cmodels;            /* +0x84 */
+	int                     numBrushes;         /* +0x88 */
+	cbrush_t               *brushes;            /* +0x8C */
+	int                     numClusters;        /* +0x90 */
+	int                     clusterBytes;       /* +0x94 */
+	byte                   *visibility;         /* +0x98 0x01617538 */
+	qboolean                vised;              /* +0x9C */
+	int                     numEntityChars;     /* +0xA0 */
+	char                   *entityString;       /* +0xA4 */
+	int                     numAreas;           /* +0xA8 */
+	cArea_t                *areas;              /* +0xAC */
+	int                    *areaPortals;        /* +0xB0 */
+	int                     numPatches;         /* +0xB4 */
+	cPatch_t               *patches;            /* +0xB8 */
+	int                     floodvalid;         /* +0xBC */
+	int                     checkcount;         /* +0xC0 0x01617560 */
+	float                   worldMins[3];       /* +0xC4 sv_worldMins (cm_world.c) */
+	float                   worldMaxs[3];       /* +0xD0 */
+	cbrush_t               *box_brush;          /* +0xDC 0x0161757C */
+	cmodel_t                box_model;          /* +0xE0 0x01617580 */
+	worldSector_t           sectors;            /* +0x108 0x016175A8 the ROOT, not an array */
+	worldSector_t          *freeSectors;        /* +0x130 0x016175D0 free-sector list head */
+	worldSector_t           listHeadNull;       /* +0x134 0x016175D4 the "no child" sentinel */
+	worldSector_t           pool[CM_MAX_WORLD_SECTORS]; /* +0x15C 0x016175FC */
+} clipMap_t;
+COD1_ASSERT_SIZE( clipMap_t, 0xA15C );
+COD1_STATIC_ASSERT( offsetof( clipMap_t, sectors ) == 0x108, "cm.sectors offset" );
+COD1_STATIC_ASSERT( offsetof( clipMap_t, pool ) == 0x15C, "cm.pool offset" );
+COD1_STATIC_ASSERT( offsetof( clipMap_t, numMaterials ) == 0x48, "cm.numMaterials offset" );
+COD1_STATIC_ASSERT( offsetof( clipMap_t, checkcount ) == 0xC0, "cm.checkcount offset" );
+COD1_STATIC_ASSERT( offsetof( clipMap_t, box_model ) == 0xE0, "cm.box_model offset" );
 
-extern int cm_numMaterials;               /* 0x016174E8 */
-extern dmaterial_t      *cm_materials; /* 0x016174EC */
-extern int cm_numBrushSides;               /* 0x016174F0 */
-extern cbrushside_t     *cm_brushsides; /* 0x016174F4 */
-extern int cm_numBrushPlanes;               /* 0x016174F8 */
-extern cplane_t         *cm_brushPlanes; /* 0x016174FC */
-extern int cm_numNodes;               /* 0x01617500 */
-extern cNode_t          *node_struct;   /* 0x01617504 */
-extern int cm_numLeafs;               /* 0x01617508 */
-extern cLeaf_t          *cm_leafs; /* 0x0161750C */
-extern int cm_numLeafBrushes;               /* 0x01617510 */
-extern int              *cm_leafbrushes; /* 0x01617514 */
-extern int cm_numLeafSurfaces;               /* 0x01617518 */
-extern int              *cm_leafsurfaces; /* 0x0161751C */
-extern int cm_numSubModels;               /* 0x01617520 */
-extern cmodel_t         *cm_cmodels; /* 0x01617524 */
-extern int cm_numBrushes;               /* 0x01617528 */
-extern cbrush_t         *cm_brushes;    /* 0x0161752C */
-extern int cm_numClusters;               /* 0x01617530 */
-extern int cm_clusterBytes;               /* 0x01617534 */
-extern byte             *lastLeaf;      /* 0x01617538 */
-extern qboolean cm_vised;          /* 0x0161753C */
-extern int cm_entityStringLen;          /* 0x01617540 */
-extern char             *cm_entityString; /* 0x01617544 */
-extern int cm_numAreas;                 /* 0x01617548 */
-extern cArea_t          *cm_areas;      /* 0x0161754C */
-extern int              *cm_areaPortals;/* 0x01617550 */
-extern int cm_numPatches;               /* 0x01617554 */
-extern cPatch_t         *cm_patches; /* 0x01617558 */
-extern int cm_floodvalid;               /* 0x0161755C */
-extern int cm_checkcount;               /* 0x01617560 */
-
-extern cbrush_t         *box_brush;     /* 0x0161757C */
+extern clipMap_t        cm;             /* 0x016174A0 */
 extern byte             *cmod_base;     /* 0x016215FC */
 extern cvar_t           *cm_noCurves;   /* 0x01617480 */
 extern cvar_t           *cm_playerCurveClip; /* 0x01621600 */
 
-#define cm_numMaterials     cm_numMaterials
-#define cm_materials        cm_materials
-#define cm_numBrushSides    cm_numBrushSides
-#define cm_brushsides       cm_brushsides
-#define cm_numPlanes        cm_numBrushPlanes
-#define cm_planes           cm_brushPlanes
-#define cm_numNodes         cm_numNodes
-#define cm_nodes            node_struct
-#define cm_numLeafs         cm_numLeafs
-#define cm_leafs            cm_leafs
-#define cm_numLeafBrushes   cm_numLeafBrushes
-#define cm_leafbrushes      cm_leafbrushes
-#define cm_numLeafSurfaces  cm_numLeafSurfaces
-#define cm_leafsurfaces     cm_leafsurfaces
-#define cm_numSubModels     cm_numSubModels
-#define cm_cmodels          cm_cmodels
-#define cm_numBrushes       cm_numBrushes
-#define cm_numClusters      cm_numClusters
-#define cm_clusterBytes     cm_clusterBytes
-#define cm_visibility       lastLeaf
-#define cm_vised            cm_vised
-#define cm_numPatches       cm_numPatches
-#define cm_patches          cm_patches
-#define cm_floodvalid       cm_floodvalid
-#define cm_checkcount       cm_checkcount
-
-/* These two are owned by cm_load.c outright.  cm_boxModel needs 40 contiguous
- * bytes and cod1_globals.c carries the retail object as six separate ints, so
- * it cannot be aliased; CM_TempBoxModel mirrors into those ints for as long as
- * cm_trace.c still reads them. */
-extern char cm_mapName[MAX_QPATH];      /* 0x016174A0 */
-extern cmodel_t cm_boxModel;            /* 0x01617580 */
+#define cm_mapName          cm.name
+#define cm_numStaticModels  cm.numStaticModels
+#define cm_staticModels     cm.staticModels
+#define cm_numMaterials     cm.numMaterials
+#define cm_materials        cm.materials
+#define cm_numBrushSides    cm.numBrushSides
+#define cm_brushsides       cm.brushsides
+#define cm_numPlanes        cm.numPlanes
+#define cm_planes           cm.planes
+#define cm_numNodes         cm.numNodes
+#define cm_nodes            cm.nodes
+#define cm_numLeafs         cm.numLeafs
+#define cm_leafs            cm.leafs
+#define cm_numLeafBrushes   cm.numLeafBrushes
+#define cm_leafbrushes      cm.leafbrushes
+#define cm_numLeafSurfaces  cm.numLeafSurfaces
+#define cm_leafsurfaces     cm.leafsurfaces
+#define cm_numSubModels     cm.numSubModels
+#define cm_cmodels          cm.cmodels
+#define cm_numBrushes       cm.numBrushes
+#define cm_brushes          cm.brushes
+#define cm_numClusters      cm.numClusters
+#define cm_clusterBytes     cm.clusterBytes
+#define cm_visibility       cm.visibility
+#define cm_vised            cm.vised
+#define cm_entityStringLen  cm.numEntityChars
+#define cm_entityString     cm.entityString
+#define cm_numAreas         cm.numAreas
+#define cm_areas            cm.areas
+#define cm_areaPortals      cm.areaPortals
+#define cm_numPatches       cm.numPatches
+#define cm_patches          cm.patches
+#define cm_floodvalid       cm.floodvalid
+#define cm_checkcount       cm.checkcount
+#define sv_worldMinsX       cm.worldMins[0]
+#define sv_worldMinsY       cm.worldMins[1]
+#define sv_worldMinsZ       cm.worldMins[2]
+#define sv_worldMaxsX       cm.worldMaxs[0]
+#define sv_worldMaxsY       cm.worldMaxs[1]
+#define sv_worldMaxsZ       cm.worldMaxs[2]
+#define box_brush           cm.box_brush
+#define cm_boxModel         cm.box_model
 
 /*
 =============================================================================
@@ -615,7 +495,7 @@ int CM_LeafArea( int leafnum );
 void CM_InitBoxHull( void );
 clipHandle_t CM_TempBoxModel( const vec3_t mins, const vec3_t maxs,
 							  int contents, qboolean capsule );
-void CM_SetTempBoxModelContents( int contents );
+int CM_SetTempBoxModelContents( int contents );
 void CM_ModelBounds( clipHandle_t model, vec3_t mins, vec3_t maxs );
 
 /* cm_test.c */
@@ -662,11 +542,12 @@ void *CM_GenerateTerrainCollide( int numIndexes, const short *indexes,
 
 /* cm_world.c */
 void CM_ClearWorld( void );
-/* PORT ONLY -- no retail address.  Zeroes the world sector storage that retail
- * gets for free from CM_LoadMap's Com_Memset(cm, 0, 0xA15C), whose 0xA15C block
- * ends exactly at the end of the sector pool.  Called from CM_ClearMap, at the
- * same point in the load that retail's memset runs.  Do not move the clear
- * into CM_ClearWorld, which retail does not do. */
+/* PORT ONLY -- no retail address.  Zeroes the world sector tail of cm that
+ * retail clears with CM_LoadMap's Com_Memset(&cm, 0, 0xA15C).  Called from
+ * CM_ClearMap, at the same point in the load that retail's memset runs: the
+ * tree's Com_Memset inlines into CM_LoadMap, retail's (which calls memset32)
+ * does not.  Do not move the clear into CM_ClearWorld, which retail does not
+ * do. */
 void CM_ClearWorldSectors( void );
 qboolean CM_TraceBox( const vec3_t start, const vec3_t end,
 					  const vec3_t mins, const vec3_t maxs, float fraction );

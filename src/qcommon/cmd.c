@@ -9,6 +9,14 @@
 
 #include "qcommon.h"
 
+/* Cmd_ExecuteString reads only sv.state, through this one-field view of
+ * server_mp/server.h's server_t (state is its first member).  Including
+ * server.h here instead compiles to the same code but changes the /GL
+ * object cmd.obj, and that alone flips the LTCG scheduling tie in
+ * Netchan_Process (measured 2026-10-17). */
+typedef struct { serverState_t state; } cmdServerView_t;
+extern cmdServerView_t sv;
+
 #define MAX_CMD_BUFFER  16384
 
 static int cmd_wait;
@@ -19,7 +27,15 @@ int cmd_argc;
 char        *cmd_argv[MAX_STRING_TOKENS];
 static char cmd_tokenized[BIG_INFO_STRING + MAX_STRING_TOKENS];
 
-static cmd_function_t  *cmd_functions;
+typedef struct cmd_function_s
+{
+	struct cmd_function_s   *next;
+	char                    *name;
+	xcommand_t function;
+} cmd_function_t;
+COD1_ASSERT_SIZE( cmd_function_t, 12 );
+
+static cmd_function_t  *cmd_functions;   /* 0x00890BE8 */
 
 /* ---- Cmd_Wait_f  0x00428150 ---- VERIFIED */
 void Cmd_Wait_f( void ) {
@@ -47,7 +63,7 @@ void Cbuf_AddText( const char *text ) {
 		Com_Printf( "Cbuf_AddText: overflow\n" );
 		return;
 	}
-	Com_Memcpy( &cmd_text.data[cmd_text.cursize], text, l );
+	memcpy( &cmd_text.data[cmd_text.cursize], text, l );
 	cmd_text.cursize += l;
 }
 
@@ -66,7 +82,7 @@ void Cbuf_InsertText( const char *text ) {
 		cmd_text.data[ i + len ] = cmd_text.data[ i ];
 	}
 
-	Com_Memcpy( cmd_text.data, text, len - 1 );
+	memcpy( cmd_text.data, text, len - 1 );
 
 	cmd_text.data[ len - 1 ] = '\n';
 
@@ -129,8 +145,10 @@ void Cbuf_Execute( void ) {
 			i = MAX_CMD_LINE - 1;
 		}
 
-		Com_Memcpy( line, text, i );
-		line[i] = 0;
+		memcpy( line, text, i );
+		/* retail 0x0042839C terminates with no bound check; written as a pointer store because
+		   line[i] = 0 makes modern /GS add a range-check fast-fail */
+		*( line + i ) = 0;
 
 		if ( i == cmd_text.cursize ) {
 			cmd_text.cursize = 0;
@@ -155,7 +173,8 @@ void Cmd_Exec_f( void ) {
 		return;
 	}
 
-	Q_strncpyz( filename, Cmd_Argv( 1 ), sizeof( filename ) );
+	/* cmd_argv[1], not Cmd_Argv( 1 ): the folded inline copy allocates eax/ecx/edx differently */
+	Q_strncpyz( filename, cmd_argv[1], sizeof( filename ) );
 	Com_DefaultExtension( filename, sizeof( filename ), ".cfg" );
 	FS_ReadFile( filename, (void **)&f );
 	if ( !f ) {
@@ -198,10 +217,10 @@ int     Cmd_Argc( void ) {
 
 /* ---- Cmd_Argv  0x004285C0 ---- VERIFIED */
 char    *Cmd_Argv( int arg ) {
-	if ( (unsigned int)arg < (unsigned int)cmd_argc ) {
-		return cmd_argv[arg];
+	if ( (unsigned)arg >= cmd_argc ) {
+		return "";
 	}
-	return "";
+	return cmd_argv[arg];
 }
 
 /* ---- Cmd_ArgvBuffer  0x004285E0 ---- VERIFIED */
@@ -245,6 +264,9 @@ void Cmd_TokenizeString2( const char *text_in, int max_tokens ) {
 	textOut = cmd_tokenized;
 
 	while ( 1 ) {
+		if ( cmd_argc == MAX_STRING_TOKENS ) {
+			return;
+		}
 		if ( !--max_tokens ) {
 			if ( !*text ) {
 				return;
@@ -317,9 +339,6 @@ void Cmd_TokenizeString2( const char *text_in, int max_tokens ) {
 		if ( *text <= ' ' ) {
 			text++;
 		}
-		if ( cmd_argc == MAX_STRING_TOKENS ) {
-			return;
-		}
 	}
 }
 
@@ -331,7 +350,6 @@ void Cmd_TokenizeString( const char *text_in ) {
 /* ---- Cmd_AddCommand  0x00428840 ---- VERIFIED */
 void    Cmd_AddCommand( const char *cmd_name, xcommand_t function ) {
 	cmd_function_t  *cmd;
-	int len;
 
 	for ( cmd = cmd_functions ; cmd ; cmd = cmd->next ) {
 		if ( !strcmp( cmd_name, cmd->name ) ) {
@@ -342,14 +360,8 @@ void    Cmd_AddCommand( const char *cmd_name, xcommand_t function ) {
 		}
 	}
 
-	cmd = Com_MallocOrDie( sizeof( cmd_function_t ) );
-	Com_Memset( cmd, 0, sizeof( cmd_function_t ) );
-
-	len = strlen( cmd_name ) + 1;
-	cmd->name = Com_MallocOrDie( len );
-	Com_Memset( cmd->name, 0, len );
-	strcpy( cmd->name, cmd_name );
-
+	cmd = Z_MallocInternal( sizeof( cmd_function_t ) );
+	cmd->name = CopyStringInternal( cmd_name );
 	cmd->function = function;
 	cmd->next = cmd_functions;
 	cmd_functions = cmd;
@@ -409,7 +421,7 @@ void    Cmd_ExecuteString( const char *text ) {
 
 	for ( prev = &cmd_functions ; *prev ; prev = &cmd->next ) {
 		cmd = *prev;
-		if ( cmd_argv[0] && cmd->name && !Q_stricmpn( cmd->name, cmd_argv[0], 99999 ) ) {
+		if ( !Q_stricmp( cmd_argv[0], cmd->name ) ) {
 			*prev = cmd->next;
 			cmd->next = cmd_functions;
 			cmd_functions = cmd;
@@ -434,7 +446,7 @@ void    Cmd_ExecuteString( const char *text ) {
 	}
 
 	if ( com_sv_running && com_sv_running->integer && sv.state == SS_GAME ) {
-		g_unk_A9CC58 = 1;
+		xanim_activePoolSlot = 1;
 		if ( VM_Call( vm, GAME_CONSOLE_COMMAND ) ) {
 			return;
 		}
@@ -480,14 +492,4 @@ void Cmd_Init( void ) {
 	Cmd_AddCommand( "vstr",Cmd_Vstr_f );
 	Cmd_AddCommand( "echo",Cmd_Echo_f );
 	Cmd_AddCommand( "wait", Cmd_Wait_f );
-}
-
-void *Com_MallocOrDie( int size ) {
-	void *p;
-
-	p = malloc( size );
-	if ( !p ) {
-		Sys_Error( "Com_MallocOrDie: failed to allocate %i bytes", size );
-	}
-	return p;
 }

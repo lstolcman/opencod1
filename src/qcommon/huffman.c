@@ -336,7 +336,8 @@ void Huff_Decompress( msg_t *mbuf, int offset ) {
 	for ( j = 0; j < cch; j++ ) {
 		ch = 0;
 		if ( ( bloc >> 3 ) > size ) {
-			seq[j] = 0;
+			/* retail 0x0043CF1A stores with no bound check; pointer store avoids the modern /GS range-check fast-fail */
+			*( seq + j ) = 0;
 			break;
 		}
 		Huff_Receive( huff.tree, &ch, buffer );

@@ -1,27 +1,8 @@
 /*
- * g_scr_main_mp.c -- the multiplayer game module's half of the script system.
- *
- * Three things live here.  The script VM's exports arrive through Scr_FarHook
- * as a block of 102 function pointers (0x200A04F8) and the game's five
- * callbacks go back the other way (0x200A04E0); every Scr_* call anywhere in
- * this module is an indirect call through that block.  scr_const is the
- * module's table of interned script strings, filled once by GScr_LoadConsts.
- * And scr_functions[] / scr_methods[] are the builtin dispatch tables --
- * Scr_GetFunction and Scr_GetMethod are what the VM asks when a script names
- * something it does not know; almost every other function in the file is one
- * entry of those two tables.
- *
- * CoD's script VM has no RTCW ancestor, so none of this is a port.
- *
- * Function order is binary order (0x2002E330 .. 0x20035490), with the
- * far-hook block and Scr_FarHook (0x2003FB40, outside the unit's own range --
- * it belongs to the DLL side of script/scr_import.c) at the two ends.
- *
- * @fidelity: likely
+ * g_scr_main_mp.c -- script builtin functions and methods, the script system
+ * import block, and the game's script callbacks.
  */
 
-/* The unit calls strcpy / strcat / strncpy / strlwr the way the retail source
-   did; the modern CRT only deprecates the names. */
 #define _CRT_SECURE_NO_WARNINGS
 #define _CRT_NONSTDC_NO_DEPRECATE
 
@@ -35,108 +16,25 @@
 
 /* Declarations that belong in a shared header. */
 
-#define ENTITYNUM_WORLD             ( MAX_GENTITIES - 2 )
-
-/* Configstring layout this unit reaches. */
-#define CS_MUSIC                    3       /* Scr_AmbientPlay also drives it */
-#define CS_TEAMSCORE_AXIS           5
-#define CS_TEAMSCORE_ALLIES         6
-#define CS_SCORES                   20      /* the "winner" info string */
-#define CS_STATUSICONS              21
-#define CS_STATUSICONS_COUNT        8
-#define CS_HEADICONS                29
-#define CS_HEADICONS_COUNT          15
-#define CS_MODELS                   268
-#define CS_EFFECTS                  780
-#define CS_FX                       844
-#define CS_FX_COUNT                 256
-#define CS_SHELLSHOCKS              1100
-#define CS_SHELLSHOCKS_COUNT        16
-#define CS_MENUS                    1180
-#define CS_MENUS_COUNT              32
-#define CS_HINTSTRINGS              1212
-#define CS_HINTSTRINGS_COUNT        32
-
-/* entityState_t.eType. */
-#define ET_LOOP_FX                  10
-
-/* entity_event_t; bg_misc.c's eventnames[] is the authority. */
-#define EV_SOUND_ALIAS              172
-#define EV_GRENADE_EXPLODE          178
-#define EV_PLAY_FX                  191
-#define EV_PLAY_FX_DIR              192
-#define EV_PLAY_FX_ON_TAG           193
-#define EV_EARTHQUAKE               195
-#define EV_OBITUARY                 201
-
 /* entityShared_t.svFlags. */
-#define SVF_NOCLIENT                0x00000001
-#define SVF_BROADCAST               0x00000008
 #define SVF_OBJECTIVE               0x00000010
-#define SVF_CAPSULE                 0x00000200
 
-/* gentity_t.flags. */
-#define FL_NO_GRENADE_TOUCH_DAMAGE  0x00008000      /* GScr_EnableGrenadeTouchDamage */
-#define FL_NO_GRENADE_BOUNCE        0x00010000      /* GScr_DisableGrenadeBounce */
-
-/* Content masks.  0x2802031 is bulletTrace's with characters, 0x802031
-   without; 0x2810011 is the spawn-point capsule test's. */
+/* bulletTrace content masks, with and without characters. */
 #define MASK_BULLET_CHARACTERS      0x02802031
 #define MASK_BULLET                 0x00802031
-#define MASK_SPAWNPOINT             0x02810011
-#define CONTENTS_BODY               0x02000000
-/* the downward probe grenadeExplosionEffect uses to pick a surface type */
-#define MASK_GRENADE_SURFACE        0x00000011
 
-/* Com_Error levels: ERR_DROP is 1, the localization level is 7. */
+/* Com_Error level for localization errors. */
 #define ERR_LOCALIZATION            7
-
-/*
- * The script VM's value discriminator.  Scr_GetType returns it for a value and
- * Scr_GetPointerType for the object a VAR_OBJECT refers to.  The engine's own
- * 19-entry type-name table fixes the domain.
- */
-typedef enum scriptVarType_e {
-	VAR_UNDEFINED           = 0,
-	VAR_STRING              = 1,
-	VAR_LOCALIZED_STRING    = 2,
-	VAR_VECTOR              = 3,
-	VAR_FLOAT               = 4,
-	VAR_INTEGER             = 5,
-	VAR_CODEPOS             = 6,
-	VAR_OBJECT              = 7,
-	VAR_KEY_VALUE           = 8,
-	VAR_FUNCTION            = 9,
-	VAR_STACK               = 10,
-	VAR_ANIMATION           = 11,
-	VAR_THREAD              = 12,
-	VAR_ENTITY              = 13,
-	VAR_STRUCT              = 14,
-	VAR_ARRAY               = 15,
-	VAR_DEAD_THREAD         = 16,
-	VAR_DEAD_ENTITY         = 17,
-	VAR_DEAD_OBJECT         = 18,
-
-	VAR_COUNT               = 19
-} scriptVarType_t;
 
 /* level.exitRequest values. */
 #define EXITREQUEST_NONE            0
 #define EXITREQUEST_MAP_RESTART     1
 #define EXITREQUEST_EXITLEVEL       2
 
-/* level.objectives[].state. */
-#define OBJST_EMPTY                 0
-#define OBJST_ACTIVE                1
-#define OBJST_INVISIBLE             2
-#define OBJST_CURRENT               4
 
 /* GScr_SetClientNameMode. */
 #define CLIENTNAMEMODE_AUTO         0
 #define CLIENTNAMEMODE_MANUAL       1
-
-/* trap_SendConsoleCommand's exec_when. */
-#define EXEC_APPEND                 2
 
 /* forward: q_shared.c */
 int         Q_stricmpn( const char *s1, const char *s2, int n );
@@ -144,27 +42,27 @@ int         Q_strncasecmp( const char *s1, const char *s2, int n );
 int         Q_strcasecmp( const char *s1, const char *s2 );
 char        *Info_ValueForKey( const char *s, const char *key );
 
-/* q_shared.h carries these in the original tree. */
+/* normally from q_shared.h */
 #ifndef M_PI
 #define M_PI                        3.14159265358979323846f
 #endif
-#define PITCH                       0
-#define YAW                         1
-#define ROLL                        2
 
 /* forward: q_math.c */
-extern vec3_t vec3_origin;                      /* 0x20055D18 */
+extern const vec3_t vec3_origin;
 vec_t       VectorNormalize( vec3_t v );
 void        vectoangles( const vec3_t value1, vec3_t angles );
 void        AngleVectors( const vec3_t angles, vec3_t forward, vec3_t right, vec3_t up );
 byte        DirToByte( const vec3_t dir );
 float       RotationToYaw( const float *quat );
+float       Com_RandFloatRange( float lo, float hi );
+double      Distance( const vec3_t p1, const vec3_t p2 );           /* keep: double, matches original codegen */
+vec_t       DistanceSquared( const vec3_t p1, const vec3_t p2 );
+void        _VectorAdd( const vec3_t veca, const vec3_t vecb, vec3_t out );
 
 /* forward: q_parse.c */
 char        *Com_Parse( char **data_p );
 
-/* forward: the CRT.  Scr_ParseGameTypeList lowercases the script name with
-   the CRT's strlwr, not q_shared's Q_strlwr. */
+/* forward: the CRT (Scr_ParseGameTypeList uses strlwr, not Q_strlwr) */
 char        *strlwr( char *string );
 
 /* forward: bg_slidemove.c */
@@ -174,11 +72,8 @@ int         Q_ftol( float f );
 void        BG_FindAnims( void );
 void        BG_FindAnimTrees( void );
 void        BG_FinalizePlayerAnims( void );
-void        BG_CreateClientAnimTrees( void );
+void        BG_LoadAnimTreeInstances( void );
 byte        BG_GetWeaponIndexForName( const char *name );
-/* bg_animation.c defines the 0x200A1C80 object as bgs_animScriptData. */
-extern animScriptData_t bgs_animScriptData;             /* 0x200A1C80 */
-
 /* forward: g_hud_mp.c */
 void        GScr_AddFieldsForHudElems( void );
 void        GScr_NewHudElem( void );
@@ -197,151 +92,238 @@ typedef void ( *xmethod_t )( unsigned int entnum );
 /* ScriptEnt_GetMethod (g_scr_ent_mp.c), HudElem_GetMethod (g_hud_mp.c) and
    Player_GetMethod (g_client_script_cmd_mp.c) are declared in g_local.h. */
 
-/* forward: g_spawn_mp.c -- Scr_SetObjectField is the third of the five game
-   callbacks Scr_FarHook publishes. */
+/* forward: g_spawn_mp.c */
 void        Scr_SetObjectField( int classnum, int objectNum, int fieldnum );
 
 /* forward: g_mover_mp.c.  GScr_SetCursorHint validates against the same table
    the "cursorhint" spawn key parses. */
-extern char *predef_hintStrings[];                      /* 0x20069D98 */
+extern char *hintStrings[];
 
 /* forward: g_main_mp.c */
-extern vmCvar_t g_gametype;                             /* 0x20236CE0 */
-extern vmCvar_t g_no_script_spam;                       /* 0x20236AA0 */
-extern vmCvar_t cl_languagewarnings;                    /* 0x20236740 */
-extern vmCvar_t cl_languagewarningsaserrors;            /* 0x20235AE0 */
+extern vmCvar_t g_gametype;
+extern vmCvar_t g_NoScriptSpam;
+extern vmCvar_t g_languagewarnings;
+extern vmCvar_t g_languagewarningsaserrors;
 
 /*
  * ---------------------------------------------------------------------------
  * The script VM import block.
  *
- * Scr_FarHook memcpy's 0x198 bytes -- 102 pointers -- over the run of globals
- * starting at Scr_GetBool (0x200A04F8), in the order scr_import.c's
- * Scr_NearHook fills them.  Slots 54, 55, 75 and 78 are holes neither side
- * ever writes; the four names below keep the block's shape.
- *
- * Slots this module never calls are declared without a prototype: their
- * argument lists are not recovered and inventing one would be a guess.
+ * Scr_FarHook copies the script system's exports over the run of pointers
+ * below, in the order the engine fills them.  The four Scr_Unused slots are
+ * never written but keep the block's shape.  Slots this module never calls
+ * are declared without a prototype.
  * ---------------------------------------------------------------------------
  */
 
-/* The five game entry points Scr_FarHook hands back, immediately below the
-   import block. */
-static void ( *scr_gameExports[5] )( void );                                            /* 0x200A04E0 */
+/* the game callbacks Scr_FarHook hands back to the engine */
+void ( *scr_gameExports[5] )( void );
 
-/*
- * THE 102 SLOTS BELOW MUST BE ONE CONTIGUOUS RUN, IN THIS ORDER.  Scr_FarHook
- * memcpy's 0x198 bytes over them starting at &Scr_GetBool, which is what the
- * engine's Scr_NearHook block expects and what retail has at 0x200A04F8.  As 102
- * separate objects that is undefined -- C promises nothing about where distinct
- * globals land relative to each other -- so a named bss segment pins it: MSVC
- * emits a segment's variables in declaration order and the linker keeps one
- * object file's contribution to a section contiguous.  The block is one object
- * in the retail image, so retail almost certainly had a struct here.
- */
-#pragma bss_seg( ".scrimp" )
-int         ( *Scr_GetBool )( unsigned int num );                                       /* 0x200A04F8 */
-int         ( *Scr_GetInt )( unsigned int num );                                        /* 0x200A04FC */
-scr_anim_t  ( *Scr_GetAnim )( unsigned int num, void *anims );                          /* 0x200A0500 */
-void        ( *Scr_GetAnimTree )();                                                     /* 0x200A0504 */
-float       ( *Scr_GetFloat )( unsigned int num );                                      /* 0x200A0508 */
-const char  *( *Scr_GetString )( unsigned int num );                                    /* 0x200A050C */
-unsigned short ( *Scr_GetConstString )( unsigned int num );                             /* 0x200A0510 */
-const char  *( *Scr_GetDebugString )( unsigned int num );                               /* 0x200A0514 */
-const char  *( *Scr_GetIString )( unsigned int num );                                   /* 0x200A0518 */
-void        ( *Scr_GetConstIString )();                                                 /* 0x200A051C */
-void        ( *Scr_GetVector )( unsigned int num, vec3_t out );                         /* 0x200A0520 */
-void        ( *Scr_GetFunc )();                                                         /* 0x200A0524 */
-int         ( *Scr_GetType )( unsigned int num );                                       /* 0x200A0528 */
-int         ( *Scr_GetPointerType )( unsigned int num );                                /* 0x200A052C */
-unsigned int ( *Scr_GetEntityNum )( unsigned int num, int *classnum );                  /* 0x200A0530 */
-unsigned int ( *Scr_GetNumParam )( void );                                              /* 0x200A0534 */
-void        ( *Scr_AddBool )( int value );                                              /* 0x200A0538 */
-void        ( *Scr_AddInt )( int value );                                               /* 0x200A053C */
-void        ( *Scr_AddFloat )( float value );                                           /* 0x200A0540 */
-void        ( *Scr_AddAnim )();                                                         /* 0x200A0544 */
-void        ( *Scr_AddUndefined )( void );                                              /* 0x200A0548 */
-void        ( *Scr_AddEntityNum )( int entnum, int classnum );                          /* 0x200A054C */
-void        ( *Scr_AddStruct )( void );                                                 /* 0x200A0550 */
-void        ( *Scr_AddString )( const char *string );                                   /* 0x200A0554 */
-void        ( *Scr_AddIString )();                                                      /* 0x200A0558 */
-void        ( *Scr_AddConstString )( unsigned short id );                               /* 0x200A055C */
-void        ( *Scr_AddVector )( const float *value );                                   /* 0x200A0560 */
-void        ( *Scr_AddObject )( unsigned short id );                                    /* 0x200A0564 */
-void        ( *Scr_AddArray )( void );                                                  /* 0x200A0568 */
-void        ( *Scr_AddArrayStringIndexed )( unsigned short id );                        /* 0x200A056C */
-void        ( *Scr_MakeArray )( void );                                                 /* 0x200A0570 */
-void        ( *Scr_BeginLoadScripts )( void );                                          /* 0x200A0574 */
-void        ( *Scr_BeginLoadAnimTrees )();                                              /* 0x200A0578 */
-void        ( *Scr_EndLoadScripts )( void );                                            /* 0x200A057C */
-void        ( *Scr_EndLoadAnimTrees )( void );                                          /* 0x200A0580 */
-void        ( *Scr_PrecacheAnimTrees )( void *( *allocFn )( int size ) );               /* 0x200A0584 */
-void        ( *Scr_FreeScripts )( int bComplete );                                      /* 0x200A0588 */
-void        ( *Scr_FreeGameVariable )( int bComplete );                                 /* 0x200A058C */
-void        ( *Scr_ShutdownSystem )( int bComplete );                                   /* 0x200A0590 */
-int         ( *Scr_IsSystemActive )( int bComplete );                                   /* 0x200A0594 */
-void        ( *Scr_AddExecThread )();                                                   /* 0x200A0598 */
-void        ( *Scr_AddExecEntThreadNum )( int entnum, int classnum, int handle, unsigned int paramcount );      /* 0x200A059C */
-unsigned short ( *Scr_ExecThread )( unsigned int handle, unsigned int paramcount );     /* 0x200A05A0 */
-unsigned short ( *Scr_ExecEntThreadNum )( int entnum, int classnum, int handle, unsigned int paramcount );      /* 0x200A05A4 */
-void        ( *Scr_IsThreadAlive )();                                                   /* 0x200A05A8 */
-void        ( *Scr_Error )( const char *error );                                        /* 0x200A05AC */
-void        ( *Scr_ErrorWithDialogMessage )();                                          /* 0x200A05B0 */
-void        ( *Scr_ParamError )( unsigned int num, const char *error );                 /* 0x200A05B4 */
-void        ( *Scr_ObjectError )( const char *error );                                  /* 0x200A05B8 */
-void        ( *Scr_SetDynamicEntityField )( int entnum, int classnum, int fieldnum );   /* 0x200A05BC */
-void        ( *Scr_FreeEntityNum )( int entnum, int classnum );                         /* 0x200A05C0 */
-unsigned short ( *Scr_GetEntityId )( int entnum, int classnum );                        /* 0x200A05C4 */
-void        ( *Scr_SetClassMap )( scr_classStruct_t *classMap, unsigned int count );    /* 0x200A05C8 */
-void        ( *Scr_RemoveClassMap )( void );                                            /* 0x200A05CC */
-void        ( *Scr_Unused36 )();                                                        /* 0x200A05D0 -- never written */
-void        ( *Scr_Unused37 )();                                                        /* 0x200A05D4 -- never written */
-void        ( *Scr_AddClassField )( unsigned short classnum, const char *name, unsigned short fieldnum );       /* 0x200A05D8 */
-void        ( *Scr_AddFields )( const char *path, const char *extension );              /* 0x200A05DC */
-unsigned short ( *Scr_FindField )( const char *name, int *type );                       /* 0x200A05E0 */
-int         ( *Scr_GetOffset )( unsigned short classnum, const char *name );            /* 0x200A05E4 */
-void        ( *Scr_CopyEntityNum )( int sourceEntnum, int destEntnum, int classnum );   /* 0x200A05E8 */
-void        ( *Scr_Init )();                                                            /* 0x200A05EC */
-void        ( *Scr_Shutdown )();                                                        /* 0x200A05F0 */
-void        ( *Scr_Abort )();                                                           /* 0x200A05F4 */
-void        ( *Scr_SetLoading )( int loading );                                         /* 0x200A05F8 */
-void        ( *Scr_AllocGameVariable )( int classnum, int time );                       /* 0x200A05FC */
-void        ( *Scr_InitSystem )( void );                                                /* 0x200A0600 */
-void        ( *Scr_GetChecksum )();                                                     /* 0x200A0604 */
-void        ( *Scr_HasSourceFiles )();                                                  /* 0x200A0608 */
-void        ( *Scr_SaveSource )();                                                      /* 0x200A060C */
-void        ( *Scr_LoadSource )();                                                      /* 0x200A0610 */
-void        ( *Scr_SkipSource )();                                                      /* 0x200A0614 */
-void        ( *Scr_SavePre )();                                                         /* 0x200A0618 */
-void        ( *Scr_SavePost )();                                                        /* 0x200A061C */
-void        ( *Scr_SaveShutdown )();                                                    /* 0x200A0620 */
-void        ( *Scr_Unused4B )();                                                        /* 0x200A0624 -- never written */
-void        ( *Scr_LoadPre )();                                                         /* 0x200A0628 */
-void        ( *Scr_LoadShutdown )();                                                    /* 0x200A062C */
-void        ( *Scr_Unused4E )();                                                        /* 0x200A0630 -- never written */
-int         ( *Scr_LoadScript )( const char *scriptName );                              /* 0x200A0634 */
-void        *( *Scr_FindAnimTree )( const char *treeName );                             /* 0x200A0638 */
-void        ( *Scr_FindAnim )( const char *treeName, const char *animName, scr_anim_t *anim );  /* 0x200A063C */
-int         ( *Scr_GetFunctionHandle )( const char *scriptName, const char *label );    /* 0x200A0640 */
-void        ( *Scr_FreeThread )( unsigned short thread );                               /* 0x200A0644 */
-void        ( *Scr_ConvertThreadToSave )();                                             /* 0x200A0648 */
-void        ( *Scr_ConvertThreadFromLoad )();                                           /* 0x200A064C */
-void        ( *Scr_SetString )( unsigned short *dest, unsigned short id );              /* 0x200A0650 */
-unsigned short ( *Scr_AllocString )( const char *string, unsigned int user );           /* 0x200A0654 */
-void        ( *Scr_NotifyNum )( int entnum, int classnum, unsigned short event, unsigned int paramcount );      /* 0x200A0658 */
-void        ( *Scr_NotifyId )();                                                        /* 0x200A065C */
-const char  *( *SL_ConvertToString )( unsigned short id );                              /* 0x200A0660 */
-unsigned short ( *SL_GetString )( const char *string, unsigned int user );              /* 0x200A0664 */
-unsigned short ( *SL_GetLowercaseString )( const char *string, unsigned int user );     /* 0x200A0668 */
-unsigned short ( *SL_FindLowercaseString )( const char *string );                       /* 0x200A066C */
-void        ( *Scr_CreateCanonicalFilename )();                                         /* 0x200A0670 */
-void        ( *Scr_SetTime )( int time );                                               /* 0x200A0674 */
-void        ( *Scr_RunCurrentThreads )( void );                                         /* 0x200A0678 */
-void        ( *Scr_ResetTimeout )( void );                                              /* 0x200A067C */
-int         ( *Scr_GetAnimsIndex )( int anims );                                        /* 0x200A0680 */
-void        ( *Scr_GetAnims )();                                                        /* 0x200A0684 */
-void        *( *MT_Alloc )( int size, int type );                                       /* 0x200A0688 */
-void        ( *MT_Free )( void *p, int size );                                          /* 0x200A068C */
+/* keep: original data layout -- the slots must stay one contiguous run, in this order */
+#pragma bss_seg( ".bss$scri000" )
+int         ( *Scr_GetBool )( unsigned int num );
+#pragma bss_seg( ".bss$scri001" )
+int         ( *Scr_GetInt )( unsigned int num );
+#pragma bss_seg( ".bss$scri002" )
+scr_anim_t  ( *Scr_GetAnim )( unsigned int num, void *anims );
+#pragma bss_seg( ".bss$scri003" )
+void        ( *Scr_GetAnimTree )();
+#pragma bss_seg( ".bss$scri004" )
+float       ( *Scr_GetFloat )( unsigned int num );
+#pragma bss_seg( ".bss$scri005" )
+const char  *( *Scr_GetString )( unsigned int num );
+#pragma bss_seg( ".bss$scri006" )
+unsigned short ( *Scr_GetConstString )( unsigned int num );
+#pragma bss_seg( ".bss$scri007" )
+const char  *( *Scr_GetDebugString )( unsigned int num );
+#pragma bss_seg( ".bss$scri008" )
+const char  *( *Scr_GetIString )( unsigned int num );
+#pragma bss_seg( ".bss$scri009" )
+void        ( *Scr_GetConstIString )();
+#pragma bss_seg( ".bss$scri010" )
+void        ( *Scr_GetVector )( unsigned int num, vec3_t out );
+#pragma bss_seg( ".bss$scri011" )
+void        ( *Scr_GetFunc )();
+#pragma bss_seg( ".bss$scri012" )
+int         ( *Scr_GetType )( unsigned int num );
+#pragma bss_seg( ".bss$scri013" )
+int         ( *Scr_GetPointerType )( unsigned int num );
+#pragma bss_seg( ".bss$scri014" )
+unsigned int ( *Scr_GetEntityNum )( unsigned int num, int *classnum );
+#pragma bss_seg( ".bss$scri015" )
+unsigned int ( *Scr_GetNumParam )( void );
+#pragma bss_seg( ".bss$scri016" )
+void        ( *Scr_AddBool )( int value );
+#pragma bss_seg( ".bss$scri017" )
+void        ( *Scr_AddInt )( int value );
+#pragma bss_seg( ".bss$scri018" )
+void        ( *Scr_AddFloat )( float value );
+#pragma bss_seg( ".bss$scri019" )
+void        ( *Scr_AddAnim )();
+#pragma bss_seg( ".bss$scri020" )
+void        ( *Scr_AddUndefined )( void );
+#pragma bss_seg( ".bss$scri021" )
+void        ( *Scr_AddEntityNum )( int entnum, int classnum );
+#pragma bss_seg( ".bss$scri022" )
+void        ( *Scr_AddStruct )( void );
+#pragma bss_seg( ".bss$scri023" )
+void        ( *Scr_AddString )( const char *string );
+#pragma bss_seg( ".bss$scri024" )
+void        ( *Scr_AddIString )();
+#pragma bss_seg( ".bss$scri025" )
+void        ( *Scr_AddConstString )( unsigned short id );
+#pragma bss_seg( ".bss$scri026" )
+void        ( *Scr_AddVector )( const float *value );
+#pragma bss_seg( ".bss$scri027" )
+void        ( *Scr_AddObject )( unsigned short id );
+#pragma bss_seg( ".bss$scri028" )
+void        ( *Scr_AddArray )( void );
+#pragma bss_seg( ".bss$scri029" )
+void        ( *Scr_AddArrayStringIndexed )( unsigned short id );
+#pragma bss_seg( ".bss$scri030" )
+void        ( *Scr_MakeArray )( void );
+#pragma bss_seg( ".bss$scri031" )
+void        ( *Scr_BeginLoadScripts )( void );
+#pragma bss_seg( ".bss$scri032" )
+void        ( *Scr_BeginLoadAnimTrees )();
+#pragma bss_seg( ".bss$scri033" )
+void        ( *Scr_EndLoadScripts )( void );
+#pragma bss_seg( ".bss$scri034" )
+void        ( *Scr_EndLoadAnimTrees )( void );
+#pragma bss_seg( ".bss$scri035" )
+void        ( *Scr_PrecacheAnimTrees )( void *( *allocFn )( int size ) );
+#pragma bss_seg( ".bss$scri036" )
+void        ( *Scr_FreeScripts )( int bComplete );
+#pragma bss_seg( ".bss$scri037" )
+void        ( *Scr_FreeGameVariable )( int bComplete );
+#pragma bss_seg( ".bss$scri038" )
+void        ( *Scr_ShutdownSystem )( int bComplete );
+#pragma bss_seg( ".bss$scri039" )
+int         ( *Scr_IsSystemActive )( int bComplete );
+#pragma bss_seg( ".bss$scri040" )
+void        ( *Scr_AddExecThread )();
+#pragma bss_seg( ".bss$scri041" )
+void        ( *Scr_AddExecEntThreadNum )( int entnum, int classnum, int handle, unsigned int paramcount );
+#pragma bss_seg( ".bss$scri042" )
+unsigned short ( *Scr_ExecThread )( unsigned int handle, unsigned int paramcount );
+#pragma bss_seg( ".bss$scri043" )
+unsigned short ( *Scr_ExecEntThreadNum )( int entnum, int classnum, int handle, unsigned int paramcount );
+#pragma bss_seg( ".bss$scri044" )
+void        ( *Scr_IsThreadAlive )();
+#pragma bss_seg( ".bss$scri045" )
+void        ( *Scr_Error )( const char *error );
+#pragma bss_seg( ".bss$scri046" )
+void        ( *Scr_ErrorWithDialogMessage )();
+#pragma bss_seg( ".bss$scri047" )
+void        ( *Scr_ParamError )( unsigned int num, const char *error );
+#pragma bss_seg( ".bss$scri048" )
+void        ( *Scr_ObjectError )( const char *error );
+#pragma bss_seg( ".bss$scri049" )
+void        ( *Scr_SetDynamicEntityField )( int entnum, int classnum, unsigned short fieldnum );
+#pragma bss_seg( ".bss$scri050" )
+void        ( *Scr_FreeEntityNum )( int entnum, int classnum );
+#pragma bss_seg( ".bss$scri051" )
+unsigned short ( *Scr_GetEntityId )( int entnum, int classnum );
+#pragma bss_seg( ".bss$scri052" )
+void        ( *Scr_SetClassMap )( scr_classStruct_t *classMap, unsigned int count );
+#pragma bss_seg( ".bss$scri053" )
+void        ( *Scr_RemoveClassMap )( void );
+#pragma bss_seg( ".bss$scri054" )
+void        ( *Scr_Unused36 )();
+#pragma bss_seg( ".bss$scri055" )
+void        ( *Scr_Unused37 )();
+#pragma bss_seg( ".bss$scri056" )
+void        ( *Scr_AddClassField )( unsigned short classnum, const char *name, unsigned short fieldnum );
+#pragma bss_seg( ".bss$scri057" )
+void        ( *Scr_AddFields )( const char *path, const char *extension );
+#pragma bss_seg( ".bss$scri058" )
+unsigned short ( *Scr_FindField )( const char *name, int *type );
+#pragma bss_seg( ".bss$scri059" )
+int         ( *Scr_GetOffset )( unsigned short classnum, const char *name );
+#pragma bss_seg( ".bss$scri060" )
+void        ( *Scr_CopyEntityNum )( int sourceEntnum, int destEntnum, int classnum );
+#pragma bss_seg( ".bss$scri061" )
+void        ( *Scr_Init )();
+#pragma bss_seg( ".bss$scri062" )
+void        ( *Scr_Shutdown )();
+#pragma bss_seg( ".bss$scri063" )
+void        ( *Scr_Abort )();
+#pragma bss_seg( ".bss$scri064" )
+void        ( *Scr_SetLoading )( int loading );
+#pragma bss_seg( ".bss$scri065" )
+void        ( *Scr_AllocGameVariable )( int classnum, int time );
+#pragma bss_seg( ".bss$scri066" )
+void        ( *Scr_InitSystem )( void );
+#pragma bss_seg( ".bss$scri067" )
+void        ( *Scr_GetChecksum )();
+#pragma bss_seg( ".bss$scri068" )
+void        ( *Scr_HasSourceFiles )();
+#pragma bss_seg( ".bss$scri069" )
+void        ( *Scr_SaveSource )();
+#pragma bss_seg( ".bss$scri070" )
+void        ( *Scr_LoadSource )();
+#pragma bss_seg( ".bss$scri071" )
+void        ( *Scr_SkipSource )();
+#pragma bss_seg( ".bss$scri072" )
+void        ( *Scr_SavePre )();
+#pragma bss_seg( ".bss$scri073" )
+void        ( *Scr_SavePost )();
+#pragma bss_seg( ".bss$scri074" )
+void        ( *Scr_SaveShutdown )();
+#pragma bss_seg( ".bss$scri075" )
+void        ( *Scr_Unused4B )();
+#pragma bss_seg( ".bss$scri076" )
+void        ( *Scr_LoadPre )();
+#pragma bss_seg( ".bss$scri077" )
+void        ( *Scr_LoadShutdown )();
+#pragma bss_seg( ".bss$scri078" )
+void        ( *Scr_Unused4E )();
+#pragma bss_seg( ".bss$scri079" )
+int         ( *Scr_LoadScript )( const char *scriptName );
+#pragma bss_seg( ".bss$scri080" )
+void        *( *Scr_FindAnimTree )( const char *treeName );
+#pragma bss_seg( ".bss$scri081" )
+void        ( *Scr_FindAnim )( const char *treeName, const char *animName, scr_anim_t *anim );
+#pragma bss_seg( ".bss$scri082" )
+int         ( *Scr_GetFunctionHandle )( const char *scriptName, const char *label );
+#pragma bss_seg( ".bss$scri083" )
+void        ( *Scr_FreeThread )( unsigned short thread );
+#pragma bss_seg( ".bss$scri084" )
+void        ( *Scr_ConvertThreadToSave )();
+#pragma bss_seg( ".bss$scri085" )
+void        ( *Scr_ConvertThreadFromLoad )();
+#pragma bss_seg( ".bss$scri086" )
+void        ( *Scr_SetString )( unsigned short *dest, unsigned short id );
+#pragma bss_seg( ".bss$scri087" )
+unsigned short ( *Scr_AllocString )( const char *string, unsigned int user );
+#pragma bss_seg( ".bss$scri088" )
+void        ( *Scr_NotifyNum )( int entnum, int classnum, unsigned short event, unsigned int paramcount );
+#pragma bss_seg( ".bss$scri089" )
+void        ( *Scr_NotifyId )();
+#pragma bss_seg( ".bss$scri090" )
+const char  *( *SL_ConvertToStringImport )( unsigned short id );
+#pragma bss_seg( ".bss$scri091" )
+unsigned short ( *SL_GetString )( const char *string, unsigned int user );
+#pragma bss_seg( ".bss$scri092" )
+unsigned short ( *SL_GetLowercaseString )( const char *string, unsigned int user );
+#pragma bss_seg( ".bss$scri093" )
+unsigned short ( *SL_FindLowercaseString )( const char *string );
+#pragma bss_seg( ".bss$scri094" )
+void        ( *Scr_CreateCanonicalFilename )();
+#pragma bss_seg( ".bss$scri095" )
+void        ( *Scr_SetTime )( int time );
+#pragma bss_seg( ".bss$scri096" )
+void        ( *Scr_RunCurrentThreads )( void );
+#pragma bss_seg( ".bss$scri097" )
+void        ( *Scr_ResetTimeout )( void );
+#pragma bss_seg( ".bss$scri098" )
+int         ( *Scr_GetAnimsIndex )( int anims );
+#pragma bss_seg( ".bss$scri099" )
+void        ( *Scr_GetAnims )();
+#pragma bss_seg( ".bss$scri100" )
+void        *( *MT_Alloc )( int size, int type );
+#pragma bss_seg( ".bss$scri101" )
+void        ( *MT_Free )( void *p, int size );
 #pragma bss_seg()
 
 /*
@@ -353,13 +335,18 @@ void        ( *MT_Free )( void *p, int size );                                  
 /* scr_data_t and its two helper types are in g_local.h: g_spawn_mp.c,
    g_hud_mp.c and g_client_mp.c all reach members of g_scr_data. */
 
-scr_data_t g_scr_data;                          /* 0x202CD340 */
+scr_data_t g_scr_data;
 
-scr_const_t scr_const;                          /* 0x202CD500 */
+scr_const_t scr_const;
+
+/* script class names -- keep: original data layout */
+static const char *scr_classnames[SCR_CLASS_NUM] = { "entity", "hudelem" };
 
 /*
 =============
 GScr_AllocString
+
+Interns a string owned by the game module.
 =============
 */
 unsigned short GScr_AllocString( const char *string ) {
@@ -369,6 +356,8 @@ unsigned short GScr_AllocString( const char *string ) {
 /*
 =============
 GScr_LoadConsts
+
+Interns every string the game code compares script values against.
 =============
 */
 void GScr_LoadConsts( void ) {
@@ -505,6 +494,8 @@ void GScr_LoadConsts( void ) {
 /*
 =============
 Scr_LoadLevel
+
+Runs the level script's main().
 =============
 */
 void Scr_LoadLevel( void ) {
@@ -516,6 +507,9 @@ void Scr_LoadLevel( void ) {
 /*
 =============
 GScr_LoadScriptAndLabel
+
+Loads a script and returns the handle of one of its functions.  A missing
+script or label is fatal if mandatory is set.
 =============
 */
 int GScr_LoadScriptAndLabel( const char *scriptName, const char *label, qboolean mandatory ) {
@@ -536,6 +530,8 @@ int GScr_LoadScriptAndLabel( const char *scriptName, const char *label, qboolean
 /*
 =============
 GScr_LoadGameTypeScript
+
+Loads the current game type's script and the code callbacks in _callbacksetup.
 =============
 */
 void GScr_LoadGameTypeScript( void ) {
@@ -559,6 +555,8 @@ void GScr_LoadGameTypeScript( void ) {
 /*
 =============
 GScr_LoadLevelScript
+
+Loads maps/mp/<mapname>.gsc, if the map has one.
 =============
 */
 void GScr_LoadLevelScript( void ) {
@@ -572,14 +570,11 @@ void GScr_LoadLevelScript( void ) {
 	g_scr_data.levelScriptMain = Scr_GetFunctionHandle( scriptName, "main" );
 }
 
-/* A two-pointer .data array at 0x20069768, just ahead of scr_functions;
-   GScr_PostLoadScripts loads both names through it (0x2002F060) rather than
-   storing the literals.  Name invented -- retail carries no symbol for it. */
-static const char *scr_classnames[SCR_CLASS_NUM] = { "entity", "hudelem" };
-
 /*
 =============
 GScr_PostLoadScripts
+
+Registers the script object classes and their fields.
 =============
 */
 void GScr_PostLoadScripts( void ) {
@@ -589,12 +584,14 @@ void GScr_PostLoadScripts( void ) {
 
 	GScr_AddFieldsForEntity();
 	GScr_AddFieldsForHudElems();
-	Scr_AddFields( "radiant", ".txt" );
+	GScr_AddFieldsForRadiant();
 }
 
 /*
 =============
 Hunk_AllocXAnimCreate
+
+Allocator for the precached anim trees.
 =============
 */
 void *Hunk_AllocXAnimCreate( int size ) {
@@ -604,15 +601,16 @@ void *Hunk_AllocXAnimCreate( int size ) {
 /*
 =============
 GScr_LoadScripts
+
+Loads the game type and level scripts, then the player animation scripts and
+anim trees.
 =============
 */
 void GScr_LoadScripts( void ) {
-	/* The two BG_AnimParseAnimScript out-parameters: 512 animScriptAnim_t (the
-	 * type is private to bg_animation.c) and the count of them.  The count is
-	 * zeroed at the top of the retail function (0x2002F0DA) because
-	 * BG_AnimationIndexForString reads it before the first write. */
+	/* BG_AnimParseAnimScript output; the count must start at zero */
 	int numAnims = 0;
-	byte animScriptBuffer[36864];
+	/* 512 animScriptAnim_t -- keep: int array, matches original codegen */
+	int animScriptBuffer[9216];
 
 	Scr_BeginLoadScripts();
 
@@ -628,12 +626,14 @@ void GScr_LoadScripts( void ) {
 	BG_FindAnimTrees();
 	Scr_EndLoadAnimTrees();
 	BG_FinalizePlayerAnims();
-	BG_CreateClientAnimTrees();
+	BG_LoadAnimTreeInstances();
 }
 
 /*
 =============
 GScr_FreeScripts
+
+Releases the class map registered when the scripts were loaded.
 =============
 */
 void GScr_FreeScripts( void ) {
@@ -643,24 +643,28 @@ void GScr_FreeScripts( void ) {
 /*
 =============
 GetEntity
+
+Returns the entity a method was called on, or raises a script error if it is
+not an entity.
 =============
 */
 gentity_t *GetEntity( unsigned int entnum ) {
-	if ( entnum >= MAX_GENTITIES ) {
-		Scr_ObjectError( "not an entity" );
-		return NULL;
+	if ( entnum < MAX_GENTITIES ) {
+		return &g_entities[entnum];
 	}
-	return &g_entities[entnum];
+	Scr_ObjectError( "not an entity" );
+	return NULL;
 }
 
 /*
 =============
 GetPlayerEntity
+
+As GetEntity, but the entity must be a player.
 =============
 */
 gentity_t *GetPlayerEntity( unsigned int entnum ) {
 	gentity_t   *ent;
-	const char  *classname;
 	const char  *targetname;
 
 	ent = GetEntity( entnum );
@@ -671,10 +675,9 @@ gentity_t *GetPlayerEntity( unsigned int entnum ) {
 		} else {
 			targetname = "<undefined>";
 		}
-		classname = SL_ConvertToString( ent->classname );
 		Scr_Error( va( "only valid on players; called on entity %i at %.0f %.0f %.0f classname %s targetname %s\n",
 					   entnum, ent->r.currentOrigin[0], ent->r.currentOrigin[1], ent->r.currentOrigin[2],
-					   classname, targetname ) );
+					   SL_ConvertToString( ent->classname ), targetname ) );
 	}
 
 	return ent;
@@ -683,13 +686,15 @@ gentity_t *GetPlayerEntity( unsigned int entnum ) {
 /*
 =============
 print
+
+Prints the parameters to the console.
 =============
 */
 void print( void ) {
 	int i;
 	int paramcount;
 
-	if ( g_no_script_spam.integer ) {
+	if ( g_NoScriptSpam.integer ) {
 		return;
 	}
 
@@ -702,10 +707,12 @@ void print( void ) {
 /*
 =============
 println
+
+Prints the parameters to the console, followed by a newline.
 =============
 */
 void println( void ) {
-	if ( g_no_script_spam.integer ) {
+	if ( g_NoScriptSpam.integer ) {
 		return;
 	}
 
@@ -716,6 +723,8 @@ void println( void ) {
 /*
 =============
 Scr_LocalizationError
+
+Raises a localization error.
 =============
 */
 void Scr_LocalizationError( const char *error ) {
@@ -748,20 +757,21 @@ prefixing each run with the marker that says whether the client should look it
 up in the localization table or print it verbatim.
 =============
 */
-void Scr_ConstructMessageString( int msgType, int firstParam, char *string, int maxLen ) {
+void Scr_ConstructMessageString( int firstParam, int msgType, char *string, int maxLen ) {
 	const char  *typeName;
 	const char  *token;
 	gentity_t   *ent;
 	int paramIndex;
 	int paramCount;
+	int type;
 	int i;
 	int len;
 	int total;
-	int marker;
 	int markerLen;
 	int hasLetters;
 	int rawPending;
 
+	rawPending = 1;
 	switch ( msgType ) {
 	case MESSAGE_GAME:
 		typeName = "Game Message";
@@ -786,23 +796,33 @@ void Scr_ConstructMessageString( int msgType, int firstParam, char *string, int 
 		break;
 	}
 
-	rawPending = 1;
 	total = 0;
 	string[0] = 0;
 
 	paramCount = Scr_GetNumParam();
 	for ( paramIndex = firstParam; paramIndex < paramCount; paramIndex++ ) {
+		type = Scr_GetType( paramIndex );
 		markerLen = 0;
-
-		if ( Scr_GetType( paramIndex ) == VAR_LOCALIZED_STRING ) {
+		if ( type == VAR_LOCALIZED_STRING ) {
 			token = Scr_GetIString( paramIndex );
 			len = strlen( token );
 
+			/* keep: the three identical calls match original codegen */
 			for ( i = 0; i < len; i++ ) {
 				if ( !isalnum( token[i] ) && token[i] != '_' ) {
-					Scr_ParamError( paramIndex,
-									va( "Illegal localized string reference: %s (must contain only alpha-numeric characters and underscores",
-										token ) );
+					if ( i ) {
+						Scr_ParamError( paramIndex,
+										va( "Illegal localized string reference: %s (must contain only alpha-numeric characters and underscores",
+											token ) );
+					} else if ( len ) {
+						Scr_ParamError( paramIndex,
+										va( "Illegal localized string reference: %s (must contain only alpha-numeric characters and underscores",
+											token ) );
+					} else {
+						Scr_ParamError( paramIndex,
+										va( "Illegal localized string reference: %s (must contain only alpha-numeric characters and underscores",
+											token ) );
+					}
 				}
 			}
 
@@ -818,8 +838,7 @@ void Scr_ConstructMessageString( int msgType, int firstParam, char *string, int 
 				total += markerLen;
 			}
 			rawPending = 1;
-		} else if ( Scr_GetType( paramIndex ) == VAR_OBJECT
-					&& Scr_GetPointerType( paramIndex ) == VAR_ENTITY ) {
+		} else if ( type == VAR_OBJECT && Scr_GetPointerType( paramIndex ) == VAR_ENTITY ) {
 			ent = Scr_GetEntity( paramIndex );
 			if ( !ent->client ) {
 				Scr_ParamError( paramIndex, "Entity is not a player" );
@@ -852,8 +871,8 @@ void Scr_ConstructMessageString( int msgType, int firstParam, char *string, int 
 									va( "bad escape character (%i) present in string", token[i] ) );
 				}
 				if ( isalpha( token[i] ) ) {
-					if ( !hasLetters && cl_languagewarnings.integer ) {
-						if ( cl_languagewarningsaserrors.integer ) {
+					if ( !hasLetters && g_languagewarnings.integer ) {
+						if ( g_languagewarningsaserrors.integer ) {
 							Com_Error( ERR_LOCALIZATION,
 									   va( "non-localized %s strings are not allowed to have letters in them: \"%s\"",
 										   typeName, token ) );
@@ -867,12 +886,10 @@ void Scr_ConstructMessageString( int msgType, int firstParam, char *string, int 
 			}
 
 			if ( hasLetters ) {
-				marker = MSG_TOKEN_LOCALIZED;
 				if ( total ) {
 					markerLen = 1;
 				}
 			} else {
-				marker = MSG_TOKEN_RAW;
 				if ( rawPending ) {
 					markerLen = 1;
 				}
@@ -881,16 +898,24 @@ void Scr_ConstructMessageString( int msgType, int firstParam, char *string, int 
 			if ( total + markerLen + len >= maxLen ) {
 				Scr_ParamError( paramIndex, va( "%s is too long. Max length is %i\n", typeName, maxLen ) );
 			}
-			if ( markerLen ) {
-				string[total] = marker;
-				string[total + 1] = 0;
-				total += markerLen;
+			if ( hasLetters ) {
+				if ( markerLen ) {
+					string[total] = MSG_TOKEN_LOCALIZED;
+					string[total + 1] = 0;
+					total += markerLen;
+				}
+			} else {
+				if ( markerLen ) {
+					string[total] = MSG_TOKEN_RAW;
+					string[total + 1] = 0;
+					total += markerLen;
+				}
 			}
 			rawPending = 0;
 		}
 
 		for ( i = 0; i < len; i++ ) {
-			if ( ( token[i] && (byte)token[i] <= 0x1F ) || (byte)token[i] >= 0x7F ) {
+			if ( ( (byte)token[i] >= 0x01 && (byte)token[i] <= 0x1F ) || (byte)token[i] >= 0x7F ) {
 				Scr_ParamError( paramIndex,
 								va( "Illegal character '%c'(ascii %i) in %s: %s\n",
 									token[i], (byte)token[i], token, typeName ) );
@@ -910,18 +935,23 @@ void Scr_ConstructMessageString( int msgType, int firstParam, char *string, int 
 /*
 =============
 Scr_MakeGameMessage
+
+Builds a message from the script parameters and sends it to clientNum (-1 for
+everyone) as the given server command.
 =============
 */
 void Scr_MakeGameMessage( int clientNum, const char *command ) {
 	char string[MAX_STRING_CHARS];
 
-	Scr_ConstructMessageString( MESSAGE_GAME, 0, string, sizeof( string ) );
+	Scr_ConstructMessageString( 0, MESSAGE_GAME, string, sizeof( string ) );
 	trap_SendServerCommand( clientNum, 0, va( "%s \"%s\"", command, string ) );
 }
 
 /*
 =============
 iprintln
+
+Prints a message in the game message area of every client.
 =============
 */
 void iprintln( void ) {
@@ -931,6 +961,8 @@ void iprintln( void ) {
 /*
 =============
 iprintlnbold
+
+Prints a bold message in the center of every client's screen.
 =============
 */
 void iprintlnbold( void ) {
@@ -940,27 +972,39 @@ void iprintlnbold( void ) {
 /*
 =============
 GScr_print3d
+
+print3d( origin, text [, rgb [, alpha [, scale]]] )
+
+Draws debug text in the world.
 =============
 */
 void GScr_print3d( void ) {
 	const char  *text;
 	vec3_t origin;
-	vec3_t color;
+	vec4_t color;
+	vec3_t rgb;
 	float scale;
 
+	scale = 1.0;
 	color[0] = 1.0;
 	color[1] = 1.0;
 	color[2] = 1.0;
-	scale = 1.0;
+	color[3] = 1.0;
 
-	if ( Scr_GetNumParam() > 2 ) {
-		if ( Scr_GetNumParam() > 3 ) {
-			if ( Scr_GetNumParam() > 4 ) {
-				Scr_GetFloat( 4 );
-			}
-			scale = Scr_GetFloat( 3 );
-		}
-		Scr_GetVector( 2, color );
+	/* param 3 is the alpha, param 4 the scale; a count of 0 or 1 lands in default */
+	switch ( Scr_GetNumParam() ) {
+	default:
+		scale = Scr_GetFloat( 4 );
+	/* fall through */
+	case 4:
+		color[3] = Scr_GetFloat( 3 );
+	/* fall through */
+	case 3:
+		Scr_GetVector( 2, rgb );
+		VectorCopy( rgb, color );
+	/* fall through */
+	case 2:
+		break;
 	}
 
 	text = Scr_GetString( 1 );
@@ -972,27 +1016,39 @@ void GScr_print3d( void ) {
 /*
 =============
 GScr_line
+
+line( start, end [, rgb [, alpha [, depthTest]]] )
+
+Draws a debug line.
 =============
 */
 void GScr_line( void ) {
 	vec3_t start;
 	vec3_t end;
-	vec3_t color;
+	vec4_t color;
+	vec3_t rgb;
 	int depthTest;
 
+	depthTest = 0;
 	color[0] = 1.0;
 	color[1] = 1.0;
 	color[2] = 1.0;
-	depthTest = 1;
+	color[3] = 1.0;
 
-	if ( Scr_GetNumParam() > 2 ) {
-		if ( Scr_GetNumParam() > 3 ) {
-			if ( Scr_GetNumParam() > 4 ) {
-				Scr_GetInt( 4 );
-			}
-			depthTest = (int)Scr_GetFloat( 3 );
-		}
-		Scr_GetVector( 2, color );
+	/* param 3 is the alpha, param 4 the depth test; a count of 0 or 1 lands in default */
+	switch ( Scr_GetNumParam() ) {
+	default:
+		depthTest = Scr_GetInt( 4 );
+	/* fall through */
+	case 4:
+		color[3] = Scr_GetFloat( 3 );
+	/* fall through */
+	case 3:
+		Scr_GetVector( 2, rgb );
+		VectorCopy( rgb, color );
+	/* fall through */
+	case 2:
+		break;
 	}
 
 	Scr_GetVector( 1, end );
@@ -1005,7 +1061,7 @@ void GScr_line( void ) {
 =============
 GScr_Assert
 
-The retail release build compiles the assert away entirely.
+Compiled out of release builds.
 =============
 */
 void GScr_Assert( void ) {
@@ -1014,29 +1070,41 @@ void GScr_Assert( void ) {
 /*
 =============
 GScr_IsDefined
+
+Returns true if the parameter is defined.
 =============
 */
 void GScr_IsDefined( void ) {
 	int type;
 
 	type = Scr_GetType( 0 );
-	if ( type != VAR_OBJECT ) {
+	if ( type == VAR_OBJECT ) {
+		/* a dead thread / entity / object reads as undefined */
+		Scr_AddInt( Scr_GetPointerType( 0 ) < VAR_DEAD_THREAD );
+	} else {
 		Scr_AddInt( type != VAR_UNDEFINED );
-		return;
 	}
-
-	/* a dead thread / entity / object reads as undefined */
-	Scr_AddInt( Scr_GetPointerType( 0 ) < VAR_DEAD_THREAD );
 }
 
 /*
 =============
 GScr_IsAlive
+
+Returns true if the parameter is an entity with health above zero.
 =============
 */
 void GScr_IsAlive( void ) {
-	if ( Scr_GetType( 0 ) == VAR_OBJECT && Scr_GetPointerType( 0 ) == VAR_ENTITY
-		 && Scr_GetEntity( 0 )->health > 0 ) {
+	if ( Scr_GetType( 0 ) != VAR_OBJECT ) {
+		Scr_AddInt( 0 );
+		return;
+	}
+
+	if ( Scr_GetPointerType( 0 ) != VAR_ENTITY ) {
+		Scr_AddInt( 0 );
+		return;
+	}
+
+	if ( Scr_GetEntity( 0 )->health > 0 ) {
 		Scr_AddInt( 1 );
 	} else {
 		Scr_AddInt( 0 );
@@ -1046,6 +1114,8 @@ void GScr_IsAlive( void ) {
 /*
 =============
 GScr_GetCvar
+
+Returns a cvar's value as a string.
 =============
 */
 void GScr_GetCvar( void ) {
@@ -1058,6 +1128,8 @@ void GScr_GetCvar( void ) {
 /*
 =============
 GScr_GetCvarInt
+
+Returns a cvar's value as an integer.
 =============
 */
 void GScr_GetCvarInt( void ) {
@@ -1067,6 +1139,8 @@ void GScr_GetCvarInt( void ) {
 /*
 =============
 GScr_GetCvarFloat
+
+Returns a cvar's value as a float.
 =============
 */
 void GScr_GetCvarFloat( void ) {
@@ -1076,31 +1150,30 @@ void GScr_GetCvarFloat( void ) {
 /*
 =============
 GScr_SetCvar
+
+Sets a cvar, creating it if needed.  A localized string value is expanded
+first.
 =============
 */
 void GScr_SetCvar( void ) {
 	const char  *name;
 	const char  *value;
 	char message[MAX_STRING_CHARS];
-	char cleaned[MAX_STRING_CHARS];
+	volatile char cleaned[MAX_STRING_CHARS];
 	int i;
 	char c;
 
 	name = Scr_GetString( 0 );
 
 	if ( Scr_GetType( 1 ) == VAR_LOCALIZED_STRING ) {
-		Scr_ConstructMessageString( MESSAGE_CVAR_VALUE, 1, message, sizeof( message ) );
+		Scr_ConstructMessageString( 1, MESSAGE_CVAR_VALUE, message, sizeof( message ) );
 		value = message;
 	} else {
 		value = Scr_GetString( 1 );
 	}
 
-	/* The destination is 1024 bytes but the loop bound is 8192 -- retail:
-	   GScr_SetCvar 0x2002FB0B and GScr_MakeCvarServerInfo 0x20034B69 both
-	   walk 0x2000 into a 0x400 frame slot.  Reproduced as-is.  The scrubbed
-	   copy in cleaned[] is dead: retail (0x2002FB43 push edi) registers/sets
-	   the original value, not the scrubbed buffer, and the loop never
-	   terminates cleaned[]. */
+	/* keep: matches original codegen -- the scrubbed copy is never used (the
+	   original value is what gets set) and the loop bound overruns cleaned[] */
 	for ( i = 0; i < 0x2000; i++ ) {
 		c = value[i];
 		if ( !c ) {
@@ -1124,6 +1197,8 @@ void GScr_SetCvar( void ) {
 /*
 =============
 GScr_GetTime
+
+Returns level.time in milliseconds.
 =============
 */
 void GScr_GetTime( void ) {
@@ -1133,6 +1208,8 @@ void GScr_GetTime( void ) {
 /*
 =============
 Scr_GetEntByNum
+
+Returns the entity with the given number, or nothing if that slot is free.
 =============
 */
 void Scr_GetEntByNum( void ) {
@@ -1153,28 +1230,32 @@ void Scr_GetEntByNum( void ) {
 /*
 =============
 Scr_GetWeaponModel
+
+Returns a weapon's world model name.
 =============
 */
 void Scr_GetWeaponModel( void ) {
 	const char  *name;
-	byte weapon;
+	int weapon;
 
 	name = Scr_GetString( 0 );
 	weapon = BG_GetWeaponIndexForName( name );
-	if ( weapon ) {
-		Scr_AddString( bg_weaponInfo[weapon]->worldModel );
+	if ( !weapon ) {
+		if ( name[0] && Q_stricmp( name, "none" ) ) {
+			Com_Printf( va( "unknown weapon '%s' in getWeaponModel\n", name ) );
+		}
+		Scr_AddString( "" );
 		return;
 	}
 
-	if ( name[0] && Q_stricmp( name, "none" ) ) {
-		Com_Printf( va( "unknown weapon '%s' in getWeaponModel\n", name ) );
-	}
-	Scr_AddString( "" );
+	Scr_AddString( bg_weaponInfo[weapon]->worldModel );
 }
 
 /*
 =============
 Scr_GetWeaponClassname
+
+Returns a weapon's Radiant classname, checking its alternate modes too.
 =============
 */
 void Scr_GetWeaponClassname( void ) {
@@ -1195,21 +1276,23 @@ void Scr_GetWeaponClassname( void ) {
 
 	/* walk the alt-weapon ring until one of them carries a Radiant name */
 	i = weapon;
-	while ( !bg_weaponInfo[i]->radiantName[0] ) {
-		i = bg_weaponInfo[i]->altWeaponIndex;
-		if ( !i || i == weapon ) {
-			Com_Printf( va( "^3WARNING^7: no Radiant name found for weapon '%s' in getWeaponClassname\n", name ) );
-			Scr_AddUndefined();
+	do {
+		if ( bg_weaponInfo[i]->radiantName[0] ) {
+			Scr_AddString( bg_weaponInfo[i]->radiantName );
 			return;
 		}
-	}
+		i = bg_weaponInfo[i]->altWeaponIndex;
+	} while ( i && i != weapon );
 
-	Scr_AddString( bg_weaponInfo[i]->radiantName );
+	Com_Printf( va( "^3WARNING^7: no Radiant name found for weapon '%s' in getWeaponClassname\n", name ) );
+	Scr_AddUndefined();
 }
 
 /*
 =============
 GScr_GetAnimLength
+
+Returns a primitive animation's length in seconds.
 =============
 */
 void GScr_GetAnimLength( void ) {
@@ -1225,6 +1308,8 @@ void GScr_GetAnimLength( void ) {
 /*
 =============
 GScr_AnimHasNotetrack
+
+Returns true if the animation has the named notetrack.
 =============
 */
 void GScr_AnimHasNotetrack( void ) {
@@ -1239,6 +1324,8 @@ void GScr_AnimHasNotetrack( void ) {
 /*
 =============
 GScr_GetBrushModelCenter
+
+Returns the center of an entity's absolute bounds.
 =============
 */
 void GScr_GetBrushModelCenter( void ) {
@@ -1248,16 +1335,15 @@ void GScr_GetBrushModelCenter( void ) {
 	unsigned int entnum;
 
 	entnum = Scr_GetEntityNum( 0, &classnum );
-	if ( classnum || entnum >= MAX_GENTITIES ) {
+	if ( classnum != SCR_CLASS_ENTITY || entnum >= MAX_GENTITIES ) {
 		Scr_ParamError( 0, "not an entity" );
 		ent = NULL;
 	} else {
 		ent = &g_entities[entnum];
 	}
 
-	center[0] = ( ent->r.absmin[0] + ent->r.absmax[0] ) * 0.5f;
-	center[1] = ( ent->r.absmin[1] + ent->r.absmax[1] ) * 0.5f;
-	center[2] = ( ent->r.absmin[2] + ent->r.absmax[2] ) * 0.5f;
+	VectorAdd( ent->r.absmin, ent->r.absmax, center );
+	VectorScale( center, 0.5f, center );
 
 	Scr_AddVector( center );
 }
@@ -1265,6 +1351,10 @@ void GScr_GetBrushModelCenter( void ) {
 /*
 =============
 GScr_Spawn
+
+spawn( classname, origin [, spawnflags] )
+
+Spawns an entity and returns it.
 =============
 */
 void GScr_Spawn( void ) {
@@ -1289,17 +1379,18 @@ void GScr_Spawn( void ) {
 	ent->r.currentOrigin[2] = origin[2];
 	ent->spawnflags = spawnflags;
 
-	if ( !G_CallSpawnEntity( ent ) ) {
+	if ( G_CallSpawnEntity( ent ) ) {
+		Scr_AddEntityNum( ent->s.number, SCR_CLASS_ENTITY );
+	} else {
 		Scr_Error( va( "unable to spawn \"%s\" entity", SL_ConvertToString( classname ) ) );
-		return;
 	}
-
-	Scr_AddEntityNum( ent->s.number, SCR_CLASS_ENTITY );
 }
 
 /*
 =============
 ScrCmd_attach
+
+Attaches a model to the entity, optionally at a tag.
 =============
 */
 void ScrCmd_attach( unsigned int entnum ) {
@@ -1310,10 +1401,10 @@ void ScrCmd_attach( unsigned int entnum ) {
 	ent = GetEntity( entnum );
 
 	modelName = Scr_GetString( 0 );
-	if ( Scr_GetNumParam() < 2 ) {
-		tagName = "";
-	} else {
+	if ( Scr_GetNumParam() >= 2 ) {
 		tagName = Scr_GetString( 1 );
+	} else {
+		tagName = "";
 	}
 
 	if ( G_EntDetach( ent, modelName, tagName ) ) {
@@ -1328,21 +1419,25 @@ void ScrCmd_attach( unsigned int entnum ) {
 /*
 =============
 ScrCmd_detach
+
+Removes an attached model.  If it is not attached, the current attachments are
+listed before the error.
 =============
 */
 void ScrCmd_detach( unsigned int entnum ) {
 	gentity_t   *ent;
 	const char  *modelName;
 	const char  *tagName;
+	unsigned short tag;
 	int i;
 
 	ent = GetEntity( entnum );
 
 	modelName = Scr_GetString( 0 );
-	if ( Scr_GetNumParam() < 2 ) {
-		tagName = "";
-	} else {
+	if ( Scr_GetNumParam() >= 2 ) {
 		tagName = Scr_GetString( 1 );
+	} else {
+		tagName = "";
 	}
 
 	if ( G_EntDetach( ent, modelName, tagName ) ) {
@@ -1354,12 +1449,13 @@ void ScrCmd_detach( unsigned int entnum ) {
 		if ( !ent->attachModelIndex[i] ) {
 			continue;
 		}
-		if ( !ent->attachTagName[i] ) {
+		tag = ent->attachTagName[i];
+		if ( !tag ) {
 			continue;
 		}
 		Com_Printf( "model: '%s', tag: '%s'\n",
 					trap_GetConfigstringConst( CS_MODELS + ent->attachModelIndex[i] ),
-					SL_ConvertToString( ent->attachTagName[i] ) );
+					SL_ConvertToString( tag ) );
 	}
 
 	Scr_Error( va( "failed to detach model '%s' from tag '%s'", modelName, tagName ) );
@@ -1368,6 +1464,8 @@ void ScrCmd_detach( unsigned int entnum ) {
 /*
 =============
 ScrCmd_detachAll
+
+Removes every attached model.
 =============
 */
 void ScrCmd_detachAll( unsigned int entnum ) {
@@ -1377,6 +1475,8 @@ void ScrCmd_detachAll( unsigned int entnum ) {
 /*
 =============
 ScrCmd_GetAttachSize
+
+Returns the number of attached models.
 =============
 */
 void ScrCmd_GetAttachSize( unsigned int entnum ) {
@@ -1397,6 +1497,8 @@ void ScrCmd_GetAttachSize( unsigned int entnum ) {
 /*
 =============
 ScrCmd_GetAttachModelName
+
+Returns the model name of an attachment.
 =============
 */
 void ScrCmd_GetAttachModelName( unsigned int entnum ) {
@@ -1416,6 +1518,8 @@ void ScrCmd_GetAttachModelName( unsigned int entnum ) {
 /*
 =============
 ScrCmd_GetAttachTagName
+
+Returns the tag name of an attachment.
 =============
 */
 void ScrCmd_GetAttachTagName( unsigned int entnum ) {
@@ -1435,6 +1539,9 @@ void ScrCmd_GetAttachTagName( unsigned int entnum ) {
 /*
 =============
 ScrCmd_LinkTo
+
+Links the entity to a parent entity, optionally at a tag with an origin and
+angles offset.
 =============
 */
 void ScrCmd_LinkTo( unsigned int entnum ) {
@@ -1459,7 +1566,7 @@ void ScrCmd_LinkTo( unsigned int entnum ) {
 	}
 
 	parentNum = Scr_GetEntityNum( 0, &classnum );
-	if ( classnum || parentNum >= MAX_GENTITIES ) {
+	if ( classnum != SCR_CLASS_ENTITY || parentNum >= MAX_GENTITIES ) {
 		Scr_ParamError( 0, "not an entity" );
 		parent = NULL;
 	} else {
@@ -1467,20 +1574,22 @@ void ScrCmd_LinkTo( unsigned int entnum ) {
 	}
 
 	numParam = Scr_GetNumParam();
-	if ( numParam < 2 ) {
-		tagName = "";
-	} else {
+	if ( numParam >= 2 ) {
 		tagName = Scr_GetString( 1 );
+	} else {
+		tagName = "";
 	}
 
-	if ( numParam > 2 ) {
+	if ( numParam <= 2 ) {
+		if ( G_EntLinkTo( ent, parent, tagName ) ) {
+			return;
+		}
+	} else {
 		Scr_GetVector( 2, originOffset );
 		Scr_GetVector( 3, anglesOffset );
 		if ( G_EntLinkToWithOffset( ent, parent, tagName, originOffset, anglesOffset ) ) {
 			return;
 		}
-	} else if ( G_EntLinkTo( ent, parent, tagName ) ) {
-		return;
 	}
 
 	/* the link failed -- work out which of the three reasons it was */
@@ -1506,6 +1615,8 @@ void ScrCmd_LinkTo( unsigned int entnum ) {
 /*
 =============
 ScrCmd_Unlink
+
+Breaks the entity's link to its parent.
 =============
 */
 void ScrCmd_Unlink( unsigned int entnum ) {
@@ -1515,6 +1626,8 @@ void ScrCmd_Unlink( unsigned int entnum ) {
 /*
 =============
 ScrCmd_EnableLinkTo
+
+Allows linkTo on a general entity that does not support it by default.
 =============
 */
 void ScrCmd_EnableLinkTo( unsigned int entnum ) {
@@ -1526,7 +1639,7 @@ void ScrCmd_EnableLinkTo( unsigned int entnum ) {
 		Scr_ObjectError( "entity already has linkTo enabled" );
 	}
 
-	if ( ent->s.eType || ent->physicsObject
+	if ( ent->s.eType != ET_GENERAL || ent->physicsObject
 		 || ( ( ent->nextthink || ent->think )
 			  && _stricmp( SL_ConvertToString( ent->classname ), "trigger_multiple" ) ) ) {
 		Scr_ObjectError( va( "entity (classname: '%s') does not currently support enableLinkTo",
@@ -1541,6 +1654,8 @@ void ScrCmd_EnableLinkTo( unsigned int entnum ) {
 /*
 =============
 ScrCmd_GetOrigin
+
+Returns the entity's current origin.
 =============
 */
 void ScrCmd_GetOrigin( unsigned int entnum ) {
@@ -1559,6 +1674,8 @@ void ScrCmd_GetOrigin( unsigned int entnum ) {
 /*
 =============
 ScrCmd_GetEye
+
+Returns a point 40 units above the entity's origin.
 =============
 */
 void ScrCmd_GetEye( unsigned int entnum ) {
@@ -1577,6 +1694,9 @@ void ScrCmd_GetEye( unsigned int entnum ) {
 /*
 =============
 ScrCmd_UseBy
+
+Notifies "trigger" and fires the entity's use function as if the given entity
+had activated it.
 =============
 */
 void ScrCmd_UseBy( unsigned int entnum ) {
@@ -1588,7 +1708,7 @@ void ScrCmd_UseBy( unsigned int entnum ) {
 	ent = GetEntity( entnum );
 
 	otherNum = Scr_GetEntityNum( 0, &classnum );
-	if ( classnum || otherNum >= MAX_GENTITIES ) {
+	if ( classnum != SCR_CLASS_ENTITY || otherNum >= MAX_GENTITIES ) {
 		Scr_ParamError( 0, "not an entity" );
 		other = NULL;
 	} else {
@@ -1606,6 +1726,8 @@ void ScrCmd_UseBy( unsigned int entnum ) {
 /*
 =============
 ScrCmd_IsTouching
+
+Returns true if the entity's bounds touch the other entity.
 =============
 */
 void ScrCmd_IsTouching( unsigned int entnum ) {
@@ -1626,7 +1748,7 @@ void ScrCmd_IsTouching( unsigned int entnum ) {
 	 */
 	if ( self->r.bmodel ) {
 		otherNum = Scr_GetEntityNum( 0, &classnum );
-		if ( classnum || otherNum >= MAX_GENTITIES ) {
+		if ( classnum != SCR_CLASS_ENTITY || otherNum >= MAX_GENTITIES ) {
 			Scr_ParamError( 0, "not an entity" );
 			self = NULL;
 		} else {
@@ -1635,7 +1757,7 @@ void ScrCmd_IsTouching( unsigned int entnum ) {
 		other = GetEntity( entnum );
 	} else {
 		otherNum = Scr_GetEntityNum( 0, &classnum );
-		if ( classnum || otherNum >= MAX_GENTITIES ) {
+		if ( classnum != SCR_CLASS_ENTITY || otherNum >= MAX_GENTITIES ) {
 			Scr_ParamError( 0, "not an entity" );
 			other = NULL;
 		} else {
@@ -1658,8 +1780,8 @@ void ScrCmd_IsTouching( unsigned int entnum ) {
 		otherMaxs[1] = other->r.maxs[1] + other->r.currentOrigin[1];
 		otherMaxs[2] = other->r.maxs[2] + other->r.currentOrigin[2];
 
-		if ( mins[0] >= otherMaxs[0] && mins[1] >= otherMaxs[1] && mins[2] >= otherMaxs[2]
-			 && otherMins[0] >= maxs[0] && otherMins[1] >= maxs[1] && otherMins[2] >= maxs[2] ) {
+		if ( !( mins[0] < otherMaxs[0] ) && !( mins[1] < otherMaxs[1] ) && !( mins[2] < otherMaxs[2] )
+			 && !( otherMins[0] < maxs[0] ) && !( otherMins[1] < maxs[1] ) && !( otherMins[2] < maxs[2] ) ) {
 			Scr_AddInt( 0 );
 			return;
 		}
@@ -1683,6 +1805,8 @@ void ScrCmd_IsTouching( unsigned int entnum ) {
 /*
 =============
 ScrCmd_LockDoor
+
+Locks a func_door or func_door_rotating.
 =============
 */
 void ScrCmd_LockDoor( unsigned int entnum ) {
@@ -1697,6 +1821,8 @@ void ScrCmd_LockDoor( unsigned int entnum ) {
 /*
 =============
 ScrCmd_UnlockDoor
+
+Unlocks a func_door or func_door_rotating.
 =============
 */
 void ScrCmd_UnlockDoor( unsigned int entnum ) {
@@ -1711,6 +1837,8 @@ void ScrCmd_UnlockDoor( unsigned int entnum ) {
 /*
 =============
 ScrCmd_IsDoorLocked
+
+Returns true if the entity is a locked door.
 =============
 */
 void ScrCmd_IsDoorLocked( unsigned int entnum ) {
@@ -1728,11 +1856,13 @@ void ScrCmd_IsDoorLocked( unsigned int entnum ) {
 /*
 =============
 ScrCmd_PlaySound
+
+Plays a sound alias on the entity for every client.
 =============
 */
 void ScrCmd_PlaySound( unsigned int entnum ) {
 	gentity_t   *ent;
-	byte alias;
+	int alias;
 
 	ent = GetEntity( entnum );
 	alias = G_SoundAliasIndex( Scr_GetString( 0 ) );
@@ -1740,14 +1870,15 @@ void ScrCmd_PlaySound( unsigned int entnum ) {
 	ent->r.svFlags &= ~SVF_NOCLIENT;
 	ent->r.svFlags |= SVF_BROADCAST;
 
-	if ( alias ) {
-		G_AddEvent( ent, EV_SOUND_ALIAS, alias );
-	}
+	/* keep: int alias, matches original codegen */
+	G_PlaySoundAlias( ent, alias );
 }
 
 /*
 =============
 ScrCmd_PlayLoopSound
+
+Starts a looping sound alias on the entity.
 =============
 */
 void ScrCmd_PlayLoopSound( unsigned int entnum ) {
@@ -1760,6 +1891,8 @@ void ScrCmd_PlayLoopSound( unsigned int entnum ) {
 /*
 =============
 ScrCmd_StopLoopSound
+
+Stops the entity's looping sound.
 =============
 */
 void ScrCmd_StopLoopSound( unsigned int entnum ) {
@@ -1769,6 +1902,9 @@ void ScrCmd_StopLoopSound( unsigned int entnum ) {
 /*
 =============
 ScrCmd_Delete
+
+Notifies "death" and frees the entity shortly after.  Player entities cannot
+be deleted.
 =============
 */
 void ScrCmd_Delete( unsigned int entnum ) {
@@ -1794,6 +1930,8 @@ void ScrCmd_Delete( unsigned int entnum ) {
 /*
 =============
 ScrCmd_SetModel
+
+Sets the entity's model; an empty name clears it.
 =============
 */
 void ScrCmd_SetModel( unsigned int entnum ) {
@@ -1803,10 +1941,10 @@ void ScrCmd_SetModel( unsigned int entnum ) {
 	ent = GetEntity( entnum );
 	modelName = Scr_GetString( 0 );
 
-	if ( modelName[0] ) {
-		ent->model = G_ModelIndex( modelName );
-	} else {
+	if ( !modelName[0] ) {
 		ent->model = 0;
+	} else {
+		ent->model = G_ModelIndex( modelName );
 	}
 
 	G_DObjUpdate( ent );
@@ -1816,6 +1954,9 @@ void ScrCmd_SetModel( unsigned int entnum ) {
 /*
 =============
 ScrCmd_GetNormalHealth
+
+Returns a player's health as a fraction of max health, or the raw health of
+any other entity.
 =============
 */
 void ScrCmd_GetNormalHealth( unsigned int entnum ) {
@@ -1837,11 +1978,13 @@ void ScrCmd_GetNormalHealth( unsigned int entnum ) {
 /*
 =============
 ScrCmd_SetNormalHealth
+
+Sets health as a fraction of max health.
 =============
 */
 void ScrCmd_SetNormalHealth( unsigned int entnum ) {
 	gentity_t   *ent;
-	float frac;
+	rfloat frac;
 	int health;
 
 	ent = GetEntity( entnum );
@@ -1852,41 +1995,47 @@ void ScrCmd_SetNormalHealth( unsigned int entnum ) {
 	}
 
 	if ( ent->client ) {
-		health = (int)( (double)ent->client->sess.maxHealth * frac );
+		health = (int)( FCAST( ent->client->sess.maxHealth ) * frac );
 	} else if ( ent->maxHealth ) {
-		health = (int)( (double)ent->maxHealth * frac );
+		health = (int)( FCAST( ent->maxHealth ) * frac );
 	} else {
 		health = (int)frac;
 	}
 
-	if ( health > 0 ) {
-		ent->health = health;
-	} else {
+	if ( health <= 0 ) {
 		Com_Printf( "ERROR: Cannot setnormalhealth to 0 or below.\n" );
+	} else {
+		ent->health = health;
 	}
 }
 
 /*
 =============
 ScrCmd_Show
+
+Makes the entity visible again.
 =============
 */
 void ScrCmd_Show( unsigned int entnum ) {
-	GetEntity( entnum )->flags &= ~FL_NOCLIENT;
+	GetEntity( entnum )->flags &= ~FL_NODRAW;
 }
 
 /*
 =============
 ScrCmd_Hide
+
+Stops the entity from being drawn.
 =============
 */
 void ScrCmd_Hide( unsigned int entnum ) {
-	GetEntity( entnum )->flags |= FL_NOCLIENT;
+	GetEntity( entnum )->flags |= FL_NODRAW;
 }
 
 /*
 =============
 ScrCmd_SetContents
+
+Sets the entity's contents and returns the previous value.
 =============
 */
 void ScrCmd_SetContents( unsigned int entnum ) {
@@ -1903,18 +2052,14 @@ void ScrCmd_SetContents( unsigned int entnum ) {
 }
 
 /*
- * The two entityState_t words the cursor-hint pair lives in.  g_public.h names
- * +216 `scale` and +220 `dmgFlags`, and g_main_mp.c's G_CheckForCursorHints
- * already reads them under those names -- +216 is the hint string's index into
- * the CS_HINTSTRINGS block (255 for "none") and +220 the hint type.
+ * The cursor hint travels in entityState_t: s.dmgFlags is the hint type and
+ * s.scale the hint string's index into CS_HINTSTRINGS (HINT_STRING_NONE for
+ * none).
  */
 
-/* The retail search bound is 138, well past the end of predef_hintStrings[];
-   the NULL slot at the end of the table is what actually stops the walk. */
+/* keep: the bound runs past the end of hintStrings[]; its NULL entry ends the walk */
 #define HINT_SEARCH_MAX             138
 
-#define HINT_INHERIT                ( -1 )
-#define HINT_STRING_NONE            255
 
 /* G_InitObjectives comes before them in the file. */
 void ClearObjective_OnEntity( objective_t *objective );
@@ -1923,12 +2068,13 @@ void ClearObjective( objective_t *objective );
 /*
 =============
 GScr_SetCursorHint
+
+Sets the cursor hint shown when a player looks at the entity.
 =============
 */
 void GScr_SetCursorHint( unsigned int entnum ) {
 	gentity_t   *ent;
 	const char  *name;
-	char        **s;
 	int i;
 
 	ent = GetEntity( entnum );
@@ -1940,10 +2086,10 @@ void GScr_SetCursorHint( unsigned int entnum ) {
 	}
 
 	for ( i = 1; i < HINT_SEARCH_MAX; i++ ) {
-		if ( !predef_hintStrings[i] ) {
+		if ( !hintStrings[i] ) {
 			break;
 		}
-		if ( !Q_strcasecmp( name, predef_hintStrings[i] ) ) {
+		if ( !Q_strcasecmp( name, hintStrings[i] ) ) {
 			ent->s.dmgFlags = i;
 			return;
 		}
@@ -1953,11 +2099,11 @@ void GScr_SetCursorHint( unsigned int entnum ) {
 	if ( ent->classname == scr_const.trigger_use ) {
 		Com_Printf( "HINT_INHERIT (for trigger_use entities only)\n" );
 	}
-	for ( s = &predef_hintStrings[1]; s < &predef_hintStrings[HINT_SEARCH_MAX]; s++ ) {
-		if ( !*s ) {
+	for ( i = 1; i < HINT_SEARCH_MAX; i++ ) {
+		if ( !hintStrings[i] ) {
 			break;
 		}
-		Com_Printf( "%s\n", *s );
+		Com_Printf( "%s\n", hintStrings[i] );
 	}
 
 	Scr_Error( va( "%s is not a valid hint type. See above for list of valid hint types\n", name ) );
@@ -1997,10 +2143,13 @@ qboolean G_GetHintStringIndex( int *index, const char *string ) {
 /*
 =============
 GScr_SetHintString
+
+Sets the hint string shown for a trigger_use.
 =============
 */
 void GScr_SetHintString( unsigned int entnum ) {
 	gentity_t   *ent;
+	const char  *hint;
 	char string[MAX_STRING_CHARS];
 	int index;
 
@@ -2010,24 +2159,29 @@ void GScr_SetHintString( unsigned int entnum ) {
 		Scr_Error( "The setHintString command only works on trigger_use entities.\n" );
 	}
 
-	if ( Scr_GetType( 0 ) == VAR_STRING && Scr_GetString( 0 ) && !Q_stricmp( Scr_GetString( 0 ), "" ) ) {
-		ent->s.scale = HINT_STRING_NONE;
-		return;
+	if ( Scr_GetType( 0 ) == VAR_STRING ) {
+		hint = Scr_GetString( 0 );
+		if ( hint && !Q_stricmp( hint, "" ) ) {
+			ent->s.scale = HINT_STRING_NONE;
+			return;
+		}
 	}
 
-	Scr_ConstructMessageString( MESSAGE_HINT_STRING, 0, string, sizeof( string ) );
+	Scr_ConstructMessageString( 0, MESSAGE_HINT_STRING, string, sizeof( string ) );
 
 	if ( !G_GetHintStringIndex( &index, string ) ) {
 		Scr_Error( va( "Too many different hintstring values. Max allowed is %i different strings",
 					   CS_HINTSTRINGS_COUNT ) );
 	}
 
-	ent->s.scale = index;
+	ent->s.scale = (unsigned char)index;
 }
 
 /*
 =============
 GScr_GetEntityNumber
+
+Returns the entity's number.
 =============
 */
 void GScr_GetEntityNumber( unsigned int entnum ) {
@@ -2037,6 +2191,8 @@ void GScr_GetEntityNumber( unsigned int entnum ) {
 /*
 =============
 GScr_EnableGrenadeTouchDamage
+
+Lets a grenade touching a trigger_damage set it off.
 =============
 */
 void GScr_EnableGrenadeTouchDamage( unsigned int entnum ) {
@@ -2046,12 +2202,14 @@ void GScr_EnableGrenadeTouchDamage( unsigned int entnum ) {
 	if ( ent->classname != scr_const.trigger_damage ) {
 		Scr_Error( "Currently on supported on damage triggers" );
 	}
-	ent->flags |= FL_NO_GRENADE_TOUCH_DAMAGE;
+	ent->flags |= FL_GRENADE_TOUCH_DAMAGE;
 }
 
 /*
 =============
 GScr_DisableGrenadeTouchDamage
+
+Stops grenades touching a trigger_damage from setting it off.
 =============
 */
 void GScr_DisableGrenadeTouchDamage( unsigned int entnum ) {
@@ -2061,12 +2219,14 @@ void GScr_DisableGrenadeTouchDamage( unsigned int entnum ) {
 	if ( ent->classname != scr_const.trigger_damage ) {
 		Scr_Error( "Currently on supported on damage triggers" );
 	}
-	ent->flags &= ~FL_NO_GRENADE_TOUCH_DAMAGE;
+	ent->flags &= ~FL_GRENADE_TOUCH_DAMAGE;
 }
 
 /*
 =============
 GScr_EnableGrenadeBounce
+
+Lets grenades bounce off the entity.
 =============
 */
 void GScr_EnableGrenadeBounce( unsigned int entnum ) {
@@ -2076,6 +2236,8 @@ void GScr_EnableGrenadeBounce( unsigned int entnum ) {
 /*
 =============
 GScr_DisableGrenadeBounce
+
+Stops grenades from bouncing off the entity.
 =============
 */
 void GScr_DisableGrenadeBounce( unsigned int entnum ) {
@@ -2086,8 +2248,7 @@ void GScr_DisableGrenadeBounce( unsigned int entnum ) {
 =============
 G_InitObjectives
 
-0x200313A0.  No retail symbol; name inferred from United Offensive, which has
-the same 16-slot clear.
+Clears every objective slot.
 =============
 */
 void G_InitObjectives( void ) {
@@ -2102,7 +2263,8 @@ void G_InitObjectives( void ) {
 =============
 ObjectiveStateIndexFromString
 
-0x200313D0.  No retail symbol; name inferred from United Offensive.
+Maps an objective state name to its OBJST_ value.  Returns qfalse for an
+unknown name.
 =============
 */
 qboolean ObjectiveStateIndexFromString( int *outState, unsigned short stateName ) {
@@ -2123,6 +2285,8 @@ qboolean ObjectiveStateIndexFromString( int *outState, unsigned short stateName 
 /*
 =============
 ClearObjective_OnEntity
+
+Detaches the objective from the entity it was following.
 =============
 */
 void ClearObjective_OnEntity( objective_t *objective ) {
@@ -2140,6 +2304,8 @@ void ClearObjective_OnEntity( objective_t *objective ) {
 /*
 =============
 ClearObjective
+
+Resets an objective slot to empty.
 =============
 */
 void ClearObjective( objective_t *objective ) {
@@ -2155,6 +2321,8 @@ void ClearObjective( objective_t *objective ) {
 /*
 =============
 SetObjectiveIcon
+
+Sets the objective's icon from the shader name in script parameter paramIndex.
 =============
 */
 void SetObjectiveIcon( unsigned int paramIndex, objective_t *objective ) {
@@ -2166,7 +2334,7 @@ void SetObjectiveIcon( unsigned int paramIndex, objective_t *objective ) {
 	i = 0;
 	if ( name[0] ) {
 		do {
-			if ( name[i] <= 31 || name[i] == 127 ) {
+			if ( name[i] <= 31 || name[i] >= 127 ) {
 				Scr_ParamError( 3, va( "Illegal character '%c'(ascii %i) in objective icon name: %s\n",
 									   name[i], (byte)name[i], name ) );
 			}
@@ -2183,6 +2351,8 @@ void SetObjectiveIcon( unsigned int paramIndex, objective_t *objective ) {
 /*
 =============
 Scr_Objective_Add
+
+objective_add( index, state [, position [, icon]] )
 =============
 */
 void Scr_Objective_Add( void ) {
@@ -2231,26 +2401,27 @@ void Scr_Objective_Add( void ) {
 /*
 =============
 Scr_Objective_Delete
+
+objective_delete( index )
 =============
 */
 void Scr_Objective_Delete( void ) {
 	int index;
-	objective_t *objective;
 
 	index = Scr_GetInt( 0 );
 	if ( index < 0 || index >= MAX_OBJECTIVES ) {
 		Scr_ParamError( 0, va( "index %i is an illegal objective index. Valid indexes are 0 to %i\n",
 							   index, MAX_OBJECTIVES - 1 ) );
 	}
-	objective = &level.objectives[index];
-
-	ClearObjective_OnEntity( objective );
-	ClearObjective( objective );
+	ClearObjective_OnEntity( &level.objectives[index] );
+	ClearObjective( &level.objectives[index] );
 }
 
 /*
 =============
 Scr_Objective_State
+
+objective_state( index, state )
 =============
 */
 void Scr_Objective_State( void ) {
@@ -2281,6 +2452,8 @@ void Scr_Objective_State( void ) {
 /*
 =============
 Scr_Objective_Icon
+
+objective_icon( index, icon )
 =============
 */
 void Scr_Objective_Icon( void ) {
@@ -2298,6 +2471,8 @@ void Scr_Objective_Icon( void ) {
 /*
 =============
 Scr_Objective_Position
+
+objective_position( index, position )
 =============
 */
 void Scr_Objective_Position( void ) {
@@ -2322,6 +2497,10 @@ void Scr_Objective_Position( void ) {
 /*
 =============
 Scr_Objective_OnEntity
+
+objective_onentity( index, entity )
+
+The objective follows the entity.
 =============
 */
 void Scr_Objective_OnEntity( void ) {
@@ -2341,7 +2520,7 @@ void Scr_Objective_OnEntity( void ) {
 	ClearObjective_OnEntity( objective );
 
 	entnum = Scr_GetEntityNum( 1, &classnum );
-	if ( classnum || entnum >= MAX_GENTITIES ) {
+	if ( classnum != SCR_CLASS_ENTITY || entnum >= MAX_GENTITIES ) {
 		Scr_ParamError( 1, "not an entity" );
 		ent = NULL;
 	} else {
@@ -2355,6 +2534,11 @@ void Scr_Objective_OnEntity( void ) {
 /*
 =============
 Scr_Objective_Current
+
+objective_current( [index, ...] )
+
+The listed objectives become current; any other current objective goes back
+to active.
 =============
 */
 void Scr_Objective_Current( void ) {
@@ -2363,6 +2547,7 @@ void Scr_Objective_Current( void ) {
 	int index;
 	int selected[MAX_OBJECTIVES];
 	int i;
+	objective_t *objective;
 
 	paramCount = Scr_GetNumParam();
 	memset( selected, 0, sizeof( selected ) );
@@ -2378,10 +2563,11 @@ void Scr_Objective_Current( void ) {
 	}
 
 	for ( i = 0; i < MAX_OBJECTIVES; i++ ) {
+		objective = &level.objectives[i];
 		if ( selected[i] ) {
-			level.objectives[i].state = OBJST_CURRENT;
-		} else if ( level.objectives[i].state == OBJST_CURRENT ) {
-			level.objectives[i].state = OBJST_ACTIVE;
+			objective->state = OBJST_CURRENT;
+		} else if ( objective->state == OBJST_CURRENT ) {
+			objective->state = OBJST_ACTIVE;
 		}
 	}
 }
@@ -2389,6 +2575,10 @@ void Scr_Objective_Current( void ) {
 /*
 =============
 GScr_Objective_Team
+
+objective_team( index, team )
+
+Shows the objective to one team only ("none" for both).
 =============
 */
 void GScr_Objective_Team( void ) {
@@ -2419,6 +2609,8 @@ void GScr_Objective_Team( void ) {
 /*
 =============
 GScr_LogPrint
+
+Writes the parameters to the game log.
 =============
 */
 void GScr_LogPrint( void ) {
@@ -2449,6 +2641,8 @@ void GScr_LogPrint( void ) {
 /*
 =============
 GScr_WorldEntNumber
+
+Returns the world entity number.
 =============
 */
 void GScr_WorldEntNumber( void ) {
@@ -2458,6 +2652,10 @@ void GScr_WorldEntNumber( void ) {
 /*
 =============
 GScr_Obituary
+
+obituary( victim, attacker, weapon, meansOfDeath )
+
+Sends a kill message to every client.
 =============
 */
 void GScr_Obituary( void ) {
@@ -2477,7 +2675,7 @@ void GScr_Obituary( void ) {
 	tent = G_TempEntity( vec3_origin, EV_OBITUARY );
 
 	entnum = Scr_GetEntityNum( 0, &classnum );
-	if ( classnum || entnum >= MAX_GENTITIES ) {
+	if ( classnum != SCR_CLASS_ENTITY || entnum >= MAX_GENTITIES ) {
 		Scr_ParamError( 0, "not an entity" );
 		self = NULL;
 	} else {
@@ -2494,11 +2692,11 @@ void GScr_Obituary( void ) {
 
 	tent->r.svFlags = SVF_BROADCAST;
 
-	/* the splash / environmental means of death travel with 0x80 set instead
-	   of a weapon index */
+	/* the splash / environmental means of death travel with MOD_FLAG set
+	   instead of a weapon index */
 	if ( mod == MOD_MELEE || mod == MOD_HEAD_SHOT || mod == MOD_SUICIDE || mod == MOD_FALLING
 		 || mod == MOD_CRUSH || mod == MOD_WATER || mod == MOD_SLIME ) {
-		tent->s.eventParm = mod | 0x80;
+		tent->s.eventParm = mod | MOD_FLAG;
 	} else {
 		tent->s.eventParm = weapon;
 	}
@@ -2507,6 +2705,9 @@ void GScr_Obituary( void ) {
 /*
 =============
 GScr_positionWouldTelefrag
+
+Returns true if a player standing at the position would overlap a living
+player.
 =============
 */
 void GScr_positionWouldTelefrag( void ) {
@@ -2516,7 +2717,7 @@ void GScr_positionWouldTelefrag( void ) {
 	int entityList[MAX_GENTITIES];
 	int num;
 	int i;
-	gclient_t   *client;
+	gentity_t   *ent;
 
 	Scr_GetVector( 0, origin );
 
@@ -2528,14 +2729,10 @@ void GScr_positionWouldTelefrag( void ) {
 	maxs[2] = playerMaxs[2] + origin[2];
 
 	num = trap_EntitiesInBox( mins, maxs, entityList, MAX_GENTITIES, CONTENTS_BODY );
-	if ( num <= 0 ) {
-		Scr_AddInt( 0 );
-		return;
-	}
 
 	for ( i = 0; i < num; i++ ) {
-		client = g_entities[entityList[i]].client;
-		if ( client && client->ps.pm_type < PM_DEAD ) {
+		ent = &g_entities[entityList[i]];
+		if ( ent->client && ent->client->ps.pm_type < PM_DEAD ) {
 			Scr_AddInt( 1 );
 			return;
 		}
@@ -2547,6 +2744,8 @@ void GScr_positionWouldTelefrag( void ) {
 /*
 =============
 GScr_getStartTime
+
+Returns level.startTime.
 =============
 */
 void GScr_getStartTime( void ) {
@@ -2556,6 +2755,8 @@ void GScr_getStartTime( void ) {
 /*
 =============
 GScr_PrecacheMenu
+
+Adds a menu to the CS_MENUS configstrings.
 =============
 */
 void GScr_PrecacheMenu( void ) {
@@ -2590,6 +2791,8 @@ void GScr_PrecacheMenu( void ) {
 /*
 =============
 GScr_GetScriptMenuIndex
+
+Returns a precached menu's index; an unknown menu is a script error.
 =============
 */
 int GScr_GetScriptMenuIndex( const char *name ) {
@@ -2598,7 +2801,7 @@ int GScr_GetScriptMenuIndex( const char *name ) {
 
 	for ( i = 0; i < CS_MENUS_COUNT; i++ ) {
 		trap_GetConfigstring( CS_MENUS + i, cs, sizeof( cs ) );
-		if ( !Q_stricmp( name, cs ) ) {
+		if ( !Q_stricmp( cs, name ) ) {
 			return i;
 		}
 	}
@@ -2610,6 +2813,8 @@ int GScr_GetScriptMenuIndex( const char *name ) {
 /*
 =============
 GScr_PrecacheStatusIcon
+
+Adds a scoreboard status icon to the CS_STATUSICONS configstrings.
 =============
 */
 void GScr_PrecacheStatusIcon( void ) {
@@ -2660,7 +2865,7 @@ int GScr_GetStatusIconIndex( const char *name ) {
 
 	for ( i = 0; i < CS_STATUSICONS_COUNT; i++ ) {
 		trap_GetConfigstring( CS_STATUSICONS + i, cs, sizeof( cs ) );
-		if ( !Q_stricmp( name, cs ) ) {
+		if ( !Q_stricmp( cs, name ) ) {
 			return i + 1;
 		}
 	}
@@ -2672,6 +2877,8 @@ int GScr_GetStatusIconIndex( const char *name ) {
 /*
 =============
 GScr_PrecacheHeadIcon
+
+Adds a head icon to the CS_HEADICONS configstrings.
 =============
 */
 void GScr_PrecacheHeadIcon( void ) {
@@ -2707,6 +2914,8 @@ void GScr_PrecacheHeadIcon( void ) {
 /*
 =============
 GScr_GetHeadIconIndex
+
+As GScr_GetStatusIconIndex, for head icons.
 =============
 */
 int GScr_GetHeadIconIndex( const char *name ) {
@@ -2719,7 +2928,7 @@ int GScr_GetHeadIconIndex( const char *name ) {
 
 	for ( i = 0; i < CS_HEADICONS_COUNT; i++ ) {
 		trap_GetConfigstring( CS_HEADICONS + i, cs, sizeof( cs ) );
-		if ( !Q_stricmp( name, cs ) ) {
+		if ( !Q_stricmp( cs, name ) ) {
 			return i + 1;
 		}
 	}
@@ -2731,6 +2940,11 @@ int GScr_GetHeadIconIndex( const char *name ) {
 /*
 =============
 Scr_BulletTrace
+
+bullettrace( start, end, hitCharacters, ignoreEnt )
+
+Returns an array with the trace's fraction, position, entity, normal and
+surfacetype.
 =============
 */
 void Scr_BulletTrace( void ) {
@@ -2776,7 +2990,7 @@ void Scr_BulletTrace( void ) {
 		Scr_AddVector( trace.normal );
 		Scr_AddArrayStringIndexed( scr_const.normal );
 
-		Scr_AddString( trap_SurfaceTypeToName( ( trace.surfaceFlags >> 20 ) & 0x1F ) );
+		Scr_AddString( trap_SurfaceTypeToName( SURF_TYPE( trace.surfaceFlags ) ) );
 		Scr_AddArrayStringIndexed( scr_const.surfacetype );
 	} else {
 		dir[0] = end[0] - start[0];
@@ -2795,6 +3009,8 @@ void Scr_BulletTrace( void ) {
 /*
 =============
 Scr_RandomInt
+
+Returns a random integer from 0 up to, but not including, range.
 =============
 */
 void Scr_RandomInt( void ) {
@@ -2804,28 +3020,32 @@ void Scr_RandomInt( void ) {
 	if ( range <= 0 ) {
 		Com_Printf( "RandomInt parm: %d  ", range );
 		Scr_Error( "RandomInt parm must be positive integer.\n" );
+		return;
 	}
 
 	com_randSeed = 214013 * com_randSeed + 2531011;
-	Scr_AddInt( ( range * ( (unsigned int)com_randSeed >> 17 ) ) >> 15 );
+	Scr_AddInt( (int)( range * ( (unsigned int)com_randSeed >> 17 ) ) >> 15 );
 }
 
 /*
 =============
 Scr_RandomFloat
+
+Returns a random float between 0 and range.
 =============
 */
 void Scr_RandomFloat( void ) {
 	float range;
 
 	range = Scr_GetFloat( 0 );
-	com_randSeed = 214013 * com_randSeed + 2531011;
-	Scr_AddFloat( (float)( (unsigned int)com_randSeed >> 17 ) * range / 32768.0f );
+	Scr_AddFloat( Com_RandFloatRange( 0.0f, range ) );
 }
 
 /*
 =============
 Scr_RandomIntRange
+
+Returns a random integer from min up to, but not including, max.
 =============
 */
 void Scr_RandomIntRange( void ) {
@@ -2841,12 +3061,14 @@ void Scr_RandomIntRange( void ) {
 	}
 
 	com_randSeed = 214013 * com_randSeed + 2531011;
-	Scr_AddInt( min + ( ( ( max - min ) * ( (unsigned int)com_randSeed >> 17 ) ) >> 15 ) );
+	Scr_AddInt( min + ( (int)( ( max - min ) * ( (unsigned int)com_randSeed >> 17 ) ) >> 15 ) );
 }
 
 /*
 =============
 Scr_RandomFloatRange
+
+Returns a random float between min and max.
 =============
 */
 void Scr_RandomFloatRange( void ) {
@@ -2857,47 +3079,62 @@ void Scr_RandomFloatRange( void ) {
 	max = Scr_GetFloat( 1 );
 
 	if ( max <= min ) {
-		Com_Printf( "Scr_RandomFloatRange parms: %d %d ", min );
+		Com_Printf( "Scr_RandomFloatRange parms: %d %d ", min, max );
 		Scr_Error( "Scr_RandomFloatRange range must be positive float.\n" );
 	}
 
-	com_randSeed = 214013 * com_randSeed + 2531011;
-	Scr_AddFloat( ( max - min ) * (float)( (unsigned int)com_randSeed >> 17 ) / 32768.0f + min );
+	Scr_AddFloat( Com_RandFloatRange( min, max ) );
 }
 
 /*
 =============
 GScr_sin
+
+Returns the sine of an angle in degrees.
 =============
 */
 void GScr_sin( void ) {
-	Scr_AddFloat( (float)sin( Scr_GetFloat( 0 ) * M_PI / 180.0f ) );
+	rfloat angle;
+	float result;
+
+	/* keep: separate statements match original codegen */
+	angle = Scr_GetFloat( 0 ) * M_PI;
+	result = sin( angle * ( 1.0f / 180.0f ) );
+	Scr_AddFloat( result );
 }
 
 /*
 =============
 GScr_cos
+
+Returns the cosine of an angle in degrees.
 =============
 */
 void GScr_cos( void ) {
-	Scr_AddFloat( (float)cos( Scr_GetFloat( 0 ) * M_PI / 180.0f ) );
+	rfloat angle;
+	float result;
+
+	/* keep: separate statements match original codegen */
+	angle = Scr_GetFloat( 0 ) * M_PI;
+	result = cos( angle * ( 1.0f / 180.0f ) );
+	Scr_AddFloat( result );
 }
 
 /*
 =============
 GScr_tan
+
+Returns the tangent of an angle in degrees.
 =============
 */
 void GScr_tan( void ) {
-	float angle;
 	float s;
 	float c;
 
-	angle = Scr_GetFloat( 0 ) * M_PI / 180.0f;
-	s = (float)sin( angle );
-	c = (float)cos( angle );
+	/* keep: the cast matches original codegen */
+	SinCos( FCAST( Scr_GetFloat( 0 ) * M_PI ) * ( 1.0f / 180.0f ), &s, &c );
 
-	if ( c == 0.0 ) {
+	if ( c == 0.0f ) {
 		Scr_Error( "divide by 0" );
 	}
 
@@ -2907,115 +3144,133 @@ void GScr_tan( void ) {
 /*
 =============
 GScr_asin
+
+Returns the arcsine in degrees.
 =============
 */
 void GScr_asin( void ) {
 	float value;
+	rfloat degrees;
 
 	value = Scr_GetFloat( 0 );
-	if ( value < -1.0 || value > 1.0 ) {
+	if ( value < -1.0f || value > 1.0f ) {
 		Scr_Error( va( "%g out of range", value ) );
 	}
 
-	Scr_AddFloat( (float)asin( value ) * 180.0f / M_PI );
+	/* keep: separate statements match original codegen */
+	degrees = FCAST( asin( value ) ) * 180.0f;
+	Scr_AddFloat( degrees * ( 1.0f / M_PI ) );
 }
 
 /*
 =============
 GScr_acos
+
+Returns the arccosine in degrees.
 =============
 */
 void GScr_acos( void ) {
 	float value;
+	rfloat degrees;
 
 	value = Scr_GetFloat( 0 );
-	if ( value < -1.0 || value > 1.0 ) {
+	if ( value < -1.0f || value > 1.0f ) {
 		Scr_Error( va( "%g out of range", value ) );
 	}
 
-	Scr_AddFloat( (float)acos( value ) * 180.0f / M_PI );
+	/* keep: separate statements match original codegen */
+	degrees = FCAST( acos( value ) ) * 180.0f;
+	Scr_AddFloat( degrees * ( 1.0f / M_PI ) );
 }
 
 /*
 =============
 GScr_atan
+
+Returns the arctangent in degrees.
 =============
 */
 void GScr_atan( void ) {
-	Scr_AddFloat( (float)atan( Scr_GetFloat( 0 ) ) * 180.0f / M_PI );
+	rfloat degrees;
+	float result;
+
+	/* keep: separate statements match original codegen */
+	degrees = FCAST( atan( Scr_GetFloat( 0 ) ) ) * 180.0f;
+	result = degrees * ( 1.0f / M_PI );
+	Scr_AddFloat( result );
 }
 
 /*
 =============
 Scr_Distance
+
+Returns the distance between two points.
 =============
 */
 void Scr_Distance( void ) {
 	vec3_t a;
 	vec3_t b;
-	float dx;
-	float dy;
-	float dz;
+	float dist;
 
 	Scr_GetVector( 0, a );
 	Scr_GetVector( 1, b );
 
-	dx = b[0] - a[0];
-	dy = b[1] - a[1];
-	dz = b[2] - a[2];
-
-	Scr_AddFloat( (float)sqrt( dz * dz + dy * dy + dx * dx ) );
+	dist = Distance( a, b );
+	Scr_AddFloat( dist );
 }
 
 /*
 =============
 Scr_DistanceSquared
+
+Returns the squared distance between two points.
 =============
 */
 void Scr_DistanceSquared( void ) {
 	vec3_t a;
 	vec3_t b;
-	float dx;
-	float dy;
-	float dz;
 
 	Scr_GetVector( 0, a );
 	Scr_GetVector( 1, b );
 
-	dx = b[0] - a[0];
-	dy = b[1] - a[1];
-	dz = b[2] - a[2];
-
-	Scr_AddFloat( dz * dz + dy * dy + dx * dx );
+	Scr_AddFloat( DistanceSquared( a, b ) );
 }
 
 /*
 =============
 Scr_Length
+
+Returns the length of a vector.
 =============
 */
 void Scr_Length( void ) {
 	vec3_t v;
 
 	Scr_GetVector( 0, v );
-	Scr_AddFloat( (float)sqrt( v[2] * v[2] + v[1] * v[1] + v[0] * v[0] ) );
+	Scr_AddFloat( (float)sqrt( v[0] * v[0] + v[1] * v[1] + v[2] * v[2] ) );
 }
 
 /*
 =============
 Scr_LengthSquared
+
+Returns the squared length of a vector.
 =============
 */
 void Scr_LengthSquared( void ) {
 	vec3_t v;
 
 	Scr_GetVector( 0, v );
-	Scr_AddFloat( v[2] * v[2] + v[1] * v[1] + v[0] * v[0] );
+	Scr_AddFloat( v[0] * v[0] + v[1] * v[1] + v[2] * v[2] );
 }
 
 /*
 =============
 Scr_Closer
+
+closer( org, a, b )
+
+Returns true if a is closer to org than b is.
 =============
 */
 void Scr_Closer( void ) {
@@ -3024,34 +3279,21 @@ void Scr_Closer( void ) {
 	vec3_t b;
 	float da;
 	float db;
-	float dx;
-	float dy;
-	float dz;
 
 	Scr_GetVector( 0, org );
 	Scr_GetVector( 1, a );
 	Scr_GetVector( 2, b );
 
-	dx = org[0] - a[0];
-	dy = org[1] - a[1];
-	dz = org[2] - a[2];
-	da = dz * dz + dy * dy + dx * dx;
-
-	dx = org[0] - b[0];
-	dy = org[1] - b[1];
-	dz = org[2] - b[2];
-	db = dz * dz + dy * dy + dx * dx;
-
-	if ( da >= db ) {
-		Scr_AddInt( 0 );
-	} else {
-		Scr_AddInt( 1 );
-	}
+	da = DistanceSquared( a, org );
+	db = DistanceSquared( b, org );
+	Scr_AddInt( da < db );
 }
 
 /*
 =============
 Scr_VectorDot
+
+Returns the dot product of two vectors.
 =============
 */
 void Scr_VectorDot( void ) {
@@ -3061,12 +3303,14 @@ void Scr_VectorDot( void ) {
 	Scr_GetVector( 0, a );
 	Scr_GetVector( 1, b );
 
-	Scr_AddFloat( b[2] * a[2] + b[1] * a[1] + b[0] * a[0] );
+	Scr_AddFloat( a[0] * b[0] + a[1] * b[1] + a[2] * b[2] );
 }
 
 /*
 =============
 Scr_VectorNormalize
+
+Returns the vector scaled to unit length.
 =============
 */
 void Scr_VectorNormalize( void ) {
@@ -3086,6 +3330,8 @@ void Scr_VectorNormalize( void ) {
 /*
 =============
 Scr_VectorToAngles
+
+Returns the angles of a direction vector.
 =============
 */
 void Scr_VectorToAngles( void ) {
@@ -3100,6 +3346,8 @@ void Scr_VectorToAngles( void ) {
 /*
 =============
 Scr_AnglesToUp
+
+Returns the up vector for a set of angles.
 =============
 */
 void Scr_AnglesToUp( void ) {
@@ -3114,98 +3362,81 @@ void Scr_AnglesToUp( void ) {
 /*
 =============
 Scr_AnglesToRight
+
+Returns the right vector for a set of angles.
 =============
 */
 void Scr_AnglesToRight( void ) {
 	vec3_t angles;
 	vec3_t right;
-	float angle;
-	float sr, sp, sy, cr, cp, cy;
 
 	Scr_GetVector( 0, angles );
-
-	angle = angles[YAW] * ( M_PI * 2 / 360 );
-	cy = (float)cos( angle );
-	sy = (float)sin( angle );
-	angle = angles[PITCH] * ( M_PI * 2 / 360 );
-	cp = (float)cos( angle );
-	sp = (float)sin( angle );
-	angle = angles[ROLL] * ( M_PI * 2 / 360 );
-	cr = (float)cos( angle );
-	sr = (float)sin( angle );
-
-	right[0] = -1 * sr * sp * cy + -1 * cr * -sy;
-	right[1] = -1 * sr * sp * sy + -1 * cr * cy;
-	right[2] = -1 * sr * cp;
-
+	AngleVectors( angles, NULL, right, NULL );
 	Scr_AddVector( right );
 }
 
 /*
 =============
 Scr_AnglesToForward
+
+Returns the forward vector for a set of angles.
 =============
 */
 void Scr_AnglesToForward( void ) {
 	vec3_t angles;
 	vec3_t forward;
-	float angle;
-	float sp, sy, cp, cy;
 
 	Scr_GetVector( 0, angles );
-
-	angle = angles[YAW] * ( M_PI * 2 / 360 );
-	cy = (float)cos( angle );
-	sy = (float)sin( angle );
-	angle = angles[PITCH] * ( M_PI * 2 / 360 );
-	cp = (float)cos( angle );
-	sp = (float)sin( angle );
-
-	forward[0] = cp * cy;
-	forward[1] = cp * sy;
-	forward[2] = -sp;
-
+	AngleVectors( angles, forward, NULL, NULL );
 	Scr_AddVector( forward );
 }
 
 /*
 =============
 Scr_MusicPlay
+
+Starts a music alias on every client.
 =============
 */
 void Scr_MusicPlay( void ) {
-	trap_SendServerCommand( -1, 0, va( "o %s", Scr_GetString( 0 ) ) );
+	trap_SendServerCommand( -1, 1, va( "o %s", Scr_GetString( 0 ) ) );
 }
 
 /*
 =============
 Scr_MusicStop
+
+Stops the music on every client, optionally fading it out over the given
+seconds.
 =============
 */
 void Scr_MusicStop( void ) {
-	int numParam;
 	int fadeTime;
 
-	numParam = Scr_GetNumParam();
-	if ( numParam ) {
-		if ( numParam != 1 ) {
-			Scr_Error( va( "USAGE: musicStop([fadetime]);\n" ) );
-			return;
-		}
-		fadeTime = Q_ftol( Scr_GetFloat( 0 ) * 1000.0f );
-		if ( fadeTime < 0 ) {
-			Scr_Error( va( "musicStop: fade time must be >= 0\n" ) );
-		}
-	} else {
+	switch ( Scr_GetNumParam() ) {
+	case 0:
 		fadeTime = 0;
+		break;
+	case 1:
+		fadeTime = Q_ftol( Scr_GetFloat( 0 ) * 1000.0f );
+		break;
+	default:
+		Scr_Error( va( "USAGE: musicStop([fadetime]);\n" ) );
+		return;
 	}
 
-	trap_SendServerCommand( -1, 0, va( "p %i", fadeTime ) );
+	if ( fadeTime < 0 ) {
+		Scr_Error( va( "musicStop: fade time must be >= 0\n" ) );
+	}
+
+	trap_SendServerCommand( -1, 1, va( "p %i", fadeTime ) );
 }
 
 /*
 =============
 Scr_SoundFade
+
+Fades the sound volume on every client.
 =============
 */
 void Scr_SoundFade( void ) {
@@ -3219,12 +3450,14 @@ void Scr_SoundFade( void ) {
 		fadeTime = 0;
 	}
 
-	trap_SendServerCommand( -1, 0, va( "q %f %i\n", volume, fadeTime ) );
+	trap_SendServerCommand( -1, 1, va( "q %f %i\n", volume, fadeTime ) );
 }
 
 /*
 =============
 Scr_PrecacheModel
+
+Registers a model.  Only valid while the level is spawning.
 =============
 */
 void Scr_PrecacheModel( void ) {
@@ -3237,6 +3470,8 @@ void Scr_PrecacheModel( void ) {
 /*
 =============
 Scr_PrecacheShellShock
+
+Registers a shellshock.  Only valid while the level is spawning.
 =============
 */
 void Scr_PrecacheShellShock( void ) {
@@ -3249,6 +3484,8 @@ void Scr_PrecacheShellShock( void ) {
 /*
 =============
 Scr_PrecacheItem
+
+Registers an item.  Only valid while the level is spawning.
 =============
 */
 void Scr_PrecacheItem( void ) {
@@ -3271,6 +3508,8 @@ void Scr_PrecacheItem( void ) {
 /*
 =============
 Scr_PrecacheShader
+
+Registers a shader.  Only valid while the level is spawning.
 =============
 */
 void Scr_PrecacheShader( void ) {
@@ -3291,6 +3530,8 @@ void Scr_PrecacheShader( void ) {
 /*
 =============
 Scr_PrecacheString
+
+Registers a localized string.  Only valid while the level is spawning.
 =============
 */
 void Scr_PrecacheString( void ) {
@@ -3309,6 +3550,8 @@ void Scr_PrecacheString( void ) {
 /*
 =============
 Scr_AmbientPlay
+
+Starts an ambient sound alias, optionally fading it in over the given seconds.
 =============
 */
 void Scr_AmbientPlay( void ) {
@@ -3319,12 +3562,15 @@ void Scr_AmbientPlay( void ) {
 	fadeTime = 0;
 	numParam = Scr_GetNumParam();
 
-	if ( numParam != 1 ) {
-		if ( numParam != 2 ) {
-			Scr_Error( va( "USAGE: ambientPlay(alias_name, <fadetime>);\n" ) );
-			return;
-		}
+	switch ( numParam ) {
+	case 1:
+		break;
+	case 2:
 		fadeTime = Q_ftol( Scr_GetFloat( 1 ) * 1000.0f );
+		break;
+	default:
+		Scr_Error( va( "USAGE: ambientPlay(alias_name, <fadetime>);\n" ) );
+		return;
 	}
 
 	alias = Scr_GetString( 0 );
@@ -3341,24 +3587,27 @@ void Scr_AmbientPlay( void ) {
 /*
 =============
 Scr_AmbientStop
+
+Stops the ambient sound, optionally fading it out over the given seconds.
 =============
 */
 void Scr_AmbientStop( void ) {
-	int numParam;
 	int fadeTime;
 
-	numParam = Scr_GetNumParam();
-	if ( numParam ) {
-		if ( numParam != 1 ) {
-			Scr_Error( va( "USAGE: ambientStop(<fadetime>);\n" ) );
-			return;
-		}
-		fadeTime = Q_ftol( Scr_GetFloat( 0 ) * 1000.0f );
-		if ( fadeTime < 0 ) {
-			Scr_Error( va( "ambientStop: fade time must be >= 0\n" ) );
-		}
-	} else {
+	switch ( Scr_GetNumParam() ) {
+	case 0:
 		fadeTime = 0;
+		break;
+	case 1:
+		fadeTime = Q_ftol( Scr_GetFloat( 0 ) * 1000.0f );
+		break;
+	default:
+		Scr_Error( va( "USAGE: ambientStop(<fadetime>);\n" ) );
+		return;
+	}
+
+	if ( fadeTime < 0 ) {
+		Scr_Error( va( "ambientStop: fade time must be >= 0\n" ) );
 	}
 
 	trap_SetConfigstring( CS_MUSIC, va( "t\\%i", level.time + fadeTime ) );
@@ -3367,6 +3616,8 @@ void Scr_AmbientStop( void ) {
 /*
 =============
 Scr_GrenadeExplosionEffect
+
+Plays a grenade explosion at a point, along with its concussion effect.
 =============
 */
 void Scr_GrenadeExplosionEffect( void ) {
@@ -3379,29 +3630,28 @@ void Scr_GrenadeExplosionEffect( void ) {
 	gentity_t   *ent;
 
 	Scr_GetVector( 0, origin );
-	origin[2] = origin[2] + 1.0f;
+	start[0] = origin[0];
+	start[1] = origin[1];
+	start[2] = origin[2] + 1.0f;
 
-	tent = G_TempEntity( origin, EV_GRENADE_EXPLODE );
+	tent = G_TempEntity( start, EV_GRENADE_EXPLODE );
 
 	up[0] = 0.0;
 	up[1] = 0.0;
 	up[2] = 1.0;
 	tent->s.eventParm = DirToByte( up );
 
-	start[0] = origin[0];
-	start[1] = origin[1];
-	start[2] = origin[2];
-	end[0] = origin[0];
-	end[1] = origin[1];
-	end[2] = origin[2] - 17.0f;
+	end[0] = start[0];
+	end[1] = start[1];
+	end[2] = start[2] - 17.0f;
 
-	trap_Trace( &trace, start, vec3_origin, vec3_origin, end, ENTITYNUM_NONE, MASK_GRENADE_SURFACE );
-	tent->s.surfType = ( trace.surfaceFlags >> 20 ) & 0x1F;
+	trap_Trace( &trace, start, vec3_origin, vec3_origin, end, ENTITYNUM_NONE, MASK_SOLID );
+	tent->s.surfType = SURF_TYPE( trace.surfaceFlags );
 
 	ent = G_Spawn();
-	ent->r.currentOrigin[0] = origin[0];
-	ent->r.currentOrigin[1] = origin[1];
-	ent->r.currentOrigin[2] = origin[2];
+	ent->r.currentOrigin[0] = start[0];
+	ent->r.currentOrigin[1] = start[1];
+	ent->r.currentOrigin[2] = start[2];
 	ent->think = Concussive_think;
 	ent->nextthink = level.time + 100;
 	ent->delay = level.time + 500.0f;
@@ -3410,6 +3660,10 @@ void Scr_GrenadeExplosionEffect( void ) {
 /*
 =============
 GScr_RadiusDamage
+
+radiusdamage( origin, radius, maxDamage, minDamage )
+
+Explosive damage inflicted by the world.
 =============
 */
 void GScr_RadiusDamage( void ) {
@@ -3431,6 +3685,8 @@ void GScr_RadiusDamage( void ) {
 /*
 =============
 GScr_SetPlayerIgnoreRadiusDamage
+
+Sets whether radiusdamage() leaves players unharmed.
 =============
 */
 void GScr_SetPlayerIgnoreRadiusDamage( void ) {
@@ -3440,6 +3696,11 @@ void GScr_SetPlayerIgnoreRadiusDamage( void ) {
 /*
 =============
 GScr_GetMoveDelta
+
+getmovedelta( anim [, startTime [, endTime]] )
+
+Returns the translation an animation applies between two fractions of its
+length.
 =============
 */
 void GScr_GetMoveDelta( void ) {
@@ -3454,17 +3715,21 @@ void GScr_GetMoveDelta( void ) {
 	startTime = 0.0f;
 	endTime = 1.0f;
 
-	if ( numParam != 1 ) {
-		if ( numParam != 2 ) {
-			endTime = Scr_GetFloat( 2 );
-			if ( endTime < 0.0f || endTime > 1.0f ) {
-				Scr_ParamError( 2, "end time must be between 0 and 1" );
-			}
+	switch ( numParam ) {
+	case 1:
+		break;
+	default:
+		endTime = Scr_GetFloat( 2 );
+		if ( endTime < 0.0f || endTime > 1.0f ) {
+			Scr_ParamError( 2, "end time must be between 0 and 1" );
 		}
+	/* fall through */
+	case 2:
 		startTime = Scr_GetFloat( 1 );
 		if ( startTime < 0.0f || startTime > 1.0f ) {
 			Scr_ParamError( 1, "start time must be between 0 and 1" );
 		}
+		break;
 	}
 
 	anim = Scr_GetAnim( 0, NULL );
@@ -3476,6 +3741,8 @@ void GScr_GetMoveDelta( void ) {
 /*
 =============
 GScr_GetAngleDelta
+
+As getmovedelta, but returns the change in yaw.
 =============
 */
 void GScr_GetAngleDelta( void ) {
@@ -3490,17 +3757,21 @@ void GScr_GetAngleDelta( void ) {
 	startTime = 0.0f;
 	endTime = 1.0f;
 
-	if ( numParam != 1 ) {
-		if ( numParam != 2 ) {
-			endTime = Scr_GetFloat( 2 );
-			if ( endTime < 0.0f || endTime > 1.0f ) {
-				Scr_ParamError( 2, "end time must be between 0 and 1" );
-			}
+	switch ( numParam ) {
+	case 1:
+		break;
+	default:
+		endTime = Scr_GetFloat( 2 );
+		if ( endTime < 0.0f || endTime > 1.0f ) {
+			Scr_ParamError( 2, "end time must be between 0 and 1" );
 		}
+	/* fall through */
+	case 2:
 		startTime = Scr_GetFloat( 1 );
 		if ( startTime < 0.0f || startTime > 1.0f ) {
 			Scr_ParamError( 1, "start time must be between 0 and 1" );
 		}
+		break;
 	}
 
 	anim = Scr_GetAnim( 0, NULL );
@@ -3512,6 +3783,8 @@ void GScr_GetAngleDelta( void ) {
 /*
 =============
 Scr_LoadFX
+
+Registers an effect and returns its id.
 =============
 */
 void Scr_LoadFX( void ) {
@@ -3528,6 +3801,10 @@ void Scr_LoadFX( void ) {
 /*
 =============
 Scr_PlayFX
+
+playfx( id, origin [, forward] )
+
+Plays a one-shot effect.
 =============
 */
 void Scr_PlayFX( void ) {
@@ -3566,6 +3843,10 @@ void Scr_PlayFX( void ) {
 /*
 =============
 Scr_PlayFXOnTag
+
+playfxontag( id, entity, tag )
+
+Plays an effect at a tag on the entity's model.
 =============
 */
 void Scr_PlayFXOnTag( void ) {
@@ -3580,12 +3861,12 @@ void Scr_PlayFXOnTag( void ) {
 	}
 
 	effectId = Scr_GetInt( 0 );
-	if ( effectId <= 0 || effectId >= 64 ) {
+	if ( effectId <= 0 || effectId >= CS_EFFECTS_COUNT ) {
 		Scr_ParamError( 0, va( "effect id %i is invalid\n", effectId ) );
 	}
 
 	entnum = Scr_GetEntityNum( 1, &classnum );
-	if ( classnum || entnum >= MAX_GENTITIES ) {
+	if ( classnum != SCR_CLASS_ENTITY || entnum >= MAX_GENTITIES ) {
 		Scr_ParamError( 1, "not an entity" );
 		ent = NULL;
 	} else {
@@ -3616,6 +3897,10 @@ void Scr_PlayFXOnTag( void ) {
 /*
 =============
 Scr_PlayLoopedFX
+
+playloopedfx( id, repeatDelay, origin [, cullDist [, forward]] )
+
+Spawns and returns an entity that keeps repeating an effect.
 =============
 */
 void Scr_PlayLoopedFX( void ) {
@@ -3632,27 +3917,27 @@ void Scr_PlayLoopedFX( void ) {
 		Scr_Error( "USAGE: playLoopedFx <effect id from loadFx> <repeat delay> <vector position of effect> <optional cull distance (0 = never cull)> <optional forward vector>" );
 	}
 
-	forward[0] = 0.0;
-	forward[1] = 0.0;
-	forward[2] = 0.0;
+	VectorClear( forward );
 	cullDist = 0.0;
 
 	effectId = Scr_GetInt( 0 );
 
 	numParam = Scr_GetNumParam();
-	if ( numParam == 4 || numParam == 5 ) {
-		if ( numParam == 5 ) {
-			Scr_GetVector( 4, forward );
-			if ( VectorNormalize( forward ) == 0.0f ) {
-				if ( effectId ) {
-					trap_GetConfigstring( CS_EFFECTS + effectId, cs, sizeof( cs ) );
-				} else {
-					strcpy( cs, "not successfully loaded" );
-				}
-				Scr_Error( va( "playLoopedFx called with (0 0 0) forward direction (effect = %s)\n", cs ) );
+	switch ( numParam ) {
+	case 5:
+		Scr_GetVector( 4, forward );
+		if ( VectorNormalize( forward ) == 0.0f ) {
+			if ( effectId ) {
+				trap_GetConfigstring( CS_EFFECTS + effectId, cs, sizeof( cs ) );
+			} else {
+				strcpy( cs, "not successfully loaded" );
 			}
+			Scr_Error( va( "playLoopedFx called with (0 0 0) forward direction (effect = %s)\n", cs ) );
 		}
+		/* fallthrough */
+	case 4:
 		cullDist = Scr_GetFloat( 3 );
+		break;
 	}
 
 	Scr_GetVector( 2, origin );
@@ -3666,12 +3951,10 @@ void Scr_PlayLoopedFX( void ) {
 	ent->s.pos.trBase[0] = origin[0];
 	ent->s.pos.trBase[1] = origin[1];
 	ent->s.pos.trBase[2] = origin[2];
-	ent->s.pos.trType = 0;
+	ent->s.pos.trType = TR_STATIONARY;
 	ent->s.pos.trTime = 0;
 	ent->s.pos.trDuration = 0;
-	ent->s.pos.trDelta[0] = 0.0;
-	ent->s.pos.trDelta[1] = 0.0;
-	ent->s.pos.trDelta[2] = 0.0;
+	VectorClear( ent->s.pos.trDelta );
 
 	ent->r.currentOrigin[0] = origin[0];
 	ent->r.currentOrigin[1] = origin[1];
@@ -3690,6 +3973,8 @@ void Scr_PlayLoopedFX( void ) {
 /*
 =============
 Scr_SetFog
+
+Validates and sets the fog for setcullfog and setexpfog.
 =============
 */
 void Scr_SetFog( const char *cmdName, float nearDist, float farDist, float density,
@@ -3714,6 +3999,8 @@ void Scr_SetFog( const char *cmdName, float nearDist, float farDist, float densi
 /*
 =============
 Scr_SetLinearFog
+
+setcullfog( near, far, red, green, blue, transitionTime )
 =============
 */
 void Scr_SetLinearFog( void ) {
@@ -3741,6 +4028,8 @@ void Scr_SetLinearFog( void ) {
 /*
 =============
 Scr_SetExponentialFog
+
+setexpfog( density, red, green, blue, transitionTime )
 =============
 */
 void Scr_SetExponentialFog( void ) {
@@ -3771,6 +4060,8 @@ void Scr_SetExponentialFog( void ) {
 /*
 =============
 GScr_IsPlayer
+
+Returns true if the parameter is a player entity.
 =============
 */
 void GScr_IsPlayer( void ) {
@@ -3785,6 +4076,8 @@ void GScr_IsPlayer( void ) {
 /*
 =============
 GScr_IsPlayerNumber
+
+Returns true if the number is a valid client number.
 =============
 */
 void GScr_IsPlayerNumber( void ) {
@@ -3816,7 +4109,7 @@ void GScr_SetWinningPlayer( void ) {
 	const char  *old;
 
 	entnum = Scr_GetEntityNum( 0, &classnum );
-	if ( classnum || entnum >= MAX_GENTITIES ) {
+	if ( classnum != SCR_CLASS_ENTITY || entnum >= MAX_GENTITIES ) {
 		Scr_ParamError( 0, "not an entity" );
 		ent = NULL;
 	} else {
@@ -3877,18 +4170,22 @@ void GScr_SetWinningTeam( void ) {
 /*
 =============
 GScr_Announcement
+
+Prints an announcement on every client.
 =============
 */
 void GScr_Announcement( void ) {
 	char string[MAX_STRING_CHARS];
 
-	Scr_ConstructMessageString( MESSAGE_ANNOUNCEMENT, 0, string, sizeof( string ) );
+	Scr_ConstructMessageString( 0, MESSAGE_ANNOUNCEMENT, string, sizeof( string ) );
 	trap_SendServerCommand( -1, 0, va( "c \"%s\" 2", string ) );
 }
 
 /*
 =============
 GScr_ClientAnnouncement
+
+Prints an announcement on one client.
 =============
 */
 void GScr_ClientAnnouncement( void ) {
@@ -3898,20 +4195,22 @@ void GScr_ClientAnnouncement( void ) {
 	char string[MAX_STRING_CHARS];
 
 	entnum = Scr_GetEntityNum( 0, &classnum );
-	if ( classnum || entnum >= MAX_GENTITIES ) {
+	if ( classnum != SCR_CLASS_ENTITY || entnum >= MAX_GENTITIES ) {
 		Scr_ParamError( 0, "not an entity" );
 		ent = NULL;
 	} else {
 		ent = &g_entities[entnum];
 	}
 
-	Scr_ConstructMessageString( MESSAGE_ANNOUNCEMENT, 1, string, sizeof( string ) );
+	Scr_ConstructMessageString( 1, MESSAGE_ANNOUNCEMENT, string, sizeof( string ) );
 	trap_SendServerCommand( ent->s.number, 0, va( "c \"%s\" 2", string ) );
 }
 
 /*
 =============
 GScr_GetTeamScore
+
+Returns the allies or axis team score.
 =============
 */
 void GScr_GetTeamScore( void ) {
@@ -3919,26 +4218,20 @@ void GScr_GetTeamScore( void ) {
 
 	teamName = Scr_GetConstString( 0 );
 
-	if ( teamName == scr_const.allies ) {
-		Scr_AddInt( level.teamScores[TEAM_ALLIES] );
-		return;
-	}
-
-	if ( teamName != scr_const.axis ) {
+	if ( teamName != scr_const.allies && teamName != scr_const.axis ) {
 		Scr_Error( va( "Illegal team string '%s'. Must be allies, or axis.",
 					   SL_ConvertToString( teamName ) ) );
 	}
 
-	if ( teamName == scr_const.allies ) {
-		Scr_AddInt( level.teamScores[TEAM_ALLIES] );
-	} else {
-		Scr_AddInt( level.teamScores[TEAM_AXIS] );
-	}
+	Scr_AddInt( teamName == scr_const.allies ? level.teamScores[TEAM_ALLIES]
+											 : level.teamScores[TEAM_AXIS] );
 }
 
 /*
 =============
 GScr_SetTeamScore
+
+Sets the allies or axis team score.
 =============
 */
 void GScr_SetTeamScore( void ) {
@@ -3967,6 +4260,9 @@ void GScr_SetTeamScore( void ) {
 /*
 =============
 GScr_SetClientNameMode
+
+Sets whether name changes take effect at once ("auto_change") or wait for
+updateclientnames ("manual_change").
 =============
 */
 void GScr_SetClientNameMode( void ) {
@@ -3986,8 +4282,8 @@ void GScr_SetClientNameMode( void ) {
 =============
 GScr_UpdateClientNames
 
-Pushes the userinfo name every connected client is waiting on out to the
-scoreboard.  `saved` is written and never read; retail does the same.
+Applies the pending name change of every connected client.  `saved` is
+written and never read.
 =============
 */
 void GScr_UpdateClientNames( void ) {
@@ -3995,33 +4291,25 @@ void GScr_UpdateClientNames( void ) {
 	gclient_t   *client;
 	char saved[32];
 
-	if ( !level.clientNameMode ) {
+	if ( level.clientNameMode == CLIENTNAMEMODE_AUTO ) {
 		Scr_Error( "Only works in [manual_change] mode" );
 	}
 
-	for ( i = 0; i < level.maxclients; i++ ) {
-		client = &level.clients[i];
-
-		if ( client->sess.connected != CON_CONNECTED ) {
-			continue;
+	client = level.clients;
+	for ( i = 0; i < level.maxclients; i++, client++ ) {
+		if ( client->sess.connected == CON_CONNECTED && strcmp( client->sess.name, client->sess.netname ) ) {
+			Q_strncpyz( saved, client->sess.name, sizeof( saved ) );
+			Q_strncpyz( client->sess.name, client->sess.netname, sizeof( client->sess.name ) );
+			ClientUserinfoChanged( i );
 		}
-		if ( !strcmp( client->sess.name, client->sess.netname ) ) {
-			continue;
-		}
-
-		strncpy( saved, client->sess.name, sizeof( saved ) - 1 );
-		saved[sizeof( saved ) - 1] = 0;
-
-		strncpy( client->sess.name, client->sess.netname, sizeof( client->sess.name ) - 1 );
-		client->sess.name[sizeof( client->sess.name ) - 1] = 0;
-
-		ClientUserinfoChanged( i );
 	}
 }
 
 /*
 =============
 GScr_GetTeamPlayersAlive
+
+Returns the number of living players on a team.
 =============
 */
 void GScr_GetTeamPlayersAlive( void ) {
@@ -4045,7 +4333,7 @@ void GScr_GetTeamPlayersAlive( void ) {
 	}
 
 	count = 0;
-	for ( i = 0; i < sv_maxclients.integer; i++ ) {
+	for ( i = 0; i < g_maxclients.integer; i++ ) {
 		ent = &g_entities[i];
 		if ( ent->inuse && ent->client->sess.sessionTeam == team && ent->health > 0 ) {
 			count++;
@@ -4058,10 +4346,12 @@ void GScr_GetTeamPlayersAlive( void ) {
 /*
 =============
 GScr_GetNumParts
+
+Returns the number of bones in a model.
 =============
 */
 void GScr_GetNumParts( void ) {
-	void        *model;
+	XModel      *model;
 
 	model = trap_XModelGet( Scr_GetString( 0 ) );
 	Scr_AddInt( trap_XModelNumBones( model ) );
@@ -4070,10 +4360,12 @@ void GScr_GetNumParts( void ) {
 /*
 =============
 GScr_GetPartName
+
+Returns the name of one bone in a model.
 =============
 */
 void GScr_GetPartName( void ) {
-	void        *model;
+	XModel      *model;
 	unsigned int index;
 	unsigned int numBones;
 	unsigned short name;
@@ -4097,6 +4389,8 @@ void GScr_GetPartName( void ) {
 /*
 =============
 GScr_Earthquake
+
+earthquake( scale, duration, origin, radius )
 =============
 */
 void GScr_Earthquake( void ) {
@@ -4120,6 +4414,8 @@ void GScr_Earthquake( void ) {
 /*
 =============
 GScr_ShellShock
+
+Applies a precached shellshock to a player for the given seconds.
 =============
 */
 void GScr_ShellShock( unsigned int entnum ) {
@@ -4140,28 +4436,26 @@ void GScr_ShellShock( unsigned int entnum ) {
 	for ( index = 1; index < CS_SHELLSHOCKS_COUNT; index++ ) {
 		trap_GetConfigstring( CS_SHELLSHOCKS + index, cs, sizeof( cs ) );
 		if ( !_stricmp( cs, name ) ) {
-			break;
+			duration = Q_ftol( Scr_GetFloat( 1 ) * 1000.0f );
+			if ( duration < 0 || duration > 60000 ) {
+				Scr_ParamError( 1, va( "duration %g should be >= 0 and <= 60", duration * 0.001f ) );
+			}
+
+			ent->client->ps.shellshockIndex = index;
+			ent->client->ps.shellshockTime = level.time;
+			ent->client->ps.shellshockDuration = duration;
+			return;
 		}
 	}
 
-	if ( index == CS_SHELLSHOCKS_COUNT ) {
-		Scr_Error( va( "shellshock '%s' was not precached\n", name ) );
-		return;
-	}
-
-	duration = Q_ftol( Scr_GetFloat( 1 ) * 1000.0f );
-	if ( duration < 0 || duration > 60000 ) {
-		Scr_ParamError( 1, va( "duration %g should be >= 0 and <= 60", duration * 0.001f ) );
-	}
-
-	ent->client->ps.shellshockIndex = index;
-	ent->client->ps.shellshockTime = level.time;
-	ent->client->ps.shellshockDuration = duration;
+	Scr_Error( va( "shellshock '%s' was not precached\n", name ) );
 }
 
 /*
 =============
 GScr_StopShellShock
+
+Ends a player's shellshock.
 =============
 */
 void GScr_StopShellShock( unsigned int entnum ) {
@@ -4181,6 +4475,10 @@ void GScr_StopShellShock( unsigned int entnum ) {
 /*
 =============
 GScr_ViewKick
+
+viewkick( force, source )
+
+Kicks a player's view as if hit from source.
 =============
 */
 void GScr_ViewKick( unsigned int entnum ) {
@@ -4207,33 +4505,30 @@ void GScr_ViewKick( unsigned int entnum ) {
 /*
 =============
 GScr_LocalToWorldCoords
+
+Transforms a point from the entity's local space into world space.
 =============
 */
 void GScr_LocalToWorldCoords( unsigned int entnum ) {
 	gentity_t   *ent;
 	vec3_t local;
 	vec3_t world;
-	vec3_t forward;
 	vec3_t right;
-	vec3_t up;
-	vec3_t left;
+	vec3_t axis[3];     /* forward, left, up */
 
 	ent = GetEntity( entnum );
 
 	Scr_GetVector( 0, local );
-	AngleVectors( ent->r.currentAngles, forward, right, up );
+	AngleVectors( ent->r.currentAngles, axis[0], right, axis[2] );
 
-	left[0] = 0.0f - right[0];
-	left[1] = 0.0f - right[1];
-	left[2] = 0.0f - right[2];
+	/* keep: term order and _VectorAdd match original codegen */
+	VectorSubtract( vec3_origin, right, axis[1] );
 
-	world[0] = forward[0] * local[2] + up[0] * local[0] + local[1] * left[0];
-	world[1] = forward[1] * local[2] + up[1] * local[0] + local[1] * left[1];
-	world[2] = forward[2] * local[2] + up[2] * local[0] + local[1] * left[2];
+	world[0] = axis[1][0] * local[1] + local[0] * axis[0][0] + local[2] * axis[2][0];
+	world[1] = axis[1][1] * local[1] + local[0] * axis[0][1] + local[2] * axis[2][1];
+	world[2] = axis[1][2] * local[1] + local[0] * axis[0][2] + local[2] * axis[2][2];
 
-	world[0] = world[0] + ent->r.currentOrigin[0];
-	world[1] = world[1] + ent->r.currentOrigin[1];
-	world[2] = world[2] + ent->r.currentOrigin[2];
+	_VectorAdd( world, ent->r.currentOrigin, world );
 
 	Scr_AddVector( world );
 }
@@ -4260,7 +4555,7 @@ void GScr_PlaceSpawnPoint( unsigned int entnum ) {
 	end[0] = ent->r.currentOrigin[0];
 	end[1] = ent->r.currentOrigin[1];
 	end[2] = ent->r.currentOrigin[2] + 128.0f;
-	trap_TraceCapsule( &trace, start, playerMins, playerMaxs, end, ent->s.number, MASK_SPAWNPOINT );
+	trap_TraceCapsule( &trace, start, playerMins, playerMaxs, end, ent->s.number, MASK_CLIENTSOLID );
 
 	start[0] = trace.endpos[0];
 	start[1] = trace.endpos[1];
@@ -4268,14 +4563,14 @@ void GScr_PlaceSpawnPoint( unsigned int entnum ) {
 	end[0] = trace.endpos[0];
 	end[1] = trace.endpos[1];
 	end[2] = trace.endpos[2] - 262144.0f;
-	trap_TraceCapsule( &trace, start, playerMins, playerMaxs, end, ent->s.number, MASK_SPAWNPOINT );
+	trap_TraceCapsule( &trace, start, playerMins, playerMaxs, end, ent->s.number, MASK_CLIENTSOLID );
 
 	ent->s.groundEntityNum = trace.entityNum;
 
 	start[0] = trace.endpos[0];
 	start[1] = trace.endpos[1];
 	start[2] = trace.endpos[2];
-	trap_TraceCapsule( &trace, start, playerMins, playerMaxs, start, ent->s.number, MASK_SPAWNPOINT );
+	trap_TraceCapsule( &trace, start, playerMins, playerMaxs, start, ent->s.number, MASK_CLIENTSOLID );
 
 	if ( trace.allsolid ) {
 		Com_Printf( "WARNING: Spawn point entity %i is in solid at (%i, %i, %i)\n",
@@ -4283,12 +4578,10 @@ void GScr_PlaceSpawnPoint( unsigned int entnum ) {
 					(int)ent->r.currentOrigin[2] );
 	}
 
-	ent->s.pos.trType = 0;
+	ent->s.pos.trType = TR_STATIONARY;
 	ent->s.pos.trTime = 0;
 	ent->s.pos.trDuration = 0;
-	ent->s.pos.trDelta[0] = 0.0;
-	ent->s.pos.trDelta[1] = 0.0;
-	ent->s.pos.trDelta[2] = 0.0;
+	VectorClear( ent->s.pos.trDelta );
 	ent->s.pos.trBase[0] = trace.endpos[0];
 	ent->s.pos.trBase[1] = trace.endpos[1];
 	ent->s.pos.trBase[2] = trace.endpos[2];
@@ -4300,10 +4593,12 @@ void GScr_PlaceSpawnPoint( unsigned int entnum ) {
 /*
 =============
 GScr_MapRestart
+
+map_restart( [matchState] )
 =============
 */
 void GScr_MapRestart( void ) {
-	if ( level.exitRequest ) {
+	if ( level.exitRequest != EXITREQUEST_NONE ) {
 		Scr_Error( level.exitRequest == EXITREQUEST_MAP_RESTART
 				   ? "map_restart already called" : "exitlevel already called" );
 	}
@@ -4320,10 +4615,14 @@ void GScr_MapRestart( void ) {
 /*
 =============
 GScr_ExitLevel
+
+exitlevel( [matchState] )
+
+Ends the level and moves on to the next map.
 =============
 */
 void GScr_ExitLevel( void ) {
-	if ( level.exitRequest ) {
+	if ( level.exitRequest != EXITREQUEST_NONE ) {
 		Scr_Error( level.exitRequest == EXITREQUEST_MAP_RESTART
 				   ? "map_restart already called" : "exitlevel already called" );
 	}
@@ -4340,18 +4639,14 @@ void GScr_ExitLevel( void ) {
 /*
 =============
 GScr_AddTestClient
+
+Adds a bot client and returns its entity.
 =============
 */
 void GScr_AddTestClient( void ) {
-	int clientNum;
 	gentity_t   *ent;
 
-	clientNum = trap_AddTestClient();
-	if ( clientNum < 0 ) {
-		return;
-	}
-
-	ent = &level.gentities[clientNum];
+	ent = trap_AddTestClient();
 	if ( ent ) {
 		Scr_AddEntityNum( ent->s.number, SCR_CLASS_ENTITY );
 	}
@@ -4360,30 +4655,29 @@ void GScr_AddTestClient( void ) {
 /*
 =============
 GScr_MakeCvarServerInfo
+
+Registers a cvar so that it shows in the server info.
 =============
 */
 void GScr_MakeCvarServerInfo( void ) {
 	const char  *name;
 	const char  *value;
 	char message[MAX_STRING_CHARS];
-	char cleaned[MAX_STRING_CHARS];
+	volatile char cleaned[MAX_STRING_CHARS];
 	int i;
 	char c;
 
 	name = Scr_GetString( 0 );
 
 	if ( Scr_GetType( 1 ) == VAR_LOCALIZED_STRING ) {
-		Scr_ConstructMessageString( MESSAGE_CVAR_VALUE, 1, message, sizeof( message ) );
+		Scr_ConstructMessageString( 1, MESSAGE_CVAR_VALUE, message, sizeof( message ) );
 		value = message;
 	} else {
 		value = Scr_GetString( 1 );
 	}
 
-	/* The destination is 1024 bytes but the loop bound is 8192 -- retail:
-	   GScr_SetCvar 0x2002FB0B and GScr_MakeCvarServerInfo 0x20034B69 both
-	   walk 0x2000 into a 0x400 frame slot.  Reproduced as-is.  cleaned[] is
-	   dead: retail (0x20034BA6 push eax) registers the original value, not
-	   the scrubbed buffer. */
+	/* keep: matches original codegen -- the scrubbed copy is never used (the
+	   original value is what gets registered) and the loop bound overruns cleaned[] */
 	for ( i = 0; i < 0x2000; i++ ) {
 		c = value[i];
 		if ( !c ) {
@@ -4406,6 +4700,8 @@ void GScr_MakeCvarServerInfo( void ) {
 /*
 =============
 GScr_SetArchive
+
+Turns the server's snapshot archive (used by the killcam) on or off.
 =============
 */
 void GScr_SetArchive( void ) {
@@ -4435,32 +4731,21 @@ typedef struct scr_methodDef_s {
 	xmethod_t call;
 } scr_methodDef_t;
 
-/*
- * Two entries need the address of a script-import wrapper.  In retail those
- * wrappers are ordinary functions -- the out-of-line bodies at 0x2003F650 and
- * 0x2003FA70 -- while the import block here is a run of pointers, so the two
- * address-taken slots get a thunk of their own.  Both thunk names are
- * inferred; retail had no separate function to name.
- */
-static void GScr_spawnstruct( void ) {
-	Scr_AddStruct();
-}
+/* spawnstruct and resettimeout go straight to the import wrappers in g_scr_import_mp.c */
+void Scr_Import_AddStruct( void );
+void Scr_Import_ResetTimeout( void );
 
-static void GScr_resettimeout( void ) {
-	Scr_ResetTimeout();
-}
-
-static scr_functionDef_t scr_functions[] = {
+static scr_functionDef_t functions[] = {
 	{ "print",                          print,                              1 },
 	{ "println",                        println,                            1 },
 	{ "iprintln",                       iprintln,                           0 },
 	{ "iprintlnbold",                   iprintlnbold,                       0 },
 	{ "print3d",                        GScr_print3d,                       0 },
 	{ "line",                           GScr_line,                          0 },
-	{ "getent",                         Scr_getent,                         0 },
+	{ "getent",                         Scr_GetEnt,                         0 },
 	{ "getentarray",                    Scr_GetEntArray,                    0 },
 	{ "spawn",                          GScr_Spawn,                         0 },
-	{ "spawnstruct",                    GScr_spawnstruct,                   0 },
+	{ "spawnstruct",                    Scr_Import_AddStruct,               0 },
 	{ "assert",                         GScr_Assert,                        1 },
 	{ "isdefined",                      GScr_IsDefined,                     0 },
 	{ "isalive",                        GScr_IsAlive,                       0 },
@@ -4531,7 +4816,7 @@ static scr_functionDef_t scr_functions[] = {
 	{ "newhudelem",                     GScr_NewHudElem,                    0 },
 	{ "newclienthudelem",               GScr_NewClientHudElem,              0 },
 	{ "newteamhudelem",                 GScr_NewTeamHudElem,                0 },
-	{ "resettimeout",                   GScr_resettimeout,                  0 },
+	{ "resettimeout",                   Scr_Import_ResetTimeout,            0 },
 	{ "isplayer",                       GScr_IsPlayer,                      0 },
 	{ "isplayernumber",                 GScr_IsPlayerNumber,                0 },
 	{ "setwinningplayer",               GScr_SetWinningPlayer,              0 },
@@ -4603,16 +4888,18 @@ static scr_methodDef_t scr_methods[] = {
 /*
 =============
 Scr_GetFunction
+
+Looks up a builtin function by name.
 =============
 */
 xfunction_t Scr_GetFunction( const char **pName, int *pDeveloper ) {
 	int i;
 
-	for ( i = 0; i < (int)( sizeof( scr_functions ) / sizeof( scr_functions[0] ) ); i++ ) {
-		if ( !strcmp( *pName, scr_functions[i].name ) ) {
-			*pName = scr_functions[i].name;
-			*pDeveloper = scr_functions[i].developer;
-			return scr_functions[i].call;
+	for ( i = 0; i < sizeof( functions ) / sizeof( functions[0] ); i++ ) {
+		if ( !strcmp( *pName, functions[i].name ) ) {
+			*pName = functions[i].name;
+			*pDeveloper = functions[i].developer;
+			return functions[i].call;
 		}
 	}
 
@@ -4622,12 +4909,14 @@ xfunction_t Scr_GetFunction( const char **pName, int *pDeveloper ) {
 /*
 =============
 BuiltIn_GetMethod
+
+Looks up a method in the generic entity method table.
 =============
 */
 xmethod_t BuiltIn_GetMethod( const char **pName ) {
 	int i;
 
-	for ( i = 0; i < (int)( sizeof( scr_methods ) / sizeof( scr_methods[0] ) ); i++ ) {
+	for ( i = 0; i < sizeof( scr_methods ) / sizeof( scr_methods[0] ); i++ ) {
 		if ( !strcmp( *pName, scr_methods[i].name ) ) {
 			*pName = scr_methods[i].name;
 			return scr_methods[i].call;
@@ -4640,6 +4929,9 @@ xmethod_t BuiltIn_GetMethod( const char **pName ) {
 /*
 =============
 Scr_GetMethod
+
+Looks up a builtin method by name, checking the player, script entity and
+hud elem tables before the generic one.
 =============
 */
 xmethod_t Scr_GetMethod( const char **pName, int *pDeveloper ) {
@@ -4652,12 +4944,12 @@ xmethod_t Scr_GetMethod( const char **pName, int *pDeveloper ) {
 		return method;
 	}
 
-	method = (xmethod_t)ScriptEnt_GetMethod( pName, pDeveloper );
+	method = (xmethod_t)ScriptEnt_GetMethod( pName );
 	if ( method ) {
 		return method;
 	}
 
-	method = (xmethod_t)HudElem_GetMethod( pName, pDeveloper );
+	method = (xmethod_t)HudElem_GetMethod( pName );
 	if ( method ) {
 		return method;
 	}
@@ -4669,8 +4961,7 @@ xmethod_t Scr_GetMethod( const char **pName, int *pDeveloper ) {
 =============
 Scr_SetOrigin
 
-fieldnum is unused: the table entry only exists so that writing "origin"
-re-links the entity.
+Field setter for "origin": moves the entity and relinks it.
 =============
 */
 void Scr_SetOrigin( gentity_t *ent, int fieldnum ) {
@@ -4685,12 +4976,10 @@ void Scr_SetOrigin( gentity_t *ent, int fieldnum ) {
 	ent->r.currentOrigin[1] = origin[1];
 	ent->r.currentOrigin[2] = origin[2];
 
-	ent->s.pos.trType = 0;
+	ent->s.pos.trType = TR_STATIONARY;
 	ent->s.pos.trTime = 0;
 	ent->s.pos.trDuration = 0;
-	ent->s.pos.trDelta[0] = 0.0;
-	ent->s.pos.trDelta[1] = 0.0;
-	ent->s.pos.trDelta[2] = 0.0;
+	VectorClear( ent->s.pos.trDelta );
 
 	if ( ent->r.linked ) {
 		trap_LinkEntity( ent );
@@ -4700,6 +4989,8 @@ void Scr_SetOrigin( gentity_t *ent, int fieldnum ) {
 /*
 =============
 Scr_SetAngles
+
+Field setter for "angles".
 =============
 */
 void Scr_SetAngles( gentity_t *ent, int fieldnum ) {
@@ -4714,17 +5005,17 @@ void Scr_SetAngles( gentity_t *ent, int fieldnum ) {
 	ent->r.currentAngles[1] = angles[1];
 	ent->r.currentAngles[2] = angles[2];
 
-	ent->s.apos.trType = 0;
+	ent->s.apos.trType = TR_STATIONARY;
 	ent->s.apos.trTime = 0;
 	ent->s.apos.trDuration = 0;
-	ent->s.apos.trDelta[0] = 0.0;
-	ent->s.apos.trDelta[1] = 0.0;
-	ent->s.apos.trDelta[2] = 0.0;
+	VectorClear( ent->s.apos.trDelta );
 }
 
 /*
 =============
 Scr_SetHealth
+
+Field setter for "health".  Non-player entities get the same max health.
 =============
 */
 void Scr_SetHealth( gentity_t *ent, int fieldnum ) {
@@ -4734,7 +5025,7 @@ void Scr_SetHealth( gentity_t *ent, int fieldnum ) {
 	ent->health = health;
 
 	if ( ent->client ) {
-		ent->client->sess.maxHealth = health;
+		ent->client->ps.stats[STAT_HEALTH] = health;
 	} else {
 		ent->maxHealth = health;
 	}
@@ -4743,6 +5034,8 @@ void Scr_SetHealth( gentity_t *ent, int fieldnum ) {
 /*
 =============
 GScr_AddVector
+
+Pushes a vector, or undefined for NULL.
 =============
 */
 void GScr_AddVector( const float *value ) {
@@ -4756,6 +5049,8 @@ void GScr_AddVector( const float *value ) {
 /*
 =============
 GScr_AddEntity
+
+Pushes an entity, or undefined for NULL.
 =============
 */
 void GScr_AddEntity( gentity_t *ent ) {
@@ -4782,7 +5077,6 @@ void Scr_ParseGameTypeList( void ) {
 	const char  *token;
 	const char  *name;
 	char        *ext;
-	scr_gameTypeEntry_t *entry;
 	fileHandle_t f;
 	int numFiles;
 	int count;
@@ -4790,18 +5084,11 @@ void Scr_ParseGameTypeList( void ) {
 	int len;
 	int fileLen;
 
+	count = 0;
 	memset( g_scr_data.gameTypes, 0, sizeof( g_scr_data.gameTypes ) );
 
-	count = 0;
 	numFiles = trap_FS_GetFileList( "maps/mp/gametypes", "gsc", fileList, sizeof( fileList ) );
 	name = fileList;
-
-	if ( numFiles <= 0 ) {
-		g_scr_data.gameTypeCount = 0;
-		return;
-	}
-
-	entry = g_scr_data.gameTypes;
 
 	for ( i = 0; i < numFiles; i++ ) {
 		len = strlen( name );
@@ -4812,46 +5099,46 @@ void Scr_ParseGameTypeList( void ) {
 		}
 
 		ext = (char *)&name[len - 4];
-		if ( !Q_stricmp( ".gsc", ext ) ) {
+		if ( !Q_stricmp( ext, ".gsc" ) ) {
 			*ext = 0;
 		}
 
-		if ( entry == (scr_gameTypeEntry_t *)g_scr_data.classMap ) {
+		if ( count == MAX_GAMETYPES ) {
 			G_Printf( "Too many game type scripts found! Only loading the first %i\n",
 					  MAX_GAMETYPES - 1 );
 			break;
 		}
 
-		entry->name = trap_Hunk_AllocLowInternal( strlen( name ) );
-		strcpy( entry->name, name );
-		strlwr( entry->name );
+		g_scr_data.gameTypes[count].name = trap_Hunk_AllocLowInternal( strlen( name ) );
+		strcpy( g_scr_data.gameTypes[count].name, name );
+		strlwr( g_scr_data.gameTypes[count].name );
 
 		fileLen = trap_FS_FOpenFile( va( "maps/mp/gametypes/%s.txt", name ), &f, FS_READ );
 
-		if ( fileLen <= 0 ) {
-			Com_Printf( "WARNING: Could not load GameType description file %s for gametype %s\n",
-						va( "maps/mp/gametypes/%s.txt", name ), name );
-			entry->displayName = entry->name;
-			entry->teamBased = 0;
-		} else if ( fileLen >= MAX_STRING_CHARS ) {
-			Com_Printf( "WARNING: GameType description file %s is too big to load.\n",
-						va( "maps/mp/gametypes/%s.txt", name ) );
-			entry->displayName = entry->name;
-			entry->teamBased = 0;
+		if ( fileLen <= 0 || fileLen >= MAX_STRING_CHARS ) {
+			if ( fileLen <= 0 ) {
+				Com_Printf( "WARNING: Could not load GameType description file %s for gametype %s\n",
+							va( "maps/mp/gametypes/%s.txt", name ), name );
+			} else {
+				Com_Printf( "WARNING: GameType description file %s is too big to load.\n",
+							va( "maps/mp/gametypes/%s.txt", name ) );
+			}
+			g_scr_data.gameTypes[count].displayName = g_scr_data.gameTypes[count].name;
+			g_scr_data.gameTypes[count].teamBased = 0;
 		} else {
 			memset( buffer, 0, sizeof( buffer ) );
 			trap_FS_Read( buffer, fileLen, f );
 
 			text = buffer;
 			token = Com_Parse( &text );
-			entry->displayName = trap_Hunk_AllocLowInternal( strlen( token ) );
-			strcpy( entry->displayName, token );
+			g_scr_data.gameTypes[count].displayName = trap_Hunk_AllocLowInternal( strlen( token ) );
+			strcpy( g_scr_data.gameTypes[count].displayName, token );
 
 			token = Com_Parse( &text );
-			if ( token && !Q_stricmp( "team", token ) ) {
-				entry->teamBased = 1;
+			if ( token && !Q_stricmp( token, "team" ) ) {
+				g_scr_data.gameTypes[count].teamBased = 1;
 			} else {
-				entry->teamBased = 0;
+				g_scr_data.gameTypes[count].teamBased = 0;
 			}
 		}
 
@@ -4859,7 +5146,6 @@ void Scr_ParseGameTypeList( void ) {
 			trap_FS_FCloseFile( f );
 		}
 
-		entry++;
 		count++;
 		name += len + 1;
 	}
@@ -4869,18 +5155,16 @@ void Scr_ParseGameTypeList( void ) {
 
 /*
 =============
-Scr_IsValidGameType
+Scr_GetGameTypeNameForScript
 
-Returns the game type's display name, which doubles as "this game type
-exists".
+Returns the game type's display name, or NULL for an unknown game type.
 =============
 */
-const char *Scr_IsValidGameType( const char *gameType ) {
+const char *Scr_GetGameTypeNameForScript( const char *gameType ) {
 	int i;
 
 	for ( i = 0; i < g_scr_data.gameTypeCount; i++ ) {
-		if ( g_scr_data.gameTypes[i].name && gameType
-			 && !Q_stricmp( gameType, g_scr_data.gameTypes[i].name ) ) {
+		if ( !Q_stricmp( g_scr_data.gameTypes[i].name, gameType ) ) {
 			return g_scr_data.gameTypes[i].displayName;
 		}
 	}
@@ -4890,7 +5174,18 @@ const char *Scr_IsValidGameType( const char *gameType ) {
 
 /*
 =============
+Scr_IsValidGameType
+=============
+*/
+qboolean Scr_IsValidGameType( const char *gameType ) {
+	return Scr_GetGameTypeNameForScript( gameType ) != NULL;
+}
+
+/*
+=============
 Scr_LoadGameType
+
+Runs the game type script's main().
 =============
 */
 void Scr_LoadGameType( void ) {
@@ -4900,6 +5195,8 @@ void Scr_LoadGameType( void ) {
 /*
 =============
 Scr_StartupGameType
+
+Calls CodeCallback_StartGameType.
 =============
 */
 void Scr_StartupGameType( void ) {
@@ -4909,21 +5206,29 @@ void Scr_StartupGameType( void ) {
 /*
 =============
 Scr_PlayerConnect
+
+Calls CodeCallback_PlayerConnect on the player.
 =============
 */
 void Scr_PlayerConnect( gentity_t *ent ) {
-	Scr_FreeThread( Scr_ExecEntThreadNum( ent->s.number, SCR_CLASS_ENTITY,
-										  g_scr_data.playerConnect, 0 ) );
+	int entnum;
+
+	entnum = ent->s.number;     /* keep: matches original codegen */
+	Scr_FreeThread( Scr_ExecEntThreadNum( entnum, SCR_CLASS_ENTITY, g_scr_data.playerConnect, 0 ) );
 }
 
 /*
 =============
 Scr_PlayerDisconnect
+
+Calls CodeCallback_PlayerDisconnect on the player.
 =============
 */
 void Scr_PlayerDisconnect( gentity_t *ent ) {
-	Scr_FreeThread( Scr_ExecEntThreadNum( ent->s.number, SCR_CLASS_ENTITY,
-										  g_scr_data.playerDisconnect, 0 ) );
+	int entnum;
+
+	entnum = ent->s.number;     /* keep: matches original codegen */
+	Scr_FreeThread( Scr_ExecEntThreadNum( entnum, SCR_CLASS_ENTITY, g_scr_data.playerDisconnect, 0 ) );
 }
 
 /*
@@ -4934,9 +5239,11 @@ CodeCallback_PlayerDamage( eInflictor, eAttacker, iDamage, iDFlags,
                            sMeansOfDeath, sWeapon, vPoint, vDir, sHitLoc )
 =============
 */
-void Scr_PlayerDamage( int hitLoc, const vec3_t point, int mod, const vec3_t dir,
-					   gentity_t *self, gentity_t *inflictor, gentity_t *attacker,
-					   int damage, int dflags, int weapon ) {
+void Scr_PlayerDamage( gentity_t *self, gentity_t *inflictor, gentity_t *attacker,
+					   int damage, int dflags, int mod, int weapon, const vec3_t point,
+					   const vec3_t dir, int hitLoc ) {
+	int entnum;
+
 	Scr_AddConstString( hitLocationConstStrings[hitLoc] );
 
 	GScr_AddVector( dir );
@@ -4956,8 +5263,8 @@ void Scr_PlayerDamage( int hitLoc, const vec3_t point, int mod, const vec3_t dir
 	GScr_AddEntity( attacker );
 	GScr_AddEntity( inflictor );
 
-	Scr_FreeThread( Scr_ExecEntThreadNum( self->s.number, SCR_CLASS_ENTITY,
-										  g_scr_data.playerDamage, 9 ) );
+	entnum = self->s.number;     /* keep: matches original codegen */
+	Scr_FreeThread( Scr_ExecEntThreadNum( entnum, SCR_CLASS_ENTITY, g_scr_data.playerDamage, 9 ) );
 }
 
 /*
@@ -4970,6 +5277,8 @@ CodeCallback_PlayerKilled( eInflictor, eAttacker, iDamage, sMeansOfDeath,
 */
 void Scr_PlayerKilled( gentity_t *self, gentity_t *inflictor, gentity_t *attacker,
 					   int damage, int mod, int weapon, const float *dir, int hitLoc ) {
+	int entnum;
+
 	Scr_AddConstString( hitLocationConstStrings[hitLoc] );
 
 	GScr_AddVector( dir );
@@ -4987,8 +5296,8 @@ void Scr_PlayerKilled( gentity_t *self, gentity_t *inflictor, gentity_t *attacke
 	GScr_AddEntity( attacker );
 	GScr_AddEntity( inflictor );
 
-	Scr_FreeThread( Scr_ExecEntThreadNum( self->s.number, SCR_CLASS_ENTITY,
-										  g_scr_data.playerKilled, 7 ) );
+	entnum = self->s.number;     /* keep: matches original codegen */
+	Scr_FreeThread( Scr_ExecEntThreadNum( entnum, SCR_CLASS_ENTITY, g_scr_data.playerKilled, 7 ) );
 }
 
 /*
@@ -5001,44 +5310,4 @@ game callback always reads nothing.
 */
 int Scr_LoadRead( int len ) {
 	return 0;
-}
-
-/*
-=============
-Scr_FarHook
-
-0x2003FB40.  The DLL half of script/scr_import.c: it takes the engine's block
-of 102 script entry points, drops it over the import pointers, and hands back
-the five entry points the VM calls into the game with.
-
-It lives here because it is what publishes the block every Scr_* call in the
-module goes through.
-=============
-*/
-
-/* 102 pointers -- Scr_GetBool through MT_Free. */
-#define SCR_IMPORT_BLOCK_SIZE       0x198
-
-typedef enum scrExport_e {
-	SCR_EXP_GET_FUNCTION        = 0,
-	SCR_EXP_GET_METHOD          = 1,
-	SCR_EXP_SET_OBJECT_FIELD    = 2,
-	SCR_EXP_GET_OBJECT_FIELD    = 3,
-	SCR_EXP_LOAD_READ           = 4,
-
-	SCR_EXP_COUNT               = 5
-} scrExport_t;
-
-void *Scr_FarHook( void *scrImports ) {
-	if ( scrImports ) {
-		memcpy( &Scr_GetBool, scrImports, SCR_IMPORT_BLOCK_SIZE );
-	}
-
-	scr_gameExports[SCR_EXP_GET_FUNCTION] = (void ( * )( void ))Scr_GetFunction;
-	scr_gameExports[SCR_EXP_GET_METHOD] = (void ( * )( void ))Scr_GetMethod;
-	scr_gameExports[SCR_EXP_SET_OBJECT_FIELD] = (void ( * )( void ))Scr_SetObjectField;
-	scr_gameExports[SCR_EXP_GET_OBJECT_FIELD] = (void ( * )( void ))Scr_GetObjectField;
-	scr_gameExports[SCR_EXP_LOAD_READ] = (void ( * )( void ))Scr_LoadRead;
-
-	return scr_gameExports;
 }

@@ -54,8 +54,15 @@
  * @fidelity: raw
  */
 
-#include "../qcommon/cod1_types.h"
+#ifdef __cplusplus
+/* retail built this unit as C++ with exceptions (/TP /GX); every name keeps C linkage */
+extern "C" {
+#endif
 
 
 /* ISO C requires a translation unit to contain at least one declaration. */
 typedef int stringed_ingame_placeholder_t;
+
+#ifdef __cplusplus
+}
+#endif

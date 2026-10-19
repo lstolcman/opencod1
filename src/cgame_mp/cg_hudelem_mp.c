@@ -1,36 +1,12 @@
-/*
- * cg_hudelem_mp.c -- drawing the script-created HUD elements.
- * (original source: cgame/cg_hudelem.c)
- *
- * cgame_mp_x86.dll 0x3001EC10 .. 0x3001F9B7, twenty-one functions.  CoD's own;
- * RTCW has no hudelem system.  This is the client half of
- * game_mp/g_hud_mp.c -- the server owns the 124-byte g_hudelem_t and copies the
- * first 112 bytes of each live one into ps.hud.current[] / ps.hud.archival[],
- * and everything below reads only those 112 bytes.
- *
- * CG_Draw2D calls CG_DrawHudElems (0x300188B3).  That collects the live
- * elements out of both playerState arrays, sorts them by sortKey, and for each
- * one builds a hudElemInfo_t -- the resolved position, size, colour, label and
- * text -- then draws a string, a shader, or a clock face.
- *
- * Four of the twenty-one have no call site in 1.1: CG_HudElemShaderDimension,
- * CG_HudElemWidth and CG_HudElemAlignY were inlined into every user (compare
- * CG_GetHudElemInfo 0x3001F2BF against CG_HudElemWidth, and CG_DrawHudElemString
- * 0x3001F49A against CG_HudElemAlignY), and CG_HudElemWidth's body is
- * byte-for-byte the block CG_GetHudElemInfo carries.
- *
- * @fidelity: likely
- */
+// cg_hudelem.c -- draws the HUD elements created by the server scripts
+// the live elements are collected from the playerState, sorted by sortKey,
+// and drawn as text, a timer, a shader or a clock
 
 #include <stdlib.h>
 #include <string.h>
 
 #include "cg_local.h"
 
-/*
- * hudelem_t.type.  The same enum g_hud_mp.c carries; the client only ever
- * switches on it.
- */
 typedef enum {
 	HE_TYPE_FREE,
 	HE_TYPE_TEXT,
@@ -44,7 +20,6 @@ typedef enum {
 	HE_TYPE_CLOCK_UP
 } hudElemType_t;
 
-/* hudelem_t.alignX / .alignY. */
 #define HE_ALIGN_LEFT       0
 #define HE_ALIGN_CENTER     1
 #define HE_ALIGN_RIGHT      2
@@ -52,48 +27,38 @@ typedef enum {
 #define HE_ALIGN_MIDDLE     1
 #define HE_ALIGN_BOTTOM     2
 
-/* hudelem_t.font, and the engine font handle each one resolves to. */
 #define HE_FONT_DEFAULT     0
 #define HE_FONT_BIGFIXED    1
 #define HE_FONT_SMALLFIXED  2
 
-/* CG_GetSortedHudElems stops at 31 per array (0x3001F942); q_shared.h's
-   hudElemState_t is current[31] + archival[31]. */
 #define MAX_CLIENT_HUDELEMS 31
 
-/* elem->label / elem->text are indices into the CS_HUDELEM_STRINGS block --
-   cg_main_mp.c's CG_SafeTranslateHudElemString carries the same 1244. */
 #define CS_HUDELEM_STRINGS  1244
 
 #define ANGLE2SHORT( x )    ( (int)( (x) * ( 65536.0f / 360.0f ) ) & 65535 )
 #define SHORT2ANGLE( x )    ( (x) * ( 360.0f / 65536.0f ) )
 
-/*
- * Everything CG_GetHudElemInfo resolves out of one hudelem_t, and the only
- * thing the drawing functions read.  64 bytes; CG_DrawSingleHudElem's frame
- * puts it at esp+0 with the 8192-byte consolidation buffer right behind it.
- */
+// one hudelem_t resolved for drawing
 typedef struct hudElemInfo_s {
-	float       x;                          /* +0x00 CG_HudElemX */
-	float       y;                          /* +0x04 CG_HudElemY */
-	float       width;                      /* +0x08 */
-	float       height;                     /* +0x0C */
-	const char *label;                      /* +0x10 */
-	float       labelWidth;                 /* +0x14 */
-	const char *text;                       /* +0x18 */
-	float       textWidth;                  /* +0x1C */
-	int         font;                       /* +0x20 the engine font handle */
-	float       fontScale;                  /* +0x24 */
-	float       charHeight;                 /* +0x28 */
-	float       charWidth;                  /* +0x2C 0 for the proportional font */
-	vec4_t      color;                      /* +0x30 */
+	float       x;
+	float       y;
+	float       width;
+	float       height;
+	const char *label;
+	float       labelWidth;
+	const char *text;
+	float       textWidth;
+	int         font;                       // the engine font handle
+	float       fontScale;
+	float       charHeight;
+	float       charWidth;                  // 0 for the proportional font
+	vec4_t      color;
 } hudElemInfo_t;
 CG_ASSERT_SIZE( hudElemInfo_t, 64 );
 
-/* cg_newDraw_mp.c. */
 qboolean    CG_ServerShaderName( int index, char *buffer, int size );
 
-static float CG_HudElemShaderWidth( const hudelem_t *elem, const hudElemInfo_t *info );
+static rfloat CG_HudElemShaderWidth( const hudelem_t *elem, const hudElemInfo_t *info );
 static float CG_HudElemShaderHeight( const hudelem_t *elem, const hudElemInfo_t *info );
 
 /*
@@ -115,9 +80,8 @@ static float CG_HudElemStringWidth( const char *string, const hudElemInfo_t *inf
 ===============
 CG_GetHudElemTime
 
-Milliseconds the element's timer still has to run, or has run for.  The +999
-and +99 round the display up so a one-second timer shows "1" for its whole
-last second.
+Milliseconds the element's timer still has to run, or has run for.
+Count-downs round up so the last second still shows "1".
 ===============
 */
 static int CG_GetHudElemTime( const hudelem_t *elem ) {
@@ -158,19 +122,21 @@ CG_HudElemTimerString
 ===============
 */
 static const char *CG_HudElemTimerString( const hudelem_t *elem ) {
-	int t;
+	int seconds;
 	int hours;
-	int rem;
+	int mins;
+	int secs;
 
-	t = CG_GetHudElemTime( elem );
-
-	hours = t / 1000 / 3600;
-	rem = t / 1000 % 3600;
+	seconds = CG_GetHudElemTime( elem ) / 1000;
+	hours = seconds / 3600;
+	seconds -= hours * 3600;
+	mins = seconds / 60;
+	secs = seconds - mins * 60;
 
 	if ( hours ) {
-		return va( "%i:%02i:%02i", hours, rem / 60, rem % 60 );
+		return va( "%i:%02i:%02i", hours, mins, secs );
 	}
-	return va( "%i:%02i", rem / 60, rem % 60 );
+	return va( "%i:%02i", mins, secs );
 }
 
 /*
@@ -182,27 +148,28 @@ static const char *CG_HudElemTenthsTimerString( const hudelem_t *elem ) {
 	int t;
 	int hours;
 	int mins;
-	int rem;
+	int secs;
+	int tenths;
 
-	t = CG_GetHudElemTime( elem );
-
-	hours = t / 100 / 36000;
-	rem = t / 100 % 36000;
-	mins = rem / 600;
-	rem %= 600;
+	t = CG_GetHudElemTime( elem ) / 100;
+	hours = t / 36000;
+	t -= hours * 36000;
+	mins = t / 600;
+	t -= mins * 600;
+	secs = t / 10;
+	tenths = t - secs * 10;
 
 	if ( hours ) {
-		return va( "%i:%02i:%02i.%i", hours, mins, rem / 10, rem % 10 );
+		return va( "%i:%02i:%02i.%i", hours, mins, secs, tenths );
 	}
-	return va( "%i:%02i.%i", mins, rem / 10, rem % 10 );
+	return va( "%i:%02i.%i", mins, secs, tenths );
 }
 
 /*
 ===============
 CG_HudElemShaderDimension
 
-A zero width or height on a shader element means "one character cell".  No call
-site in 1.1 -- inlined into both shader-dimension functions.
+A zero width or height on a shader element means "one character cell"
 ===============
 */
 static float CG_HudElemShaderDimension( int dimension, const hudElemInfo_t *info ) {
@@ -215,11 +182,13 @@ static float CG_HudElemShaderDimension( int dimension, const hudElemInfo_t *info
 /*
 ===============
 CG_HudElemShaderWidth
+
+keep: rfloat return matches original codegen
 ===============
 */
-static float CG_HudElemShaderWidth( const hudelem_t *elem, const hudElemInfo_t *info ) {
-	float   w;
-	float   from;
+static rfloat CG_HudElemShaderWidth( const hudelem_t *elem, const hudElemInfo_t *info ) {
+	rfloat  w;
+	rfloat  from;
 	int     t;
 
 	w = CG_HudElemShaderDimension( elem->width, info );
@@ -228,7 +197,7 @@ static float CG_HudElemShaderWidth( const hudelem_t *elem, const hudElemInfo_t *
 		t = cg.time - elem->scaleStartTime;
 		if ( t < elem->scaleTime ) {
 			from = CG_HudElemShaderDimension( elem->scaleFromWidth, info );
-			return ( w - from ) * ( 1.0f / elem->scaleTime * t ) + from;
+			return ( w - from ) * ( t * ( 1.0f / (rfloat)elem->scaleTime ) ) + from;
 		}
 	}
 
@@ -251,7 +220,7 @@ static float CG_HudElemShaderHeight( const hudelem_t *elem, const hudElemInfo_t 
 		t = cg.time - elem->scaleStartTime;
 		if ( t < elem->scaleTime ) {
 			from = CG_HudElemShaderDimension( elem->scaleFromHeight, info );
-			return ( h - from ) * ( 1.0f / elem->scaleTime * t ) + from;
+			return ( h - from ) * ( t * ( 1.0f / elem->scaleTime ) ) + from;
 		}
 	}
 
@@ -262,10 +231,11 @@ static float CG_HudElemShaderHeight( const hudelem_t *elem, const hudElemInfo_t 
 ===============
 CG_HudElemWidth
 
-No call site in 1.1: CG_GetHudElemInfo carries this body inlined (0x3001F2A8).
 ===============
 */
 static float CG_HudElemWidth( const hudelem_t *elem, const hudElemInfo_t *info ) {
+	rfloat width;
+
 	switch ( elem->type ) {
 	case HE_TYPE_TEXT:
 	case HE_TYPE_VALUE:
@@ -273,23 +243,28 @@ static float CG_HudElemWidth( const hudelem_t *elem, const hudElemInfo_t *info )
 	case HE_TYPE_TIMER_UP:
 	case HE_TYPE_TENTHS_TIMER_DOWN:
 	case HE_TYPE_TENTHS_TIMER_UP:
-		return info->textWidth + info->labelWidth;
+		width = info->textWidth;
+		break;
 
 	case HE_TYPE_SHADER:
 	case HE_TYPE_CLOCK_DOWN:
 	case HE_TYPE_CLOCK_UP:
-		return CG_HudElemShaderWidth( elem, info ) + info->labelWidth;
+		width = CG_HudElemShaderWidth( elem, info );
+		break;
 
 	default:
 		return 0.0f;
 	}
+
+	width += info->labelWidth;
+	return width;
 }
 
 /*
 ===============
 CG_HudElemHeight
 
-A labelled element is never shorter than one line of its own font.
+A labelled element is never shorter than one line of its own font
 ===============
 */
 static float CG_HudElemHeight( const hudelem_t *elem, const hudElemInfo_t *info ) {
@@ -325,25 +300,23 @@ static float CG_HudElemHeight( const hudelem_t *elem, const hudElemInfo_t *info 
 ===============
 CG_HudElemX
 
-moveOverTime lerps x from moveFromX in integer units before the alignment is
-applied.
+Moves from moveFromX over moveTime, then applies the alignment.
+keep: rfloat return matches original codegen
 ===============
 */
-static float CG_HudElemX( const hudelem_t *elem, const hudElemInfo_t *info ) {
-	float   x;
+static rfloat CG_HudElemX( const hudelem_t *elem, const hudElemInfo_t *info ) {
+	rfloat  x;
 	int     t;
 
-	x = (float)elem->x;
-
-	if ( elem->moveTime > 0 ) {
-		t = cg.time - elem->moveStartTime;
-		if ( t < elem->moveTime ) {
-			x = (float)( ( elem->x - elem->moveFromX ) * t ) * ( 1.0f / elem->moveTime )
-				+ elem->moveFromX;
-		}
+	if ( elem->moveTime > 0 && ( t = cg.time - elem->moveStartTime ) < elem->moveTime ) {
+		x = ( elem->x - elem->moveFromX ) * t * ( 1.0f / (rfloat)elem->moveTime ) + elem->moveFromX;
+	} else {
+		x = elem->x;
 	}
 
 	switch ( elem->alignX ) {
+	case HE_ALIGN_LEFT:
+		return x;
 	case HE_ALIGN_CENTER:
 		return x - info->width * 0.5f;
 	case HE_ALIGN_RIGHT:
@@ -356,23 +329,22 @@ static float CG_HudElemX( const hudelem_t *elem, const hudElemInfo_t *info ) {
 /*
 ===============
 CG_HudElemY
+
 ===============
 */
-static float CG_HudElemY( const hudelem_t *elem, const hudElemInfo_t *info ) {
-	float   y;
+static rfloat CG_HudElemY( const hudelem_t *elem, const hudElemInfo_t *info ) {
+	rfloat  y;
 	int     t;
 
-	y = (float)elem->y;
-
-	if ( elem->moveTime > 0 ) {
-		t = cg.time - elem->moveStartTime;
-		if ( t < elem->moveTime ) {
-			y = (float)( ( elem->y - elem->moveFromY ) * t ) * ( 1.0f / elem->moveTime )
-				+ elem->moveFromY;
-		}
+	if ( elem->moveTime > 0 && ( t = cg.time - elem->moveStartTime ) < elem->moveTime ) {
+		y = ( elem->y - elem->moveFromY ) * t * ( 1.0f / (rfloat)elem->moveTime ) + elem->moveFromY;
+	} else {
+		y = elem->y;
 	}
 
 	switch ( elem->alignY ) {
+	case HE_ALIGN_TOP:
+		return y;
 	case HE_ALIGN_MIDDLE:
 		return y - info->height * 0.5f;
 	case HE_ALIGN_BOTTOM:
@@ -387,12 +359,7 @@ static float CG_HudElemY( const hudelem_t *elem, const hudElemInfo_t *info ) {
 CG_ConsolidateHudElemText
 
 An element with both a label and a text draws as one string: the label with its
-"%s" replaced by the text, or the text appended if the label has no "%s".  The
-result becomes info->text and the label is emptied, so the caller draws once.
-
-The first loop indexes the destination with the label position rather than the
-output length -- the two are equal until the "%s" is reached, and the loop stops
-there, so it makes no difference.
+"%s" replaced by the text, or the text appended if the label has no "%s"
 ===============
 */
 static void CG_ConsolidateHudElemText( hudElemInfo_t *info, int size, char *buffer ) {
@@ -451,13 +418,13 @@ static void CG_ConsolidateHudElemText( hudElemInfo_t *info, int size, char *buff
 ===============
 CG_GetHudElemInfo
 
-Resolves one networked hudelem_t into everything the drawing functions need.
+Resolves one hudelem_t into everything the drawing functions need
 ===============
 */
 static void CG_GetHudElemInfo( hudElemInfo_t *info, const hudelem_t *elem,
 							   char *buffer, int size ) {
 	int     t;
-	float   frac;
+	rfloat  frac;   // keep: matches original codegen
 	int     i;
 
 	switch ( elem->font ) {
@@ -483,7 +450,11 @@ static void CG_GetHudElemInfo( hudElemInfo_t *info, const hudelem_t *elem,
 		break;
 	}
 
-	info->label = CG_SafeTranslateHudElemString( elem->label );
+	if ( elem->label ) {
+		info->label = CG_SafeTranslateHudElemString( elem->label );
+	} else {
+		info->label = "";
+	}
 
 	switch ( elem->type ) {
 	case HE_TYPE_TEXT:
@@ -533,7 +504,7 @@ static void CG_GetHudElemInfo( hudElemInfo_t *info, const hudelem_t *elem,
 	if ( elem->fadeTime > 0 ) {
 		t = cg.time - elem->fadeStartTime;
 		if ( t < elem->fadeTime ) {
-			frac = (float)t / elem->fadeTime;
+			frac = (rfloat)t / elem->fadeTime;
 			for ( i = 0; i < 4; i++ ) {
 				info->color[i] = ( ( elem->color[i] - elem->fromColor[i] ) * frac
 								   + elem->fromColor[i] ) * ( 1.0f / 255.0f );
@@ -551,9 +522,7 @@ static void CG_GetHudElemInfo( hudElemInfo_t *info, const hudelem_t *elem,
 ===============
 CG_HudElemAlignY
 
-The vertical placement of one drawn item of height h inside the element's box.
-No call site in 1.1 -- inlined into CG_DrawHudElemString (0x3001F49A),
-CG_DrawHudElemClock (0x3001F650) and CG_DrawHudElemShader (0x3001F748).
+The vertical placement of an item of height h inside the element's box
 ===============
 */
 static float CG_HudElemAlignY( const hudelem_t *elem, const hudElemInfo_t *info, float h ) {
@@ -573,11 +542,10 @@ static float CG_HudElemAlignY( const hudelem_t *elem, const hudElemInfo_t *info,
 ===============
 CG_DrawHudElemString
 
-trap_R_Text_Paint takes the baseline, which is one character cell below the top
-of the line.
+trap_R_Text_Paint takes the baseline, one character cell below the top
 ===============
 */
-static void CG_DrawHudElemString( const hudElemInfo_t *info, const hudelem_t *elem,
+static void CG_DrawHudElemString( const hudelem_t *elem, const hudElemInfo_t *info,
 								  const char *string ) {
 	float y;
 
@@ -591,12 +559,11 @@ static void CG_DrawHudElemString( const hudElemInfo_t *info, const hudelem_t *el
 ===============
 CG_DrawHudElemClock
 
-Draws the element's material, then the same name with "Needle" appended rotated
-to the fraction of the clock that is left.  A zero rotationPeriodMs means the
-needle sweeps once a minute.
+Draws the element's material, then the same name with "Needle" appended
+rotated by the elapsed time.  A zero rotationPeriodMs means once a minute.
 ===============
 */
-static void CG_DrawHudElemClock( const hudElemInfo_t *info, const hudelem_t *elem ) {
+static void CG_DrawHudElemClock( const hudelem_t *elem, const hudElemInfo_t *info ) {
 	char        name[64];
 	qhandle_t   hFace;
 	qhandle_t   hNeedle;
@@ -614,10 +581,9 @@ static void CG_DrawHudElemClock( const hudElemInfo_t *info, const hudelem_t *ele
 
 	t = CG_GetHudElemTime( elem );
 	if ( elem->rotationPeriodMs ) {
-		angle = SHORT2ANGLE( ANGLE2SHORT( (float)t * 360.0f / elem->rotationPeriodMs ) );
+		angle = AngleNormalize360( (float)t * 360.0f / elem->rotationPeriodMs );
 	} else {
-		/* the 360/60000 and the ANGLE2SHORT scale fold into one constant here */
-		angle = SHORT2ANGLE( ANGLE2SHORT( (float)t * 360.0f / 60000.0f ) );
+		angle = AngleNormalize360( (float)t * ( 360.0f / 60000.0f ) );
 	}
 
 	w = CG_HudElemShaderWidth( elem, info );
@@ -635,7 +601,7 @@ static void CG_DrawHudElemClock( const hudElemInfo_t *info, const hudelem_t *ele
 CG_DrawHudElemShader
 ===============
 */
-static void CG_DrawHudElemShader( const hudElemInfo_t *info, const hudelem_t *elem ) {
+static void CG_DrawHudElemShader( const hudelem_t *elem, const hudElemInfo_t *info ) {
 	char        name[64];
 	qhandle_t   hShader;
 	float       w, h, y;
@@ -667,8 +633,8 @@ static void CG_DrawSingleHudElem( const hudelem_t *elem ) {
 	CG_GetHudElemInfo( &info, elem, buffer, sizeof( buffer ) );
 
 	if ( info.label[0] ) {
-		CG_DrawHudElemString( &info, elem, info.label );
-		info.x = info.x + info.labelWidth;
+		CG_DrawHudElemString( elem, &info, info.label );
+		info.x += info.labelWidth;
 	}
 
 	switch ( elem->type ) {
@@ -679,17 +645,17 @@ static void CG_DrawSingleHudElem( const hudelem_t *elem ) {
 	case HE_TYPE_TENTHS_TIMER_DOWN:
 	case HE_TYPE_TENTHS_TIMER_UP:
 		if ( info.text[0] ) {
-			CG_DrawHudElemString( &info, elem, info.text );
+			CG_DrawHudElemString( elem, &info, info.text );
 		}
 		break;
 
 	case HE_TYPE_CLOCK_DOWN:
 	case HE_TYPE_CLOCK_UP:
-		CG_DrawHudElemClock( &info, elem );
+		CG_DrawHudElemClock( elem, &info );
 		break;
 
 	case HE_TYPE_SHADER:
-		CG_DrawHudElemShader( &info, elem );
+		CG_DrawHudElemShader( elem, &info );
 		break;
 
 	default:
@@ -720,32 +686,30 @@ static int compare_hudelems( const void *a, const void *b ) {
 ===============
 CG_GetSortedHudElems
 
-Both playerState arrays, archival first, each stopping at the first free slot,
-then sorted by sortKey.
+Both playerState arrays, archival first, sorted by sortKey
 ===============
 */
 static int CG_GetSortedHudElems( const hudelem_t **list ) {
-	const hudelem_t *elem;
+	const playerState_t *ps;
 	int             count;
 	int             i;
 
+	ps = &cg.snap->ps;
 	count = 0;
 
-	elem = cg.snap->ps.hud.archival;
-	for ( i = 0; i < MAX_CLIENT_HUDELEMS; i++, elem++ ) {
-		if ( !elem->type ) {
+	for ( i = 0; i < MAX_CLIENT_HUDELEMS; i++ ) {
+		if ( !ps->hud.archival[i].type ) {
 			break;
 		}
-		list[count] = elem;
+		list[count] = &ps->hud.archival[i];
 		count++;
 	}
 
-	elem = cg.snap->ps.hud.current;
-	for ( i = 0; i < MAX_CLIENT_HUDELEMS; i++, elem++ ) {
-		if ( !elem->type ) {
+	for ( i = 0; i < MAX_CLIENT_HUDELEMS; i++ ) {
+		if ( !ps->hud.current[i].type ) {
 			break;
 		}
-		list[count] = elem;
+		list[count] = &ps->hud.current[i];
 		count++;
 	}
 
@@ -766,7 +730,9 @@ void CG_DrawHudElems( void ) {
 
 	count = CG_GetSortedHudElems( list );
 
-	for ( i = 0; i < count; i++ ) {
-		CG_DrawSingleHudElem( list[i] );
+	if ( count ) {
+		for ( i = 0; i < count; i++ ) {
+			CG_DrawSingleHudElem( list[i] );
+		}
 	}
 }

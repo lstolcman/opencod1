@@ -34,7 +34,7 @@
  * coalescible.
  *
  * Retail arena base: 0x008E6318.  Retail also caches &blocks[0] in a global at
- * 0x008E6208 (GetRefString_var); the array is indexed directly here.
+ * 0x008E6208 (GetRefString_var, set by MT_Init) and reads the arena through it.
  */
 
 #define SCR_MT_BLOCK_COUNT      0x10000     /* 65536 blocks */
@@ -44,16 +44,20 @@
 #define SCR_MT_LOOKUP_COUNT     256
 #define SCR_MT_MAX_ALLOC_SIZE   0x10000
 
+/* no byte-array view: a char array in a node local would give it a /GS cookie retail lacks */
+typedef struct scrMemNode_s {
+	unsigned short  left;
+	unsigned short  right;
+	unsigned int    payload;
+} scrMemNode_t;
+
 typedef union scrMemBlock_u {
-	struct {
-		unsigned short  left;
-		unsigned short  right;
-		unsigned int    payload;
-	} node;
-	unsigned char       bytes[SCR_MT_BLOCK_SIZE];
+	scrMemNode_t        node;
 } scrMemBlock_t;
+COD1_ASSERT_SIZE( scrMemBlock_t, SCR_MT_BLOCK_SIZE );
 
 extern scrMemBlock_t    scrMemTree_blocks[SCR_MT_BLOCK_COUNT];
+extern int              GetRefString_var;           /* retail 0x008E6208, &scrMemTree_blocks[0] */
 extern unsigned short   scrMemTree_freeRoots[SCR_MT_BUCKET_COUNT];
 extern int              scrMemTree_allocBuckets;    /* retail 0x008E6310 */
 extern int              scrMemTree_allocInstances;  /* retail 0x008E60D8 */
@@ -130,6 +134,7 @@ const char     *SL_ConvertToString( unsigned short handle );
 unsigned short  SL_ConvertFromString( const char *text );
 unsigned short  SL_FindStringOfLen( const char *text, unsigned int size );
 unsigned short  SL_FindString( const char *text );
+unsigned short  SL_FindCanonicalString( const char *text );   /* scr_main.cpp */
 unsigned short  SL_FindLowercaseString( const char *text );
 unsigned short  SL_GetStringOfLen( const char *text, unsigned char user,
 								   unsigned int size, int type );
@@ -166,8 +171,9 @@ unsigned short  Scr_CreateCanonicalFilename( const char *filename );
  * it for the parse tree, which is thrown away wholesale after each GSC file.
  */
 
-/* the cursor lives in qcommon/cod1_globals.c as "currentPos" (retail
- * 0x01407368); scr_main.cpp writes it directly.  See scr_tempmemory.cpp. */
+/* the cursor (retail 0x01407368, defined in scr_tempmemory.cpp); scr_main.cpp writes it
+ * directly, and xanim/xmodel.cpp grows the block in place. */
+extern int      currentPos;
 
 void            TempMemoryReset( void );
 void           *TempMalloc( int len );
@@ -205,7 +211,7 @@ void            TempMemorySetPos( void *pos );
  * accessors in scr_variable.cpp, which name every use at its offset.
  *
  * Node 0 is not a variable.  It is the free list sentinel: node0.hashNext is
- * the head and node0.u.halfword[0] the tail, and a zero handle is what every
+ * the head and node0.u.halfword.lo the tail, and a zero handle is what every
  * Find* entry point returns for "not present".
  *
  * The 0x60 occupancy field is what makes a node's +0x08 link unambiguous:
@@ -270,9 +276,19 @@ typedef union VariableUnion_u {
 	const float        *vectorValue;
 	const char         *codePosValue;
 	void               *pointerValue;
-	/* [0] is at +0x00 and [1] at +0x02; scr_variable.cpp names every use */
-	unsigned short      halfword[2];
+	/* lo at +0x00, hi at +0x02; scr_variable.cpp names every use.  Two fields,
+	 * not a short array: VC7 /GS cookies every frame holding a short array. */
+	struct {
+		unsigned short  lo;
+		unsigned short  hi;
+	}                   halfword;
 } VariableUnion;
+
+/* Pause-root storage has a DWORD read view and a WORD handle write view. */
+typedef union ScriptArrayRootStorage_s {
+	unsigned int word;
+	unsigned short handle;
+} ScriptArrayRootStorage;
 
 typedef struct VariableValue_s {
 	VariableUnion       u;              /* +0x00 */
@@ -310,8 +326,8 @@ extern unsigned short           scrVarPub_tempVariable;
 extern const char * const       var_typename[VAR_TYPE_COUNT];  /* retail 0x005757C8 */
 
 /* owned by scr_vm_state.c */
-extern qboolean                 scr_inited;
-extern unsigned short           scr_timeArrayId;
+extern unsigned char            scr_inited;     /* retail scrVarPub.bInited, byte 0x0140735A */
+extern unsigned short scr_timeArrayId;
 
 /* pool and lifetime */
 void            InitVariables( void );
@@ -379,8 +395,8 @@ unsigned short  GetThreadNotifyName( unsigned short id );
 void            SetThreadNotifyName( unsigned short id, unsigned short name );
 void            ClearThreadNotifyName( unsigned short id );
 unsigned short  GetSelf( unsigned short id );
-unsigned short  GetEntnum( unsigned short id );
-unsigned short  GetArraySize( unsigned short id );
+unsigned int    GetEntnum( unsigned short id );
+unsigned int    GetArraySize( unsigned short id );
 unsigned short  FindNextSibling( unsigned short id );
 unsigned short  GetObject( unsigned short id );
 unsigned short  GetArray( unsigned short id );
@@ -410,7 +426,7 @@ short           Scr_FindField( const char *name, int *typeOut );
 void            Scr_AddFields( const char *path, const char *extension );
 
 /* the `game` array, and value lifetime for the game module */
-extern unsigned short  scrVarPub_gameId;        /* retail 0x00A7A5DC, owned by scr_vm.cpp */
+extern ScriptArrayRootStorage scrVarPub_gameId;        /* retail 0x00A7A5DC, owned by scr_vm.cpp */
 
 void            Scr_FreeValue( unsigned short id );
 int             Scr_MakeValuePrimitive( unsigned short arrayId );
@@ -448,5 +464,80 @@ void            SetEntityFieldValue__FUiiiP13VariableValue(
 void            VM_CancelNotify__FUsUs( unsigned short startLocalId,
 										unsigned short notifyListId );
 void            VM_TerminateNotifyList__FUs( unsigned short id );
+
+/*
+ * Compiler state (scr_compiler.cpp; retail scrCompilePub / scrCompileGlob fields)
+ */
+extern int scrCompileGlob_codeRelocStart;   /* 0x008E5F00 */
+extern int scrCompileGlob_lastOpcodePos;   /* 0x00966430 */
+extern void *scrCompileGlob_devOpBuffer;   /* 0x0140738C */
+extern void *scrCompileGlob_devPatchTable;   /* 0x01407394 */
+extern int scrCompileGlob_animTreeValue;   /* 0x008E5ED8 */
+extern int developer_script_int;   /* 0x008E5EE8, scrCompileGlob codegen mode (SCR_CODEGEN_*) */
+extern char *developerCodeStart;   /* 0x008E5EE4 */
+extern int scrCompilePub_checksum;   /* 0x01407364 */
+extern int scrCompilePub_programLen;   /* 0x01407388 */
+extern int scrCompilePub_scriptCount;   /* 0x008E60B8 */
+extern int scrCompilePub_scriptfilename;   /* 0x01407374 */
+extern int scrCompilePub_sourceBuf;   /* 0x01407370 */
+extern unsigned short scrCompileGlob_currentFuncRoot;   /* 0x008E5EEC, 16-bit object handle */
+extern unsigned short scrCompilePub_loadedScripts;   /* 0x008E60B4, 16-bit object handle */
+extern unsigned short scrCompilePub_scriptsPos;   /* 0x008E60CC, 16-bit handle of the loaded-scripts object */
+extern unsigned char scrCompileGlob_breakAllowed;   /* 0x0140739C */
+extern unsigned char scrCompileGlob_breakAllowedDev;   /* 0x0140739D */
+extern unsigned char scrCompileGlob_contAllowed;   /* 0x014073A4 */
+extern unsigned char scrCompileGlob_contAllowedDev;   /* 0x014073A5 */
+extern unsigned char scrCompileGlob_caseAllowed;   /* 0x014073AC */
+extern unsigned char scrCompileGlob_caseAllowedDev;   /* 0x014073AD */
+
+/*
+ * Variable-system state (scr_variable.cpp; retail scrVarPub fields)
+ */
+extern int scrVarPub_programBuffer;   /* 0x01407380 */
+extern int scrVarPub_endScriptBuffer;   /* 0x01407384 */
+extern int scrVarPub_developer;   /* 0x008E60D0 */
+extern int scrVarPub_developerScript;   /* 0x008E60C4 */
+extern int scrVarPub_canonicalStrCountAndLoadFlags;   /* 0x008E60BC */
+
+/*
+ * Save-game read state (scr_variable.cpp)
+ */
+extern unsigned short scrSave_numSaveObjects;   /* 0x00976458 */
+extern unsigned short *scrSave_idToSaveId;   /* 0x0097645C */
+extern unsigned short *scrSave_saveIdToId;   /* 0x0097646C */
+extern char *scrSave_readPos;   /* 0x00976470, the read cursor */
+
+/*
+ * VM state (scr_vm.cpp; retail scrVmPub / scrVmGlob fields)
+ */
+extern signed __int32 scrVmGlob_funcCount;   /* 0x00A7A5D8 */
+extern unsigned char scrVmPub_terminal_error;   /* 0x00A7A5CC */
+extern const char *scrVmGlob_callStack[32];   /* 0x00A7A510 */
+extern const char *scrVmGlob_devCallStack[32];   /* 0x00A7A488 */
+
+/* The game module's script imports, one object at 0x008E5F04 (script/scr_import.c): Scr_NearHook
+ * copies all five with a single `rep movsd`. */
+typedef struct {
+	int ( *GetFunction )();         /* +0x00 0x008E5F04 */
+	int ( *GetMethod )();           /* +0x04 */
+	int ( *SetObjectField )();      /* +0x08 */
+	int ( *GetObjectField )();      /* +0x0C */
+	int ( *LoadRead )();            /* +0x10 */
+} scrImport_t;
+extern scrImport_t scrImport;   /* 0x008E5F04 */
+#define scrImport_GetFunction       scrImport.GetFunction
+#define scrImport_GetMethod         scrImport.GetMethod
+#define scrImport_SetObjectField    scrImport.SetObjectField
+#define scrImport_GetObjectField    scrImport.GetObjectField
+#define scrImport_LoadRead          scrImport.LoadRead
+
+/*
+ * Animation trees (scr_animtree.cpp)
+ */
+extern int scrAnimPub_treeCount[2];   /* 0x008E58D0, one count per xanim pool */
+extern int scrAnimPub_trees[256];   /* 0x008E5AD8, 128 tree handles per xanim pool */
+extern unsigned short scrAnimPub_currentTreeRoot;   /* 0x008E5EDC, 16-bit object handle */
+extern unsigned short scrAnimPub_usingTreeNames;   /* 0x008E60B0, 16-bit object handle */
+extern unsigned short scrAnimPub_treeRoot;   /* 0x008E60C0, 16-bit object handle */
 
 #endif /* __SCR_LOCAL_H__ */

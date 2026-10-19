@@ -1,1764 +1,1620 @@
 /*
  * @fidelity: likely
  * @fidelity-default: unreviewed
+ *
+ * tr_staticmodel.c -- CoD static-model rendering.
+ *
+ * A "static model" is a non-animated XModel instance placed in the world (a
+ * prop).  This is CoD-specific; RTCW has no analog.  R_CreateStaticModel /
+ * R_AddStaticModelToWorld build one cStaticModel per placement and filter its
+ * bounds into the world's cell tree; R_RegisterStaticModel / R_SetupDObjToStaticModel
+ * / R_FinishDObjToStaticModel build the shared, shader-merged, per-LOD surface
+ * geometry (smSurface_t records) that every instance of the same model draws
+ * from, and R_OptimizeSModelSurf{Generic,ARB,ATI,NV} upload that geometry into
+ * the best available GPU vertex buffer.  At draw time R_AddStaticModelSurfaces
+ * culls/LODs an instance, optionally caches its lit vertices through
+ * tr_staticmodelcache.c, and queues draw surfs; the RB_SurfaceStaticModel*
+ * entry points (referenced by tr_main.c's rb_surfaceTable) tessellate or draw
+ * each surface for the generic / ARB / ATI / NV paths.
+ *
+ * The pointer-passed records are typed file-locally below (proven against
+ * retail CoDMP.exe + CoDUO, pinned with size/offset asserts); tr_local.h is not
+ * touched.  The XModel -> XModelInfo -> XModelLodInfo -> XModelSurfs -> XSurface
+ * chain and DObj duplicate tr_model.c / tr_xanim.c's file-local copies on
+ * purpose (separate translation units).  Global scalars stay on the
+ * tr_local.h / tr_records.h / tr_smcache.h / tr_tess.h symbols.
  */
 
 #include <malloc.h>
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "tr_records.h"
 #include "tr_gl_types.h"
 #include "tr_tess.h"
 #include "tr_smcache.h"
+#include "tr_local.h"
+
+extern int GetRefString_var;   /* script/scr_memorytree.cpp: the script string arena (scr_local.h) */
+/* ---- renderer-owned globals ---- */
+int rendererPendingStaticModels;   /* 0x014072EC */
+
 
 extern char xmodel_defaultCollision[];
 
 extern void AnglesToAxis( const float *angles, float *axis );
 extern int BoxOnPlaneSide();
 extern int DObjCalcAnim();
-extern int DObjCalcSkel();
+extern void DObjCalcSkel();
 extern int DObjCreate();
 extern int GL_Bind();
 extern int GL_ClientState();
 extern int GL_Cull();
+extern void __cdecl GL_DrawElements( GLsizei numIndexes, GLenum mode, GLenum type, GLvoid *indices );
 extern int GL_State();
 extern int Hunk_AllocAlignInternal();
 extern int MatrixInverse();
+extern void __cdecl RB_BindAnimatedImage( void *bundle );
 extern int RB_ChooseSurfaceCountColor();
-extern int RB_GetAnimatedImage();
 extern void __cdecl RB_SetIteratorFog( void );
 extern int RB_SetupMultitexture();
 extern int RB_SetupMultitextureATI();
 extern int RE_RegisterModel();
 extern int R_AddScaledDebugString();
 extern int R_CacheStaticModelSurface();
+extern void __cdecl R_AddDrawSurf( int sortStorage, shader_t *shader, void *surface, int dlightBits, int fogIndex, int worldEntityFlag );
+extern smcPage_t *__cdecl R_UsedCachedStaticModelSurface( smcSurface_t *surface );
 extern char *__cdecl R_CacheableStaticModelShader( int shader );
 extern int R_CreateBufferARB();
 extern int R_FindShader();
 extern double __cdecl R_GetLodDist( float *entityOrigin );
 extern int R_GetStaticLightContributions();
-extern float *__cdecl R_GetXModelBounds( float *transform, int obj, float *mins, float *maxs );
+extern void __cdecl R_GetXModelBounds( float *transform, int obj, float *mins, float *maxs );
 extern int R_RemapTextureCoordinatesForSheet();
-extern int count;
 extern int R_SetupStaticModelLighting();
-extern _DWORD *__cdecl R_SyncRenderThread( void );
+extern unsigned int *__cdecl R_SyncRenderThread( void );
 extern float VectorMax( const float *v );
 extern void __cdecl DObjBindEvalStorage( void *storage, void *dobj );
+
+/* DObjBindEvalStorage as retail inlines it in R_AddStaticModelToWorld: attach
+ * the storage and clear its three 4-word part-bit sets (evaluated / control /
+ * blocked) */
+#define R_BIND_DOBJ_EVAL_STORAGE( obj, storage )   {     int k_;     (obj)->evalStorage = (storage);     for ( k_ = 0; k_ < 4; ++k_ )     {       ((unsigned int *)(storage))[k_]     = 0;       ((unsigned int *)(storage))[4 + k_] = 0;       ((unsigned int *)(storage))[8 + k_] = 0;     }   }
 extern int DObjGetNumSurfaces();
-extern int DObjGetSurfaces();
+extern void DObjGetSurfaces();
 extern int XSurfaceGetVerts();
 extern int __cdecl XModelGetLodForDist( const void *model, float distance );
 
-/* ---- R_AddModelToCell_0  0x005038E0 ----  [HIGH] */
-_DWORD *__cdecl R_AddModelToCell_0(int a1, int a2, int a3)
-{
-  int v3;
-  _DWORD *result;
+/* ------------------------------------------------------------------------- *
+ *  CoD XModel data chain (file-local typed views; same layout tr_model.c /
+ *  tr_xanim.c use).  Only the fields this file touches are named.
+ * ------------------------------------------------------------------------- */
+typedef struct XModel_s XModel;
 
-  v3 = *(_DWORD *)(a2 + 292) + (a1 << 6);
-  result = *(_DWORD **)(v3 + 56);
-  if ( !result || *result != a3 )
+typedef struct {
+	unsigned char  tileMode;          /* +0x00 */
+	unsigned char  pad01;             /* +0x01 */
+	short          vertexCount;       /* +0x02 */
+	short          triangleCount;     /* +0x04 */
+	short          boneMatrixOffset;  /* +0x06 */
+	unsigned int   boneUsage[4];      /* +0x08 */
+	void          *weightedPoints;    /* +0x18 */
+	unsigned short *triangles;        /* +0x1c  index triples */
+	void          *vertexData;        /* +0x20 */
+	float        (*texCoords)[2];     /* +0x24 */
+	void          *optimizedDataARB;  /* +0x28 */
+	void          *optimizedDataATI;  /* +0x2c */
+	void          *optimizedDataNV;   /* +0x30 */
+} XSurface;
+COD1_ASSERT_SIZE(XSurface, 0x34);
+ASSERT_OFF(XSurface, vertexCount, 0x02);
+ASSERT_OFF(XSurface, triangleCount, 0x04);
+ASSERT_OFF(XSurface, triangles, 0x1c);
+
+typedef struct XModelSurfsData {
+	struct XModelSurfsData *next;         /* +0x00 */
+	short                   surfaceCount; /* +0x04 */
+	short                   pad06;        /* +0x06 */
+	XSurface              **surfaces;     /* +0x08 */
+} XModelSurfsData;
+COD1_ASSERT_SIZE(XModelSurfsData, 0x0c);
+ASSERT_OFF(XModelSurfsData, surfaceCount, 0x04);
+ASSERT_OFF(XModelSurfsData, surfaces, 0x08);
+
+typedef struct {
+	const char      *name;                /* +0x00 */
+	XModelSurfsData *surfs;               /* +0x04 */
+	void           (*freeData)(void *);   /* +0x08 */
+} XModelSurfs;
+COD1_ASSERT_SIZE(XModelSurfs, 0x0c);
+ASSERT_OFF(XModelSurfs, surfs, 0x04);
+
+typedef struct {
+	float           distance;             /* +0x00 */
+	const char     *name;                 /* +0x04 */
+	short           surfaceCount;         /* +0x08 */
+	short           pad0a;                /* +0x0a */
+	unsigned short *surfaceNameTable;     /* +0x0c */
+	XModelSurfs    *surfs;                /* +0x10 */
+} XModelLodInfo;
+COD1_ASSERT_SIZE(XModelLodInfo, 0x14);
+ASSERT_OFF(XModelLodInfo, surfaceNameTable, 0x0c);
+ASSERT_OFF(XModelLodInfo, surfs, 0x10);
+
+typedef struct {
+	void          *parts;                 /* +0x00 */
+	XModelLodInfo  lodRecords[3];         /* +0x04  stride 0x14 */
+	void          *collisionSurfaces;     /* +0x40 */
+	int            collisionSurfaceCount; /* +0x44 */
+	int            contents;              /* +0x48 */
+	float          mins[3];               /* +0x4c */
+	float          maxs[3];               /* +0x58 */
+	short          lodCount;              /* +0x64 */
+	short          modelFileCount;        /* +0x66 */
+} XModelInfo;
+COD1_ASSERT_SIZE(XModelInfo, 0x68);
+ASSERT_OFF(XModelInfo, lodRecords, 0x04);
+ASSERT_OFF(XModelInfo, lodCount, 0x64);
+
+struct XModel_s {
+	const char  *name;                    /* +0x00 */
+	XModelInfo  *info;                    /* +0x04 */
+	void       (*freeData)(void *);       /* +0x08 */
+};
+COD1_ASSERT_SIZE(XModel, 0x0c);
+ASSERT_OFF(XModel, info, 0x04);
+
+/* DObj -- an instanced skeleton (see tr_xanim.c).  Only the fields this file
+ * reads are named. */
+typedef struct {
+	void          *tree;                       /* +0x00 */
+	void          *evalStorage;                /* +0x04  DObjSkelMat[] bone matrices */
+	int            skelCacheKey;               /* +0x08 */
+	unsigned char *partRemapTable;             /* +0x0c */
+	unsigned short unknownState10;             /* +0x10 */
+	unsigned short scrNotifyId;                /* +0x12 */
+	unsigned short tracePartRemapHandle;       /* +0x14 */
+	unsigned char  childCount;                 /* +0x16 */
+	unsigned char  partCount;                  /* +0x17 */
+	XModel        *childRefs[8];               /* +0x18 */
+	short          childModelIndices[8];       /* +0x38 */
+	unsigned char  childParentPartIndices[8];  /* +0x48 */
+	unsigned char  childPartBaseIndices[8];    /* +0x50 */
+} DObj;
+COD1_ASSERT_SIZE(DObj, 0x58);
+ASSERT_OFF(DObj, evalStorage, 0x04);
+ASSERT_OFF(DObj, childCount, 0x16);
+ASSERT_OFF(DObj, partCount, 0x17);
+ASSERT_OFF(DObj, childRefs, 0x18);
+ASSERT_OFF(DObj, childPartBaseIndices, 0x50);
+
+/* ------------------------------------------------------------------------- *
+ *  Static-model surface geometry.
+ *
+ *  R_FinishDObjToStaticModel merges every source XSurface that shares a shader
+ *  into one smSurface_t and builds the smSurfaceList_t (one per LOD) that the
+ *  registered model points at.  The drawSurf emitted by R_AddStaticModelSurfaces
+ *  points at the smSurface_t base; this is also the smSurface_t that
+ *  R_CacheStaticModelSurface caches (cachedShader @ +0x0c, vertexCount @ +0x12,
+ *  texCoords @ +0x14, normals @ +0x18, vertices @ +0x1c).
+ * ------------------------------------------------------------------------- */
+
+/* surfaceType selector (smSurface_t.surfaceType / drawSurf dispatch index) */
+typedef enum {
+	SM_SURFACE_TESS           = 11,   /* RB_SurfaceStaticModel (un-optimized, copies into tess) */
+	SM_SURFACE_T2V3_GENERIC   = 16,   /* tex+pos, 20-byte */
+	SM_SURFACE_T2V3_ARB       = 17,
+	SM_SURFACE_T2V3_ATI       = 18,
+	SM_SURFACE_T2V3_NV        = 19,
+	SM_SURFACE_T2N3V3_GENERIC = 20,   /* tex+normal+pos, 32-byte */
+	SM_SURFACE_T2N3V3_ARB     = 21,
+	SM_SURFACE_T2N3V3_ATI     = 22,
+	SM_SURFACE_T2N3V3_NV      = 23
+} smSurfaceType_t;
+
+/* shader.surfaceFlags masks that select the vertex format an optimized surface
+ * uses: geometry that needs no normals (0x3FF5FD00 clear) uses T2V3, otherwise
+ * T2N3V3 unless 0x3FF7FC00 is also set (then it is left unoptimized). */
+#define SM_NEEDS_NORMALS_MASK     0x3FF5FD00
+#define SM_NO_OPTIMIZE_MASK       0x3FF7FC00
+
+typedef struct {
+	int             surfaceType;         /* +0x00  smSurfaceType_t */
+	int             storageMode;         /* +0x04  storageClass */
+	shader_t       *shader;              /* +0x08 */
+	shader_t       *cachedShader;        /* +0x0c  R_CacheableStaticModelShader result */
+	unsigned short  indexCount;          /* +0x10  3 * triangleCount */
+	unsigned short  vertexCount;         /* +0x12 */
+	float         (*texCoords)[2];       /* +0x14 */
+	vec3_t         *normals;             /* +0x18 */
+	vec3_t         *vertices;            /* +0x1c */
+	unsigned short *indices;             /* +0x20 */
+	void           *gpuVertexBuffer;     /* +0x24  ARB vertex VBO / ATI buffer object / generic+NV verts */
+	int             gpuIndexBuffer;      /* +0x28  ARB index VBO / ATI vertex byte offset */
+	int             gpuIndexOffset;      /* +0x2c  ATI index byte offset */
+} smSurface_t;
+COD1_ASSERT_SIZE(smSurface_t, 0x30);
+ASSERT_OFF(smSurface_t, shader, 0x08);
+ASSERT_OFF(smSurface_t, cachedShader, 0x0c);
+ASSERT_OFF(smSurface_t, indexCount, 0x10);
+ASSERT_OFF(smSurface_t, vertexCount, 0x12);
+ASSERT_OFF(smSurface_t, texCoords, 0x14);
+ASSERT_OFF(smSurface_t, normals, 0x18);
+ASSERT_OFF(smSurface_t, vertices, 0x1c);
+ASSERT_OFF(smSurface_t, indices, 0x20);
+ASSERT_OFF(smSurface_t, gpuVertexBuffer, 0x24);
+
+/* { int surfaceCount; smSurface_t surfaces[surfaceCount]; } -- one per LOD */
+typedef struct {
+	int         surfaceCount;   /* +0x00 */
+	smSurface_t surfaces[1];    /* +0x04 */
+} smSurfaceList_t;
+ASSERT_OFF(smSurfaceList_t, surfaces, 0x04);
+
+/* the shared static-model template (tr_registeredStaticModels[]): its name, the
+ * source XModel, and the per-LOD merged surface lists. */
+typedef struct {
+	const char       *name;         /* +0x00 */
+	int               lodCount;     /* +0x04 */
+	XModel           *model;        /* +0x08 */
+	smSurfaceList_t  *lodSurfs[1];  /* +0x0c  [lodCount]; name string follows */
+} smRegisteredModel_t;
+ASSERT_OFF(smRegisteredModel_t, model, 0x08);
+ASSERT_OFF(smRegisteredModel_t, lodSurfs, 0x0c);
+
+/* interleaved optimized-vertex formats written into the GPU buffers */
+typedef struct {
+	float texCoord[2];    /* +0x00 */
+	float position[3];    /* +0x08 */
+} smVertexT2V3_t;
+COD1_ASSERT_SIZE(smVertexT2V3_t, 0x14);
+
+typedef struct {
+	float texCoord[2];    /* +0x00 */
+	float normal[3];      /* +0x08 */
+	float position[3];    /* +0x14 */
+} smVertexT2N3V3_t;
+COD1_ASSERT_SIZE(smVertexT2N3V3_t, 0x20);
+
+/* ------------------------------------------------------------------------- *
+ *  Placed static-model instances.
+ *
+ *  worldStaticModel_t is the pending placement built by R_CreateStaticModel and
+ *  threaded on rendererPendingStaticModels.  R_AddStaticModelToWorld turns each into a
+ *  renderer_static_model_t (a refEntity-prefixed record; the renderer_static_model_t of
+ *  tr_staticmodelcache.c) that is filtered into the world cell tree and owns the
+ *  per-surface vertex cache (surfaceLightingCache[] at +0x248).
+ * ------------------------------------------------------------------------- */
+typedef struct worldStaticModel_s {
+	char                       name[64];      /* +0x00 */
+	vec3_t                     origin;        /* +0x40 */
+	float                      axis[3][3];    /* +0x4c */
+	float                      axisScale;     /* +0x70  VectorMax of the model scale */
+	vec3_t                     color;         /* +0x74 */
+	smRegisteredModel_t       *registered;    /* +0x80 */
+	vec3_t                     boundsMin;     /* +0x84 */
+	vec3_t                     boundsMax;     /* +0x90 */
+	struct worldStaticModel_s *next;          /* +0x9c */
+} worldStaticModel_t;
+COD1_ASSERT_SIZE(worldStaticModel_t, 0xa0);
+ASSERT_OFF(worldStaticModel_t, origin, 0x40);
+ASSERT_OFF(worldStaticModel_t, axis, 0x4c);
+ASSERT_OFF(worldStaticModel_t, color, 0x74);
+ASSERT_OFF(worldStaticModel_t, registered, 0x80);
+ASSERT_OFF(worldStaticModel_t, boundsMin, 0x84);
+ASSERT_OFF(worldStaticModel_t, next, 0x9c);
+
+typedef struct {
+	int                  reType;             /* +0x00  1 (from list) or 2 (registered) */
+	int                  renderfx;           /* +0x04  = 128 */
+	int                  hModel;             /* +0x08 */
+	vec3_t               localOrigin;        /* +0x0c  bounds centre (mins+maxs)*0.5 */
+	float                shadowPlane;        /* +0x18 */
+	float                axis[3][3];         /* +0x1c */
+	float                axisScale;          /* +0x40 */
+	vec3_t               origin;             /* +0x44 */
+	int                  frame;              /* +0x50 */
+	vec3_t               oldorigin;          /* +0x54 */
+	int                  oldframe;           /* +0x60 */
+	float                radius2;            /* +0x64 */
+	int                  customShader;       /* +0x68 */
+	byte                 color[4];           /* +0x6c  shaderRGBA */
+	float                shaderTexCoord[2];  /* +0x70 */
+	float                shaderTime;         /* +0x78 */
+	float                radius;             /* +0x7c */
+	float                rotation;           /* +0x80 */
+	vec3_t               fireRiseDir;        /* +0x84 */
+	DObj                *dobj;               /* +0x90 */
+	void                *owner;              /* +0x94 */
+	smRegisteredModel_t *registered;         /* +0x98 */
+	float                bounds[2][3];       /* +0x9c  mins / maxs */
+	int                  viewCount;          /* +0xb4  DPVS submitted-this-view stamp (tr_dpvs.c dpvsStaticModel_t) */
+	int                  lightContributions; /* +0xb8  R_GetStaticLightContributions result */
+	byte                 lighting[0x248 - 0xbc]; /* +0xbc  static-light index / colour tables */
+	void                *surfaceLightingCache[1];/* +0x248  [surfaceIndex] */
+} renderer_static_model_t;
+ASSERT_OFF(renderer_static_model_t, localOrigin, 0x0c);
+ASSERT_OFF(renderer_static_model_t, axis, 0x1c);
+ASSERT_OFF(renderer_static_model_t, origin, 0x44);
+ASSERT_OFF(renderer_static_model_t, color, 0x6c);
+ASSERT_OFF(renderer_static_model_t, dobj, 0x90);
+ASSERT_OFF(renderer_static_model_t, registered, 0x98);
+ASSERT_OFF(renderer_static_model_t, bounds, 0x9c);
+ASSERT_OFF(renderer_static_model_t, surfaceLightingCache, 0x248);
+
+/* one static-model reference threaded on a world cell's list */
+typedef struct smodelRef_s {
+	renderer_static_model_t     *model;   /* +0x00 */
+	struct smodelRef_s *next;    /* +0x04 */
+} smodelRef_t;
+COD1_ASSERT_SIZE(smodelRef_t, 0x08);
+
+/* one world cell (0x40); only the static-model list head is touched here */
+typedef struct {
+	vec3_t       mins;               /* +0x00  (tr_dpvs.c dpvsCell_t) */
+	vec3_t       maxs;               /* +0x0c */
+	void        *aabbTree;           /* +0x18 */
+	void        *portals;            /* +0x1c */
+	int          portalCount;        /* +0x20 */
+	void        *cullGroups;         /* +0x24 */
+	int          cullGroupCount;     /* +0x28 */
+	void        *occluders;          /* +0x2c */
+	int          occluderCount;      /* +0x30 */
+	int          markViewCount;      /* +0x34 */
+	smodelRef_t *firstStaticModel;   /* +0x38 */
+	void        *entityLinks;        /* +0x3c */
+} worldCell_t;
+COD1_ASSERT_SIZE(worldCell_t, 0x40);
+ASSERT_OFF(worldCell_t, firstStaticModel, 0x38);
+
+/* trRefEntity_t (tr_local.h) fields the static-model draw path reads that fall
+ * outside the header's named prefix (proven against retail). */
+#define R_EntStaticModel(ent)        ((smRegisteredModel_t *)(ent)->e.staticModel)
+#define R_EntHasDynamicLights(ent)   ((ent)->hasDynamicLights)
+#define R_EntOwner(ent)              ((renderer_static_model_t *)(ent)->staticModelLighting)
+
+/* one shader stage (0x688); only the fields the draw backends touch are named
+ * (interior layout is disputed across the shade TUs, so it stays file-local). */
+typedef struct {
+	unsigned int  attributeBits;    /* +0x000 */
+	int           bundle;           /* +0x004  first textureBundle (image / anim) */
+	byte          bundleRest[0x644 - 0x008]; /* rest of textureBundle_t bundles[8] (tr_shade.c) */
+	int           atiFragmentShader;      /* +0x644 */
+	void         *registerCombiners;      /* +0x648 */
+	char         *vertexProgram;          /* +0x64c */
+	byte          rgbWave[0x14];          /* +0x650  waveForm_t */
+	int           rgbGen;           /* +0x664  colorGen_t */
+	byte          alphaWave[0x14];        /* +0x668  waveForm_t */
+	int           alphaGen;               /* +0x67c */
+	byte          constantColor[4]; /* +0x680  RGBA */
+	unsigned int  stateBits;        /* +0x684  GL_State bits */
+} shaderStage_t;
+COD1_ASSERT_SIZE(shaderStage_t, 0x688);
+ASSERT_OFF(shaderStage_t, rgbGen, 0x664);
+ASSERT_OFF(shaderStage_t, constantColor, 0x680);
+ASSERT_OFF(shaderStage_t, stateBits, 0x684);
+
+#define CGEN_LIGHTING_PRECALC   11   /* rgbGen: use the entity's precomputed shaderRGBA */
+
+/* shader fields past tr_local.h's named prefix, reached on the tess / globals shader */
+#define R_ShaderCullType(sh)   (((shader_t *)(sh))->cullType)
+#define R_ShaderStages(sh)     ((shaderStage_t **)((shader_t *)(sh))->stages)
+
+/* ---- R_AddModelToCell_0  0x005038E0 ----  [HIGH]
+ * Prepend one static-model reference to a world cell's list, unless the cell's
+ * head already references this model.  Returns the (new or existing) head. */
+smodelRef_t *__cdecl R_AddModelToCell_0(int cellIndex, int world, int model)
+{
+  worldCell_t *cell = (worldCell_t *)(*(int *)(world + 292) + (cellIndex << 6));
+  smodelRef_t *ref;
+
+  ref = cell->firstStaticModel;
+  if ( !ref || (int)ref->model != model )
   {
-    result = (_DWORD *)ri_Hunk_Alloc(8);
-    *result = a3;
-    result[1] = *(_DWORD *)(v3 + 56);
-    *(_DWORD *)(v3 + 56) = result;
+    ref = (smodelRef_t *)ri.Hunk_Alloc(8);
+    ref->model = (renderer_static_model_t *)model;
+    ref->next = cell->firstStaticModel;
+    cell->firstStaticModel = ref;
   }
-  return result;
+  return ref;
 }
 
-/* ---- R_FilterModelIntoCells_r_0  0x00503920 ----  VERIFIED */
-void __cdecl R_FilterModelIntoCells_r_0(int a1, _DWORD *a2, int a3, int *a4, _DWORD *a5)
+/* ---- R_FilterModelIntoCells_r_0  0x00503920 ----  VERIFIED
+ * Recursively descend the world cell tree, adding the static model to every leaf
+ * cell its bounding box reaches.  A leaf (cellIndex >= 0) gets one reference; an
+ * internal node either follows a single side or, when the box straddles an axial
+ * split plane, is clipped and recursed on both sides. */
+smodelRef_t *__cdecl R_FilterModelIntoCells_r_0(int world, mnode_t *node, int model, float *mins, float *maxs)
 {
-  _DWORD *v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  _DWORD *v10;
-  int v11;
-  _DWORD *v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  int v18[3]; // [esp+10h] [ebp-18h] BYREF
-  _DWORD v19[3]; // [esp+1Ch] [ebp-Ch] BYREF
+  int       side;
+  cplane_t *plane;
+  float     newMins[3];
+  float     newMaxs[3];
 
-  v5 = a2;
-  if ( a2[2] != -2 )
+  while ( node->cellIndex == -2 )   /* internal node */
   {
-LABEL_7:
-    v7 = v5[2];
-    if ( v7 >= 0 )
+    side = BoxOnPlaneSide((int)mins, (int)maxs, (int)node->u.node.plane);
+    if ( side == 3 )   /* straddles the plane */
     {
-      v8 = *(_DWORD *)(a1 + 292);
-      v9 = v7 << 6;
-      v10 = *(_DWORD **)(v9 + v8 + 56);
-      v11 = v8 + v9;
-      if ( !v10 || *v10 != a3 )
+      if ( node->u.node.plane->type < 3 )
       {
-        v12 = (_DWORD *)ri_Hunk_Alloc(8);
-        *v12 = a3;
-        v12[1] = *(_DWORD *)(v11 + 56);
-        *(_DWORD *)(v11 + 56) = v12;
+        /* axial split: front half clipped to mins[axis] = dist, back half to maxs */
+        plane = node->u.node.plane;
+        newMins[1] = mins[1];
+        newMins[0] = mins[0];
+        newMins[2] = mins[2];
+        newMins[plane->type] = plane->dist;
+        newMaxs[0] = maxs[0];
+        newMaxs[1] = maxs[1];
+        newMaxs[2] = maxs[2];
+        newMaxs[plane->type] = plane->dist;
+        if ( newMins[plane->type] < maxs[plane->type] )   /* front half not empty (ordered <: NaN/equal skip) */
+          R_FilterModelIntoCells_r_0(world, node->u.node.children[0], model, newMins, maxs);
+        R_FilterModelIntoCells_r_0(world, node->u.node.children[1], model, mins, newMaxs);
+        return;
       }
+      /* non-axial split -> recurse both */
+      R_FilterModelIntoCells_r_0(world, node->u.node.children[0], model, mins, maxs);
+      node = node->u.node.children[1];
     }
-    return;
-  }
-  while ( 1 )
-  {
-    v6 = BoxOnPlaneSide((int)a4, (int)a5, v5[3]);
-    if ( v6 != 3 )
+    else   /* wholly on one side */
     {
-      v5 = (_DWORD *)v5[v6 + 3];
-      goto LABEL_6;
+      node = node->u.node.children[side - 1];
     }
-    if ( *(_BYTE *)(v5[3] + 16) < 3u )
-      break;
-    R_FilterModelIntoCells_r_0(a1, (_DWORD *)v5[4], a3, a4, a5);
-    v5 = (_DWORD *)v5[5];
-LABEL_6:
-    if ( v5[2] != -2 )
-      goto LABEL_7;
   }
-  v13 = *a4;
-  v14 = a4[2];
-  v18[1] = a4[1];
-  v15 = v5[3];
-  v18[0] = v13;
-  v18[2] = v14;
-  v18[*(unsigned __int8 *)(v15 + 16)] = *(_DWORD *)(v15 + 12);
-  v16 = a5[1];
-  v19[0] = *a5;
-  v17 = a5[2];
-  v19[1] = v16;
-  v19[2] = v17;
-  v19[*(unsigned __int8 *)(v15 + 16)] = *(_DWORD *)(v15 + 12);
-  if ( (*(float *)&v18[*(unsigned __int8 *)(v15 + 16)] < (double)*(float *)&a5[*(unsigned __int8 *)(v15 + 16)])
-     | __UNORDERED__(*(float *)&v18[*(unsigned __int8 *)(v15 + 16)], *(float *)&a5[*(unsigned __int8 *)(v15 + 16)]) )
-  {
-    R_FilterModelIntoCells_r_0(a1, (_DWORD *)v5[4], a3, v18, a5);
-  }
-  R_FilterModelIntoCells_r_0(a1, (_DWORD *)v5[5], a3, a4, v19);
+
+  if ( node->cellIndex >= 0 )
+    return R_AddModelToCell_0(node->cellIndex, world, model);
 }
 
-/* ---- R_OptimizeSModelSurfGeneric  0x00503A60 ----  VERIFIED */
-int __cdecl R_OptimizeSModelSurfGeneric(int a1)
+/* ---- R_OptimizeSModelSurfGeneric  0x00503A60 ----  VERIFIED
+ * Build a system-memory interleaved vertex buffer for a merged surface: T2V3
+ * (tex + position) when the shader needs no normals, else T2N3V3 (tex + normal +
+ * position).  Returns the buffer / trailing cursor (dead EAX). */
+void __cdecl R_OptimizeSModelSurfGeneric(smSurface_t *surf)
 {
-  int result;
-  int v2;
-  bool v3; // zf
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
+  int          result;
+  int i,size;
 
-  result = *(_DWORD *)(*(_DWORD *)(a1 + 8) + 80);
-  if ( (result & 0x3FF5FD00) != 0 )
+  if((surf->shader->surfaceFlags&SM_NEEDS_NORMALS_MASK)==0)
   {
-    if ( (result & 0x3FF7FC00) == 0 )
+    smVertexT2V3_t *out;
+
+    surf->storageMode = 3;
+    surf->surfaceType = SM_SURFACE_T2V3_GENERIC;
+    size=20*surf->vertexCount;out=(smVertexT2V3_t *)ri.Hunk_Alloc(size);
+    surf->gpuVertexBuffer = out;
+    for ( i = 0; i < surf->vertexCount; ++i )
     {
-      v8 = 32 * *(unsigned __int16 *)(a1 + 18);
-      *(_DWORD *)(a1 + 4) = 3;
-      *(_DWORD *)a1 = 20;
-      result = ri_Hunk_Alloc(v8);
-      v5 = 0;
-      v3 = *(_WORD *)(a1 + 18) == 0;
-      *(_DWORD *)(a1 + 36) = result;
-      if ( !v3 )
-      {
-        result = 0;
-        v6 = 0;
-        do
-        {
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36)) = *(_DWORD *)(*(_DWORD *)(a1 + 20) + 8 * v5);
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 4) = *(_DWORD *)(*(_DWORD *)(a1 + 20) + 8 * v5 + 4);
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 8) = *(_DWORD *)(v6 + *(_DWORD *)(a1 + 24));
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 12) = *(_DWORD *)(*(_DWORD *)(a1 + 24) + v6 + 4);
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 16) = *(_DWORD *)(*(_DWORD *)(a1 + 24) + v6 + 8);
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 20) = *(_DWORD *)(v6 + *(_DWORD *)(a1 + 28));
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 24) = *(_DWORD *)(v6 + *(_DWORD *)(a1 + 28) + 4);
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 28) = *(_DWORD *)(v6 + *(_DWORD *)(a1 + 28) + 8);
-          ++v5;
-          v6 += 12;
-          result += 32;
-        }
-        while ( v5 < *(unsigned __int16 *)(a1 + 18) );
-      }
+      ((smVertexT2V3_t *)surf->gpuVertexBuffer)[i].texCoord[0] = surf->texCoords[i][0];
+      ((smVertexT2V3_t *)surf->gpuVertexBuffer)[i].texCoord[1] = surf->texCoords[i][1];
+      ((smVertexT2V3_t *)surf->gpuVertexBuffer)[i].position[0] = surf->vertices[i][0];
+      ((smVertexT2V3_t *)surf->gpuVertexBuffer)[i].position[1] = surf->vertices[i][1];
+      ((smVertexT2V3_t *)surf->gpuVertexBuffer)[i].position[2] = surf->vertices[i][2];
     }
+
   }
   else
   {
-    v7 = 20 * *(unsigned __int16 *)(a1 + 18);
-    *(_DWORD *)(a1 + 4) = 3;
-    *(_DWORD *)a1 = 16;
-    result = ri_Hunk_Alloc(v7);
-    v2 = 0;
-    v3 = *(_WORD *)(a1 + 18) == 0;
-    *(_DWORD *)(a1 + 36) = result;
-    if ( !v3 )
+    if ( (surf->shader->surfaceFlags & SM_NO_OPTIMIZE_MASK) == 0 )
     {
-      result = 0;
-      v4 = 0;
-      do
+      smVertexT2N3V3_t *out;
+
+      surf->storageMode = 3;
+      surf->surfaceType = SM_SURFACE_T2N3V3_GENERIC;
+      size=32*surf->vertexCount;out=(smVertexT2N3V3_t *)ri.Hunk_Alloc(size);
+      surf->gpuVertexBuffer = out;
+      for ( i = 0; i < surf->vertexCount; ++i )
       {
-        *(_DWORD *)(result + *(_DWORD *)(a1 + 36)) = *(_DWORD *)(*(_DWORD *)(a1 + 20) + 8 * v2);
-        *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 4) = *(_DWORD *)(*(_DWORD *)(a1 + 20) + 8 * v2 + 4);
-        *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 8) = *(_DWORD *)(v4 + *(_DWORD *)(a1 + 28));
-        *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 12) = *(_DWORD *)(v4 + *(_DWORD *)(a1 + 28) + 4);
-        *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 16) = *(_DWORD *)(v4 + *(_DWORD *)(a1 + 28) + 8);
-        ++v2;
-        v4 += 12;
-        result += 20;
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].texCoord[0] = surf->texCoords[i][0];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].texCoord[1] = surf->texCoords[i][1];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].normal[0]   = surf->normals[i][0];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].normal[1]   = surf->normals[i][1];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].normal[2]   = surf->normals[i][2];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].position[0] = surf->vertices[i][0];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].position[1] = surf->vertices[i][1];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].position[2] = surf->vertices[i][2];
       }
-      while ( v2 < *(unsigned __int16 *)(a1 + 18) );
+
     }
   }
-  return result;
+  return;
 }
 
-/* ---- R_OptimizeSModelSurfNV  0x00503BC0 ----  VERIFIED */
-int __cdecl R_OptimizeSModelSurfNV(int a1)
+/* ---- R_OptimizeSModelSurfNV  0x00503BC0 ----  VERIFIED
+ * As R_OptimizeSModelSurfGeneric, but the interleaved buffer is placed in NV
+ * static vertex memory (primary, else secondary, else an aligned hunk block);
+ * storageMode records which pool.  Returns the buffer / cursor (dead EAX). */
+void __cdecl R_OptimizeSModelSurfNV(int surface)
 {
-  int result;
-  int v2;
-  unsigned int v3;
-  int v4;
-  bool v5; // zf
-  int v6;
-  int v7;
-  unsigned int v8;
-  int v9;
-  int v10;
+  smSurface_t *surf = (smSurface_t *)surface;
+  int          result;
+  int          i;
 
-  result = *(_DWORD *)(*(_DWORD *)(a1 + 8) + 80);
-  if ( (result & 0x3FF5FD00) != 0 )
+  result = surf->shader->surfaceFlags;
+  if((result&SM_NEEDS_NORMALS_MASK)==0)
   {
-    if ( (result & 0x3FF7FC00) == 0 )
+    unsigned int    size;
+    smVertexT2V3_t *out;
+
+    surf->surfaceType = SM_SURFACE_T2V3_NV;
+    size = (4 * (5 * surf->vertexCount) + 31) & 0xFFFFFFE0;
+    if ( (int)(tr_staticVertexMemoryPrimaryUsed + size) < tr_staticVertexMemoryPrimaryLimit )
     {
-      v7 = 32 * *(unsigned __int16 *)(a1 + 18) + 31;
-      *(_DWORD *)a1 = 23;
-      v8 = v7 & 0xFFFFFFE0;
-      if ( (int)(tr_staticVertexMemoryPrimaryUsed + v8) >= tr_staticVertexMemoryPrimaryLimit )
-      {
-        if ( (int)(tr_staticVertexMemorySecondaryUsed + v8) >= tr_staticVertexMemorySecondaryLimit )
-        {
-          *(_DWORD *)(a1 + 36) = Hunk_AllocAlignInternal(v8, 32);
-          result = 3;
-        }
-        else
-        {
-          *(_DWORD *)(a1 + 36) = tr_staticVertexMemorySecondaryUsed + tr_staticVertexMemorySecondary;
-          tr_staticVertexMemorySecondaryUsed += v8;
-          result = 2;
-        }
-      }
-      else
-      {
-        *(_DWORD *)(a1 + 36) = tr_staticVertexMemoryPrimaryUsed + tr_staticVertexMemoryPrimary;
-        tr_staticVertexMemoryPrimaryUsed += v8;
-        result = 1;
-      }
-      v9 = 0;
-      v5 = *(_WORD *)(a1 + 18) == 0;
-      *(_DWORD *)(a1 + 4) = result;
-      if ( !v5 )
-      {
-        result = 0;
-        v10 = 0;
-        do
-        {
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36)) = *(_DWORD *)(*(_DWORD *)(a1 + 20) + 8 * v9);
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 4) = *(_DWORD *)(*(_DWORD *)(a1 + 20) + 8 * v9 + 4);
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 8) = *(_DWORD *)(v10 + *(_DWORD *)(a1 + 24));
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 12) = *(_DWORD *)(*(_DWORD *)(a1 + 24) + v10 + 4);
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 16) = *(_DWORD *)(*(_DWORD *)(a1 + 24) + v10 + 8);
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 20) = *(_DWORD *)(v10 + *(_DWORD *)(a1 + 28));
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 24) = *(_DWORD *)(v10 + *(_DWORD *)(a1 + 28) + 4);
-          *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 28) = *(_DWORD *)(v10 + *(_DWORD *)(a1 + 28) + 8);
-          ++v9;
-          v10 += 12;
-          result += 32;
-        }
-        while ( v9 < *(unsigned __int16 *)(a1 + 18) );
-      }
-    }
-  }
-  else
-  {
-    v2 = 5 * *(unsigned __int16 *)(a1 + 18);
-    *(_DWORD *)a1 = 19;
-    v3 = (4 * v2 + 31) & 0xFFFFFFE0;
-    if ( (int)(tr_staticVertexMemoryPrimaryUsed + v3) >= tr_staticVertexMemoryPrimaryLimit )
-    {
-      if ( (int)(tr_staticVertexMemorySecondaryUsed + v3) >= tr_staticVertexMemorySecondaryLimit )
-      {
-        *(_DWORD *)(a1 + 36) = Hunk_AllocAlignInternal(v3, 32);
-        result = 3;
-      }
-      else
-      {
-        *(_DWORD *)(a1 + 36) = tr_staticVertexMemorySecondaryUsed + tr_staticVertexMemorySecondary;
-        tr_staticVertexMemorySecondaryUsed += v3;
-        result = 2;
-      }
-    }
-    else
-    {
-      *(_DWORD *)(a1 + 36) = tr_staticVertexMemoryPrimaryUsed + tr_staticVertexMemoryPrimary;
-      tr_staticVertexMemoryPrimaryUsed += v3;
+      surf->gpuVertexBuffer = (void *)(tr_staticVertexMemoryPrimaryUsed + tr_staticVertexMemoryPrimary);
+      tr_staticVertexMemoryPrimaryUsed += size;
       result = 1;
     }
-    v4 = 0;
-    v5 = *(_WORD *)(a1 + 18) == 0;
-    *(_DWORD *)(a1 + 4) = result;
-    if ( !v5 )
+    else if ( (int)(tr_staticVertexMemorySecondaryUsed + size) < tr_staticVertexMemorySecondaryLimit )
     {
-      result = 0;
-      v6 = 0;
-      do
-      {
-        *(_DWORD *)(result + *(_DWORD *)(a1 + 36)) = *(_DWORD *)(*(_DWORD *)(a1 + 20) + 8 * v4);
-        *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 4) = *(_DWORD *)(*(_DWORD *)(a1 + 20) + 8 * v4 + 4);
-        *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 8) = *(_DWORD *)(v6 + *(_DWORD *)(a1 + 28));
-        *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 12) = *(_DWORD *)(v6 + *(_DWORD *)(a1 + 28) + 4);
-        *(_DWORD *)(result + *(_DWORD *)(a1 + 36) + 16) = *(_DWORD *)(v6 + *(_DWORD *)(a1 + 28) + 8);
-        ++v4;
-        v6 += 12;
-        result += 20;
-      }
-      while ( v4 < *(unsigned __int16 *)(a1 + 18) );
-    }
-  }
-  return result;
-}
-
-/* ---- R_OptimizeSModelSurfATI  0x00503DD0 ----  VERIFIED */
-int __cdecl R_OptimizeSModelSurfATI(int a1)
-{
-  int v1;
-  unsigned int v2;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  unsigned int v8;
-  int v9;
-  int v10;
-  int v11;
-  _DWORD *v12;
-  _DWORD *v13;
-  int v14;
-  _DWORD *v15;
-  int v16;
-  _DWORD *v17;
-  _DWORD *v18;
-  _DWORD *v19;
-  _DWORD *v20;
-  int v21;
-  int v23;
-  int v24;
-  int v25;
-  int v26;
-  _BYTE v27[262144]; // [esp+14h] [ebp-40000h] BYREF
-
-  v1 = *(_DWORD *)(*(_DWORD *)(a1 + 8) + 80);
-  v2 = (2 * *(unsigned __int16 *)(a1 + 16) + 31) & 0xFFFFFFE0;
-  if ( (v1 & 0x3FF5FD00) != 0 )
-  {
-    if ( (v1 & 0x3FF7FC00) != 0 )
-      return 0;
-    v5 = *(unsigned __int16 *)(a1 + 18);
-    *(_DWORD *)a1 = 22;
-    v4 = 32 * v5;
-  }
-  else
-  {
-    v3 = *(unsigned __int16 *)(a1 + 18);
-    *(_DWORD *)a1 = 18;
-    v4 = 20 * v3;
-  }
-  v25 = v4;
-  v6 = v4;
-  if ( glConfig_ATIElementArray )
-    v6 = v4 + v2;
-  v7 = tr_staticVertexMemoryPrimaryUsed;
-  v8 = (v6 + 31) & 0xFFFFFFE0;
-  if ( (int)(tr_staticVertexMemoryPrimaryUsed + v8) > tr_staticVertexMemoryPrimaryLimit )
-  {
-    v7 = tr_staticVertexMemorySecondaryUsed;
-    v10 = tr_staticVertexMemorySecondaryUsed + v8;
-    if ( v10 > tr_staticVertexMemorySecondaryLimit )
-    {
-      v7 = v4;
-      v9 = 0;
+      surf->gpuVertexBuffer = (void *)(tr_staticVertexMemorySecondaryUsed + tr_staticVertexMemorySecondary);
+      tr_staticVertexMemorySecondaryUsed += size;
+      result = 2;
     }
     else
     {
-      tr_staticVertexMemorySecondaryUsed = v10;
-      v9 = 2;
+      surf->gpuVertexBuffer = (void *)Hunk_AllocAlignInternal(size, 32);
+      result = 3;
     }
+    surf->storageMode = result;
+    out = (smVertexT2V3_t *)surf->gpuVertexBuffer;
+    for ( i = 0; i < surf->vertexCount; ++i )
+    {
+      ((smVertexT2V3_t *)surf->gpuVertexBuffer)[i].texCoord[0] = surf->texCoords[i][0];
+      ((smVertexT2V3_t *)surf->gpuVertexBuffer)[i].texCoord[1] = surf->texCoords[i][1];
+      ((smVertexT2V3_t *)surf->gpuVertexBuffer)[i].position[0] = surf->vertices[i][0];
+      ((smVertexT2V3_t *)surf->gpuVertexBuffer)[i].position[1] = surf->vertices[i][1];
+      ((smVertexT2V3_t *)surf->gpuVertexBuffer)[i].position[2] = surf->vertices[i][2];
+    }
+
   }
   else
   {
-    tr_staticVertexMemoryPrimaryUsed += v8;
-    v9 = 1;
+    if ( (result & SM_NO_OPTIMIZE_MASK) == 0 )
+    {
+      unsigned int      size;
+      smVertexT2N3V3_t *out;
+
+      surf->surfaceType = SM_SURFACE_T2N3V3_NV;
+      size = (32 * surf->vertexCount + 31) & 0xFFFFFFE0;
+      if ( (int)(tr_staticVertexMemoryPrimaryUsed + size) < tr_staticVertexMemoryPrimaryLimit )
+      {
+        surf->gpuVertexBuffer = (void *)(tr_staticVertexMemoryPrimaryUsed + tr_staticVertexMemoryPrimary);
+        tr_staticVertexMemoryPrimaryUsed += size;
+        result = 1;
+      }
+      else if ( (int)(tr_staticVertexMemorySecondaryUsed + size) < tr_staticVertexMemorySecondaryLimit )
+      {
+        surf->gpuVertexBuffer = (void *)(tr_staticVertexMemorySecondaryUsed + tr_staticVertexMemorySecondary);
+        tr_staticVertexMemorySecondaryUsed += size;
+        result = 2;
+      }
+      else
+      {
+        surf->gpuVertexBuffer = (void *)Hunk_AllocAlignInternal(size, 32);
+        result = 3;
+      }
+      surf->storageMode = result;
+      out = (smVertexT2N3V3_t *)surf->gpuVertexBuffer;
+      for ( i = 0; i < surf->vertexCount; ++i )
+      {
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].texCoord[0] = surf->texCoords[i][0];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].texCoord[1] = surf->texCoords[i][1];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].normal[0]   = surf->normals[i][0];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].normal[1]   = surf->normals[i][1];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].normal[2]   = surf->normals[i][2];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].position[0] = surf->vertices[i][0];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].position[1] = surf->vertices[i][1];
+        ((smVertexT2N3V3_t *)surf->gpuVertexBuffer)[i].position[2] = surf->vertices[i][2];
+      }
+
+    }
   }
-  *(_DWORD *)(a1 + 4) = v9;
-  if ( !v9 )
-    return 0;
-  if ( v9 == 1 )
-    *(_DWORD *)(a1 + 36) = tr_staticVertexMemoryPrimary;
+  return;
+}
+
+/* ---- R_OptimizeSModelSurfATI  0x00503DD0 ----  VERIFIED
+ * Build an ATI-object-buffer interleaved vertex (and, with ATIElementArray, a
+ * paired index) buffer for a merged surface: T2V3 or T2N3V3 by shader.  The
+ * geometry is staged in a scratch buffer then uploaded with
+ * qglUpdateObjectBufferATI.  Returns 1 on success, 0 when disabled/no room. */
+int __cdecl R_OptimizeSModelSurfATI(int surface)
+{
+  smSurface_t *surf = (smSurface_t *)surface;
+  int          surfaceFlags;
+  unsigned int indexBytes;
+  int          vertexBytes;
+  int          totalBytes;
+  int          bufferBase;
+  unsigned int alignedBytes;
+  int          storageMode;
+  int          i;
+
+  surfaceFlags = surf->shader->surfaceFlags;
+  indexBytes = (2 * surf->indexCount + 31) & 0xFFFFFFE0;
+  if ( (surfaceFlags & SM_NEEDS_NORMALS_MASK) == 0 )
+  {
+    surf->surfaceType = SM_SURFACE_T2V3_ATI;
+    vertexBytes = 20 * surf->vertexCount;
+  }
+  else if ( (surfaceFlags & SM_NO_OPTIMIZE_MASK) == 0 )
+  {
+    surf->surfaceType = SM_SURFACE_T2N3V3_ATI;
+    vertexBytes = 32 * surf->vertexCount;
+  }
   else
-    *(_DWORD *)(a1 + 36) = tr_staticVertexMemorySecondary;
-  *(_DWORD *)(a1 + 4) = 3;
+  {
+    return 0;
+  }
+
+  totalBytes = vertexBytes;
   if ( glConfig_ATIElementArray )
+    totalBytes = vertexBytes + indexBytes;   /* also reserve the index buffer */
+  /* R_AllocMemoryATI(1, totalBytes, &bufferBase), inlined in retail */
+  alignedBytes = (totalBytes + 31) & 0xFFFFFFE0;
+  if ( (int)(tr_staticVertexMemoryPrimaryUsed + alignedBytes) <= tr_staticVertexMemoryPrimaryLimit )
   {
-    v11 = *(_DWORD *)(a1 + 32);
-    *(_DWORD *)(a1 + 40) = v7 + v2;
-    v24 = 2 * *(unsigned __int16 *)(a1 + 16);
-    v23 = *(_DWORD *)(a1 + 36);
-    *(_DWORD *)(a1 + 44) = v7;
-    qglUpdateObjectBufferATI(v23, v7, v24, v11, 34658);
+    bufferBase = tr_staticVertexMemoryPrimaryUsed;
+    tr_staticVertexMemoryPrimaryUsed += alignedBytes;
+    storageMode = 1;
+  }
+  else if ( (int)(tr_staticVertexMemorySecondaryUsed + alignedBytes) <= tr_staticVertexMemorySecondaryLimit )
+  {
+    bufferBase = tr_staticVertexMemorySecondaryUsed;
+    tr_staticVertexMemorySecondaryUsed += alignedBytes;
+    storageMode = 2;
   }
   else
   {
-    *(_DWORD *)(a1 + 44) = 0;
-    *(_DWORD *)(a1 + 40) = v7;
+    storageMode = 0;
   }
-  if ( *(_DWORD *)a1 == 18 )
+  surf->storageMode = storageMode;
+  if ( storageMode )
   {
-    if ( *(_WORD *)(a1 + 18) )
+    if ( storageMode == 1 )
+      surf->gpuVertexBuffer = (void *)tr_staticVertexMemoryPrimary;
+    else
+      surf->gpuVertexBuffer = (void *)tr_staticVertexMemorySecondary;
+    surf->storageMode = 3;
+
+    if ( glConfig_ATIElementArray )
     {
-      v12 = *(_DWORD **)(a1 + 28);
-      v13 = *(_DWORD **)(a1 + 20);
-      v14 = *(unsigned __int16 *)(a1 + 18);
-      v15 = (_DWORD *)(v27 + 4);
-      do
+      surf->gpuIndexBuffer = bufferBase + indexBytes;   /* vertex data after the indices */
+      surf->gpuIndexOffset = bufferBase;
+      qglUpdateObjectBufferATI((int)surf->gpuVertexBuffer, bufferBase, 2 * surf->indexCount,
+                               (int)surf->indices, 34658);
+    }
+    else
+    {
+      surf->gpuIndexOffset = 0;
+      surf->gpuIndexBuffer = bufferBase;
+    }
+
+    /* per-format block-scoped staging arrays (retail overlaps them in one 0x40000 slot) */
+    if ( surf->surfaceType == SM_SURFACE_T2V3_ATI )
+    {
+      smVertexT2V3_t staging[0x40000 / sizeof(smVertexT2V3_t)];
+
+      for ( i = 0; i < surf->vertexCount; ++i )
       {
-        *(v15 - 1) = *v13;
-        *v15 = v13[1];
-        v15[1] = *v12;
-        v15[2] = v12[1];
-        v15[3] = v12[2];
-        v13 += 2;
-        v12 += 3;
-        v15 += 5;
-        --v14;
+        staging[i].texCoord[0] = surf->texCoords[i][0];
+        staging[i].texCoord[1] = surf->texCoords[i][1];
+        staging[i].position[0] = surf->vertices[i][0];
+        staging[i].position[1] = surf->vertices[i][1];
+        staging[i].position[2] = surf->vertices[i][2];
       }
-      while ( v14 );
+      qglUpdateObjectBufferATI((int)surf->gpuVertexBuffer, surf->gpuIndexBuffer, vertexBytes, (int)staging, 34658);
     }
-  }
-  else if ( *(_WORD *)(a1 + 18) )
-  {
-    v16 = *(_DWORD *)(a1 + 24);
-    v17 = *(_DWORD **)(a1 + 28);
-    v18 = *(_DWORD **)(a1 + 20);
-    v19 = (_DWORD *)(v16 + 8);
-    v20 = (_DWORD *)(v27 + 4);
-    v21 = v16 - (_DWORD)v17;
-    v26 = *(unsigned __int16 *)(a1 + 18);
-    do
+    else
     {
-      *(v20 - 1) = *v18;
-      *v20 = v18[1];
-      v20[1] = *(_DWORD *)((char *)v17 + v21);
-      v20[2] = *(v19 - 1);
-      v20[3] = *v19;
-      v20[4] = *v17;
-      v20[5] = v17[1];
-      v20[6] = v17[2];
-      v18 += 2;
-      v19 += 3;
-      v17 += 3;
-      v20 += 8;
-      --v26;
+      smVertexT2N3V3_t staging[0x40000 / sizeof(smVertexT2N3V3_t)];
+
+      for ( i = 0; i < surf->vertexCount; ++i )
+      {
+        staging[i].texCoord[0] = surf->texCoords[i][0];
+        staging[i].texCoord[1] = surf->texCoords[i][1];
+        staging[i].normal[0]   = surf->normals[i][0];
+        staging[i].normal[1]   = surf->normals[i][1];
+        staging[i].normal[2]   = surf->normals[i][2];
+        staging[i].position[0] = surf->vertices[i][0];
+        staging[i].position[1] = surf->vertices[i][1];
+        staging[i].position[2] = surf->vertices[i][2];
+      }
+      qglUpdateObjectBufferATI((int)surf->gpuVertexBuffer, surf->gpuIndexBuffer, vertexBytes, (int)staging, 34658);
     }
-    while ( v26 );
-    v4 = v25;
+    return 1;
   }
-  qglUpdateObjectBufferATI(*(_DWORD *)(a1 + 36), *(_DWORD *)(a1 + 40), v4, v27, 34658);
-  return 1;
+  return 0;
 }
 
-/* ---- R_OptimizeSModelSurfARB  0x00503FD0 ----  VERIFIED */
-int __cdecl R_OptimizeSModelSurfARB(int a1)
+/* ---- R_OptimizeSModelSurfARB  0x00503FD0 ----  VERIFIED
+ * Build ARB vertex + index buffer objects (VBOs) for a merged surface, staging
+ * the interleaved vertices before R_CreateBufferARB uploads them.  Returns 1 on
+ * success, 0 if either VBO could not be created. */
+int __cdecl R_OptimizeSModelSurfARB(int surface)
 {
-  int v1;
-  unsigned int v2;
-  int v3;
-  int v4;
-  int BufferARB;
-  _DWORD *v6;
-  _DWORD *v7;
-  int v8;
-  _DWORD *v9;
-  int v10;
-  _DWORD *v11;
-  _DWORD *v12;
-  _DWORD *v13;
-  _DWORD *v14;
-  int v15;
-  int v16;
-  int v18;
-  int v19;
-  _BYTE v20[262144]; // [esp+14h] [ebp-40000h] BYREF
+  smSurface_t *surf = (smSurface_t *)surface;
+  int          surfaceFlags;
+  unsigned int indexBytes;
+  int          vertexBytes;
+  int          indexBuffer;
+  int          vertexBuffer;
+  int          i;
 
-  v1 = *(_DWORD *)(*(_DWORD *)(a1 + 8) + 80);
-  v2 = (2 * *(unsigned __int16 *)(a1 + 16) + 31) & 0xFFFFFFE0;
-  if ( (v1 & 0x3FF5FD00) != 0 )
+  indexBytes = (2 * surf->indexCount + 31) & 0xFFFFFFE0;
+  surfaceFlags = surf->shader->surfaceFlags;
+  if ( (surfaceFlags & SM_NEEDS_NORMALS_MASK) == 0 )
   {
-    if ( (v1 & 0x3FF7FC00) != 0 )
-      return 0;
-    v4 = *(unsigned __int16 *)(a1 + 18);
-    *(_DWORD *)a1 = 21;
-    v3 = 32 * v4;
+    surf->surfaceType = SM_SURFACE_T2V3_ARB;
+    vertexBytes = 20 * surf->vertexCount;
+  }
+  else if ( (surfaceFlags & SM_NO_OPTIMIZE_MASK) == 0 )
+  {
+    surf->surfaceType = SM_SURFACE_T2N3V3_ARB;
+    vertexBytes = 32 * surf->vertexCount;
   }
   else
   {
-    v1 = *(unsigned __int16 *)(a1 + 18);
-    *(_DWORD *)a1 = 17;
-    v3 = 20 * v1;
-  }
-  v18 = v3;
-  BufferARB = R_CreateBufferARB(v1, 34963, v2, *(_DWORD *)(a1 + 32), 35044);
-  v6 = (_DWORD *)(a1 + 40);
-  *(_DWORD *)(a1 + 40) = BufferARB;
-  if ( !BufferARB )
     return 0;
-  if ( *(_DWORD *)a1 == 17 )
+  }
+
+  indexBuffer = R_CreateBufferARB(34963, indexBytes, (int)surf->indices, 35044);
+  surf->gpuIndexBuffer = indexBuffer;
+  if ( !indexBuffer )
+    return 0;
+
+  /* per-format block-scoped staging arrays (retail overlaps them in one 0x40000 slot) */
+  if ( surf->surfaceType == SM_SURFACE_T2V3_ARB )
   {
-    if ( *(_WORD *)(a1 + 18) )
+    smVertexT2V3_t staging[0x40000 / sizeof(smVertexT2V3_t)];
+
+    for ( i = 0; i < surf->vertexCount; ++i )
     {
-      v6 = *(_DWORD **)(a1 + 28);
-      v7 = *(_DWORD **)(a1 + 20);
-      v8 = *(unsigned __int16 *)(a1 + 18);
-      v9 = (_DWORD *)(v20 + 4);
-      do
-      {
-        *(v9 - 1) = *v7;
-        *v9 = v7[1];
-        v9[1] = *v6;
-        v9[2] = v6[1];
-        v9[3] = v6[2];
-        v7 += 2;
-        v6 += 3;
-        v9 += 5;
-        --v8;
-      }
-      while ( v8 );
+      staging[i].texCoord[0] = surf->texCoords[i][0];
+      staging[i].texCoord[1] = surf->texCoords[i][1];
+      staging[i].position[0] = surf->vertices[i][0];
+      staging[i].position[1] = surf->vertices[i][1];
+      staging[i].position[2] = surf->vertices[i][2];
     }
+    vertexBuffer = R_CreateBufferARB(34962, vertexBytes, (int)staging, 35044);
   }
   else
   {
-    if ( *(_WORD *)(a1 + 18) )
+    smVertexT2N3V3_t staging[0x40000 / sizeof(smVertexT2N3V3_t)];
+
+    for ( i = 0; i < surf->vertexCount; ++i )
     {
-      v10 = *(_DWORD *)(a1 + 24);
-      v11 = *(_DWORD **)(a1 + 28);
-      v12 = *(_DWORD **)(a1 + 20);
-      v13 = (_DWORD *)(v10 + 8);
-      v14 = (_DWORD *)(v20 + 4);
-      v15 = v10 - (_DWORD)v11;
-      v19 = *(unsigned __int16 *)(a1 + 18);
-      do
-      {
-        *(v14 - 1) = *v12;
-        *v14 = v12[1];
-        v14[1] = *(_DWORD *)((char *)v11 + v15);
-        v14[2] = *(v13 - 1);
-        v14[3] = *v13;
-        v14[4] = *v11;
-        v14[5] = v11[1];
-        v14[6] = v11[2];
-        v12 += 2;
-        v13 += 3;
-        v11 += 3;
-        v14 += 8;
-        --v19;
-      }
-      while ( v19 );
-      v3 = v18;
+      staging[i].texCoord[0] = surf->texCoords[i][0];
+      staging[i].texCoord[1] = surf->texCoords[i][1];
+      staging[i].normal[0]   = surf->normals[i][0];
+      staging[i].normal[1]   = surf->normals[i][1];
+      staging[i].normal[2]   = surf->normals[i][2];
+      staging[i].position[0] = surf->vertices[i][0];
+      staging[i].position[1] = surf->vertices[i][1];
+      staging[i].position[2] = surf->vertices[i][2];
     }
-    v6 = v20;
+    vertexBuffer = R_CreateBufferARB(34962, vertexBytes, (int)staging, 35044);
   }
-  v16 = R_CreateBufferARB((int)v6, 34962, v3, (int)v20, 35044);
-  *(_DWORD *)(a1 + 36) = v16;
-  if ( !v16 )
+  surf->gpuVertexBuffer = (void *)vertexBuffer;
+  if ( !vertexBuffer )
   {
-    qglDeleteBuffersARB(1, a1 + 40);
+    qglDeleteBuffersARB(1, (int)&surf->gpuIndexBuffer);
     return 0;
   }
   return 1;
 }
 
-/* ---- R_SetupDObjToStaticModel  0x00504150 ----  VERIFIED */
-int __cdecl R_SetupDObjToStaticModel(int a1, const char *a2)
+/* ---- R_SetupDObjToStaticModel  0x00504150 ----  VERIFIED
+ * Allocate the shared static-model template for a model name.  With optimize on,
+ * it reserves one surface-list slot per LOD; otherwise it is a bare name record
+ * (lodCount / model zero) that R_FinishLoadingStaticModels leaves alone. */
+smRegisteredModel_t *__cdecl R_SetupDObjToStaticModel(int dobjPtr, const char *name)
 {
-  int v2;
-  int v3;
-  int result;
-  int v5;
-  char *v6;  /* retail's cursor; NOT const, it is the copy source AND */
-  int v7;
-  char v8;
+  DObj                *dobj = (DObj *)dobjPtr;
+  smRegisteredModel_t *registered;
+  int                  lodCount;
 
   if ( r_optimize->integer && r_optimizeSModels->integer )
   {
-    v2 = *(_DWORD *)(a1 + 24);
-    v3 = *(__int16 *)(*(_DWORD *)(v2 + 4) + 100);
-    result = ri_Hunk_Alloc(strlen(a2) + 4 * v3 + 13);
-    v5 = result + 4 * v3 + 12;
-    *(_DWORD *)result = v5;
-    v6 = (char *)a2;
-    v7 = v5 - (int)a2;
-    do
-    {
-      v8 = *v6;
-      v6[v7] = *v6;
-      ++v6;
-    }
-    while ( v8 );
-    *(_DWORD *)(result + 4) = v3;
-    *(_DWORD *)(result + 8) = v2;
+    XModel *model = dobj->childRefs[0];
+    lodCount = model->info->lodCount;
+    registered = (smRegisteredModel_t *)ri.Hunk_Alloc(strlen(name) + 4 * lodCount + 13);
+    registered->name = (char *)&registered->lodSurfs[lodCount];   /* name follows the LOD slots */
+    strcpy((char *)registered->name, name);
+    registered->lodCount = lodCount;
+    registered->model = model;
   }
   else
   {
-    result = ri_Hunk_Alloc(strlen(a2) + 13);
-    *(_DWORD *)result = result + 12;
-    strcpy((char *)(result + 12), a2);
-    *(_DWORD *)(result + 4) = 0;
-    *(_DWORD *)(result + 8) = 0;
+    registered = (smRegisteredModel_t *)ri.Hunk_Alloc(strlen(name) + 13);
+    registered->name = (char *)&registered->lodSurfs[0];          /* name at +12 */
+    strcpy((char *)registered->name, name);
+    registered->lodCount = 0;
+    registered->model = 0;
   }
-  return result;
+  return registered;
 }
 
-/* ---- R_FinishDObjToStaticModel  0x00504200 ----  VERIFIED */
-int __cdecl R_FinishDObjToStaticModel(_DWORD *a1, int a2)
+/* ---- R_FinishDObjToStaticModel  0x00504200 ----  VERIFIED
+ * Build a static-model template's per-LOD merged surface geometry from a DObj.
+ * For each LOD it enumerates the DObj's surfaces, merges every surface that
+ * shares a (possibly remapped) shader into one smSurface_t, allocates that
+ * surface's interleaved tex/normal/vertex/index arrays, copies and re-bases each
+ * source surface's data into its group, then uploads each merged surface into a
+ * GPU vertex buffer (ARB / NV / ATI, falling back to a system-memory copy).
+ * Returns the LOD count (dead EAX). */
+void __cdecl R_FinishDObjToStaticModel(unsigned int *registeredPtr, int dobjPtr)
 {
-  int v2;
-  int result;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v10;
-  int *v11;
-  int v12;
-  int v13;
-  int v14;
-  unsigned __int16 v15;
-  const char *v16;
-  char *v17;
-  char *Shader;
-  int v19;
-  int v20;
-  int v21;
-  int v22;
-  int v23;
-  int v24;
-  int v25;
-  int *v26;
-  unsigned __int16 *v27;
-  int v28;
-  char *v29;
-  int v30;
-  int v31;
-  unsigned __int16 v32;
-  int v33;
-  int v34;
-  int v35;
-  int v36;
-  int v37;
-  int v38;
-  int v39;
-  int v40;
-  int v41;
-  int v42;
-  int v43;
-  int v44;
-  int v45;
-  char *v46;
-  int v47;
-  int v48;
-  int v49;
-  int v50;
-  int v51;
-  int v52;
-  int v53;
-  int v54;
-  int v55;
-  const void *v56;
-  void *v57;
-  int v58;
-  int v59;
-  int *v60;
-  int v61;
-  int v62;
-  int v63;
-  int **v64;
-  _WORD *v65;
-  _DWORD v66[1024]; // [esp+10h] [ebp-5058h] BYREF
-  int v67[4096]; // [esp+1010h] [ebp-4058h] BYREF
-  int v68[4]; // [esp+5010h] [ebp-58h] BYREF
-  int v69;
-  int v70;
-  int *v71;
-  int v72;
-  char *v73;
-  int v74;
-  int **v75;
-  char *v76;
-  int v77;
-  int v78;
-  int v79; // [esp+5048h] [ebp-20h] BYREF
-  int v80;
-  int v81;
-  _DWORD *v82;
-  int v83;
-  int *v84;
-  int *v85;
-  int v86;
+  smRegisteredModel_t *registered = (smRegisteredModel_t *)registeredPtr;
+  DObj                *dobj = (DObj *)dobjPtr;
+  int                  numLods = dobj->childRefs[0]->info->lodCount;
+  int                  currentLod;
 
-  v2 = a2;
-  result = *(__int16 *)(*(_DWORD *)(*(_DWORD *)(a2 + 24) + 4) + 100);
-  v74 = result;
-  v77 = 0;
-  if ( result > 0 )
+
+  int   surfShaders[1024];      /* shader per source surface */
+  int   surfGroup[1024];        /* group index per source surface */
+  int   groupVertCount[1024];   /* per group: vertex count, then pass-2 write cursor */
+  int   groupIndexCount[1024];  /* per group: index count, then pass-2 write cursor */
+  int   groupShaders[1024];     /* merged shader per group */
+
+  for ( currentLod = 0; currentLod < numLods; ++currentLod )
   {
-    v75 = (int **)(a1 + 3);
-    while ( 1 )
+    int              partBits[4];
+    int              lodIndex;   /* one slot; other children's LODs read past it (retail stack aliasing) */
+    int             *surfRefs;
+    smSurfaceList_t *surfList;
+    int              surfaceCount;
+    int              groupCount;
+    int              child;
+    int              s;
+    int              g;
+
+    lodIndex = currentLod;   /* single-child static model: only child 0 is used */
+
+    /* count this LOD's surfaces across the DObj's children */
+    surfaceCount = 0;
+    for(child=dobj->childCount-1;child>=0;--child)
     {
-      v79 = v77;
-      v4 = 0;
-      v5 = *(unsigned __int8 *)(v2 + 22) - 1;
-      v78 = 0;
-      if ( v5 >= 0 )
+      int childLod = (&lodIndex)[child];
+      if ( childLod >= 0 )
       {
-        v6 = v2 + 4 * v5 + 24;
-        do
+        XModelSurfs *surfs = dobj->childRefs[child]->info->lodRecords[childLod].surfs;
+        if ( surfs )
+          surfaceCount += surfs->surfs->surfaceCount;
+      }
+    }
+    if ( surfaceCount > 1024 )
+      ri.Error(1, "\x15" "model '%s' has %i surfaces, which is more than %i\n",
+               registered->name, surfaceCount, 1024);
+
+    surfRefs = (int *)alloca(4 * surfaceCount);
+    DObjGetSurfaces(partBits, dobj, surfRefs, (int)&lodIndex);
+
+    /* pass 1: merge surfaces sharing a shader into groups, summing their counts */
+    groupCount = 0;
+    for ( s = 0; s < surfaceCount; ++s )
+    {
+      int             modelIndex   = (short)(surfRefs[s]&0xFFFF);
+      int             surfaceIndex = (short)(surfRefs[s]>>16);
+      XModelLodInfo  *lod   = &dobj->childRefs[modelIndex]->info->lodRecords[(&lodIndex)[modelIndex]];
+      XSurface       *surf  = lod->surfs->surfs->surfaces[surfaceIndex];
+      unsigned short  nameIndex = lod->surfaceNameTable[surfaceIndex];
+      const char     *skinName = nameIndex ? (const char *)(GetRefString_var + 8 * nameIndex + 4) : "DEFAULT";
+      shader_t       *shader = (shader_t *)R_FindShader(va("skins/%s", skinName), -1, 1, (const char *)7);
+
+      surfShaders[s] = (int)shader;
+      groupShaders[groupCount] = (int)shader;
+      if ( (shader->flags & 0x1000) != 0 )   /* SHADER_REMAPPED -> use the remap target */
+        groupShaders[groupCount] = *(int *)((char *)shader + 0x180);
+
+      for ( g = 0; g < groupCount; ++g )
+      {
+        if ( groupShaders[g] == groupShaders[groupCount] )
+          break;
+      }
+      if ( g == groupCount )   /* new group */
+      {
+        surfGroup[s] = groupCount;
+        groupIndexCount[groupCount] = 3 * surf->triangleCount;
+        groupVertCount[groupCount] = surf->vertexCount;
+        ++groupCount;
+      }
+      else                      /* merge into existing group g */
+      {
+        surfGroup[s] = g;
+        groupIndexCount[g] += 3 * surf->triangleCount;
+        groupVertCount[g] += surf->vertexCount;
+      }
+    }
+
+    /* allocate the surface list and each merged surface's SoA arrays */
+    surfList = (smSurfaceList_t *)ri.Hunk_Alloc(48 * groupCount + 4);
+    surfList->surfaceCount = groupCount;
+    for ( g = 0; g < groupCount; ++g )
+    {
+      smSurface_t *record = &surfList->surfaces[g];
+      int          vertexCount;
+      int          block;
+
+      record->surfaceType  = SM_SURFACE_TESS;
+      record->storageMode  = storageClass;
+      record->shader       = (shader_t *)groupShaders[g];
+      record->cachedShader = (shader_t *)R_CacheableStaticModelShader(groupShaders[g]);
+      record->indexCount   = (unsigned short)groupIndexCount[g];
+      record->vertexCount  = (unsigned short)groupVertCount[g];
+      if ( record->indexCount != groupIndexCount[g] || record->vertexCount != groupVertCount[g] )
+        ri.Error(1, "\x15" "model %s surface %s has more than 65,535 vertices"
+                 " or more than 21,845 triangles", registered->name, surfShaders[g]);
+
+      /* one hunk block holds tex(8V) + normals(12V) + vertices(12V) + indices(2I) */
+      vertexCount = record->vertexCount;
+      block = ri.Hunk_Alloc(8 * vertexCount + 12 * vertexCount + 12 * vertexCount + 2 * record->indexCount);
+      record->texCoords = (float (*)[2])block;
+      record->normals   = (vec3_t *)(block + 8 * vertexCount);
+      record->vertices  = (vec3_t *)(block + 20 * vertexCount);
+      record->indices   = (unsigned short *)(block + 32 * vertexCount);
+      groupIndexCount[g] = 0;   /* reset to a write cursor for pass 2 */
+      groupVertCount[g] = 0;
+    }
+
+    /* pass 2: copy and re-base each source surface's verts/indices into its group */
+    for ( s = 0; s < surfaceCount; ++s )
+    {
+      int           modelIndex   = (short)(surfRefs[s]&0xFFFF);
+      int           surfaceIndex = (short)(surfRefs[s]>>16);
+      XModelLodInfo *lod   = &dobj->childRefs[modelIndex]->info->lodRecords[(&lodIndex)[modelIndex]];
+      XSurface      *surf  = lod->surfs->surfs->surfaces[surfaceIndex];
+      int           group = surfGroup[s];
+      smSurface_t  *record = &surfList->surfaces[group];
+      int           vertBase  = groupVertCount[group];
+      int           indexBase = groupIndexCount[group];
+      int           surfIndexCount = 3 * surf->triangleCount;
+      int           boneMatrix = (dobj->childPartBaseIndices[modelIndex] << 6) + (int)dobj->evalStorage + 48;
+      int           k;
+
+      memcpy(&record->indices[indexBase], surf->triangles, 6 * surf->triangleCount);
+      XSurfaceGetVerts((int)surf, boneMatrix,
+                       (int)((char *)record->vertices + 12 * vertBase),
+                       (int)((char *)record->texCoords + 8 * vertBase),
+                       (int)((char *)record->normals + 12 * vertBase));
+      if ( vertBase )   /* re-base this surface's indices onto the merged vertex range */
+      {
+        for ( k = 0; k < surfIndexCount; ++k )
+          record->indices[indexBase + k] += vertBase;
+      }
+      if ( (((shader_t *)surfShaders[s])->flags & 0x1000) != 0 )   /* remapped shader: fix tex coords */
+        R_RemapTextureCoordinatesForSheet(surf->vertexCount,
+                                          (int)((char *)record->texCoords + 8 * vertBase),
+                                          surfShaders[s]);
+      groupIndexCount[group] += surfIndexCount;
+      groupVertCount[group] = surf->vertexCount + vertBase;
+    }
+
+    /* upload each merged surface into a GPU vertex buffer (else keep it in system memory) */
+    if ( groupCount > 0 )
+    {
+      for ( g = 0; g < groupCount; ++g )
+      {
+        smSurface_t *record = &surfList->surfaces[g];
+
+        if ( glConfig_ARBVertexBufferObject )
         {
-          v7 = *(&v79 + v5);
-          if ( v7 >= 0 )
-          {
-            v8 = *(_DWORD *)(*(_DWORD *)(*(_DWORD *)v6 + 4) + 4 * (5 * v7 + 5));
-            if ( v8 )
-              v4 += *(__int16 *)(*(_DWORD *)(v8 + 4) + 4);
-          }
-          --v5;
-          v6 -= 4;
+          if ( !R_OptimizeSModelSurfARB((int)record) )
+            R_OptimizeSModelSurfGeneric(record);
         }
-        while ( v5 >= 0 );
-        v78 = v4;
-        if ( v4 > 1024 )
-          ri_Error(1, "\x15" "model '%s' has %i surfaces, which is more than %i\n", *a1, v4, 1024);
-      }
-      v65 = (_WORD *)alloca((4 * v4 + 7) & 0xFFFFFFF8);
-      v85 = (int *)v65;
-      DObjGetSurfaces(v68, v2, v65, (int)&v79);
-      v10 = 0;
-      v83 = 0;
-      if ( v78 > 0 )
-      {
-        v11 = v85;
-        v76 = (char *)((char *)v66 - (char *)v85);
-        v82 = (_DWORD *)((char *)v67 - (char *)v85);
-        v84 = 0;
-        v86 = v78;
-        do
+        else if ( glConfig_NVVertexArrayRange )
         {
-          v12 = *(__int16 *)v11;
-          v13 = *((__int16 *)v11 + 1);
-          v14 = *(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(v2 + 4 * v12 + 24) + 4)
-                                                              + 20 * (*(&v79 + v12) + 1))
-                                                  + 4)
-                                      + 8)
-                          + 4 * v13);
-          v15 = *(_WORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(v2 + 4 * v12 + 24) + 4) + 20 * *(&v79 + v12) + 16)
-                         + 2 * v13);
-          if ( v15 )
-            v16 = (const char *)(GetRefString_var + 8 * v15 + 4);
-          else
-            v16 = "DEFAULT";
-          v17 = va("skins/%s", v16);
-          Shader = R_FindShader(v17, -1, 1, (const char *)7);
-          v19 = *((_DWORD *)Shader + 19);
-          *(int *)((char *)v11 + (_DWORD)v76) = (int)Shader;
-          v20 = (int)v84;
-          *(int *)((char *)&v67[3072] + (_DWORD)v84) = (int)Shader;
-          if ( (v19 & 0x1000) != 0 )
-            *(int *)((char *)&v67[3072] + v20) = *((_DWORD *)Shader + 96);
-          v21 = *(__int16 *)(v14 + 4);
-          v22 = *(__int16 *)(v14 + 2);
-          v10 = v83;
-          v81 = 3 * v21;
-          v23 = 0;
-          v80 = v22;
-          if ( v20 <= 0 )
-          {
-LABEL_21:
-            v24 = v81;
-            *(int *)((char *)v11 + (_DWORD)v82) = v83;
-            v25 = v80;
-            ++v10;
-            *(int *)((char *)&v67[2048] + v20) = v24;
-            *(int *)((char *)&v67[1024] + v20) = v25;
-            v83 = v10;
-            v84 = (int *)(v20 + 4);
-          }
-          else
-          {
-            while ( v67[v23 + 3072] != *(int *)((char *)&v67[3072] + v20) )
-            {
-              if ( ++v23 >= v83 )
-                goto LABEL_21;
-            }
-            v41 = v81;
-            *(int *)((char *)v11 + (_DWORD)v82) = v23;
-            v42 = v41 + v67[v23 + 2048];
-            v43 = v67[v23 + 1024];
-            v67[v23 + 2048] = v42;
-            v67[v23 + 1024] = v80 + v43;
-          }
-          ++v11;
-          --v86;
+          R_OptimizeSModelSurfNV((int)record);
         }
-        while ( v86 );
-      }
-      v26 = (int *)ri_Hunk_Alloc(48 * v10 + 4);
-      v84 = v26;
-      *v26 = v10;
-      v86 = 0;
-      if ( v10 > 0 )
-      {
-        v27 = (unsigned __int16 *)v26 + 11;
-        do
+        else if ( glConfig_ATIVertexArrayObject )
         {
-          v28 = v67[v86 + 3072];
-          *(_DWORD *)(v27 - 9) = 11;
-          *(_DWORD *)(v27 - 7) = storageClass;
-          *(_DWORD *)(v27 - 5) = v28;
-          v29 = R_CacheableStaticModelShader(v28);
-          v30 = v86;
-          v31 = v67[v86 + 2048];
-          v32 = v67[v86 + 1024];
-          *(_DWORD *)(v27 - 3) = v29;
-          LOWORD(v29) = v67[v30 + 2048];
-          *(v27 - 1) = (unsigned __int16)v29;
-          *v27 = v32;
-          if ( (unsigned __int16)v29 != v31 || v32 != v67[v30 + 1024] )
-            ri_Error(1, "\x15" "model %s surface %s has more than 65,535 vertices"
-              " or more than 21,845 triangles", *a1, v66[v30]);
-          v33 = *v27;
-          v34 = 8 * v33;
-          v33 *= 12;
-          v35 = ri_Hunk_Alloc(v34 + v33 + v33 + 2 * *(v27 - 1));
-          *(_DWORD *)(v27 + 1) = v35;
-          v36 = v35 + v33;
-          *(_DWORD *)(v27 + 3) = v35 + v34;
-          *(_DWORD *)(v27 + 7) = v34 + v33 + v33 + v35;
-          v37 = v86;
-          v67[v86 + 2048] = 0;
-          v67[v37 + 1024] = 0;
-          v38 = v83;
-          *(_DWORD *)(v27 + 5) = v34 + v36;
-          v27 += 24;
-          v86 = v37 + 1;
-        }
-        while ( v37 + 1 < v38 );
-        v2 = a2;
-        v26 = v84;
-        v10 = v38;
-      }
-      v39 = 0;
-      v86 = 0;
-      if ( v78 > 0 )
-      {
-        v76 = (char *)((char *)v66 - (char *)v85);
-        v40 = (char *)v85 - (char *)v67;
-        v69 = (char *)v85 - (char *)v67;
-        while ( 1 )
-        {
-          v44 = v40 + 4 * v39;
-          v45 = *(__int16 *)((char *)v67 + v44);
-          v46 = (char *)v67 + v44;
-          v72 = (*(unsigned __int8 *)(v45 + v2 + 80) << 6) + *(_DWORD *)(v2 + 4) + 48;
-          v47 = *(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(v2 + 4 * v45 + 24) + 4) + 20 * (*(&v79 + v45) + 1)) + 4);
-          v48 = *((__int16 *)v46 + 1);
-          v73 = v46;
-          v49 = *(_DWORD *)(*(_DWORD *)(v47 + 8) + 4 * v48);
-          v50 = v67[v39];
-          v51 = v67[v50 + 1024];
-          v52 = (int)&v84[12 * v50 + 1];
-          v53 = v67[v50 + 2048];
-          v85 = &v67[v50 + 2048];
-          v54 = *(__int16 *)(v49 + 4);
-          v71 = &v67[v50 + 1024];
-          v81 = 3 * v54;
-          v80 = *(__int16 *)(v49 + 2);
-          v55 = 2 * v53;
-          v56 = *(const void **)(v49 + 28);
-          v82 = (_DWORD *)v52;
-          v57 = (void *)(v55 + *(_DWORD *)(v52 + 32));
-          v70 = v55;
-          qmemcpy(v57, v56, 6 * v54);
-          XSurfaceGetVerts((char *)(8 * v51 + v82[5]), (float *)(12 * v51 + v82[7]), v49, v72, 12 * v51 + v82[6]);
-          if ( v51 )
-          {
-            v58 = v81;
-            if ( v81 > 0 )
-            {
-              v59 = v70;
-              do
-              {
-                *(_WORD *)(v82[8] + v59) += v51;
-                v59 += 2;
-                --v58;
-              }
-              while ( v58 );
-            }
-          }
-          if ( (*(_DWORD *)(*(_DWORD *)&v76[(_DWORD)v73] + 76) & 0x1000) != 0 )
-            R_RemapTextureCoordinatesForSheet(v80, 8 * v51 + v82[5], *(_DWORD *)&v76[(_DWORD)v73]);
-          v60 = v71;
-          *v85 += v81;
-          v61 = v86;
-          *v60 = v80 + v51;
-          v2 = a2;
-          v86 = v61 + 1;
-          if ( v61 + 1 >= v78 )
-            break;
-          v40 = v69;
-          v39 = v86;
-        }
-        v10 = v83;
-        v26 = v84;
-      }
-      if ( v10 > 0 )
-        break;
-LABEL_54:
-      v64 = v75;
-      *v75 = v26;
-      result = v77 + 1;
-      v75 = v64 + 1;
-      if ( ++v77 >= v74 )
-        return result;
-    }
-    v62 = (int)(v26 + 1);
-    v85 = (int *)v10;
-    while ( 1 )
-    {
-      if ( glConfig_ARBVertexBufferObject )
-      {
-        v63 = R_OptimizeSModelSurfARB(v62);
-      }
-      else
-      {
-        if ( glConfig_NVVertexArrayRange )
-        {
-          R_OptimizeSModelSurfNV(v62);
-          goto LABEL_52;
-        }
-        if ( !glConfig_ATIVertexArrayObject )
-          goto LABEL_51;
-        v63 = R_OptimizeSModelSurfATI(v62);
-      }
-      if ( !v63 )
-LABEL_51:
-        R_OptimizeSModelSurfGeneric(v62);
-LABEL_52:
-      v62 += 48;
-      v85 = (int *)((char *)v85 - 1);
-      if ( !v85 )
-      {
-        v26 = v84;
-        goto LABEL_54;
-      }
-    }
-  }
-  return result;
-}
-
-/* ---- R_NeedsBoundsAdjustment  0x00504750 ----  VERIFIED */
-int __cdecl R_NeedsBoundsAdjustment(int a1)
-{
-  int v1;
-  int *v2;
-  int v3;
-  int v4;
-  _DWORD *i;
-  int v7;
-  int v8;
-  int v9;
-  int v11;
-  unsigned __int16 v12;
-  const char *v13;
-  char *v14;
-  int *v15;
-  int v16[4]; // [esp+Ch] [ebp-18h] BYREF
-  _DWORD v17[2]; // [esp+1Ch] [ebp-8h] BYREF
-
-  v1 = *(_DWORD *)(a1 + 152);
-  if ( !v1 )
-  {
-    v7 = *(_DWORD *)(a1 + 144);
-    if ( v7 )
-    {
-      v8 = *(_DWORD *)(a1 + 144);
-      v17[0] = 0;
-      v9 = DObjGetNumSurfaces(v8, (int)v17);
-      /* retail 0x005047CE, sized off DObjGetNumSurfaces' count */
-      v15 = (int *)alloca((4 * v9 + 7) & 0xFFFFFFF8);
-      DObjGetSurfaces(v16, v7, v15, (int)v17);
-      v11 = 0;
-      if ( v9 > 0 )
-      {
-        while ( 1 )
-        {
-          v12 = *(_WORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(*(_DWORD *)(a1 + 144) + 4 * SLOWORD(v15[v11]) + 24) + 4)
-                                     + 20 * v17[SLOWORD(v15[v11])]
-                                     + 16)
-                         + 2 * SHIWORD(v15[v11]));
-          v13 = v12 ? (const char *)(GetRefString_var + 8 * v12 + 4) : "DEFAULT";
-          v14 = va("skins/%s", v13);
-          if ( (*((_DWORD *)R_FindShader(v14, -1, 1, (const char *)7) + 20) & 0x20000000) != 0 )
-            break;
-          if ( ++v11 >= v9 )
-            return 0;
-        }
-        return 1;
-      }
-    }
-    return 0;
-  }
-  v2 = *(int **)(v1 + 12);
-  v3 = *v2;
-  v4 = 0;
-  if ( *v2 <= 0 )
-    return 0;
-  for ( i = v2 + 3; (*(_DWORD *)(*i + 80) & 0x20000000) == 0; i += 12 )
-  {
-    if ( ++v4 >= v3 )
-      return 0;
-  }
-  return 1;
-}
-
-/* ---- R_AdjustBoundsForAutosprite  0x00504880 ----  VERIFIED */
-int __cdecl R_AdjustBoundsForAutosprite(int a1, float *a2, float *a3)
-{
-  int result;
-  double v4;
-  double v5;
-  double v6;
-  double v7;
-  double v8;
-  double v9;
-  long double v10;
-  float v11;
-  float v12;
-
-  result = R_NeedsBoundsAdjustment(a1);
-  if ( result )
-  {
-    v12 = a3[2] + a2[2];
-    v11 = (*a2 + *a3) * 0.5;
-    v4 = (a3[1] + a2[1]) * 0.5;
-    v5 = v12 * 0.5;
-    v6 = a3[2] - a2[2];
-    v7 = a3[1] - a2[1];
-    v8 = v6 * v6 + v7 * v7;
-    v9 = *a3 - *a2;
-    v10 = sqrt(v8 + v9 * v9) * 0.55000001 + 2.0;
-    *a2 = v11 - v10;
-    a2[1] = v4 - v10;
-    a2[2] = v5 - v10;
-    *a3 = v11 + v10;
-    a3[1] = v10 + v4;
-    a3[2] = v10 + v5;
-  }
-  return result;
-}
-
-/* ---- R_RegisterStaticModel  0x00504930 ----  VERIFIED */
-_DWORD *__cdecl R_RegisterStaticModel(const char *a1, int a2)
-{
-  int v3;
-  int i;
-  _DWORD *v5;
-  int v7;
-  const char *v8;
-  const char *v9;
-  int v10;
-
-  v3 = tr_registeredStaticModelCount;
-  for ( i = 0; i < v3; ++i )
-  {
-    v5 = (_DWORD *)tr_registeredStaticModels[i];
-    if ( *v5 && a1 )
-    {
-      if ( !Q_stricmpn(*(const char **)v5, a1, 99999) )
-        return v5[2] != 0 ? v5 : 0;
-      v3 = tr_registeredStaticModelCount;
-    }
-  }
-  if ( v3 == 2048 )
-  {
-    ri_Printf(2, "R_RegisterStaticModel failed for '%s' -- more than %i unique static models\n", a1, 2048);
-    return 0;
-  }
-  else
-  {
-    if ( tr_modelsFinishedLoading )
-    {
-      if ( r_errorOnConflicts->integer )
-      {
-        if ( !tr_ignorePrecacheErrorCount )
-          ri_Error(1, "\x15" "model '%s' not precached\n", a1);
-      }
-    }
-    else
-    {
-      tr_delayedImageGroup = ++tr_delayedImageGroupSequence;
-    }
-    v7 = R_SetupDObjToStaticModel(a2, a1);
-    tr_delayedImageGroup = 0;
-    tr_delayedImageGroupTriCount = 0;
-    tr_registeredStaticModels[tr_registeredStaticModelCount++] = v7;
-    return *(_DWORD *)(v7 + 8) != 0 ? (_DWORD *)v7 : 0;
-  }
-}
-
-/* ---- R_CreateStaticModel  0x00504A20 ----  VERIFIED */
-void __fastcall R_CreateStaticModel(int a1, char *a2, int a3, _DWORD *a4, float *a5, _DWORD *a6)
-{
-  char v8;
-  int v9;
-  char *v10;
-  char v11;
-  void *v12;
-  int v13;
-  _BYTE v14[88]; // [esp+Ch] [ebp-78h] BYREF -- DObj, 0x58 bytes
-  int v15[4]; // [esp+64h] [ebp-20h] BYREF -- partBits
-  _DWORD v16[2]; // [esp+74h] [ebp-10h] BYREF -- DObjModel
-  __int16 v17;
-
-  if ( !_strnicmp(a2, "xmodel", 6u) && ((v8 = a2[6], v8 == 47) || v8 == 92) )
-  {
-    if ( strlen(a2) < 0x39 )
-    {
-      R_SyncRenderThread();
-      v9 = ri_Malloc(160);
-      v10 = a2 + 7;
-      do
-      {
-        v11 = *v10;
-        v10[v9 - (_DWORD)(a2 + 7)] = *v10;
-        ++v10;
-      }
-      while ( v11 );
-      v17 = RE_RegisterModel(a2, (const char *)7);
-      v16[0] = *(_DWORD *)(((int *)tr_models)[v17] + 84);
-      v16[1] = 0;
-      DObjCreate(0, (int)v14, (int)v16, 1u, 0);
-      v12 = alloca(96 * v14[23] + 64);
-      DObjBindEvalStorage((void *)( ( (unsigned int)v12 + 15 ) & ~15u ), v14);
-      Com_Memset(v15, 255, 0x10u);
-      DObjCalcAnim((int)v14, v15);
-      DObjCalcSkel(v15, (int)v14);
-      *(_DWORD *)(v9 + 64) = *a4;
-      *(_DWORD *)(v9 + 68) = a4[1];
-      *(_DWORD *)(v9 + 72) = a4[2];
-      AnglesToAxis(a5, (float *)(v9 + 76));
-      *(_DWORD *)(v9 + 112) = 0;
-      if ( *(_DWORD *)a1 != 1065353216 || *(_DWORD *)(a1 + 4) != 1065353216 || *(_DWORD *)(a1 + 8) != 1065353216 )
-      {
-        *(float *)(v9 + 76) = *(float *)a1 * *(float *)(v9 + 76);
-        *(float *)(v9 + 80) = *(float *)a1 * *(float *)(v9 + 80);
-        *(float *)(v9 + 84) = *(float *)a1 * *(float *)(v9 + 84);
-        *(float *)(v9 + 88) = *(float *)(a1 + 4) * *(float *)(v9 + 88);
-        *(float *)(v9 + 92) = *(float *)(a1 + 4) * *(float *)(v9 + 92);
-        *(float *)(v9 + 96) = *(float *)(a1 + 4) * *(float *)(v9 + 96);
-        *(float *)(v9 + 100) = *(float *)(v9 + 100) * *(float *)(a1 + 8);
-        *(float *)(v9 + 104) = *(float *)(v9 + 104) * *(float *)(a1 + 8);
-        *(float *)(v9 + 108) = *(float *)(v9 + 108) * *(float *)(a1 + 8);
-        *(float *)(v9 + 112) = VectorMax((float *)a1);
-      }
-      R_GetXModelBounds((float *)(v9 + 76), (int)v14, (float *)(v9 + 132), (float *)(v9 + 144));
-      *(float *)(v9 + 132) = *(float *)(v9 + 64) + *(float *)(v9 + 132);
-      *(float *)(v9 + 136) = *(float *)(v9 + 68) + *(float *)(v9 + 136);
-      *(float *)(v9 + 140) = *(float *)(v9 + 140) + *(float *)(v9 + 72);
-      *(float *)(v9 + 144) = *(float *)(v9 + 144) + *(float *)(v9 + 64);
-      *(float *)(v9 + 148) = *(float *)(v9 + 68) + *(float *)(v9 + 148);
-      *(float *)(v9 + 152) = *(float *)(v9 + 152) + *(float *)(v9 + 72);
-      *(_DWORD *)(v9 + 116) = *a6;
-      *(_DWORD *)(v9 + 120) = a6[1];
-      v13 = v16[0];
-      *(_DWORD *)(v9 + 124) = a6[2];
-      *(_DWORD *)(v9 + 128) = 0;
-      if ( (void *)*(_DWORD *)(v13 + 4) != (void *)xmodel_defaultCollision )
-        *(_DWORD *)(v9 + 128) = R_RegisterStaticModel((const char *)v9, (int)v14);
-      *(_DWORD *)(v9 + 156) = dword_14072EC;
-      dword_14072EC = v9;
-    }
-    else
-    {
-      Com_Printf("Model '%s' has a name longer than %i characters\n", a2, 57);
-    }
-  }
-  else
-  {
-    Com_Printf("Model '%s' is not an xmodel\n", a2);
-  }
-}
-
-/* ---- R_AddStaticModelToWorld  0x00504CC0 ----  VERIFIED */
-int __cdecl R_AddStaticModelToWorld(int a1)
-{
-  int v2;
-  int v3;
-  int v4;
-  int v5;
-  _DWORD **v6;
-  int v7;
-  char *v8;
-  int v9;
-  _DWORD *v10;
-  int v11;
-  int *v12;
-  float v13;
-  bool v14; // c0
-  bool v15; // c3
-  float v16;
-  bool v17; // c0
-  bool v18; // c3
-  float v19;
-  bool v20; // c0
-  bool v21; // c3
-  int result;
-  _DWORD v23[2]; // [esp+14h] [ebp-1Ch] BYREF
-  __int16 v24;
-  int v25[4]; // [esp+20h] [ebp-10h] BYREF
-  int v26;
-  float v27;
-  float v28;
-  float v29;
-  float v30;
-  float v31;
-  float v32;
-
-  v2 = *(_DWORD *)(a1 + 128);
-  if ( v2 )
-  {
-    v3 = *(_DWORD *)(v2 + 4);
-    v4 = 0;
-    v5 = 2;
-    v26 = 0;
-    if ( v3 > 0 )
-    {
-      v6 = (_DWORD **)(v2 + 12);
-      do
-      {
-        v4 += **v6++;
-        --v3;
-      }
-      while ( v3 );
-    }
-  }
-  else
-  {
-    v5 = 1;
-    v7 = ri_Hunk_Alloc(88);
-    v8 = va("xmodel/%s", (const char *)a1);
-    v24 = RE_RegisterModel(v8, (const char *)7);
-    v23[0] = *(_DWORD *)(tr_models[v24] + 84);
-    v23[1] = 0;
-    DObjCreate(0, v7, (int)v23, 1u, 0);
-    v26 = v7;
-    v9 = ri_Hunk_Alloc(96 * *(unsigned __int8 *)(v7 + 23) + 48);
-    *(_DWORD *)(v7 + 4) = v9;
-    v10 = (_DWORD *)(v9 + 32);
-    v11 = 4;
-    do
-    {
-      *(v10 - 8) = 0;
-      *(v10 - 4) = 0;
-      *v10++ = 0;
-      --v11;
-    }
-    while ( v11 );
-    Com_Memset(v25, 255, 0x10u);
-    DObjCalcAnim(v7, v25);
-    DObjCalcSkel(v25, v7);
-    v4 = 0;
-  }
-  v12 = (int *)ri_Hunk_Alloc(4 * v4 + 584);
-  memset(v12, 0, 0x9Cu);
-  *v12 = v5;
-  v12[36] = v26;
-  v12[1] = 128;
-  v12[38] = *(_DWORD *)(a1 + 128);
-  v12[17] = *(_DWORD *)(a1 + 64);
-  v12[18] = *(_DWORD *)(a1 + 68);
-  v12[19] = *(_DWORD *)(a1 + 72);
-  v12[7] = *(_DWORD *)(a1 + 76);
-  v12[8] = *(_DWORD *)(a1 + 80);
-  v12[9] = *(_DWORD *)(a1 + 84);
-  v12[10] = *(_DWORD *)(a1 + 88);
-  v12[11] = *(_DWORD *)(a1 + 92);
-  v12[12] = *(_DWORD *)(a1 + 96);
-  v12[13] = *(_DWORD *)(a1 + 100);
-  v12[14] = *(_DWORD *)(a1 + 104);
-  v12[15] = *(_DWORD *)(a1 + 108);
-  v12[16] = *(_DWORD *)(a1 + 112);
-  R_AdjustBoundsForAutosprite((int)v12, (float *)(a1 + 132), (float *)(a1 + 144));
-  *((float *)v12 + 3) = *(float *)(a1 + 132) + *(float *)(a1 + 144);
-  *((float *)v12 + 4) = *(float *)(a1 + 148) + *(float *)(a1 + 136);
-  *((float *)v12 + 5) = *(float *)(a1 + 140) + *(float *)(a1 + 152);
-  *((float *)v12 + 3) = *((float *)v12 + 3) * 0.5;
-  *((float *)v12 + 4) = *((float *)v12 + 4) * 0.5;
-  *((float *)v12 + 5) = *((float *)v12 + 5) * 0.5;
-  v27 = tr_identityLight * *(float *)(a1 + 116) * 255.0;
-  v13 = v27;
-  if ( v27 >= 0.0 && (v27 > 255.0) | __UNORDERED__(255.0, v27) )
-  {
-    v28 = 255.0;
-  }
-  else
-  {
-    v14 = v27 > 0.0;
-    v15 = 0.0 == v27;
-    v28 = 0.0;
-    if ( v14 || v15 )
-      v28 = v13;
-  }
-  *((_BYTE *)v12 + 108) = (unsigned __int64)v28;
-  v29 = tr_identityLight * *(float *)(a1 + 120) * 255.0;
-  v16 = v29;
-  if ( v29 >= 0.0 && (v29 > 255.0) | __UNORDERED__(255.0, v29) )
-  {
-    v30 = 255.0;
-  }
-  else
-  {
-    v17 = v29 > 0.0;
-    v18 = 0.0 == v29;
-    v30 = 0.0;
-    if ( v17 || v18 )
-      v30 = v16;
-  }
-  *((_BYTE *)v12 + 109) = (unsigned __int64)v30;
-  v31 = tr_identityLight * *(float *)(a1 + 124) * 255.0;
-  v19 = v31;
-  if ( v31 >= 0.0 && (v31 > 255.0) | __UNORDERED__(255.0, v31) )
-  {
-    v32 = 255.0;
-  }
-  else
-  {
-    v20 = v31 > 0.0;
-    v21 = 0.0 == v31;
-    v32 = 0.0;
-    if ( v20 || v21 )
-      v32 = v19;
-  }
-  *((_BYTE *)v12 + 110) = (unsigned __int64)v32;
-  *((_BYTE *)v12 + 111) = -1;
-  v12[39] = *(_DWORD *)(a1 + 132);
-  v12[40] = *(_DWORD *)(a1 + 136);
-  v12[41] = *(_DWORD *)(a1 + 140);
-  v12[42] = *(_DWORD *)(a1 + 144);
-  v12[43] = *(_DWORD *)(a1 + 148);
-  v12[44] = *(_DWORD *)(a1 + 152);
-  v12[45] = 0;
-  R_FilterModelIntoCells_r_0(tr_world, *(_DWORD **)(tr_world + 152), (int)v12, v12 + 39, v12 + 42);
-  result = R_GetStaticLightContributions((float *)v12 + 3, (char *)v12 + 192, (float *)v12 + 47, (char *)v12 + 388);
-  v12[46] = result;
-  return result;
-}
-
-/* ---- R_FinishLoadingStaticModels  0x005050A0 ----  VERIFIED */
-int R_FinishLoadingStaticModels()
-{
-  int result;
-  int v1;
-  int v2;
-  char *v3;
-  __int16 v4;
-  int v5;
-  int v6;
-  _DWORD *v7;
-  int v8;
-  int v9;
-  int v10;
-  int i;
-  _DWORD v12[2]; // [esp+14h] [ebp-7Ch] BYREF
-  __int16 v13;
-  int v14[4]; // [esp+20h] [ebp-70h] BYREF
-  _BYTE v15[0x58]; // [esp+30h] [ebp-60h] BYREF -- sizeof(DObj)
-  unsigned int v18;
-  unsigned int retaddr;
-
-  v18 = retaddr ^ _security_cookie;
-  result = tr_registeredStaticModelCount;
-  v1 = 0;
-  for ( i = 0; v1 < tr_registeredStaticModelCount; i = v1 )
-  {
-    v2 = tr_registeredStaticModels[v1];
-    if ( !*(_DWORD *)(v2 + 12) )
-    {
-      v3 = va("xmodel/%s", *(const char **)v2);
-      v4 = RE_RegisterModel(v3, (const char *)7);
-      v5 = tr_models[v4];
-      v13 = v4;
-      v12[0] = *(_DWORD *)(v5 + 84);
-      v12[1] = 0;
-      DObjCreate(0, (int)v15, (int)v12, 1u, 0);
-      v6 = ri_Hunk_AllocateTempMemory(96 * (unsigned __int8)v15[0x17] + 48);
-      *(int *)&v15[0x04] = v6;
-      v7 = (_DWORD *)(v6 + 32);
-      v8 = 4;
-      do
-      {
-        *(v7 - 8) = 0;
-        *(v7 - 4) = 0;
-        *v7++ = 0;
-        --v8;
-      }
-      while ( v8 );
-      Com_Memset(v14, 255, 0x10u);
-      DObjCalcAnim((int)v15, v14);
-      DObjCalcSkel(v14, (int)v15);
-      R_FinishDObjToStaticModel((_DWORD *)tr_registeredStaticModels[i], (int)v15);
-      ri_Hunk_FreeTempMemory(v6);
-      v1 = i;
-    }
-    result = tr_registeredStaticModelCount;
-    ++v1;
-  }
-  v9 = dword_14072EC;
-  if ( dword_14072EC )
-  {
-    do
-    {
-      v10 = *(_DWORD *)(v9 + 156);
-      R_AddStaticModelToWorld(v9);
-      result = ri_Free(v9);
-      v9 = v10;
-    }
-    while ( v10 );
-  }
-  dword_14072EC = 0;
-  return result;
-}
-
-/* ---- R_ShutdownStaticModels  0x00505220 ----  VERIFIED */
-int R_ShutdownStaticModels()
-{
-  int result;
-  int v1;
-
-  result = dword_14072EC;
-  if ( dword_14072EC )
-  {
-    do
-    {
-      v1 = *(_DWORD *)(result + 156);
-      ri_Free(result);
-      result = v1;
-    }
-    while ( v1 );
-  }
-  dword_14072EC = 0;
-  return result;
-}
-
-/* ---- R_AddStaticModelSurfaces  0x00505260 ----  VERIFIED */
-char __cdecl R_AddStaticModelSurfaces(int a1)
-{
-  int v2;
-  int v3;
-  int v4;
-  _DWORD **v5;
-  int v6;
-  _DWORD *v7;
-  int v8;
-  unsigned __int16 *v9;
-  int v10;
-  unsigned int v11;
-  _DWORD *v12;
-  _DWORD *v13;
-  int v14;
-  int v15;
-  char *v16;
-  float LodDist;
-  int v19;
-  int v20;
-  int v21;
-  int v22;
-  _DWORD *v23;
-  int v24;
-  float v25[9]; // [esp+2Ch] [ebp-24h] BYREF
-
-  v2 = *(_DWORD *)(a1 + 152);
-  LodDist = R_GetLodDist((float *)a1);
-  v3 = XModelGetLodForDist(*(int *)(v2 + 8), LodDist);
-  if ( v3 >= 0 )
-  {
-    v4 = 0;
-    v22 = 0;
-    if ( v3 > 0 )
-    {
-      v5 = (_DWORD **)(v2 + 12);
-      v6 = v3;
-      do
-      {
-        v4 += **v5++;
-        --v6;
-      }
-      while ( v6 );
-      v22 = v4;
-    }
-    v7 = *(_DWORD **)(v2 + 4 * v3 + 12);
-    v21 = 0;
-    v24 = 0;
-    v20 = 0;
-    v23 = v7;
-    v19 = 0;
-    if ( (int)*v7 > 0 )
-    {
-      v8 = 4 * v4 + 584;
-      v9 = (unsigned __int16 *)(v7 + 4);
-      do
-      {
-        if ( !*(_DWORD *)(*(_DWORD *)(a1 + 688) + v8) )
-        {
-          if ( *(_DWORD *)v9 )
-          {
-            if ( !v21 )
-            {
-              MatrixInverse((float *)(a1 + 28), v25);
-              R_SetupStaticModelLighting((int)&tr_refdef_x, a1);
-              v21 = 1;
-            }
-            if ( !*(_BYTE *)(a1 + 160) )
-              *(_DWORD *)(*(_DWORD *)(a1 + 688) + v8) = R_CacheStaticModelSurface(
-                                                          *(float **)(a1 + 688),
-                                                          (int)(v9 - 6),
-                                                          v22 + v19,
-                                                          a1,
-                                                          v25);
-          }
-        }
-        v10 = *(_DWORD *)(*(_DWORD *)(a1 + 688) + v8);
-        if ( v10 )
-        {
-          v11 = (int)((unsigned __int64)(2411209711i64 * (v10 - (int)&r_smcCache)) >> 32) >> 8;
-          v12 = (_DWORD *)((char *)&r_smcCache + 456 * (v11 >> 31) + 456 * v11);
-          v13 = (_DWORD *)v12[1];
-          v12[2] = tr_frameCount;
-          *v13 = *v12;
-          *(_DWORD *)(*v12 + 4) = v12[1];
-          *v12 = &dword_11DA658;
-          v12[1] = dword_11DA65C;
-          dword_11DA65C = (int)v12;
-          *(_DWORD *)v12[1] = v12;
-          if ( (*(_BYTE *)(*((_DWORD *)v9 - 1) + 84) & 0x18) != 0
-            && (R_SetupStaticModelLighting((int)&tr_refdef_x, a1), *(_BYTE *)(a1 + 160)) )
-          {
-            if ( tr_refdef_numDrawSurfs < 0x10000 )
-            {
-              *(_DWORD *)(tr_refdef_drawSurfs + 8 * tr_refdef_numDrawSurfs) = tr_shiftedEntityNumber
-                                                             | ((*(_DWORD *)(*((_DWORD *)v9 - 1) + 72)
-                                                               | (*((_DWORD *)v9 - 2) << 12)) << 18);
-              *(_DWORD *)(tr_refdef_drawSurfs + 8 * tr_refdef_numDrawSurfs++ + 4) = v9 - 6;
-            }
-          }
-          else
-          {
-            v14 = *(_DWORD *)(*(_DWORD *)(a1 + 688) + v8);
-            if ( tr_refdef_numDrawSurfs < 0x10000 )
-            {
-              *(_DWORD *)(tr_refdef_drawSurfs + 8 * tr_refdef_numDrawSurfs) = tr_shiftedEntityNumber
-                                                             | (((tr_cachedStaticModelStorageSource << 12) | *(_DWORD *)(*(_DWORD *)v9 + 72)) << 18);
-              v7 = v23;
-              *(_DWORD *)(tr_refdef_drawSurfs + 8 * tr_refdef_numDrawSurfs++ + 4) = v14;
-            }
-          }
+          if ( !R_OptimizeSModelSurfATI((int)record) )
+            R_OptimizeSModelSurfGeneric(record);
         }
         else
         {
-          if ( tr_refdef_numDrawSurfs < 0x10000 )
-          {
-            *(_DWORD *)(tr_refdef_drawSurfs + 8 * tr_refdef_numDrawSurfs) = tr_shiftedEntityNumber
-                                                           | (((*((_DWORD *)v9 - 2) << 12)
-                                                             | *(_DWORD *)(*((_DWORD *)v9 - 1) + 72)) << 18);
-            *(_DWORD *)(tr_refdef_drawSurfs + 8 * tr_refdef_numDrawSurfs++ + 4) = v9 - 6;
-          }
-          if ( (*(_BYTE *)(*((_DWORD *)v9 - 1) + 84) & 0x18) != 0 )
-            v24 = 1;
+          R_OptimizeSModelSurfGeneric(record);
         }
-        v20 += v9[2];
-        v8 += 4;
-        v9 += 24;
-        ++v19;
       }
-      while ( v19 < *v7 );
     }
-    if ( !r_showtricounts->integer || (*(_BYTE *)(a1 + 4) & 8) != 0 )
-    {
-      if ( !r_showsurfcounts->integer || (*(_BYTE *)(a1 + 4) & 8) != 0 )
-        goto LABEL_33;
-      v15 = *v7;
-    }
-    else
-    {
-      v15 = v20 / 3;
-    }
-    v16 = va("%i", v15);
-    R_AddScaledDebugString(a1 + 68, modelBoundsDebugColor, v16);
-LABEL_33:
-    LOBYTE(v3) = v24;
-    if ( v24 )
-      LOBYTE(v3) = R_SetupStaticModelLighting((int)&tr_refdef_x, a1);
+
+    registered->lodSurfs[currentLod] = surfList;
+
   }
-  return v3;
+  return;
 }
 
-/* ---- RB_SurfaceStaticModel  0x00505580 ----  VERIFIED */
-int __cdecl RB_SurfaceStaticModel(int a1)
+/* ---- R_NeedsBoundsAdjustment  0x00504750 ----  VERIFIED
+ * True when any of the model's surfaces uses an autosprite-type shader
+ * (surfaceFlags & 0x20000000), so its bounds must be grown to a sphere.  Uses
+ * the finished per-LOD surface list when present, else walks the raw DObj. */
+int __cdecl R_NeedsBoundsAdjustment(int modelPtr)
 {
-  char *v1;
-  int v2;
-  int result;
+  renderer_static_model_t *model = (renderer_static_model_t *)modelPtr;
+  int                      i;
 
-  if ( r_logFile->integer )
+  if ( model->registered )
   {
-    v1 = va("--- RB_SurfaceStaticModel( %s ) ---\n", (const char *)tess_shader);
-    if ( Stream )
-      fprintf(Stream, "%s", (int)v1);
-  }
-  Com_Memcpy(4 * tess_numVertexes * tess_vertexComponentCount + ((int)(char *)tess_xyz), *(int **)(a1 + 28), 12 * *(unsigned __int16 *)(a1 + 18));
-  Com_Memcpy(8 * tess_numVertexes + ((int)(char *)tess_texCoords0), *(int **)(a1 + 20), 8 * *(unsigned __int16 *)(a1 + 18));
-  if ( (*(_DWORD *)(tess_shader + 80) & 0x102) != 0 )
-  {
-    Com_Memcpy(12 * tess_numVertexes + ((int)(char *)tess_stageNormals), *(int **)(a1 + 24), 12 * *(unsigned __int16 *)(a1 + 18));
-    tess_requiresVertexBasis = 1;
-  }
-  v2 = 0;
-  if ( *(_WORD *)(a1 + 16) )
-  {
-    do
+    for ( i = 0; i < model->registered->lodSurfs[0]->surfaceCount; ++i )
     {
-      tess_indexes[v2 + tess_numIndexes] = tess_numVertexes + *(_WORD *)(*(_DWORD *)(a1 + 32) + 2 * v2);
-      ++v2;
+      if ( (model->registered->lodSurfs[0]->surfaces[i].shader->surfaceFlags & 0x20000000) != 0 )
+        return 1;
     }
-    while ( v2 < *(unsigned __int16 *)(a1 + 16) );
+    return 0;
   }
-  tess_numIndexes += *(unsigned __int16 *)(a1 + 16);
-  result = *(unsigned __int16 *)(a1 + 18) + tess_numVertexes;
-  tess_numVertexes = result;
+
+  {
+    DObj *dobj = model->dobj;
+    if ( dobj )
+    {
+      int  lodIndex;      /* one slot; other children's LODs read past it (retail stack aliasing) */
+      int  partBits[4];
+      int  surfaceCount;
+      int *surfRefs;
+
+      lodIndex = 0;
+      surfaceCount = DObjGetNumSurfaces(dobj, (int)&lodIndex);
+      surfRefs = (int *)alloca(4 * surfaceCount);
+      DObjGetSurfaces(partBits, dobj, surfRefs, (int)&lodIndex);
+      for ( i = 0; i < surfaceCount; ++i )
+      {
+        int             modelIndex   = (short)surfRefs[i];
+        int             surfaceIndex = (short)(surfRefs[i] >> 16);
+        XModelLodInfo  *lod = &model->dobj->childRefs[modelIndex]->info->lodRecords[(&lodIndex)[modelIndex]];
+        unsigned short  nameIndex = lod->surfaceNameTable[surfaceIndex];
+        const char     *skinName = nameIndex ? (const char *)(GetRefString_var + 8 * nameIndex + 4) : "DEFAULT";
+        shader_t       *shader = (shader_t *)R_FindShader(va("skins/%s", skinName), -1, 1, (const char *)7);
+
+        if ( (shader->surfaceFlags & 0x20000000) != 0 )
+          return 1;
+      }
+    }
+    return 0;
+  }
+}
+
+/* ---- R_AdjustBoundsForAutosprite  0x00504880 ----  VERIFIED
+ * When the model needs autosprite bounds, replace its box with a cube centred on
+ * the box's centre and sized to enclose the box's bounding sphere (0.55 * the
+ * diagonal, plus 2).  Returns R_NeedsBoundsAdjustment (dead EAX). */
+int __cdecl R_AdjustBoundsForAutosprite(int modelPtr, float *mins, float *maxs)
+{
+  int result = R_NeedsBoundsAdjustment(modelPtr);
+
+  if ( result )
+  {
+#ifdef COD1_VC7
+    /* VC7 keeps center[1] in a register and spills only center[0] and the z sum
+     * (the two fstp dword); the #else models that rounding for modern MSVC. */
+    vec3_t center;
+    rfloat dx, dy, dz, radius;
+
+    VectorAdd(mins, maxs, center);
+    VectorScale(center, 0.5f, center);
+    dx = maxs[0] - mins[0];
+    dy = maxs[1] - mins[1];
+    dz = maxs[2] - mins[2];
+    radius = FCAST(sqrt(dx * dx + dy * dy + dz * dz)) * 0.55f + 2.0f;
+
+    mins[0] = center[0] - radius;
+    mins[1] = center[1] - radius;
+    mins[2] = center[2] - radius;
+    maxs[0] = center[0] + radius;
+    maxs[1] = radius + center[1];
+    maxs[2] = radius + center[2];
+#else
+    /* Retail rounds only the z-sum and centerX to float (the two fstp dword
+     * spills); everything else stays on the x87 stack, modelled as double. */
+    float  sumZ    = maxs[2] + mins[2];                  /* 0x5048A4 fstp var_4 */
+    float  centerX = (mins[0] + maxs[0]) * 0.5f;         /* 0x5048B0 fstp var_C */
+    double centerY = ((double)maxs[1] + mins[1]) * 0.5;  /* kept on x87 stack */
+    double centerZ = sumZ * 0.5;
+    double dz = (double)maxs[2] - mins[2];
+    double dy = (double)maxs[1] - mins[1];
+    double dx = (double)maxs[0] - mins[0];
+    double radius = sqrt(dz * dz + dy * dy + dx * dx) * 0.55000001f + 2.0;
+
+    mins[0] = (float)(centerX - radius);
+    mins[1] = (float)(centerY - radius);
+    mins[2] = (float)(centerZ - radius);
+    maxs[0] = (float)(centerX + radius);
+    maxs[1] = (float)(radius + centerY);
+    maxs[2] = (float)(radius + centerZ);
+#endif
+  }
   return result;
 }
 
-/* ---- RB_SurfaceStaticModelCached  0x005056A0 ----  VERIFIED */
-int __cdecl RB_SurfaceStaticModelCached(int a1)
+/* ---- R_RegisterStaticModel  0x00504930 ----  VERIFIED
+ * Look up (by name) or create the shared static-model template for a DObj.
+ * Returns the template when it carries a source model, else 0 (and fails hard
+ * when a not-precached model is registered after loading finished). */
+unsigned int *__cdecl R_RegisterStaticModel(const char *name, int dobjPtr)
 {
-  char *v1;
-  int *v2;
-  int *v3;
-  int v4;
-  int v5;
-  int v6;
-  int result;
-  _DWORD *v8;
-  _DWORD *v9;
-  int v10;
-  _DWORD *v11;
-  _DWORD *v12;
+  smRegisteredModel_t *registered;
+  int                  i;
 
-  if ( r_logFile->integer )
+  for ( i = 0; i < tr_registeredStaticModelCount; ++i )
   {
-    v1 = va("--- RB_SurfaceStaticModelCached( %s ) ---\n", (const char *)tess_shader);
-    if ( Stream )
-      fprintf(Stream, "%s", (int)v1);
+    registered = (smRegisteredModel_t *)tr_registeredStaticModels[i];
+    if ( !Q_stricmp(registered->name, name) )
+      return registered->model ? (unsigned int *)registered : 0;
   }
-  v2 = (int *)(a1 + 8);
-  if ( tess_optimizedVertexEnd )
+  if ( tr_registeredStaticModelCount == 2048 )
   {
-    if ( tess_optimizedFirstVertex > *v2 )
-      tess_optimizedFirstVertex = *v2;
-    v3 = (int *)(a1 + 4);
-    if ( tess_optimizedVertexEnd < *v2 + *(unsigned __int16 *)(*(_DWORD *)(a1 + 4) + 18) )
-      tess_optimizedVertexEnd = *v2 + *(unsigned __int16 *)(*(_DWORD *)(a1 + 4) + 18);
+    ri.Printf(2, "R_RegisterStaticModel failed for '%s' -- more than %i unique static models\n", name, 2048);
+    return 0;
+  }
+
+  if ( !tr_modelsFinishedLoading )
+    tr_delayedImageGroup = ++tr_delayedImageGroupSequence;
+  else if ( r_errorOnConflicts->integer && !tr_ignorePrecacheErrorCount )
+    ri.Error(1, "\x15" "model '%s' not precached\n", name);
+  registered = R_SetupDObjToStaticModel(dobjPtr, name);
+  tr_delayedImageGroup = 0;
+  tr_delayedImageGroupTriCount = 0;
+  tr_registeredStaticModels[tr_registeredStaticModelCount] = (int)registered;
+  tr_registeredStaticModelCount++;
+  return registered->model ? (unsigned int *)registered : 0;
+}
+
+/* ---- R_CreateStaticModel  0x00504A20 ----  VERIFIED
+ * Queue a static-model placement: register the XModel, build its DObj and
+ * skeleton, apply the placement scale/angles/origin to a worldStaticModel, take
+ * its transformed world bounds, register its shared template, and thread it on
+ * the pending list (rendererPendingStaticModels).  unused is unused (kept for the ABI). */
+void __cdecl R_CreateStaticModel(int unused, char *name, float *origin, float *angles, float *scale, float *color)
+{
+  worldStaticModel_t *model;
+  short               modelHandle;
+  int                 dobjModel[3];   /* DObjModel {model, tagName, short negativeModelIndex}: stride 12 */
+  XModel             *xmodel;
+  DObj                dobj;            // byte v14[88] BYREF
+  int                 partBits[4];     // v15
+  void               *evalStorage;
+/* retail calls DObjBindEvalStorage out of line here but inlines it in
+ * R_FinishLoadingStaticModels: no inlining into this function */
+#pragma inline_depth(0)
+
+  if ( !_strnicmp(name, "xmodel", 6u) && ( name[6] == '/' || name[6] == '\\' ) )
+  {
+    if ( strlen(name) >= 0x39 )
+    {
+      Com_Printf("Model '%s' has a name longer than %i characters\n", name, 57);
+      return;
+    }
+
+    R_SyncRenderThread();
+    model = (worldStaticModel_t *)ri.Malloc(160);
+    strcpy(model->name, name + 7);
+
+    modelHandle = RE_RegisterModel(name, (const char *)7);
+    dobjModel[0] = (int)((model_t *)tr_models[modelHandle])->xmodel;
+    dobjModel[1] = 0;
+    *(short *)&dobjModel[2] = modelHandle;   /* retail: handle word at DObjModel+8 -> DObj.childModelIndices[0] */
+    DObjCreate((int)dobjModel, 1u, 0, (int)&dobj, 0);
+    evalStorage = alloca(96 * dobj.partCount + 64);
+    DObjBindEvalStorage((void *)(((unsigned int)evalStorage + 15) & ~15u), &dobj);
+    Com_Memset(partBits, 255, 0x10u);
+    DObjCalcAnim((int)&dobj, partBits);
+    DObjCalcSkel(partBits, (int)&dobj);
+
+    model->origin[0] = origin[0];
+    model->origin[1] = origin[1];
+    model->origin[2] = origin[2];
+    AnglesToAxis(angles, model->axis[0]);
+    model->axisScale = 0.0f;
+    if ( scale[0] != 1.0f || scale[1] != 1.0f || scale[2] != 1.0f )
+    {
+      model->axis[0][0] = scale[0] * model->axis[0][0];
+      model->axis[0][1] = scale[0] * model->axis[0][1];
+      model->axis[0][2] = scale[0] * model->axis[0][2];
+      model->axis[1][0] = scale[1] * model->axis[1][0];
+      model->axis[1][1] = scale[1] * model->axis[1][1];
+      model->axis[1][2] = scale[1] * model->axis[1][2];
+      model->axis[2][0] = model->axis[2][0] * scale[2];
+      model->axis[2][1] = model->axis[2][1] * scale[2];
+      model->axis[2][2] = model->axis[2][2] * scale[2];
+      model->axisScale = VectorMax(scale);
+    }
+    R_GetXModelBounds(model->axis[0], (int)&dobj, model->boundsMin, model->boundsMax);
+    model->boundsMin[0] = model->origin[0] + model->boundsMin[0];
+    model->boundsMin[1] = model->origin[1] + model->boundsMin[1];
+    model->boundsMin[2] = model->boundsMin[2] + model->origin[2];
+    model->boundsMax[0] = model->boundsMax[0] + model->origin[0];
+    model->boundsMax[1] = model->origin[1] + model->boundsMax[1];
+    model->boundsMax[2] = model->boundsMax[2] + model->origin[2];
+    model->color[0] = color[0];
+    model->color[1] = color[1];
+    model->color[2] = color[2];
+
+    xmodel = (XModel *)dobjModel[0];
+    model->registered = 0;
+    if ( (void *)xmodel->info != (void *)xmodel_defaultCollision )
+      model->registered = (smRegisteredModel_t *)R_RegisterStaticModel(model->name, (int)&dobj);
+    model->next = (worldStaticModel_t *)rendererPendingStaticModels;
+    rendererPendingStaticModels = (int)model;
   }
   else
   {
-    tess_optimizedFirstVertex = *v2;
-    v3 = (int *)(a1 + 4);
-    tess_optimizedVertexEnd = *v2 + *(unsigned __int16 *)(*(_DWORD *)(a1 + 4) + 18);
+    Com_Printf("Model '%s' is not an xmodel\n", name);
   }
-  v4 = *v3;
-  v5 = *(unsigned __int16 *)(*v3 + 16);
-  v6 = v5 / 6;
-  result = *v2 | (*v2 << 16);
-  v8 = *(_DWORD **)(v4 + 32);
-  v9 = (_DWORD *)((char *)&tess_optimizedIndexes + 2 * count);
-  count += v5;
-  do
+}
+
+/* ---- R_AddStaticModelToWorld  0x00504CC0 ----  VERIFIED
+ * Turn a pending placement into a live cStaticModel: reserve one surface-cache
+ * slot per surface across all LODs (or, when the model has no shared template,
+ * build a DObj), copy in the transform/colour/bounds, adjust autosprite bounds,
+ * filter the box into every world cell it touches, and precompute its static
+ * light contributions.  Returns those contributions (dead EAX). */
+#pragma optimize( "p", on )
+int __cdecl R_AddStaticModelToWorld(int sourcePtr)
+{
+  worldStaticModel_t  *source = (worldStaticModel_t *)sourcePtr;
+  smRegisteredModel_t *registered = source->registered;
+  renderer_static_model_t      *model;
+  DObj                *dobj;
+  int                  reType;
+  int                  surfaceSlots;
+  int                  result;
+  float                c;
+#pragma inline_depth()
+
+  if ( registered )
   {
-    *v9 = result + *v8;
-    v10 = v8[1];
-    v11 = v8 + 1;
-    v12 = v9 + 1;
-    *v12++ = result + v10;
-    *v12 = result + v11[1];
-    v9 = v12 + 1;
-    v8 = v11 + 2;
-    --v6;
+    int lod;
+    reType = 2;
+    dobj = 0;
+    surfaceSlots = 0;
+    for ( lod = 0; lod < registered->lodCount; ++lod )
+      surfaceSlots += registered->lodSurfs[lod]->surfaceCount;
   }
-  while ( v6 );
+  else
+  {
+    /* no shared template: build a DObj so the surfaces can be enumerated later */
+    short  modelHandle;
+    int    dobjModel[3];   /* DObjModel {model, tagName, short negativeModelIndex}: stride 12 */
+    int    partBits[4];
+    void  *evalStorage;
+    DObj  *obj;
+
+    reType = 1;
+    obj = (DObj *)ri.Hunk_Alloc(88);
+    modelHandle = RE_RegisterModel(va("xmodel/%s", source->name), (const char *)7);
+    dobjModel[0] = (int)((model_t *)tr_models[modelHandle])->xmodel;
+    dobjModel[1] = 0;
+    *(short *)&dobjModel[2] = modelHandle;   /* retail: handle word at DObjModel+8 -> DObj.childModelIndices[0] */
+    DObjCreate((int)dobjModel, 1u, 0, (int)obj, 0);
+    dobj = obj;
+    evalStorage = (void *)ri.Hunk_Alloc(96 * obj->partCount + 48);
+    R_BIND_DOBJ_EVAL_STORAGE(obj, evalStorage);
+    Com_Memset(partBits, 255, 0x10u);
+    DObjCalcAnim((int)obj, partBits);
+    DObjCalcSkel(partBits, (int)obj);
+    surfaceSlots = 0;
+  }
+
+  model = (renderer_static_model_t *)ri.Hunk_Alloc(4 * surfaceSlots + 584);
+  memset(model, 0, 0x9Cu);
+  model->reType = reType;
+  model->dobj = dobj;
+  model->renderfx = 128;
+  model->registered = source->registered;
+  model->origin[0] = source->origin[0];
+  model->origin[1] = source->origin[1];
+  model->origin[2] = source->origin[2];
+  model->axis[0][0] = source->axis[0][0];
+  model->axis[0][1] = source->axis[0][1];
+  model->axis[0][2] = source->axis[0][2];
+  model->axis[1][0] = source->axis[1][0];
+  model->axis[1][1] = source->axis[1][1];
+  model->axis[1][2] = source->axis[1][2];
+  model->axis[2][0] = source->axis[2][0];
+  model->axis[2][1] = source->axis[2][1];
+  model->axis[2][2] = source->axis[2][2];
+  model->axisScale = source->axisScale;
+
+  R_AdjustBoundsForAutosprite((int)model, source->boundsMin, source->boundsMax);
+  model->localOrigin[0] = source->boundsMin[0] + source->boundsMax[0];
+  model->localOrigin[1] = source->boundsMax[1] + source->boundsMin[1];
+  model->localOrigin[2] = source->boundsMin[2] + source->boundsMax[2];
+  model->localOrigin[0] = model->localOrigin[0] * 0.5f;
+  model->localOrigin[1] = model->localOrigin[1] * 0.5f;
+  model->localOrigin[2] = model->localOrigin[2] * 0.5f;
+
+  model->color[0] = (byte)(int)( 255.0f < ( 0.0f > (tr_identityLight * source->color[0] * 255.0f) ? 0.0f : (tr_identityLight * source->color[0] * 255.0f) ) ? 255.0f : ( 0.0f > (tr_identityLight * source->color[0] * 255.0f) ? 0.0f : (tr_identityLight * source->color[0] * 255.0f) ) );
+  model->color[1] = (byte)(int)( 255.0f < ( 0.0f > (tr_identityLight * source->color[1] * 255.0f) ? 0.0f : (tr_identityLight * source->color[1] * 255.0f) ) ? 255.0f : ( 0.0f > (tr_identityLight * source->color[1] * 255.0f) ? 0.0f : (tr_identityLight * source->color[1] * 255.0f) ) );
+  model->color[2] = (byte)(int)( 255.0f < ( 0.0f > (tr_identityLight * source->color[2] * 255.0f) ? 0.0f : (tr_identityLight * source->color[2] * 255.0f) ) ? 255.0f : ( 0.0f > (tr_identityLight * source->color[2] * 255.0f) ? 0.0f : (tr_identityLight * source->color[2] * 255.0f) ) );
+  model->color[3] = 255;
+
+  model->bounds[0][0] = source->boundsMin[0];
+  model->bounds[0][1] = source->boundsMin[1];
+  model->bounds[0][2] = source->boundsMin[2];
+  model->bounds[1][0] = source->boundsMax[0];
+  model->bounds[1][1] = source->boundsMax[1];
+  model->bounds[1][2] = source->boundsMax[2];
+  model->viewCount = 0;
+
+  R_FilterModelIntoCells_r_0(tr_world, *(mnode_t **)(tr_world + 152), (int)model,
+                             model->bounds[0], model->bounds[1]);
+  /* static light index / colour tables sit in model->lighting (0xbc..0x248) */
+  result = R_GetStaticLightContributions(model->localOrigin, (char *)model + 0xc0,
+                                         (float *)((char *)model + 0xbc), (char *)model + 0x184);
+  model->lightContributions = result;
+  return result;
+}
+#pragma optimize( "p", off )
+
+/* ---- R_FinishLoadingStaticModels  0x005050A0 ----  VERIFIED
+ * Finish every registered template that has no surfaces yet (build its DObj on
+ * temp memory and hand it to R_FinishDObjToStaticModel), then place every pending
+ * static model into the world and free the placement records.  Returns the last
+ * ri.Free result (dead EAX). */
+void R_FinishLoadingStaticModels(void)
+{
+
+  int                 i;
+  worldStaticModel_t *pending;
+
+  for ( i = 0; i < tr_registeredStaticModelCount; ++i )
+  {
+    smRegisteredModel_t *registered = (smRegisteredModel_t *)tr_registeredStaticModels[i];
+    if ( !registered->lodSurfs[0] )   /* not finished yet */
+    {
+      short  modelHandle;
+      int    dobjModel[3];   /* DObjModel {model, tagName, short negativeModelIndex}: stride 12 */
+      DObj   dobj;            // byte v15[0x58] BYREF
+      int    partBits[4];     // v14
+      void *evalStorage;int skelSize;
+
+      modelHandle = RE_RegisterModel(va("xmodel/%s", registered->name), (const char *)7);
+      *(short *)&dobjModel[2] = modelHandle;   /* retail: handle word at DObjModel+8 -> DObj.childModelIndices[0] */
+      dobjModel[0] = (int)((model_t *)tr_models[modelHandle])->xmodel;
+      dobjModel[1] = 0;
+      DObjCreate((int)dobjModel, 1u, 0, (int)&dobj, 0);
+      skelSize=96*dobj.partCount+48;evalStorage=(void *)ri.Hunk_AllocateTempMemory(skelSize);
+      DObjBindEvalStorage(evalStorage, &dobj);
+      Com_Memset(partBits, 255, 0x10u);
+      DObjCalcAnim((int)&dobj, partBits);
+      DObjCalcSkel(partBits, (int)&dobj);
+      R_FinishDObjToStaticModel((unsigned int *)tr_registeredStaticModels[i], (int)&dobj);
+      ri.Hunk_FreeTempMemory((int)evalStorage);
+    }
+
+  }
+
+  pending = (worldStaticModel_t *)rendererPendingStaticModels;
+  while ( pending )
+  {
+    worldStaticModel_t *next = pending->next;
+    R_AddStaticModelToWorld((int)pending);
+    ri.Free((int)pending);
+    pending = next;
+  }
+  rendererPendingStaticModels = 0;
+  return;
+}
+
+/* ---- R_ShutdownStaticModels  0x00505220 ----  VERIFIED
+ * Free every pending (not-yet-placed) static-model placement and clear the list.
+ * Returns 0 (the tail of the list; dead EAX). */
+int R_ShutdownStaticModels()
+{
+  int result = rendererPendingStaticModels;
+
+  if ( rendererPendingStaticModels )
+  {
+    do
+    {
+      int next = (int)((worldStaticModel_t *)result)->next;
+      ri.Free(result);
+      result = next;
+    }
+    while ( result );
+  }
+  rendererPendingStaticModels = 0;
   return result;
 }
 
-/* ---- RB_SurfaceStaticModelT2V3_ARB  0x005057A0 ----  [HIGH] */
-int __cdecl RB_SurfaceStaticModelT2V3_ARB(int a1)
+/* ---- R_AddStaticModelSurfaces  0x00505260 ----  VERIFIED
+ * Add a static-model instance's visible surfaces to the draw lists.  Picks a LOD
+ * by distance, and for each merged surface: builds its lit vertex cache (unless
+ * it needs per-frame lighting), stamps the cache page as used this frame, then
+ * queues a draw surf -- from the cache when static, or the raw merged surface
+ * when it must be re-lit or is not yet cached.  Feeds the tri/surf-count overlay
+ * and queues entity lighting when any surface needs it. */
+void __cdecl R_AddStaticModelSurfaces(int refEntity)
 {
-  float v;      /* written before every read; retail spills it at
-                 * [esp+2Ch+var_14] */
-  void *v4;
-  int v5;
-  _DWORD *v6;
-  int v7;
-  GLsizei v8;
-  int integer;
-  int v10;
-  GLenum *AnimatedImage;
-  GLsizei v12;
-  int result;
-  _DWORD v14[5]; // [esp+2Ch] [ebp-14h] BYREF
+  trRefEntity_t       *entity = (trRefEntity_t *)refEntity;
+  smRegisteredModel_t *registered = R_EntStaticModel(entity);
+  smSurfaceList_t     *surfList;
+  int                  lod;
+  int                  surfaceBase;   /* surfaces in the LODs below this one */
+  int                  lightingSetup;
+  int                  needsLighting;
+  int                  indexTotal;
+  int                  i;
+  float                inverseAxis[9];
+
+  lod = XModelGetLodForDist(registered->model, R_GetLodDist((float *)entity));
+  if ( lod < 0 )
+    return;
+
+  surfaceBase = 0;
+  for ( i = 0; i < lod; ++i )
+    surfaceBase += registered->lodSurfs[i]->surfaceCount;
+  surfList = registered->lodSurfs[lod];
+
+  lightingSetup = 0;
+  needsLighting = 0;
+  indexTotal = 0;
+  for ( i = 0; i < surfList->surfaceCount; ++i )
+  {
+    /* cache the surface's lit vertices (once), unless it needs per-frame light */
+    if ( !R_EntOwner(entity)->surfaceLightingCache[surfaceBase + i] && surfList->surfaces[i].cachedShader )
+    {
+      if ( !lightingSetup )
+      {
+        MatrixInverse(entity->e.axis, inverseAxis);
+        R_SetupStaticModelLighting((int)&tr_refdef_x, (int)entity);
+        lightingSetup = 1;
+      }
+      if ( !R_EntHasDynamicLights(entity) )
+        R_EntOwner(entity)->surfaceLightingCache[surfaceBase + i] =
+          (void *)R_CacheStaticModelSurface((int)&surfList->surfaces[i], (int)R_EntOwner(entity), surfaceBase + i,
+                                            (int)entity, (int)inverseAxis);
+    }
+
+    if ( R_EntOwner(entity)->surfaceLightingCache[surfaceBase + i] )
+    {
+      R_UsedCachedStaticModelSurface((smcSurface_t *)R_EntOwner(entity)->surfaceLightingCache[surfaceBase + i]);
+      if ( (surfList->surfaces[i].shader->lightingFlags & 0x18) != 0
+        && (R_SetupStaticModelLighting((int)&tr_refdef_x, (int)entity), R_EntHasDynamicLights(entity)) )
+      {
+        /* dynamic light present: draw the raw merged surface so it is re-lit */
+        R_AddDrawSurf(surfList->surfaces[i].storageMode, surfList->surfaces[i].shader, &surfList->surfaces[i], 0, 0, 0);
+      }
+      else
+      {
+        /* static: draw straight from the vertex cache */
+        R_AddDrawSurf(tr_cachedStaticModelStorageSource, surfList->surfaces[i].cachedShader,
+                      R_EntOwner(entity)->surfaceLightingCache[surfaceBase + i], 0, 0, 0);
+      }
+    }
+    else
+    {
+      /* not cached: draw the raw merged surface, and flag if it wants lighting */
+      R_AddDrawSurf(surfList->surfaces[i].storageMode, surfList->surfaces[i].shader, &surfList->surfaces[i], 0, 0, 0);
+      if ( (surfList->surfaces[i].shader->lightingFlags & 0x18) != 0 )
+        needsLighting = 1;
+    }
+    indexTotal += surfList->surfaces[i].indexCount;
+  }
+
+  /* r_showtricounts / r_showsurfcounts overlay above the model */
+  if ( !r_showtricounts->integer || (entity->e.renderfx & 8) != 0 )
+  {
+    if ( r_showsurfcounts->integer && (entity->e.renderfx & 8) == 0 )
+      R_AddScaledDebugString((int)entity->e.origin, (int)modelBoundsDebugColor,
+                             (int)va("%i", surfList->surfaceCount));
+  }
+  else
+  {
+    R_AddScaledDebugString((int)entity->e.origin, (int)modelBoundsDebugColor,
+                           (int)va("%i", indexTotal / 3));
+  }
+
+  if ( needsLighting )
+    R_SetupStaticModelLighting((int)&tr_refdef_x, (int)entity);
+}
+
+/* ---- RB_SurfaceStaticModel  0x00505580 ----  VERIFIED
+ * Tessellate an un-optimized merged surface: copy its positions / tex coords
+ * (and, when the shader needs them, normals) into the tess buffers, then append
+ * its re-based indices. */
+void __cdecl RB_SurfaceStaticModel(int surface)
+{
+  smSurface_t *surf = (smSurface_t *)surface;
+  int          i;
+
+  if ( r_logFile->integer )
+  {
+    char *msg = va("--- RB_SurfaceStaticModel( %s ) ---\n", (const char *)tess_shader);
+    if ( Stream )
+      fprintf(Stream, "%s", (int)msg);
+  }
+  Com_Memcpy(4 * tess_numVertexes * tess_vertexComponentCount + (int)(char *)tess_xyz,
+             (int)surf->vertices, 12 * surf->vertexCount);
+  Com_Memcpy(8 * tess_numVertexes + (int)(char *)tess_texCoords0,
+             (int)surf->texCoords, 8 * surf->vertexCount);
+  if ( (((shader_t *)tess_shader)->surfaceFlags & 0x102) != 0 )
+  {
+    Com_Memcpy(12 * tess_numVertexes + (int)(char *)tess_stageNormals,
+               (int)surf->normals, 12 * surf->vertexCount);
+    tess_requiresVertexBasis = 1;
+  }
+  for ( i = 0; i < surf->indexCount; ++i )
+    tess_indexes[tess_numIndexes + i] = tess_numVertexes + surf->indices[i];
+  tess_numIndexes += surf->indexCount;
+  tess_numVertexes += surf->vertexCount;
+}
+
+/* ---- RB_SurfaceStaticModelCached  0x005056A0 ----  VERIFIED
+ * Emit a cached surface's indices into the optimized-index buffer, re-based onto
+ * its cache vertex offset, and extend the batch's optimized-vertex span.  The
+ * offset is packed into both halves of a dword so it adds to two 16-bit indices
+ * per store.  Returns the packed offset (dead EAX). */
+void __cdecl RB_SurfaceStaticModelCached(int surface)
+{
+  smcSurface_t *cached = (smcSurface_t *)surface;
+  smSurface_t  *record;
+  int           result;
+  unsigned int *dst;
+  unsigned int *src;
+  int           pairs;
+
+  if ( r_logFile->integer )
+  {
+    char *msg = va("--- RB_SurfaceStaticModelCached( %s ) ---\n", (const char *)tess_shader);
+    if ( Stream )
+      fprintf(Stream, "%s", (int)msg);
+  }
+
+  if ( !tess_optimizedVertexEnd )
+  {
+    tess_optimizedFirstVertex = cached->cached.vertexOffset;
+    tess_optimizedVertexEnd = cached->cached.vertexOffset + ((smSurface_t *)cached->cached.source)->vertexCount;
+  }
+  else
+  {
+    if ( tess_optimizedFirstVertex > cached->cached.vertexOffset )
+      tess_optimizedFirstVertex = cached->cached.vertexOffset;
+    if ( tess_optimizedVertexEnd < cached->cached.vertexOffset + ((smSurface_t *)cached->cached.source)->vertexCount )
+      tess_optimizedVertexEnd = cached->cached.vertexOffset + ((smSurface_t *)cached->cached.source)->vertexCount;
+  }
+
+  record = (smSurface_t *)cached->cached.source;
+  pairs = record->indexCount / 6;
+  result = cached->cached.vertexOffset | ( cached->cached.vertexOffset << 16 );
+  src = (unsigned int *)record->indices;
+  dst = (unsigned int *)((char *)&tess_optimizedIndexes + 2 * tess_renderedIndexCount);
+  tess_renderedIndexCount += record->indexCount;
+  do
+  {
+    *dst++ = result + *src++;
+    *dst++ = result + *src++;
+    *dst++ = result + *src++;
+  }
+  while ( --pairs );
+  return;
+}
+
+/* ---- RB_SurfaceStaticModelT2V3_ARB  0x005057A0 ----  [HIGH]
+ * Draw a T2V3 (tex+position) merged surface from its ARB vertex/index VBOs.  Per
+ * stage: set state, bind textures, pick the vertex colour (entity RGBA for a
+ * precalc-lit stage, else the stage constant), and draw; then the r_showtris
+ * overlay.  Returns the running backEnd vertex count. */
+int __cdecl RB_SurfaceStaticModelT2V3_ARB(int surface)
+{
+  smSurface_t *surf = (smSurface_t *)surface;
+  int          i;
+  int          texEnv[8];
 
   if ( Stream )
     fprintf(Stream, "%s", (int)"--- RB_SurfaceStaticModelT2V3_ARB ---\n");
   RB_SetIteratorFog();
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
+  GL_Cull(R_ShaderCullType(tess_shader));
   GL_ClientState(1025);
-  qglBindBufferARB(34962, *(_DWORD *)(a1 + 36));
-  qglBindBufferARB(34963, *(_DWORD *)(a1 + 40));
+  qglBindBufferARB(34962, (int)surf->gpuVertexBuffer);
+  qglBindBufferARB(34963, surf->gpuIndexBuffer);
   glVertexPointer(3, 0x1406u, 20, (const GLvoid *)8);
-  v5 = 0;
-  for ( v14[0] = 0; v5 < tess_activeStageCount; ++v5 )
+  texEnv[0] = 0;
+  for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v6 = *(_DWORD **)(tess_activeStages + 4 * v5);
-    GL_State(v6[417]);
-    RB_SetupMultitexture(v6, (int)v14, 20);
-    v7 = *(_DWORD *)(tess_activeStages + 4 * v5);
-    if ( *(_DWORD *)(v7 + 1636) == 11 )
+    shaderStage_t *stage = *(shaderStage_t **)(tess_activeStages + 4 * i);
+
+    GL_State(stage->stateBits);
+    RB_SetupMultitexture(stage, texEnv, 20);
+    stage = *(shaderStage_t **)(tess_activeStages + 4 * i);   /* retail re-reads the stage pointer */
+    if ( stage->rgbGen == CGEN_LIGHTING_PRECALC )
     {
       if ( r_entFullbright->integer )
         qglColor3f(tr_identityLight, tr_identityLight, tr_identityLight);
@@ -1767,200 +1623,150 @@ int __cdecl RB_SurfaceStaticModelT2V3_ARB(int a1)
     }
     else
     {
-      glColor4ubv((const GLubyte *)(v7 + 1664));
+      glColor4ubv((const GLubyte *)stage->constantColor);
     }
-    v8 = *(unsigned __int16 *)(a1 + 16);
-    backEnd_pc_drawnIndexCount += v8;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v8, 0x1403u, 0);
+    GL_DrawElements(surf->indexCount, 4u, 0x1403u, 0);
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  if ( r_showtris->integer )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    GL_State(*(_DWORD *)(*(_DWORD *)(tr_showTrisShader + 340) + 1668));
-    AnimatedImage = (GLenum *)
-      RB_GetAnimatedImage(0, *(_DWORD *)(tr_showTrisShader + 340) + 4, glState_currentTmu);
-    GL_Bind(AnimatedImage);
-    if ( r_showtris->integer < 5 )
+    if ( (r_showtris->integer & 1) != 0 )
+      glDepthRange(0.0, 0.10000000149011612);   /* (double)0.1f = 0x3FB99999A0000000, retail 0x005058ED */
+    GL_State(R_ShaderStages(tr_showTrisShader)[0]->stateBits);
+    RB_BindAnimatedImage(&R_ShaderStages(tr_showTrisShader)[0]->bundle);
+    if ( r_showtris->integer >= 5 )
     {
-      v = tr_identityLight * 0.25;
-      qglColor3f(v, v, tr_identityLight);
+      float color;   /* block-scoped: shares the dead surface slot as in retail */
+
+      RB_ChooseSurfaceCountColor(surf->indexCount, &color);
+      glColor4ubv((const GLubyte *)&color);
     }
     else
     {
-      RB_ChooseSurfaceCountColor(*(unsigned __int16 *)(a1 + 16), &v);
-      glColor4ubv((const GLubyte *)&v);
+      float color = tr_identityLight * 0.25f;
+
+      qglColor3f(color, color, tr_identityLight);
     }
-    v12 = *(unsigned __int16 *)(a1 + 16);
-    backEnd_pc_drawnIndexCount += v12;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v12, 0x1403u, 0);
+    GL_DrawElements(surf->indexCount, 4u, 0x1403u, 0);
     glDepthRange(0.0, 1.0);
   }
   qglBindBufferARB(34962, 0);
   qglBindBufferARB(34963, 0);
   if ( Stream )
     fprintf(Stream, "%s", (int)"----------\n");
-  backEnd_pc_indexCount += *(unsigned __int16 *)(a1 + 16);
-  result = *(unsigned __int16 *)(a1 + 18) + backEnd_pc_vertexCount;
-  backEnd_pc_vertexCount = result;
-  return result;
+  backEnd_pc_indexCount += surf->indexCount;
+  backEnd_pc_vertexCount += surf->vertexCount;
+  return backEnd_pc_vertexCount;
 }
 
-/* ---- RB_SurfaceStaticModelT2N3V3_ARB  0x00505A30 ----  [HIGH] */
-int __cdecl RB_SurfaceStaticModelT2N3V3_ARB(int a1)
+/* ---- RB_SurfaceStaticModelT2N3V3_ARB  0x00505A30 ----  [HIGH]
+ * Draw a T2N3V3 (tex+normal+position) merged surface from its ARB VBOs.  The
+ * normals carry lighting, so each stage just sets state, binds textures and
+ * draws; then the r_showtris overlay.  Returns the running vertex count. */
+int __cdecl RB_SurfaceStaticModelT2N3V3_ARB(int surface)
 {
-  float v;
-  void *v4;
-  int v5;
-  _DWORD *v6;
-  GLsizei v7;
-  int integer;
-  int v9;
-  GLenum *AnimatedImage;
-  GLsizei v11;
-  int result;
-  _DWORD v13[5]; // [esp+38h] [ebp-14h] BYREF
+  smSurface_t *surf = (smSurface_t *)surface;
+  int          i;
+  int          texEnv[8];
 
   if ( Stream )
     fprintf(Stream, "%s", (int)"--- RB_SurfaceStaticModelT2N3V3_ARB ---\n");
   RB_SetIteratorFog();
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
+  GL_Cull(R_ShaderCullType(tess_shader));
   GL_ClientState(1537);
-  qglBindBufferARB(34962, *(_DWORD *)(a1 + 36));
-  qglBindBufferARB(34963, *(_DWORD *)(a1 + 40));
+  qglBindBufferARB(34962, (int)surf->gpuVertexBuffer);
+  qglBindBufferARB(34963, surf->gpuIndexBuffer);
   glNormalPointer(0x1406u, 32, (const GLvoid *)8);
   glVertexPointer(3, 0x1406u, 32, (const GLvoid *)0x14);
-  v5 = 0;
-  for ( v13[0] = 0; v5 < tess_activeStageCount; ++v5 )
+  texEnv[0] = 0;
+  for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v6 = *(_DWORD **)(tess_activeStages + 4 * v5);
-    GL_State(v6[417]);
-    RB_SetupMultitexture(v6, (int)v13, 32);
-    v7 = *(unsigned __int16 *)(a1 + 16);
-    backEnd_pc_drawnIndexCount += v7;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v7, 0x1403u, 0);
+    shaderStage_t *stage = *(shaderStage_t **)(tess_activeStages + 4 * i);
+
+    GL_State(stage->stateBits);
+    RB_SetupMultitexture(stage, texEnv, 32);
+    GL_DrawElements(surf->indexCount, 4u, 0x1403u, 0);
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  if ( r_showtris->integer )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    GL_State(*(_DWORD *)(*(_DWORD *)(tr_showTrisShader + 340) + 1668));
-    AnimatedImage = (GLenum *)
-      RB_GetAnimatedImage(0, *(_DWORD *)(tr_showTrisShader + 340) + 4, glState_currentTmu);
-    GL_Bind(AnimatedImage);
-    if ( r_showtris->integer < 5 )
+    if ( (r_showtris->integer & 1) != 0 )
+      glDepthRange(0.0, 0.10000000149011612);   /* (double)0.1f = 0x3FB99999A0000000, retail 0x00505B41 */
+    GL_State(R_ShaderStages(tr_showTrisShader)[0]->stateBits);
+    RB_BindAnimatedImage(&R_ShaderStages(tr_showTrisShader)[0]->bundle);
+    if ( r_showtris->integer >= 5 )
     {
-      v = tr_identityLight * 0.25;
-      qglColor3f(v, v, tr_identityLight);
+      float color;   /* block-scoped: shares the dead surface slot as in retail */
+
+      RB_ChooseSurfaceCountColor(surf->indexCount, &color);
+      glColor4ubv((const GLubyte *)&color);
     }
     else
     {
-      RB_ChooseSurfaceCountColor(*(unsigned __int16 *)(a1 + 16), &v);
-      glColor4ubv((const GLubyte *)&v);
+      float color = tr_identityLight * 0.25f;
+
+      qglColor3f(color, color, tr_identityLight);
     }
-    v11 = *(unsigned __int16 *)(a1 + 16);
-    backEnd_pc_drawnIndexCount += v11;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v11, 0x1403u, 0);
+    GL_DrawElements(surf->indexCount, 4u, 0x1403u, 0);
     glDepthRange(0.0, 1.0);
   }
   qglBindBufferARB(34962, 0);
   qglBindBufferARB(34963, 0);
   if ( Stream )
     fprintf(Stream, "%s", (int)"----------\n");
-  backEnd_pc_indexCount += *(unsigned __int16 *)(a1 + 16);
-  result = *(unsigned __int16 *)(a1 + 18) + backEnd_pc_vertexCount;
-  backEnd_pc_vertexCount = result;
-  return result;
+  backEnd_pc_indexCount += surf->indexCount;
+  backEnd_pc_vertexCount += surf->vertexCount;
+  return backEnd_pc_vertexCount;
 }
 
-/* ---- RB_SurfaceStaticModelATI  0x00505C80 ----  VERIFIED */
-int __cdecl RB_SurfaceStaticModelATI(int v)
+/* ---- RB_SurfaceStaticModelATI  0x00505C80 ----  VERIFIED
+ * Draw a merged surface through the ATI vertex-array-object path (T2V3 or
+ * T2N3V3).  With ATIElementArray the indices are an object buffer drawn by
+ * glDrawElementArrayATI; otherwise they are drawn from system memory.  Per
+ * stage: bind arrays/textures, colour (T2V3 only), draw; then r_showtris.
+ * Returns the surface vertex count (backEnd_pc_vertexCount accumulates). */
+int __cdecl RB_SurfaceStaticModelATI(int surface)
 {
-  FILE *integer;
-  char *v2;
-  int v3;
-  bool v4; // zf
-  int v5;
-  int v6;
-  int i;
-  int v8;
-  _DWORD *v9;
-  int v10;
-  int v11;
-  _DWORD *v12;
-  int v13;
-  int j;
-  int v15;
-  const GLubyte *v16;
-  _DWORD *v17;
-  int v18;
-  GLsizei v19;
-  int v20;
-  _DWORD *v21;
-  int v22;
-  GLsizei v23;
-  int result;
-  float v25;
-  float v26;
-  float v27;
-  float v28;
-  int v29;
-  int v30;
-  int v31;
-  const GLvoid *v32;
-  const GLvoid *v33;
-  int v34;
-  int v35;
-  _DWORD v36[8]; // [esp+84h] [ebp-20h] BYREF
+  smSurface_t *surf = (smSurface_t *)surface;
+  int          stride;
+  int          result;
+  int          i;
+  int          texEnv[8];   // v36
 
-  integer = (FILE *)r_logFile->integer;
-  if ( integer )
+
+  if ( r_logFile->integer )
   {
-    v2 = va("--- RB_SurfaceStaticModelATI( %s ) ---\n", (const char *)tess_shader);
-    integer = Stream;
+    char *msg = va("--- RB_SurfaceStaticModelATI( %s ) ---\n", (const char *)tess_shader);
     if ( Stream )
-      fprintf(Stream, "%s", (int)v2);
+      fprintf(Stream, "%s", (int)msg);
   }
   RB_SetIteratorFog();
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
+  GL_Cull(R_ShaderCullType(tess_shader));
   GL_ClientState(1025);
-  v3 = v;
-  v4 = *(_DWORD *)v == 18;
-  v5 = *(_DWORD *)(v + 40);
-  v36[0] = v5;
-  if ( v4 )
+  texEnv[0] = surf->gpuIndexBuffer;
+  if ( surf->surfaceType == SM_SURFACE_T2V3_ATI )
   {
-    v35 = v5 + 8;
-    v34 = *(_DWORD *)(v + 36);
-    v = 20;
-    v29 = 20;
+    stride = 20;
+    qglArrayObjectATI(32884, 3, 5126, 20, (int)surf->gpuVertexBuffer, surf->gpuIndexBuffer + 8);    /* positions */
   }
   else
   {
-    v6 = *(_DWORD *)(v + 36);
-    v = 32;
-    qglArrayObjectATI(32885, 3, 5126, 32, v6, v5 + 8);
-    v35 = *(_DWORD *)(v3 + 40) + 20;
-    v34 = *(_DWORD *)(v3 + 36);
-    v29 = 32;
+    stride = 32;
+    qglArrayObjectATI(32885, 3, 5126, 32, (int)surf->gpuVertexBuffer, surf->gpuIndexBuffer + 8);    /* normals */
+    qglArrayObjectATI(32884, 3, 5126, 32, (int)surf->gpuVertexBuffer, surf->gpuIndexBuffer + 20);   /* positions */
   }
-  qglArrayObjectATI(32884, 3, 5126, v29, v34, v35);
+
   if ( glConfig_ATIElementArray )
   {
     glEnableClientState(0x8768u);
-    qglArrayObjectATI(34664, 1, 5123, 0, *(_DWORD *)(v3 + 36), *(_DWORD *)(v3 + 44));
+    qglArrayObjectATI(34664, 1, 5123, 0, (int)surf->gpuVertexBuffer, surf->gpuIndexOffset);         /* indices */
     for ( i = 0; i < tess_activeStageCount; ++i )
     {
-      if ( *(_DWORD *)v3 == 18 )
+      shaderStage_t *stage;
+      GLsizei        n;
+
+      if ( surf->surfaceType == SM_SURFACE_T2V3_ATI )
       {
-        v8 = *(_DWORD *)(tess_activeStages + 4 * i);
-        if ( *(_DWORD *)(v8 + 1636) == 11 )
+        stage = *(shaderStage_t **)(tess_activeStages + 4 * i);
+        if ( stage->rgbGen == CGEN_LIGHTING_PRECALC )
         {
           if ( r_entFullbright->integer )
             qglColor3f(tr_identityLight, tr_identityLight, tr_identityLight);
@@ -1969,144 +1775,132 @@ int __cdecl RB_SurfaceStaticModelATI(int v)
         }
         else
         {
-          glColor4ubv((const GLubyte *)(v8 + 1664));
+          glColor4ubv((const GLubyte *)stage->constantColor);
         }
       }
-      v9 = *(_DWORD **)(tess_activeStages + 4 * i);
-      v10 = *(_DWORD *)(v3 + 36);
-      GL_State(v9[417]);
-      RB_SetupMultitextureATI(v9, v10, (int)v36, v);
-      v30 = *(unsigned __int16 *)(v3 + 16);
-      backEnd_pc_drawnIndexCount += v30;
+      stage=*(shaderStage_t **)(tess_activeStages+4*i);
+      GL_State(stage->stateBits);
+      RB_SetupMultitextureATI(stage, (int)surf->gpuVertexBuffer, texEnv, stride);
+      n = surf->indexCount;
+      backEnd_pc_drawnIndexCount += n;
       ++backEnd_pc_drawCallCount;
-      glDrawElementArrayATI(4, v30);
+      glDrawElementArrayATI(4, n);
     }
-    v11 = r_showtris->integer;
-    if ( v11 )
+    if ( r_showtris->integer )
     {
-      if ( (v11 & 1) != 0 )
-        glDepthRange(0.0, 0.1000000014901161);
-      v12 = *(_DWORD **)(tr_showTrisShader + 340);
-      v13 = *(_DWORD *)(v3 + 36);
-      GL_State(v12[417]);
-      RB_SetupMultitextureATI(v12, v13, (int)v36, v);
-      if ( r_showtris->integer < 5 )
+      GLsizei n;
+
+      if ( (r_showtris->integer & 1) != 0 )
+        glDepthRange(0.0, 0.10000000149011612);   /* (double)0.1f = 0x3FB99999A0000000, retail 0x00505E4F */
+      GL_State(R_ShaderStages(tr_showTrisShader)[0]->stateBits);
+      RB_SetupMultitextureATI(R_ShaderStages(tr_showTrisShader)[0], (int)surf->gpuVertexBuffer, texEnv, stride);
+      if ( r_showtris->integer >= 5 )
       {
-        v27 = tr_identityLight * 0.75;
-        v25 = tr_identityLight * 0.5;
-        qglColor3f(v25, v27, tr_identityLight);
+        float color;
+        RB_ChooseSurfaceCountColor(surf->indexCount, &color);
+        glColor4ubv((const GLubyte *)&color);
       }
       else
       {
-        RB_ChooseSurfaceCountColor(*(unsigned __int16 *)(v3 + 16), &v);
-        glColor4ubv((const GLubyte *)&v);
+        float green = tr_identityLight * 0.75f;
+        float red   = tr_identityLight * 0.5f;
+        qglColor3f(red, green, tr_identityLight);
       }
-      v31 = *(unsigned __int16 *)(v3 + 16);
-      backEnd_pc_drawnIndexCount += v31;
+      n = surf->indexCount;
+      backEnd_pc_drawnIndexCount += n;
       ++backEnd_pc_drawCallCount;
-      glDrawElementArrayATI(4, v31);
+      glDrawElementArrayATI(4, n);
       glDepthRange(0.0, 1.0);
     }
     glDisableClientState(0x8768u);
-    goto LABEL_40;
   }
-  for ( j = 0; j < tess_activeStageCount; ++j )
+  else
   {
-    if ( *(_DWORD *)v3 == 18 )
+    for ( i = 0; i < tess_activeStageCount; ++i )
     {
-      v15 = *(_DWORD *)(tess_activeStages + 4 * j);
-      if ( *(_DWORD *)(v15 + 1636) != 11 )
+      shaderStage_t *stage;
+      GLsizei        n;
+
+      if ( surf->surfaceType == SM_SURFACE_T2V3_ATI )
       {
-        v16 = (const GLubyte *)(v15 + 1664);
-        goto LABEL_31;
+        stage = *(shaderStage_t **)(tess_activeStages + 4 * i);
+        if ( stage->rgbGen == CGEN_LIGHTING_PRECALC )
+        {
+          if ( r_entFullbright->integer )
+            qglColor3f(tr_identityLight, tr_identityLight, tr_identityLight);
+          else
+            glColor4ubv((const GLubyte *)(backEnd_currentEntity + 108));
+        }
+        else
+        {
+          glColor4ubv((const GLubyte *)stage->constantColor);
+        }
       }
-      if ( !r_entFullbright->integer )
+      stage=*(shaderStage_t **)(tess_activeStages+4*i);
+      GL_State(stage->stateBits);
+      RB_SetupMultitextureATI(stage, (int)surf->gpuVertexBuffer, texEnv, stride);
+      n = surf->indexCount;
+      backEnd_pc_drawnIndexCount += n;
+      ++backEnd_pc_drawCallCount;
+      glDrawElements(4u, n, 0x1403u, (const GLvoid *)surf->indices);
+    }
+    if ( r_showtris->integer )
+    {
+      GLsizei n;
+
+      if ( (r_showtris->integer & 1) != 0 )
+        glDepthRange(0.0, 0.10000000149011612);   /* (double)0.1f = 0x3FB99999A0000000, retail 0x00506009 */
+      GL_State(R_ShaderStages(tr_showTrisShader)[0]->stateBits);
+      RB_SetupMultitextureATI(R_ShaderStages(tr_showTrisShader)[0], (int)surf->gpuVertexBuffer, texEnv, stride);
+      if ( r_showtris->integer >= 5 )
       {
-        v16 = (const GLubyte *)(backEnd_currentEntity + 108);
-LABEL_31:
-        glColor4ubv(v16);
-        goto LABEL_32;
+        float color;
+        RB_ChooseSurfaceCountColor(surf->indexCount, &color);
+        glColor4ubv((const GLubyte *)&color);
       }
-      qglColor3f(tr_identityLight, tr_identityLight, tr_identityLight);
+      else
+      {
+        float green = tr_identityLight * 0.75f;
+        float red   = tr_identityLight * 0.5f;
+        qglColor3f(red, green, tr_identityLight);
+      }
+      n = surf->indexCount;
+      backEnd_pc_drawnIndexCount += n;
+      ++backEnd_pc_drawCallCount;
+      glDrawElements(4u, n, 0x1403u, (const GLvoid *)surf->indices);
+      glDepthRange(0.0, 1.0);
     }
-LABEL_32:
-    v17 = *(_DWORD **)(tess_activeStages + 4 * j);
-    v18 = *(_DWORD *)(v3 + 36);
-    GL_State(v17[417]);
-    RB_SetupMultitextureATI(v17, v18, (int)v36, v);
-    v19 = *(unsigned __int16 *)(v3 + 16);
-    v32 = *(const GLvoid **)(v3 + 32);
-    backEnd_pc_drawnIndexCount += v19;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v19, 0x1403u, v32);
   }
-  v20 = r_showtris->integer;
-  if ( v20 )
-  {
-    if ( (v20 & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    v21 = *(_DWORD **)(tr_showTrisShader + 340);
-    v22 = *(_DWORD *)(v3 + 36);
-    GL_State(v21[417]);
-    RB_SetupMultitextureATI(v21, v22, (int)v36, v);
-    if ( r_showtris->integer < 5 )
-    {
-      v28 = tr_identityLight * 0.75;
-      v26 = tr_identityLight * 0.5;
-      qglColor3f(v26, v28, tr_identityLight);
-    }
-    else
-    {
-      RB_ChooseSurfaceCountColor(*(unsigned __int16 *)(v3 + 16), &v);
-      glColor4ubv((const GLubyte *)&v);
-    }
-    v23 = *(unsigned __int16 *)(v3 + 16);
-    v33 = *(const GLvoid **)(v3 + 32);
-    backEnd_pc_drawnIndexCount += v23;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v23, 0x1403u, v33);
-    glDepthRange(0.0, 1.0);
-  }
-LABEL_40:
   if ( Stream )
     fprintf(Stream, "%s", (int)"----------\n");
-  backEnd_pc_indexCount += *(unsigned __int16 *)(v3 + 16);
-  result = *(unsigned __int16 *)(v3 + 18);
+  backEnd_pc_indexCount += surf->indexCount;
+  result = surf->vertexCount;
   backEnd_pc_vertexCount += result;
   return result;
 }
 
-/* ---- RB_SurfaceStaticModelT2V3_NV  0x00506130 ----  VERIFIED */
-int __cdecl RB_SurfaceStaticModelT2V3_NV(int v)
+/* ---- RB_SurfaceStaticModelT2V3_NV  0x00506130 ----  VERIFIED
+ * Draw a T2V3 merged surface through the NV vertex-array-range path (vertices in
+ * a raw pointer buffer, indices in system memory). */
+int __cdecl RB_SurfaceStaticModelT2V3_NV(int surface)
 {
-  void *v1;
-  int v2;
-  int v3;
-  int v4;
-  _DWORD *v5;
-  GLsizei v6;
-  int integer;
-  _DWORD *v8;
-  GLsizei v9;
-  int result;
-  float v11;
-  float v12;
-  const GLvoid *v13;
-  const GLvoid *v14;
-  _DWORD v15[8]; // [esp+4Ch] [ebp-20h] BYREF
+  smSurface_t   *surf = (smSurface_t *)surface;
+  int            i;
+  int            result;
+  int            texEnv[8];   // v15
+  shaderStage_t *stage;
 
   if ( Stream )
     fprintf(Stream, "%s", (int)"--- RB_SurfaceStaticModelT2V3_NV ---\n");
   RB_SetIteratorFog();
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
+  GL_Cull(R_ShaderCullType(tess_shader));
   GL_ClientState(1025);
-  v2 = v;
-  glVertexPointer(3, 0x1406u, 20, (const GLvoid *)(*(_DWORD *)(v + 36) + 8));
-  v3 = 0;
-  for ( v15[0] = *(_DWORD *)(v2 + 36); v3 < tess_activeStageCount; ++v3 )
+  glVertexPointer(3, 0x1406u, 20, (const GLvoid *)((char *)surf->gpuVertexBuffer + 8));
+  texEnv[0] = (int)surf->gpuVertexBuffer;
+  for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v4 = *(_DWORD *)(tess_activeStages + 4 * v3);
-    if ( *(_DWORD *)(v4 + 1636) == 11 )
+    stage = *(shaderStage_t **)(tess_activeStages + 4 * i);
+    if ( stage->rgbGen == CGEN_LIGHTING_PRECALC )
     {
       if ( r_entFullbright->integer )
         qglColor3f(tr_identityLight, tr_identityLight, tr_identityLight);
@@ -2115,152 +1909,120 @@ int __cdecl RB_SurfaceStaticModelT2V3_NV(int v)
     }
     else
     {
-      glColor4ubv((const GLubyte *)(v4 + 1664));
+      glColor4ubv((const GLubyte *)stage->constantColor);
     }
-    v5 = *(_DWORD **)(tess_activeStages + 4 * v3);
-    GL_State(v5[417]);
-    RB_SetupMultitexture(v5, (int)v15, 20);
-    v6 = *(unsigned __int16 *)(v2 + 16);
-    v13 = *(const GLvoid **)(v2 + 32);
-    backEnd_pc_drawnIndexCount += v6;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v6, 0x1403u, v13);
+    stage = *(shaderStage_t **)(tess_activeStages + 4 * i);   /* retail re-reads the stage pointer */
+    GL_State(stage->stateBits);
+    RB_SetupMultitexture(stage, texEnv, 20);
+    GL_DrawElements(surf->indexCount, 4u, 0x1403u, surf->indices);
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  if ( r_showtris->integer )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    v8 = *(_DWORD **)(tr_showTrisShader + 340);
-    GL_State(v8[417]);
-    RB_SetupMultitexture(v8, (int)v15, 20);
-    if ( r_showtris->integer < 5 )
+    if ( (r_showtris->integer & 1) != 0 )
+      glDepthRange(0.0, 0.10000000149011612);   /* (double)0.1f = 0x3FB99999A0000000, retail 0x0050626D */
+    stage = R_ShaderStages(tr_showTrisShader)[0];
+    GL_State(stage->stateBits);
+    RB_SetupMultitexture(stage, texEnv, 20);
+    if ( r_showtris->integer >= 5 )
     {
-      v12 = tr_identityLight * 0.75;
-      v11 = tr_identityLight * 0.5;
-      qglColor3f(v11, v12, tr_identityLight);
+      float color;   /* block-scoped: shares the dead surface slot as in retail */
+
+      RB_ChooseSurfaceCountColor(surf->indexCount, &color);
+      glColor4ubv((const GLubyte *)&color);
     }
     else
     {
-      RB_ChooseSurfaceCountColor(*(unsigned __int16 *)(v2 + 16), &v);
-      glColor4ubv((const GLubyte *)&v);
+      qglColor3f(tr_identityLight * 0.5f, tr_identityLight * 0.75f, tr_identityLight);
     }
-    v9 = *(unsigned __int16 *)(v2 + 16);
-    v14 = *(const GLvoid **)(v2 + 32);
-    backEnd_pc_drawnIndexCount += v9;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v9, 0x1403u, v14);
+    GL_DrawElements(surf->indexCount, 4u, 0x1403u, surf->indices);
     glDepthRange(0.0, 1.0);
   }
   if ( Stream )
     fprintf(Stream, "%s", (int)"----------\n");
-  backEnd_pc_indexCount += *(unsigned __int16 *)(v2 + 16);
-  result = *(unsigned __int16 *)(v2 + 18);
+  backEnd_pc_indexCount += surf->indexCount;
+  result = surf->vertexCount;
   backEnd_pc_vertexCount += result;
   return result;
 }
 
-/* ---- RB_SurfaceStaticModelT2N3V3_Generic  0x00506390 ----  VERIFIED */
-int __cdecl RB_SurfaceStaticModelT2N3V3_Generic(int a1)
+/* ---- RB_SurfaceStaticModelT2N3V3_Generic  0x00506390 ----  VERIFIED
+ * Draw a T2N3V3 merged surface through the fixed-function path (interleaved
+ * pointer arrays, indices in system memory).  Normals carry lighting, so stages
+ * just set state and draw; r_showtris binds the debug image. */
+int __cdecl RB_SurfaceStaticModelT2N3V3_Generic(int surface)
 {
-  float v;
-  void *v1;
-  int v2;  /* the surface pointer */
-  int i;
-  _DWORD *v4;
-  int integer;
-  GLenum *AnimatedImage;
-  int result;
-  GLsizei v8;
-  GLsizei v9;
-  const GLvoid *v10;
-  const GLvoid *v11;
-  _DWORD v12[8]; // [esp+1Ch] [ebp-20h] BYREF
+  smSurface_t *surf = (smSurface_t *)surface;
+  int          i;
+  int          result;
+  int          texEnv[8];   // v12
 
   if ( Stream )
     fprintf(Stream, "%s", (int)"--- RB_SurfaceStaticModelT2N3V3_Generic ---\n");
   RB_SetIteratorFog();
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
+  GL_Cull(R_ShaderCullType(tess_shader));
   GL_ClientState(1537);
-  v2 = a1;
-  glNormalPointer(0x1406u, 32, (const GLvoid *)(*(_DWORD *)(a1 + 36) + 8));
-  glVertexPointer(3, 0x1406u, 32, (const GLvoid *)(*(_DWORD *)(v2 + 36) + 20));
-  v12[0] = *(_DWORD *)(v2 + 36);
+  glNormalPointer(0x1406u, 32, (const GLvoid *)((char *)surf->gpuVertexBuffer + 8));
+  glVertexPointer(3, 0x1406u, 32, (const GLvoid *)((char *)surf->gpuVertexBuffer + 20));
+  texEnv[0] = (int)surf->gpuVertexBuffer;
   for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v4 = *(_DWORD **)(tess_activeStages + 4 * i);
-    GL_State(v4[417]);
-    RB_SetupMultitexture(v4, (int)v12, 32);
-    v10 = *(const GLvoid **)(v2 + 32);
-    v8 = *(unsigned __int16 *)(v2 + 16);
-    backEnd_pc_drawnIndexCount += v8;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v8, 0x1403u, v10);
+    shaderStage_t *stage = *(shaderStage_t **)(tess_activeStages + 4 * i);
+
+    GL_State(stage->stateBits);
+    RB_SetupMultitexture(stage, texEnv, 32);
+    GL_DrawElements(surf->indexCount, 4u, 0x1403u, surf->indices);
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  if ( r_showtris->integer )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    GL_State(*(_DWORD *)(*(_DWORD *)(tr_showTrisShader + 340) + 1668));
-    AnimatedImage = (GLenum *)RB_GetAnimatedImage(glState_currentTmu, *(_DWORD *)(tr_showTrisShader + 340) + 4, glState_currentTmu);
-    GL_Bind(AnimatedImage);
-    if ( r_showtris->integer < 5 )
+    if ( (r_showtris->integer & 1) != 0 )
+      glDepthRange(0.0, 0.10000000149011612);   /* (double)0.1f = 0x3FB99999A0000000, retail 0x00506493 */
+    GL_State(R_ShaderStages(tr_showTrisShader)[0]->stateBits);
+    RB_BindAnimatedImage(&R_ShaderStages(tr_showTrisShader)[0]->bundle);
+    if ( r_showtris->integer >= 5 )
     {
-      v = tr_identityLight * 0.25;
-      qglColor3f(v, v, tr_identityLight);
+      float color;   /* block-scoped: shares the dead surface slot as in retail */
+
+      RB_ChooseSurfaceCountColor(surf->indexCount, &color);
+      glColor4ubv((const GLubyte *)&color);
     }
     else
     {
-      RB_ChooseSurfaceCountColor(*(unsigned __int16 *)(v2 + 16), &v);
-      glColor4ubv((const GLubyte *)&v);
+      float color = tr_identityLight * 0.25f;
+
+      qglColor3f(color, color, tr_identityLight);
     }
-    v11 = *(const GLvoid **)(v2 + 32);
-    v9 = *(unsigned __int16 *)(v2 + 16);
-    backEnd_pc_drawnIndexCount += v9;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v9, 0x1403u, v11);
+    GL_DrawElements(surf->indexCount, 4u, 0x1403u, surf->indices);
     glDepthRange(0.0, 1.0);
   }
   if ( Stream )
     fprintf(Stream, "%s", (int)"----------\n");
-  backEnd_pc_indexCount += *(unsigned __int16 *)(v2 + 16);
-  result = *(unsigned __int16 *)(v2 + 18);
+  backEnd_pc_indexCount += surf->indexCount;
+  result = surf->vertexCount;
   backEnd_pc_vertexCount += result;
   return result;
 }
 
-/* ---- RB_SurfaceStaticModelT2V3_Generic  0x005065C0 ----  VERIFIED */
-int __cdecl RB_SurfaceStaticModelT2V3_Generic(int v)
+/* ---- RB_SurfaceStaticModelT2V3_Generic  0x005065C0 ----  VERIFIED
+ * Fixed-function T2V3 draw (same shape as the NV T2V3 path). */
+int __cdecl RB_SurfaceStaticModelT2V3_Generic(int surface)
 {
-  void *v1;
-  int v2;
-  int v3;
-  int v4;
-  _DWORD *v5;
-  GLsizei v6;
-  int integer;
-  _DWORD *v8;
-  GLsizei v9;
-  int result;
-  float v11;
-  float v12;
-  const GLvoid *v13;
-  const GLvoid *v14;
-  _DWORD v15[8]; // [esp+4Ch] [ebp-20h] BYREF
+  smSurface_t   *surf = (smSurface_t *)surface;
+  int            i;
+  int            result;
+  int            texEnv[8];   // v15
+  shaderStage_t *stage;
 
   if ( Stream )
     fprintf(Stream, "%s", (int)"--- RB_SurfaceStaticModelT2V3_Generic ---\n");
   RB_SetIteratorFog();
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
+  GL_Cull(R_ShaderCullType(tess_shader));
   GL_ClientState(1025);
-  v2 = v;
-  glVertexPointer(3, 0x1406u, 20, (const GLvoid *)(*(_DWORD *)(v + 36) + 8));
-  v3 = 0;
-  for ( v15[0] = *(_DWORD *)(v2 + 36); v3 < tess_activeStageCount; ++v3 )
+  glVertexPointer(3, 0x1406u, 20, (const GLvoid *)((char *)surf->gpuVertexBuffer + 8));
+  texEnv[0] = (int)surf->gpuVertexBuffer;
+  for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v4 = *(_DWORD *)(tess_activeStages + 4 * v3);
-    if ( *(_DWORD *)(v4 + 1636) == 11 )
+    stage = *(shaderStage_t **)(tess_activeStages + 4 * i);
+    if ( stage->rgbGen == CGEN_LIGHTING_PRECALC )
     {
       if ( r_entFullbright->integer )
         qglColor3f(tr_identityLight, tr_identityLight, tr_identityLight);
@@ -2269,402 +2031,278 @@ int __cdecl RB_SurfaceStaticModelT2V3_Generic(int v)
     }
     else
     {
-      glColor4ubv((const GLubyte *)(v4 + 1664));
+      glColor4ubv((const GLubyte *)stage->constantColor);
     }
-    v5 = *(_DWORD **)(tess_activeStages + 4 * v3);
-    GL_State(v5[417]);
-    RB_SetupMultitexture(v5, (int)v15, 20);
-    v6 = *(unsigned __int16 *)(v2 + 16);
-    v13 = *(const GLvoid **)(v2 + 32);
-    backEnd_pc_drawnIndexCount += v6;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v6, 0x1403u, v13);
+    stage = *(shaderStage_t **)(tess_activeStages + 4 * i);   /* retail re-reads the stage pointer */
+    GL_State(stage->stateBits);
+    RB_SetupMultitexture(stage, texEnv, 20);
+    GL_DrawElements(surf->indexCount, 4u, 0x1403u, surf->indices);
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  if ( r_showtris->integer )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    v8 = *(_DWORD **)(tr_showTrisShader + 340);
-    GL_State(v8[417]);
-    RB_SetupMultitexture(v8, (int)v15, 20);
-    if ( r_showtris->integer < 5 )
+    if ( (r_showtris->integer & 1) != 0 )
+      glDepthRange(0.0, 0.10000000149011612);   /* (double)0.1f = 0x3FB99999A0000000, retail 0x005066FD */
+    stage = R_ShaderStages(tr_showTrisShader)[0];
+    GL_State(stage->stateBits);
+    RB_SetupMultitexture(stage, texEnv, 20);
+    if ( r_showtris->integer >= 5 )
     {
-      v12 = tr_identityLight * 0.75;
-      v11 = tr_identityLight * 0.5;
-      qglColor3f(v11, v12, tr_identityLight);
+      float color;   /* block-scoped: shares the dead surface slot as in retail */
+
+      RB_ChooseSurfaceCountColor(surf->indexCount, &color);
+      glColor4ubv((const GLubyte *)&color);
     }
     else
     {
-      RB_ChooseSurfaceCountColor(*(unsigned __int16 *)(v2 + 16), &v);
-      glColor4ubv((const GLubyte *)&v);
+      qglColor3f(tr_identityLight * 0.5f, tr_identityLight * 0.75f, tr_identityLight);
     }
-    v9 = *(unsigned __int16 *)(v2 + 16);
-    v14 = *(const GLvoid **)(v2 + 32);
-    backEnd_pc_drawnIndexCount += v9;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v9, 0x1403u, v14);
+    GL_DrawElements(surf->indexCount, 4u, 0x1403u, surf->indices);
     glDepthRange(0.0, 1.0);
   }
   if ( Stream )
     fprintf(Stream, "%s", (int)"----------\n");
-  backEnd_pc_indexCount += *(unsigned __int16 *)(v2 + 16);
-  result = *(unsigned __int16 *)(v2 + 18);
+  backEnd_pc_indexCount += surf->indexCount;
+  result = surf->vertexCount;
   backEnd_pc_vertexCount += result;
   return result;
 }
 
-/* ---- RB_SurfaceStaticModelT2N3V3_NV  0x00506820 ----  VERIFIED */
-int __cdecl RB_SurfaceStaticModelT2N3V3_NV(int a1)
+/* ---- RB_SurfaceStaticModelT2N3V3_NV  0x00506820 ----  VERIFIED
+ * NV T2N3V3 draw (same shape as the fixed-function T2N3V3 path). */
+int __cdecl RB_SurfaceStaticModelT2N3V3_NV(int surface)
 {
-  float v;
-  void *v1;
-  int v2;  /* the surface pointer */
-  int i;
-  _DWORD *v4;
-  int integer;
-  GLenum *AnimatedImage;
-  int result;
-  GLsizei v8;
-  GLsizei v9;
-  const GLvoid *v10;
-  const GLvoid *v11;
-  _DWORD v12[8]; // [esp+1Ch] [ebp-20h] BYREF
+  smSurface_t *surf = (smSurface_t *)surface;
+  int          i;
+  int          result;
+  int          texEnv[8];   // v12
 
   if ( Stream )
     fprintf(Stream, "%s", (int)"--- RB_SurfaceStaticModelT2N3V3_NV ---\n");
   RB_SetIteratorFog();
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
+  GL_Cull(R_ShaderCullType(tess_shader));
   GL_ClientState(1537);
-  v2 = a1;
-  glNormalPointer(0x1406u, 32, (const GLvoid *)(*(_DWORD *)(a1 + 36) + 8));
-  glVertexPointer(3, 0x1406u, 32, (const GLvoid *)(*(_DWORD *)(v2 + 36) + 20));
-  v12[0] = *(_DWORD *)(v2 + 36);
+  glNormalPointer(0x1406u, 32, (const GLvoid *)((char *)surf->gpuVertexBuffer + 8));
+  glVertexPointer(3, 0x1406u, 32, (const GLvoid *)((char *)surf->gpuVertexBuffer + 20));
+  texEnv[0] = (int)surf->gpuVertexBuffer;
   for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v4 = *(_DWORD **)(tess_activeStages + 4 * i);
-    GL_State(v4[417]);
-    RB_SetupMultitexture(v4, (int)v12, 32);
-    v10 = *(const GLvoid **)(v2 + 32);
-    v8 = *(unsigned __int16 *)(v2 + 16);
-    backEnd_pc_drawnIndexCount += v8;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v8, 0x1403u, v10);
+    shaderStage_t *stage = *(shaderStage_t **)(tess_activeStages + 4 * i);
+
+    GL_State(stage->stateBits);
+    RB_SetupMultitexture(stage, texEnv, 32);
+    GL_DrawElements(surf->indexCount, 4u, 0x1403u, surf->indices);
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  if ( r_showtris->integer )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    GL_State(*(_DWORD *)(*(_DWORD *)(tr_showTrisShader + 340) + 1668));
-    AnimatedImage = (GLenum *)RB_GetAnimatedImage(glState_currentTmu, *(_DWORD *)(tr_showTrisShader + 340) + 4, glState_currentTmu);
-    GL_Bind(AnimatedImage);
-    if ( r_showtris->integer < 5 )
+    if ( (r_showtris->integer & 1) != 0 )
+      glDepthRange(0.0, 0.10000000149011612);   /* (double)0.1f = 0x3FB99999A0000000, retail 0x00506923 */
+    GL_State(R_ShaderStages(tr_showTrisShader)[0]->stateBits);
+    RB_BindAnimatedImage(&R_ShaderStages(tr_showTrisShader)[0]->bundle);
+    if ( r_showtris->integer >= 5 )
     {
-      v = tr_identityLight * 0.25;
-      qglColor3f(v, v, tr_identityLight);
+      float color;   /* block-scoped: shares the dead surface slot as in retail */
+
+      RB_ChooseSurfaceCountColor(surf->indexCount, &color);
+      glColor4ubv((const GLubyte *)&color);
     }
     else
     {
-      RB_ChooseSurfaceCountColor(*(unsigned __int16 *)(v2 + 16), &v);
-      glColor4ubv((const GLubyte *)&v);
+      float color = tr_identityLight * 0.25f;
+
+      qglColor3f(color, color, tr_identityLight);
     }
-    v11 = *(const GLvoid **)(v2 + 32);
-    v9 = *(unsigned __int16 *)(v2 + 16);
-    backEnd_pc_drawnIndexCount += v9;
-    ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, v9, 0x1403u, v11);
+    GL_DrawElements(surf->indexCount, 4u, 0x1403u, surf->indices);
     glDepthRange(0.0, 1.0);
   }
   if ( Stream )
     fprintf(Stream, "%s", (int)"----------\n");
-  backEnd_pc_indexCount += *(unsigned __int16 *)(v2 + 16);
-  result = *(unsigned __int16 *)(v2 + 18);
+  backEnd_pc_indexCount += surf->indexCount;
+  result = surf->vertexCount;
   backEnd_pc_vertexCount += result;
   return result;
 }
 
-/* ---- R_RefreshStaticModels_ARB  0x00506A50 ----  VERIFIED */
-int __cdecl R_RefreshStaticModels_ARB(char a1)
+/* ---- R_RefreshStaticModels_ARB  0x00506A50 ----  VERIFIED
+ * Re-upload every ARB-optimized merged surface's vertex and/or index VBO from
+ * its source arrays (refreshFlags bit 1 = vertices, bit 2 = indices).  Non-ARB surfaces
+ * (no VBOs) are skipped.  Returns tr_registeredStaticModelCount (dead EAX). */
+void __cdecl R_RefreshStaticModels_ARB(char refreshFlags)
 {
-  int result;
-  int *v2;
-  int *v3;
-  _DWORD *v4;
-  int v5;
-  _DWORD *v6;
-  _DWORD *v7;
-  char *v8;
-  int v9;
-  _DWORD *v10;
-  _DWORD *v11;
-  _DWORD *v12;
-  char *v13;
-  int v14;
-  bool v15; // cc
-  int v16;
-  char *v17;
-  int v18;
-  int v19;
-  int *v20;
-  int v21;
-  int v22;
-  int v23;
-  int *v24;
-  char v25[8192 * 20]; // [esp+2Ch] [ebp-67FF0h] BYREF -- T2V3 staging
-  char v27[8192 * 32]; // [esp+2802Ch] [ebp-3FFF0h] BYREF -- T2N3V3 staging
 
-  result = tr_registeredStaticModelCount;
-  v19 = 0;
-  if ( tr_registeredStaticModelCount > 0 )
+  int  m;
+  smVertexT2V3_t   staging20[8192];   // v25  T2V3 staging (vertex arrays, not char[]: no /GS cookie)
+  smVertexT2N3V3_t staging32[8192];   // v27  T2N3V3 staging
+
+  for ( m = 0; m < tr_registeredStaticModelCount; ++m )
   {
-    v2 = tr_registeredStaticModels;
-    v20 = tr_registeredStaticModels;
-    do
-    {
-      v22 = 0;
-      if ( *(int *)(*v2 + 4) > 0 )
-      {
-        v18 = 12;
-        do
-        {
-          v3 = *(int **)(v18 + *v2);
-          v24 = v3;
-          v21 = 0;
-          if ( *v3 > 0 )
-          {
-            v4 = v3 + 11;
-            do
-            {
-              if ( *(v4 - 1) )
-              {
-                if ( *v4 )
-                {
-                  if ( (a1 & 2) != 0 )
-                  {
-                    qglBindBufferARB(34963, *v4);
-                    qglBufferDataARB(34963, 2 * *((unsigned __int16 *)v4 - 12), *(v4 - 2), 35044);
-                    qglBindBufferARB(34963, 0);
-                  }
-                  if ( (a1 & 1) != 0 )
-                  {
-                    qglBindBufferARB(34962, *(v4 - 1));
-                    if ( *(v4 - 10) == 17 )
-                    {
-                      v5 = *((unsigned __int16 *)v4 - 11);
-                      if ( *((_WORD *)v4 - 11) )
-                      {
-                        v6 = (_DWORD *)*(v4 - 3);
-                        v7 = (_DWORD *)*(v4 - 5);
-                        v8 = &v25[4];   /* ebp-0x67FEC */
-                        do
-                        {
-                          *((_DWORD *)v8 - 1) = *v7;
-                          *(_DWORD *)v8 = v7[1];
-                          *((_DWORD *)v8 + 1) = *v6;
-                          *((_DWORD *)v8 + 2) = v6[1];
-                          *((_DWORD *)v8 + 3) = v6[2];
-                          v7 += 2;
-                          v6 += 3;
-                          v8 += 20;
-                          --v5;
-                        }
-                        while ( v5 );
-                      }
-                      v17 = v25;
-                      v16 = 20 * *((unsigned __int16 *)v4 - 11);
-                    }
-                    else
-                    {
-                      if ( *((_WORD *)v4 - 11) )
-                      {
-                        v9 = *(v4 - 4);
-                        v10 = (_DWORD *)*(v4 - 3);
-                        v11 = (_DWORD *)*(v4 - 5);
-                        v12 = (_DWORD *)(v9 + 8);
-                        v13 = &v27[4];  /* ebp-0x3FFEC */
-                        v14 = v9 - (_DWORD)v10;
-                        v23 = *((unsigned __int16 *)v4 - 11);
-                        do
-                        {
-                          *((_DWORD *)v13 - 1) = *v11;
-                          *(_DWORD *)v13 = v11[1];
-                          *((_DWORD *)v13 + 1) = *(_DWORD *)((char *)v10 + v14);
-                          *((_DWORD *)v13 + 2) = *(v12 - 1);
-                          *((_DWORD *)v13 + 3) = *v12;
-                          *((_DWORD *)v13 + 4) = *v10;
-                          *((_DWORD *)v13 + 5) = v10[1];
-                          *((_DWORD *)v13 + 6) = v10[2];
-                          v11 += 2;
-                          v12 += 3;
-                          v10 += 3;
-                          v13 += 32;
-                          --v23;
-                        }
-                        while ( v23 );
-                        v3 = v24;
-                      }
-                      v17 = v27;
-                      v16 = 32 * *((unsigned __int16 *)v4 - 11);
-                    }
-                    qglBufferDataARB(34962, v16, v17, 35044);
-                    qglBindBufferARB(34962, 0);
-                    v2 = v20;
-                  }
-                }
-              }
-              v4 += 12;
-              ++v21;
-            }
-            while ( v21 < *v3 );
-          }
-          v15 = ++v22 < *(_DWORD *)(*v2 + 4);
-          v18 += 4;
-        }
-        while ( v15 );
-      }
-      result = v19 + 1;
-      ++v2;
-      v15 = ++v19 < tr_registeredStaticModelCount;
-      v20 = v2;
-    }
-    while ( v15 );
-  }
-  return result;
-}
+    int lod;
 
-/* ---- R_IncrementalRefreshStaticModels_ARB  0x00506C80 ----  VERIFIED */
-void __cdecl R_IncrementalRefreshStaticModels_ARB(char a1)
-{
-  int v1;
-  int v2;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  _DWORD *v7;
-  _DWORD *v8;
-  _DWORD *v9;
-  int v10;
-  int v11;
-  int v12;
-  _DWORD *v13;
-  _DWORD *v14;
-  _DWORD *v15;
-  _DWORD *v16;
-  int v17;
-  int v18;
-  int v19;
-  _BYTE v20[262144]; // [esp+18h] BYREF
-
-  if ( tr_registeredStaticModelCount && !dword_14072EC )
-  {
-    v1 = tr_staticModelRefreshModelIndex;
-    v2 = tr_staticModelRefreshLodIndex;
-    v3 = tr_staticModelRefreshSurfaceIndex;
-    v4 = tr_staticModelRefreshModelIndex;
-    while ( 1 )
+    for ( lod = 0; lod < ((smRegisteredModel_t *)tr_registeredStaticModels[m])->lodCount; ++lod )
     {
-      tr_staticModelRefreshSurfaceIndex = ++v3;
-      if ( v3 >= **(_DWORD **)(tr_registeredStaticModels[v1] + 4 * v2 + 12) )
+      smSurfaceList_t *surfList = ((smRegisteredModel_t *)tr_registeredStaticModels[m])->lodSurfs[lod];
+      int              s;
+
+      for ( s = 0; s < surfList->surfaceCount; ++s )
       {
-        v3 = 0;
-        ++v2;
-        tr_staticModelRefreshSurfaceIndex = 0;
-        tr_staticModelRefreshLodIndex = v2;
-        if ( v2 >= *(_DWORD *)(tr_registeredStaticModels[v1] + 4) )
+        smSurface_t *record = &surfList->surfaces[s];
+        int          i;
+
+        if ( !record->gpuVertexBuffer || !record->gpuIndexBuffer )
+          continue;
+
+        if ( (refreshFlags & 2) != 0 )
         {
-          v2 = 0;
-          ++v1;
-          tr_staticModelRefreshLodIndex = 0;
-          tr_staticModelRefreshModelIndex = v1;
-          if ( v1 >= tr_registeredStaticModelCount )
-          {
-            v1 = 0;
-            tr_staticModelRefreshModelIndex = 0;
-          }
-          if ( v1 == v4 )
-            break;
-        }
-      }
-      v5 = *(_DWORD *)(tr_registeredStaticModels[v1] + 4 * v2 + 12) + 48 * v3 + 4;
-      if ( *(_DWORD *)(*(_DWORD *)(tr_registeredStaticModels[v1] + 4 * v2 + 12) + 48 * v3 + 40)
-        && *(_DWORD *)(*(_DWORD *)(tr_registeredStaticModels[v1] + 4 * v2 + 12) + 48 * v3 + 44) )
-      {
-        if ( (a1 & 2) != 0 )
-        {
-          qglBindBufferARB(34963, *(_DWORD *)(*(_DWORD *)(tr_registeredStaticModels[v1] + 4 * v2 + 12) + 48 * v3 + 44));
-          qglBufferDataARB(34963, 2 * *(unsigned __int16 *)(v5 + 16), 0, 35044);
-          qglBufferDataARB(34963, 2 * *(unsigned __int16 *)(v5 + 16), *(_DWORD *)(v5 + 32), 35044);
+          qglBindBufferARB(34963, record->gpuIndexBuffer);
+          qglBufferDataARB(34963, 2 * record->indexCount, (int)record->indices, 35044);
           qglBindBufferARB(34963, 0);
         }
-        if ( (a1 & 1) != 0 )
+        if ( (refreshFlags & 1) != 0 )
         {
-          qglBindBufferARB(34962, *(_DWORD *)(v5 + 36));
-          if ( *(_DWORD *)v5 == 17 )
+          qglBindBufferARB(34962, (int)record->gpuVertexBuffer);
+          if ( record->surfaceType == SM_SURFACE_T2V3_ARB )
           {
-            v6 = *(unsigned __int16 *)(v5 + 18);
-            if ( *(_WORD *)(v5 + 18) )
+            int          vertexCount = record->vertexCount;
+            const float *tc  = record->texCoords[0];
+            const float *xyz = record->vertices[0];
+            for ( i = 0; i < vertexCount; ++i )
             {
-              v7 = *(_DWORD **)(v5 + 28);
-              v8 = *(_DWORD **)(v5 + 20);
-              v9 = (_DWORD *)(v20 + 4);
-              v10 = *(unsigned __int16 *)(v5 + 18);
-              do
-              {
-                *(v9 - 1) = *v8;
-                *v9 = v8[1];
-                v9[1] = *v7;
-                v9[2] = v7[1];
-                v9[3] = v7[2];
-                v8 += 2;
-                v7 += 3;
-                v9 += 5;
-                --v10;
-              }
-              while ( v10 );
+              staging20[i].texCoord[0] = tc[0];
+              staging20[i].texCoord[1] = tc[1];
+              tc += 2;
+              staging20[i].position[0] = xyz[0];
+              staging20[i].position[1] = xyz[1];
+              staging20[i].position[2] = xyz[2];
+              xyz += 3;
             }
-            qglBufferDataARB(34962, 20 * v6, 0, 35044);
-            v18 = 20 * *(unsigned __int16 *)(v5 + 18);
+            qglBufferDataARB(34962, 20 * record->vertexCount, (int)staging20, 35044);
           }
           else
           {
-            v11 = *(unsigned __int16 *)(v5 + 18);
-            if ( *(_WORD *)(v5 + 18) )
+            int          vertexCount = record->vertexCount;
+            const float *tc  = record->texCoords[0];
+            const float (*nrm)[3] = (const float (*)[3])record->normals;
+            const float (*xyz)[3] = (const float (*)[3])record->vertices;
+            for ( i = 0; i < vertexCount; ++i, tc += 2 )
             {
-              v12 = *(_DWORD *)(v5 + 24);
-              v13 = *(_DWORD **)(v5 + 28);
-              v14 = *(_DWORD **)(v5 + 20);
-              v15 = (_DWORD *)(v12 + 8);
-              v16 = (_DWORD *)(v20 + 4);
-              v17 = v12 - (_DWORD)v13;
-              v19 = *(unsigned __int16 *)(v5 + 18);
-              do
-              {
-                *(v16 - 1) = *v14;
-                *v16 = v14[1];
-                v16[1] = *(_DWORD *)((char *)v13 + v17);
-                v16[2] = *(v15 - 1);
-                v16[3] = *v15;
-                v16[4] = *v13;
-                v16[5] = v13[1];
-                v16[6] = v13[2];
-                v14 += 2;
-                v15 += 3;
-                v13 += 3;
-                v16 += 8;
-                --v19;
-              }
-              while ( v19 );
+              staging32[i].texCoord[0] = tc[0];
+              staging32[i].texCoord[1] = tc[1];
+              staging32[i].normal[0]   = nrm[i][0];
+              staging32[i].normal[1]   = nrm[i][1];
+              staging32[i].normal[2]   = nrm[i][2];
+              staging32[i].position[0] = xyz[i][0];
+              staging32[i].position[1] = xyz[i][1];
+              staging32[i].position[2] = xyz[i][2];
             }
-            qglBufferDataARB(34962, 32 * v11, 0, 35044);
-            v18 = 32 * *(unsigned __int16 *)(v5 + 18);
+            qglBufferDataARB(34962, 32 * record->vertexCount, (int)staging32, 35044);
           }
-          qglBufferDataARB(34962, v18, v20, 35044);
           qglBindBufferARB(34962, 0);
         }
-        return;
       }
+    }
+
+  }
+  return;
+}
+
+/* ---- R_IncrementalRefreshStaticModels_ARB  0x00506C80 ----  VERIFIED
+ * Re-upload at most one ARB merged surface's VBOs per call, advancing the
+ * persistent (model, LOD, surface) cursor first (so surface 0 of each LOD is
+ * skipped, as retail does) and orphaning each buffer before the refill.  Stops
+ * when the cursor wraps all the way around without a refreshable surface. */
+void __cdecl R_IncrementalRefreshStaticModels_ARB(char refreshFlags)
+{
+  int  modelIndex;
+  int  lodIndex;
+  int  surfaceIndex;
+  int  startModel;
+
+  if ( !tr_registeredStaticModelCount || rendererPendingStaticModels )
+    return;
+
+  startModel = tr_staticModelRefreshModelIndex;
+  modelIndex = startModel;
+  lodIndex = tr_staticModelRefreshLodIndex;
+  surfaceIndex = tr_staticModelRefreshSurfaceIndex;
+
+  while ( 1 )
+  {
+    smSurface_t *record;
+    int          i;
+
+    /* tr.staticModels[] is re-read after each cursor store (one tr object), as retail */
+    tr_staticModelRefreshSurfaceIndex = ++surfaceIndex;
+    if ( surfaceIndex >= ((smRegisteredModel_t *)tr_registeredStaticModels[modelIndex])->lodSurfs[lodIndex]->surfaceCount )
+    {
+      surfaceIndex = 0;
+      ++lodIndex;
+      tr_staticModelRefreshSurfaceIndex = surfaceIndex;
+      tr_staticModelRefreshLodIndex = lodIndex;
+      if ( lodIndex >= ((smRegisteredModel_t *)tr_registeredStaticModels[modelIndex])->lodCount )
+      {
+        lodIndex = 0;
+        ++modelIndex;
+        tr_staticModelRefreshLodIndex = lodIndex;
+        tr_staticModelRefreshModelIndex = modelIndex;
+        if ( modelIndex >= tr_registeredStaticModelCount )
+        {
+          modelIndex = 0;
+          tr_staticModelRefreshModelIndex = modelIndex;
+        }
+        if ( modelIndex == startModel )
+          break;
+      }
+    }
+
+    record = &((smRegisteredModel_t *)tr_registeredStaticModels[modelIndex])->lodSurfs[lodIndex]->surfaces[surfaceIndex];
+    if ( record->gpuVertexBuffer && record->gpuIndexBuffer )
+    {
+      if ( (refreshFlags & 2) != 0 )
+      {
+        qglBindBufferARB(34963, record->gpuIndexBuffer);
+        qglBufferDataARB(34963, 2 * record->indexCount, 0, 35044);
+        qglBufferDataARB(34963, 2 * record->indexCount, (int)record->indices, 35044);
+        qglBindBufferARB(34963, 0);
+      }
+      if ( (refreshFlags & 1) != 0 )
+      {
+        qglBindBufferARB(34962, (int)record->gpuVertexBuffer);
+        /* per-format block-scoped staging arrays (retail overlaps them in one 0x40000 slot) */
+        if ( record->surfaceType == SM_SURFACE_T2V3_ARB )
+        {
+          smVertexT2V3_t staging[0x40000 / sizeof(smVertexT2V3_t)];
+
+          for ( i = 0; i < record->vertexCount; ++i )
+          {
+            staging[i].texCoord[0] = record->texCoords[i][0];
+            staging[i].texCoord[1] = record->texCoords[i][1];
+            staging[i].position[0] = record->vertices[i][0];
+            staging[i].position[1] = record->vertices[i][1];
+            staging[i].position[2] = record->vertices[i][2];
+          }
+          qglBufferDataARB(34962, 20 * record->vertexCount, 0, 35044);
+          qglBufferDataARB(34962, 20 * record->vertexCount, (int)staging, 35044);
+        }
+        else
+        {
+          smVertexT2N3V3_t staging[0x40000 / sizeof(smVertexT2N3V3_t)];
+
+          for ( i = 0; i < record->vertexCount; ++i )
+          {
+            staging[i].texCoord[0] = record->texCoords[i][0];
+            staging[i].texCoord[1] = record->texCoords[i][1];
+            staging[i].normal[0]   = record->normals[i][0];
+            staging[i].normal[1]   = record->normals[i][1];
+            staging[i].normal[2]   = record->normals[i][2];
+            staging[i].position[0] = record->vertices[i][0];
+            staging[i].position[1] = record->vertices[i][1];
+            staging[i].position[2] = record->vertices[i][2];
+          }
+          qglBufferDataARB(34962, 32 * record->vertexCount, 0, 35044);
+          qglBufferDataARB(34962, 32 * record->vertexCount, (int)staging, 35044);
+        }
+        qglBindBufferARB(34962, 0);
+      }
+      return;
     }
   }
 }

@@ -1,36 +1,24 @@
-/*
- * q_shared.h -- the engine-wide declarations every layer sees.
- *
- * Call of Duty 1.1 (Windows, CoDMP.exe).  RTCW's game/q_shared.h is the
- * structural model: everything below has a counterpart there unless a comment
- * says otherwise.
- *
- * Every layout here carries a static assertion against the size recorded in
- * the CoDMP.exe type library.  If one fires, the declaration is wrong, not the
- * assertion.
- *
- * The assertion macros live here because they have to be reachable from every
- * header a struct can land in -- q_shared.h, qcommon.h, server.h, cm_local.h,
- * cm_patch_local.h, files_local.h -- and this is the only header all of those
- * reach, directly or through qcommon.h.
- *
- * @fidelity-default: verified
- */
+// q_shared.h -- included first by ALL program modules.
+// A user mod should never modify this file
+
+// Every structure below is checked with COD1_ASSERT_SIZE; if one fires, the
+// declaration is wrong, not the assertion.  The assertion macros live here
+// because this is the one header every structure header reaches.
 
 #ifndef __Q_SHARED_H__
 #define __Q_SHARED_H__
 
-/* NULL, size_t, offsetof.  RTCW's q_shared.h opens with the C headers for
- * the same reason; without it a unit that includes only <math.h> beside
- * cg_local.h has no NULL. */
 #include <stddef.h>
+
+// FCAST / rfloat precision markers
+#include "../qcommon/vc7_compat.h"
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 #define COD1_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
 #else
-/* Pre-C11 fallback: a negative-width array typedef.  The name must be unique
- * per use, and __LINE__ only expands if it is passed through two levels of
- * macro before being pasted. */
+// pre-C11 fallback: a negative-size array typedef.  The name must be unique
+// per use, and __LINE__ only expands if it is passed through two levels of
+// macro before being pasted.
 #define COD1_SA_CAT_(a, b) a##b
 #define COD1_SA_CAT(a, b) COD1_SA_CAT_(a, b)
 #define COD1_STATIC_ASSERT(cond, msg) \
@@ -48,30 +36,23 @@ typedef enum qboolean_e
 	qtrue  = 0x1,
 } qboolean;
 
-/*
- * NOTE: the values below are the 1.1 ones; the loose cod1-types-common.h in
- * the workspace root carries an extra ERR_VID_FATAL at 1 and shifts the rest
- * up by one.  TODO: re-confirm against Com_Error's callers before anything
- * depends on the numeric values.
- */
+// parameters to the main Error routine
 typedef enum errorParm_e
 {
-	ERR_FATAL            = 0x0,
-	ERR_DROP             = 0x1,
-	ERR_SERVERDISCONNECT = 0x2,
-	ERR_DISCONNECT       = 0x3,
-	ERR_NEED_CD          = 0x4,
+	ERR_FATAL            = 0x0,     // exit the entire game with a popup window
+	ERR_DROP             = 0x1,     // print to console and disconnect from game
+	ERR_SERVERDISCONNECT = 0x2,     // don't kill server
+	ERR_DISCONNECT       = 0x3,     // client disconnected from the server
+	ERR_NEED_CD          = 0x4,     // pop up the need-cd dialog
 	ERR_AUTOUPDATE       = 0x5,
 } errorParm_t;
 
 /*
-=============================================================================
+==============================================================
 
-	VECTOR / PLANE PRIMITIVES
+MATHLIB
 
-	Q3/RTCW q_shared.h, unchanged except where noted.
-
-=============================================================================
+==============================================================
 */
 
 typedef float vec_t;
@@ -79,17 +60,15 @@ typedef float vec3_t[3];
 typedef float vec4_t[4];
 
 #ifndef M_PI
-#define M_PI        3.14159265358979323846f
+#define M_PI        3.14159265358979323846f // matches value in gcc v2 math.h
 #endif
 
+#if defined( UIDLL ) || defined( GAMEDLL ) || defined( CGAMEDLL )
+extern const vec3_t vec3_origin;
+#else
 extern vec3_t vec3_origin;
+#endif
 
-/*
- * g_color_table -- the eight colours the ^N escape selects, indexed by
- * ColorIndex().  Defined in q_shared.c, which every image compiles its own
- * copy of: 0x00541950 in the exe, 0x200555B0 in game_mp_x86.dll, 0x30060868
- * in cgame_mp_x86.dll.
- */
 extern const vec4_t g_color_table[8];
 
 #define DotProduct( x,y )           ( (x)[0]*(y)[0] + (x)[1]*(y)[1] + (x)[2]*(y)[2] )
@@ -108,46 +87,50 @@ vec_t VectorNormalize( vec3_t v );
 void AngleVectors( const vec3_t angles, vec3_t forward, vec3_t right, vec3_t up );
 void SinCos( float radians, float *sinOut, float *cosOut );
 
+qboolean Com_BitCheck( const int array[], int bitNum );
+float GetLeanFraction( float f );
+float UnGetLeanFraction( float f );
+void AddLeanToPosition( float *pos, float yaw, float leanFrac, float leanDist, float scale );
+
 /*
- * SetPlaneSignbits (0x00430C40) writes signbits as a byte at +17, and
- * BoxOnPlaneSide (0x00430C80) reads that same byte to index its lazily built
- * 8-entry jump table; type is at +16 and the whole structure is 20 bytes --
- * identical to Q3/RTCW.
- */
+==============================================================
+
+COLLISION DETECTION
+
+==============================================================
+*/
+
+// plane_t structure
+// !!! if this is changed, it must be changed in asm code too !!!
 typedef struct cplane_t
 {
 	vec3_t normal;
 	float dist;
-	byte type;                      // for fast side tests
-	byte signbits;                  // signx + (signy << 1) + (signz << 2)
+	byte type;                      // for fast side tests: 0,1,2 = axial, 3 = nonaxial
+	byte signbits;                  // signx + (signy<<1) + (signz<<2), used as lookup during collision
 	byte pad[2];
 } cplane_t;
 COD1_ASSERT_SIZE( cplane_t, 20 );
 
-/*
- * There is only one trace in 1.1 and it is the 48-byte one below, not RTCW's
- * 56-byte form with an embedded cplane_t: entityNum and partName are 16-bit,
- * allsolid/startsolid are bytes, and there is no cplane_t.
- *
- * client_t.frames[32] spans 269696 bytes, so clientSnapshot_t is 8428 and
- * playerState_t is 8400 -- which only holds if the embedded
- * serverCursorHintTrace is 48 bytes rather than 56.
- */
+// a trace is returned when a box is swept through the world
 typedef struct trace_t
 {
-	float fraction;                 /* +0x00  time completed, 1.0 = hit nothing */
-	vec3_t endpos;                  /* +0x04  final position */
-	vec3_t normal;                  /* +0x10  surface normal at impact */
-	int surfaceFlags;               /* +0x1C */
-	int contents;                   /* +0x20  UO name */
-	int material;                   /* +0x24  UO name */
-	unsigned short entityNum;       /* +0x28 */
-	unsigned short partName;        /* +0x2A */
-	unsigned short partGroup;       /* +0x2C  UO name */
-	byte allsolid;                  /* +0x2E */
-	byte startsolid;                /* +0x2F */
+	float fraction;                 // time completed, 1.0 = didn't hit anything
+	vec3_t endpos;                  // final position
+	vec3_t normal;                  // surface normal at impact, transformed to world space
+	int surfaceFlags;               // surface hit
+	int contents;                   // contents on other side of surface hit
+	int material;
+	unsigned short entityNum;       // entity the contacted surface is a part of
+	unsigned short partName;
+	unsigned short partGroup;
+	byte allsolid;
+	byte startsolid;                // if true, the initial point was in a solid area
 } trace_t;
 COD1_ASSERT_SIZE( trace_t, 48 );
+
+// trace->entityNum can also be 0 to (MAX_GENTITIES-1)
+// or ENTITYNUM_NONE, ENTITYNUM_WORLD
 
 /*
 =============================================================================
@@ -160,6 +143,7 @@ COD1_ASSERT_SIZE( trace_t, 48 );
 typedef int clipHandle_t;
 typedef int fileHandle_t;
 
+// mode parm for FS_FOpenFile
 typedef enum fsMode_t
 {
 	FS_READ        = 0x0,
@@ -176,29 +160,39 @@ typedef enum fsOrigin_t
 } fsOrigin_t;
 
 /*
-=============================================================================
+==========================================================
 
-						CVARS
+CVARS (console variables)
 
-=============================================================================
+Many variables can be used for cheating purposes, so when
+cheats is zero, force all unspecified variables to their
+default values.
+==========================================================
 */
 
 typedef int cvarHandle_t;
 
 typedef enum cvarFlags_e
 {
-	CVAR_ARCHIVE             = 0x1,
-	CVAR_USERINFO            = 0x2,
-	CVAR_SERVERINFO          = 0x4,
-	CVAR_SYSTEMINFO          = 0x8,
-	CVAR_INIT                = 0x10,
-	CVAR_LATCH               = 0x20,
-	CVAR_ROM                 = 0x40,
-	CVAR_USER_CREATED        = 0x80,
-	CVAR_TEMP                = 0x100,
-	CVAR_CHEAT               = 0x200,
-	CVAR_NORESTART           = 0x400,
-	CVAR_WOLFINFO            = 0x800,
+	CVAR_ARCHIVE             = 0x1,     // set to cause it to be saved to vars.rc
+	                                    // used for system variables, not for player
+	                                    // specific configurations
+	CVAR_USERINFO            = 0x2,     // sent to server on connect or change
+	CVAR_SERVERINFO          = 0x4,     // sent in response to front end requests
+	CVAR_SYSTEMINFO          = 0x8,     // these cvars will be duplicated on all clients
+	CVAR_INIT                = 0x10,    // don't allow change from console at all,
+	                                    // but can be set from the command line
+	CVAR_LATCH               = 0x20,    // will only change when C code next does
+	                                    // a Cvar_Get(), so it can't be changed
+	                                    // without proper initialization.  modified
+	                                    // will be set, even though the value hasn't
+	                                    // changed yet
+	CVAR_ROM                 = 0x40,    // display only, cannot be set by user at all
+	CVAR_USER_CREATED        = 0x80,    // created by a set command
+	CVAR_TEMP                = 0x100,   // can be set even when cheats are disabled, but is not archived
+	CVAR_CHEAT               = 0x200,   // can not be changed if cheats are disabled
+	CVAR_NORESTART           = 0x400,   // do not clear when a cvar_restart is issued
+	CVAR_WOLFINFO            = 0x800,   // like userinfo, but for multiplayer info
 	CVAR_UNSAFE              = 0x1000,
 	CVAR_SERVERINFO_NOUPDATE = 0x2000,
 } cvarFlags_t;
@@ -210,6 +204,8 @@ enum
 	MAX_CVARS             = 0x400,
 };
 
+// the modules that run in the virtual machine can't access the cvar_t directly,
+// so they must ask for structured updates
 typedef struct vmCvar_s
 {
 	cvarHandle_t handle;
@@ -220,17 +216,18 @@ typedef struct vmCvar_s
 } vmCvar_t;
 COD1_ASSERT_SIZE( vmCvar_t, 272 );
 
+// nothing outside the Cvar_*() functions should modify these fields!
 typedef struct cvar_s
 {
 	char            *name;
 	char            *string;
-	char            *resetString;
-	char            *latchedString;
+	char            *resetString;       // cvar_restart will reset to this value
+	char            *latchedString;     // for CVAR_LATCH vars
 	cvarFlags_t flags;
-	qboolean modified;
-	int modificationCount;
-	float value;
-	int integer;
+	qboolean modified;                  // set each time the cvar is changed
+	int modificationCount;              // incremented each time the cvar is changed
+	float value;                        // atof( string )
+	int integer;                        // atoi( string )
 	struct cvar_s   *next;
 	struct cvar_s   *hashNext;
 } cvar_t;
@@ -259,13 +256,13 @@ enum
 
 typedef enum pmtype_t
 {
-	PM_NORMAL        = 0x0,
+	PM_NORMAL        = 0x0,     // can accelerate and turn
 	PM_NORMAL_LINKED = 0x1,
-	PM_NOCLIP        = 0x2,
+	PM_NOCLIP        = 0x2,     // noclip movement
 	PM_UFO           = 0x3,
-	PM_SPECTATOR     = 0x4,
-	PM_INTERMISSION  = 0x5,
-	PM_DEAD          = 0x6,
+	PM_SPECTATOR     = 0x4,     // still run into walls
+	PM_INTERMISSION  = 0x5,     // no movement or status bar
+	PM_DEAD          = 0x6,     // no acceleration or turning, but free falling
 	PM_DEAD_LINKED   = 0x7,
 } pmtype_t;
 
@@ -286,25 +283,19 @@ typedef enum weaponstate_t
 	WEAPONSTATES_NUM             = 0xC,
 } weaponstate_t;
 
-/*
- * 24 bytes, naturally aligned (the #pragma pack is not load-bearing).  The
- * 30-byte packed form with int buttons, offHandIndex, selectedLoc and
- * remoteControlAngles is the UO/CoD2 shape, not 1.1's: client_t places
- * downloadName at 0x10A64, which walking client_t from offset 0 reaches only
- * when usercmd_t is 24 bytes (a 30-byte one lands at 0x10A6A).
- */
+// usercmd_t is sent to the server each client frame
 typedef struct usercmd_t
 {
 	int serverTime;
-	byte buttons;                   /* console, chat, ads, attack, use */
-	byte wbuttons;                  /* lean left, lean right, reload */
+	byte buttons;                   // console, chat, ads, attack, use
+	byte wbuttons;                  // lean left, lean right, reload
 	byte weapon;
 	byte flags;
 	int angles[3];
 	signed char forwardmove;
 	signed char rightmove;
 	signed char upmove;
-	byte unknown;                   /* TODO: unidentified trailing byte */
+	byte reserved_0x17;             // unused
 } usercmd_t;
 COD1_ASSERT_SIZE( usercmd_t, 24 );
 
@@ -318,49 +309,39 @@ typedef struct objective_t
 } objective_t;
 COD1_ASSERT_SIZE( objective_t, 28 );
 
-/*
- * One script-created HUD element as it travels in playerState_t.hud.
- *
- * These 112 bytes are the first 112 of game_mp/g_local.h's 124-byte
- * g_hudelem_t (the field table at 0x200558D0, HudElem_SetDefaults and the
- * HECmd_* setters); HudElem_UpdateClient (0x20022760) copies exactly 0x70 of
- * it into ps.hud, dropping the three server-only words.  Member names follow
- * United Offensive's; CoD 1.1 carries no symbols for them.
- *
- * color / fromColor are four bytes here because that is how the client reads
- * them (0x3001F31E / 0x3001F326, one channel at a time); g_hudelem_t spells
- * the same four bytes as one packed int, which is how the server writes them.
- */
+// a script-created HUD element as it is sent in playerState_t.hud: the
+// leading 112 bytes of the server's g_hudelem_t.  The server writes
+// color / fromColor as one packed int; the client reads them a byte at a time.
 typedef struct hudelem_t
 {
-	int type;                       /* +0x00 hudElemType_t; 0 = free slot */
-	int x;                          /* +0x04 CG_HudElemX 0x3001EFCF */
-	int y;                          /* +0x08 CG_HudElemY 0x3001F03F */
-	float fontScale;                /* +0x0C CG_GetHudElemInfo 0x3001F140 */
-	int font;                       /* +0x10 0x3001F129 */
-	int alignX;                     /* +0x14 CG_HudElemX 0x3001EFF8 */
-	int alignY;                     /* +0x18 CG_HudElemY 0x3001F068 */
-	byte color[4];                  /* +0x1C */
-	byte fromColor[4];              /* +0x20 the fadeOverTime source colour */
-	int fadeStartTime;              /* +0x24 0x3001F30F */
-	int fadeTime;                   /* +0x28 0x3001F2FB */
-	int label;                      /* +0x2C localized string index, 0x3001F1AE */
-	int width;                      /* +0x30 CG_HudElemShaderWidth 0x3001EE23 */
-	int height;                     /* +0x34 CG_HudElemShaderHeight 0x3001EE93 */
-	int materialIndex;              /* +0x38 CG_DrawHudElemShader 0x3001F70B */
-	int scaleFromWidth;             /* +0x3C 0x3001EE53 */
-	int scaleFromHeight;            /* +0x40 0x3001EEC3 */
-	int scaleStartTime;             /* +0x44 0x3001EE48 */
-	int scaleTime;                  /* +0x48 0x3001EE37 */
-	int moveFromX;                  /* +0x4C 0x3001EFCC */
-	int moveFromY;                  /* +0x50 0x3001F03C */
-	int moveStartTime;              /* +0x54 0x3001EFC5 */
-	int moveTime;                   /* +0x58 0x3001EFB3 */
-	int timerValue;                 /* +0x5C CG_GetHudElemTime 0x3001EC8A */
-	int rotationPeriodMs;           /* +0x60 CG_DrawHudElemClock 0x3001F5BD */
-	float value;                    /* +0x64 CG_GetHudElemInfo 0x3001F237 */
-	int text;                       /* +0x68 localized string index, 0x3001F20E */
-	float sortKey;                  /* +0x6C compare_hudelems 0x3001F8EA */
+	int type;                       // hudElemType_t; 0 = free slot
+	int x;
+	int y;
+	float fontScale;
+	int font;
+	int alignX;
+	int alignY;
+	byte color[4];
+	byte fromColor[4];              // fadeOverTime source colour
+	int fadeStartTime;
+	int fadeTime;
+	int label;                      // localized string index
+	int width;
+	int height;
+	int materialIndex;
+	int scaleFromWidth;
+	int scaleFromHeight;
+	int scaleStartTime;
+	int scaleTime;
+	int moveFromX;
+	int moveFromY;
+	int moveStartTime;
+	int moveTime;
+	int timerValue;
+	int rotationPeriodMs;
+	float value;
+	int text;                       // localized string index
+	float sortKey;
 } hudelem_t;
 COD1_ASSERT_SIZE( hudelem_t, 112 );
 
@@ -371,91 +352,110 @@ typedef struct hudElemState_t
 } hudElemState_t;
 COD1_ASSERT_SIZE( hudElemState_t, 6944 );
 
+// playerState_t is the information needed by both the client and server
+// to predict player motion and actions
+// nothing outside of pmove should modify these, or some degree of prediction error
+// will occur
+
+// you can't add anything to this without modifying the code in msg.c
+
+// playerState_t is a full superset of entityState_t as it is used by players,
+// so if a playerState_t is transmitted, the entityState_t can be fully derived
+// from it.
 typedef struct playerState_s
 {
-	int commandTime;
+	int commandTime;                // cmd->serverTime of last executed command
 	pmtype_t pm_type;
 	int bobCycle;                   // for view bobbing and footstep generation
-	int pm_flags;
+	int pm_flags;                   // ducked, jump_held, etc
 	int pm_time;
 	vec3_t origin;
 	vec3_t velocity;
 	int weaponTime;
-	int weaponDelay;
-	int grenadeTimeLeft;
+	int weaponDelay;                // for weapons that don't fire immediately when 'fire' is hit (grenades, venom, ...)
+	int grenadeTimeLeft;            // for delayed grenade throwing.  this is set to a #define for grenade
+	                                // lifetime when the attack button goes down, then when attack is released
+	                                // this is the amount of time left before the grenade goes off (or if it
+	                                // gets to 0 while in players hand, it explodes)
 	int iFoliageSoundTime;
 	int gravity;
-	float leanf;
+	float leanf;                    // amount of 'lean' when player is looking around corner
 	int speed;
-	// add to command angles to get view direction.  SHORT angle units held in
-	// dwords, not floats: PM_UpdateViewAngles stores `16000 - cmd->angles[i]`
-	// as an integer (0x2000B1CE) and accumulates `+= ANGLE2SHORT(...)` with an
-	// integer add (0x2000B2EB).  msg_mp.c nets all three at 16 bits.
-	int delta_angles[3];
-	int groundEntityNum;
+	int delta_angles[3];            // add to command angles to get view direction
+	                                // changed by spawns, rotating objects, and teleporters
+	int groundEntityNum;            // ENTITYNUM_NONE = in air
 	vec3_t vLadderVec;
 	int jumpTime;
 	float fJumpOriginZ;
-	int legsTimer;
-	int legsAnim;
-	int torsoTimer;
-	int torsoAnim;
-	int movementDir;
-	int eFlags;
-	int eventSequence;
+	int legsTimer;                  // don't change low priority animations until this runs out
+	int legsAnim;                   // mask off ANIM_TOGGLEBIT
+	int torsoTimer;                 // don't change low priority animations until this runs out
+	int torsoAnim;                  // mask off ANIM_TOGGLEBIT
+	int movementDir;                // a number 0 to 7 that represents the reletive angle
+	                                // of movement to the view angle (axial and diagonals)
+	                                // when at rest, the value will remain unchanged
+	                                // used to twist the legs during strafing
+	int eFlags;                     // copied to entityState_t->eFlags
+	int eventSequence;              // pmove generated events
 	int events[4];
 	int eventParms[4];
-	int oldEventSequence;
-	int clientNum;
-	unsigned int weapon;
+	int oldEventSequence;           // so we can see which events have been added since we last converted to entityState_t
+	int clientNum;                  // ranges from 0 to MAX_CLIENTS-1
+
+	// weapon info
+	unsigned int weapon;            // copied to entityState_t->weapon
 	weaponstate_t weaponstate;
 	float fWeaponPosFrac;
 	int viewmodelIndex;
-	vec3_t viewangles;
+	vec3_t viewangles;              // for fixed views
 	int viewHeightTarget;
 	float viewHeightCurrent;
 	int viewHeightLerpTime;
 	int viewHeightLerpTarget;
 	int viewHeightLerpDown;
-	float viewHeightLerpPosAdj;     // PM_ViewHeightAdjust fld/fsub/fstp's it
-	                                // (0x20009792, 0x20009852); msg_mp.c nets
-	                                // ps+224 as a float too.
-	int damageEvent;
+	float viewHeightLerpPosAdj;
+
+	// damage feedback
+	int damageEvent;                // when it changes, latch the other parms
 	int damageYaw;
 	int damagePitch;
 	int damageCount;
 	int stats[6];
-	int ammo[64];
-	int ammoclip[64];
-	unsigned int weapons[2];
+	int ammo[64];                   // total amount of ammo
+	int ammoclip[64];               // ammo in clip
+	unsigned int weapons[2];        // 64 bits for weapons held
 	byte weaponslots[8];
 	unsigned int weaponrechamber[2];
+
+	// allow for individual bounding boxes
 	vec3_t mins;
 	vec3_t maxs;
 	int proneViewHeight;
 	int crouchViewHeight;
 	int standViewHeight;
 	int deadViewHeight;
+
+	// variable movement speed
 	float walkSpeedScale;
 	float runSpeedScale;
 	float proneSpeedScale;
 	float crouchSpeedScale;
 	float strafeSpeedScale;
 	float backSpeedScale;
-	float leanSpeedScale;           /* +0x364  named by the retail playerState field table */
+	float leanSpeedScale;
 	float proneDirection;
 	float proneDirectionPitch;
 	float proneTorsoPitch;
+
+	// view locking for mg42
 	int viewlocked;
 	int viewlocked_entNum;
 	float friction;
 	int gunfx;
-	int serverCursorHint;
-	int serverCursorHintVal;
-	/* +908 is serverCursorHintString (retail playerState field table), which
-	 * puts serverCursorHintTrace at 912-960. */
+	int serverCursorHint;           // what type of cursor hint the server is dictating
+	int serverCursorHintVal;        // a value (0-255) associated with the above
 	int serverCursorHintString;
-	trace_t serverCursorHintTrace;
+	trace_t serverCursorHintTrace;  // not communicated over net, but used to store the current server-side cursorhint trace
 	int iCompassFriendInfo;
 	float fTorsoHeight;
 	float fTorsoPitch;
@@ -468,7 +468,7 @@ typedef struct playerState_s
 	int shellshockDuration;
 	objective_t objective[16];
 	hudElemState_t hud;
-	int ping;
+	int ping;                       // server to game info for scoreboard
 	int deltaTime;
 } playerState_t;
 COD1_ASSERT_SIZE( playerState_t, 8400 );
@@ -478,10 +478,8 @@ COD1_ASSERT_SIZE( playerState_t, 8400 );
 
 						PARSER
 
-	universal/q_parse.c.  RTCW keeps the parse session file-static in
-	q_shared.c and only exports the API; CoD 1.1 has a real global session
-	record that the renderer reads directly (tr_bsp.c, tr_shader.c), so the
-	layout has to be visible and lives with the API that owns it.
+	The parse session itself is public: q_parse.c owns it, but the
+	renderer reads it directly.
 
 =============================================================================
 */

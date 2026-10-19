@@ -12,7 +12,7 @@
 #define __QCOMMON_H__
 
 #include "../universal/q_shared.h"
-#include "cod1_types.h"
+#include "cm_public.h"
 
 #include <stddef.h>
 #include <stdarg.h>
@@ -110,17 +110,10 @@ typedef struct vm_s vm_t;
 
 typedef void ( *xcommand_t )( void );
 
-typedef struct cmd_function_s
-{
-	struct cmd_function_s   *next;
-	char                    *name;
-	xcommand_t function;
-} cmd_function_t;
-COD1_ASSERT_SIZE( cmd_function_t, 12 );
-/* RTCW keeps cmd_function_t file-static in cmd.c.  CoD 1.1 cannot:
- * qcommon/cod1_globals.h declares `cmd_function_t *cmd_functions` at
- * 0x00890BE8, so the typedef has to be visible to every unit that includes
- * that header.  Fold it back into cmd.c when that declaration goes. */
+/* cmd.c -- the tokenized command line (Cmd_Argc / Cmd_Argv read them inline
+ * on the client). */
+extern int cmd_argc;   /* 0x008930F0 */
+extern char *cmd_argv[MAX_STRING_TOKENS];   /* 0x00890BF0 */
 
 /*
 =============================================================================
@@ -240,6 +233,7 @@ COD1_ASSERT_SIZE( netField_t, 12 );
 /* RTCW builds its netField_t tables file-static in msg.c.  1.1 cannot: the
  * client's delta reader (client_mp/cl_parse_mp.c) takes `const netField_t *`
  * arguments and is handed msg_mp.c's tables, so the type is shared. */
+extern netField_t stateFields[];   /* 0x005419D0, msg_mp.c's entityState_t fields */
 
 /*
 =============================================================================
@@ -316,7 +310,7 @@ typedef struct sysEvent_t
 COD1_ASSERT_SIZE( sysEvent_t, 24 );
 
 /* 284 bytes (0x11C), NOT the 268 a three-int head implies: the console
- * history ring unk_14304C0 is 9088 bytes, which is exactly 32 * 284.
+ * history ring historyEditLines (0x014304C0) is 9088 bytes, which is exactly 32 * 284.
  * Field_CompleteCommand copies sizeof(field_t), so the size matters. */
 typedef struct field_t
 {
@@ -434,9 +428,8 @@ qboolean Com_FilterPath( const char *filter, const char *name, int casesensitive
 void *Z_MallocInternal( int size );
 char *CopyStringInternal( const char *in );
 void *Hunk_AllocateTempMemoryInternal( int size );
-void Hunk_FreeTempMemoryInternal( void *buf );
-void Hunk_ResetTempMark( void );
 void Hunk_ClearToStart( void );
+void Hunk_Clear( void );
 void Com_InitHunkMemory( void );
 
 unsigned Com_BlockChecksum( void *buffer, int length );
@@ -445,6 +438,7 @@ unsigned Com_BlockChecksumKey( void *buffer, int length, int key );
 void *Com_GetClientDObj( int handle );
 void *Com_GetServerDObj( int handle );
 int Com_GetFreeDObjIndex( void );
+void Com_InitDObj( void );
 
 /* TWO DIFFERENT LIMITS.
  *
@@ -491,7 +485,31 @@ extern int com_frameTime;
 extern int com_frameNumber;
 extern qboolean com_errorEntered;
 extern qboolean com_fullyInitialized;
+extern qboolean com_animCheckCached;   /* 0x014073B4, com_animCheck latched per frame; SetAnimCheck (scr_animtree.cpp) */
 extern int com_skelTimeStamp;
+extern int com_skelInvalidated;   /* 0x014073D8 */
+extern int com_skelInvalidated2;   /* 0x0140743C */
+extern cvar_t *com_shortversion;   /* 0x0163B3E8 */
+extern cvar_t *com_version;   /* 0x0163A2C4 */
+extern cvar_t *sv_paused;   /* 0x0163B3C8 */
+extern cvar_t *cl_paused;   /* 0x0163A22C */
+extern int com_safemode;   /* 0x01407404 */
+extern int com_dobjInited;   /* 0x01407400 */
+extern int dobj_defaultTracePartRemapHandle;   /* 0x0140733C */
+extern int com_hunkMeminfoRunningTotal;   /* 0x0163A204, RTCW com_hunkusedvalue */
+extern int fs_checksumFeed;   /* 0x0162D768, universal/com_files.c */
+extern int com_randSeed_m;   /* 0x0057B4B0, universal/com_memory.c */
+/* universal/com_memory_core.c -- see Com_BindHunkGlobals */
+extern int hunk_totalSize;   /* 0x0089319C */
+extern signed __int32 hunk_totalZoneSize;   /* 0x008931A0 */
+extern int hunk_highMark;   /* 0x008931A4 */
+extern int hunk_highTempMark;   /* 0x008931A8 */
+extern int hunk_highUsed;   /* 0x008931AC */
+extern int hunk_highTemp;   /* 0x008931B0 */
+extern int hunk_lowMark;   /* 0x008931BC, game-VM hunk mark */
+extern int hunk_lowTempMark;   /* 0x008931C0 */
+extern int hunk_temp_permanent;   /* 0x008931C4, holds an address */
+extern int hunk_temp_temp;   /* 0x008931C8, holds an address */
 extern int fs_loadingMode;
 extern int time_game, time_frontend, time_backend;
 
@@ -533,7 +551,7 @@ void Cvar_Set( const char *var_name, const char *value );
 void Cvar_SetLatched( const char *var_name, const char *value );
 void Cvar_SetValue( const char *var_name, float value );
 void Cvar_Reset( const char *var_name );
-void Cvar_VMSet( const char *value, vmCvar_t *vmCvar );
+void Cvar_VMSet( vmCvar_t *vmCvar, const char *value );
 void Cvar_Register( vmCvar_t *vmCvar, const char *varName, const char *defaultValue, int flags );
 void Cvar_Update( vmCvar_t *vmCvar );
 void Cvar_Init( void );
@@ -581,7 +599,7 @@ void FS_AddCommands( void );
 void FS_RemoveCommands( void );
 
 int FS_FOpenFileRead( const char *qpath, fileHandle_t *file, qboolean uniqueFILE );
-int FS_FOpenFileReadStream( const char *qpath, fileHandle_t *file );
+int FS_FOpenFileReadStream( const char *qpath, fileHandle_t *file, qboolean uniqueFILE );
 fileHandle_t FS_FOpenFileWrite( const char *filename );
 fileHandle_t FS_FOpenTextFileWrite( const char *filename );
 fileHandle_t FS_FOpenFileAppend( const char *filename );
@@ -600,7 +618,7 @@ int FS_ReadFile( const char *qpath, void **buffer );
 void FS_FreeFile( void *buffer );
 void FS_WriteFile( const char *qpath, const void *buffer, int size );
 void FS_ResetFiles( void );
-qboolean FS_CopyFile( char *fromOSPath, char *toOSPath );
+void FS_CopyFile( char *fromOSPath, char *toOSPath );
 qboolean FS_CreatePath( char *OSPath );
 
 char **FS_ListFiles( const char *path, const char *extension, int *numfiles );
@@ -711,7 +729,7 @@ void Com_NoiseInit( void );
 float GetNoiseValue( int x, int y, int z, int t );
 /* 0x004DD4F0.  FOUR arguments, result in ST0 -- there is no output pointer
  * (each caller's `push edi` is a register save, not a fifth argument). */
-float Com_NoiseGet4f( float x, float y, float z, float t );
+double Com_NoiseGet4f( float x, float y, float z, float t );
 
 void Huff_Init( huffman_t *huff );
 void Huff_Compress( msg_t *mbuf, int offset );
@@ -747,7 +765,6 @@ void StatMon_Reset( void );
 */
 
 void Sys_Init( void );
-void *Com_MallocOrDie( int size );   /* not retail -- see cmd.c */
 void QDECL Sys_Error( const char *error, ... );
 int Sys_Milliseconds( void );
 sysEvent_t Sys_GetEvent( void );
@@ -757,11 +774,24 @@ qboolean Sys_ShouldReconfigure( void );
 void Sys_SetConfigCvars( int configSum );
 int Sys_GetVideoRam( void );	/* bytes, 0 when unknown -- the MB figure is sys_vidMBValue */
 int Sys_GetSystemRam( void );
-float Sys_GetCPUSpeed( void );
+double Sys_GetCPUSpeed( void );
 qboolean Sys_ConfigureChecksumChanged( int checksum );
 qboolean Sys_CheckCrashOrRerun( void );
 void Sys_DestroySplashWindow( void );
+void Sys_HideSplashWindow( void );
 void Sys_DestroyConsole( void );
+/* win32/win_platform.c (Sys_Milliseconds); the users read sys_timeBase unsigned. */
+extern unsigned __int32 sys_timeBase;   /* 0x016C35C0 */
+extern signed __int32 sys_timeBaseInit;   /* 0x014073B8 */
+/* win32/win_main.c: Sys_RegisterInfoCvars / Sys_DetectHardware_m results. */
+extern cvar_t *sys_cpuMHz;   /* 0x008E3C4C */
+extern cvar_t *sys_sysMB;   /* 0x008E3B30 */
+extern cvar_t *sys_vidMB;   /* 0x008E3C50 */
+extern double sys_cpuMHzValue;   /* 0x008E3B38 */
+extern signed __int32 sys_sysMBValue;   /* 0x008E3B40 */
+extern int sys_vidMBValue;   /* 0x008E3B44 */
+extern int sys_hasSSE;   /* 0x016BF5A0 */
+extern int sys_monkeySpank;   /* 0x008E3C48, reliable-command probe gate */
 /* The single-instance-marker cleanup (win32/win_main.c, retail 0x004640A0).
    Retail inlines DeleteFileA(FileName), FileName = 0x008E3B10, at five sites:
 
@@ -778,14 +808,12 @@ int  Sys_DeleteInstanceMarker( void );
    Sys_ShutdownTimer is timeEndPeriod(1), in win32/win_platform.c beside the
    timeBeginPeriod(1) it undoes.
 
-   Sys_PlatformExit is a `return 0` link stub, and it is NOT a platform exit
-   hook: it sits in Key_Shutdown's slot (retail 0x0040E2B0), between
-   Cmd_Shutdown and exit(0).  Key_Shutdown lives in client_mp/, which a
-   dedicated server does not link, so binding it needs a dedicated/ boundary
-   stub as well, and everything it would free is reclaimed by the exit(0) two
-   lines later.  Do not "implement" Sys_PlatformExit as something else. */
+   The seh_localization reset is SEH_ShutdownLocalization_m (0x00462430,
+   inlined in retail), and Key_Shutdown (0x0040E2B0) is called in its retail
+   slot between Cmd_Shutdown and exit(0) on the client build only
+   (#ifndef DEDICATED): Key_Shutdown lives in client_mp/, which the dedicated
+   build does not link. */
 void Sys_ShutdownTimer( void );
-void Sys_PlatformExit( void );
 qboolean Sys_IsLANAddress( netadr_t adr );
 /* win32/win_shared.c -- the search-path defaults.  Sys_DefaultHomePath
  * returns NULL on Windows; callers fall back to fs_basepath. */
@@ -797,7 +825,6 @@ char *Sys_Cwd( void );
 char **Sys_ListFiles( const char *directory, const char *extension, const char *filter, int *numfiles, int wantsubs );
 void Sys_FreeFileList( char **list );
 void *Sys_LoadDll( const char *name, char *fqpath, int ( **entryPoint )( int, ... ), int ( *systemcalls )( int, ... ) );
-char *SEH_GetLanguageString( const char *key );
 char *SEH_LocalizeTextMessage( const char *text, const char *type, int flag );
 void SEH_UpdateLanguageInfo( void );
 void Conbuf_AppendText( const char *msg );
@@ -822,8 +849,8 @@ void CL_ShutdownRef( void );
 void CL_StartHunkUsers( void );
 /* __usercall(txt@<ecx>, channel@<ebx>, msgtime, width) in retail.  msgtime 0
  * means "derive it from the channel's cvar". */
-void CL_ConsolePrint( const char *txt, int channel, int msgtime, int width );
-void CL_ConsoleFixPosition( int a );
+void CL_ConsolePrint( int channel, const char *txt, int msgtime, int width );
+void CL_ConsoleFixPosition( void );
 void CL_PacketEvent( netadr_t from, msg_t *msg );
 void CL_KeyEvent( int key, int down, unsigned time );
 void CL_CharEvent( int key );
@@ -884,10 +911,15 @@ void SV_SetConfigValueForKey( int start, const char *key, const char *value, int
 void NET_Init( void );
 qboolean NET_GetLoopPacket( netsrc_t sock, netadr_t *net_from, msg_t *net_message );
 void Netchan_Init( int qport );
+/* net_chan_mp.c */
+extern cvar_t *net_profile;   /* 0x01651550 */
+extern cvar_t *net_showprofile;   /* 0x0165155C */
+extern cvar_t *net_lanauthorize;   /* 0x01651554 */
+extern int net_iProfilingOn;   /* 0x014073EC */
 void MSG_Init( msg_t *buf, byte *data, int length );
 int MSG_ReadBits( msg_t *msg, int bits );
 
-void Scr_Init( void );
+void Scr_Init( int developer, int developerScript );
 void Scr_Shutdown( void );
 
 /* The server's game VM, retail 0x014073D0, defined in
@@ -903,31 +935,32 @@ extern void     *s_hunkData;
 extern fileHandle_t com_journalDataFile;
 
 /*
- * THE FOUR clientStatic_t FIELDS qcommon TOUCHES, AS THE FOUR REAL GLOBALS.
- *
- * There is no `cls` object in retail: all four are separate globals
- * (0x0155F2C8 is not even in the same neighbourhood), and retail spells them
- * as such -- Com_Shutdown 0x004358C9 / 0x004358D3, Com_ErrorCleanup
- * 0x0043597F, and the StatMon/UI_CONSOLE_COMMAND sites.  Com_Shutdown's two
- * stores are what tell CL_StartHunkUsers to bring the renderer back up after
- * Hunk_ClearToStart.
+ * clientStatic_t cls (client_mp/cl_static.h): ONE object at 0x0155F2C0.
+ * CL_Shutdown 0x004129C1 clears 0x1ACE7 dwords from cls.state with a single
+ * rep stosd, through cls.debugLineDurations at 0x015CA658.  qcommon touches
+ * cls_rendererStarted, cls_loadingPlaque (cls.uiStarted), cls_cddialog and
+ * cls_realtime through its member macros.
  */
-extern int cls_rendererStarted;    /* 0x0155F3CC */
-extern int cls_loadingPlaque;      /* 0x0155F3D4 -- cls.uiStarted, see cl_main_mp.c */
-extern int cls_cddialog;           /* 0x0155F2C8 */
-extern int cls_realtime;           /* 0x0155F3E0 */
+#if !defined( UIDLL ) && !defined( GAMEDLL ) && !defined( CGAMEDLL )
+#include "../client_mp/cl_static.h"
+#endif
 
-/* Minimal server view needed by qcommon; the real server_t lands with sv_*. */
+/* server_t sv: server_mp/server.h, defined in server_mp/sv_main_mp.c. */
 typedef enum { SS_DEAD, SS_LOADING, SS_GAME } serverState_t;
-typedef struct { serverState_t state; } server_public_t;
-extern server_public_t sv;
-extern int g_unk_A9CC58;          /* TODO: unresolved global at 0x00A9CC58 */
+/* server_mp/sv_main_mp.c; the client's renderer-import table takes their addresses */
+extern cvar_t *sv_gametype;   /* 0x016BDB78 */
+extern cvar_t *sv_hostname;   /* 0x016BDB5C */
+extern cvar_t *sv_maxRate;   /* 0x016BDB80 */
+extern int xanim_activePoolSlot;   /* 0x00A9CC58, XAnim pool selector */
+extern int xmodel_animCheck;   /* 0x01407330, xanim/xmodel.cpp */
+extern int xmodel_enforceExist;   /* 0x00572D68, the cl_xmodelcheck latch, xanim/xmodel.cpp */
 
 extern char cl_cdkey[34];
 extern char cl_cdkeychecksum[10];
 extern int cl_cdkeyZero;
-extern const char *g_languages[];
 extern cvar_t *cl_language;
+extern int cl_connectedToPureServer;   /* 0x01617460, client_mp/cl_parse_mp.c (RTCW qcommon.h) */
+extern int g_currentAsian;   /* 0x00CA26C0, stringed/stringed_hooks.cpp */
 extern cvar_t *fs_ignoreLocalized;
 extern int fs_numServerPaks;
 extern int fs_serverPaks[];

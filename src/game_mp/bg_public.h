@@ -1,14 +1,9 @@
 /*
- * bg_public.h -- definitions shared by the multiplayer game DLL and cgame.
+ * name:		bg_public.h
  *
- * Call of Duty 1.1 (game_mp_x86.dll, imagebase 0x20000000).  Covers the five
- * "both games" units: bg_pmove.c, bg_slidemove.c, bg_animation.c, bg_weapon.c
- * and bg_misc.c.  RTCW's game/bg_public.h is the structural model; every
- * layout below carries the retail address that fixes it.
+ * desc:		definitions shared by both the server game and client game modules
  *
- * COD1_ASSERT_SIZE appears only where an allocation site or an array stride
- * in the DLL fixes the retail size.
- */
+*/
 
 #ifndef __BG_PUBLIC_H__
 #define __BG_PUBLIC_H__
@@ -18,51 +13,328 @@
 /*
 =============================================================================
 
-						PLAYER MOVEMENT
+						ENTITY STATE
 
 =============================================================================
 */
 
-/* pm->touchents capacity: PM_AddTouchEnt (0x20007080) stops at 32. */
-#define MAXTOUCH 32
+// angle indexes
+#define PITCH                   0       // up / down
+#define YAW                     1       // left / right
+#define ROLL                    2       // fall over
+
+#define MAX_EVENTS              4       // max events per frame before we drop events
+
+#define DEFAULT_GRAVITY         800
+
+//
+// entityState_t->eType
+//
+typedef enum entityType_e {
+	ET_GENERAL              = 0,
+	ET_PLAYER               = 1,
+	ET_PLAYER_CORPSE        = 2,
+	ET_ITEM                 = 3,
+	ET_MISSILE              = 4,
+	ET_MOVER                = 5,
+	ET_PORTAL               = 6,
+	ET_INVISIBLE            = 7,
+	ET_SCRIPTMOVER          = 8,
+	ET_SOUND_BLEND          = 9,       // crossfades between two sound aliases
+	ET_LOOP_FX              = 10,      // looping effect
+	ET_TURRET               = 11,
+	ET_EVENTS               = 12       // any of the EV_* events can be added freestanding
+									   // by setting eType to ET_EVENTS + eventNum
+} entityType_t;
+
+typedef enum trType_e {
+	TR_STATIONARY           = 0,
+	TR_INTERPOLATE          = 1,       // non-parametric, but interpolate between snapshots
+	TR_LINEAR               = 2,
+	TR_LINEAR_STOP          = 3,
+	TR_SINE                 = 4,       // value = base + sin( time / duration ) * delta
+	TR_GRAVITY              = 5,
+	TR_GRAVITY_LOW          = 6,
+	TR_GRAVITY_FLOAT        = 7,       // super low grav with no gravity acceleration (floating feathers/fabric/leaves/...)
+	TR_GRAVITY_PAUSED       = 8,       // has stopped, but will still do a short trace to see if it should be switched back to TR_GRAVITY
+	TR_ACCELERATE           = 9,       // trDelta is the ultimate speed
+	TR_DECCELERATE          = 10       // trDelta is the starting speed
+} trType_t;
+
+// player_state->stats[] indexes
+typedef enum statIndex_e {
+	STAT_HEALTH              = 0,
+	STAT_DEAD_YAW            = 1,      // look this direction when dead
+	STAT_MAX_HEALTH          = 2,      // health limit
+	STAT_IDENT_CLIENT_NUM    = 3,      // client under the crosshair
+	STAT_IDENT_CLIENT_HEALTH = 4,
+	STAT_SPAWN_COUNT         = 5       // bumped on every respawn
+} statIndex_t;
+
+// entityState_t->event values
+// entity events are for effects that take place reletive
+// to an existing entities origin.  Very network efficient.
+
+// NOTE: this must be synched with eventnames[] in bg_misc.c
+// the surface runs are indexed by SURF_TYPE( surfaceFlags )
+typedef enum entity_event_e {
+	EV_NONE                         = 0,
+	EV_FOOTSTEP_RUN_DEFAULT         = 1,
+	EV_FOOTSTEP_RUN_BARK            = 2,
+	EV_FOOTSTEP_RUN_BRICK           = 3,
+	EV_FOOTSTEP_RUN_CARPET          = 4,
+	EV_FOOTSTEP_RUN_CLOTH           = 5,
+	EV_FOOTSTEP_RUN_CONCRETE        = 6,
+	EV_FOOTSTEP_RUN_DIRT            = 7,
+	EV_FOOTSTEP_RUN_FLESH           = 8,
+	EV_FOOTSTEP_RUN_FOLIAGE         = 9,
+	EV_FOOTSTEP_RUN_GLASS           = 10,
+	EV_FOOTSTEP_RUN_GRASS           = 11,
+	EV_FOOTSTEP_RUN_GRAVEL          = 12,
+	EV_FOOTSTEP_RUN_ICE             = 13,
+	EV_FOOTSTEP_RUN_METAL           = 14,
+	EV_FOOTSTEP_RUN_MUD             = 15,
+	EV_FOOTSTEP_RUN_PAPER           = 16,
+	EV_FOOTSTEP_RUN_PLASTER         = 17,
+	EV_FOOTSTEP_RUN_ROCK            = 18,
+	EV_FOOTSTEP_RUN_SAND            = 19,
+	EV_FOOTSTEP_RUN_SNOW            = 20,
+	EV_FOOTSTEP_RUN_WATER           = 21,
+	EV_FOOTSTEP_RUN_WOOD            = 22,
+	EV_FOOTSTEP_RUN_ASPHALT         = 23,
+	EV_FOOTSTEP_WALK_DEFAULT        = 24,
+	EV_FOOTSTEP_WALK_BARK           = 25,
+	EV_FOOTSTEP_WALK_BRICK          = 26,
+	EV_FOOTSTEP_WALK_CARPET         = 27,
+	EV_FOOTSTEP_WALK_CLOTH          = 28,
+	EV_FOOTSTEP_WALK_CONCRETE       = 29,
+	EV_FOOTSTEP_WALK_DIRT           = 30,
+	EV_FOOTSTEP_WALK_FLESH          = 31,
+	EV_FOOTSTEP_WALK_FOLIAGE        = 32,
+	EV_FOOTSTEP_WALK_GLASS          = 33,
+	EV_FOOTSTEP_WALK_GRASS          = 34,
+	EV_FOOTSTEP_WALK_GRAVEL         = 35,
+	EV_FOOTSTEP_WALK_ICE            = 36,
+	EV_FOOTSTEP_WALK_METAL          = 37,
+	EV_FOOTSTEP_WALK_MUD            = 38,
+	EV_FOOTSTEP_WALK_PAPER          = 39,
+	EV_FOOTSTEP_WALK_PLASTER        = 40,
+	EV_FOOTSTEP_WALK_ROCK           = 41,
+	EV_FOOTSTEP_WALK_SAND           = 42,
+	EV_FOOTSTEP_WALK_SNOW           = 43,
+	EV_FOOTSTEP_WALK_WATER          = 44,
+	EV_FOOTSTEP_WALK_WOOD           = 45,
+	EV_FOOTSTEP_WALK_ASPHALT        = 46,
+	EV_FOOTSTEP_PRONE_DEFAULT       = 47,
+	EV_FOOTSTEP_PRONE_BARK          = 48,
+	EV_FOOTSTEP_PRONE_BRICK         = 49,
+	EV_FOOTSTEP_PRONE_CARPET        = 50,
+	EV_FOOTSTEP_PRONE_CLOTH         = 51,
+	EV_FOOTSTEP_PRONE_CONCRETE      = 52,
+	EV_FOOTSTEP_PRONE_DIRT          = 53,
+	EV_FOOTSTEP_PRONE_FLESH         = 54,
+	EV_FOOTSTEP_PRONE_FOLIAGE       = 55,
+	EV_FOOTSTEP_PRONE_GLASS         = 56,
+	EV_FOOTSTEP_PRONE_GRASS         = 57,
+	EV_FOOTSTEP_PRONE_GRAVEL        = 58,
+	EV_FOOTSTEP_PRONE_ICE           = 59,
+	EV_FOOTSTEP_PRONE_METAL         = 60,
+	EV_FOOTSTEP_PRONE_MUD           = 61,
+	EV_FOOTSTEP_PRONE_PAPER         = 62,
+	EV_FOOTSTEP_PRONE_PLASTER       = 63,
+	EV_FOOTSTEP_PRONE_ROCK          = 64,
+	EV_FOOTSTEP_PRONE_SAND          = 65,
+	EV_FOOTSTEP_PRONE_SNOW          = 66,
+	EV_FOOTSTEP_PRONE_WATER         = 67,
+	EV_FOOTSTEP_PRONE_WOOD          = 68,
+	EV_FOOTSTEP_PRONE_ASPHALT       = 69,
+	EV_JUMP_DEFAULT                 = 70,
+	EV_JUMP_BARK                    = 71,
+	EV_JUMP_BRICK                   = 72,
+	EV_JUMP_CARPET                  = 73,
+	EV_JUMP_CLOTH                   = 74,
+	EV_JUMP_CONCRETE                = 75,
+	EV_JUMP_DIRT                    = 76,
+	EV_JUMP_FLESH                   = 77,
+	EV_JUMP_FOLIAGE                 = 78,
+	EV_JUMP_GLASS                   = 79,
+	EV_JUMP_GRASS                   = 80,
+	EV_JUMP_GRAVEL                  = 81,
+	EV_JUMP_ICE                     = 82,
+	EV_JUMP_METAL                   = 83,
+	EV_JUMP_MUD                     = 84,
+	EV_JUMP_PAPER                   = 85,
+	EV_JUMP_PLASTER                 = 86,
+	EV_JUMP_ROCK                    = 87,
+	EV_JUMP_SAND                    = 88,
+	EV_JUMP_SNOW                    = 89,
+	EV_JUMP_WATER                   = 90,
+	EV_JUMP_WOOD                    = 91,
+	EV_JUMP_ASPHALT                 = 92,
+	EV_LANDING_DEFAULT              = 93,
+	EV_LANDING_BARK                 = 94,
+	EV_LANDING_BRICK                = 95,
+	EV_LANDING_CARPET               = 96,
+	EV_LANDING_CLOTH                = 97,
+	EV_LANDING_CONCRETE             = 98,
+	EV_LANDING_DIRT                 = 99,
+	EV_LANDING_FLESH                = 100,
+	EV_LANDING_FOLIAGE              = 101,
+	EV_LANDING_GLASS                = 102,
+	EV_LANDING_GRASS                = 103,
+	EV_LANDING_GRAVEL               = 104,
+	EV_LANDING_ICE                  = 105,
+	EV_LANDING_METAL                = 106,
+	EV_LANDING_MUD                  = 107,
+	EV_LANDING_PAPER                = 108,
+	EV_LANDING_PLASTER              = 109,
+	EV_LANDING_ROCK                 = 110,
+	EV_LANDING_SAND                 = 111,
+	EV_LANDING_SNOW                 = 112,
+	EV_LANDING_WATER                = 113,
+	EV_LANDING_WOOD                 = 114,
+	EV_LANDING_ASPHALT              = 115,
+	EV_LANDING_PAIN_DEFAULT         = 116,
+	EV_LANDING_PAIN_BARK            = 117,
+	EV_LANDING_PAIN_BRICK           = 118,
+	EV_LANDING_PAIN_CARPET          = 119,
+	EV_LANDING_PAIN_CLOTH           = 120,
+	EV_LANDING_PAIN_CONCRETE        = 121,
+	EV_LANDING_PAIN_DIRT            = 122,
+	EV_LANDING_PAIN_FLESH           = 123,
+	EV_LANDING_PAIN_FOLIAGE         = 124,
+	EV_LANDING_PAIN_GLASS           = 125,
+	EV_LANDING_PAIN_GRASS           = 126,
+	EV_LANDING_PAIN_GRAVEL          = 127,
+	EV_LANDING_PAIN_ICE             = 128,
+	EV_LANDING_PAIN_METAL           = 129,
+	EV_LANDING_PAIN_MUD             = 130,
+	EV_LANDING_PAIN_PAPER           = 131,
+	EV_LANDING_PAIN_PLASTER         = 132,
+	EV_LANDING_PAIN_ROCK            = 133,
+	EV_LANDING_PAIN_SAND            = 134,
+	EV_LANDING_PAIN_SNOW            = 135,
+	EV_LANDING_PAIN_WATER           = 136,
+	EV_LANDING_PAIN_WOOD            = 137,
+	EV_LANDING_PAIN_ASPHALT         = 138,
+	EV_FOLIAGE_SOUND                = 139,
+	EV_STANCE_FORCE_STAND           = 140,
+	EV_STANCE_FORCE_CROUCH          = 141,
+	EV_STANCE_FORCE_PRONE           = 142,
+	EV_STEP_VIEW                    = 143,
+	EV_WATER_TOUCH                  = 144,
+	EV_WATER_LEAVE                  = 145,
+	EV_ITEM_PICKUP                  = 146,
+	EV_ITEM_PICKUP_QUIET            = 147,
+	EV_AMMO_PICKUP                  = 148,
+	EV_NOAMMO                       = 149,
+	EV_EMPTYCLIP                    = 150,
+	EV_RELOAD                       = 151,
+	EV_RELOAD_FROM_EMPTY            = 152,
+	EV_RELOAD_START                 = 153,
+	EV_RELOAD_END                   = 154,
+	EV_RAISE_WEAPON                 = 155,
+	EV_PUTAWAY_WEAPON               = 156,
+	EV_WEAPON_ALT                   = 157,
+	EV_PULLBACK_WEAPON              = 158,
+	EV_FIRE_WEAPON                  = 159,
+	EV_FIRE_WEAPONB                 = 160,
+	EV_FIRE_WEAPON_LASTSHOT         = 161,
+	EV_RECHAMBER_WEAPON             = 162,
+	EV_EJECT_BRASS                  = 163,
+	EV_MELEE_SWIPE                  = 164,
+	EV_FIRE_MELEE                   = 165,
+	EV_MELEE_HIT                    = 166,
+	EV_MELEE_MISS                   = 167,
+	EV_FIRE_WEAPON_MG42             = 168,
+	EV_FIRE_QUADBARREL_1            = 169,
+	EV_FIRE_QUADBARREL_2            = 170,
+	EV_BULLET_TRACER                = 171,
+	EV_SOUND_ALIAS                  = 172,
+	EV_BULLET_HIT_SMALL             = 173,
+	EV_BULLET_HIT_LARGE             = 174,
+	EV_BULLET_HIT_CLIENT_SMALL      = 175,
+	EV_BULLET_HIT_CLIENT_LARGE      = 176,
+	EV_GRENADE_BOUNCE               = 177,
+	EV_GRENADE_EXPLODE              = 178,
+	EV_ROCKET_EXPLODE               = 179,
+	EV_ROCKET_EXPLODE_NOMARKS       = 180,
+	EV_MOLOTOV_EXPLODE              = 181,
+	EV_MOLOTOV_EXPLODE_NOMARKS      = 182,
+	EV_CUSTOM_EXPLODE               = 183,
+	EV_CUSTOM_EXPLODE_NOMARKS       = 184,
+	EV_RAILTRAIL                    = 185,
+	EV_BULLET                       = 186,
+	EV_PAIN                         = 187,
+	EV_CROUCH_PAIN                  = 188,
+	EV_DEATH                        = 189,
+	EV_DEBUG_LINE                   = 190,
+	EV_PLAY_FX                      = 191,
+	EV_PLAY_FX_DIR                  = 192,
+	EV_PLAY_FX_ON_TAG               = 193,
+	EV_FLAMEBARREL_BOUNCE           = 194,
+	EV_EARTHQUAKE                   = 195,
+	EV_DROPWEAPON                   = 196,
+	EV_ITEM_RESPAWN                 = 197,
+	EV_ITEM_POP                     = 198,
+	EV_PLAYER_TELEPORT_IN           = 199,
+	EV_PLAYER_TELEPORT_OUT          = 200,
+	EV_OBITUARY                     = 201,
+
+	EV_MAX_EVENTS                   = 202
+} entity_event_t;
+
 
 /*
- * pmove_t.  248 bytes -- ClientThink_real declares it as a 62-dword stack
- * object and Pmove/PmoveSingle reach 0xF4 at most.
- *
- * The three trace callbacks are distinct source members that /OPT:ICF folded:
- * ClientThink_real stores the same trap wrapper into all three.  trace is the
- * general one (PM_GroundTrace, PM_CorrectAllSolid, PM_FootstepEvent,
- * PM_FoliageSounds); trace2/trace3 are the pair handed to BG_CheckProneValid
- * by PM_VerifyPronePosition (0x2000C830) and PM_CheckDuck.  All three share
- * one signature.
- */
+===================================================================================
+
+PMOVE MODULE
+
+The pmove code takes a player_state_t and a usercmd_t and generates a new player_state_t
+and some other output data.  Used for local prediction on the client game and true
+movement on the server game.
+===================================================================================
+*/
+
+#define MAXTOUCH 32
+
 typedef struct pmove_t
 {
+	// state (in / out)
 	playerState_t *ps;
-	usercmd_t cmd;
-	usercmd_t oldcmd;
-	int tracemask;
-	int debugLevel;                 /* +0x38  PM_StepSlideMove tests it against 1 and 2 */
+
+	// command (in)
+	usercmd_t cmd, oldcmd;
+	int tracemask;                  // collide against these types of surfaces
+	int debugLevel;                 // if set, diagnostic output will be printed
+
+	// results (out)
 	int numtouch;
 	int touchents[MAXTOUCH];
-	vec3_t mins;
-	vec3_t maxs;
-	byte watertype;                 /* +0xD8  byte, not int -- ClientThink_real copies both as bytes */
+
+	vec3_t mins, maxs;              // bounding box size
+
+	byte watertype;                 // byte, not int
 	byte waterlevel;
-	byte unknown_0xDA[2];
-	float xyspeed;                  /* +0xDC  written by PM_Footsteps, read by PM_FoliageSounds */
+	byte pad_0xDA;
+	byte pad_0xDB;
+
+	float xyspeed;
+
+	// for fixed msec Pmove
 	qboolean pmove_fixed;
 	int pmove_msec;
+
+	// callbacks to test the world
+	// these will be different functions during game and cgame
 	void ( *trace )( trace_t *results, const vec3_t start, const vec3_t mins, const vec3_t maxs, const vec3_t end, int passEntityNum, int contentMask );
 	void ( *trace2 )( trace_t *results, const vec3_t start, const vec3_t mins, const vec3_t maxs, const vec3_t end, int passEntityNum, int contentMask );
 	void ( *trace3 )( trace_t *results, const vec3_t start, const vec3_t mins, const vec3_t maxs, const vec3_t end, int passEntityNum, int contentMask );
 	int ( *pointcontents )( const vec3_t point, int passEntityNum, int contentMask );
 } pmove_t;
 COD1_ASSERT_SIZE( pmove_t, 248 );
-
-/* pml_t, pm and pml are bg_local.h's: the movement units share them, the
-   game/cgame interface does not. */
+COD1_STATIC_ASSERT( offsetof( pmove_t, pad_0xDA ) == 0xDA, "pmove_t.pad_0xDA" );
+COD1_STATIC_ASSERT( offsetof( pmove_t, xyspeed ) == 0xDC, "pmove_t.xyspeed" );
 
 void Pmove( pmove_t *pmove );
 void PmoveSingle( pmove_t *pmove );
@@ -75,25 +347,11 @@ void PmoveSingle( pmove_t *pmove );
 =============================================================================
 */
 
-/*
- * 64 weapon bits.  BG_GetConditionValue (0x20003300) walks the ANIM_COND_WEAPONS
- * bit set to 0x40, and bg_itemlist reserves exactly 64 weapon slots.
- */
 #define MAX_WEAPONS 64
 
-/*
- * The weapon-file parse table is bg_weaponInfoFields at 0x2006ADD0: 248
- * {const char *name; int offset; int type;} triples plus a {NULL,-1,-1}
- * sentinel, walked by ParseConfigStringToStruct (0x2003F070) from
- * BG_ParseWeaponInfoFiles.  Field types 0-7 are generic (0 string, 4 int,
- * 5 qboolean, 6 float, 7 seconds-to-milliseconds); 8-13 are dispatched to
- * BG_ParseWeaponInfoSpecificFieldType (0x2000D990) and name the enums below.
- *
- * Constant names in these enums are inferred from convention: only the string
- * spellings are recovered, from the name tables the parser matches against.
- */
+// weapon file values
+// NOTE: these must all be in sync with the name tables in bg_weapon.c
 
-/* bg_weaponTypeNames, 0x2006AD5C */
 typedef enum weapType_t
 {
 	WEAPTYPE_BULLET     = 0x0,
@@ -102,7 +360,6 @@ typedef enum weapType_t
 	WEAPTYPE_NUM        = 0x3,
 } weapType_t;
 
-/* bg_weaponClassNames, 0x2006ADA0 */
 typedef enum weapClass_t
 {
 	WEAPCLASS_RIFLE          = 0x0,
@@ -112,11 +369,10 @@ typedef enum weapClass_t
 	WEAPCLASS_GRENADE        = 0x4,
 	WEAPCLASS_ROCKETLAUNCHER = 0x5,
 	WEAPCLASS_TURRET         = 0x6,
-	WEAPCLASS_NON_PLAYER     = 0x7,        /* "non-player" */
+	WEAPCLASS_NON_PLAYER     = 0x7,        // "non-player"
 	WEAPCLASS_NUM            = 0x8,
 } weapClass_t;
 
-/* bg_weaponSlotNames, 0x2006AD7C */
 typedef enum weapSlot_t
 {
 	WEAPSLOT_NONE         = 0x0,
@@ -128,7 +384,6 @@ typedef enum weapSlot_t
 	WEAPSLOT_NUM          = 0x6,
 } weapSlot_t;
 
-/* bg_weaponStanceNames, 0x2006AD94 */
 typedef enum weapStance_t
 {
 	WEAPSTANCE_STAND = 0x0,
@@ -137,7 +392,6 @@ typedef enum weapStance_t
 	WEAPSTANCE_NUM   = 0x3,
 } weapStance_t;
 
-/* bg_weaponOverlayReticleNames, 0x2006AD68 */
 typedef enum weapOverlayReticle_t
 {
 	WEAPOVERLAYRETICLE_NONE        = 0x0,
@@ -148,7 +402,6 @@ typedef enum weapOverlayReticle_t
 	WEAPOVERLAYRETICLE_NUM         = 0x5,
 } weapOverlayReticle_t;
 
-/* bg_weaponGrenadeTypeNames, 0x2006ADC0 */
 typedef enum weapProjExposion_t
 {
 	WEAPPROJEXP_GRENADE = 0x0,
@@ -158,14 +411,7 @@ typedef enum weapProjExposion_t
 	WEAPPROJEXP_NUM     = 0x4,
 } weapProjExposion_t;
 
-/*
- * weaponInfo_t.  1052 bytes -- InitWeaponInfo (0x2000DC80) allocates that
- * much.  Field names and offsets are the parse table's, verbatim; weapIndex
- * and szInternalName are the two members InitWeaponInfo /
- * BG_ParseWeaponInfoFiles fill in themselves.  Every unknown_ range below is
- * a slot the parse table never names and that this DLL never touches (they
- * are cgame-side, except where noted).
- */
+// weapon definition, parsed from the files in weapons/mp
 typedef struct weaponInfo_t
 {
 	int weapIndex;
@@ -174,7 +420,8 @@ typedef struct weaponInfo_t
 	const char *AIOverlayDescription;
 	const char *gunModel;
 	const char *handModel;
-	byte unknown_0x18[4];
+	// viewmodel animations; slot 0 is the root and is never parsed
+	const char *rootAnim;
 	const char *idleAnim;
 	const char *emptyIdleAnim;
 	const char *fireAnim;
@@ -272,17 +519,17 @@ typedef struct weaponInfo_t
 	const char *ammoIcon;
 	int startAmmo;
 	const char *ammoName;
-	int ammoIndex;                  /* +0x1A0  BG_SetupAmmoIndexes / BG_AmmoForWeapon */
+	int ammoIndex;
 	const char *clipName;
-	int clipIndex;                  /* +0x1A8  BG_SetupClipIndexes / BG_ClipForWeapon */
+	int clipIndex;
 	int maxAmmo;
 	int clipSize;
 	const char *sharedAmmoCapName;
-	int sharedAmmoCapIndex;         /* +0x1B8  BG_SetupSharedAmmoIndexes */
+	int sharedAmmoCapIndex;
 	int sharedAmmoCap;
 	int damage;
 	int meleeDamage;
-	byte unknown_0x1C8[4];
+	int damageType;
 	int fireDelay;
 	int meleeDelay;
 	int fireTime;
@@ -359,7 +606,7 @@ typedef struct weaponInfo_t
 	int reloadAmmoAdd;
 	int reloadStartAdd;
 	const char *altWeapon;
-	int altWeaponIndex;             /* +0x2FC  BG_SetupWeaponAlts */
+	int altWeaponIndex;
 	int dropAmmoMin;
 	int dropAmmoMax;
 	int explosionRadius;
@@ -393,7 +640,8 @@ typedef struct weaponInfo_t
 	float adsViewKickYawMin;
 	float adsViewKickYawMax;
 	float adsViewKickCenterSpeed;
-	byte unknown_0x384[8];
+	float adsViewScatterMin;
+	float adsViewScatterMax;
 	float adsSpread;
 	float hipGunKickPitchMin;
 	float hipGunKickPitchMax;
@@ -408,7 +656,8 @@ typedef struct weaponInfo_t
 	float hipViewKickYawMin;
 	float hipViewKickYawMax;
 	float hipViewKickCenterSpeed;
-	byte unknown_0x3C4[8];
+	float hipViewScatterMin;
+	float hipViewScatterMax;
 	float aiEffectiveRange;
 	float aiMissRange;
 	int adsReloadTransTime;
@@ -425,18 +674,18 @@ typedef struct weaponInfo_t
 	float animHorRotateInc;
 	float playerPositionDist;
 	const char *useHintString;
-	int useHintStringIndex;         /* +0x40C  G_GetHintStringIndex out-param, 0x2000EC74 */
+	int useHintStringIndex;
 	const char *script;
-	/* 1/adsTransInTime and 1/adsTransOutTime, derived by BG_SetupTransitionTimes
-	 * (0x2000E060); no parse-table entry names them, so both names are
-	 * inferred. */
-	float adsTransInRate;           /* +0x414  BG_SetupTransitionTimes; 1/300 when unset */
-	float adsTransOutRate;          /* +0x418  1/500 when unset */
+	// derived from adsTransInTime / adsTransOutTime
+	float adsTransInRate;
+	float adsTransOutRate;
 } weaponInfo_t;
 COD1_ASSERT_SIZE( weaponInfo_t, 1052 );
+COD1_STATIC_ASSERT( offsetof( weaponInfo_t, rootAnim ) == 0x18, "weaponInfo_t.rootAnim" );
+COD1_STATIC_ASSERT( offsetof( weaponInfo_t, damageType ) == 0x1C8, "weaponInfo_t.damageType" );
+COD1_STATIC_ASSERT( offsetof( weaponInfo_t, adsViewScatterMin ) == 0x384, "weaponInfo_t.adsViewScatterMin" );
+COD1_STATIC_ASSERT( offsetof( weaponInfo_t, hipViewScatterMin ) == 0x3C4, "weaponInfo_t.hipViewScatterMin" );
 
-/* BG_SetupWeaponInfo (0x2000ECE0) stores trap_GetWeaponInfoMemory's result
- * into 0x200A069C and every reader loads that dword before indexing. */
 extern weaponInfo_t **bg_weaponInfo;
 extern int bg_numWeapons;
 
@@ -453,7 +702,7 @@ const char *BG_GetWeaponTypeName( weapType_t weaponType );
 const char *BG_GetWeaponSlotNameForIndex( weapSlot_t weaponSlot );
 int BG_AmmoForWeapon( int weaponIndex );
 int BG_ClipForWeapon( int weaponIndex );
-int BG_WeaponAmmo( int weaponIndex );
+int BG_WeaponIsClipOnly( int weaponIndex );
 qboolean BG_IsAimDownSightWeapon( int weaponIndex );
 
 /*
@@ -464,18 +713,10 @@ qboolean BG_IsAimDownSightWeapon( int weaponIndex );
 =============================================================================
 */
 
-/*
- * bg_itemlist (0x2006BB68) is 70 entries of 48 bytes: [0] is the IT_BAD
- * placeholder, [1..64] are the emptyitem_"wNN" slots BG_FillInWeaponItems
- * overwrites from the parsed weapon files, [65..69] are the two grenade-ammo
- * and three health items.  BG_CanItemBeGrabbed rejects anything outside
- * [1,70).
- */
 #define MAX_ITEM_MODELS 2
+#define MAX_ITEM_ICONS 4
 
-/* Only these four are observed: bg_itemlist uses 2 for ammo and 3 for health,
- * BG_FillInWeaponItems writes 1 for weapons, and BG_CanItemBeGrabbed errors
- * out on 0 with "BG_CanItemBeGrabbed: IT_BAD". */
+// gitem_t->type
 typedef enum itemType_t
 {
 	IT_BAD    = 0x0,
@@ -486,21 +727,24 @@ typedef enum itemType_t
 
 typedef struct gitem_s
 {
-	const char *classname;
+	const char *classname;          // spawning name
 	const char *pickup_sound;
 	const char *world_model[MAX_ITEM_MODELS];
 	const char *icon;
 	const char *ammoicon;
-	const char *pickup_name;
-	int quantity;
-	itemType_t giType;
+	const char *pickup_name;        // for printing on pickup
+	int quantity;                   // for ammo how much, or duration of powerup
+	itemType_t giType;              // IT_* flags
 	int giTag;
-	int giAmmoIndex;
-	int giClipIndex;
+	int giAmmoIndex;                // type of weapon ammo this uses
+	int giClipIndex;                // which clip this weapon uses
 } gitem_t;
 COD1_ASSERT_SIZE( gitem_t, 48 );
 
+// included in both the game dll and the client
 extern gitem_t bg_itemlist[];
+
+#define BG_NUM_ITEMS            70      // not counting the terminator
 
 gitem_t *BG_FindItem( const char *pickupName );
 gitem_t *BG_FindItemForWeapon( int weaponIndex );
@@ -513,21 +757,13 @@ gitem_t *BG_FindItemForWeapon( int weaponIndex );
 =============================================================================
 */
 
-/*
- * Sizes, and the strides in the DLL that fix them:
- *   animation_t                     92   BG_FinalizePlayerAnims (0x20001500)
- *   animScript_t                   516   BG_AnimScriptAnimation (0x20003020)
- *   animScriptItem_t               244   BG_ParseCommands (0x20001CE0)
- *   MAX_MODEL_ANIMATIONS           512   numAnimations sits at +47104
- *   NUM_ANIM_MOVETYPES              18   scriptAnims row stride 9288
- *   MAX_ANIMSCRIPT_ITEMS_PER_MODEL 2048  cmp [edi+9B6BCh], 800h
- */
-#define MAX_MODEL_ANIMATIONS 512
+#define MAX_MODEL_ANIMATIONS 512     // animations per model
 #define MAX_ANIMSCRIPT_ANIMCOMMANDS 8
 #define MAX_ANIMSCRIPT_ITEMS 128
 #define MAX_ANIMSCRIPT_ITEMS_PER_MODEL 2048
 
-/* animStateStr, 0x2006CBEC */
+// NOTE: these must all be in sync with string tables in bg_animation.c
+
 typedef enum aistateEnum_t
 {
 	AISTATE_RELAXED = 0x0,
@@ -537,7 +773,6 @@ typedef enum aistateEnum_t
 	MAX_AISTATES    = 0x4,
 } aistateEnum_t;
 
-/* animMoveTypesStr, 0x2006CC18 */
 typedef enum scriptAnimMoveTypes_t
 {
 	ANIM_MT_UNUSED      = 0x0,
@@ -561,7 +796,6 @@ typedef enum scriptAnimMoveTypes_t
 	NUM_ANIM_MOVETYPES  = 0x12,
 } scriptAnimMoveTypes_t;
 
-/* animEventTypesStr, 0x2006CCB0 */
 typedef enum scriptAnimEventTypes_t
 {
 	ANIM_ET_PAIN            = 0x0,
@@ -581,7 +815,6 @@ typedef enum scriptAnimEventTypes_t
 	NUM_ANIM_EVENTTYPES     = 0xE,
 } scriptAnimEventTypes_t;
 
-/* animBodyPartsStr, 0x2006CD28 */
 typedef enum animBodyPart_t
 {
 	ANIM_BP_UNUSED     = 0x0,
@@ -591,7 +824,6 @@ typedef enum animBodyPart_t
 	NUM_ANIM_BODYPARTS = 0x4,
 } animBodyPart_t;
 
-/* animConditionsStr, 0x2006CE18 -- CoD1 cut RTCW's list to these nine. */
 typedef enum scriptAnimConditions_t
 {
 	ANIM_COND_WEAPONS         = 0x0,
@@ -606,7 +838,6 @@ typedef enum scriptAnimConditions_t
 	NUM_ANIM_CONDITIONS       = 0x9,
 } scriptAnimConditions_t;
 
-/* animConditionsTable, 0x2006CE68: {int type; animStringItem_t *values;} */
 typedef enum animScriptConditionTypes_t
 {
 	ANIM_CONDTYPE_BITFLAGS = 0x0,
@@ -614,21 +845,18 @@ typedef enum animScriptConditionTypes_t
 	NUM_ANIM_CONDTYPES     = 0x2,
 } animScriptConditionTypes_t;
 
-/* animMountedStr, 0x2006CD80 */
 typedef enum animScriptMountedType_t
 {
 	MOUNTED_UNUSED = 0x0,
 	MOUNTED_MG42   = 0x1,
 } animScriptMountedType_t;
 
-/* animWeaponPositionStr, 0x2006CDE0 */
 typedef enum animScriptWeaponPosition_t
 {
 	WEAPON_POSITION_HIP = 0x0,
 	WEAPON_POSITION_ADS = 0x1,
 } animScriptWeaponPosition_t;
 
-/* animStrafingStr, 0x2006CDF8 */
 typedef enum animScriptStrafing_t
 {
 	STRAFING_NOT   = 0x0,
@@ -643,16 +871,7 @@ typedef struct animStringItem_t
 } animStringItem_t;
 COD1_ASSERT_SIZE( animStringItem_t, 8 );
 
-/*
- * animation_t.  92 bytes; BG_FinalizePlayerAnims fills every named member and
- * BG_GetAnimString returns &animations[i] as the name.
- */
-/*
- * A script animation reference, passed and returned by value in a single
- * dword.  The XAnim traps unpack it into two syscall arguments (`shr 16` for
- * anims, `movzx word` for index -- 0x20039090 onwards), and trap_XAnimGetChildAt
- * rewrites only the low half before handing the whole dword back (0x20039450).
- */
+// script animation handle: anim tree and index into it
 typedef struct scr_anim_s {
 	unsigned short index;
 	unsigned short anims;
@@ -662,30 +881,45 @@ COD1_ASSERT_SIZE( scr_anim_t, 4 );
 typedef struct animation_t
 {
 	char name[64];
-	int blendTime;                  /* +0x40  -1 when the script gave none */
-	int moveSpeed;                  /* +0x44  1000 * distance / duration */
-	int duration;                   /* +0x48  clamped to >= 500 */
+	int blendTime;                  // take this long to blend to next anim
+	int moveSpeed;
+	//
+	// derived
+	//
+	int duration;
 	int hash;
 	int flags;
-	int movetype;                   /* +0x54  scriptAnimMoveTypes_t bit set, BG_ParseCommands 0x20001E90 */
-	int noteType;                   /* +0x58  BG_SetupAnimNoteTypes 0x200014C1 */
+	int movetype;                   // bit set of scriptAnimMoveTypes_t
+	int noteType;
 } animation_t;
 COD1_ASSERT_SIZE( animation_t, 92 );
 
+// animation_t->flags
+#define ANIMFL_LADDER           0x002
+#define ANIMFL_TURRET           0x004
+#define ANIMFL_FIRING           0x008
+#define ANIMFL_STRAFELEFT       0x010
+#define ANIMFL_STRAFERIGHT      0x020
+#define ANIMFL_DEATH            0x040
+#define ANIMFL_LOOPED           0x080
+
+// flip the togglebit every time an animation
+// changes so a restart of the same anim can be detected
+#define ANIM_TOGGLEBIT          0x200
+
 typedef struct animScriptCondition_t
 {
-	int index;
-	int value[2];
+	int index;      // reference into the table of possible conditionals
+	int value[2];       // can store anything from weapon bits, to position enums, etc
 } animScriptCondition_t;
 COD1_ASSERT_SIZE( animScriptCondition_t, 12 );
 
-/* soundIndex is a full int here; RTCW's is a short. */
 typedef struct animScriptCommand_t
 {
-	short bodyPart[2];
-	short animIndex[2];
+	short bodyPart[2];      // play this animation on legs/torso/both
+	short animIndex[2];     // animation index in our list of animations
 	short animDuration[2];
-	int soundIndex;
+	int soundIndex;         // int, not short
 } animScriptCommand_t;
 COD1_ASSERT_SIZE( animScriptCommand_t, 16 );
 
@@ -701,239 +935,186 @@ COD1_ASSERT_SIZE( animScriptItem_t, 244 );
 typedef struct animScript_t
 {
 	int numItems;
-	animScriptItem_t *items[MAX_ANIMSCRIPT_ITEMS];
+	animScriptItem_t *items[MAX_ANIMSCRIPT_ITEMS];   // pointers into a global list of items
 } animScript_t;
 COD1_ASSERT_SIZE( animScript_t, 516 );
 
-/*
- * animScriptData_t.  CoD1 folded RTCW's animModelInfo_t into this and dropped
- * the per-model array -- multiplayer has one player model.  Offsets:
- * animations 0, numAnimations 47104, scriptAnims 47108,
- * scriptCannedAnims 84260, scriptStateChange 121412, scriptEvents 129668
- * (BG_AnimScriptEvent, 0x200031F0), scriptItems 136892, numScriptItems 636604,
- * soundIndex 636624 (BG_ParseCommands), playSound 636628 (BG_ExecuteCommand).
- *
- * No size assertion: nothing in this DLL reads past playSound.  RTCW's
- * animScriptData_t ends there.
- */
+// this is the main structure that is duplicated on the client and server
 typedef struct animScriptData_t
 {
-	animation_t animations[MAX_MODEL_ANIMATIONS];
+	animation_t animations[MAX_MODEL_ANIMATIONS];           // anim names, etc
 	int numAnimations;
 
-	animScript_t scriptAnims[MAX_AISTATES][NUM_ANIM_MOVETYPES];
-	animScript_t scriptCannedAnims[MAX_AISTATES][NUM_ANIM_MOVETYPES];
-	animScript_t scriptStateChange[MAX_AISTATES][MAX_AISTATES];
-	animScript_t scriptEvents[NUM_ANIM_EVENTTYPES];
+	// parsed from script file
+	animScript_t scriptAnims[MAX_AISTATES][NUM_ANIM_MOVETYPES];             // locomotive anims, etc
+	animScript_t scriptCannedAnims[MAX_AISTATES][NUM_ANIM_MOVETYPES];       // played randomly
+	animScript_t scriptStateChange[MAX_AISTATES][MAX_AISTATES];             // state change events
+	animScript_t scriptEvents[NUM_ANIM_EVENTTYPES];                         // events that trigger special anims
 
+	// global list of script items for this model
 	animScriptItem_t scriptItems[MAX_ANIMSCRIPT_ITEMS_PER_MODEL];
 	int numScriptItems;
 
-	int animTreeIndex;              /* +0x9B6C0  handed to Scr_GetAnimsIndex by BG_FinalizePlayerAnims */
-	scr_anim_t torsoAnim;           /* +0x9B6C4  BG_FindAnimTrees 0x20004EC0 */
-	scr_anim_t legsAnim;            /* +0x9B6C8 */
-	scr_anim_t turningAnim;         /* +0x9B6CC */
-	/* Returns the alias record's first int, which both engines hand back as-is
-	   (G_FIND_SOUND_ALIAS / cgame trap 191, both `*Com_FindSoundAlias(name)`)
-	   and which both playSound implementations then treat as a name string --
-	   so this is very likely `const char *(*)( const char * )`.  Left as int
-	   here because correcting it cascades into trap_FindSoundAlias,
-	   trap_Com_SoundAliasString and animScriptCommand_t.soundIndex. */
+	int animTreeIndex;
+	scr_anim_t torsoAnim;
+	scr_anim_t legsAnim;
+	scr_anim_t turningAnim;
+	//
+	// pointers to functions from the owning module
+	//
 	int ( *soundIndex )( const char *name );
-	/* Two arguments, clientNum FIRST, in both builds: bg_animation.c's single
-	   call site is `push soundIndex; push clientNum; call [+0x9B6D4]; add
-	   esp,8` (game 0x20002FF0, cgame 0x30003000).  ps->origin is never
-	   passed; RTCW's three-argument shape does not apply.  The two stored
-	   implementations, G_AnimScriptSound 0x2003C5E0 and
-	   CG_PlayEntitySoundAliasByName 0x30021BC0, are both ( int, const char * ). */
 	void ( *playSound )( int clientNum, const char *name );
 } animScriptData_t;
 COD1_ASSERT_SIZE( animScriptData_t, 636632 );
 
-/*
- * bg_clientinfo's capacity: BG_CreateClientAnimTrees walks the array from the
- * first entry's animTree (0x2013D7AC) to 0x2014E9AC in 0x448 steps
- * (0x20004F3B), which is exactly 64 entries.
- */
 #ifndef MAX_CLIENTS
 #define MAX_CLIENTS             64
 #endif
 
-/* attachModelNames / attachTagNames are six slots each: BG_UpdatePlayerDObj
- * (0x20004D9C) loops six times with a 0x40 stride, and the tag table sits
- * 0x180 bytes past the model table (0x20004DBD). */
 #ifndef MAX_ATTACHED_MODELS
 #define MAX_ATTACHED_MODELS     6
 #endif
 
-/*
- * lerpFrame_t -- one animation slot.  48 bytes; clientInfo_t carries two of
- * them back to back (legs at +0x37C, torso at +0x3AC) and BG_PlayerAnimation
- * hands both to the same BG_RunLerpFrameRate / BG_PlayerAnimation_VerifyAnim
- * (0x20004C9D, 0x20004CA9).
- *
- * This is RTCW's lerpFrame_t with the frame-interpolation head removed: CoD
- * plays XAnims, so oldFrame/frame/backlerp and oldAnimationNumber are gone and
- * yawAngle moved to the front.  pitchAngle/pitching are only ever used through
- * the torso slot (BG_PlayerAngles 0x20004319); nothing in this DLL reads the
- * legs slot's copy.
- */
+// one animation slot (legs or torso) of a clientInfo_t
 typedef struct lerpFrame_t
 {
-	float yawAngle;                 /* +0x00  BG_SwingAngles target, 0x200041E0 */
-	qboolean yawing;                /* +0x04  0x20004102 */
-	float pitchAngle;               /* +0x08  0x2000431F */
-	qboolean pitching;              /* +0x0C  0x20004155 */
-	int animationNumber;            /* +0x10  includes ANIM_TOGGLEBIT, 0x200036E8 */
-	animation_t *animation;         /* +0x14  0x20003739 */
-	int animationTime;              /* +0x18  blend time in ms, 0x2000373F */
-	vec3_t oldFramePos;             /* +0x1C  0x20003CB7 */
-	float animSpeedScale;           /* +0x28  0x20003C9D */
-	int oldFrameSnapshotTime;       /* +0x2C  0x20003CB1 */
+	float yawAngle;
+	qboolean yawing;
+	float pitchAngle;
+	qboolean pitching;
+	int animationNumber;            // may include ANIM_TOGGLEBIT
+	animation_t *animation;
+	int animationTime;              // blend time in msec
+	vec3_t oldFramePos;
+	float animSpeedScale;
+	int oldFrameSnapshotTime;
 } lerpFrame_t;
 COD1_ASSERT_SIZE( lerpFrame_t, 48 );
 
-/*
- * clientInfo_t -- the per-client animation and DObj record shared by the game
- * module and cgame.  1096 bytes: ClientConnect memsets 0x448 of an entry
- * (0x20019E5E) and every index site multiplies the client number by 0x448.
- *
- * The array is really a member of one larger object: G_InitGame's single
- * `rep stosd` (0x20025EB6) clears 0x200A1C80 .. 0x2014E56C in one go -- the
- * animScriptData_t, then the four resolved script animations, then these 64
- * entries -- so the retail spelling is `bgs.clientinfo[]`.  There is no
- * bgs_t here, so the array is declared on its own under an inferred name.
- *
- * ClientConnect saves and restores animTree across its memset (0x20019E51 /
- * 0x20019E60); everything else is cleared on connect.
- */
+// per-client animation and model info, shared by the game and cgame
 typedef struct clientInfo_t
 {
-	qboolean infoValid;                             /* +0x000  gate in BG_UpdatePlayerDObj 0x20004D2A */
-	byte unknown_0x004[4];                          /* +0x004  ClientConnect writes 1 (0x20019E6D) and
-	                                                           nothing here reads it; UO calls this slot
-	                                                           `active` in cgame / `pmType` in game */
-	int clientNum;                                  /* +0x008  0x20019DB8; the animation phase seed in
-	                                                           BG_SetNewAnimation 0x200038A8 */
-	char name[32];                                  /* +0x00C  strncpy 31 + terminate at +43, 0x20019DC0 */
-	int team;                                       /* +0x02C  = sess->team, 0x20019DE1 */
-	int score;                                      /* +0x030  the game DLL never touches these three;
-	                                                           cgame does (CG_ParseScores 0x3002BB2B
-	                                                           writes score) */
-	int location;                                   /* +0x034  CG_DrawPlayerLocation 0x300260DF */
-	int health;                                     /* +0x038  CG_DrawSelectedPlayerHealth 0x30025DD0 */
-	char modelName[64];                             /* +0x03C  ClientEndFrame 0x20018EE4 */
-	char attachModelNames[MAX_ATTACHED_MODELS][64]; /* +0x07C  0x20018F12 */
-	char attachTagNames[MAX_ATTACHED_MODELS][64];   /* +0x1FC  0x20018FED */
-	lerpFrame_t legs;                               /* +0x37C  BG_PlayerAnimation 0x20004C9D */
-	lerpFrame_t torso;                              /* +0x3AC  BG_PlayerAnimation 0x20004CA9 */
-	float leanAmount;                               /* +0x3DC  = es +0x6C, ClientEndFrame 0x20018E48;
-	                                                           name inferred from UO */
-	float leanFraction;                             /* +0x3E0  = es->leanf, 0x20018E54 */
-	float viewPitch;                                /* +0x3E4  = ps->viewangles[0], 0x20018E60 */
-	float viewYaw;                                  /* +0x3E8  = ps->viewangles[1], 0x20018E6C */
-	float viewRoll;                                 /* +0x3EC  = ps->viewangles[2], 0x20018E78 */
-	int gunHandLeft;                                /* +0x3F0  cleared with the line below whenever the
-	                                                           torso animation changes (0x20003933);
-	                                                           never read here.  Name inferred from UO. */
-	int dobjNeedsUpdate;                            /* +0x3F4  raised 0x2000393D, tested and cleared by
-	                                                           BG_UpdatePlayerDObj 0x20004D51/0x20004E0A */
-	int conditions[NUM_ANIM_CONDITIONS][2];         /* +0x3F8  BG_UpdateConditionValue 0x200032E9 */
-	void *animTree;                                 /* +0x440  survives ClientConnect's memset; filled by
-	                                                           GScr_LoadScripts 0x20004F39 */
-	int dobjWeapon;                                 /* +0x444  the es->weapon the DObj was built for,
-	                                                           BG_UpdatePlayerDObj 0x20004D49/0x20004E04 */
+	qboolean infoValid;
+	qboolean nextValid;                             // present in the newest snapshot
+	int clientNum;
+	char name[32];
+	int team;
+	int score;
+	int location;
+	int health;
+	char modelName[64];
+	char attachModelNames[MAX_ATTACHED_MODELS][64];
+	char attachTagNames[MAX_ATTACHED_MODELS][64];
+	lerpFrame_t legs;
+	lerpFrame_t torso;
+	float leanAmount;
+	float leanFraction;
+	float viewPitch;
+	float viewYaw;
+	float viewRoll;
+	int gunHandLeft;
+	int dobjNeedsUpdate;                            // rebuild the DObj
+	int conditions[NUM_ANIM_CONDITIONS][2];
+	void *animTree;                                 // kept across ClientConnect
+	int dobjWeapon;                                 // weapon the DObj was built for
 } clientInfo_t;
 COD1_ASSERT_SIZE( clientInfo_t, 1096 );
 
-extern clientInfo_t bg_clientinfo[MAX_CLIENTS];     /* 0x2013D36C */
+// animation data shared by the bg code; G_InitGame and CG_Init clear it in one go
+typedef struct bgs_s {
+	animScriptData_t animScriptData;
+	void *animTree;
+	scr_anim_t rootAnim, torsoAnim, legsAnim, turningAnim;
+	clientInfo_t clientinfo[MAX_CLIENTS];
+} bgs_t;
+COD1_ASSERT_SIZE( bgs_t, 0xAC8EC );
+COD1_STATIC_ASSERT( offsetof( bgs_t, animTree ) == 0x9B6D8, "bgs animation tree offset" );
+COD1_STATIC_ASSERT( offsetof( bgs_t, clientinfo ) == 0x9B6EC, "bgs client array offset" );
+extern bgs_t bgs;
+#define bgs_animScriptData bgs.animScriptData
+#define bgs_animTree bgs.animTree
+#define bgs_rootAnim bgs.rootAnim
+#define bgs_torsoAnim bgs.torsoAnim
+#define bgs_legsAnim bgs.legsAnim
+#define bgs_turningAnim bgs.turningAnim
+#define bg_clientinfo bgs.clientinfo
 
-/*
- * One entry of the model list trap_DObjCreate takes: 12 bytes, and
- * G_DObjUpdate (0x2003B1E0) and BG_UpdatePlayerDObj both build an array of
- * MAX_ATTACHED_MODELS + 1 of them on the stack.  UO grew the record to 16
- * bytes with an ignoreCollision dword; 1.1 has neither the field nor the
- * attach flag that feeds it.
- */
+#if defined( GAMEDLL ) || defined( CGAMEDLL )
+// animation clock
+typedef struct {
+	int time;
+	int animTime;
+	int frametime;
+} bgGameClock_t;
+COD1_ASSERT_SIZE( bgGameClock_t, 12 );
+extern bgGameClock_t bg;
+#define bgs_time bg.time
+#define bgs_animTime bg.animTime
+#define bgs_frametime bg.frametime
+#endif
+
+// one entry of the model list handed to trap_DObjCreate
 typedef struct DObjModel_s {
-	void            *model;                 /* +0x00 */
-	const char      *tagName;               /* +0x04 NULL for the base model */
-	short boneName;                         /* +0x08 negated model index: the engine
-	                                                 reads a negative part name as
-	                                                 "root bone of model n" */
-	short unused_0x0A;
+	void            *model;
+	const char      *tagName;               // NULL for the base model
+	short boneName;                         // negated model index: root bone of model n
+	byte pad_0x0A[2];
 } DObjModel;
 
-/*
- * The two angle-state blocks ClientThink_real (0x20017AA0) builds on its stack
- * out of the gclient_t tail and hands to bg_weapon.c's calculators.
- * pmWeaponAngleState_t is 80 bytes; baseAngles is a vec3 here (UO's is a vec2
- * and its record is 0x4C).
- */
+// view and weapon angle state, handed to the bg_weapon.c calculators
 typedef struct pmWeaponAngleState_t
 {
-	playerState_t *ps;              /* +0x00 */
-	float speed;                    /* +0x04 */
-	float frametime;                /* +0x08 */
-	vec3_t moveOffset;              /* +0x0C */
-	float idleScale;                /* +0x18 */
-	int time;                       /* +0x1C */
-	int viewKickStartTime;          /* +0x20 */
-	float viewKickPitch;            /* +0x24 */
-	float viewKickYaw;              /* +0x28 */
-	float recoilPitch;              /* +0x2C */
-	float recoilYaw;                /* +0x30 */
-	float recoilRoll;               /* +0x34 */
-	float recoilPitchSpeed;         /* +0x38 */
-	float recoilYawSpeed;           /* +0x3C */
-	int recoilState;                /* +0x40 */
-	vec3_t baseAngles;              /* +0x44 */
+	playerState_t *ps;
+	float speed;
+	float frametime;
+	vec3_t moveOffset;
+	float idleScale;
+	int time;
+	int viewKickStartTime;
+	float viewKickPitch;
+	float viewKickYaw;
+	float recoilPitch;
+	float recoilYaw;
+	float recoilRoll;
+	float recoilPitchSpeed;
+	float recoilYawSpeed;
+	int recoilState;
+	vec3_t baseAngles;
 } pmWeaponAngleState_t;
 
 typedef struct bgViewAngleState_t
 {
-	playerState_t *ps;              /* +0x00 */
-	int viewKickStartTime;          /* +0x04 */
-	int time;                       /* +0x08 */
-	float viewKickPitch;            /* +0x0C */
-	float viewKickRoll;             /* +0x10 */
-	float speed;                    /* +0x14 */
+	playerState_t *ps;
+	int viewKickStartTime;
+	int time;
+	float viewKickPitch;
+	float viewKickRoll;
+	float speed;
 } bgViewAngleState_t;
 
 //
 // bg_animation.c
 //
-/* These two are the file's genuine client/server split -- the game build
-   resolves the DObj from the entity, the cgame build is handed it already
-   resolved (CG_TransitionSnapshot -> Com_GetClientDObj, trap 162).  The
-   bodies live behind the same CGAMEDLL conditional in bg_animation.c.
-     BG_Player_DoControllers  game 0x200046B0  cgame 0x30004710
-     BG_UpdatePlayerDObj      game 0x20004CF0  cgame 0x30004EB0 */
-/* entityState_t is g_public.h's in the game build and cg_public.h's in cgame,
-   and this header includes neither -- same reason trajectory_t is a bare tag
-   below.  Both spell it `struct entityState_s`, so the tag is enough. */
+// entityState_t comes from g_public.h or cg_public.h, neither of which is included here
 struct entityState_s;
 #ifdef CGAMEDLL
-void        BG_Player_DoControllers( clientInfo_t *ci, int obj,
+struct DObj_s;
+void        BG_Player_DoControllers( struct DObj_s *obj, clientInfo_t *ci,
 									 struct entityState_s *es, int *partBits );
-void        BG_UpdatePlayerDObj( int obj, struct entityState_s *es, clientInfo_t *ci );
-void        BG_PlayerAnimation( clientInfo_t *ci, int obj,
-                                struct entityState_s *es );
+void        BG_UpdatePlayerDObj( struct DObj_s *obj, struct entityState_s *es, clientInfo_t *ci );
+void        BG_PlayerAnimation( struct DObj_s *obj, struct entityState_s *es,
+                                clientInfo_t *ci );
 #else
 struct gentity_s;
-void        BG_Player_DoControllers( clientInfo_t *ci, struct gentity_s *ent,
+void        BG_Player_DoControllers( struct gentity_s *ent, clientInfo_t *ci,
 									 struct entityState_s *es, int *partBits );
 void        BG_UpdatePlayerDObj( struct gentity_s *ent, struct entityState_s *es,
 								 clientInfo_t *ci );
-void        BG_PlayerAnimation( clientInfo_t *ci, struct gentity_s *ent,
-                                struct entityState_s *es );
+void        BG_PlayerAnimation( struct gentity_s *ent, struct entityState_s *es,
+                                clientInfo_t *ci );
 #endif
 
-/* The runtime animation list is animScriptAnim_t, which is private to
-   bg_animation.c: neither caller outside that file can name it, so the slot is
-   void * on both sides.  GScr_LoadScripts (0x2002F0D0) and CGScr_LoadAnimTrees
-   (0x300133E0) hand it a 512-entry stack array with the count by reference;
-   BG_FinalizePlayerAnims' re-parse (0x2000174B) passes NULL/NULL. */
+// anims is the caller's animation list (NULL when re-parsing)
 void        BG_AnimParseAnimScript( animScriptData_t *scriptData, void *anims, int *numAnims );
 int         BG_AnimScriptAnimation( playerState_t *ps, aistateEnum_t state,
                                     scriptAnimMoveTypes_t movetype, qboolean isContinue );
@@ -943,26 +1124,36 @@ int         BG_AnimScriptEvent( playerState_t *ps, scriptAnimEventTypes_t event,
 //
 // bg_misc.c
 //
-/* trajectory_t belongs to g_public.h, which a bg unit does not include; the
-   evaluators only ever take a pointer to one. */
 struct trajectory_t;
 void        BG_AddPredictableEventToPlayerstate( int newEvent, int eventParm,
                                                  playerState_t *ps );
 void        BG_EvaluateTrajectory( const struct trajectory_t *tr, int atTime, vec3_t result );
 void        BG_EvaluateTrajectoryDelta( const struct trajectory_t *tr, int atTime, vec3_t result );
-/* Both are __usercall; the parameter order is RTCW's (bg_misc.c:3884 and
-   :3991, bg_public.h:1401), not the register order. */
 void        BG_PlayerStateToEntityState( playerState_t *ps, struct entityState_s *s,
                                          qboolean snap );
 void        BG_PlayerStateToEntityStateExtrapolate( playerState_t *ps, struct entityState_s *s,
                                                     int time, qboolean snap );
+int         BG_CheckProneValid( int clientNum, const vec3_t origin, float radius, float height,
+                                float yaw, float *groundOffset, float *pitchDown, float *pitchUp,
+                                qboolean skipInitialTrace, qboolean allowFallback,
+                                const vec3_t groundNormal,
+                                void ( *traceFunc )( trace_t *, const vec3_t, const vec3_t, const vec3_t, const vec3_t, int, int ),
+                                void ( *traceDownFunc )( trace_t *, const vec3_t, const vec3_t, const vec3_t, const vec3_t, int, int ),
+                                qboolean useAltContentMask );
+int         BG_CheckProne( int clientNum, const vec3_t origin, float radius, float height,
+                           float yaw, float *groundOffset, float *pitchDown, float *pitchUp,
+                           qboolean skipInitialTrace, qboolean allowFallback,
+                           const vec3_t groundNormal,
+                           void ( *traceFunc )( trace_t *, const vec3_t, const vec3_t, const vec3_t, const vec3_t, int, int ),
+                           void ( *traceDownFunc )( trace_t *, const vec3_t, const vec3_t, const vec3_t, const vec3_t, int, int ),
+                           qboolean useAltContentMask );
 
 //
 // bg_weapon.c
 //
-extern int bg_ammoTypeMax[MAX_WEAPONS];             /* 0x20088DD0 */
-extern int bg_ammoClipSizes[MAX_WEAPONS];           /* 0x200891E0 */
-extern const char *bg_weaponSlotNames[WEAPSLOT_NUM];        /* 0x2006AD7C */
+extern int bg_ammoTypeMax[MAX_WEAPONS];
+extern int bg_ammoClipSizes[MAX_WEAPONS];
+extern const char *bg_weaponSlotNames[WEAPSLOT_NUM];
 
 qboolean    BG_GivePlayerWeapon( playerState_t *ps, int weapon );
 int         BG_TakePlayerWeapon( playerState_t *ps, int weapon );
@@ -970,6 +1161,6 @@ int         BG_IsPlayerWeaponInSlot( const playerState_t *ps, int weapon, qboole
 int         BG_GetEmptySlotForWeapon( const playerState_t *ps, int weapon );
 int         BG_GetStackSlotForWeapon( const playerState_t *ps, int weapon, int preferredSlot );
 int         BG_GetMaxPickupableAmmo( const playerState_t *ps, int weapon );
-float       BG_GetMinSpreadForWeapon( int time, const playerState_t *ps, int weaponIndex );
+double      BG_GetMinSpreadForWeapon( int time, const playerState_t *ps, int weaponIndex );
 
 #endif /* __BG_PUBLIC_H__ */

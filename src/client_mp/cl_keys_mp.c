@@ -4,10 +4,29 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "cl_vm.h"
 #include "cl_records.h"
+#include "cl_local.h"
+
+/* field completion state (RTCW cl_keys.c keeps these static) */
+char shortestMatch[9420];           /* 0x0087A308 */
+int anykeydown;                     /* 0x0142F75C */
+int matchCount;
+char *completionString;
+
+/* RTCW cl_keys.c */
+field_t         historyEditLines[32];       /* 0x014304C0, 9088 == 32 * 284 */
+int nextHistoryLine;
+int historyLine;
+field_t         g_consoleField;             /* 0x0142F640 */
+field_t         chatField;                  /* 0x014303A0 */
+int chat_team;   /* 0x01430380 */
+int key_overstrikeMode;   /* 0x0142F628 */
+int keysStorage[768];   /* 0x0142F780, keys[256] (qkey_t) */
+
+/* MAX_EDIT_LINE is RTCW qcommon/qcommon.h:720; it is the size of field_t.buffer
+ * (256) and the console/chat edit line length. */
+#define MAX_EDIT_LINE           256
 
 extern void CL_AddReliableCommand( const char *cmd );
 extern int CL_Disconnect_f();
@@ -18,6 +37,7 @@ extern int Con_PageDown();
 extern int Con_PageUp();
 extern void Con_ToggleConsole_f( void );   /* cl_console_mp.c 0x004083A0 */
 extern int Con_Top();
+extern void Con_Bottom( void );   /* cl_console_mp.c 0x0040A3A0 */
 extern int MSS_StopSounds();
 extern int SCR_UpdateScreen();
 extern int SEH_PrintStrlen();
@@ -26,411 +46,357 @@ extern int UI_checkKeyExec();
 
 extern int chat_playerNum;
 
-/* Unrenamed cells in this unit:
+/* Retail cells used by this unit (flattened keys[] fields):
  *
- *   dword_142F628   retail's key_overstrikeMode (0x0142F628, read by
- *                   Key_GetOverstrikeMode at 0x0040D480).  TODO: this file also
- *                   carries a file-static key_overstrikeMode for the Get/Set
- *                   pair, so the two are separate storage here where retail
- *                   has one.
- *   dword_142FEF4   retail keys[K_CTRL].down  -- 0x0142F780 + 159*12.
- *   dword_142FF00   retail keys[K_SHIFT].down -- 0x0142F780 + 160*12.
- *                   TODO: cod1_globals.c defines both as standalone ints, not
- *                   aliases of the keys[] array, so every ctrl-/shift- modified
- *                   branch below reads a cell nothing ever writes.
- *   dword_57C0F8    the console field width; 0x0057C0FC and 0x0057C100 are the
+ *   key_overstrikeMode   0x0142F628, owned by Key_Get/SetOverstrikeMode
+ *                   (0x0040D480/0x0040D490) -- one storage, as in retail.
+ *   keys_ctrlDown   retail keys[K_CTRL].down  -- 0x0142F780 + 159*12 = 0x0142FEF4.
+ *   keys_shiftDown   retail keys[K_SHIFT].down -- 0x0142F780 + 160*12 = 0x0142FF00.
+ *                   Both are cl_local.h macros reading keysStorage[3*159] /
+ *                   keysStorage[3*160], the .down cells CL_KeyEvent writes, as
+ *                   retail's absolute reads of those two addresses do.
+ *   con_fieldWidthPixels    the console field width; 0x0057C0FC and 0x0057C100 are the
  *                   8.0f/16.0f char metrics beside it.  RTCW cl_console.c calls
  *                   the first g_console_field_width (cl_keys.c:1156 assigns it
  *                   at exactly this point); the three are defined and driven
  *                   from cl_console_mp.c and cl_main_mp.c.
  *
- * Indirect call slots used by Field_Draw and Field_AdjustScroll: dword_143292C
- * is refexport_t +0xCC re.Text_Width and dword_1432940 is +0xE0
+ * Indirect call slots used by Field_Draw and Field_AdjustScroll: re_Text_Width
+ * is refexport_t +0xCC re.Text_Width and re_Text_PaintWithCursor is +0xE0
  * re.Text_PaintWithCursor (cl_refapi.c).
  */
 
 /* Defined further down this unit. Retail __usercall(field@<eax>, ch@<ebx>), cdecl here. */
-void __cdecl Field_CharEvent(void *field, int ch);
+void __cdecl Field_CharEvent( field_t *field, int ch );
 
 /* ---- Field_Draw  0x0040C500 ----  [HIGH] */
-void __cdecl Field_Draw(void *edit, int x, int y)
-{
-  int v2;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  double v9;
-  int v10;
-  char v11;
-  double v12;
-  float v13;
-  float v14;
-  float v15;
-  float v16;
-  char v17;
-  _DWORD v18[4];
-  char Destination[1024];
-  unsigned int v21;
-  unsigned int retaddr;
+/* re_Text_PaintWithCursor is refexport_t +0xE0 re.Text_PaintWithCursor; it is
+ * unprototyped in the header, so it is called here through its real signature
+ * (float coordinates, a char cursor).  showCursor is pushed by every retail
+ * caller and never read. */
+typedef void ( *TextPaintWithCursor_t )( float x, float y, int font, float scale, const float *color,
+                                         const char *text, int cursorPos, char cursor, float charWidth,
+                                         int limit, int style );
 
-  v21 = retaddr ^ _security_cookie;
-  v2 = (int)edit;
-  v3 = *(_DWORD *)(v2 + 4);
-  v4 = 256 - v3;
-  v18[0] = 1065353216;
-  v18[1] = 1065353216;
-  v18[2] = 1065353216;
-  v18[3] = 1065353216;
-  strncpy(Destination, (const char *)(v3 + v2 + 28), 256 - v3 - 1);
-  v13 = (float)x;
-  v14 = *(float *)(v2 + 16);
-  v5 = *(_DWORD *)(v2 + 24);
-  v6 = *(_DWORD *)v2 - *(_DWORD *)(v2 + 4);
-  v7 = dword_142F628;
-  v15 = (double)y + *(float *)(v2 + 20);
-  Destination[v4 - 1] = 0;
-  v16 = *(float *)(v2 + 20) * 0.020833334;
-  if ( v5 )
+void __cdecl Field_Draw( field_t *edit, int x, int y, int showCursor )
+{
+  char  text[1024];
+  float color[4];
+  float fx;
+  float fy;
+  float charWidth;
+  float charHeightScale;
+  int   style;
+  int   charset;
+  char  cursorChar;
+  int   cursorPos;
+  int   len;
+
+  len = MAX_EDIT_LINE - edit->scroll;
+  color[0] = 1.0f;
+  color[1] = 1.0f;
+  color[2] = 1.0f;
+  color[3] = 1.0f;
+  strncpy( text, edit->buffer + edit->scroll, len - 1 );
+
+  fx              = (float)x;
+  charWidth       = edit->charWidth;
+  cursorPos       = edit->cursor - edit->scroll;
+  fy              = y + edit->charHeight;              /* implicit int->float: a cast schedules the fadd later */
+  /* retail 0x0040C58C terminates with no bound check; written as a pointer store because
+     text[len - 1] = 0 makes modern /GS add a range-check fast-fail */
+  *( text + len - 1 ) = 0;
+  charHeightScale = edit->charHeight * 0.020833334f;      /* charHeight / 48; retail float const 0x00568FEC */
+
+  if ( edit->fixedWidth )
   {
-    v8 = 0;
-    v9 = 640.0 / (double)cls_glconfig_vidWidth;
-    v10 = 5;
-    v11 = (v7 != 0) + 10;
-    v13 = v13 * v9;
-    v12 = 480.0 / (double)cls_glconfig_vidHeight;
-    v15 = v15 * v12;
-    v16 = v12 * v16;
-    v14 = v9 * v14;
+    rfloat xadjust;
+    rfloat yadjust;
+
+    charset         = 0;
+    style           = 5;
+    cursorChar      = ( key_overstrikeMode != 0 ) + 10;
+    xadjust         = 640.0f / (rfloat)cls_glconfig_vidWidth;
+    fx              = fx * xadjust;
+    yadjust         = 480.0f / (rfloat)cls_glconfig_vidHeight;
+    fy              = fy * yadjust;
+    charHeightScale = yadjust * charHeightScale;
+    charWidth       = xadjust * charWidth;
   }
   else
   {
-    v10 = 0;
-    v8 = 3;
-    v11 = v7 == 0 ? 124 : 95;
+    style      = 0;
+    charset    = 3;
+    cursorChar = key_overstrikeMode ? '_' : '|';
   }
-  v17 = v11;
-  if ( !*(_DWORD *)(v2 + 8) )
-    *(_DWORD *)(v2 + 8) = 256;
-  dword_1432940(
-    LODWORD(v13),
-    LODWORD(v15),
-    v10,
-    LODWORD(v16),
-    v18,
-    Destination,
-    v6,
-    v17,
-    LODWORD(v14),
-    *(_DWORD *)(v2 + 8),
-    v8);
+
+  if ( !edit->widthInChars )
+    edit->widthInChars = MAX_EDIT_LINE;
+
+  ( (TextPaintWithCursor_t)re_Text_PaintWithCursor )(   /* re.Text_PaintWithCursor */
+    fx,
+    fy,
+    style,
+    charHeightScale,
+    color,
+    text,
+    cursorPos,
+    cursorChar,
+    charWidth,
+    edit->widthInChars,
+    charset );
 }
 
 /* ---- Field_AdjustScroll  0x0040C660 ----  [HIGH] */
-void __cdecl Field_AdjustScroll(void *field)
+/* re_Text_Width is refexport_t +0xCC re.Text_Width; unprototyped, so the two
+ * float metrics are passed as raw bit patterns.  It returns the pixel
+ * width of the string (optionally limited to a leading character count). */
+void __cdecl Field_AdjustScroll( field_t *field )
 {
-  int v1;
-  int v2;
-  double v3;
-  float v4;
-  float v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  signed int v11;
-  signed int v12;
-  double v13;
-  int v14;
-  float v15;
-  float v16;
-  int v17;
-  int v18;
-  float v19;
+  struct { float width, height; } metrics;
+  float  pixelWidth;
+  rfloat xadjust;
+  rfloat yadjust;
+  rfloat width;
+  int    charset;
+  int    fullWidth;
+  int    cursorOffset;
+  int    len;
+  int    scrollWidth;
 
-  v1 = (int)field;
-  v16 = *(float *)(v1 + 16);
-  v19 = *(float *)(v1 + 20) * 0.020833334;
-  v15 = (float)*(int *)(v1 + 12);
-  if ( *(_DWORD *)(v1 + 24) )
+  metrics.width   = field->charWidth;
+  metrics.height = field->charHeight * 0.020833334f;       /* charHeight / 48; retail float const 0x00568FEC */
+  pixelWidth  = (float)field->widthInPixels;
+
+  if ( field->fixedWidth )
   {
-    v2 = 5;
-    v19 = 480.0 / (double)cls_glconfig_vidHeight * v19;
-    v3 = 640.0 / (double)cls_glconfig_vidWidth;
-    v16 = v16 * v3;
-    v15 = v3 * v15;
+    charset     = 5;
+    yadjust     = 480.0f / (rfloat)cls_glconfig_vidHeight;
+    metrics.height = yadjust * metrics.height;
+    xadjust     = 640.0f / (rfloat)cls_glconfig_vidWidth;
+    metrics.width   = metrics.width * xadjust;
+    pixelWidth  = xadjust * pixelWidth;
   }
   else
   {
-    v2 = 0;
+    charset = 0;
   }
-  v4 = v16;
-  v5 = v19;
-  v17 = dword_143292C(v1 + 28, v2, LODWORD(v19), LODWORD(v16), 0);
-  if ( ((double)v17 < v15) | __UNORDERED__((double)v17, v15) )
+
+  fullWidth = re_Text_Width( field->buffer, charset,
+                             *(unsigned int *)&metrics.height, *(unsigned int *)&metrics.width, 0 );
+  if ( (rfloat)fullWidth < pixelWidth )
   {
-    *(_DWORD *)(v1 + 4) = 0;
-    *(_DWORD *)(v1 + 8) = SEH_PrintStrlen((char *)(v1 + 28));
+    /* the whole line fits, so no horizontal scroll is needed */
+    field->scroll       = 0;
+    field->widthInChars = SEH_PrintStrlen( field->buffer );
     return;
   }
-  if ( (v15 > 0.0) | __UNORDERED__(0.0, v15) )
+
+  /* pull the scroll back while the tail still fits the visible box */
+  width = 0;
+  while ( width < pixelWidth && field->scroll > 0 )
   {
-    while ( 1 )
-    {
-      v6 = *(_DWORD *)(v1 + 4);
-      if ( v6 <= 0 || (double)dword_143292C(v6 + v1 + 27, v2, LODWORD(v19), LODWORD(v4), 0) >= v15 )
-        break;
-      --*(_DWORD *)(v1 + 4);
-    }
+    width = re_Text_Width( field->buffer + field->scroll - 1, charset,
+                           *(unsigned int *)&metrics.height, *(unsigned int *)&metrics.width, 0 );
+    if ( width >= pixelWidth )
+      break;
+    --field->scroll;
   }
-  while ( 1 )
+
+  /* nudge the scroll until the cursor lands inside the visible box */
+  do
   {
-    v7 = dword_143292C(*(_DWORD *)(v1 + 4) + v1 + 28, v2, LODWORD(v5), LODWORD(v4), 0);
-    v8 = v7 - dword_143292C(*(_DWORD *)v1 + v1 + 28, v2, LODWORD(v19), LODWORD(v4), 0);
-    v18 = v8;
-    if ( v8 < 0 )
+    scrollWidth   = re_Text_Width( field->buffer + field->scroll, charset,
+                                   *(unsigned int *)&metrics.height, *(unsigned int *)&metrics.width, 0 );
+    cursorOffset  = scrollWidth - re_Text_Width( field->buffer + field->cursor, charset,
+                                                 *(unsigned int *)&metrics.height, *(unsigned int *)&metrics.width, 0 );
+
+    if ( cursorOffset >= 0 )
     {
-      v14 = *(_DWORD *)(v1 + 4);
-      if ( !v14 )
-      {
-        v18 = 0;
-        goto LABEL_17;
-      }
-      v9 = v14 - 1;
+      if ( (rfloat)cursorOffset >= pixelWidth )
+        ++field->scroll;
     }
     else
     {
-      if ( (double)v8 < v15 )
-        goto LABEL_16;
-      v9 = *(_DWORD *)(v1 + 4) + 1;
+      if ( field->scroll )   /* this test order moves the block out of line, as in retail */
+        --field->scroll;
+      else
+        cursorOffset = 0;
     }
-    *(_DWORD *)(v1 + 4) = v9;
-LABEL_16:
-    if ( v8 < 0 )
-      goto LABEL_11;
-LABEL_17:
-    if ( (double)v18 < v15 )
-      break;
-LABEL_11:
-    v5 = v19;
   }
-  v10 = *(_DWORD *)(v1 + 4);
-  v11 = strlen((const char *)(v10 + v1 + 28));
-  *(_DWORD *)(v1 + 8) = *(_DWORD *)v1 - v10;
-  if ( (v15 > 0.0) | __UNORDERED__(0.0, v15) )
+  while ( cursorOffset < 0 || (rfloat)cursorOffset >= pixelWidth );
+
+  /* extend widthInChars to as many characters as fit from the scroll position */
+  len = strlen( field->buffer + field->scroll );
+  field->widthInChars = field->cursor - field->scroll;
+  width = 0;
+  while ( width < pixelWidth && field->widthInChars < len )
   {
-    while ( 1 )
-    {
-      v12 = *(_DWORD *)(v1 + 8);
-      if ( v12 >= v11 )
-        break;
-      v13 = (double)dword_143292C(*(_DWORD *)(v1 + 4) + v1 + 28, v2, LODWORD(v19), LODWORD(v4), v12 + 1);
-      if ( !((v13 < v15) | __UNORDERED__(v13, v15)) )
-        break;
-      ++*(_DWORD *)(v1 + 8);
-    }
+    width = re_Text_Width( field->buffer + field->scroll, charset,
+                           *(unsigned int *)&metrics.height, *(unsigned int *)&metrics.width,
+                           field->widthInChars + 1 );
+    if ( width < pixelWidth )
+      ++field->widthInChars;
   }
 }
 
 /* ---- Field_Paste  0x0040C870 ----  [CONFIRMED] */
-void __cdecl Field_Paste(void *field)
+void __cdecl Field_Paste( field_t *field )
 {
-  char *ClipboardData;
-  char *v4;
-  int v5;
-  int v6;
+  char *cbd;
+  int   pasteLen;
+  int   i;
 
-  ClipboardData = Sys_GetClipboardData();
-  v4 = ClipboardData;
-  if ( ClipboardData )
-  {
-    v5 = strlen(ClipboardData);
-    v6 = 0;
-    if ( v5 > 0 )
-    {
-      do
-      {
-        Field_CharEvent(field, v4[v6]);
-        ++v6;
-      }
-      while ( v6 < v5 );
-    }
-    free(v4);
-  }
+  cbd = Sys_GetClipboardData();
+  if ( !cbd )
+    return;
+
+  pasteLen = strlen( cbd );
+  for ( i = 0; i < pasteLen; i++ )
+    Field_CharEvent( field, cbd[i] );
+
+  free( cbd );
 }
 
 /* ---- Field_KeyDownEvent  0x0040C8C0 ----  [HIGH] */
-void __cdecl Field_KeyDownEvent(void *field, int key)
+/* keys_shiftDown / keys_ctrlDown are retail keys[K_SHIFT].down / keys[K_CTRL].down
+ * (see the file header) and key_overstrikeMode is the retail overstrike flag. */
+void __cdecl Field_KeyDownEvent( field_t *field, int key )
 {
-  int v2;
-  int v3;
-  int *v4;
-  signed int v5;
-  int v6;
-  int v7;
-  int v8;
-  bool v9;
-  void *v10;
+  int len;
 
-  v2 = (int)field;
-  v3 = key;
-  v10 = field;
-  v4 = (int *)v2;
-  v5 = strlen((const char *)(v2 + 28));
-  if ( (v3 == 161 || v3 == 192) && dword_142FF00 )
+  len = strlen( field->buffer );
+
+  /* shift + Ins / KP_Ins pastes the clipboard */
+  if ( ( key == 161 || key == 192 ) && keys_shiftDown )   /* 161 K_INS, 192 K_KP_INS */
   {
-    Field_Paste(v4);
+    Field_Paste( field );
   }
-  else
+  else if ( key == 162 )   /* K_DEL */
   {
-    switch ( v3 )
+    if ( field->cursor < len )
+      memmove( field->buffer + field->cursor,
+               field->buffer + field->cursor + 1,
+               len - field->cursor );
+  }
+  else if ( key == 157 )   /* K_RIGHTARROW */
+  {
+    if ( field->cursor < len )
+      ++field->cursor;
+    if ( keys_ctrlDown )   /* ctrl: skip to the start of the next word */
     {
-      case 162:
-        if ( *v4 < v5 )
-          memcpy((char *)v4 + *v4 + 28, (char *)v4 + *v4 + 29, v5 - *v4);
-        break;
-      case 157:
-        if ( *v4 < v5 )
-          ++*v4;
-        if ( dword_142FEF4 )
-        {
-          if ( *v4 < v5 )
-          {
-            do
-            {
-              if ( !isalnum(*((char *)v4 + *v4 + 28)) )
-                break;
-              v6 = *v4 + 1;
-              *v4 = v6;
-            }
-            while ( v6 < v5 );
-            if ( *v4 < v5 )
-            {
-              do
-              {
-                if ( isalnum(*((char *)v4 + *v4 + 28)) )
-                  break;
-                v7 = *v4 + 1;
-                *v4 = v7;
-              }
-              while ( v7 < v5 );
-            }
-          }
-        }
-        break;
-      case 156:
-        if ( *v4 > 0 )
-          --*v4;
-        if ( dword_142FEF4 )
-        {
-          if ( *v4 > 0 )
-          {
-            do
-            {
-              if ( !isalnum(*((char *)v4 + *v4 + 27)) )
-                break;
-              v8 = *v4 - 1;
-              v9 = *v4 == 1;
-              *v4 = v8;
-            }
-            while ( v8 >= 0 && !v9 );
-          }
-        }
-        if ( *v4 < v4[1] )
-          v4[1] = *v4;
-        break;
-      default:
-        if ( v3 == 165 || tolower(v3) == 97 && dword_142FEF4 )
-        {
-          *v4 = 0;
-        }
-        else if ( v3 == 166 || tolower(v3) == 101 && dword_142FEF4 )
-        {
-          *v4 = v5;
-        }
-        else if ( v3 == 161 )
-        {
-          dword_142F628 = dword_142F628 == 0;
-        }
-        break;
+      while ( field->cursor < len && isalnum( field->buffer[field->cursor] ) )
+        ++field->cursor;
+      while ( field->cursor < len && !isalnum( field->buffer[field->cursor] ) )
+        ++field->cursor;
     }
   }
+  else if ( key == 156 )   /* K_LEFTARROW */
+  {
+    if ( field->cursor > 0 )
+      --field->cursor;
+    if ( keys_ctrlDown )   /* ctrl: skip to the start of the current word */
+    {
+      while ( field->cursor > 0 && isalnum( field->buffer[field->cursor - 1] ) )
+        --field->cursor;
+    }
+    if ( field->cursor < field->scroll )
+      field->scroll = field->cursor;
+  }
+  else if ( key == 165 || ( tolower( key ) == 'a' && keys_ctrlDown ) )         /* K_HOME / ctrl+a */
+  {
+    field->cursor = 0;
+  }
+  else if ( key == 166 || ( tolower( key ) == 'e' && keys_ctrlDown ) )    /* K_END / ctrl+e */
+  {
+    field->cursor = len;
+  }
+  else if ( key == 161 )                                                  /* K_INS toggles overstrike */
+  {
+    key_overstrikeMode = !key_overstrikeMode;
+  }
+
   if ( uivm )
-    Field_AdjustScroll(v10);
+    Field_AdjustScroll( field );
 }
 
 /* ---- Field_CharEvent  0x0040CA70 ----  VERIFIED */
-void __cdecl Field_CharEvent(void *field, int ch)
+void __cdecl Field_CharEvent( field_t *field, int ch )
 {
-  int v3;
-  int *v4;
-  void *v5;
-  unsigned int v6;
-  unsigned int v7;
-  int v8;
+  int len;
 
-  v4 = (int *)field;
-  v3 = ch;
-  v5 = (char *)field + 28;
-  v6 = strlen((const char *)field + 28);
-  v7 = v6;
-  switch ( v3 )
+  len = strlen( field->buffer );
+
+  if ( ch == 22 )   /* Ctrl-V: paste */
   {
-    case 22:
-      Field_Paste(v4);
-      Field_AdjustScroll(v4);
-      return;
-    case 3:
-      memset(v5, 0, 0x100u);
-      *v4 = 0;
-      v4[1] = 0;
-      v4[2] = 256;
-      Field_AdjustScroll(v4);
-      return;
-    case 8:
-      if ( *v4 > 0 )
-      {
-        memcpy((char *)v4 + *v4 + 27, (char *)v4 + *v4 + 28, v6 - *v4 + 1);
-        --*v4;
-        Field_AdjustScroll(v4);
-        return;
-      }
-LABEL_20:
-      Field_AdjustScroll(v4);
-      return;
-    case 1:
-      *v4 = 0;
-      v4[1] = 0;
-      return;
-    case 5:
-      *v4 = v6;
-      Field_AdjustScroll(v4);
-      return;
+    Field_Paste( field );
+    Field_AdjustScroll( field );
+    return;
   }
-  if ( v3 >= 32 )
+
+  if ( ch == 3 )    /* Ctrl-C: clear the line */
   {
-    if ( dword_142F628 )
-    {
-      if ( *v4 == 255 )
-        return;
-      *((_BYTE *)v4 + *v4 + 28) = v3;
-    }
-    else
-    {
-      if ( v6 == 255 )
-        return;
-      memcpy((char *)v4 + *v4 + 29, (char *)v4 + *v4 + 28, v6 - *v4 + 1);
-      *((_BYTE *)v4 + *v4 + 28) = v3;
-    }
-    v8 = *v4 + 1;
-    *v4 = v8;
-    if ( v8 == v7 + 1 )
-      *((_BYTE *)v4 + v8 + 28) = 0;
-    goto LABEL_20;
+    memset( field->buffer, 0, MAX_EDIT_LINE );
+    field->cursor       = 0;
+    field->scroll       = 0;
+    field->widthInChars = MAX_EDIT_LINE;
+    Field_AdjustScroll( field );
+    return;
   }
+
+  if ( ch == 8 )    /* Backspace */
+  {
+    if ( field->cursor > 0 )
+    {
+      /* memmove, not memcpy: retail calls the CRT copy here, never the rep movs intrinsic */
+      memmove( field->buffer + field->cursor - 1,
+               field->buffer + field->cursor,
+               len - field->cursor + 1 );
+      --field->cursor;
+    }
+    Field_AdjustScroll( field );
+    return;
+  }
+
+  if ( ch == 1 )    /* Ctrl-A: home */
+  {
+    field->cursor = 0;
+    field->scroll = 0;
+    return;
+  }
+
+  if ( ch == 5 )    /* Ctrl-E: end */
+  {
+    field->cursor = len;
+    Field_AdjustScroll( field );
+    return;
+  }
+
+  if ( ch < 32 )
+    return;
+
+  if ( key_overstrikeMode )   /* overstrike */
+  {
+    if ( field->cursor == 255 )
+      return;
+    field->buffer[field->cursor] = ch;
+    field->cursor++;
+  }
+  else                   /* insert */
+  {
+    if ( len == 255 )
+      return;
+    memmove( field->buffer + field->cursor + 1,
+             field->buffer + field->cursor,
+             len - field->cursor + 1 );
+    field->buffer[field->cursor] = ch;
+    field->cursor++;
+  }
+
+  if ( field->cursor == len + 1 )
+    field->buffer[field->cursor] = 0;
+
+  Field_AdjustScroll( field );
 }
 
 /* ---- CL_FindMatches  0x0040CB80 ----  VERIFIED */
@@ -454,7 +420,9 @@ void __cdecl CL_FindMatches( const char *s )
 			break;
 		}
 	}
-	shortestMatch[i] = 0;
+	/* retail 0x0040CC0D terminates with no bound check; written as a pointer store because
+	   shortestMatch[i] = 0 makes modern /GS add a range-check fast-fail */
+	*( shortestMatch + i ) = 0;
 }
 
 /* ---- CL_PrintMatches  0x0040CC20 ----  VERIFIED */
@@ -471,10 +439,10 @@ static void keyConcatArgs( void )
 	int		i;
 	char	*arg;
 
-	for ( i = 1 ; i < cmd_argc ; i++ ) {
+	for ( i = 1 ; i < Cmd_Argc() ; i++ ) {
 		Q_strcat( (char *)text_in, 256, " " );
 
-		arg = ( (unsigned int)i < (unsigned int)cmd_argc ) ? cmd_argv[i] : (char *)empty_string;
+		arg = Cmd_Argv( i );
 		while ( *arg ) {
 			if ( *arg == ' ' ) {
 				Q_strcat( (char *)text_in, 256, "\"" );
@@ -483,8 +451,7 @@ static void keyConcatArgs( void )
 			arg++;
 		}
 
-		Q_strcat( (char *)text_in, 256,
-				  ( (unsigned int)i < (unsigned int)cmd_argc ) ? cmd_argv[i] : (char *)empty_string );
+		Q_strcat( (char *)text_in, 256, Cmd_Argv( i ) );
 
 		if ( *arg == ' ' ) {
 			Q_strcat( (char *)text_in, 256, "\"" );
@@ -510,15 +477,12 @@ void __cdecl CL_ConcatRemaining( const char *src, const char *start )
 /* ---- CompleteCommand  0x0040CE80 ----  VERIFIED */
 void __cdecl CompleteCommand( void )
 {
-	char	temp[256];
+	field_t	temp;
 	char	*cmd;
 
 	Cmd_TokenizeString2( (const char *)text_in, 0 );
 
-	cmd = (char *)empty_string;
-	if ( (unsigned int)cmd_argc > 0 ) {
-		cmd = cmd_argv[0];
-	}
+	cmd = Cmd_Argv( 0 );
 	completionString = cmd;
 	if ( cmd[0] == '\\' || cmd[0] == '/' ) {
 		completionString = ++cmd;
@@ -538,14 +502,15 @@ void __cdecl CompleteCommand( void )
 		return;
 	}
 
-	Com_Memcpy( temp, text_in, sizeof( temp ) );
+	/* retail 0x0040CF40 copies the whole field_t (0x11C) from g_consoleField */
+	Com_Memcpy( &temp, &g_consoleField, sizeof( temp ) );
 
 	if ( matchCount == 1 ) {
 		Com_sprintf( (char *)text_in, 256, "\\%s", shortestMatch );
 		if ( cmd_argc == 1 ) {
 			Q_strcat( (char *)text_in, 256, " " );
 		} else {
-			CL_ConcatRemaining( temp, completionString );
+			CL_ConcatRemaining( temp.buffer, completionString );
 		}
 		g_consoleField.cursor = strlen( (const char *)text_in );
 		Field_AdjustScroll( &g_consoleField );
@@ -554,7 +519,7 @@ void __cdecl CompleteCommand( void )
 
 	Com_sprintf( (char *)text_in, 256, "\\%s", shortestMatch );
 	g_consoleField.cursor = strlen( (const char *)text_in );
-	CL_ConcatRemaining( temp, completionString );
+	CL_ConcatRemaining( temp.buffer, completionString );
 	Field_AdjustScroll( &g_consoleField );
 
 	Com_Printf( "]%s\n", text_in );
@@ -564,145 +529,125 @@ void __cdecl CompleteCommand( void )
 }
 
 /* ---- Console_Key  0x0040D050 ----  [HIGH] */
-void __cdecl Console_Key(int key)
+/* keys_ctrlDown / keys_shiftDown are retail keys[K_CTRL].down / keys[K_SHIFT].down
+ * (see the file header). */
+void __cdecl Console_Key( int key )
 {
-  int v3;
-  int ctrl;
-  char Destination[1024];
+  char temp[1024];
 
-  if ( key == 'l' )
+  /* Ctrl-L clears the console */
+  if ( key == 'l' && keys_ctrlDown )
   {
-    if ( dword_142FEF4 )
-    {
-      Cbuf_AddText("clear\n");
-      return;
-    }
-    goto LABEL_15;
-  }
-
-  if ( key != 13 && key != 191 )
-  {
-    switch ( key )
-    {
-      case 9:
-        CompleteCommand();
-        return;
-      case 206:
-        if ( dword_142FF00 )
-          goto LABEL_10;
-        break;
-      case 154:
-      case 183:
-        goto LABEL_10;
-    }
-LABEL_15:
-    if ( tolower(key) != 'p' || !dword_142FEF4 )
-    {
-      if ( key == 205 )
-      {
-        if ( dword_142FF00 )
-        {
-LABEL_19:
-          if ( historyLine == nextHistoryLine )
-            return;
-          v3 = historyLine + 1;
-          goto LABEL_21;
-        }
-      }
-      else if ( key == 155 || key == 189 )
-      {
-        goto LABEL_19;
-      }
-      ctrl = dword_142FEF4;
-      if ( tolower(key) == 'n' && ctrl )
-        goto LABEL_19;
-      switch ( key )
-      {
-        case 164:
-LABEL_32:
-          Con_PageUp();
-          return;
-        case 163:
-LABEL_36:
-          Con_PageDown();
-          return;
-        case 206:
-          Con_PageUp();
-          if ( !ctrl )
-            return;
-          Con_PageUp();
-          goto LABEL_32;
-        case 205:
-          Con_PageDown();
-          if ( !ctrl )
-            return;
-          Con_PageDown();
-          goto LABEL_36;
-        case 165:
-          if ( dword_142FEF4 )
-          {
-            Con_Top();
-            return;
-          }
-          break;
-        default:
-          if ( key == 166 && dword_142FEF4 )
-          {
-            con_displayLine = con_current;
-            return;
-          }
-          break;
-      }
-      Field_KeyDownEvent(&g_consoleField, key);
-      return;
-    }
-LABEL_10:
-    v3 = historyLine;
-    if ( nextHistoryLine - historyLine >= COMMAND_HISTORY || historyLine <= 0 )
-      goto LABEL_22;
-    v3 = historyLine - 1;
-LABEL_21:
-    historyLine = v3;
-LABEL_22:
-    g_consoleField = historyEditLines[v3 % COMMAND_HISTORY];
-    Field_AdjustScroll(&g_consoleField);
+    Cbuf_AddText( "clear\n" );
     return;
   }
 
+  if ( key != 13 && key != 191 )   /* not ENTER / KP_ENTER: an editing or navigation key */
+  {
+    if ( key == 9 )   /* TAB: command completion */
+    {
+      CompleteCommand();
+      return;
+    }
+
+    /* recall the previous (older) history line */
+    if ( ( key == 206 && keys_shiftDown )             /* shift + MWHEELUP */
+         || key == 154 || key == 183                  /* UPARROW / KP_UPARROW */
+         || ( tolower( key ) == 'p' && keys_ctrlDown ) )   /* Ctrl-P */
+    {
+      if ( nextHistoryLine - historyLine < COMMAND_HISTORY && historyLine > 0 )
+        --historyLine;
+      g_consoleField = historyEditLines[historyLine % COMMAND_HISTORY];
+      Field_AdjustScroll( &g_consoleField );
+    }
+    /* recall the next (newer) history line */
+    else if ( ( key == 205 && keys_shiftDown )             /* shift + MWHEELDOWN */
+         || key == 155 || key == 189                  /* DOWNARROW / KP_DOWNARROW */
+         || ( tolower( key ) == 'n' && keys_ctrlDown ) )   /* Ctrl-N */
+    {
+      if ( historyLine == nextHistoryLine )
+        return;
+      ++historyLine;
+      g_consoleField = historyEditLines[historyLine % COMMAND_HISTORY];
+      Field_AdjustScroll( &g_consoleField );
+    }
+    /* scrollback navigation */
+    else if ( key == 164 )   /* K_PGUP */
+    {
+      Con_PageUp();
+    }
+    else if ( key == 163 )   /* K_PGDN */
+    {
+      Con_PageDown();
+    }
+    else if ( key == 206 )   /* K_MWHEELUP -- Ctrl scrolls a whole page */
+    {
+      Con_PageUp();
+      if ( keys_ctrlDown )
+      {
+        Con_PageUp();
+        Con_PageUp();
+      }
+    }
+    else if ( key == 205 )   /* K_MWHEELDOWN -- Ctrl scrolls a whole page */
+    {
+      Con_PageDown();
+      if ( keys_ctrlDown )
+      {
+        Con_PageDown();
+        Con_PageDown();
+      }
+    }
+    else if ( key == 165 && keys_ctrlDown )   /* Ctrl-HOME jumps to the top */
+    {
+      Con_Top();
+    }
+    else if ( key == 166 && keys_ctrlDown )   /* Ctrl-END jumps to the bottom */
+    {
+      Con_Bottom();
+    }
+    else
+    {
+      Field_KeyDownEvent( &g_consoleField, key );
+    }
+    return;
+  }
+
+  /* ENTER / KP_ENTER: dispatch the command line */
   if ( cls_state != CA_ACTIVE && text_in[0] != '\\' && text_in[0] != '/' )
   {
-    strncpy(Destination, (const char *)text_in, 0x3FFu);
-    Destination[1023] = 0;
-    Com_sprintf((char *)text_in, 256, "\\%s", Destination);
+    strncpy( temp, (const char *)text_in, 0x3FFu );
+    temp[1023] = 0;
+    Com_sprintf( (char *)text_in, MAX_EDIT_LINE, "\\%s", temp );
     ++g_consoleField.cursor;
   }
 
-  Com_Printf("]%s\n", text_in);
+  Com_Printf( "]%s\n", text_in );
 
   if ( text_in[0] != '\\' && text_in[0] != '/' )
   {
     if ( !text_in[0] )
       return;
-    Cbuf_AddText("cmd say ");
-    Cbuf_AddText((const char *)text_in);
+    Cbuf_AddText( "cmd say " );
+    Cbuf_AddText( (const char *)text_in );
   }
   else
   {
-    Cbuf_AddText((const char *)text_in + 1);
+    Cbuf_AddText( (const char *)text_in + 1 );
   }
-  Cbuf_AddText("\n");
+  Cbuf_AddText( "\n" );
 
   historyEditLines[nextHistoryLine % COMMAND_HISTORY] = g_consoleField;
   ++nextHistoryLine;
   historyLine = nextHistoryLine;
-  memset(text_in, 0, 0x100u);
-  g_consoleField.cursor = 0;
-  g_consoleField.scroll = 0;
-  g_consoleField.widthInChars = 256;
-  g_consoleField.widthInPixels = dword_57C0F8;
-  *(int *)&g_consoleField.charWidth = dword_57C0FC;
-  *(int *)&g_consoleField.charHeight = dword_57C100;
-  g_consoleField.fixedWidth = 1;
+  memset( text_in, 0, MAX_EDIT_LINE );
+  g_consoleField.cursor        = 0;
+  g_consoleField.scroll        = 0;
+  g_consoleField.widthInChars  = MAX_EDIT_LINE;
+  g_consoleField.widthInPixels = con_fieldWidthPixels;
+  *(int *)&g_consoleField.charWidth  = con_fieldCharWidth;
+  *(int *)&g_consoleField.charHeight = con_fieldCharHeight;
+  g_consoleField.fixedWidth    = 1;
 
   if ( cls_state == CA_DISCONNECTED )
     SCR_UpdateScreen();
@@ -713,16 +658,20 @@ void __cdecl Message_Key( int key )
 {
 	char	buffer[MAX_STRING_CHARS];
 
-	/* dword_1430380 below is RTCW cl_keys.c:45 `qboolean chat_team`; the three
+	/* chat_team below is RTCW cl_keys.c:45 `qboolean chat_team`; the three
 	 * Con_MessageMode*_f in cl_console_mp.c drive it exactly as RTCW does. */
 	if ( key == 27 ) {
 		cls_keyCatchers &= ~KEYCATCH_MESSAGE;
-	} else if ( key == 13 || key == 0xBF ) {
+		Field_Clear( &chatField );
+		return;
+	}
+
+	if ( key == 13 || key == 0xBF ) {
 		if ( chatField.buffer[0] && cls_state == CA_ACTIVE ) {
 			if ( chat_playerNum != -1 ) {
 				Com_sprintf( buffer, sizeof( buffer ), "tell %i \"" "\x15" "%s\"\n",
 							 chat_playerNum, chatField.buffer );
-			} else if ( dword_1430380 ) {
+			} else if ( chat_team ) {
 				Com_sprintf( buffer, sizeof( buffer ), "say_team \"" "\x15" "%s\"\n",
 							 chatField.buffer );
 			} else {
@@ -732,18 +681,12 @@ void __cdecl Message_Key( int key )
 			CL_AddReliableCommand( buffer );
 		}
 		cls_keyCatchers &= ~KEYCATCH_MESSAGE;
-	} else {
-		Field_KeyDownEvent( &chatField, key );
+		Field_Clear( &chatField );
 		return;
 	}
 
-	memset( chatField.buffer, 0, 256 );
-	chatField.cursor = 0;
-	chatField.scroll = 0;
-	chatField.widthInChars = 256;
+	Field_KeyDownEvent( &chatField, key );
 }
-
-static qboolean key_overstrikeMode;
 
 /* ---- Key_GetOverstrikeMode  0x0040D480 ----  [CONFIRMED] */
 qboolean Key_GetOverstrikeMode(void)
@@ -763,114 +706,14 @@ qboolean __cdecl Key_IsDown( int keynum )
 	if ( keynum == -1 ) {
 		return qfalse;
 	}
-	return (qboolean)dword_142F780[3 * keynum];
+	return (qboolean)keysStorage[3 * keynum];
 }
 
 /* Key_StringToKeynum (0x0040D4C0) is defined further down this unit, along with the keynames[] table at 0x0057B8D0. */
 
-#if 0
-char *__cdecl Key_KeynumToString(int keynum)
-{
-  int v1;
-  int v2;
-  int v3;
-  char **v5;
-  char *v6;
-  int v7;
-  int v8;
-  char v9;
-  char v10;
-
-  v3 = v1;
-  if ( v1 == -1 )
-    return "<KEY NOT FOUND>";
-  if ( (unsigned int)v1 >= 0x100 )
-    return "<OUT OF RANGE>";
-  if ( v2 && cl_language->integer == 1 && v1 >= 48 && v1 <= 57 )
-    return (&off_57C010)[v1];
-  if ( v1 <= 32 || v1 >= 127 || v1 == 34 )
-  {
-    v5 = &off_57BCD0;
-    if ( v2 )
-      goto LABEL_17;
-  }
-  else
-  {
-    byte_87A2FC = toupper(v1);
-    byte_87A2FD = 0;
-    if ( v3 != 59 || v2 )
-      return &byte_87A2FC;
-  }
-  v5 = (char **)&off_57B8D0;
-LABEL_17:
-  if ( *v5 )
-  {
-    while ( (char *)v3 != v5[1] )
-    {
-      v6 = v5[2];
-      v5 += 2;
-      if ( !v6 )
-        goto LABEL_20;
-    }
-    return *v5;
-  }
-  else
-  {
-LABEL_20:
-    v7 = v3 >> 4;
-    v8 = v3 & 0xF;
-    byte_87A2FC = 48;
-    byte_87A2FD = 120;
-    if ( v7 <= 9 )
-      v9 = v7 + 48;
-    else
-      v9 = v7 + 87;
-    byte_87A2FE = v9;
-    if ( v8 <= 9 )
-      v10 = v8 + 48;
-    else
-      v10 = v8 + 87;
-    byte_87A2FF = v10;
-    byte_87A300 = 0;
-    return &byte_87A2FC;
-  }
-}
-#endif
-
 /* Key_SetBinding (0x0040D6A0) is defined further down this unit, where the keys[] table lives. */
-#if 0
-void __cdecl Key_SetBinding(int keynum, const char *binding)
-{
-  int v2;
-  const char *v3;
-  int v4;
-  char *v5;
-  int *v6;
-
-  if ( v2 != -1 )
-  {
-    v4 = 3 * v2;
-    v5 = (&s1)[3 * v2];
-    if ( v5 )
-      free(v5);
-    v6 = Z_MallocInternal(strlen(v3) + 1);
-    strcpy((char *)v6, v3);
-    (&s1)[v4] = (char *)v6;
-    cvar_modifiedFlags |= 1u;
-  }
-}
-#endif
 
 /* Key_GetBinding (0x0040D700) is defined further down this unit. */
-#if 0
-char *__cdecl Key_GetBinding(int keynum)
-{
-  if ( keynum == -1 )
-    return &empty_string;
-  else
-    return (&s1)[3 * keynum];
-}
-#endif
 
 /* ---- Key_GetKey  0x0040D730 ----  VERIFIED */
 int __cdecl Key_GetKey( const char *binding )
@@ -879,8 +722,8 @@ int __cdecl Key_GetKey( const char *binding )
 
 	if ( binding ) {
 		for ( i = 0 ; i < MAX_KEYS ; i++ ) {
-			if ( dword_142F780[3 * i + 2]
-				 && !Q_stricmpn( binding, (const char *)dword_142F780[3 * i + 2], 99999 ) ) {
+			if ( keysStorage[3 * i + 2]
+				 && !Q_stricmpn( binding, (const char *)keysStorage[3 * i + 2], 99999 ) ) {
 				return i;
 			}
 		}
@@ -891,277 +734,12 @@ int __cdecl Key_GetKey( const char *binding )
 /* Key_Unbind_f (0x0040D770) is defined further down this unit. */
 
 /* Key_UnbindAll_f (0x0040D7C0) is defined further down this unit. */
-#if 0
-void __cdecl Key_UnbindAll_f()
-{
-  int v0;
-  char **v1;
-  int v2;
-  const char *v3;
-
-  v0 = 0;
-  v1 = &s1;
-  do
-  {
-    if ( *v1 )
-      Key_SetBinding(v2, v3);
-    v1 += 3;
-    ++v0;
-  }
-  while ( (int)v1 < (int)&unk_1430388 );
-}
-#endif
 
 /* Key_Bind_f (0x0040D800) is defined further down this unit. */
-#if 0
-void __cdecl Key_Bind_f()
-{
-  const char *v0;
-  const char *v1;
-  unsigned __int32 v2;
-  char *v3;
-  int v4;
-  char *v5;
-  int v6;
-  signed __int32 v7;
-  const char *v8;
-  char *v9;
-  char *v10;
-  unsigned int v11;
-  signed __int32 v12;
-  char *v13;
-  char *v14;
-  unsigned int v15;
-  char *v16;
-  char *v18;
-  int v20;
-  const char *v21;
-  signed __int32 v22; // [esp+8h] [ebp-408h] BYREF
-  char v23;
-  unsigned int v24;
-  unsigned int retaddr;
-
-  v2 = cmd_argc;
-  v24 = retaddr ^ _security_cookie;
-  v22 = cmd_argc;
-  if ( cmd_argc >= 2 )
-  {
-    v3 = cmd_argv[1];
-    v21 = v0;
-    v4 = Key_StringToKeynum(v1);
-    if ( v4 == -1 )
-    {
-      v5 = &empty_string;
-      if ( v2 > 1 )
-        v5 = v3;
-      Com_Printf("\"%s\" isn't a valid key\n", v5);
-    }
-    else
-    {
-      v6 = tolower(v4);
-      v7 = v22;
-      if ( v22 == 2 )
-      {
-        v8 = (&s1)[3 * v6];
-        if ( v8 )
-        {
-          v9 = &empty_string;
-          if ( (unsigned int)cmd_argc > 1 )
-            v9 = cmd_argv[1];
-          Com_Printf("\"%s\" = \"%s\"\n", v9, v8);
-        }
-        else
-        {
-          v10 = &empty_string;
-          if ( (unsigned int)cmd_argc > 1 )
-            v10 = cmd_argv[1];
-          Com_Printf("\"%s\" is not bound\n", v10);
-        }
-      }
-      else
-      {
-        v11 = 2;
-        v23 = 0;
-        if ( v22 > 2 )
-        {
-          v12 = v22 - 1;
-          do
-          {
-            v13 = &empty_string;
-            if ( v11 < cmd_argc )
-              v13 = cmd_argv[v11];
-            v14 = v13;
-            v15 = strlen(v13) + 1;
-            v16 = (char *)&v22 + 3;
-            while ( *++v16 )
-              ;
-            qmemcpy(v16, v14, v15);
-            if ( v11 != v12 )
-            {
-              v18 = (char *)&v22 + 3;
-              while ( *++v18 )
-                ;
-              strcpy(v18, " ");
-            }
-            ++v11;
-          }
-          while ( (int)v11 < v7 );
-        }
-        Key_SetBinding(v20, v21);
-      }
-    }
-  }
-  else
-  {
-    Com_Printf("bind <key> [command] : attach a command to a key\n");
-  }
-}
-#endif
 
 /* Key_WriteBindings (0x0040D9A0) is defined further down this unit. */
-#if 0
-void __cdecl Key_WriteBindings(int f)
-{
-  int i;
-  char *v2;
-  const char *v3;
-  const char **v4;
-  const char *v5;
-  int v6;
-  char v7;
-  char v8;
-  char v9;
-
-  FS_Printf(f, "unbindall\n");
-  for ( i = 0; i < 256; ++i )
-  {
-    v2 = (&s1)[3 * i];
-    if ( v2 && *v2 )
-    {
-      if ( i == -1 )
-      {
-        v3 = "<KEY NOT FOUND>";
-      }
-      else if ( i < 0 )
-      {
-        v3 = "<OUT OF RANGE>";
-      }
-      else if ( i <= 32 || i >= 127 || i == 34 || (byte_87A2FC = toupper(i), byte_87A2FD = 0, i == 59) )
-      {
-        v4 = (const char **)&off_57B8D0;
-        if ( off_57B8D0 )
-        {
-          while ( (const char *)i != v4[1] )
-          {
-            v5 = v4[2];
-            v4 += 2;
-            if ( !v5 )
-              goto LABEL_15;
-          }
-          v3 = *v4;
-        }
-        else
-        {
-LABEL_15:
-          v6 = i >> 4;
-          v7 = i & 0xF;
-          byte_87A2FC = 48;
-          byte_87A2FD = 120;
-          if ( i >> 4 <= 9 )
-            v8 = v6 + 48;
-          else
-            v8 = v6 + 87;
-          byte_87A2FE = v8;
-          if ( (i & 0xFu) <= 9 )
-            v9 = v7 + 48;
-          else
-            v9 = v7 + 87;
-          byte_87A2FF = v9;
-          byte_87A300 = 0;
-          v3 = &byte_87A2FC;
-        }
-      }
-      else
-      {
-        v3 = &byte_87A2FC;
-      }
-      FS_Printf(f, "bind %s \"%s\"\n", v3, (&s1)[3 * i]);
-    }
-  }
-}
-#endif
 
 /* Key_Bindlist_f (0x0040DAD0) is defined further down this unit. */
-#if 0
-void __cdecl Key_Bindlist_f()
-{
-  int i;
-  char *v1;
-  const char *v2;
-  const char **v3;
-  const char *v4;
-  int v5;
-  char v6;
-  char v7;
-  char v8;
-
-  for ( i = 0; i < 256; ++i )
-  {
-    v1 = (&s1)[3 * i];
-    if ( v1 && *v1 )
-    {
-      if ( i == -1 )
-      {
-        v2 = "<KEY NOT FOUND>";
-      }
-      else if ( i < 0 )
-      {
-        v2 = "<OUT OF RANGE>";
-      }
-      else if ( i <= 32 || i >= 127 || i == 34 || (byte_87A2FC = toupper(i), byte_87A2FD = 0, i == 59) )
-      {
-        v3 = (const char **)&off_57B8D0;
-        if ( off_57B8D0 )
-        {
-          while ( (const char *)i != v3[1] )
-          {
-            v4 = v3[2];
-            v3 += 2;
-            if ( !v4 )
-              goto LABEL_15;
-          }
-          v2 = *v3;
-        }
-        else
-        {
-LABEL_15:
-          v5 = i >> 4;
-          v6 = i & 0xF;
-          byte_87A2FC = 48;
-          byte_87A2FD = 120;
-          if ( i >> 4 <= 9 )
-            v7 = v5 + 48;
-          else
-            v7 = v5 + 87;
-          byte_87A2FE = v7;
-          if ( (i & 0xFu) <= 9 )
-            v8 = v6 + 48;
-          else
-            v8 = v6 + 87;
-          byte_87A2FF = v8;
-          byte_87A300 = 0;
-          v2 = &byte_87A2FC;
-        }
-      }
-      else
-      {
-        v2 = &byte_87A2FC;
-      }
-      Com_Printf("%s \"%s\"\n", v2, (&s1)[3 * i]);
-    }
-  }
-}
-#endif
 
 /* ---- CL_InitKeyCommands  0x0040DBF0 ----  [CONFIRMED] */
 void __cdecl CL_InitKeyCommands()
@@ -1173,309 +751,20 @@ void __cdecl CL_InitKeyCommands()
 }
 
 /* CL_KeyEvent (0x0040DC30) is defined further down this unit. */
-#if 0
-void __cdecl CL_KeyEvent(int key, qboolean down, unsigned int time)
-{
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  bool v8; // sf
-  int v9;
-  int v10;
-  char *v11;
-  vm_s *v12;
-  vm_s *v13;
-  char *v14;
-  int integer;
-  int v16;
-  bool v17; // zf
-  int v18;
-  const char *v19;
-  char *v20;
-  const char **v21;
-  const char *v22;
-  int v23;
-  int v24;
-  char v25;
-  char v26;
-  const char *v27;
-  const char *v28;
-  int v29;
-
-  v4 = cls_keyCatchers;
-  v5 = key;
-  v6 = v3;
-  dword_142F780[3 * key] = v3;
-  if ( v3 )
-  {
-    v7 = dword_142F784[3 * key] + 1;
-    v8 = dword_142F784[3 * key] < 0;
-    dword_142F784[3 * key] = v7;
-    if ( v7 == 1 )
-    {
-      ++anykeydown;
-    }
-    else if ( !(v8 ^ __OFSUB__(v7, 1) | (v7 == 1)) && ((v4 & 5) == 0 || key == 96 || key == 126 || key == 27) )
-    {
-      return;
-    }
-    if ( cl_waitForFire && cl_waitForFire->integer )
-    {
-      if ( (v4 & 1) != 0 )
-        Con_ToggleConsole_f();
-      v11 = (&s1)[3 * key];
-      memset(KB_LEFT, 0, 0x2D0u);
-      if ( v11 )
-      {
-        if ( !Q_stricmpn(v27, v28, v29) )
-          Cvar_Set2("cl_waitForFire", "0", qtrue);
-      }
-      return;
-    }
-  }
-  else
-  {
-    v9 = anykeydown - 1;
-    v8 = anykeydown - 1 < 0;
-    dword_142F784[3 * key] = 0;
-    anykeydown = v9;
-    if ( v8 )
-      anykeydown = 0;
-  }
-  if ( key == 96 || key == 126 )
-  {
-    if ( v3 )
-      Con_ToggleConsole_f();
-    return;
-  }
-  v10 = *(_DWORD *)cls_state;
-  if ( v3
-    && (key < 128 || key == 200)
-    && (clc_demoplaying || *(_DWORD *)cls_state == 7 || *(_DWORD *)cls_state == 8)
-    && !v4 )
-  {
-    Cvar_Set2("nextdemo", &empty_string, qtrue);
-    v10 = *(_DWORD *)cls_state;
-    v4 = cls_keyCatchers;
-    v5 = 27;
-  }
-  else if ( key != 27 )
-  {
-    goto LABEL_46;
-  }
-  if ( v6 )
-  {
-    if ( (v4 & 4) != 0 )
-    {
-LABEL_31:
-      Message_Key((int)v27);
-      return;
-    }
-    if ( (v4 & 8) != 0 )
-    {
-      cls_keyCatchers = v4 & 0xFFFFFFF7;
-      VM_Call(cgvm, 8, 0);
-      return;
-    }
-    if ( (v4 & 2) != 0 )
-    {
-      VM_Call(uivm, 3, 27, v6);
-      return;
-    }
-    if ( v10 == 6 )
-    {
-      if ( clc_demoplaying )
-      {
-        VM_Call(uivm, 7, 1);
-        return;
-      }
-      v12 = uivm;
-      if ( !cl_serverloadwaiting->integer )
-      {
-        VM_Call(uivm, 7, 2);
-        return;
-      }
-LABEL_40:
-      VM_Call(v12, 7, 1);
-      return;
-    }
-    if ( v10 > 6 && v10 <= 8 )
-    {
-      CL_Disconnect_f();
-      MSS_StopSounds(0);
-      VM_Call(uivm, 7, 1);
-      return;
-    }
-    v12 = uivm;
-    if ( uivm )
-      goto LABEL_40;
-    return;
-  }
-LABEL_46:
-  v13 = cgvm;
-  if ( cgvm )
-  {
-    if ( VM_Call(cgvm, 6, v5, v6) )
-      return;
-    v10 = *(_DWORD *)cls_state;
-    LOBYTE(v4) = cls_keyCatchers;
-    v13 = cgvm;
-  }
-  if ( !v6 )
-  {
-    v14 = (&s1)[3 * v5];
-    if ( v14 )
-    {
-      if ( *v14 == 43 )
-      {
-        Com_sprintf("-%s %i %i\n", (int)(v14 + 1), (const char *)v5, down);
-        Cbuf_AddText(v27);
-        LOBYTE(v4) = cls_keyCatchers;
-        v13 = cgvm;
-      }
-    }
-    if ( (v4 & 2) != 0 && uivm )
-    {
-      VM_Call(uivm, 3, v5, 0);
-    }
-    else if ( (v4 & 8) != 0 )
-    {
-      if ( v13 )
-        VM_Call(v13, 5, v5, 0);
-    }
-    return;
-  }
-  if ( cl_bypassMouseInput )
-  {
-    integer = cl_bypassMouseInput->integer;
-    if ( integer )
-    {
-      if ( v5 == 200 || v5 == 201 || v5 == 202 )
-      {
-        v17 = integer == 1;
-        v18 = 1;
-        if ( v17 )
-          goto LABEL_68;
-      }
-      else
-      {
-        v16 = UI_checkKeyExec((void *)v5);
-        LOBYTE(v4) = cls_keyCatchers;
-        v10 = *(_DWORD *)cls_state;
-        v17 = v16 == 0;
-        v13 = cgvm;
-        if ( v17 )
-        {
-          v18 = 1;
-          goto LABEL_68;
-        }
-      }
-    }
-  }
-  v18 = 0;
-LABEL_68:
-  if ( (v4 & 1) != 0 )
-    goto LABEL_69;
-  if ( (v4 & 2) != 0 && !v18 )
-  {
-    v19 = (&s1)[3 * v5];
-    if ( v19 )
-    {
-      if ( !Q_stricmp(v19, "help") && VM_Call(uivm, 8) == 7 )
-        v5 = 27;
-    }
-    VM_Call(uivm, 3, v5, v6);
-    return;
-  }
-  if ( (v4 & 8) != 0 )
-  {
-    if ( v13 )
-      VM_Call(v13, 5, v5, v6);
-    return;
-  }
-  if ( (v4 & 4) != 0 )
-    goto LABEL_31;
-  if ( !v10 )
-  {
-LABEL_69:
-    Console_Key((int)v27);
-    return;
-  }
-  v20 = (&s1)[3 * v5];
-  if ( v20 )
-  {
-    if ( *v20 == 43 )
-      Com_sprintf("%s %i %i\n", (int)v20, (const char *)v5, down);
-    else
-      Cbuf_AddText(v27);
-    Cbuf_AddText(v27);
-  }
-  else if ( v5 >= 200 )
-  {
-    if ( v5 > 255 )
-    {
-      Com_Printf("%s is unbound, use controls menu to set.\n", "<OUT OF RANGE>");
-    }
-    else
-    {
-      v21 = (const char **)&off_57B8D0;
-      if ( off_57B8D0 )
-      {
-        while ( (const char *)v5 != v21[1] )
-        {
-          v22 = v21[2];
-          v21 += 2;
-          if ( !v22 )
-            goto LABEL_88;
-        }
-        Com_Printf("%s is unbound, use controls menu to set.\n", *v21);
-      }
-      else
-      {
-LABEL_88:
-        v23 = v5 >> 4;
-        v24 = v5 & 0xF;
-        byte_87A2FC = 48;
-        byte_87A2FD = 120;
-        if ( v23 <= 9 )
-          v25 = v23 + 48;
-        else
-          v25 = v23 + 87;
-        byte_87A2FE = v25;
-        if ( v24 <= 9 )
-          v26 = v24 + 48;
-        else
-          v26 = v24 + 87;
-        byte_87A2FF = v26;
-        byte_87A300 = 0;
-        Com_Printf("%s is unbound, use controls menu to set.\n", &byte_87A2FC);
-      }
-    }
-  }
-}
-#endif
 
 /* ---- Key_ClearStates  0x0040E260 ----  VERIFIED */
 void __cdecl Key_ClearStates( void )
 {
-  int v0;
-  int *v1;
+  int  i;
 
   anykeydown = 0;
-  v0 = 0;
-  v1 = dword_142F780;
-  do
+  for ( i = 0; i < MAX_KEYS; i++ )
   {
-    if ( *v1 )
-      CL_KeyEvent(v0, qfalse, 0);
-    *v1 = 0;
-    v1[1] = 0;
-    v1 += 3;
-    ++v0;
+    if ( keysStorage[3 * i] )         /* keys[i].down */
+      CL_KeyEvent( i, qfalse, 0 );
+    keysStorage[3 * i] = 0;           /* keys[i].down */
+    keysStorage[3 * i + 1] = 0;       /* keys[i].repeats */
   }
-  while ( v0 < MAX_KEYS );
 }
 
                     /* KEY BINDINGS 0x0040D4C0-0x0040DBF0 */
@@ -1487,9 +776,9 @@ typedef struct {
 } qkey_t;
 
 /* RTCW cl_keys.c:52 `qkey_t keys[MAX_KEYS];`.  Key_IsDown, Key_GetKey and
- * Key_ClearStates above index dword_142F780[3*keynum] by hand; keys[n].down
+ * Key_ClearStates above index keysStorage[3*keynum] by hand; keys[n].down
  * emits a different multiply. */
-#define keys        ( (qkey_t *)dword_142F780 )
+#define keys        ( (qkey_t *)keysStorage )
 #define anykeydown  anykeydown           /* 0x0142F75C */
 
 typedef struct {
@@ -1538,6 +827,59 @@ static keyname_t keynames[] = {
 	{ NULL, 0 }
 };
 
+/* Retail 0x0057BCD0: the localization-reference twin of keynames[], in the same
+ * order with a "KEY_" prefix on every name.  Its 128..147 entries are the
+ * Latin-1 characters themselves.  Key_KeynumToString reads it only when
+ * translate is set, which only Key_KeynumToStringBuf does. */
+static keyname_t keynames_loc[] = {
+	{ "KEY_TAB", 9 }, { "KEY_ENTER", 13 }, { "KEY_ESCAPE", 27 }, { "KEY_SPACE", 32 },
+	{ "KEY_BACKSPACE", 127 }, { "KEY_UPARROW", 154 }, { "KEY_DOWNARROW", 155 },
+	{ "KEY_LEFTARROW", 156 }, { "KEY_RIGHTARROW", 157 },
+	{ "KEY_ALT", 158 }, { "KEY_CTRL", 159 }, { "KEY_SHIFT", 160 }, { "KEY_CAPSLOCK", 151 },
+	{ "KEY_F1", 167 }, { "KEY_F2", 168 }, { "KEY_F3", 169 }, { "KEY_F4", 170 }, { "KEY_F5", 171 },
+	{ "KEY_F6", 172 }, { "KEY_F7", 173 }, { "KEY_F8", 174 }, { "KEY_F9", 175 }, { "KEY_F10", 176 },
+	{ "KEY_F11", 177 }, { "KEY_F12", 178 },
+	{ "KEY_INS", 161 }, { "KEY_DEL", 162 }, { "KEY_PGDN", 163 }, { "KEY_PGUP", 164 },
+	{ "KEY_HOME", 165 }, { "KEY_END", 166 },
+	{ "KEY_MOUSE1", 200 }, { "KEY_MOUSE2", 201 }, { "KEY_MOUSE3", 202 }, { "KEY_MOUSE4", 203 },
+	{ "KEY_MOUSE5", 204 }, { "KEY_MWHEELUP", 206 }, { "KEY_MWHEELDOWN", 205 },
+	{ "KEY_JOY1", 207 }, { "KEY_JOY2", 208 }, { "KEY_JOY3", 209 }, { "KEY_JOY4", 210 },
+	{ "KEY_JOY5", 211 }, { "KEY_JOY6", 212 }, { "KEY_JOY7", 213 }, { "KEY_JOY8", 214 },
+	{ "KEY_JOY9", 215 }, { "KEY_JOY10", 216 }, { "KEY_JOY11", 217 }, { "KEY_JOY12", 218 },
+	{ "KEY_JOY13", 219 }, { "KEY_JOY14", 220 }, { "KEY_JOY15", 221 }, { "KEY_JOY16", 222 },
+	{ "KEY_JOY17", 223 }, { "KEY_JOY18", 224 }, { "KEY_JOY19", 225 }, { "KEY_JOY20", 226 },
+	{ "KEY_JOY21", 227 }, { "KEY_JOY22", 228 }, { "KEY_JOY23", 229 }, { "KEY_JOY24", 230 },
+	{ "KEY_JOY25", 231 }, { "KEY_JOY26", 232 }, { "KEY_JOY27", 233 }, { "KEY_JOY28", 234 },
+	{ "KEY_JOY29", 235 }, { "KEY_JOY30", 236 }, { "KEY_JOY31", 237 }, { "KEY_JOY32", 238 },
+	{ "KEY_AUX1", 239 }, { "KEY_AUX2", 240 }, { "KEY_AUX3", 241 }, { "KEY_AUX4", 242 },
+	{ "KEY_AUX5", 243 }, { "KEY_AUX6", 244 }, { "KEY_AUX7", 245 }, { "KEY_AUX8", 246 },
+	{ "KEY_AUX9", 247 }, { "KEY_AUX10", 248 }, { "KEY_AUX11", 249 }, { "KEY_AUX12", 250 },
+	{ "KEY_AUX13", 251 }, { "KEY_AUX14", 252 }, { "KEY_AUX15", 253 }, { "KEY_AUX16", 254 },
+	{ "KEY_KP_HOME", 182 }, { "KEY_KP_UPARROW", 183 }, { "KEY_KP_PGUP", 184 },
+	{ "KEY_KP_LEFTARROW", 185 }, { "KEY_KP_5", 186 }, { "KEY_KP_RIGHTARROW", 187 },
+	{ "KEY_KP_END", 188 }, { "KEY_KP_DOWNARROW", 189 }, { "KEY_KP_PGDN", 190 },
+	{ "KEY_KP_ENTER", 191 }, { "KEY_KP_INS", 192 }, { "KEY_KP_DEL", 193 },
+	{ "KEY_KP_SLASH", 194 }, { "KEY_KP_MINUS", 195 }, { "KEY_KP_PLUS", 196 },
+	{ "KEY_KP_NUMLOCK", 197 }, { "KEY_KP_STAR", 198 }, { "KEY_KP_EQUALS", 199 },
+	{ "KEY_PAUSE", 153 },
+	{ "KEY_SEMICOLON", 59 },
+	{ "KEY_COMMAND", 150 },
+	{ "\xB5", 128 }, { "\xBF", 129 }, { "\xDF", 130 }, { "\xE0", 131 },
+	{ "\xE1", 132 }, { "\xE4", 133 }, { "\xE5", 134 }, { "\xE6", 135 },
+	{ "\xE7", 136 }, { "\xE8", 137 }, { "\xE9", 138 }, { "\xEC", 139 },
+	{ "\xF1", 140 }, { "\xF2", 141 }, { "\xF3", 142 }, { "\xF6", 143 },
+	{ "\xF8", 144 }, { "\xF9", 145 }, { "\xFA", 146 }, { "\xFC", 147 },
+	{ NULL, 0 }
+};
+
+/* Retail 0x0057C0D0 (read as off_57C010[keynum] for keynum '0'..'9'): the
+ * unshifted top-row characters of the French AZERTY layout, which
+ * Key_KeynumToString returns for the digit keys when translate is set and
+ * cl_language is 1. */
+static const char *keynames_digitsFR[10] = {
+	"&", "\xE9", "\"", "'", "(", "-", "\xE8", "_", "\xE7", "\xE0"
+};
+
 /* ---- Key_StringToKeynum  0x0040D4C0 ----  [CONFIRMED] */
 int Key_StringToKeynum( const char *str ) {
 	keyname_t *kn;
@@ -1546,14 +888,19 @@ int Key_StringToKeynum( const char *str ) {
 		return -1;
 	}
 	if ( !str[1] ) {
-		return (unsigned char)str[0];
+		/* retail 0x0040D4DA `movsx eax, al`: plain signed char, so a single
+		 * Latin-1 character >= 0x80 comes back as a negative keynum (-128..-1).
+		 * Key_Bind_f and Key_Unbind_f only reject -1, so retail then indexes
+		 * keys[] with that negative value (out of bounds, bug-for-bug). */
+		return str[0];
 	}
 
 	if ( str[0] == '0' && str[1] == 'x' && strlen( str ) == 4 ) {
 		int n1, n2;
 
+		/* retail 0x0040D504 / 0x0040D529 test the digits with Q_isnumeric (0x0044A9B0) */
 		n1 = str[2];
-		if ( n1 >= '0' && n1 <= '9' ) {
+		if ( Q_isnumeric( n1 ) ) {
 			n1 -= '0';
 		} else if ( n1 >= 'a' && n1 <= 'f' ) {
 			n1 = n1 - 'a' + 10;
@@ -1562,7 +909,7 @@ int Key_StringToKeynum( const char *str ) {
 		}
 
 		n2 = str[3];
-		if ( n2 >= '0' && n2 <= '9' ) {
+		if ( Q_isnumeric( n2 ) ) {
 			n2 -= '0';
 		} else if ( n2 >= 'a' && n2 <= 'f' ) {
 			n2 = n2 - 'a' + 10;
@@ -1581,8 +928,12 @@ int Key_StringToKeynum( const char *str ) {
 	return -1;
 }
 
-/* ---- Key_KeynumToString  0x0040D4E0 ----  [CONFIRMED] */
-char *Key_KeynumToString( int keynum ) {
+/* ---- Key_KeynumToString  0x0040D5A0 ----  [CONFIRMED] */
+/* Retail __usercall(keynum@<eax>, translate@<edi>).  The only out-of-line
+ * caller is Key_KeynumToStringBuf (translate 1).  Key_WriteBindings,
+ * Key_Bindlist_f and CL_KeyEvent inline the translate 0 path, so they pass
+ * qfalse here. */
+char *Key_KeynumToString( int keynum, qboolean translate ) {
 	static char tinystr[5];
 	keyname_t *kn;
 	int i, j;
@@ -1590,17 +941,28 @@ char *Key_KeynumToString( int keynum ) {
 	if ( keynum == -1 ) {
 		return "<KEY NOT FOUND>";
 	}
-	if ( keynum < 0 || keynum >= MAX_KEYS ) {
+	if ( keynum < 0 || keynum > 255 ) {
 		return "<OUT OF RANGE>";
 	}
 
-	if ( keynum > 32 && keynum < 127 && keynum != '"' && keynum != ';' ) {
-		tinystr[0] = (char)toupper( keynum );
-		tinystr[1] = 0;
-		return tinystr;
+	/* retail 0x0040D5C3-0x0040D5E4 */
+	if ( translate && cl_language->integer == 1 && keynum >= '0' && keynum <= '9' ) {
+		return (char *)keynames_digitsFR[keynum - '0'];
 	}
 
-	for ( kn = keynames; kn->name; kn++ ) {
+	if ( keynum > 32 && keynum < 127 && keynum != '"' ) {
+		tinystr[0] = (char)toupper( keynum );
+		tinystr[1] = 0;
+		/* retail 0x0040D5FD-0x0040D610: only the untranslated ';' goes on
+		 * to the keynames[] lookup ("SEMICOLON"). */
+		if ( keynum != ';' || translate ) {
+			return tinystr;
+		}
+	}
+
+	kn = translate ? keynames_loc : keynames;
+
+	for ( ; kn->name; kn++ ) {
 		if ( keynum == kn->keynum ) {
 			return (char *)kn->name;
 		}
@@ -1626,8 +988,7 @@ void Key_SetBinding( int keynum, const char *binding ) {
 		Z_FreeInternal( keys[keynum].binding );
 	}
 
-	keys[keynum].binding = (char *)Z_MallocInternal( (int)strlen( binding ) + 1 );
-	strcpy( keys[keynum].binding, binding );
+	keys[keynum].binding = CopyStringInternal( binding );
 
 	cvar_modifiedFlags |= CVAR_ARCHIVE;
 }
@@ -1638,14 +999,6 @@ char *Key_GetBinding( int keynum ) {
 		return "";
 	}
 	return keys[keynum].binding;
-}
-
-/* ---- Key_IsDownLocal  no-address ----  [HIGH] */
-qboolean Key_IsDownLocal( int keynum ) {
-	if ( keynum < 0 || keynum >= MAX_KEYS ) {
-		return qfalse;
-	}
-	return keys[keynum].down;
 }
 
 /* ---- Key_Unbind_f  0x0040D770 ----  [CONFIRMED] */
@@ -1683,7 +1036,7 @@ void Key_Bind_f( void ) {
 	char cmd[MAX_STRING_CHARS];
 
 	c = Cmd_Argc();
-	if ( c < 2 ) {
+	if ( Cmd_Argc() < 2 ) {   /* retail tests the inlined count itself, not a copy of c */
 		Com_Printf( "bind <key> [command] : attach a command to a key\n" );
 		return;
 	}
@@ -1697,11 +1050,12 @@ void Key_Bind_f( void ) {
 	/* Retail folds the keynum here (0x0040D891); Key_Unbind_f (0x0040D770) deliberately does not. */
 	b = tolower( b );
 
+	/* retail 0x0040D8B5-0x0040D8F2 echoes the key exactly as typed (Cmd_Argv(1)), not Key_KeynumToString. */
 	if ( c == 2 ) {
 		if ( keys[b].binding ) {
-			Com_Printf( "\"%s\" = \"%s\"\n", Key_KeynumToString( b ), keys[b].binding );
+			Com_Printf( "\"%s\" = \"%s\"\n", Cmd_Argv( 1 ), keys[b].binding );
 		} else {
-			Com_Printf( "\"%s\" is not bound\n", Key_KeynumToString( b ) );
+			Com_Printf( "\"%s\" is not bound\n", Cmd_Argv( 1 ) );
 		}
 		return;
 	}
@@ -1725,7 +1079,7 @@ void Key_WriteBindings( fileHandle_t f ) {
 
 	for ( i = 0; i < MAX_KEYS; i++ ) {
 		if ( keys[i].binding && keys[i].binding[0] ) {
-			FS_Printf( f, "bind %s \"%s\"\n", Key_KeynumToString( i ), keys[i].binding );
+			FS_Printf( f, "bind %s \"%s\"\n", Key_KeynumToString( i, qfalse ), keys[i].binding );
 		}
 	}
 }
@@ -1736,19 +1090,8 @@ void Key_Bindlist_f( void ) {
 
 	for ( i = 0; i < MAX_KEYS; i++ ) {
 		if ( keys[i].binding && keys[i].binding[0] ) {
-			Com_Printf( "%s \"%s\"\n", Key_KeynumToString( i ), keys[i].binding );
+			Com_Printf( "%s \"%s\"\n", Key_KeynumToString( i, qfalse ), keys[i].binding );
 		}
-	}
-}
-
-/* ---- Key_ClearStatesLocal  no-address ----  [HIGH] */
-void Key_ClearStatesLocal( void ) {
-	int i;
-
-	anykeydown = 0;
-	for ( i = 0; i < MAX_KEYS; i++ ) {
-		keys[i].down = qfalse;
-		keys[i].repeats = 0;
 	}
 }
 
@@ -1756,17 +1099,30 @@ void Key_ClearStatesLocal( void ) {
 void CL_KeyEvent( int key, int down, unsigned time ) {
 	char *kb;
 	char cmd[1024];
-	qboolean bypassMenu;
+	qboolean bypassMenu = qfalse;
 
-	keys[key].down = (qboolean)( down != 0 );
+	/* retail 0x0040DC6B stores the raw down value, not a normalised 0/1 */
+	keys[key].down = down;
 
 	if ( down ) {
 		keys[key].repeats++;
 		if ( keys[key].repeats == 1 ) {
 			anykeydown++;
-		} else if ( !( cls_keyCatchers & ( KEYCATCH_CONSOLE | KEYCATCH_MESSAGE ) )
-		            || key == '`' || key == '~' || key == 27 ) {
-			/* retail 0x0040DD4C: auto-repeats are swallowed unless a text field (console or chat) is up, and the toggle/escape keys never repeat */
+		}
+	} else {
+		keys[key].repeats = 0;
+		anykeydown--;
+		if ( anykeydown < 0 ) {
+			anykeydown = 0;
+		}
+	}
+
+	if ( down ) {
+		/* retail 0x0040DD2C: auto-repeats are swallowed unless a text field (console or chat) is up,
+		 * and the toggle/escape keys never repeat; jle, so a count below 1 skips the test */
+		if ( keys[key].repeats > 1
+		     && ( !( cls_keyCatchers & ( KEYCATCH_CONSOLE | KEYCATCH_MESSAGE ) )
+		          || key == '`' || key == '~' || key == 27 ) ) {
 			return;
 		}
 
@@ -1776,16 +1132,10 @@ void CL_KeyEvent( int key, int down, unsigned time ) {
 			}
 			kb = keys[key].binding;
 			CL_ClearKeys();
-			if ( kb && !Q_stricmp( kb, "+attack" ) ) {
+			if ( !Q_stricmp( kb, "+attack" ) ) {
 				Cvar_Set2( "cl_waitForFire", "0", qtrue );
 			}
 			return;
-		}
-	} else {
-		keys[key].repeats = 0;
-		anykeydown--;
-		if ( anykeydown < 0 ) {
-			anykeydown = 0;
 		}
 	}
 
@@ -1814,29 +1164,35 @@ void CL_KeyEvent( int key, int down, unsigned time ) {
 			VM_Call( cgvm, CG_EVENT_HANDLING, 0  );
 			return;
 		}
-		if ( cls_keyCatchers & KEYCATCH_UI ) {
-			VM_Call( uivm, UI_KEY_EVENT, key, down );
-			return;
-		}
-		if ( cls_state == CA_ACTIVE ) {
-			if ( clc_demoplaying ) {
+		if ( !( cls_keyCatchers & KEYCATCH_UI ) ) {
+			switch ( cls_state ) {
+			case CA_ACTIVE:
+				if ( !clc_demoplaying ) {
+					if ( !cl_serverloadwaiting->integer ) {
+						VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_INGAME );
+					} else {
+						VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
+					}
+				} else {
+					VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
+				}
+				break;
+			case CA_CINEMATIC:
+			case CA_LOGO:
+				CL_Disconnect_f();
+				MSS_StopSounds( 0 );
 				VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
-			} else if ( cl_serverloadwaiting->integer ) {
-				VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
-			} else {
-				VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_INGAME );
+				break;
+			default:
+				if ( uivm ) {
+					VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
+				}
+				break;
 			}
 			return;
 		}
-		if ( cls_state > CA_ACTIVE && cls_state <= CA_LOGO ) {
-			CL_Disconnect_f();
-			MSS_StopSounds( 0 );
-			VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
-			return;
-		}
-		if ( uivm ) {
-			VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
-		}
+
+		VM_Call( uivm, UI_KEY_EVENT, key, down );
 		return;
 	}
 
@@ -1852,7 +1208,8 @@ void CL_KeyEvent( int key, int down, unsigned time ) {
 			Cbuf_AddText( cmd );
 		}
 
-		if ( cls_keyCatchers & KEYCATCH_UI ) {
+		/* retail 0x0040DF36-0x0040DF59: a NULL uivm falls through to the cgame test. */
+		if ( ( cls_keyCatchers & KEYCATCH_UI ) && uivm ) {
 			VM_Call( uivm, UI_KEY_EVENT, key, down );
 		} else if ( ( cls_keyCatchers & KEYCATCH_CGAME ) && cgvm ) {
 			VM_Call( cgvm, CG_KEY_EVENT, key, down );
@@ -1860,7 +1217,6 @@ void CL_KeyEvent( int key, int down, unsigned time ) {
 		return;
 	}
 
-	bypassMenu = qfalse;
 	if ( cl_bypassMouseInput && cl_bypassMouseInput->integer ) {
 		if ( key == 200 || key == 201 || key == 202  ) {
 			if ( cl_bypassMouseInput->integer == 1 ) {
@@ -1902,7 +1258,7 @@ void CL_KeyEvent( int key, int down, unsigned time ) {
 	kb = keys[key].binding;
 	if ( !kb ) {
 		if ( key >= 200 ) {
-			Com_Printf( "%s is unbound, use controls menu to set.\n", Key_KeynumToString( key ) );
+			Com_Printf( "%s is unbound, use controls menu to set.\n", Key_KeynumToString( key, qfalse ) );
 		}
 		return;
 	}
@@ -1927,10 +1283,9 @@ void CL_CharEvent( int key ) {
 		return;
 	}
 
+	/* retail 0x0040E216-0x0040E233: no uivm NULL test before the call. */
 	if ( cls_keyCatchers & KEYCATCH_UI ) {
-		if ( uivm ) {
-			VM_Call( uivm, UI_KEY_EVENT, key | K_CHAR_FLAG, qtrue );
-		}
+		VM_Call( uivm, UI_KEY_EVENT, key | K_CHAR_FLAG, qtrue );
 		return;
 	}
 
@@ -1951,7 +1306,7 @@ void CL_CharEvent( int key ) {
 
 /* ---- Key_Shutdown  0x0040E2B0 ----  VERIFIED */
 void Key_Shutdown( void ) {
-	int i;
+	unsigned int i;   /* retail walks a byte offset with an unsigned (jb) compare */
 
 	for ( i = 0 ; i < MAX_KEYS ; i++ ) {
 		if ( keys[i].binding ) {

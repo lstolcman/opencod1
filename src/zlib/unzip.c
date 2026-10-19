@@ -9,8 +9,11 @@
  * @fidelity: verified
  *
  * TAKEN OUT OF THE GENERATOR DELIBERATELY, for the same reason zlib/inflate.c
- * was.  The bodies below are still machine-shaped -- `verified` here means
- * checked, not rewritten -- but three things in this file cannot survive a
+ * was.  `verified` here means checked; the bodies are now minizip's (zlib
+ * 1.1.4 contrib/minizip, the Quake3/RTCW variant with unzReOpen and the
+ * file-info-position pair) text with minizip's names over unz_s /
+ * file_in_zip_read_info_s / z_stream (naming pass 2026-10-14, byte-identical
+ * under VC7).  Three things in this file cannot survive a
  * regeneration: the real prototypes added below (the generator emits
  * `extern int f();`, which switches argument checking off), the note that
  * unzReadCurrentFile and unzGetCurrentFileInfo are in REGISTER order rather
@@ -47,8 +50,7 @@
  * ---------------------------------------------------------------------------
  *
  * THIS FILE WAS NOT WRITTEN BY HAND.  It is Hex-Rays output with the
- * dialect mechanically rewritten (see qcommon/hexrays_shim.h for exactly
- * what was changed and what could not be).  It exists so the tree links
+ * dialect mechanically rewritten.  It exists so the tree links
  * and so each function has a starting point -- not because it is right.
  *
  * Before trusting any function in here:
@@ -63,8 +65,7 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
+#include "zlib_types.h"
 
 /*
  * Functions this unit calls that live elsewhere.  REAL prototypes, not the
@@ -73,76 +74,159 @@
  * this tree.  Each was checked against its definition:
  *
  *   inflate / inflateEnd / inflateInit2_   zlib/inflate.c, same file set
- *   sub_4A2CE0 = crc32 (0x004A2CE0)        universal/memorytree.cpp
+ *   crc32 (0x004A2CE0)                universal/memorytree.cpp
  *
- * sub_4A2CE0's (crc, len, buf) is NOT zlib's crc32(crc, buf, len).  Retail is
- * __usercall crc@<eax>, buf@<ecx>, len@<edx> -- no stack arguments -- so
- * register order carries nothing and both sides simply agree on the recovered
- * spelling.  The two call sites below and memorytree.cpp's definition move
- * together or not at all.
+ * This is zlib's crc32(crc, buf, len).  Retail is __usercall crc@<eax>,
+ * buf@<ecx>, len@<edx>; the declaration order still matters: LTCG evaluates
+ * the register arguments right to left, so callers load len before buf
+ * (unzReadCurrentFile 0x004A95C0).  The two call sites below and
+ * memorytree.cpp's definition move together or not at all.
  */
-/* `strm` is spelled void* rather than z_streamp because the recovered bodies
- * carry the z_stream as three different pointer types (`_DWORD *`,
- * `unsigned __int8 **`, and a raw `v3 + 1`); the parameter COUNT and the
- * scalar arguments are what the prototype is here to check. */
-extern int __cdecl inflate( void *strm, int flush );
-extern int __cdecl inflateEnd( void *strm );
-extern int __cdecl inflateInit2_( const char *version, int windowBits,
-                                  void *strm, int stream_size );
-extern int __cdecl sub_4A2CE0( int crc, unsigned int len, unsigned char *buf );
+extern int __cdecl inflate( z_streamp strm, int flush );
+extern int __cdecl inflateEnd( z_streamp strm );
+extern int __cdecl inflateInit2_( z_streamp strm, int windowBits,
+                                  const char *version, int stream_size );
+extern int __cdecl crc32( int crc, unsigned char *buf, unsigned int len );
+
+/* minizip unzip.h */
+typedef void *unzFile;
+
+#define UNZ_OK                  (0)
+#define UNZ_END_OF_LIST_OF_FILE (-100)
+#define UNZ_ERRNO               (Z_ERRNO)
+#define UNZ_EOF                 (0)
+#define UNZ_PARAMERROR          (-102)
+#define UNZ_BADZIPFILE          (-103)
+#define UNZ_INTERNALERROR       (-104)
+#define UNZ_CRCERROR            (-105)
+
+/* minizip unzip.c */
+#define CASESENSITIVITYDEFAULTVALUE 2
+#define UNZ_BUFSIZE (16384)
+#define UNZ_MAXFILENAMEINZIP (256)
+#define SIZECENTRALDIRITEM (0x2e)
+#define SIZEZIPLOCALHEADER (0x1e)
+#define BUFREADCOMMENT (0x400)
 
 /* Defined below, but called before their definitions. */
-int __cdecl unzGoToFirstFile( _DWORD *a1 );
-int __cdecl unzCloseCurrentFile( int a1 );
+int __cdecl unzGoToFirstFile( unzFile file );
+int __cdecl unzCloseCurrentFile( unzFile file );
+int __cdecl unzGoToNextFile( unzFile file );
+
+/* z_stream (56 bytes, the size inflateInit2_ checks) is zlib_types.h's. */
+
+/* minizip's own types (zlib 1.1.4 contrib/minizip), sized as retail's
+ * malloc(0x80) / malloc(0x6C) and the field offsets used below. */
+typedef struct tm_unz_s {
+  unsigned int tm_sec;
+  unsigned int tm_min;
+  unsigned int tm_hour;
+  unsigned int tm_mday;
+  unsigned int tm_mon;
+  unsigned int tm_year;
+} tm_unz;
+
+typedef struct unz_global_info_s {
+  unsigned long number_entry;
+  unsigned long size_comment;
+} unz_global_info;
+
+typedef struct unz_file_info_s {
+  unsigned long version;
+  unsigned long version_needed;
+  unsigned long flag;
+  unsigned long compression_method;
+  unsigned long dosDate;
+  unsigned long crc;
+  unsigned long compressed_size;
+  unsigned long uncompressed_size;
+  unsigned long size_filename;
+  unsigned long size_file_extra;
+  unsigned long size_file_comment;
+  unsigned long disk_num_start;
+  unsigned long internal_fa;
+  unsigned long external_fa;
+  tm_unz tmu_date;
+} unz_file_info;
+
+typedef struct unz_file_info_internal_s {
+  unsigned long offset_curfile;
+} unz_file_info_internal;
+
+typedef struct {
+  char *read_buffer;
+  z_stream stream;
+  unsigned long pos_in_zipfile;
+  unsigned long stream_initialised;
+  unsigned long offset_local_extrafield;
+  unsigned int size_local_extrafield;
+  unsigned long pos_local_extrafield;
+  unsigned long crc32;
+  unsigned long crc32_wait;
+  unsigned long rest_read_compressed;
+  unsigned long rest_read_uncompressed;
+  FILE *file;
+  unsigned long compression_method;
+  unsigned long byte_before_the_zipfile;
+} file_in_zip_read_info_s;
+
+typedef struct {
+  FILE *file;
+  unz_global_info gi;
+  unsigned long byte_before_the_zipfile;
+  unsigned long num_file;
+  unsigned long pos_in_central_dir;
+  unsigned long current_file_ok;
+  unsigned long central_pos;
+  unsigned long size_central_dir;
+  unsigned long offset_central_dir;
+  unz_file_info cur_file_info;
+  unz_file_info_internal cur_file_info_internal;
+  file_in_zip_read_info_s *pfile_in_zip_read;
+} unz_s;
 
 /* ---- uncompress  0x004A87C0 ---- */
 // uncompress -- CONFIRMED 90. uncompr.c: builds a 56-byte z_stream on the stack, inflateInit_ / inflate(Z_FINISH) / inflateEnd.
 /*
- * VERIFIED 0x004A87C0 against upstream zlib 1.1.4 uncompr.c.  v7[] is the
- * 56-byte z_stream as a 14-slot array: [0] next_in, [1] avail_in, [3] next_out,
- * [4] avail_out, [8] zalloc, [9] zfree -- so the recovered (a1,a2,a3,a4) is
- * (source, sourceLen, dest, destLen) and *a4 receives total_out on success.
- * NOTE THE SPLIT-RECORD HAZARD IS NOT PRESENT: Hex-Rays kept the z_stream as
- * one contiguous `v7[14]`, which is what inflateInit2_(...,56) requires.
+ * VERIFIED 0x004A87C0 against upstream zlib 1.1.4 uncompr.c, now written as
+ * upstream's text (dest, destLen, source, sourceLen) over a real z_stream.
+ * Retail's registers: source@eax, sourceLen@ecx, dest@edx, destLen@edi.
+ * inflateInit2_ is declared with upstream's (strm, windowBits, version,
+ * stream_size) parameter order (inflate.c matches); that order is what sets
+ * up the register arguments as retail does.
  * DEAD IN RETAIL -- no xrefs.  CoD1 never calls uncompress(); the pak path
  * goes through unzReadCurrentFile.  Verified but not exercised.
  */
 int __cdecl uncompress(
-        unsigned __int8 *a1,
-        unsigned __int8 *a2,
-        unsigned __int8 *a3,
-        unsigned __int8 **a4)
+        unsigned char *dest,
+        unsigned long *destLen,
+        const unsigned char *source,
+        unsigned long sourceLen)
 {
-  unsigned __int8 *v4; // eax
-  int result; // eax
-  int v6; // esi
-  unsigned __int8 *v7[14]; // [esp+4h] [ebp-38h] BYREF
+  z_stream stream;
+  int err;
 
-  v7[0] = a1;
-  v4 = *a4;
-  v7[1] = a3;
-  v7[4] = v4;
-  v7[3] = a2;
-  v7[8] = 0;
-  v7[9] = 0;
-  result = inflateInit2_("1.1.4", 15, v7, 56);
-  if ( !result )
+  stream.next_in = (unsigned char *)source;
+  stream.avail_in = (unsigned int)sourceLen;
+  stream.next_out = dest;
+  stream.avail_out = (unsigned int)*destLen;
+  stream.zalloc = 0;
+  stream.zfree = 0;
+
+  err = inflateInit2_(&stream, MAX_WBITS, ZLIB_VERSION, sizeof(stream));
+  if ( err != Z_OK )
+    return err;
+
+  err = inflate(&stream, Z_FINISH);
+  if ( err != Z_STREAM_END )
   {
-    v6 = inflate(v7, 4);
-    if ( v6 == 1 )
-    {
-      *a4 = v7[5];
-      return inflateEnd(v7);
-    }
-    else
-    {
-      inflateEnd(v7);
-      result = -5;
-      if ( v6 )
-        return v6;
-    }
+    inflateEnd(&stream);
+    return err == Z_OK ? Z_BUF_ERROR : err;
   }
-  return result;
+  *destLen = stream.total_out;
+
+  err = inflateEnd(&stream);
+  return err;
 }
 
 /* ---- unzlocal_getShort  0x004A8840 ---- */
@@ -153,26 +237,28 @@ int __cdecl uncompress(
  *   fread(&scratch, 2, 1, eax)     <- FILE* is the EAX register argument
  *   movsx edx, word ptr [scratch]  <- SIGN extension, so `(__int16)` is right
  *   mov [arg_0], edx ; xor eax,eax <- unconditional UNZ_OK
- * `Buffer = a2;` models the `push ecx` exactly: the upper half is never read
- * back, only the low word through the movsx, so the uninitialised slot cannot
- * be observed.  a2 is that phantom, not a real parameter.
+ * The scratch is a plain uninitialised `short` (the `push ecx`).  Retail's
+ * inlined copies in unzOpen and unzlocal_GetCurrentFileInfoInternal share
+ * their caller's scratch slots, so a short read there keeps an earlier
+ * field's bytes; the modern build calls getShort/getLong out of line and gets
+ * this call's own uninitialised scratch instead (truncated archives only).
  *
  * DIVERGES FROM UPSTREAM MINIZIP, which builds the value a byte at a time
  * through unzlocal_getByte and returns UNZ_ERRNO/UNZ_EOF on a short read.
- * Retail does one little-endian fread and CANNOT fail -- which is why the
- * callers below (unzOpen, unzlocal_GetCurrentFileInfoInternal) drop upstream's
- * `if (... != UNZ_OK) err = UNZ_ERRNO;` around every field: the compiler could
- * see the test was dead.  Little-endian host assumed.
+ * Retail does one little-endian fread and CANNOT fail (Q3's unzip.c form, minus
+ * its LittleShort) -- so the callers' upstream `if (... != UNZ_OK) err =
+ * UNZ_ERRNO;` tests are kept in the source and compile away.  Little-endian
+ * host assumed.
  *
  * DEAD IN RETAIL -- no xrefs; every call site was inlined.
  */
-int __cdecl unzlocal_getShort(FILE *a1, int a2, _DWORD *a3)
+int __cdecl unzlocal_getShort(FILE *fin, unsigned long *pX)
 {
-  int Buffer; // [esp+0h] [ebp-4h] BYREF
+  short v;
 
-  Buffer = a2;
-  fread(&Buffer, 2u, 1u, a1);
-  *a3 = (__int16)Buffer;
+  fread(&v, sizeof(v), 1, fin);
+
+  *pX = v;
   return 0;
 }
 
@@ -181,13 +267,13 @@ int __cdecl unzlocal_getShort(FILE *a1, int a2, _DWORD *a3)
 /* VERIFIED 0x004A8870.  Identical to unzlocal_getShort above but with
  * ElementSize 4 and no sign extension (the whole dword is the value).  Same
  * divergence from upstream, same dead-in-retail status (no xrefs). */
-int __cdecl unzlocal_getLong(FILE *a1, int a2, int *a3)
+int __cdecl unzlocal_getLong(FILE *fin, unsigned long *pX)
 {
-  int Buffer; // [esp+0h] [ebp-4h] BYREF
+  int v;
 
-  Buffer = a2;
-  fread(&Buffer, 4u, 1u, a1);
-  *a3 = Buffer;
+  fread(&v, sizeof(v), 1, fin);
+
+  *pX = v;
   return 0;
 }
 
@@ -196,56 +282,50 @@ int __cdecl unzlocal_getLong(FILE *a1, int a2, int *a3)
 /* VERIFIED 0x004A8890 against upstream minizip strcmpcasenosensitive_internal,
  * term for term including the a-z/A-Z fold by subtracting 32 and the three-way
  * result.  Reached only from unzLocateFile, which is itself dead. */
-int __cdecl strcmpcasenosensitive_internal(char *a1, char *a2)
+int __cdecl strcmpcasenosensitive_internal(const char *fileName1, const char *fileName2)
 {
-  char v3; // cl
-  char v4; // al
-
-  while ( 1 )
+  for ( ;; )
   {
-    v3 = *a2;
-    v4 = *a1;
-    ++a2;
-    ++a1;
-    if ( v3 >= 97 && v3 <= 122 )
-      v3 -= 32;
-    if ( v4 >= 97 && v4 <= 122 )
-      v4 -= 32;
-    if ( !v3 )
-      return -(v4 != 0);
-    if ( !v4 )
+    char c1 = *(fileName1++);
+    char c2 = *(fileName2++);
+    if ( c1 >= 'a' && c1 <= 'z' )
+      c1 -= 0x20;
+    if ( c2 >= 'a' && c2 <= 'z' )
+      c2 -= 0x20;
+    if ( c1 == '\0' )
+      return ( c2 == '\0' ) ? 0 : -1;
+    if ( c2 == '\0' )
       return 1;
-    if ( v3 < v4 )
-      break;
-    if ( v3 > v4 )
+    if ( c1 < c2 )
+      return -1;
+    if ( c1 > c2 )
       return 1;
   }
-  return -1;
 }
 
 /* ---- unzStringFileNameCompare  0x004A88D0 ---- */
 // unzStringFileNameCompare -- CONFIRMED 95. iCaseSensitivity == 1 selects strcmp, otherwise the case-insensitive helper. minizip verbatim.
 /*
  * VERIFIED 0x004A88D0 instruction by instruction.  Retail is __usercall
- * a1@<eax>, a2@<edx>, iCaseSensitivity@<ecx>.  Both of upstream's non-1 cases
- * (0 -> CASESENSITIVITYDEFAULTVALUE, and 2) fall into the same
- * `jmp strcmpcasenosensitive_internal` tail, which is what the else branch
- * below is; the ==1 case is an INLINED strcmp ending in
+ * fileName1@<edx>, fileName2@<eax>, iCaseSensitivity@<ecx>.  Both of upstream's
+ * non-1 cases (0 -> CASESENSITIVITYDEFAULTVALUE, and 2) fall into the same
+ * `jmp strcmpcasenosensitive_internal` tail (retail keeps upstream's `== 0`
+ * test as a separate `test ecx,ecx / je`); the ==1 case is an INLINED strcmp ending in
  * `sbb eax,eax / sbb eax,-1`, i.e. sign(*edx - *eax).
  *
- * The two branches AGREE in sign -- strcmpcasenosensitive_internal also
- * returns sign(a2 - a1), reading *a2 into v3 and *a1 into v4.  So the pair is
- * consistent and the only open question is which recovered parameter is
- * upstream's fileName1, which the binary cannot settle: the sole caller
- * (unzLocateFile) tests the result against zero and never for order.
+ * Parameter order is upstream's (fileName1, fileName2) here and in
+ * strcmpcasenosensitive_internal: the registers are the same either way, but
+ * unzLocateFile's inlined call sets eax before edx only in this order (the
+ * recovered (a1, a2) swap set them up the other way round).
  * DEAD IN RETAIL -- no xrefs.
  */
-int __cdecl unzStringFileNameCompare(char *a1, char *a2, int a3)
+int __cdecl unzStringFileNameCompare(const char *fileName1, const char *fileName2, int iCaseSensitivity)
 {
-  if ( a3 == 1 )
-    return strcmp(a2, a1);
-  else
-    return strcmpcasenosensitive_internal(a1, a2);
+  if ( iCaseSensitivity == 0 )
+    iCaseSensitivity = 2;   /* CASESENSITIVITYDEFAULTVALUE */
+  if ( iCaseSensitivity == 1 )
+    return strcmp(fileName1, fileName2);
+  return strcmpcasenosensitive_internal(fileName1, fileName2);
 }
 
 /* ---- unzlocal_SearchCentralDir  0x004A8920 ---- */
@@ -257,95 +337,66 @@ int __cdecl unzStringFileNameCompare(char *a1, char *a2, int a3)
  * for pak0 down to 3 for pak6), which is this function's whole job.
  *
  * Upstream's BUFREADCOMMENT is 0x400, hence the malloc(0x404) and the
- * `v10 = 1028` clamp; the 0xFFFF cap is upstream's uMaxBack.  The 'P','K',5,6
- * literal at 80/75/5/6 is the EOCD signature.
+ * 1028-byte read clamp; the 0xFFFF cap is upstream's uMaxBack.  The 'P','K',5,6
+ * literal at 0x50/0x4b/5/6 is the EOCD signature.  Upstream's text (uLong
+ * file offset returned, TRYFREE) gives retail's bytes.
  *
- * The return type is `char *` only because Hex-Rays typed the malloc result
- * that way and the file offset shares the register; the VALUE returned is a
- * byte offset (v14), which is why unzOpen immediately does
- * `fseek(v2, (int)v3, 0)`.  32-bit only, as retail is.
- *
- * NOTE the unsigned arithmetic is load-bearing: v1/v4/v6/v13/v15 are all
- * `unsigned int`, so `v6 + 1024 <= v1` and `v6 >= v13` cannot go negative on a
- * pak larger than 2 GB.  Left as recovered.
+ * NOTE the unsigned arithmetic is load-bearing: the offsets are all uLong, so
+ * `uBackRead + 0x400 > uMaxBack` cannot go negative on a pak larger than 2 GB.
  */
-char *__cdecl unzlocal_SearchCentralDir(FILE *Stream)
+unsigned long __cdecl unzlocal_SearchCentralDir(FILE *fin)
 {
-  unsigned int v1; // ebp
-  char *result; // eax
-  unsigned int v3; // eax
-  unsigned int v4; // edi
-  char *v5; // esi
-  unsigned int v6; // ebx
-  unsigned int v7; // eax
-  bool v8; // cc
-  int v9; // ebp
-  size_t v10; // edi
-  int v11; // eax
-  char v12; // cl
-  unsigned int v13; // [esp+8h] [ebp-Ch]
-  int v14; // [esp+Ch] [ebp-8h]
-  unsigned int v15; // [esp+10h] [ebp-4h]
+  unsigned char *buf;
+  unsigned long uSizeFile;
+  unsigned long uBackRead;
+  unsigned long uMaxBack = 0xffff; /* maximum size of global comment */
+  unsigned long uPosFound = 0;
 
-  v1 = 0xFFFF;
-  v13 = 0xFFFF;
-  v14 = 0;
-  if ( fseek(Stream, 0, 2) )
+  if ( fseek(fin, 0, SEEK_END) != 0 )
     return 0;
-  v3 = ftell(Stream);
-  v4 = v3;
-  v15 = v3;
-  if ( v3 < 0xFFFF )
+
+  uSizeFile = ftell(fin);
+
+  if ( uMaxBack > uSizeFile )
+    uMaxBack = uSizeFile;
+
+  buf = (unsigned char *)malloc(BUFREADCOMMENT + 4);
+  if ( buf == NULL )
+    return 0;
+
+  uBackRead = 4;
+  while ( uBackRead < uMaxBack )
   {
-    v13 = v3;
-    v1 = v3;
-  }
-  result = (char *)malloc(0x404u);
-  v5 = result;
-  if ( result )
-  {
-    v6 = 4;
-    if ( v1 > 4 )
-    {
-      while ( 1 )
+    unsigned long uReadSize, uReadPos;
+    int i;
+    if ( uBackRead + BUFREADCOMMENT > uMaxBack )
+      uBackRead = uMaxBack;
+    else
+      uBackRead += BUFREADCOMMENT;
+    uReadPos = uSizeFile - uBackRead;
+
+    uReadSize = ((BUFREADCOMMENT + 4) < (uSizeFile - uReadPos)) ?
+                (BUFREADCOMMENT + 4) : (uSizeFile - uReadPos);
+    if ( fseek(fin, uReadPos, SEEK_SET) != 0 )
+      break;
+
+    if ( fread(buf, (unsigned int)uReadSize, 1, fin) != 1 )
+      break;
+
+    for ( i = (int)uReadSize - 3; (i--) > 0; )
+      if ( ((*(buf + i)) == 0x50) && ((*(buf + i + 1)) == 0x4b) &&
+           ((*(buf + i + 2)) == 0x05) && ((*(buf + i + 3)) == 0x06) )
       {
-        v7 = v6 + 1024;
-        v8 = v6 + 1024 <= v1;
-        v6 = v1;
-        if ( v8 )
-          v6 = v7;
-        v9 = v4 - v6;
-        v10 = 1028;
-        if ( v6 <= 0x404 )
-          v10 = v6;
-        if ( fseek(Stream, v9, 0) || fread(v5, v10, 1u, Stream) != 1 )
-          break;
-        v11 = v10 - 3;
-        if ( (int)(v10 - 3) > 0 )
-        {
-          while ( 1 )
-          {
-            v12 = v5[--v11];
-            if ( v12 == 80 && v5[v11 + 1] == 75 && v5[v11 + 2] == 5 && v5[v11 + 3] == 6 )
-              break;
-            if ( v11 <= 0 )
-              goto LABEL_23;
-          }
-          v14 = v9 + v11;
-          if ( v9 + v11 )
-            break;
-        }
-LABEL_23:
-        if ( v6 >= v13 )
-          break;
-        v1 = v13;
-        v4 = v15;
+        uPosFound = uReadPos + i;
+        break;
       }
-    }
-    free(v5);
-    return (char *)v14;
+
+    if ( uPosFound != 0 )
+      break;
   }
-  return result;
+  if ( buf )
+    free(buf);
+  return uPosFound;
 }
 
 /* ---- unzReOpen  0x004A8A50 ---- */
@@ -353,11 +404,11 @@ LABEL_23:
 /*
  * VERIFIED 0x004A8A50 instruction by instruction, 26 instructions.  Retail is
  * __usercall path@<eax> with the unz_s pointer as the single stack argument,
- * so the recovered (a1 = path, a2 = file) IS the source order:
- *     4a8a56  push eax          ; FileName  -> a1
- *     4a8a72  mov ecx,[arg_0]   ; the unz_s -> a2
+ * so (path, file) IS the source order:
+ *     4a8a56  push eax          ; FileName  -> path
+ *     4a8a72  mov ecx,[arg_0]   ; the unz_s -> file
  *     4a8a76  push 80h / push ecx / push esi / call Com_Memcpy
- * i.e. Com_Memcpy(dest = the new 128-byte block, src = a2, 128).  ARGUMENT
+ * i.e. Com_Memcpy(dest = the new 128-byte block, src = file, 128).  ARGUMENT
  * ORDER OF THE Com_Memcpy CALL IS THEREFORE (dest, src, count) and matches
  * qcommon.h.  `mov [esi+7Ch],0` is pfile_in_zip_read = NULL on the copy.
  *
@@ -372,23 +423,22 @@ LABEL_23:
  * BEHAVIOURALLY EXERCISED 14,493 times -- it is the first call on the
  * FS_FOpenFileRead pak path (universal/com_files.c:1274).
  */
-FILE *__cdecl unzReOpen(const char *a1, int *a2)
+unzFile __cdecl unzReOpen(const char *path, unzFile file)
 {
-  FILE *result; // eax
-  FILE *v3; // edi
-  _DWORD *v4; // esi
+  unz_s *s;
+  FILE *fin;
 
-  result = fopen(a1, "rb");
-  v3 = result;
-  if ( result )
-  {
-    v4 = malloc(0x80u);
-    Com_Memcpy(v4, a2, 128);   /* was Com_Memcpy((int)v4, ...) -- C4022 */
-    *v4 = v3;
-    v4[31] = 0;
-    return (FILE *)v4;
-  }
-  return result;
+  fin = fopen(path, "rb");
+  if ( fin == NULL )
+    return NULL;
+
+  s = (unz_s *)malloc(sizeof(unz_s));
+  Com_Memcpy(s, (unz_s *)file, sizeof(unz_s));
+
+  s->file = fin;
+  s->pfile_in_zip_read = NULL;
+
+  return (unzFile)s;
 }
 
 /* ---- unzOpen  0x004A8AA0 ---- */
@@ -402,91 +452,109 @@ FILE *__cdecl unzReOpen(const char *a1, int *a2)
  *      3 byte_before_the_zipfile             4 num_file
  *      5 pos_in_central_dir                  6 current_file_ok
  *      7 central_pos   8 size_central_dir    9 offset_central_dir
- *     10..29 cur_file_info (20 dwords, the 0x50 qmemcpy in the Internal)
+ *     10..29 cur_file_info (20 dwords, the 0x50 copy in the Internal)
  *     30 cur_file_info_internal.offset_curfile
  *     31 pfile_in_zip_read                   -- 32 dwords, 0x80 bytes
  * which is exactly the malloc(0x80) here and in unzReOpen, and makes the
- * `+124` in unzClose/unzReadCurrentFile/unzCloseCurrentFile dword 31.
+ * `+124` in unzClose/unzReadCurrentFile/unzCloseCurrentFile dword 31.  The
+ * unz_s typedef at the top of this file spells that layout out.
  *
- * `v13[3] = v4 - v7 - v6` is upstream's
- *     byte_before_the_zipfile = central_pos - (offset_central_dir + size_central_dir)
- * -- the self-extracting-stub allowance.  Checked as nonzero-safe: it is 0 for
+ * byte_before_the_zipfile = central_pos - (offset_central_dir + size_central_dir)
+ * is the self-extracting-stub allowance.  Checked as nonzero-safe: it is 0 for
  * all nine stock paks and is added to every fseek offset downstream.
  *
- * UPSTREAM'S PER-FIELD ERROR CHECKS ARE GONE, and that is not a recovery loss:
- * retail's unzlocal_getShort/getLong cannot return anything but UNZ_OK (see
- * their note above), so the compiler deleted `if (... != UNZ_OK) err = ...`.
- * Only the three checks with real predicates survive -- the single-disk test,
- * the `central_pos < offset+size` sanity test, and err from SearchCentralDir.
+ * Upstream's text, per-field `!= UNZ_OK` checks included: retail's
+ * unzlocal_getShort/getLong cannot return anything but UNZ_OK (see their note
+ * above), so those tests compile away and only the single-disk test, the
+ * `central_pos < offset+size` sanity test and SearchCentralDir's 0 survive.
  *
- * SIGN NOTE: number_entry and size_comment come in through `__int16 v10` /
- * `(__int16)Buffer`, i.e. movsx, so a pak with more than 32,767 entries would
+ * SIGN NOTE: number_entry and size_comment come in through getShort's `short`,
+ * i.e. movsx, so a pak with more than 32,767 entries would
  * store a negative count.  That is retail's behaviour, matched here; the
  * largest stock pak is 12,816 entries.  Do not widen it to movzx -- the
  * divergence would be ours, not the binary's.
  */
-FILE *__cdecl unzOpen(const char *a1)
+unzFile __cdecl unzOpen(const char *path)
 {
-  FILE *result; // eax
-  FILE *v2; // esi
-  char *v3; // eax
-  unsigned int v4; // edi
-  int v5; // ebx
-  int v6; // ebx
-  int v7; // ebp
-  _DWORD *v8; // ebx
-  int Buffer; // [esp+4h] [ebp-90h] BYREF
-  __int16 v10; // [esp+8h] [ebp-8Ch] BYREF
-  int v11; // [esp+Ch] [ebp-88h]
-  __int16 v12; // [esp+10h] [ebp-84h] BYREF
-  _DWORD v13[32]; // [esp+14h] [ebp-80h] BYREF
+  unz_s us;
+  unz_s *s;
+  unsigned long central_pos, uL;
+  FILE *fin;
 
-  v11 = 0;
-  result = fopen(a1, "rb");
-  v2 = result;
-  if ( result )
+  unsigned long number_disk;
+  unsigned long number_disk_with_CD;
+  unsigned long number_entry_CD;
+
+  int err = 0;
+
+  fin = fopen(path, "rb");
+  if ( fin == NULL )
+    return NULL;
+
+  central_pos = unzlocal_SearchCentralDir(fin);
+  if ( central_pos == 0 )
+    err = UNZ_ERRNO;
+
+  if ( fseek(fin, central_pos, SEEK_SET) != 0 )
+    err = UNZ_ERRNO;
+
+  /* the signature, already checked */
+  if ( unzlocal_getLong(fin, &uL) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  /* number of this disk */
+  if ( unzlocal_getShort(fin, &number_disk) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  /* number of the disk with the start of the central directory */
+  if ( unzlocal_getShort(fin, &number_disk_with_CD) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  /* total number of entries in the central dir on this disk */
+  if ( unzlocal_getShort(fin, &us.gi.number_entry) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  /* total number of entries in the central dir */
+  if ( unzlocal_getShort(fin, &number_entry_CD) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( (number_entry_CD != us.gi.number_entry) ||
+       (number_disk_with_CD != 0) ||
+       (number_disk != 0) )
+    err = UNZ_BADZIPFILE;
+
+  /* size of the central directory */
+  if ( unzlocal_getLong(fin, &us.size_central_dir) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  /* offset of start of central directory with respect to the starting disk number */
+  if ( unzlocal_getLong(fin, &us.offset_central_dir) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  /* zipfile comment length */
+  if ( unzlocal_getShort(fin, &us.gi.size_comment) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( (central_pos < us.offset_central_dir + us.size_central_dir) &&
+       (err == UNZ_OK) )
+    err = UNZ_BADZIPFILE;
+
+  if ( err != UNZ_OK )
   {
-    v3 = unzlocal_SearchCentralDir(result);
-    v4 = (unsigned int)v3;
-    if ( !v3 )
-      v11 = -1;
-    if ( fseek(v2, (int)v3, 0) )
-      v11 = -1;
-    fread(&Buffer, 4u, 1u, v2);
-    fread(&Buffer, 2u, 1u, v2);
-    fread(&v12, 2u, 1u, v2);
-    fread(&v10, 2u, 1u, v2);
-    v5 = v10;
-    v13[1] = v10;
-    fread(&v10, 2u, 1u, v2);
-    if ( v10 != v5 || v12 || (_WORD)Buffer )
-      v11 = -103;
-    fread(&Buffer, 4u, 1u, v2);
-    v6 = Buffer;
-    v13[8] = Buffer;
-    fread(&Buffer, 4u, 1u, v2);
-    v7 = Buffer;
-    v13[9] = Buffer;
-    fread(&Buffer, 2u, 1u, v2);
-    v13[2] = (__int16)Buffer;
-    if ( v4 < v6 + v7 || v11 )
-    {
-      fclose(v2);
-      return 0;
-    }
-    else
-    {
-      v13[0] = v2;
-      v13[3] = v4 - v7 - v6;
-      v13[7] = v4;
-      v13[31] = 0;
-      v8 = malloc(0x80u);
-      qmemcpy(v8, v13, 0x80u);
-      unzGoToFirstFile(v8);
-      return (FILE *)v8;
-    }
+    fclose(fin);
+    return NULL;
   }
-  return result;
+
+  us.file = fin;
+  us.byte_before_the_zipfile = central_pos -
+                               (us.offset_central_dir + us.size_central_dir);
+  us.central_pos = central_pos;
+  us.pfile_in_zip_read = NULL;
+
+  s = (unz_s *)malloc(sizeof(unz_s));
+  *s = us;
+  unzGoToFirstFile((unzFile)s);
+  return (unzFile)s;
 }
 
 /* ---- unzClose  0x004A8C30 ---- */
@@ -496,15 +564,19 @@ FILE *__cdecl unzOpen(const char *a1)
  * times (once per unzReOpen handle) plus nine times on the directory handle.
  * universal/com_files.c:910 records that FS_FCloseFile inlines this same body
  * rather than calling it -- the two must not drift. */
-int __cdecl unzClose(int a1)
+int __cdecl unzClose(unzFile file)
 {
-  if ( !a1 )
-    return -102;
-  if ( *(_DWORD *)(a1 + 124) )
-    unzCloseCurrentFile(a1);
-  fclose(*(FILE **)a1);
-  free((void *)a1);
-  return 0;
+  unz_s *s;
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+
+  if ( s->pfile_in_zip_read != NULL )
+    unzCloseCurrentFile(file);
+
+  fclose(s->file);
+  free(s);
+  return UNZ_OK;
 }
 
 /* ---- unzGetGlobalInfo  0x004A8C60 ---- */
@@ -513,34 +585,37 @@ int __cdecl unzClose(int a1)
  * back matched the true entry count of all nine stock paks (12,816 / 4,858 /
  * 3,736 / 2,642 / 1,992 / 1,668 / 1,204 / 694 / 3).  This is the single field
  * Unz_GetGlobalNumFiles in zlib/unz_compat.c reads. */
-int __cdecl unzGetGlobalInfo(int a1, _DWORD *a2)
+int __cdecl unzGetGlobalInfo(unzFile file, unz_global_info *pglobal_info)
 {
-  if ( !a1 )
-    return -102;
-  *a2 = *(_DWORD *)(a1 + 4);
-  a2[1] = *(_DWORD *)(a1 + 8);
+  unz_s *s;
+
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+  *pglobal_info = s->gi;
   return 0;
 }
 
 /* ---- unzlocal_DosDateToTmuDate  0x004A8C80 ---- */
 // unzlocal_DosDateToTmuDate -- CONFIRMED 95. The exact MS-DOS date/time bit unpack, including the +1980 year base and the -1 month adjustment.
 /* VERIFIED 0x004A8C80 against upstream minizip unzlocal_DosDateToTmuDate; all
- * six fields and both bases match.  Shifts are on `unsigned int a1`, so the
- * >>25 and >>21 are logical, as required.  DEAD IN RETAIL -- no xrefs; the
- * unpack was INLINED into unzlocal_GetCurrentFileInfoInternal below (see
- * v34[14..19] there), which is the copy that actually runs. */
-unsigned int __fastcall unzlocal_DosDateToTmuDate(unsigned int a1, _DWORD *a2)
+ * six fields and both bases match, written in upstream's mask-and-divide
+ * form on an unsigned ulDosDate, so every shift is logical, as required.  DEAD
+ * IN RETAIL -- no xrefs; the unpack was INLINED into
+ * unzlocal_GetCurrentFileInfoInternal below (file_info.tmu_date there), which
+ * is the copy that actually runs. */
+void __cdecl unzlocal_DosDateToTmuDate(uLong ulDosDate, tm_unz *ptm)
 {
-  unsigned int result; // eax
+  uLong uDate;
 
-  a2[3] = BYTE2(a1) & 0x1F;
-  a2[5] = (a1 >> 25) + 1980;
-  a2[2] = (unsigned __int16)a1 >> 11;
-  result = (a1 >> 5) & 0x3F;
-  a2[4] = ((a1 >> 21) & 0xF) - 1;
-  a2[1] = result;
-  *a2 = 2 * (a1 & 0x1F);
-  return result;
+  uDate = (uLong)(ulDosDate >> 16);
+  ptm->tm_mday = (uInt)(uDate & 0x1f);
+  ptm->tm_mon = (uInt)((((uDate) & 0x1E0) / 0x20) - 1);
+  ptm->tm_year = (uInt)(((uDate & 0x0FE00) / 0x0200) + 1980);
+
+  ptm->tm_hour = (uInt)((ulDosDate & 0xF800) / 0x800);
+  ptm->tm_min = (uInt)((ulDosDate & 0x7E0) / 0x20);
+  ptm->tm_sec = (uInt)(2 * (ulDosDate & 0x1f));
 }
 
 /* ---- unzlocal_GetCurrentFileInfoInternal  0x004A8CD0 ---- */
@@ -552,216 +627,179 @@ unsigned int __fastcall unzlocal_DosDateToTmuDate(unsigned int a1, _DWORD *a2)
  * is what the decompressed bytes were tested against, and the size it reports
  * is what unzOpenCurrentFile caches as rest_read_uncompressed.
  *
- * v34[0..19] is unz_file_info, 20 dwords / 0x50 bytes -- matching the
- * `qmemcpy(a2, v34, 0x50u)` at the end and cur_file_info's ten dwords 10..29
- * inside unz_s:
+ * file_info is unz_file_info, 20 dwords / 0x50 bytes -- the struct copy at the
+ * end and cur_file_info's dwords 10..29 inside unz_s:
  *   0 version  1 version_needed  2 flag  3 compression_method  4 dosDate
  *   5 crc      6 compressed_size 7 uncompressed_size
  *   8 size_filename  9 size_file_extra  10 size_file_comment
  *  11 disk_num_start 12 internal_fa     13 external_fa
  *  14..19 tmu_date{sec,min,hour,mday,mon,year}
- * 33639248 is 0x02014B50, the central-directory header signature.
+ * 0x02014B50 is the central-directory header signature.
  *
- * THE SPLIT-RECORD HAZARD IS NOT PRESENT HERE.  Hex-Rays kept the whole
- * record as one `_DWORD v34[20]`; the DosDateToTmuDate unpack writes v34[14]
- * through v34[19] inside it, which is exactly what the qmemcpy then ships.
- * The dozen `FILE *v19..v31` are a single reload of *(FILE**)a1 that the
- * decompiler split per call site -- no storage, no hazard.
+ * Upstream's text, with getShort/getLong and DosDateToTmuDate inlined, gives
+ * retail's bytes.  A failed comment read sets err = UNZ_ERRNO, which skips the
+ * copy-out, so a short read of the comment loses pfile_info entirely rather
+ * than reporting a partly-filled one (Hex-Rays showed this as an early
+ * `return -1`).  CoD1 never passes a comment buffer.
  *
- * DIVERGENCE FROM UPSTREAM, and it is a real one: on the truncated-comment
- * path upstream does `if (lSeek!=0) fseek(...) else err=UNZ_ERRNO` and always
- * NUL-terminates; retail returns -1 directly out of the middle of the comment
- * fread (`v33 = -1; return -1;`) without running the LABEL_41 copy-out.  So a
- * short read of the comment loses pfile_info entirely rather than reporting a
- * partly-filled one.  Kept -- CoD1 never passes a comment buffer.
- *
- * SIGN NOTE: every 2-byte field arrives as `(__int16)Buffer`, i.e. movsx --
+ * SIGN NOTE: every 2-byte field arrives through getShort's `short`, i.e. movsx --
  * see the note on unzlocal_getShort.  Consistent with the binary; a filename
  * longer than 32,767 bytes would go negative, which the ZIP format forbids.
  */
 int __cdecl unzlocal_GetCurrentFileInfoInternal(
-        int a1,
-        void *a2,
-        unsigned int *a3,
-        _BYTE *a4,
-        size_t a5,
-        void *a6,
-        size_t ElementSize,
-        _BYTE *a8,
-        size_t a9)
+        unzFile file,
+        unz_file_info *pfile_info,
+        unz_file_info_internal *pfile_info_internal,
+        char *szFileName,
+        uLong fileNameBufferSize,
+        void *extraField,
+        uLong extraFieldBufferSize,
+        char *szComment,
+        uLong commentBufferSize)
 {
-  FILE *v11; // eax
-  unsigned int v12; // ebx
-  size_t v13; // ebp
-  size_t v14; // edi
-  size_t v15; // edi
-  size_t v16; // edi
-  int v17; // ebx
-  size_t v18; // ebp
-  FILE *v19; // [esp-40h] [ebp-9Ch]
-  FILE *v20; // [esp-40h] [ebp-9Ch]
-  FILE *v21; // [esp-40h] [ebp-9Ch]
-  FILE *v22; // [esp-30h] [ebp-8Ch]
-  FILE *v23; // [esp-30h] [ebp-8Ch]
-  FILE *v24; // [esp-30h] [ebp-8Ch]
-  FILE *v25; // [esp-20h] [ebp-7Ch]
-  FILE *v26; // [esp-20h] [ebp-7Ch]
-  FILE *v27; // [esp-20h] [ebp-7Ch]
-  FILE *v28; // [esp-20h] [ebp-7Ch]
-  FILE *v29; // [esp-10h] [ebp-6Ch]
-  FILE *v30; // [esp-10h] [ebp-6Ch]
-  FILE *v31; // [esp-10h] [ebp-6Ch]
-  unsigned int Buffer; // [esp+4h] [ebp-58h] BYREF
-  int v33; // [esp+8h] [ebp-54h]
-  _DWORD v34[20]; // [esp+Ch] [ebp-50h] BYREF
+  unz_s *s;
+  unz_file_info file_info;
+  unz_file_info_internal file_info_internal;
+  int err = 0;
+  unsigned long uMagic;
+  long lSeek = 0;
 
-  v33 = 0;
-  if ( !a1 )
-    return -102;
-  if ( fseek(*(FILE **)a1, *(_DWORD *)(a1 + 12) + *(_DWORD *)(a1 + 20), 0) )
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+  if ( fseek(s->file, s->pos_in_central_dir + s->byte_before_the_zipfile, SEEK_SET) != 0 )
+    err = UNZ_ERRNO;
+
+  /* we check the magic */
+  if ( err == UNZ_OK )
   {
-    v33 = -1;
+    if ( unzlocal_getLong(s->file, &uMagic) != UNZ_OK )
+      err = UNZ_ERRNO;
+    else if ( uMagic != 0x02014b50 )
+      err = UNZ_BADZIPFILE;
   }
-  else
+
+  if ( unzlocal_getShort(s->file, &file_info.version) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getShort(s->file, &file_info.version_needed) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getShort(s->file, &file_info.flag) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getShort(s->file, &file_info.compression_method) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getLong(s->file, &file_info.dosDate) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  unzlocal_DosDateToTmuDate(file_info.dosDate, &file_info.tmu_date);
+
+  if ( unzlocal_getLong(s->file, &file_info.crc) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getLong(s->file, &file_info.compressed_size) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getLong(s->file, &file_info.uncompressed_size) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getShort(s->file, &file_info.size_filename) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getShort(s->file, &file_info.size_file_extra) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getShort(s->file, &file_info.size_file_comment) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getShort(s->file, &file_info.disk_num_start) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getShort(s->file, &file_info.internal_fa) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getLong(s->file, &file_info.external_fa) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  if ( unzlocal_getLong(s->file, &file_info_internal.offset_curfile) != UNZ_OK )
+    err = UNZ_ERRNO;
+
+  lSeek += file_info.size_filename;
+  if ( (err == UNZ_OK) && (szFileName != NULL) )
   {
-    fread(&Buffer, 4u, 1u, *(FILE **)a1);
-    if ( Buffer != 33639248 )
-      v33 = -103;
-  }
-  fread(&Buffer, 2u, 1u, *(FILE **)a1);
-  v25 = *(FILE **)a1;
-  v34[0] = (__int16)Buffer;
-  fread(&Buffer, 2u, 1u, v25);
-  v22 = *(FILE **)a1;
-  v34[1] = (__int16)Buffer;
-  fread(&Buffer, 2u, 1u, v22);
-  v19 = *(FILE **)a1;
-  v34[2] = (__int16)Buffer;
-  fread(&Buffer, 2u, 1u, v19);
-  v29 = *(FILE **)a1;
-  v34[3] = (__int16)Buffer;
-  fread(&Buffer, 4u, 1u, v29);
-  v34[17] = BYTE2(Buffer) & 0x1F;
-  v34[19] = (Buffer >> 25) + 1980;
-  v34[18] = ((Buffer >> 21) & 0xF) - 1;
-  v34[4] = Buffer;
-  v34[16] = (unsigned __int16)Buffer >> 11;
-  v26 = *(FILE **)a1;
-  v34[14] = 2 * (Buffer & 0x1F);
-  v34[15] = (Buffer >> 5) & 0x3F;
-  fread(&Buffer, 4u, 1u, v26);
-  v11 = *(FILE **)a1;
-  v34[5] = Buffer;
-  fread(&Buffer, 4u, 1u, v11);
-  v20 = *(FILE **)a1;
-  v34[6] = Buffer;
-  fread(&Buffer, 4u, 1u, v20);
-  v30 = *(FILE **)a1;
-  v34[7] = Buffer;
-  fread(&Buffer, 2u, 1u, v30);
-  v12 = (__int16)Buffer;
-  v27 = *(FILE **)a1;
-  v34[8] = (__int16)Buffer;
-  fread(&Buffer, 2u, 1u, v27);
-  v13 = (__int16)Buffer;
-  v23 = *(FILE **)a1;
-  v34[9] = (__int16)Buffer;
-  fread(&Buffer, 2u, 1u, v23);
-  v14 = (__int16)Buffer;
-  v21 = *(FILE **)a1;
-  v34[10] = (__int16)Buffer;
-  fread(&Buffer, 2u, 1u, v21);
-  v31 = *(FILE **)a1;
-  v34[11] = (__int16)Buffer;
-  fread(&Buffer, 2u, 1u, v31);
-  v28 = *(FILE **)a1;
-  v34[12] = (__int16)Buffer;
-  fread(&Buffer, 4u, 1u, v28);
-  v24 = *(FILE **)a1;
-  v34[13] = Buffer;
-  fread(&Buffer, 4u, 1u, v24);
-  if ( !v33 )
-  {
-    if ( !a4 )
-      goto LABEL_17;
-    if ( v12 >= a5 )
+    unsigned long uSizeRead;
+    if ( file_info.size_filename < fileNameBufferSize )
     {
-      v15 = a5;
+      *(szFileName + file_info.size_filename) = '\0';
+      uSizeRead = file_info.size_filename;
     }
     else
-    {
-      a4[v12] = 0;
-      v15 = v12;
-    }
-    if ( v12 )
-    {
-      if ( a5 )
-      {
-        if ( fread(a4, v15, 1u, *(FILE **)a1) != 1 )
-          v33 = -1;
-      }
-    }
-    v12 -= v15;
-    v14 = v34[10];
-    if ( !v33 )
-    {
-LABEL_17:
-      if ( a6 )
-      {
-        v16 = ElementSize;
-        if ( v13 < ElementSize )
-          v16 = v13;
-        if ( v12 )
-        {
-          if ( fseek(*(FILE **)a1, v12, 1) )
-            v33 = -1;
-          else
-            v12 = 0;
-        }
-        if ( v13 )
-        {
-          if ( ElementSize )
-          {
-            if ( fread(a6, v16, 1u, *(FILE **)a1) != 1 )
-              v33 = -1;
-          }
-        }
-        v13 -= v16;
-        v14 = v34[10];
-      }
-    }
+      uSizeRead = fileNameBufferSize;
+
+    if ( (file_info.size_filename > 0) && (fileNameBufferSize > 0) )
+      if ( fread(szFileName, (unsigned int)uSizeRead, 1, s->file) != 1 )
+        err = UNZ_ERRNO;
+    lSeek -= uSizeRead;
   }
-  v17 = v13 + v12;
-  if ( !v33 )
+
+  if ( (err == UNZ_OK) && (extraField != NULL) )
   {
-    if ( !a8 )
-      goto LABEL_41;
-    v18 = a9;
-    if ( v14 < a9 )
+    unsigned long uSizeRead;
+    if ( file_info.size_file_extra < extraFieldBufferSize )
+      uSizeRead = file_info.size_file_extra;
+    else
+      uSizeRead = extraFieldBufferSize;
+
+    if ( lSeek != 0 )
     {
-      a8[v14] = 0;
-      v18 = v14;
+      if ( fseek(s->file, lSeek, SEEK_CUR) == 0 )
+        lSeek = 0;
+      else
+        err = UNZ_ERRNO;
     }
-    if ( v17 )
-    {
-      if ( fseek(*(FILE **)a1, v17, 1) )
-        v33 = -1;
-    }
-    if ( v14 && a9 && fread(a8, v18, 1u, *(FILE **)a1) != 1 )
-    {
-      v33 = -1;
-      return -1;
-    }
-    if ( !v33 )
-    {
-LABEL_41:
-      if ( a2 )
-        qmemcpy(a2, v34, 0x50u);
-      if ( a3 )
-        *a3 = Buffer;
-    }
+    if ( (file_info.size_file_extra > 0) && (extraFieldBufferSize > 0) )
+      if ( fread(extraField, (unsigned int)uSizeRead, 1, s->file) != 1 )
+        err = UNZ_ERRNO;
+    lSeek += file_info.size_file_extra - uSizeRead;
   }
-  return v33;
+  else
+    lSeek += file_info.size_file_extra;
+
+  if ( (err == UNZ_OK) && (szComment != NULL) )
+  {
+    unsigned long uSizeRead;
+    if ( file_info.size_file_comment < commentBufferSize )
+    {
+      *(szComment + file_info.size_file_comment) = '\0';
+      uSizeRead = file_info.size_file_comment;
+    }
+    else
+      uSizeRead = commentBufferSize;
+
+    if ( lSeek != 0 )
+    {
+      if ( fseek(s->file, lSeek, SEEK_CUR) == 0 )
+        lSeek = 0;
+      else
+        err = UNZ_ERRNO;
+    }
+    if ( (file_info.size_file_comment > 0) && (commentBufferSize > 0) )
+      if ( fread(szComment, (unsigned int)uSizeRead, 1, s->file) != 1 )
+        err = UNZ_ERRNO;
+    lSeek += file_info.size_file_comment - uSizeRead;
+  }
+  else
+    lSeek += file_info.size_file_comment;
+
+  if ( (err == UNZ_OK) && (pfile_info != NULL) )
+    *pfile_info = file_info;
+
+  if ( (err == UNZ_OK) && (pfile_info_internal != NULL) )
+    *pfile_info_internal = file_info_internal;
+
+  return err;
 }
 
 /* ---- unzGetCurrentFileInfo  0x004A9090 ---- */
@@ -770,46 +808,51 @@ LABEL_41:
  * VERIFIED 0x004A9090.  THE PARAMETER ORDER BELOW IS REGISTER ORDER, NOT
  * MINIZIP'S -- this is one of the two functions in this file whose recovered
  * signature is a permutation of the public API, and it has already cost this
- * project hours once.  The forwarding call
- *     unzlocal_GetCurrentFileInfoInternal(a4, a5, 0, a6, a7, a8, ElementSize, a1, a3)
- * onto the nine-parameter internal -- whose order IS canonical -- pins every
- * slot: a1 szComment, a2 extraFieldBufferSize, a3 commentBufferSize, a4 file,
- * a5 pfile_info, a6 szFileName, a7 fileNameBufferSize, a8 extraField.
+ * project hours once.  The forwarding call onto the nine-parameter internal
+ * -- whose order IS canonical -- pins every slot: the recovered (a1..a8) are
+ * szComment, extraFieldBufferSize, commentBufferSize, file, pfile_info,
+ * szFileName, fileNameBufferSize, extraField, which is the order below.
  * zlib/unz_compat.c's Unz_GetCurrentFileInfo is the adapter that converts
  * from the canonical eight-argument order; both were exercised 14,493 times.
  * If this file is ever regenerated, that adapter must be re-checked with it.
  */
 int __cdecl unzGetCurrentFileInfo(
-        _BYTE *a1,
-        size_t ElementSize,
-        size_t a3,
-        int a4,
-        void *a5,
-        _BYTE *a6,
-        size_t a7,
-        void *a8)
+        char *szComment,
+        uLong extraFieldBufferSize,
+        uLong commentBufferSize,
+        unzFile file,
+        unz_file_info *pfile_info,
+        char *szFileName,
+        uLong fileNameBufferSize,
+        void *extraField)
 {
-  return unzlocal_GetCurrentFileInfoInternal(a4, a5, 0, a6, a7, a8, ElementSize, a1, a3);
+  return unzlocal_GetCurrentFileInfoInternal(file, pfile_info, NULL,
+                                             szFileName, fileNameBufferSize,
+                                             extraField, extraFieldBufferSize,
+                                             szComment, commentBufferSize);
 }
 
 /* ---- unzGoToFirstFile  0x004A90C0 ---- */
 // unzGoToFirstFile -- CONFIRMED 92. pos_in_central_dir = offset_central_dir; num_file = 0. minizip verbatim.
 /* VERIFIED 0x004A90C0 against upstream, and behaviourally as the first step of
- * every one of the nine pak walks.  `a1 + 10` and `a1 + 30` are &cur_file_info
- * and &offset_curfile -- POINTER arithmetic on `_DWORD *`, i.e. bytes 40 and
- * 120, which is what the disassembly's `lea` operands are.  The handle arrives
- * in ESI (`mov esi, ebx` in unzOpen at 0x004A8C1A). */
-int __cdecl unzGoToFirstFile(_DWORD *a1)
+ * every one of the nine pak walks.  &s->cur_file_info and
+ * &s->cur_file_info_internal are bytes 40 and 120 of unz_s, which is what the
+ * disassembly's `lea` operands are.  The handle arrives in ESI (`mov esi, ebx`
+ * in unzOpen at 0x004A8C1A). */
+int __cdecl unzGoToFirstFile(unzFile file)
 {
-  int result; // eax
-
-  if ( !a1 )
-    return -102;
-  a1[5] = a1[9];
-  a1[4] = 0;
-  result = unzlocal_GetCurrentFileInfoInternal((int)a1, a1 + 10, a1 + 30, 0, 0, 0, 0, 0, 0);
-  a1[6] = result == 0;
-  return result;
+  int err = UNZ_OK;
+  unz_s *s;
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+  s->pos_in_central_dir = s->offset_central_dir;
+  s->num_file = 0;
+  err = unzlocal_GetCurrentFileInfoInternal(file, &s->cur_file_info,
+                                            &s->cur_file_info_internal,
+                                            NULL, 0, NULL, 0, NULL, 0);
+  s->current_file_ok = (err == UNZ_OK);
+  return err;
 }
 
 /* ---- unzGoToNextFile  0x004A9100 ---- */
@@ -817,27 +860,30 @@ int __cdecl unzGoToFirstFile(_DWORD *a1)
 /* VERIFIED 0x004A9100 against upstream, and behaviourally: walking it 27,613
  * times across the nine stock paks landed on a valid 0x02014B50 header EVERY
  * time -- which is the strongest possible test of the +46 stride and of
- * a1[18]/a1[19]/a1[20] being size_filename/size_file_extra/size_file_comment
- * (cur_file_info[8]/[9]/[10]), since one wrong term desynchronises the whole
- * remaining walk.  `v2 == a1[1]` is num_file+1 == gi.number_entry -> UNZ_END_
- * OF_LIST_OF_FILE (-100). */
-int __cdecl unzGoToNextFile(_DWORD *a1)
+ * size_filename/size_file_extra/size_file_comment (unz_s dwords 18/19/20,
+ * cur_file_info[8]/[9]/[10]), since one wrong term desynchronises the whole
+ * remaining walk. */
+int __cdecl unzGoToNextFile(unzFile file)
 {
-  int result; // eax
-  int v2; // eax
+  unz_s *s;
+  int err;
 
-  if ( !a1 )
-    return -102;
-  if ( !a1[6] )
-    return -100;
-  v2 = a1[4] + 1;
-  if ( v2 == a1[1] )
-    return -100;
-  a1[5] += a1[19] + a1[20] + a1[18] + 46;
-  a1[4] = v2;
-  result = unzlocal_GetCurrentFileInfoInternal((int)a1, a1 + 10, a1 + 30, 0, 0, 0, 0, 0, 0);
-  a1[6] = result == 0;
-  return result;
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+  if ( !s->current_file_ok )
+    return UNZ_END_OF_LIST_OF_FILE;
+  if ( s->num_file + 1 == s->gi.number_entry )
+    return UNZ_END_OF_LIST_OF_FILE;
+
+  s->pos_in_central_dir += SIZECENTRALDIRITEM + s->cur_file_info.size_filename +
+                           s->cur_file_info.size_file_extra + s->cur_file_info.size_file_comment;
+  s->num_file++;
+  err = unzlocal_GetCurrentFileInfoInternal(file, &s->cur_file_info,
+                                            &s->cur_file_info_internal,
+                                            NULL, 0, NULL, 0, NULL, 0);
+  s->current_file_ok = (err == UNZ_OK);
+  return err;
 }
 
 /* ---- unzGetCurrentFileInfoPosition  0x004A9170 ---- */
@@ -850,28 +896,40 @@ int __cdecl unzGoToNextFile(_DWORD *a1)
  * decompressed to the right bytes -- so the getter/setter pair round-trips.
  * NOTE zlib/unz_compat.c wraps this into a one-argument value-returning form
  * because that is the shape universal/com_files.c calls. */
-int __cdecl unzGetCurrentFileInfoPosition(int a1, _DWORD *a2)
+int __cdecl unzGetCurrentFileInfoPosition(unzFile file, unsigned long *pos)
 {
-  if ( !a1 )
-    return -102;
-  *a2 = *(_DWORD *)(a1 + 20);
-  return 0;
+  unz_s *s;
+
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+
+  *pos = s->pos_in_central_dir;
+  return UNZ_OK;
 }
 
 /* ---- unzSetCurrentFileInfoPosition  0x004A9190 ---- */
 // unzSetCurrentFileInfoPosition -- CONFIRMED 92. The setter half; called by FS_FOpenFileRead_Internal and FS_Seek.
 /* VERIFIED 0x004A9190.  NOT UPSTREAM -- the other half of the id/IW pair.
  * Note it returns 0 unconditionally and records success in current_file_ok
- * (a1[6]) instead, so a caller that seeks to a bad position learns nothing
- * from the return value; unzOpenCurrentFile's `!a1[6]` check is what catches
+ * instead, so a caller that seeks to a bad position learns nothing from the
+ * return value; unzOpenCurrentFile's `!s->current_file_ok` check is what catches
  * it.  Exercised 14,493 times on the FS_FOpenFileRead path. */
-int __cdecl unzSetCurrentFileInfoPosition(_DWORD *a1, int a2)
+int __cdecl unzSetCurrentFileInfoPosition(unzFile file, unsigned long pos)
 {
-  if ( !a1 )
-    return -102;
-  a1[5] = a2;
-  a1[6] = unzlocal_GetCurrentFileInfoInternal((int)a1, a1 + 10, a1 + 30, 0, 0, 0, 0, 0, 0) == 0;
-  return 0;
+  unz_s *s;
+  int err;
+
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+
+  s->pos_in_central_dir = pos;
+  err = unzlocal_GetCurrentFileInfoInternal(file, &s->cur_file_info,
+                                            &s->cur_file_info_internal,
+                                            NULL, 0, NULL, 0, NULL, 0);
+  s->current_file_ok = (err == UNZ_OK);
+  return UNZ_OK;
 }
 
 /* ---- unzLocateFile  0x004A91D0 ---- */
@@ -895,42 +953,45 @@ int __cdecl unzSetCurrentFileInfoPosition(_DWORD *a1, int a2)
    the disassembly (`mov esi, ecx` at 0x004A91EB with no matching stack slot)
    and the restored body re-read against upstream minizip unzLocateFile term
    for term, including the save/restore of num_file and pos_in_central_dir on
-   failure and the UNZ_MAXFILENAMEINZIP 0x100 cap.  Not exercised: still dead. */
-int __cdecl unzLocateFile(void *file, char *a1, int a2)
+   failure and the UNZ_MAXFILENAMEINZIP 0x100 cap.  Not exercised: still dead.
+   Now upstream's text (unzGetCurrentFileInfo and unzStringFileNameCompare
+   inlined), byte-identical under VC7. */
+int __cdecl unzLocateFile(unzFile file, const char *szFileName, int iCaseSensitivity)
 {
-  _DWORD *v3; // esi
-  int result; // eax
-  int v5; // ebx
-  int v7; // [esp+8h] [ebp-10Ch]
-  char v8[260]; // [esp+Ch] [ebp-108h] BYREF
+  unz_s *s;
+  int err;
 
-  v3 = (_DWORD *)file;
-  if ( !file || strlen(a1) >= 0x100 )
-    return -102;
-  if ( !v3[6] )
-    return -100;
-  v5 = v3[4];
-  v7 = v3[5];
-  result = unzGoToFirstFile(v3);
-  if ( result )
+  uLong num_fileSaved;
+  uLong pos_in_central_dirSaved;
+
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+
+  if ( strlen(szFileName) >= UNZ_MAXFILENAMEINZIP )
+    return UNZ_PARAMERROR;
+
+  s = (unz_s *)file;
+  if ( !s->current_file_ok )
+    return UNZ_END_OF_LIST_OF_FILE;
+
+  num_fileSaved = s->num_file;
+  pos_in_central_dirSaved = s->pos_in_central_dir;
+
+  err = unzGoToFirstFile(file);
+
+  while ( err == UNZ_OK )
   {
-LABEL_12:
-    v3[4] = v5;
-    v3[5] = v7;
+    char szCurrentFileName[UNZ_MAXFILENAMEINZIP + 1];
+    unzGetCurrentFileInfo(NULL, 0, 0, file, NULL,
+                          szCurrentFileName, sizeof(szCurrentFileName) - 1, NULL);
+    if ( unzStringFileNameCompare(szCurrentFileName, szFileName, iCaseSensitivity) == 0 )
+      return UNZ_OK;
+    err = unzGoToNextFile(file);
   }
-  else
-  {
-    while ( 1 )
-    {
-      unzlocal_GetCurrentFileInfoInternal((int)v3, 0, 0, v8, 0x100u, 0, 0, 0, 0);
-      if ( !(a2 == 1 ? strcmp(v8, a1) : strcmpcasenosensitive_internal(a1, v8)) )
-        return 0;
-      result = unzGoToNextFile(v3);
-      if ( result )
-        goto LABEL_12;
-    }
-  }
-  return result;
+
+  s->num_file = num_fileSaved;
+  s->pos_in_central_dir = pos_in_central_dirSaved;
+  return err;
 }
 
 /* ---- unzlocal_CheckCurrentFileCoherencyHeader  0x004A92F0 ---- */
@@ -939,89 +1000,89 @@ LABEL_12:
  * VERIFIED 0x004A92F0 INSTRUCTION BY INSTRUCTION, all 164 of them, because
  * this body looks wrong and is not.
  *
- * `fread(&Buffer, 4u, 1u, ...)` writes over the PARAMETER named Buffer.  That
- * is faithful: MSVC reused the incoming parameter's own stack slot as the
- * 4-byte read scratch once it had copied the pointer to EBP.  The retail frame
- * says so directly -- arg1 lives at [esp+0Ch] and every `lea edx,[esp+..+Buffer]`
- * fread destination is that same slot.  The pointer is saved into v6 on the
- * first line and every later write goes through v6/a3/a4, which are untouched.
- * Do not "repair" this into a separate local: it would be correct C but would
- * stop matching the binary, and the next person would undo it.
+ * Every fread lands in the incoming piSizeVar parameter's stack slot: MSVC
+ * keeps the pointer in EBP for the whole body and packs the 4-byte read
+ * scratch into that home slot.  Writing over the parameter itself (Hex-Rays'
+ * shape) cost an extra `mov ebp,eax`; the separate `uData` local below is
+ * what VC7 turns into retail's frame byte for byte.
  *
- * Ten reads, in retail's order: signature (0x04034B50 = 67324752), version
- * needed (discarded), flag (v9, only bit 3 used), method, dosDate (discarded),
- * crc, compressed_size, uncompressed_size, size_filename, size_extra_field.
- * Central-directory fields compared against are a1+52/+60/+64/+68/+72 = dwords
- * 13/15/16/17/18 = method/crc/csize/usize/size_filename.  `(v9 & 8) == 0`
- * is upstream's "sizes live in the data descriptor, do not compare" flag.
- * a1+120 is dword 30, offset_curfile; the +30 is sizeof(local file header).
+ * Ten reads, in retail's order: signature (0x04034B50), version needed
+ * (discarded), flags (only bit 3 used), method, dosDate (discarded), crc,
+ * compressed_size, uncompressed_size, size_filename, size_extra_field.
+ * Central-directory fields compared against are unz_s +52/+60/+64/+68/+72 =
+ * cur_file_info.compression_method/crc/compressed_size/uncompressed_size/
+ * size_filename.  `(uFlags & 8) == 0` is upstream's "sizes live in the data
+ * descriptor, do not compare" flag.  cur_file_info_internal.offset_curfile is
+ * unz_s +120; SIZEZIPLOCALHEADER (30) is sizeof(local file header).
  *
- * DIVERGENCE FROM UPSTREAM: retail folds upstream's separate
- * `compression_method != 0 && != Z_DEFLATED -> UNZ_BADZIPFILE` check into the
- * local-header method comparison here (`v10 && v10 != 8`), so
- * unzOpenCurrentFile has no method check of its own.
+ * The `compression_method && compression_method != Z_DEFLATED` check is
+ * upstream's own (1.1.4 minizip tests compression_method here AND, dead,
+ * again in unzOpenCurrentFile).  Upstream's text for this function (getShort/
+ * getLong calls into separate locals) was tried and is byte-identical under
+ * VC7 too; this form stays, with minizip's names, because its single shared
+ * read scratch is what the modern build needs to reproduce retail's value on
+ * a short read.
  *
  * BEHAVIOURALLY exercised 14,493 times -- it runs before every single pak read
  * and returned UNZ_OK for every stock entry, which also proves the offsets.
  */
-int __cdecl unzlocal_CheckCurrentFileCoherencyHeader(int a1, _DWORD *Buffer, _DWORD *a3, _DWORD *a4)
+int __cdecl unzlocal_CheckCurrentFileCoherencyHeader(unz_s *s, uInt *piSizeVar,
+                                                     uLong *poffset_local_extrafield,
+                                                     uInt *psize_local_extrafield)
 {
-  _DWORD *v4; // eax
-  _DWORD *v5; // ecx
-  _DWORD *v6; // ebp
-  int v7; // edi
-  int result; // eax
-  char v9; // bl
-  int v10; // eax
-  int v11; // ebx
-  int v12; // eax
-  int v13; // ecx
+  int uData;            /* read scratch: retail's getShort/getLong, inlined as raw freads */
+  int err = UNZ_OK;
+  int uFlags;
+  int compression_method;
+  int size_filename;
+  int size_extra_field;
 
-  v4 = a3;
-  v5 = a4;
-  v6 = Buffer;
-  v7 = 0;
-  *Buffer = 0;
-  *v4 = 0;
-  *v5 = 0;
-  if ( fseek(*(FILE **)a1, *(_DWORD *)(a1 + 120) + *(_DWORD *)(a1 + 12), 0) )
-    return -1;
-  fread(&Buffer, 4u, 1u, *(FILE **)a1);
-  if ( Buffer != (_DWORD *)67324752 )
-    v7 = -103;
-  fread(&Buffer, 2u, 1u, *(FILE **)a1);
-  fread(&Buffer, 2u, 1u, *(FILE **)a1);
-  v9 = (char)Buffer;
-  fread(&Buffer, 2u, 1u, *(FILE **)a1);
-  if ( !v7 )
+  *piSizeVar = 0;
+  *poffset_local_extrafield = 0;
+  *psize_local_extrafield = 0;
+
+  if ( fseek(s->file, s->cur_file_info_internal.offset_curfile +
+                      s->byte_before_the_zipfile, SEEK_SET) )
+    return UNZ_ERRNO;
+#ifndef COD1_VC7
+  uData = (int)piSizeVar;   /* VC7 puts uData in piSizeVar's home slot: same start value on a short read */
+#endif
+  fread(&uData, 4u, 1u, s->file);
+  if ( uData != 0x04034b50 )
+    err = UNZ_BADZIPFILE;
+  fread(&uData, 2u, 1u, s->file);       /* version needed, not checked */
+  fread(&uData, 2u, 1u, s->file);
+  uFlags = (short)uData;
+  fread(&uData, 2u, 1u, s->file);
+  if ( err == UNZ_OK )
   {
-    v10 = *(_DWORD *)(a1 + 52);
-    if ( (__int16)Buffer != v10 || v10 && v10 != 8 )
-      v7 = -103;
+    compression_method = s->cur_file_info.compression_method;
+    if ( (short)uData != compression_method ||
+         compression_method && compression_method != Z_DEFLATED )
+      err = UNZ_BADZIPFILE;
   }
-  fread(&Buffer, 4u, 1u, *(FILE **)a1);
-  fread(&Buffer, 4u, 1u, *(FILE **)a1);
-  if ( !v7 && Buffer != *(_DWORD **)(a1 + 60) && (v9 & 8) == 0 )
-    v7 = -103;
-  fread(&Buffer, 4u, 1u, *(FILE **)a1);
-  if ( !v7 && Buffer != *(_DWORD **)(a1 + 64) && (v9 & 8) == 0 )
-    v7 = -103;
-  fread(&Buffer, 4u, 1u, *(FILE **)a1);
-  if ( !v7 && Buffer != *(_DWORD **)(a1 + 68) && (v9 & 8) == 0 )
-    v7 = -103;
-  fread(&Buffer, 2u, 1u, *(FILE **)a1);
-  v11 = (__int16)Buffer;
-  if ( !v7 && (__int16)Buffer != *(_DWORD *)(a1 + 72) )
-    v7 = -103;
-  *v6 += (__int16)Buffer;
-  fread(&Buffer, 2u, 1u, *(FILE **)a1);
-  v12 = (__int16)Buffer;
-  *a3 = *(_DWORD *)(a1 + 120) + v11 + 30;
-  *a4 = v12;
-  v13 = v12 + *v6;
-  result = v7;
-  *v6 = v13;
-  return result;
+  fread(&uData, 4u, 1u, s->file);       /* date/time */
+  fread(&uData, 4u, 1u, s->file);       /* crc */
+  if ( err == UNZ_OK && uData != s->cur_file_info.crc && (uFlags & 8) == 0 )
+    err = UNZ_BADZIPFILE;
+  fread(&uData, 4u, 1u, s->file);       /* size compr */
+  if ( err == UNZ_OK && uData != s->cur_file_info.compressed_size && (uFlags & 8) == 0 )
+    err = UNZ_BADZIPFILE;
+  fread(&uData, 4u, 1u, s->file);       /* size uncompr */
+  if ( err == UNZ_OK && uData != s->cur_file_info.uncompressed_size && (uFlags & 8) == 0 )
+    err = UNZ_BADZIPFILE;
+  fread(&uData, 2u, 1u, s->file);
+  size_filename = (short)uData;
+  if ( err == UNZ_OK && (short)uData != s->cur_file_info.size_filename )
+    err = UNZ_BADZIPFILE;
+  *piSizeVar += (short)uData;
+  fread(&uData, 2u, 1u, s->file);
+  size_extra_field = (short)uData;
+  *poffset_local_extrafield = s->cur_file_info_internal.offset_curfile +
+                              size_filename + SIZEZIPLOCALHEADER;
+  *psize_local_extrafield = size_extra_field;
+  *piSizeVar += size_extra_field;
+  return err;
 }
 
 /* ---- unzOpenCurrentFile  0x004A94A0 ---- */
@@ -1048,76 +1109,91 @@ int __cdecl unzlocal_CheckCurrentFileCoherencyHeader(int a1, _DWORD *Buffer, _DW
  * runs over pak data and the CRC in unzCloseCurrentFile is the only integrity
  * test there is -- the reason crc32 being stubbed to `return 0` mattered.
  *
- * v3[21] = a1[15] is crc32_wait <- cur_file_info.crc, the value the running
- * CRC is finally compared against.  v3[23] = a1[17] is
- * rest_read_uncompressed <- cur_file_info.uncompressed_size, which is also
- * what Unz_GetCurrentFileUncompressedSize in zlib/unz_compat.c reads directly
- * out of the handle.
+ * crc32_wait <- cur_file_info.crc is the value the running CRC is finally
+ * compared against; rest_read_uncompressed <- cur_file_info.uncompressed_size
+ * is also what Unz_GetCurrentFileUncompressedSize in zlib/unz_compat.c reads
+ * directly out of the handle.
  *
- * DIVERGENCE FROM UPSTREAM: retail does not free the read buffer if
- * inflateInit2_ fails -- it only clears stream_initialised.  Upstream is the
- * same in 1.01; kept either way.
+ * Retail does not free the read buffer if inflateInit2_ fails -- it only
+ * leaves stream_initialised clear.  That is upstream's own behaviour.
  *
- * &v10/&v11 flagged by vecsplit_scan.py are legitimate 4-byte out-parameters
- * of unzlocal_CheckCurrentFileCoherencyHeader, not a split record.
+ * Upstream's text.  inflateInit2_ takes upstream's (strm, windowBits,
+ * version, stream_size) order, which sets up its register arguments the
+ * way retail does (see uncompress).
  */
-int __cdecl unzOpenCurrentFile(_DWORD *a1)
+int __cdecl unzOpenCurrentFile(unzFile file)
 {
-  _DWORD *v3; // ebx
-  void *v4; // eax
-  int v5; // ecx
-  int v6; // edx
-  bool v7; // zf
-  int v8; // eax
-  int v9; // edx
-  int v10; // [esp+8h] [ebp-Ch] BYREF
-  int v11; // [esp+Ch] [ebp-8h] BYREF
-  int Buffer; // [esp+10h] [ebp-4h] BYREF
+  int err = 0;
+  int Store;
+  unsigned int iSizeVar;
+  unz_s *s;
+  file_in_zip_read_info_s *pfile_in_zip_read_info;
+  unsigned long offset_local_extrafield;
+  unsigned int size_local_extrafield;
 
-  if ( !a1 || !a1[6] )
-    return -102;
-  if ( a1[31] )
-    unzCloseCurrentFile((int)a1);
-  if ( unzlocal_CheckCurrentFileCoherencyHeader((int)a1, &Buffer, &v10, &v11) )
-    return -103;
-  v3 = malloc(0x6Cu);
-  if ( !v3 )
-    return -104;
-  v4 = malloc(0x4000u);
-  v5 = v10;
-  v6 = v11;
-  *v3 = v4;
-  v3[17] = v5;
-  v3[18] = v6;
-  v3[19] = 0;
-  if ( !v4 )
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+  if ( !s->current_file_ok )
+    return UNZ_PARAMERROR;
+
+  if ( s->pfile_in_zip_read != NULL )
+    unzCloseCurrentFile(file);
+
+  if ( unzlocal_CheckCurrentFileCoherencyHeader(s, &iSizeVar,
+         &offset_local_extrafield, &size_local_extrafield) != UNZ_OK )
+    return UNZ_BADZIPFILE;
+
+  pfile_in_zip_read_info = (file_in_zip_read_info_s *)malloc(sizeof(file_in_zip_read_info_s));
+  if ( pfile_in_zip_read_info == NULL )
+    return UNZ_INTERNALERROR;
+
+  pfile_in_zip_read_info->read_buffer = (char *)malloc(UNZ_BUFSIZE);
+  pfile_in_zip_read_info->offset_local_extrafield = offset_local_extrafield;
+  pfile_in_zip_read_info->size_local_extrafield = size_local_extrafield;
+  pfile_in_zip_read_info->pos_local_extrafield = 0;
+
+  if ( pfile_in_zip_read_info->read_buffer == NULL )
   {
-    free(v3);
-    return -104;
+    if ( pfile_in_zip_read_info )
+      free(pfile_in_zip_read_info);
+    return UNZ_INTERNALERROR;
   }
-  v3[16] = 0;
-  v7 = a1[13] == 0;
-  v3[21] = a1[15];
-  v3[20] = 0;
-  v3[25] = a1[13];
-  v3[24] = *a1;
-  v3[26] = a1[3];
-  v3[6] = 0;
-  if ( !v7 )
+
+  pfile_in_zip_read_info->stream_initialised = 0;
+
+  if ( (s->cur_file_info.compression_method != 0) &&
+       (s->cur_file_info.compression_method != Z_DEFLATED) )
+    err = UNZ_BADZIPFILE;
+  Store = s->cur_file_info.compression_method == 0;
+
+  pfile_in_zip_read_info->crc32_wait = s->cur_file_info.crc;
+  pfile_in_zip_read_info->crc32 = 0;
+  pfile_in_zip_read_info->compression_method = s->cur_file_info.compression_method;
+  pfile_in_zip_read_info->file = s->file;
+  pfile_in_zip_read_info->byte_before_the_zipfile = s->byte_before_the_zipfile;
+
+  pfile_in_zip_read_info->stream.total_out = 0;
+
+  if ( !Store )
   {
-    v3[9] = 0;
-    v3[10] = 0;
-    v3[11] = 0;
-    if ( !inflateInit2_("1.1.4", -15, v3 + 1, 56) )
-      v3[16] = 1;
+    pfile_in_zip_read_info->stream.zalloc = 0;
+    pfile_in_zip_read_info->stream.zfree = 0;
+    pfile_in_zip_read_info->stream.opaque = 0;
+
+    err = inflateInit2_(&pfile_in_zip_read_info->stream, -MAX_WBITS, ZLIB_VERSION, sizeof(z_stream));
+    if ( err == Z_OK )
+      pfile_in_zip_read_info->stream_initialised = 1;
   }
-  v3[22] = a1[16];
-  v8 = Buffer;
-  v3[23] = a1[17];
-  v9 = a1[30];
-  v3[2] = 0;
-  v3[15] = v9 + v8 + 30;
-  a1[31] = v3;
+  pfile_in_zip_read_info->rest_read_compressed = s->cur_file_info.compressed_size;
+  pfile_in_zip_read_info->rest_read_uncompressed = s->cur_file_info.uncompressed_size;
+
+  pfile_in_zip_read_info->pos_in_zipfile =
+      s->cur_file_info_internal.offset_curfile + 30 + iSizeVar;
+
+  pfile_in_zip_read_info->stream.avail_in = 0;
+
+  s->pfile_in_zip_read = pfile_in_zip_read_info;
   return 0;
 }
 
@@ -1132,137 +1208,141 @@ int __cdecl unzOpenCurrentFile(_DWORD *a1)
  *
  * ARGUMENT ORDER IS (file, len, buf) AND THAT IS NOT MINIZIP'S.  Retail is
  * __usercall file@<eax>, len@<ecx>, buf@<stack+0>:
- *     4a95e3  mov esi,[eax+7Ch]   ; a1 -> pfile_in_zip_read
- *     4a960a  test ecx,ecx        ; a2 = len; zero -> return 0
+ *     4a95e3  mov esi,[eax+7Ch]   ; file -> pfile_in_zip_read
+ *     4a960a  test ecx,ecx        ; len; zero -> return 0
  *     4a9624  mov [esi+14h],ecx   ;   -> stream.avail_out
- *     4a9618  mov eax,[esp+arg_0] ; a3 = buf
+ *     4a9618  mov eax,[esp+arg_0] ; buf
  *     4a961c  mov [esi+10h],eax   ;   -> stream.next_out
  * Retail's own FS_Read agrees at 0x0042A490.  Passing minizip's (file, buf,
  * len) put the length in next_out and the pointer in avail_out, which is half
  * of the historic "FS_ReadFile returns a buffer of zeroes".
  * zlib/unz_compat.c's Unz_ReadCurrentFile is the adapter.
  *
- * `a2` is `unsigned int` and `*(_DWORD *)` is unsigned (hexrays_shim.h), so
- * every clamp here -- len vs rest_read_uncompressed, rest_read_compressed vs
- * 0x4000, avail_in vs avail_out -- is an unsigned comparison, as zlib requires.
- * Checked deliberately: a signed compare here would truncate reads rather than
- * crash.
+ * `len` and the uLong/uInt fields are unsigned, so every clamp here -- len vs
+ * rest_read_uncompressed, rest_read_compressed vs 0x4000, avail_in vs
+ * avail_out -- is an unsigned comparison, as zlib requires.  Checked
+ * deliberately: a signed compare here would truncate reads rather than crash.
  *
- * sub_4A2CE0 is crc32 (universal/memorytree.cpp), (crc, len, buf).
+ * crc32 (universal/memorytree.cpp) takes zlib's (crc, buf, len).
  *
- * TWO DIVERGENCES FROM UPSTREAM MINIZIP, both in the inflate branch:
- *   - on Z_STREAM_END upstream returns `iRead==0 ? UNZ_EOF : iRead`; retail
- *     returns iRead unconditionally, so a read past the end yields 0 rather
- *     than -100.  universal/com_files.c's FS_Read tolerates a single zero
- *     read, which is what makes that survivable.
- *   - on any other inflate error upstream breaks out and returns iRead;
- *     retail returns the raw zlib error (negative).  FS_Read treats -1 as
- *     fatal, so a corrupt pak surfaces there rather than as silent truncation.
+ * The body is upstream minizip's text.  UNZ_EOF is 0, so upstream's
+ * `iRead==0 ? UNZ_EOF : iRead` on Z_STREAM_END is plain iRead (a read past the
+ * end yields 0; universal/com_files.c's FS_Read tolerates a single zero read),
+ * and any other inflate error breaks out and returns the raw zlib error
+ * (FS_Read treats -1 as fatal).  The remaining VC7 differences are crc32's:
+ * retail's is zlib's DO8-unrolled body (not inlined here) taking upstream's
+ * (crc, buf, len) order.
  */
-int __cdecl unzReadCurrentFile(int a1, unsigned int a2, int a3)
+int __cdecl unzReadCurrentFile(unzFile file, unsigned len, void *buf)
 {
-  int v4; // esi
-  unsigned int v5; // eax
-  unsigned int v6; // eax
-  size_t v7; // edi
-  void *v8; // edx
-  size_t v9; // eax
-  unsigned int v10; // edi
-  unsigned int i; // eax
-  _BYTE *v12; // ebx
-  int v13; // eax
-  int v14; // ecx
-  int v15; // ebp
-  int v16; // edx
-  unsigned int v17; // eax
-  int v18; // ecx
-  int v19; // ebx
-  _BYTE *v20; // ebp
-  unsigned int v21; // edi
-  int v22; // eax
-  int v23; // ebx
-  int v24; // [esp+0h] [ebp-8h]
-  int v25; // [esp+4h] [ebp-4h]
+  int err = 0;
+  unsigned int iRead = 0;
+  unz_s *s;
+  file_in_zip_read_info_s *pfile_in_zip_read_info;
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+  pfile_in_zip_read_info = s->pfile_in_zip_read;
 
-  v24 = 0;
-  if ( !a1 )
-    return -102;
-  v4 = *(_DWORD *)(a1 + 124);
-  if ( !v4 )
-    return -102;
-  if ( !*(_DWORD *)v4 )
-    return -100;
-  if ( !a2 )
+  if ( pfile_in_zip_read_info == NULL )
+    return UNZ_PARAMERROR;
+
+  if ( (pfile_in_zip_read_info->read_buffer == NULL) )
+    return UNZ_END_OF_LIST_OF_FILE;
+  if ( len == 0 )
     return 0;
-  *(_DWORD *)(v4 + 16) = a3;
-  v5 = *(_DWORD *)(v4 + 92);
-  *(_DWORD *)(v4 + 20) = a2;
-  if ( a2 > v5 )
-    *(_DWORD *)(v4 + 20) = v5;
-  while ( *(_DWORD *)(v4 + 20) )
+
+  pfile_in_zip_read_info->stream.next_out = (unsigned char *)buf;
+
+  pfile_in_zip_read_info->stream.avail_out = (unsigned int)len;
+
+  if ( len > pfile_in_zip_read_info->rest_read_uncompressed )
+    pfile_in_zip_read_info->stream.avail_out =
+      (unsigned int)pfile_in_zip_read_info->rest_read_uncompressed;
+
+  while ( pfile_in_zip_read_info->stream.avail_out > 0 )
   {
-    if ( !*(_DWORD *)(v4 + 8) )
+    if ( (pfile_in_zip_read_info->stream.avail_in == 0) &&
+         (pfile_in_zip_read_info->rest_read_compressed > 0) )
     {
-      v6 = *(_DWORD *)(v4 + 88);
-      if ( v6 )
-      {
-        v7 = 0x4000;
-        if ( v6 < 0x4000 )
-          v7 = *(_DWORD *)(v4 + 88);
-        if ( fseek(*(FILE **)(v4 + 96), *(_DWORD *)(v4 + 60) + *(_DWORD *)(v4 + 104), 0)
-          || fread(*(void **)v4, v7, 1u, *(FILE **)(v4 + 96)) != 1 )
-        {
-          return -1;
-        }
-        v8 = *(void **)v4;
-        v9 = *(_DWORD *)(v4 + 88) - v7;
-        *(_DWORD *)(v4 + 60) += v7;
-        *(_DWORD *)(v4 + 88) = v9;
-        *(_DWORD *)(v4 + 4) = v8;
-        *(_DWORD *)(v4 + 8) = v7;
-      }
+      uInt uReadThis = UNZ_BUFSIZE;
+      if ( pfile_in_zip_read_info->rest_read_compressed < uReadThis )
+        uReadThis = (unsigned int)pfile_in_zip_read_info->rest_read_compressed;
+      if ( uReadThis == 0 )
+        return UNZ_EOF;
+      if ( fseek(pfile_in_zip_read_info->file,
+                 pfile_in_zip_read_info->pos_in_zipfile +
+                 pfile_in_zip_read_info->byte_before_the_zipfile, SEEK_SET) != 0 )
+        return UNZ_ERRNO;
+      if ( fread(pfile_in_zip_read_info->read_buffer, uReadThis, 1,
+                 pfile_in_zip_read_info->file) != 1 )
+        return UNZ_ERRNO;
+      pfile_in_zip_read_info->pos_in_zipfile += uReadThis;
+
+      pfile_in_zip_read_info->rest_read_compressed -= uReadThis;
+
+      pfile_in_zip_read_info->stream.next_in =
+        (unsigned char *)pfile_in_zip_read_info->read_buffer;
+      pfile_in_zip_read_info->stream.avail_in = (unsigned int)uReadThis;
     }
-    if ( *(_DWORD *)(v4 + 100) )
+
+    if ( pfile_in_zip_read_info->compression_method == 0 )
     {
-      v19 = *(_DWORD *)(v4 + 24);
-      v20 = *(_BYTE **)(v4 + 16);
-      v25 = inflate((unsigned __int8 **)(v4 + 4), 2);
-      v21 = *(_DWORD *)(v4 + 24) - v19;
-      v22 = sub_4A2CE0(*(_DWORD *)(v4 + 80), v21, v20);
-      v23 = *(_DWORD *)(v4 + 92);
-      *(_DWORD *)(v4 + 80) = v22;
-      *(_DWORD *)(v4 + 92) = v23 - v21;
-      v24 += v21;
-      if ( v25 == 1 )
-        return v24;
-      if ( v25 )
-        return v25;
+      unsigned int uDoCopy, i;
+      if ( pfile_in_zip_read_info->stream.avail_out <
+           pfile_in_zip_read_info->stream.avail_in )
+        uDoCopy = pfile_in_zip_read_info->stream.avail_out;
+      else
+        uDoCopy = pfile_in_zip_read_info->stream.avail_in;
+
+      for ( i = 0; i < uDoCopy; i++ )
+        *(pfile_in_zip_read_info->stream.next_out + i) =
+          *(pfile_in_zip_read_info->stream.next_in + i);
+
+      pfile_in_zip_read_info->crc32 = crc32(pfile_in_zip_read_info->crc32,
+                                            pfile_in_zip_read_info->stream.next_out,
+                                            uDoCopy);
+      pfile_in_zip_read_info->rest_read_uncompressed -= uDoCopy;
+      pfile_in_zip_read_info->stream.avail_in -= uDoCopy;
+      pfile_in_zip_read_info->stream.avail_out -= uDoCopy;
+      pfile_in_zip_read_info->stream.next_out += uDoCopy;
+      pfile_in_zip_read_info->stream.next_in += uDoCopy;
+      pfile_in_zip_read_info->stream.total_out += uDoCopy;
+      iRead += uDoCopy;
     }
     else
     {
-      v10 = *(_DWORD *)(v4 + 8);
-      if ( *(_DWORD *)(v4 + 20) < v10 )
-        v10 = *(_DWORD *)(v4 + 20);
-      for ( i = 0; i < v10; ++i )
-        *(_BYTE *)(i + *(_DWORD *)(v4 + 16)) = *(_BYTE *)(i + *(_DWORD *)(v4 + 4));
-      v12 = *(_BYTE **)(v4 + 16);
-      v13 = sub_4A2CE0(*(_DWORD *)(v4 + 80), v10, v12);
-      v14 = *(_DWORD *)(v4 + 92);
-      v15 = *(_DWORD *)(v4 + 20);
-      v16 = *(_DWORD *)(v4 + 4);
-      *(_DWORD *)(v4 + 80) = v13;
-      v17 = *(_DWORD *)(v4 + 8) - v10;
-      *(_DWORD *)(v4 + 92) = v14 - v10;
-      v18 = *(_DWORD *)(v4 + 24);
-      *(_DWORD *)(v4 + 8) = v17;
-      *(_DWORD *)(v4 + 20) = v15 - v10;
-      *(_DWORD *)(v4 + 16) = &v12[v10];
-      *(_DWORD *)(v4 + 4) = v10 + v16;
-      *(_DWORD *)(v4 + 24) = v10 + v18;
-      v24 += v10;
+      unsigned long uTotalOutBefore, uTotalOutAfter;
+      const unsigned char *bufBefore;
+      unsigned long uOutThis;
+      int flush = Z_SYNC_FLUSH;
+
+      uTotalOutBefore = pfile_in_zip_read_info->stream.total_out;
+      bufBefore = pfile_in_zip_read_info->stream.next_out;
+
+      err = inflate(&pfile_in_zip_read_info->stream, flush);
+
+      uTotalOutAfter = pfile_in_zip_read_info->stream.total_out;
+      uOutThis = uTotalOutAfter - uTotalOutBefore;
+
+      pfile_in_zip_read_info->crc32 =
+        crc32(pfile_in_zip_read_info->crc32, (unsigned char *)bufBefore,
+              (unsigned int)(uOutThis));
+
+      pfile_in_zip_read_info->rest_read_uncompressed -= uOutThis;
+
+      iRead += (unsigned int)(uTotalOutAfter - uTotalOutBefore);
+
+      if ( err == Z_STREAM_END )
+        return (iRead == 0) ? UNZ_EOF : iRead;
+      if ( err != Z_OK )
+        break;
     }
   }
-  return v24;
+
+  if ( err == Z_OK )
+    return iRead;
+  return err;
 }
 
 /* ---- unztell  0x004A97A0 ---- */
@@ -1270,29 +1350,42 @@ int __cdecl unzReadCurrentFile(int a1, unsigned int a2, int a3)
 /* VERIFIED 0x004A97A0.  +124 is pfile_in_zip_read, +24 inside it is
  * stream.total_out (z_stream offset 20 plus the 4-byte read_buffer that
  * precedes the stream in file_in_zip_read_info_s).  Upstream verbatim.
- * DEAD IN RETAIL -- no xrefs; FS_FTell uses its own bookkeeping. */
-int __cdecl unztell(int a1)
+ * No xrefs in retail: it is inlined into FS_FTell (byte-identical with the call). */
+int __cdecl unztell(unzFile file)
 {
-  int v1; // eax
+  unz_s *s;
+  file_in_zip_read_info_s *pfile_in_zip_read_info;
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+  pfile_in_zip_read_info = s->pfile_in_zip_read;
 
-  if ( a1 && (v1 = *(_DWORD *)(a1 + 124)) != 0 )
-    return *(_DWORD *)(v1 + 24);
-  else
-    return -102;
+  if ( pfile_in_zip_read_info == NULL )
+    return UNZ_PARAMERROR;
+
+  return (int)pfile_in_zip_read_info->stream.total_out;
 }
 
 /* ---- unzeof  0x004A97C0 ---- */
 // unzeof -- CONFIRMED 85. rest_read_uncompressed == 0.
 /* VERIFIED 0x004A97C0.  +92 is rest_read_uncompressed, matching the field map
  * on unzOpenCurrentFile.  Upstream verbatim.  DEAD IN RETAIL -- no xrefs. */
-int __cdecl unzeof(int a1)
+int __cdecl unzeof(unzFile file)
 {
-  int v1; // eax
+  unz_s *s;
+  file_in_zip_read_info_s *pfile_in_zip_read_info;
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+  pfile_in_zip_read_info = s->pfile_in_zip_read;
 
-  if ( a1 && (v1 = *(_DWORD *)(a1 + 124)) != 0 )
-    return *(_DWORD *)(v1 + 92) == 0;
+  if ( pfile_in_zip_read_info == NULL )
+    return UNZ_PARAMERROR;
+
+  if ( pfile_in_zip_read_info->rest_read_uncompressed == 0 )
+    return 1;
   else
-    return -102;
+    return 0;
 }
 
 /* ---- unzGetLocalExtrafield  0x004A97E0 ---- */
@@ -1301,47 +1394,62 @@ int __cdecl unzeof(int a1)
  * VERIFIED 0x004A97E0 instruction by instruction -- AND IT CONTAINS A RETAIL
  * BUFFER OVERFLOW, which is faithfully reproduced below.  DO NOT WIRE THIS UP.
  *
- * v3 is the caller's len clamped to the bytes remaining (upstream's
- * `read_now`); v7 is the UNCLAMPED remaining.  The fread reads v7 and the
- * function returns v3.  Retail agrees exactly:
+ * read_now is the caller's len clamped to the bytes remaining; size_to_read is
+ * the UNCLAMPED remaining.  The fread reads size_to_read and the function
+ * returns read_now.  Retail agrees exactly:
  *     4a980d  sub edi, eax        ; edi = size_local_extrafield - pos_...
  *     4a981a  cmp ebx, edi / jbe / mov ebx, edi   ; ebx = min(len, edi)
  *     4a9851  push edi ; ElementSize  <-- reads EDI, the UNCLAMPED count
  *     4a9863  mov eax, ebx            <-- returns EBX, the clamped count
  * so any caller passing a buffer smaller than the entry's local extra field
- * gets that field written past the end of it.  Upstream minizip passes
- * `read_now` to both, i.e. this is an IW/Aspyr edit or a bad merge, not a
- * decompiler artifact.
+ * gets that field written past the end of it.  This is zlib 1.1.4 minizip's
+ * own `fread(buf,(uInt)size_to_read,...)` (later minizip reads read_now), so
+ * upstream's text with upstream's (file, buf, len) order is what is below;
+ * retail's registers: file@eax, len@ecx, buf on the stack.
  *
  * It is harmless today only because it is DEAD IN RETAIL -- no xrefs, and
  * nothing in universal/com_files.c reaches it.  Left matching the binary
  * because the binary wins; flagged this loudly because the day someone calls
  * it, it is a stack smash and it will not look like a zlib bug.
  */
-size_t __cdecl unzGetLocalExtrafield(int a1, size_t a2, void *Buffer)
+int __cdecl unzGetLocalExtrafield(unzFile file, void *buf, unsigned len)
 {
-  size_t v3; // ebx
-  int v5; // esi
-  int v6; // eax
-  size_t v7; // edi
+  unz_s *s;
+  file_in_zip_read_info_s *pfile_in_zip_read_info;
+  uInt read_now;
+  uLong size_to_read;
 
-  v3 = a2;
-  if ( !a1 )
-    return -102;
-  v5 = *(_DWORD *)(a1 + 124);
-  if ( !v5 )
-    return -102;
-  v6 = *(_DWORD *)(v5 + 76);
-  v7 = *(_DWORD *)(v5 + 72) - v6;
-  if ( !Buffer )
-    return *(_DWORD *)(v5 + 72) - v6;
-  if ( a2 > v7 )
-    v3 = *(_DWORD *)(v5 + 72) - v6;
-  if ( !v3 )
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+  pfile_in_zip_read_info = s->pfile_in_zip_read;
+
+  if ( pfile_in_zip_read_info == NULL )
+    return UNZ_PARAMERROR;
+
+  size_to_read = (pfile_in_zip_read_info->size_local_extrafield -
+                  pfile_in_zip_read_info->pos_local_extrafield);
+
+  if ( buf == NULL )
+    return (int)size_to_read;
+
+  if ( len > size_to_read )
+    read_now = (uInt)size_to_read;
+  else
+    read_now = (uInt)len;
+
+  if ( read_now == 0 )
     return 0;
-  if ( fseek(*(FILE **)(v5 + 96), v6 + *(_DWORD *)(v5 + 68), 0) || fread(Buffer, v7, 1u, *(FILE **)(v5 + 96)) != 1 )
-    return -1;
-  return v3;
+
+  if ( fseek(pfile_in_zip_read_info->file,
+             pfile_in_zip_read_info->offset_local_extrafield +
+             pfile_in_zip_read_info->pos_local_extrafield, SEEK_SET) != 0 )
+    return UNZ_ERRNO;
+
+  if ( fread(buf, (uInt)size_to_read, 1, pfile_in_zip_read_info->file) != 1 )
+    return UNZ_ERRNO;
+
+  return (int)read_now;
 }
 
 /* ---- unzCloseCurrentFile  0x004A9870 ---- */
@@ -1356,77 +1464,81 @@ size_t __cdecl unzGetLocalExtrafield(int a1, size_t a2, void *Buffer)
  * of every stock pak.
  *
  * +80 crc32, +84 crc32_wait, +92 rest_read_uncompressed, +64
- * stream_initialised -- the map on unzOpenCurrentFile.  `inflateEnd(v3 + 4)`
- * is &pfile->stream, i.e. byte offset 4, as `(_DWORD *)(v3 + 4)` on an int.
+ * stream_initialised -- the map on unzOpenCurrentFile; &stream is byte
+ * offset 4 of file_in_zip_read_info_s.
  *
  * NOTE the return value is the error, but universal/com_files.c:914 discards
  * it, so a CRC failure will NOT report itself -- it will surface as a corrupt
  * asset somewhere else.  Worth wiring to a Com_Printf one day; not changed
  * here because it is not this file's decision.
  */
-int __cdecl unzCloseCurrentFile(int a1)
+int __cdecl unzCloseCurrentFile(unzFile file)
 {
-  int v1; // ebx
-  int result; // eax
-  int v3; // esi
-  int v4; // eax
+  int err = UNZ_OK;
 
-  v1 = 0;
-  if ( !a1 )
-    return -102;
-  v3 = *(_DWORD *)(a1 + 124);
-  if ( !v3 )
-    return -102;
-  if ( !*(_DWORD *)(v3 + 92) && *(_DWORD *)(v3 + 80) != *(_DWORD *)(v3 + 84) )
-    v1 = -105;
-  free(*(void **)v3);
-  v4 = *(_DWORD *)(v3 + 64);
-  *(_DWORD *)v3 = 0;
-  if ( v4 )
-    inflateEnd((_DWORD *)(v3 + 4));
-  *(_DWORD *)(v3 + 64) = 0;
-  free((void *)v3);
-  result = v1;
-  *(_DWORD *)(a1 + 124) = 0;
-  return result;
+  unz_s *s;
+  file_in_zip_read_info_s *pfile_in_zip_read_info;
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
+  pfile_in_zip_read_info = s->pfile_in_zip_read;
+
+  if ( pfile_in_zip_read_info == NULL )
+    return UNZ_PARAMERROR;
+
+  if ( pfile_in_zip_read_info->rest_read_uncompressed == 0 )
+  {
+    if ( pfile_in_zip_read_info->crc32 != pfile_in_zip_read_info->crc32_wait )
+      err = UNZ_CRCERROR;
+  }
+
+  free(pfile_in_zip_read_info->read_buffer);
+  pfile_in_zip_read_info->read_buffer = NULL;
+  if ( pfile_in_zip_read_info->stream_initialised )
+    inflateEnd(&pfile_in_zip_read_info->stream);
+
+  pfile_in_zip_read_info->stream_initialised = 0;
+  free(pfile_in_zip_read_info);
+
+  s->pfile_in_zip_read = NULL;
+
+  return err;
 }
 
 /* ---- unzGetGlobalComment  0x004A98E0 ---- */
 // unzGetGlobalComment -- CONFIRMED 82. Final function of minizip's unzip.c.
 /* VERIFIED 0x004A98E0 against upstream minizip unzGetGlobalComment.  The
- * `*a2 = 0;` that happens before the `if (a2)` null check further down looks
+ * `*szComment = '\0';` that happens before the `szComment != NULL` check further down looks
  * like a defect and is upstream's own shape -- upstream writes `*szComment =
  * '\0'` inside `if (uReadThis > 0)` and only null-checks szComment for the
  * trailing terminator.  Left alone.  +8 is gi.size_comment, +28 is
  * central_pos, and 22 is sizeof(end of central directory record).
  * DEAD IN RETAIL -- no xrefs. */
-size_t __cdecl unzGetGlobalComment(int a1, _BYTE *a2, size_t ElementSize)
+int __cdecl unzGetGlobalComment(unzFile file, char *szComment, uLong uSizeBuf)
 {
-  size_t v5; // eax
-  size_t v6; // edi
-  size_t v7; // esi
+  unz_s *s;
+  uLong uReadThis;
+  if ( file == NULL )
+    return UNZ_PARAMERROR;
+  s = (unz_s *)file;
 
-  if ( !a1 )
-    return -102;
-  v5 = *(_DWORD *)(a1 + 8);
-  v6 = ElementSize;
-  if ( ElementSize > v5 )
-    v6 = v5;
-  if ( fseek(*(FILE **)a1, *(_DWORD *)(a1 + 28) + 22, 0) )
-    return -1;
-  if ( v6 )
+  uReadThis = uSizeBuf;
+  if ( uReadThis > s->gi.size_comment )
+    uReadThis = s->gi.size_comment;
+
+  if ( fseek(s->file, s->central_pos + 22, SEEK_SET) != 0 )
+    return UNZ_ERRNO;
+
+  if ( uReadThis > 0 )
   {
-    *a2 = 0;
-    if ( fread(a2, v6, 1u, *(FILE **)a1) != 1 )
-      return -1;
+    *szComment = '\0';
+    if ( fread(szComment, (uInt)uReadThis, 1, s->file) != 1 )
+      return UNZ_ERRNO;
   }
-  if ( a2 )
-  {
-    v7 = *(_DWORD *)(a1 + 8);
-    if ( ElementSize > v7 )
-      a2[v7] = 0;
-  }
-  return v6;
+
+  if ( (szComment != NULL) && (uSizeBuf > s->gi.size_comment) )
+    *(szComment + s->gi.size_comment) = '\0';
+  return (int)uReadThis;
 }
 
 /* ---- zlibVersion  0x004A9950 ---- */
@@ -1438,7 +1550,7 @@ size_t __cdecl unzGetGlobalComment(int a1, _BYTE *a2, size_t ElementSize)
  * rather than guessed at.  DEAD IN RETAIL -- no xrefs. */
 const char *zlibVersion()
 {
-  return "1.1.4";
+  return ZLIB_VERSION;
 }
 
 /* ---- zError  0x004A9960 ---- */
@@ -1454,12 +1566,12 @@ const char *zlibVersion()
  * -- zlib/zlib_rdata.c), so the folded constant is spelled out again rather
  * than being carried in the symbol's address.  Before that it indexed off the
  * FRONT of `extern int z_errmsg;` and returned neighbouring globals as strings.
- * The cast stays because cod1_globals.h is included here and still declares the
- * name an int; the storage behind it is the 40-byte table.
+ * The cast stays because zlib_types.h declares the name an int; the storage
+ * behind it is the 40-byte table.
  */
-const char *__cdecl zError(int a1)
+const char *__cdecl zError(int err)
 {
-  return ((const char **)&z_errmsg)[2 - a1];
+  return ((const char **)&z_errmsg)[Z_NEED_DICT - err];   /* ERR_MSG(err) */
 }
 
 /* ---- zcalloc  0x004A9980 ---- */
@@ -1467,16 +1579,16 @@ const char *__cdecl zError(int a1)
 /*
  * VERIFIED 0x004A9980.  NOT UPSTREAM -- zutil.c's zcalloc calls malloc; this
  * routes through Z_MallocInternal so pak decompression is visible in the zone.
- * a1 is opaque and unused; the product a3*a2 is commutative, so the recovered
+ * opaque is unused; the product size*items is commutative, so the recovered
  * register order of items/size cannot be wrong in any way that matters.
  * Reached only as a function POINTER, installed by inflateInit2_ into
  * z_stream.zalloc and called as (opaque, items, size).  Exercised on every one
  * of the 14,493 reads -- it allocates the 32 KB inflate window and the 1,440-
  * entry huft pool each time a pak file is opened.
  */
-int *__cdecl zcalloc(int a1, int a2, int a3)
+int *__cdecl zcalloc(int opaque, int items, int size)
 {
-  return Z_MallocInternal(a3 * a2);
+  return Z_MallocInternal(size * items);
 }
 
 /* ---- zcfree  0x004A99A0 ---- */
@@ -1489,8 +1601,8 @@ int *__cdecl zcalloc(int a1, int a2, int a3)
  * it is exactly the kind of asymmetry that reads as a typo later.
  * Reached only as the z_stream.zfree function pointer, (opaque, block).
  */
-void __cdecl zcfree(int a1, void *Block)
+void __cdecl zcfree(int opaque, void *ptr)
 {
-  free(Block);
+  free(ptr);
 }
 

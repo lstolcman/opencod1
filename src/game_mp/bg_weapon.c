@@ -1,36 +1,14 @@
-/*
- * bg_weapon.c -- the weapon definition unit shared by the multiplayer game DLL
- * and cgame.
- *
- * Call of Duty 1.1 (game_mp_x86.dll, imagebase 0x20000000), 0x2000D980 ..
- * 0x20013270.  RTCW has no ancestor for this file: CoD's weapon system is its
- * own.  Where a name is United Offensive's rather than a recovered symbol it
- * is called out in the comment above it.
- *
- * The unit owns four things:
- *   - the weapon-file parser (bg_weaponInfoFields and the enum name tables it
- *     dispatches through) and the post-parse index/alt/hint fixups;
- *   - bg_itemlist, the 70-row pickup table BG_FillInWeaponItems fills in from
- *     the parsed weapon files;
- *   - the weapon half of Pmove: PM_Weapon and everything it drives;
- *   - the first-person weapon/view angle solver (BG_CalculateWeaponAngles,
- *     BG_CalculateViewAngles, BG_CalculateWeaponPosition_Sway).
- *
- * @fidelity: likely
- */
+// bg_weapon.c -- both games weapon code: the weapon file parser, the weapon
+// half of Pmove and the first person weapon / view angles
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Everything in the block below is public in the retail tree -- it lives in
-   bg_public.h / q_shared.h and is shared with cgame, g_active_mp.c and
-   g_items_mp.c.  None of it is a file-local invention. */
-
 #include "bg_local.h"
 
-/* q_shared.c's ParseConfigStringToStruct (0x2003F070) walks this. */
+// one entry of a ParseConfigStringToStruct field table
 typedef struct parseField_t
 {
 	const char *name;
@@ -38,11 +16,8 @@ typedef struct parseField_t
 	int type;
 } parseField_t;
 
-/*
- * Field discriminants.  0..7 are handled by ParseConfigStringToStruct itself,
- * 8..13 are handed to BG_ParseWeaponInfoSpecificFieldType; the constant names
- * are conventional, only the numbers are recovered.
- */
+// weapon file field types; 0..7 are handled by ParseConfigStringToStruct itself,
+// the rest by BG_ParseWeaponInfoSpecificFieldType
 typedef enum weaponFieldType_t
 {
 	WFT_STRING         = 0,
@@ -62,11 +37,7 @@ typedef enum weaponFieldType_t
 	WFT_NUM            = 14
 } weaponFieldType_t;
 
-/*
- * playerState_t::weapAnim.  The spellings are the retail ones -- they are the
- * strings PM_Weapon_PrintWeaponAnim (0x20011D60) prints.  1 is not printed and
- * has no recovered name.
- */
+// playerState_t->weapAnim values
 typedef enum weaponAnimNumber_t
 {
 	WEAP_IDLE                = 0,
@@ -87,97 +58,39 @@ typedef enum weaponAnimNumber_t
 	WEAP_ALTSWITCHTO         = 16
 } weaponAnimNumber_t;
 
-#define ANIM_TOGGLEBIT 0x200
-
-/*
- * entity_event_t values this unit raises.  The engine's full 202-entry name
- * table is at 0x2006C8B8; only the ones used here are spelled.
- */
-enum
-{
-	EV_NOAMMO               = 149,
-	EV_RELOAD               = 151,
-	EV_RELOAD_FROM_EMPTY    = 152,
-	EV_RELOAD_START         = 153,
-	EV_RELOAD_END           = 154,
-	EV_RAISE_WEAPON         = 155,
-	EV_PUTAWAY_WEAPON       = 156,
-	EV_WEAPON_ALT           = 157,
-	EV_PULLBACK_WEAPON      = 158,
-	EV_FIRE_WEAPON          = 159,
-	EV_FIRE_WEAPON_LASTSHOT = 161,
-	EV_RECHAMBER_WEAPON     = 162,
-	EV_EJECT_BRASS          = 163,
-	EV_MELEE_SWIPE          = 164,
-	EV_FIRE_MELEE           = 165
-};
-
-/* The pm_flags names this unit reads or writes live in bg_local.h.  0x0800 is
-   PMF_RESPAWNED, not PMF_FOLLOW: PM_Weapon's opening guard (0x200119CF) is
-   RTCW's "don't allow attack until all buttons are up", and PmoveSingle
-   0x2000C34C clears the same bit.  PMF_FOLLOW is 0x00010000. */
-
-/* playerState_t::eFlags bits this unit reads. */
-#define EF_CROUCHING                0x00000020
-#define EF_PRONE                    0x00000040
-#define EF_MOUNTED                  0x0000C000  /* the two mg42 bits */
-
-#define ENTITYNUM_NONE              1023
-
-/* usercmd_t::buttons / ::wbuttons bits this unit reads. */
-#define BUTTON_ATTACK               0x01
-#define BUTTON_ADS                  0x10
-#define BUTTON_MELEE                0x20
+// usercmd_t wbuttons bits
 #define WBUTTON_RELOAD              0x08
 
-/* configstring index BG_SetupWeaponInfo publishes the weapon-file list into. */
+// configstring the weapon file list is published in
 #define CS_WEAPONFILES              7
+// size of the CS_HINTSTRINGS block
+#define CS_HINTSTRINGS_COUNT        32
 
-/* g_main_mp.c cvar table */
 extern vmCvar_t bg_debugWeaponState;
 extern vmCvar_t bg_debugWeaponAnim;
 
-/* bg_animation.c */
 void BG_UpdateConditionValue( int client, int condition, int value, qboolean checkConversion );
 
-/* g_main_mp.c */
 void Com_Printf( const char *fmt, ... );
 void Com_DPrintf( const char *fmt, ... );
 void Com_Error( int level, const char *fmt, ... );
 
-/*
- * Three things the CLIENT build of this file does not have, each compiled out
- * rather than renamed:
- *
- *   RegisterItem            BG_GivePlayerWeapon is 258 bytes in cgame
- *                           (0x3000F2D0) to the game's 306, and makes NO calls
- *                           at all; both RegisterItem sites are simply gone.
- *   G_GetHintStringIndex    BG_SetupUseHintStrings does not exist in the cgame
- *                           image and BG_SetupWeaponInfo does not call it.  Its
- *                           Com_Error string is absent from the image too.  The
- *                           26-byte function at 0x3000EEF0 is
- *                           compare_weaponfile_names with Q_stricmp inlined
- *                           (the s1&&s2 guard and the Q_stricmpn 99999 tail
- *                           call), not BG_SetupUseHintStrings.
- *   trap_SetConfigstring    the client does not publish configstrings; it
- *                           READS CS_WEAPONFILES back.  See BG_SetupWeaponInfo.
- */
+// the client build doesn't register items, set up hint strings or publish
+// configstrings
 #ifndef CGAMEDLL
-/* g_items_mp.c / g_scr_main_mp.c */
 void RegisterItem( int item, qboolean sendUpdate );
 qboolean G_GetHintStringIndex( int *index, const char *string );
 #endif
 
 #ifdef CGAMEDLL
-/* cg_main.c 0x30021B00; the client half of BG_SetupWeaponInfo reads the list
-   the server published.  LTCG inlined it at 0x3000EFC6, constant index and
-   all, so the retail body indexes cgs.gameState directly. */
+// the client reads back the weapon file list the server published
 const char *CG_ConfigString( int index );
 #endif
 
-/* universal/q_shared.c, universal/com_math.c */
 int Q_stricmp( const char *s1, const char *s2 );
 int Q_stricmpn( const char *s1, const char *s2, int n );
+void Com_BitSet( int array[], int bitNum );
+void Com_BitClear( int array[], int bitNum );
 char *Q_strlwr( char *s1 );
 qboolean ParseConfigStringToStruct( const parseField_t *fields, void *base, int numFields,
 									const char *info, int numGenericTypes,
@@ -186,7 +99,6 @@ qboolean ParseConfigStringToStruct( const parseField_t *fields, void *base, int 
 float AngleSubtract( float a1, float a2 );
 float AngleNormalize180( float angle );
 
-/* game_mp/g_syscalls_mp.c */
 void *trap_Hunk_AllocLowInternal( int size );
 void *trap_Hunk_AllocLowAlignInternal( int size, int align );
 int trap_FS_FOpenFile( const char *qpath, fileHandle_t *f, fsMode_t mode );
@@ -198,7 +110,6 @@ void trap_SetConfigstring( int num, const char *string );
 #endif
 void *trap_GetWeaponInfoMemory( int size, int *pPrevOwner );
 
-/* This unit's own entry points that are used above their definition. */
 int BG_IsPlayerWeaponInSlot( const playerState_t *ps, int weapon, qboolean includeAltWeapons );
 void PM_StartWeaponAnim( int anim );
 void PM_ContinueWeaponAnim( int anim );
@@ -213,9 +124,12 @@ void PM_Weapon_PrintWeaponAnim( void );
 =============================================================================
 */
 
-/* Printed by the two weapon debug tracers; cgame's copy of this file carries
- * "C".  Recovered spelling, inferred (invented) name. */
+// printed by the weapon debug tracers
+#ifdef CGAMEDLL
+static const char *bg_szDebugModule = "CG";
+#else
 static const char *bg_szDebugModule = "G";
+#endif
 
 static const char *bg_szWeaponsFolder = "weapons/mp";
 
@@ -275,12 +189,9 @@ static const char *bg_weaponGrenadeTypeNames[WEAPPROJEXP_NUM] =
 #define WFOFS( x ) ( (int)&( ( (weaponInfo_t *)0 )->x ) )
 #define WEAPONINFO_NUM_FIELDS ( (int)( sizeof( bg_weaponInfoFields ) / sizeof( bg_weaponInfoFields[0] ) ) )
 
-/*
- * The weapon-file parse table, bg_weaponInfoFields at 0x2006ADD0: 248 triples
- * in this order.  ParseConfigStringToStruct is given the count, not a NULL
- * sentinel.
- */
-static const parseField_t bg_weaponInfoFields[] =
+// the weapon file parse table; ParseConfigStringToStruct is given the count,
+// not a NULL sentinel
+static parseField_t bg_weaponInfoFields[] =
 {
 	{ "displayName",            WFOFS( displayName ),            WFT_STRING },
 	{ "AIOverlayDescription",   WFOFS( AIOverlayDescription ),   WFT_STRING },
@@ -532,32 +443,19 @@ static const parseField_t bg_weaponInfoFields[] =
 	{ "aiMissRange",            WFOFS( aiMissRange ),            WFT_FLOAT }
 };
 
+// keep: unreferenced, matches the original data layout
+const int bg_iNumWeaponInfoFields = WEAPONINFO_NUM_FIELDS;
+
 /*
 =============================================================================
 
 	ITEMS
 
-	bg_itemlist, 0x2006BB68.  70 rows: [0] is the IT_BAD placeholder, [1..64]
-	are the weapon placeholders BG_FillInWeaponItems overwrites from the parsed
-	weapon files, [65..69] are the two grenade-ammo and three health items.
-
 =============================================================================
 */
 
-/* bg_misc.c defines bg_itemlist (0x2006BB68): every item ACCESSOR --
-   BG_FindItemForWeapon, BG_FindItem, BG_PlayerTouchesItem,
-   BG_CanItemBeGrabbed -- sits there at 0x20004F50..0x200050B0, immediately
-   after the table, which is RTCW's arrangement; this unit holds only
-   BG_FillInWeaponItems (0x2000E270), which WRITES the table.
+extern gitem_t bg_itemlist[];
 
-   TODO: whether the 64 weapon placeholder rows carry "" or NULL for
-   pickup_sound / world_model / icon / ammoicon / pickup_name is unresolved;
-   bg_misc.c gives them NULL.  bg_misc.c's table carries a 71st all-NULL
-   terminator row, so BG_NUM_ITEMS is the literal 70 that BG_FindItem's loop
-   uses, not a sizeof. */
-extern gitem_t bg_itemlist[];                   /* bg_misc.c, 0x2006BB68 */
-
-#define BG_NUM_ITEMS                70
 
 /*
 =============================================================================
@@ -573,8 +471,7 @@ static char *bg_sharedAmmoCapNames[MAX_WEAPONS];
 static int bg_numAmmoClips;
 static int bg_numSharedAmmoCaps;
 static int bg_numAmmoTypes;
-/* One shared "" every unset string field points at; InitWeaponInfo hands it out
- * so that no parsed field is ever NULL. */
+// one shared "" every unset string field points at
 static char *bg_szEmptyString;
 static int bg_sharedAmmoCapSizes[MAX_WEAPONS];
 static char *bg_ammoTypeNames[MAX_WEAPONS];
@@ -586,8 +483,6 @@ weaponInfo_t **bg_weaponInfo;
 /*
 ==============
 BG_GetWeaponTypeName
-
-No range check in the retail leaf.
 ==============
 */
 const char *BG_GetWeaponTypeName( weapType_t weaponType ) {
@@ -618,7 +513,7 @@ qboolean BG_ParseWeaponInfoSpecificFieldType( void *base, const char *value, int
 		if ( i == WEAPTYPE_NUM ) {
 			Com_Error( ERR_DROP, "\x15" "Unknown weapon type \"%s\" in \"%s\"\n", value, weaponInfo->szInternalName );
 		}
-		return qtrue;
+		break;
 
 	case WFT_WEAPONCLASS:
 		for ( i = 0; i < WEAPCLASS_NUM; i++ ) {
@@ -630,7 +525,7 @@ qboolean BG_ParseWeaponInfoSpecificFieldType( void *base, const char *value, int
 		if ( i == WEAPCLASS_NUM ) {
 			Com_Error( ERR_DROP, "\x15" "Unknown weapon class \"%s\" in \"%s\"\n", value, weaponInfo->szInternalName );
 		}
-		return qtrue;
+		break;
 
 	case WFT_OVERLAYRETICLE:
 		for ( i = 0; i < WEAPOVERLAYRETICLE_NUM; i++ ) {
@@ -642,7 +537,7 @@ qboolean BG_ParseWeaponInfoSpecificFieldType( void *base, const char *value, int
 		if ( i == WEAPOVERLAYRETICLE_NUM ) {
 			Com_Error( ERR_DROP, "\x15" "Unknown weapon overlay reticle \"%s\" in \"%s\"\n", value, weaponInfo->szInternalName );
 		}
-		return qtrue;
+		break;
 
 	case WFT_WEAPONSLOT:
 		for ( i = 0; i < WEAPSLOT_NUM; i++ ) {
@@ -654,7 +549,7 @@ qboolean BG_ParseWeaponInfoSpecificFieldType( void *base, const char *value, int
 		if ( i == WEAPSLOT_NUM ) {
 			Com_Error( ERR_DROP, "\x15" "Unknown weapon slot \"%s\" in \"%s\"\n", value, weaponInfo->szInternalName );
 		}
-		return qtrue;
+		break;
 
 	case WFT_WEAPONSTANCE:
 		for ( i = 0; i < WEAPSTANCE_NUM; i++ ) {
@@ -666,7 +561,7 @@ qboolean BG_ParseWeaponInfoSpecificFieldType( void *base, const char *value, int
 		if ( i == WEAPSTANCE_NUM ) {
 			Com_Error( ERR_DROP, "\x15" "Unknown weapon stance \"%s\" in \"%s\"\n", value, weaponInfo->szInternalName );
 		}
-		return qtrue;
+		break;
 
 	case WFT_PROJEXPLOSION:
 		for ( i = 0; i < WEAPPROJEXP_NUM; i++ ) {
@@ -678,22 +573,26 @@ qboolean BG_ParseWeaponInfoSpecificFieldType( void *base, const char *value, int
 		if ( i == WEAPPROJEXP_NUM ) {
 			Com_Error( ERR_DROP, "\x15" "Unknown projectile explosion \"%s\" in \"%s\"\n", value, weaponInfo->szInternalName );
 		}
-		return qtrue;
+		break;
 
 	default:
 		Com_Error( ERR_DROP, "\x15" "Bad field type %i in %s\n", fieldType, weaponInfo->szInternalName );
 		return qfalse;
 	}
+	return qtrue;
 }
 
 /*
 ==============
 SetConfigString
 
-Nothing calls this in the retail DLL any more -- LTCG inlined every call site
--- but the standalone body survives at 0x2000DBE0.
+keep: the auto_inline pragmas and the client's SetConfigString macro below
+match the original codegen
 ==============
 */
+#if defined(CGAMEDLL)
+#pragma auto_inline(off)
+#endif
 char *SetConfigString( char **dest, const char *value ) {
 	char *out;
 
@@ -715,17 +614,29 @@ The same thing as a ParseConfigStringToStruct callback: the destination
 arrives as base + field offset, so it is typed void *.
 ==============
 */
+#if defined(CGAMEDLL)
+#pragma auto_inline(on)
+#endif
 void SetConfigString2( void *dest, const char *value ) {
-	char *out;
-
-	if ( !*value ) {
-		*(char **)dest = bg_szEmptyString;
-		return;
-	}
-	out = trap_Hunk_AllocLowAlignInternal( strlen( value ) + 1, 1 );
-	strcpy( out, value );
-	*(char **)dest = out;
+	SetConfigString( (char **)dest, value );
 }
+
+#if defined(CGAMEDLL)
+// keep: matches original codegen
+#define SetConfigString( dest, value ) \
+	do { \
+		char **d_ = ( dest ); \
+		const char *v_ = ( value ); \
+		char *out_; \
+		if ( !*v_ ) { \
+			*d_ = bg_szEmptyString; \
+			break; \
+		} \
+		out_ = trap_Hunk_AllocLowAlignInternal( strlen( v_ ) + 1, 1 ); \
+		strcpy( out_, v_ ); \
+		*d_ = out_; \
+	} while ( 0 )
+#endif
 
 /*
 ==============
@@ -744,7 +655,7 @@ weaponInfo_t *InitWeaponInfo( int weapIndex, const parseField_t *fields, int num
 	SetConfigString( (char **)&weaponInfo->szInternalName, "" );
 	for ( i = 0; i < numFields; i++ ) {
 		if ( fields[i].type == WFT_STRING ) {
-			SetConfigString2( (byte *)weaponInfo + fields[i].ofs, "" );
+			SetConfigString( (char **)( (byte *)weaponInfo + fields[i].ofs ), "" );
 		}
 	}
 	return weaponInfo;
@@ -755,20 +666,23 @@ weaponInfo_t *InitWeaponInfo( int weapIndex, const parseField_t *fields, int num
 BG_ParseWeaponInfoFiles
 ==============
 */
-int BG_ParseWeaponInfoFiles( char **weaponFiles, int numWeaponFiles ) {
+void BG_ParseWeaponInfoFiles( char **weaponFiles, int numWeaponFiles ) {
 	weaponInfo_t *weaponInfo;
 	char filename[64];
-	char buffer[8196];
+	char buffer[8192];
+	const char *prefix;
 	fileHandle_t f;
 	int prefixLen;
 	int len;
 	int i;
 
-	prefixLen = strlen( "WEAPONFILE" );
+	// keep: strlen through a local matches original codegen
+	prefix = "WEAPONFILE";
+	prefixLen = strlen( prefix );
 	bg_szEmptyString = trap_Hunk_AllocLowAlignInternal( 1, 1 );
 	bg_szEmptyString[0] = 0;
 
-	/* index 0 is the "none" weapon; it has no file */
+	// index 0 is the "none" weapon; it has no file
 	weaponInfo = InitWeaponInfo( 0, bg_weaponInfoFields, WEAPONINFO_NUM_FIELDS );
 	SetConfigString( (char **)&weaponInfo->szInternalName, "none" );
 
@@ -787,7 +701,7 @@ int BG_ParseWeaponInfoFiles( char **weaponFiles, int numWeaponFiles ) {
 
 		trap_FS_Read( buffer, prefixLen, f );
 		buffer[prefixLen] = 0;
-		if ( strncmp( buffer, "WEAPONFILE", prefixLen ) ) {
+		if ( strncmp( buffer, prefix, prefixLen ) ) {
 			Com_Error( ERR_DROP, "\x15" "\"%s\" does not appear to be a weapon file", filename );
 		}
 
@@ -798,7 +712,8 @@ int BG_ParseWeaponInfoFiles( char **weaponFiles, int numWeaponFiles ) {
 
 		memset( buffer, 0, 8192 );
 		trap_FS_Read( buffer, len, f );
-		buffer[len] = 0;
+		// keep: pointer store matches original codegen
+		*( buffer + len ) = 0;
 		trap_FS_FCloseFile( f );
 
 		if ( strchr( buffer, '"' ) || strchr( buffer, ';' ) ) {
@@ -813,15 +728,14 @@ int BG_ParseWeaponInfoFiles( char **weaponFiles, int numWeaponFiles ) {
 			bg_numWeapons--;
 		}
 	}
-	return i;
 }
 
 /*
 ==============
 BG_SetupTransitionTimes
 
-The two reciprocals at +0x414 and +0x418 have no parse-table entry; they are
-derived here so the ADS lerp is a multiply.  The fallbacks are 1/300 and 1/500.
+Derive the ADS transition rates so the lerp is a multiply.  The fallbacks
+are 1/300 and 1/500.
 ==============
 */
 void BG_SetupTransitionTimes( void ) {
@@ -857,8 +771,9 @@ void BG_FillInWeaponItems( void ) {
 	gitem_t *item;
 	int i, j;
 
-	for ( i = 1; i <= bg_numWeapons; i++ ) {
-		item = &bg_itemlist[i];
+	// one item pointer walks both loops
+	item = &bg_itemlist[1];
+	for ( i = 1; i <= bg_numWeapons; i++, item++ ) {
 		weaponInfo = bg_weaponInfo[i];
 
 		item->classname = weaponInfo->radiantName;
@@ -875,14 +790,13 @@ void BG_FillInWeaponItems( void ) {
 		item->giClipIndex = weaponInfo->clipIndex;
 	}
 
-	for ( ; i < BG_NUM_ITEMS; i++ ) {
-		item = &bg_itemlist[i];
+	for ( ; i < BG_NUM_ITEMS; i++, item++ ) {
 		if ( item->giType != IT_AMMO ) {
 			continue;
 		}
 		for ( j = 1; j <= bg_numWeapons; j++ ) {
 			weaponInfo = bg_weaponInfo[j];
-			if ( !Q_stricmpn( weaponInfo->szInternalName, item->pickup_name, strlen( weaponInfo->szInternalName ) ) ) {
+			if ( !Q_stricmpn( item->pickup_name, weaponInfo->szInternalName, strlen( weaponInfo->szInternalName ) ) ) {
 				item->giTag = j;
 				item->giAmmoIndex = weaponInfo->ammoIndex;
 				item->giClipIndex = weaponInfo->clipIndex;
@@ -891,9 +805,10 @@ void BG_FillInWeaponItems( void ) {
 		}
 		if ( item->giTag == -1 ) {
 			Com_Printf( "^3WARNING^7: Could not find weapon for ammo item %s\n", item->pickup_name );
+			weaponInfo = bg_weaponInfo[1];
 			item->giTag = 1;
-			item->giAmmoIndex = bg_weaponInfo[1]->ammoIndex;
-			item->giClipIndex = bg_weaponInfo[1]->clipIndex;
+			item->giAmmoIndex = weaponInfo->ammoIndex;
+			item->giClipIndex = weaponInfo->clipIndex;
 		}
 	}
 }
@@ -957,18 +872,21 @@ void BG_SetupSharedAmmoIndexes( void ) {
 			continue;
 		}
 
+#ifndef CGAMEDLL
+		// the client build skips the print
 		Com_DPrintf( "%s: %s\n", weaponInfo->szInternalName, weaponInfo->sharedAmmoCapName );
+#endif
 		Q_strlwr( (char *)weaponInfo->sharedAmmoCapName );
 
 		for ( j = 0; j < bg_numSharedAmmoCaps; j++ ) {
-			if ( Q_stricmp( weaponInfo->sharedAmmoCapName, bg_sharedAmmoCapNames[j] ) ) {
+			if ( Q_stricmp( bg_sharedAmmoCapNames[j], weaponInfo->sharedAmmoCapName ) ) {
 				continue;
 			}
 			weaponInfo->sharedAmmoCapIndex = j;
 			if ( bg_sharedAmmoCapSizes[j] != weaponInfo->sharedAmmoCap && j ) {
 				for ( k = 1; k < i; k++ ) {
 					other = bg_weaponInfo[k];
-					if ( !Q_stricmp( other->sharedAmmoCapName, bg_sharedAmmoCapNames[j] )
+					if ( !Q_stricmp( bg_sharedAmmoCapNames[j], other->sharedAmmoCapName )
 						 && other->sharedAmmoCap == bg_sharedAmmoCapSizes[j] ) {
 						Com_Error( ERR_DROP,
 								   "\x15" "Shared ammo cap mismatch for \"%s\" shared ammo cap: '%s\" set it to %i, but \"%s\" already set it to %i.\n",
@@ -993,8 +911,7 @@ void BG_SetupSharedAmmoIndexes( void ) {
 ==============
 BG_SetupClipIndexes
 
-The mismatch diagnostic prints ammoName where it says "clip"; retail does the
-same thing.
+keep: the mismatch diagnostic prints ammoName where it says "clip"
 ==============
 */
 void BG_SetupClipIndexes( void ) {
@@ -1094,11 +1011,7 @@ void BG_SetupWeaponAlts( void ) {
 ==============
 BG_SetupUseHintStrings
 
-The index G_GetHintStringIndex fills in is weaponInfo_t +0x40C, which the parse
-table never names (0x2000EC74).
-
-Game build only: neither this function nor its call site survives into
-cgame_mp_x86.dll, and neither does its Com_Error string.
+Game build only.
 ==============
 */
 #ifndef CGAMEDLL
@@ -1112,7 +1025,7 @@ void BG_SetupUseHintStrings( void ) {
 			continue;
 		}
 		if ( !G_GetHintStringIndex( &weaponInfo->useHintStringIndex, weaponInfo->useHintString ) ) {
-			Com_Error( ERR_DROP, "\x15" "Too many different hintstring values on weapons. Max allowed is %i different strings", 32 );
+			Com_Error( ERR_DROP, "\x15" "Too many different hintstring values on weapons. Max allowed is %i different strings", CS_HINTSTRINGS_COUNT );
 		}
 	}
 }
@@ -1121,10 +1034,17 @@ void BG_SetupUseHintStrings( void ) {
 /*
 ==============
 compare_weaponfile_names
+
+keep: extern even though the client build never calls it
 ==============
 */
-static int compare_weaponfile_names( const void *a, const void *b ) {
-	return Q_stricmp( *(const char **)a, *(const char **)b );
+int compare_weaponfile_names( const void *a, const void *b ) {
+	const char *s1;
+	const char *s2;
+
+	s1 = *(const char **)a;
+	s2 = *(const char **)b;
+	return Q_stricmp( s1, s2 );
 }
 
 /*
@@ -1135,15 +1055,9 @@ The weaponInfo array is engine memory: trap_GetWeaponInfoMemory hands back the
 previous owner's block when there is one, and in that case the files have
 already been parsed -- only the count has to be recovered.
 
-The two builds diverge in the !prevOwner arm, and the divergence is the whole
-reason the client copy is 461 bytes (0x3000EF10) to the game's 732.  The server
-enumerates the weapons folder, sorts it, joins it with spaces and PUBLISHES it
-as CS_WEAPONFILES; the client SPLITS that configstring back apart and parses the
-same list.  So the client has no trap_SetConfigstring, no trap_FS_GetFileList,
-no qsort and no filelist[4096] -- its frame is weaponFiles[63], prevOwner and
-bigstring[8196] and nothing else (alloca 0x2110 at 0x3000EF16, buffer at
-frame+0x108).  It also has neither Com_DPrintf: "----------------------" and
-"Game: BG_SetupWeaponInfo" are absent from the image altogether.
+The server enumerates the weapons folder and publishes the sorted list as
+CS_WEAPONFILES; the client splits that configstring back apart and parses the
+same list.
 ==============
 */
 void BG_SetupWeaponInfo( void ) {
@@ -1151,7 +1065,7 @@ void BG_SetupWeaponInfo( void ) {
 #ifndef CGAMEDLL
 	char filelist[4096];
 #endif
-	char bigstring[8196];
+	char bigstring[8192];
 #ifndef CGAMEDLL
 	char *fileptr;
 	int filelen;
@@ -1174,36 +1088,25 @@ void BG_SetupWeaponInfo( void ) {
 	}
 
 	memset( bg_ammoTypeNames, 0, sizeof( bg_ammoTypeNames ) );
+	// keep: initialize each registry before moving to the next one
+	memset( bg_ammoTypeMax, 0, sizeof( bg_ammoTypeMax[0] ) );
+	bg_ammoTypeNames[0] = "none";
+	bg_numAmmoTypes = 1;
 	memset( bg_ammoClipNames, 0, sizeof( bg_ammoClipNames ) );
+	memset( bg_ammoClipSizes, 0, sizeof( bg_ammoClipSizes[0] ) );
+	bg_ammoClipNames[0] = "none";
+	bg_numAmmoClips = 1;
 	memset( weaponFiles, 0, sizeof( weaponFiles ) );
 
-	bg_ammoTypeNames[0] = "none";
-	bg_ammoClipNames[0] = "none";
-	bg_ammoTypeMax[0] = 0;
-	bg_numAmmoTypes = 1;
-	bg_ammoClipSizes[0] = 0;
-	bg_numAmmoClips = 1;
-
-	if ( prevOwner ) {
-		bg_numWeapons = 0;
-		for ( i = 1; i < MAX_WEAPONS; i++ ) {
-			if ( !bg_weaponInfo[i] ) {
-				break;
-			}
-			bg_numWeapons++;
-		}
-	} else {
+	if ( !prevOwner ) {
 #ifdef CGAMEDLL
-		/*
-		 * 0x3000EFC6..0x3000F040.  The list arrives as one space-separated
-		 * configstring; the split is destructive and runs in place.  A run of
-		 * two spaces produces no entry, and a trailing space ends the scan.
-		 */
+		// the list arrives as one space-separated configstring; the split is
+		// destructive and runs in place
 		strcpy( bigstring, CG_ConfigString( CS_WEAPONFILES ) );
 
 		weaponFiles[0] = bigstring;
-		numWeaponFiles = 1;
 		p = bigstring;
+		numWeaponFiles = 1;
 		while ( *p ) {
 			if ( *p == ' ' ) {
 				*p++ = 0;
@@ -1219,6 +1122,7 @@ void BG_SetupWeaponInfo( void ) {
 		}
 #else
 		numWeaponFiles = trap_FS_GetFileList( bg_szWeaponsFolder, "", filelist, sizeof( filelist ) );
+		fileptr = filelist;
 		if ( numWeaponFiles < 1 ) {
 			Com_Error( ERR_DROP, "\x15" "No weapon files found in %s.\n", bg_szWeaponsFolder );
 		}
@@ -1226,7 +1130,6 @@ void BG_SetupWeaponInfo( void ) {
 			Com_Error( ERR_DROP, "\x15" "Max number of weapons allowed is %i, found %i.\n", MAX_WEAPONS - 1, numWeaponFiles );
 		}
 
-		fileptr = filelist;
 		for ( i = 0; i < numWeaponFiles; i++ ) {
 			if ( i >= MAX_WEAPONS - 1 ) {
 				break;
@@ -1250,6 +1153,14 @@ void BG_SetupWeaponInfo( void ) {
 #endif
 
 		BG_ParseWeaponInfoFiles( weaponFiles, numWeaponFiles );
+	} else {
+		bg_numWeapons = 0;
+		for ( i = 1; i <= MAX_WEAPONS - 1; i++ ) {
+			if ( !bg_weaponInfo[i] ) {
+				break;
+			}
+			bg_numWeapons++;
+		}
 	}
 
 	BG_SetupTransitionTimes();
@@ -1277,8 +1188,6 @@ weaponInfo_t *BG_GetInfoForWeapon( int weaponIndex ) {
 	return bg_weaponInfo[weaponIndex];
 }
 
-/* Name inferred from United Offensive; the retail symbol was not
-   recovered. */
 int BG_GetWeaponForInfo( const weaponInfo_t *weaponInfo ) {
 	return weaponInfo->weapIndex;
 }
@@ -1319,7 +1228,7 @@ int BG_GetAmmoTypeForName( const char *name ) {
 	int i;
 
 	for ( i = 0; i < bg_numAmmoTypes; i++ ) {
-		if ( !Q_stricmp( name, bg_ammoTypeNames[i] ) ) {
+		if ( !Q_stricmp( bg_ammoTypeNames[i], name ) ) {
 			return i;
 		}
 	}
@@ -1331,7 +1240,7 @@ int BG_GetAmmoClipForName( const char *name ) {
 	int i;
 
 	for ( i = 0; i < bg_numAmmoClips; i++ ) {
-		if ( !Q_stricmp( name, bg_ammoClipNames[i] ) ) {
+		if ( !Q_stricmp( bg_ammoClipNames[i], name ) ) {
 			return i;
 		}
 	}
@@ -1357,16 +1266,14 @@ const char *BG_GetWeaponSlotNameForIndex( weapSlot_t weaponSlot ) {
 /*
 ==============
 BG_GetWeaponIndexForName
-
-The retail leaf returns only the low byte of the match.
 ==============
 */
-int BG_GetWeaponIndexForName( const char *name ) {
+byte BG_GetWeaponIndexForName( const char *name ) {
 	int i;
 
 	for ( i = 0; i <= bg_numWeapons; i++ ) {
-		if ( !Q_stricmp( bg_weaponInfo[i]->szInternalName, name ) ) {
-			return i & 0xFF;
+		if ( !Q_stricmp( name, bg_weaponInfo[i]->szInternalName ) ) {
+			return i;
 		}
 	}
 	Com_DPrintf( "Couldn't find weapon \"%s\"\n", name );
@@ -1374,7 +1281,7 @@ int BG_GetWeaponIndexForName( const char *name ) {
 }
 
 qboolean BG_IsAimDownSightWeapon( int weaponIndex ) {
-	return bg_weaponInfo[weaponIndex]->aimDownSight;
+	return BG_GetInfoForWeapon( weaponIndex )->aimDownSight;
 }
 
 /*
@@ -1392,26 +1299,25 @@ BG_GivePlayerWeapon
 */
 qboolean BG_GivePlayerWeapon( playerState_t *ps, int weapon ) {
 	const weaponInfo_t *weaponInfo;
-	unsigned int bit;
-	int word;
 	int alt;
 
-	bit = 1 << ( weapon & 31 );
-	word = weapon >> 5;
-	if ( ps->weapons[word] & bit ) {
+	if ( ps->weapons[weapon >> 5] & ( 1 << ( weapon & 31 ) ) ) {
 		return qfalse;
 	}
 
 	weaponInfo = bg_weaponInfo[weapon];
-	if ( weaponInfo->weaponClass == WEAPCLASS_TURRET || weaponInfo->weaponClass == WEAPCLASS_NON_PLAYER ) {
+	if ( weaponInfo->weaponClass == WEAPCLASS_TURRET ) {
+		return qfalse;
+	}
+	if ( weaponInfo->weaponClass == WEAPCLASS_NON_PLAYER ) {
 		return qfalse;
 	}
 
 #ifndef CGAMEDLL
 	RegisterItem( weapon, qtrue );
 #endif
-	ps->weapons[word] |= bit;
-	ps->weaponrechamber[word] &= ~bit;
+	Com_BitSet( (int *)ps->weapons, weapon );
+	Com_BitClear( (int *)ps->weaponrechamber, weapon );
 
 	switch ( weaponInfo->weaponSlot ) {
 	case WEAPSLOT_PRIMARY:
@@ -1440,10 +1346,10 @@ qboolean BG_GivePlayerWeapon( playerState_t *ps, int weapon ) {
 #ifndef CGAMEDLL
 		RegisterItem( alt, qtrue );
 #endif
-		ps->weapons[alt >> 5] |= 1 << ( alt & 31 );
-		/* retail clears the bit of the weapon that was granted first, not the
-		 * alternate's own bit */
-		ps->weaponrechamber[word] &= ~bit;
+		Com_BitSet( (int *)ps->weapons, alt );
+		// keep: clears the bit of the weapon that was granted first, not the
+		// alternate's own bit
+		Com_BitClear( (int *)ps->weaponrechamber, weapon );
 	}
 	return qtrue;
 }
@@ -1470,12 +1376,13 @@ int BG_TakePlayerWeapon( playerState_t *ps, int weapon ) {
 	weaponInfo = bg_weaponInfo[weapon];
 	slot = BG_IsPlayerWeaponInSlot( ps, weapon, qtrue );
 	if ( slot ) {
-		if ( !weaponInfo->slotStackable ) {
-			ps->weaponslots[slot] = 0;
-		} else {
+		if ( weaponInfo->slotStackable ) {
 			for ( i = 1; i <= bg_numWeapons; i++ ) {
-				/* retail re-tests the weapon being removed, not the candidate */
-				if ( !weaponInfo->slotStackable ) {
+				// keep: re-tests the weapon being removed, not the candidate
+				if ( !bg_weaponInfo[weapon]->slotStackable ) {
+					continue;
+				}
+				if ( weaponInfo->weaponSlot != bg_weaponInfo[weapon]->weaponSlot ) {
 					continue;
 				}
 				if ( !( ps->weapons[i >> 5] & ( 1 << ( i & 31 ) ) ) ) {
@@ -1490,16 +1397,18 @@ int BG_TakePlayerWeapon( playerState_t *ps, int weapon ) {
 			if ( i > bg_numWeapons ) {
 				ps->weaponslots[slot] = 0;
 			}
+		} else {
+			ps->weaponslots[slot] = 0;
 		}
 	}
 
-	ps->weapons[word] &= ~bit;
+	Com_BitClear( (int *)ps->weapons, weapon );
 
 	for ( alt = weaponInfo->altWeaponIndex; alt; alt = bg_weaponInfo[alt]->altWeaponIndex ) {
 		if ( !( ps->weapons[alt >> 5] & ( 1 << ( alt & 31 ) ) ) ) {
 			break;
 		}
-		ps->weapons[alt >> 5] &= ~( 1 << ( alt & 31 ) );
+		Com_BitClear( (int *)ps->weapons, alt );
 	}
 	return 1;
 }
@@ -1609,17 +1518,16 @@ int BG_GetEmptySlotForWeapon( const playerState_t *ps, int weapon ) {
 		if ( !ps->weaponslots[WEAPSLOT_PRIMARYB] ) {
 			return WEAPSLOT_PRIMARYB;
 		}
-		return WEAPSLOT_NONE;
+		break;
 	case WEAPSLOT_PISTOL:
 	case WEAPSLOT_GRENADE:
 	case WEAPSLOT_SMOKEGRENADE:
-		if ( ps->weaponslots[weaponSlot] ) {
-			return WEAPSLOT_NONE;
+		if ( !ps->weaponslots[weaponSlot] ) {
+			return weaponSlot;
 		}
-		return weaponSlot;
-	default:
-		return WEAPSLOT_NONE;
+		break;
 	}
+	return WEAPSLOT_NONE;
 }
 
 /*
@@ -1633,7 +1541,7 @@ stackable.
 int BG_GetStackSlotForWeapon( const playerState_t *ps, int weapon, int preferredSlot ) {
 	const weaponInfo_t *weaponInfo;
 	int weaponSlot;
-	int occupant;
+	qboolean takes;
 
 	weaponInfo = bg_weaponInfo[weapon];
 	if ( !weaponInfo->slotStackable ) {
@@ -1645,28 +1553,30 @@ int BG_GetStackSlotForWeapon( const playerState_t *ps, int weapon, int preferred
 	case WEAPSLOT_PRIMARY:
 	case WEAPSLOT_PRIMARYB:
 		if ( preferredSlot == WEAPSLOT_PRIMARY || preferredSlot == WEAPSLOT_PRIMARYB ) {
-			occupant = (signed char)ps->weaponslots[preferredSlot];
-			if ( !occupant || bg_weaponInfo[occupant]->slotStackable ) {
+			if ( !ps->weaponslots[preferredSlot]
+				 || bg_weaponInfo[(signed char)ps->weaponslots[preferredSlot]]->slotStackable ) {
 				return preferredSlot;
 			}
 		}
-		occupant = (signed char)ps->weaponslots[WEAPSLOT_PRIMARY];
-		if ( !occupant || bg_weaponInfo[occupant]->slotStackable ) {
+		takes = !ps->weaponslots[WEAPSLOT_PRIMARY]
+				|| bg_weaponInfo[(signed char)ps->weaponslots[WEAPSLOT_PRIMARY]]->slotStackable;
+		if ( takes ) {
 			return WEAPSLOT_PRIMARY;
 		}
-		occupant = (signed char)ps->weaponslots[WEAPSLOT_PRIMARYB];
-		if ( occupant && !bg_weaponInfo[occupant]->slotStackable ) {
-			return WEAPSLOT_NONE;
+		takes = !ps->weaponslots[WEAPSLOT_PRIMARYB]
+				|| bg_weaponInfo[(signed char)ps->weaponslots[WEAPSLOT_PRIMARYB]]->slotStackable;
+		if ( takes ) {
+			return WEAPSLOT_PRIMARYB;
 		}
-		return WEAPSLOT_PRIMARYB;
+		return WEAPSLOT_NONE;
 	case WEAPSLOT_PISTOL:
 	case WEAPSLOT_GRENADE:
 	case WEAPSLOT_SMOKEGRENADE:
-		occupant = (signed char)ps->weaponslots[weaponSlot];
-		if ( occupant && !bg_weaponInfo[occupant]->slotStackable ) {
-			return WEAPSLOT_NONE;
+		if ( !ps->weaponslots[weaponSlot]
+			 || bg_weaponInfo[(signed char)ps->weaponslots[weaponSlot]]->slotStackable ) {
+			return weaponSlot;
 		}
-		return weaponSlot;
+		return WEAPSLOT_NONE;
 	default:
 		return WEAPSLOT_NONE;
 	}
@@ -1715,35 +1625,35 @@ int BG_GetMaxPickupableAmmo( const playerState_t *ps, int weapon ) {
 	memset( seenClip, 0, sizeof( seenClip ) );
 
 	sharedIndex = weaponInfo->sharedAmmoCapIndex;
-	if ( sharedIndex < 0 ) {
-		if ( weaponInfo->clipOnly ) {
-			return bg_ammoClipSizes[clipIndex] - ps->ammoclip[clipIndex];
+	if ( sharedIndex >= 0 ) {
+		remaining = bg_sharedAmmoCapSizes[sharedIndex];
+		for ( i = 1; i <= bg_numWeapons; i++ ) {
+			if ( !( ps->weapons[i >> 5] & ( 1 << ( i & 31 ) ) ) ) {
+				continue;
+			}
+			other = bg_weaponInfo[i];
+			if ( other->sharedAmmoCapIndex != sharedIndex ) {
+				continue;
+			}
+			if ( other->clipOnly ) {
+				if ( !seenClip[other->clipIndex] ) {
+					seenClip[other->clipIndex] = 1;
+					remaining -= ps->ammoclip[other->clipIndex];
+				}
+			} else {
+				if ( !seenAmmo[other->ammoIndex] ) {
+					seenAmmo[other->ammoIndex] = 1;
+					remaining -= ps->ammo[other->ammoIndex];
+				}
+			}
 		}
-		return bg_ammoTypeMax[ammoIndex] - ps->ammo[ammoIndex];
+		return remaining;
 	}
 
-	remaining = bg_sharedAmmoCapSizes[sharedIndex];
-	for ( i = 1; i <= bg_numWeapons; i++ ) {
-		if ( !( ps->weapons[i >> 5] & ( 1 << ( i & 31 ) ) ) ) {
-			continue;
-		}
-		other = bg_weaponInfo[i];
-		if ( other->sharedAmmoCapIndex != sharedIndex ) {
-			continue;
-		}
-		if ( other->clipOnly ) {
-			if ( !seenClip[other->clipIndex] ) {
-				seenClip[other->clipIndex] = 1;
-				remaining -= ps->ammoclip[other->clipIndex];
-			}
-		} else {
-			if ( !seenAmmo[other->ammoIndex] ) {
-				seenAmmo[other->ammoIndex] = 1;
-				remaining -= ps->ammo[other->ammoIndex];
-			}
-		}
+	if ( weaponInfo->clipOnly ) {
+		return bg_ammoClipSizes[clipIndex] - ps->ammoclip[clipIndex];
 	}
-	return remaining;
+	return bg_ammoTypeMax[ammoIndex] - ps->ammo[ammoIndex];
 }
 
 /*
@@ -1761,41 +1671,41 @@ int BG_GetTotalAmmoReserve( const playerState_t *ps, int weapon ) {
 	int i;
 
 	weaponInfo = bg_weaponInfo[weapon];
-	clipIndex = weaponInfo->clipIndex;
 	ammoIndex = weaponInfo->ammoIndex;
+	clipIndex = weaponInfo->clipIndex;
+	total = 0;
 	memset( seenAmmo, 0, sizeof( seenAmmo ) );
 	memset( seenClip, 0, sizeof( seenClip ) );
 
 	sharedIndex = weaponInfo->sharedAmmoCapIndex;
-	total = 0;
-	if ( sharedIndex < 0 ) {
-		if ( weaponInfo->clipOnly ) {
-			return ps->ammoclip[clipIndex];
+	if ( sharedIndex >= 0 ) {
+		for ( i = 1; i <= bg_numWeapons; i++ ) {
+			if ( !( ps->weapons[i >> 5] & ( 1 << ( i & 31 ) ) ) ) {
+				continue;
+			}
+			other = bg_weaponInfo[i];
+			if ( other->sharedAmmoCapIndex != sharedIndex ) {
+				continue;
+			}
+			if ( other->clipOnly ) {
+				if ( !seenClip[other->clipIndex] ) {
+					seenClip[other->clipIndex] = 1;
+					total += ps->ammoclip[other->clipIndex];
+				}
+			} else {
+				if ( !seenAmmo[other->ammoIndex] ) {
+					seenAmmo[other->ammoIndex] = 1;
+					total += ps->ammo[other->ammoIndex];
+				}
+			}
 		}
-		return ps->ammo[ammoIndex];
+		return total;
 	}
 
-	for ( i = 1; i <= bg_numWeapons; i++ ) {
-		if ( !( ps->weapons[i >> 5] & ( 1 << ( i & 31 ) ) ) ) {
-			continue;
-		}
-		other = bg_weaponInfo[i];
-		if ( other->sharedAmmoCapIndex != sharedIndex ) {
-			continue;
-		}
-		if ( other->clipOnly ) {
-			if ( !seenClip[other->clipIndex] ) {
-				seenClip[other->clipIndex] = 1;
-				total += ps->ammoclip[other->clipIndex];
-			}
-		} else {
-			if ( !seenAmmo[other->ammoIndex] ) {
-				seenAmmo[other->ammoIndex] = 1;
-				total += ps->ammo[other->ammoIndex];
-			}
-		}
+	if ( weaponInfo->clipOnly ) {
+		return ps->ammoclip[clipIndex];
 	}
-	return total;
+	return ps->ammo[ammoIndex];
 }
 
 /*
@@ -1806,17 +1716,17 @@ While the view height is lerping between stances the minimum hip spread lerps
 with it.
 ==============
 */
-float BG_GetMinSpreadForWeapon( int time, const playerState_t *ps, int weaponIndex ) {
+double BG_GetMinSpreadForWeapon( int time, const playerState_t *ps, int weaponIndex ) {
 	const weaponInfo_t *weaponInfo;
 	int target;
-	float frac;
+	// keep: rfloat matches original codegen
+	rfloat frac;
 
 	weaponInfo = bg_weaponInfo[weaponIndex];
 	target = ps->viewHeightLerpTarget;
 
 	if ( (float)target != ps->viewHeightCurrent && ps->viewHeightLerpTime ) {
-		frac = (float)( (double)( time - ps->viewHeightLerpTime )
-						/ (double)PM_GetViewHeightLerpTime( ps, target, ps->viewHeightLerpDown ) );
+		frac = (rfloat)( time - ps->viewHeightLerpTime ) / PM_GetViewHeightLerpTime( ps, target, ps->viewHeightLerpDown );
 		if ( frac < 0.0f ) {
 			frac = 0.0f;
 		} else if ( frac > 1.0f ) {
@@ -1824,15 +1734,15 @@ float BG_GetMinSpreadForWeapon( int time, const playerState_t *ps, int weaponInd
 		}
 
 		if ( target == ps->proneViewHeight ) {
-			return ( weaponInfo->hipSpreadProneMin - weaponInfo->hipSpreadDuckedMin ) * frac + weaponInfo->hipSpreadDuckedMin;
+			return ( (double)weaponInfo->hipSpreadProneMin - weaponInfo->hipSpreadDuckedMin ) * frac + weaponInfo->hipSpreadDuckedMin;
 		}
 		if ( target == ps->standViewHeight ) {
-			return ( weaponInfo->hipSpreadStandMin - weaponInfo->hipSpreadDuckedMin ) * frac + weaponInfo->hipSpreadDuckedMin;
+			return ( (double)weaponInfo->hipSpreadStandMin - weaponInfo->hipSpreadDuckedMin ) * frac + weaponInfo->hipSpreadDuckedMin;
 		}
 		if ( ps->viewHeightLerpDown ) {
-			return ( weaponInfo->hipSpreadDuckedMin - weaponInfo->hipSpreadStandMin ) * frac + weaponInfo->hipSpreadStandMin;
+			return ( (double)weaponInfo->hipSpreadDuckedMin - weaponInfo->hipSpreadStandMin ) * frac + weaponInfo->hipSpreadStandMin;
 		}
-		return ( weaponInfo->hipSpreadDuckedMin - weaponInfo->hipSpreadProneMin ) * frac + weaponInfo->hipSpreadProneMin;
+		return ( (double)weaponInfo->hipSpreadDuckedMin - weaponInfo->hipSpreadProneMin ) * frac + weaponInfo->hipSpreadProneMin;
 	}
 
 	if ( ps->pm_flags & PMF_PRONE ) {
@@ -1870,15 +1780,21 @@ void PM_UpdateAimDownSightFlag( void ) {
 		 || ps->weaponstate == WEAPON_MELEE_FIRE
 		 || ( !pml.groundPlane && ps->pm_type != PM_NORMAL_LINKED ) ) {
 		ps->pm_flags &= ~PMF_ADS;
-	} else if ( !( ps->pm_flags & PMF_PRONE ) ) {
+	} else if ( ps->pm_flags & PMF_PRONE ) {
+		if ( !( pm->oldcmd.buttons & BUTTON_ADS ) || ( !pm->cmd.forwardmove && !pm->cmd.rightmove ) ) {
+			ps->pm_flags |= PMF_ADS;
+			pm->ps->pm_flags |= PMF_PRONE_MOVEOVERRIDE;
+		}
+	} else {
 		ps->pm_flags |= PMF_ADS;
-	} else if ( !( pm->oldcmd.buttons & BUTTON_ADS ) || ( !pm->cmd.forwardmove && !pm->cmd.rightmove ) ) {
-		ps->pm_flags |= PMF_ADS;
-		pm->ps->pm_flags |= PMF_PRONE_MOVEOVERRIDE;
 	}
 
-	BG_UpdateConditionValue( ps->clientNum, ANIM_COND_WEAPON_POSITION,
-							 ( ps->pm_flags & PMF_ADS ) != 0, qtrue );
+	// keep: two calls with constant values match original codegen
+	if ( pm->ps->pm_flags & PMF_ADS ) {
+		BG_UpdateConditionValue( pm->ps->clientNum, ANIM_COND_WEAPON_POSITION, WEAPON_POSITION_ADS, qtrue );
+	} else {
+		BG_UpdateConditionValue( pm->ps->clientNum, ANIM_COND_WEAPON_POSITION, WEAPON_POSITION_HIP, qtrue );
+	}
 }
 
 /*
@@ -1898,7 +1814,6 @@ PM_UpdateAimDownSightLerp
 void PM_UpdateAimDownSightLerp( void ) {
 	const weaponInfo_t *weaponInfo;
 	playerState_t *ps;
-	qboolean allowAds;
 	qboolean bAds;
 
 	weaponInfo = pml.weaponInfo;
@@ -1908,46 +1823,38 @@ void PM_UpdateAimDownSightLerp( void ) {
 		return;
 	}
 
-	allowAds = qtrue;
-	ps = pm->ps;
-	if ( !weaponInfo->segmentedReload ) {
-		if ( ps->weaponstate == WEAPON_RELOADING
-			 && ps->weaponTime - weaponInfo->adsReloadTransTime > 0 ) {
-			allowAds = qfalse;
-		}
-	} else if ( ps->weaponstate == WEAPON_RELOADING
-				|| ps->weaponstate == WEAPON_RELOADING_INTERUPT
-				|| ps->weaponstate == WEAPON_RELOAD_START
-				|| ps->weaponstate == WEAPON_RELOAD_START_INTERUPT
-				|| ( ps->weaponstate == WEAPON_RELOAD_END
-					 && ps->weaponTime - weaponInfo->adsReloadTransTime > 0 ) ) {
-		allowAds = qfalse;
-	}
-
-	ps = pm->ps;
-	if ( allowAds && ( ps->pm_flags & PMF_ADS ) ) {
+	if ( ( !weaponInfo->segmentedReload && pm->ps->weaponstate == WEAPON_RELOADING
+		   && pm->ps->weaponTime - weaponInfo->adsReloadTransTime > 0 )
+		 || ( weaponInfo->segmentedReload
+			  && ( pm->ps->weaponstate == WEAPON_RELOADING
+				   || pm->ps->weaponstate == WEAPON_RELOADING_INTERUPT
+				   || pm->ps->weaponstate == WEAPON_RELOAD_START
+				   || pm->ps->weaponstate == WEAPON_RELOAD_START_INTERUPT
+				   || ( pm->ps->weaponstate == WEAPON_RELOAD_END
+						&& pm->ps->weaponTime - weaponInfo->adsReloadTransTime > 0 ) ) ) ) {
+		bAds = qfalse;
+	} else if ( pm->ps->pm_flags & PMF_ADS ) {
 		bAds = qtrue;
 	}
 
-	if ( ( weaponInfo->adsFire && ps->weaponDelay && ps->weaponstate == WEAPON_FIRING ) || bAds ) {
-		if ( ps->fWeaponPosFrac == 1.0f ) {
-			return;
-		}
-		ps->fWeaponPosFrac = (float)( ps->fWeaponPosFrac
-									  + (double)pml.msec * weaponInfo->adsTransInRate );
-	} else {
-		if ( ps->fWeaponPosFrac == 0.0f ) {
-			return;
-		}
-		ps->fWeaponPosFrac = (float)( ps->fWeaponPosFrac
-									  - (double)pml.msec * weaponInfo->adsTransOutRate );
+	ps = pm->ps;
+	if ( weaponInfo->adsFire && ps->weaponDelay && ps->weaponstate == WEAPON_FIRING ) {
+		bAds = qtrue;
 	}
 
-	ps = pm->ps;
-	if ( ps->fWeaponPosFrac >= 1.0f ) {
-		ps->fWeaponPosFrac = 1.0f;
-	} else if ( ps->fWeaponPosFrac <= 0.0f ) {
-		ps->fWeaponPosFrac = 0.0f;
+	if ( ( bAds && ps->fWeaponPosFrac != 1.0f ) || ( !bAds && ps->fWeaponPosFrac != 0.0f ) ) {
+		if ( bAds ) {
+			ps->fWeaponPosFrac = ps->fWeaponPosFrac + (rfloat)pml.msec * weaponInfo->adsTransInRate;
+		} else {
+			ps->fWeaponPosFrac = ps->fWeaponPosFrac - (rfloat)pml.msec * weaponInfo->adsTransOutRate;
+		}
+
+		ps = pm->ps;
+		if ( ps->fWeaponPosFrac >= 1.0f ) {
+			ps->fWeaponPosFrac = 1.0f;
+		} else if ( ps->fWeaponPosFrac <= 0.0f ) {
+			ps->fWeaponPosFrac = 0.0f;
+		}
 	}
 }
 
@@ -1959,29 +1866,23 @@ qtrue when the stance change may proceed.
 ==============
 */
 qboolean PM_InteruptWeaponWithProneMove( void ) {
-	playerState_t *ps;
+	int weaponstate;
 
-	ps = pm->ps;
-	switch ( ps->weaponstate ) {
-	case WEAPON_READY:
-	case WEAPON_RAISING:
-	case WEAPON_DROPPING:
-	case WEAPON_RELOADING:
-	case WEAPON_RELOADING_INTERUPT:
-	case WEAPON_RELOAD_START:
-	case WEAPON_RELOAD_START_INTERUPT:
-	case WEAPON_RELOAD_END:
-		return qtrue;
-	case WEAPON_FIRING:
-	case WEAPON_MELEE_FIRE:
-		return qfalse;
-	default:
-		ps->weaponTime = 0;
-		ps->weaponDelay = 0;
-		ps->weaponstate = WEAPON_READY;
-		PM_ContinueWeaponAnim( WEAP_IDLE );
+	weaponstate = pm->ps->weaponstate;
+	if ( weaponstate == WEAPON_READY || weaponstate == WEAPON_RAISING || weaponstate == WEAPON_DROPPING
+		 || weaponstate == WEAPON_RELOADING || weaponstate == WEAPON_RELOAD_START
+		 || weaponstate == WEAPON_RELOAD_END || weaponstate == WEAPON_RELOAD_START_INTERUPT
+		 || weaponstate == WEAPON_RELOADING_INTERUPT ) {
 		return qtrue;
 	}
+	if ( weaponstate == WEAPON_FIRING || weaponstate == WEAPON_MELEE_FIRE ) {
+		return qfalse;
+	}
+	pm->ps->weaponTime = 0;
+	pm->ps->weaponDelay = 0;
+	pm->ps->weaponstate = WEAPON_READY;
+	PM_ContinueWeaponAnim( WEAP_IDLE );
+	return qtrue;
 }
 
 /*
@@ -2000,11 +1901,11 @@ int BG_AmmoForWeapon( int weaponIndex ) {
 	return bg_weaponInfo[weaponIndex]->ammoIndex;
 }
 
-int BG_WeaponAmmo( int weaponIndex ) {
+int BG_WeaponIsClipOnly( int weaponIndex ) {
 	return bg_weaponInfo[weaponIndex]->clipOnly;
 }
 
-int PM_ReloadClip( const playerState_t *ps, int weapon ) {
+int BG_WeaponAmmo( const playerState_t *ps, int weapon ) {
 	const weaponInfo_t *weaponInfo;
 
 	weaponInfo = bg_weaponInfo[weapon];
@@ -2015,20 +1916,19 @@ int PM_ReloadClip( const playerState_t *ps, int weapon ) {
 ==============
 PM_Weapon_ReloadClipAmmo
 
-0x2000FDB0, no retail symbol: the tail PM_Weapon_ReloadDelayedAction jumps
-to.  Moves one reload increment from the reserve into the clip and returns it.
+Moves one reload increment from the reserve into the clip.
 ==============
 */
-int PM_Weapon_ReloadClipAmmo( void ) {
+void PM_Weapon_ReloadClipAmmo( void ) {
 	const weaponInfo_t *weaponInfo;
 	playerState_t *ps;
 	int ammoIndex, clipIndex;
-	int reserve, add, cap;
+	int reserve, add;
 
 	ps = pm->ps;
 	if ( ( ps->weaponstate == WEAPON_RELOAD_START || ps->weaponstate == WEAPON_RELOAD_START_INTERUPT )
 		 && !pml.weaponInfo->reloadStartAdd ) {
-		return pml.weaponInfo->reloadStartAdd;
+		return;
 	}
 
 	weaponInfo = bg_weaponInfo[ps->weapon];
@@ -2041,23 +1941,19 @@ int PM_Weapon_ReloadClipAmmo( void ) {
 	}
 
 	if ( ps->weaponstate == WEAPON_RELOAD_START || ps->weaponstate == WEAPON_RELOAD_START_INTERUPT ) {
-		cap = pml.weaponInfo->reloadStartAdd;
-	} else {
-		cap = pml.weaponInfo->reloadAmmoAdd;
-		if ( !cap ) {
-			goto transfer;
+		if ( pml.weaponInfo->reloadStartAdd < bg_ammoClipSizes[clipIndex] && add > pml.weaponInfo->reloadStartAdd ) {
+			add = pml.weaponInfo->reloadStartAdd;
+		}
+	} else if ( pml.weaponInfo->reloadAmmoAdd && pml.weaponInfo->reloadAmmoAdd < bg_ammoClipSizes[clipIndex] ) {
+		if ( add > pml.weaponInfo->reloadAmmoAdd ) {
+			add = pml.weaponInfo->reloadAmmoAdd;
 		}
 	}
-	if ( cap < bg_ammoClipSizes[clipIndex] && add > cap ) {
-		add = cap;
-	}
 
-transfer:
 	if ( add ) {
 		ps->ammo[ammoIndex] = reserve - add;
 		pm->ps->ammoclip[clipIndex] += add;
 	}
-	return add;
 }
 
 void PM_WeaponUseAmmo( int weapon, int amount ) {
@@ -2120,55 +2016,50 @@ PM_Weapon_CheckForRechamber
 */
 qboolean PM_Weapon_CheckForRechamber( qboolean weaponTimeExpired ) {
 	playerState_t *ps;
-	int weapon;
 
-	if ( !pml.weaponInfo->boltAction ) {
-		return qfalse;
-	}
-
-	ps = pm->ps;
-	weapon = ps->weapon;
-	if ( !( ps->weaponrechamber[weapon >> 5] & ( 1 << ( weapon & 31 ) ) ) ) {
-		return qfalse;
-	}
-
-	if ( ps->weaponstate == WEAPON_RECHAMBERING && weaponTimeExpired ) {
-		ps->weaponrechamber[weapon >> 5] &= ~( 1 << ( weapon & 31 ) );
-		PM_AddEvent( EV_EJECT_BRASS );
+	if ( pml.weaponInfo->boltAction ) {
 		ps = pm->ps;
-		if ( ps->weaponTime ) {
-			return qtrue;
-		}
-	} else if ( ps->weaponTime ) {
-		if ( ps->weaponstate == WEAPON_FIRING
-			 || ps->weaponstate == WEAPON_RECHAMBERING
-			 || ps->weaponstate == WEAPON_MELEE_INIT
-			 || ps->weaponstate == WEAPON_MELEE_FIRE
-			 || ps->weaponDelay ) {
-			return qfalse;
-		}
-	}
+		if ( Com_BitCheck( (const int *)ps->weaponrechamber, ps->weapon ) ) {
+			if ( ps->weaponstate == WEAPON_RECHAMBERING && weaponTimeExpired ) {
+				Com_BitClear( (int *)ps->weaponrechamber, ps->weapon );
+				PM_AddEvent( EV_EJECT_BRASS );
+				ps = pm->ps;
+				if ( ps->weaponTime ) {
+					return qtrue;
+				}
+			} else if ( ps->weaponTime ) {
+				ps = pm->ps;	// keep: re-read matches original codegen
+				if ( ps->weaponstate == WEAPON_FIRING
+					 || ps->weaponstate == WEAPON_RECHAMBERING
+					 || ps->weaponstate == WEAPON_MELEE_INIT
+					 || ps->weaponstate == WEAPON_MELEE_FIRE
+					 || ps->weaponDelay ) {
+					return qfalse;
+				}
+			}
 
-	if ( ps->weaponstate == WEAPON_RECHAMBERING ) {
-		PM_Weapon_FinishRechamber();
-		return qfalse;
-	}
+			if ( ps->weaponstate == WEAPON_RECHAMBERING ) {
+				PM_Weapon_FinishRechamber();
+				return qfalse;
+			}
 
-	if ( ps->weaponstate == WEAPON_READY ) {
-		if ( ps->fWeaponPosFrac <= 0.75f ) {
-			PM_StartWeaponAnim( WEAP_RECHAMBER );
-		} else {
-			PM_StartWeaponAnim( WEAP_ADS_RECHAMBER );
+			if ( ps->weaponstate == WEAPON_READY ) {
+				if ( ps->fWeaponPosFrac > 0.75f ) {
+					PM_StartWeaponAnim( WEAP_ADS_RECHAMBER );
+				} else {
+					PM_StartWeaponAnim( WEAP_RECHAMBER );
+				}
+				pm->ps->weaponstate = WEAPON_RECHAMBERING;
+				pm->ps->weaponTime = pml.weaponInfo->rechamberTime;
+				if ( pml.weaponInfo->rechamberBoltTime
+					 && pml.weaponInfo->rechamberBoltTime < pml.weaponInfo->rechamberTime ) {
+					pm->ps->weaponDelay = pml.weaponInfo->rechamberBoltTime;
+				} else {
+					pm->ps->weaponDelay = 1;
+				}
+				PM_AddEvent( EV_RECHAMBER_WEAPON );
+			}
 		}
-		pm->ps->weaponstate = WEAPON_RECHAMBERING;
-		pm->ps->weaponTime = pml.weaponInfo->rechamberTime;
-		if ( pml.weaponInfo->rechamberBoltTime
-			 && pml.weaponInfo->rechamberBoltTime < pml.weaponInfo->rechamberTime ) {
-			pm->ps->weaponDelay = pml.weaponInfo->rechamberBoltTime;
-		} else {
-			pm->ps->weaponDelay = 1;
-		}
-		PM_AddEvent( EV_RECHAMBER_WEAPON );
 	}
 	return qfalse;
 }
@@ -2185,8 +2076,7 @@ qboolean PM_Weapon_CheckForRechamber( qboolean weaponTimeExpired ) {
 ==============
 PM_SetReloadDelay
 
-0x20010160, no retail symbol: the tail PM_SetReloadingState and
-PM_BeginWeaponReload both jump to.  Returns the delay it armed.
+Arms the reload delay and returns it.
 ==============
 */
 int PM_SetReloadDelay( void ) {
@@ -2195,12 +2085,16 @@ int PM_SetReloadDelay( void ) {
 
 	ps = pm->ps;
 	if ( ps->weaponstate == WEAPON_RELOAD_START || ps->weaponstate == WEAPON_RELOAD_START_INTERUPT ) {
-		delay = pml.weaponInfo->reloadStartAddTime;
-		if ( delay && delay >= pml.weaponInfo->reloadStartTime ) {
-			delay = pml.weaponInfo->reloadStartTime;
+		if ( pml.weaponInfo->reloadStartAddTime ) {
+			delay = pml.weaponInfo->reloadStartAddTime;
+			if ( delay >= pml.weaponInfo->reloadStartTime ) {
+				delay = pml.weaponInfo->reloadStartTime;
+			}
+		} else {
+			delay = 0;
 		}
 	} else {
-		if ( ps->ammoclip[bg_weaponInfo[ps->weapon]->clipIndex] || pml.weaponInfo->weaponType ) {
+		if ( ps->ammoclip[bg_weaponInfo[ps->weapon]->clipIndex] || pml.weaponInfo->weaponType != WEAPTYPE_BULLET ) {
 			delay = pml.weaponInfo->reloadTime;
 		} else {
 			delay = pml.weaponInfo->reloadEmptyTime;
@@ -2211,15 +2105,18 @@ int PM_SetReloadDelay( void ) {
 	}
 
 	if ( pml.weaponInfo->boltAction
-		 && ( ps->weaponrechamber[ps->weapon >> 5] & ( 1 << ( ps->weapon & 31 ) ) ) ) {
+		 && ( ps->weaponrechamber[(int)ps->weapon >> 5] & ( 1 << ( ps->weapon & 31 ) ) ) ) {
 		if ( !delay ) {
 			delay = ps->weaponTime;
 		}
-		if ( pml.weaponInfo->rechamberBoltTime >= delay || !pml.weaponInfo->rechamberBoltTime ) {
-			ps->weaponDelay = 1;
-			return 1;
+		if ( pml.weaponInfo->rechamberBoltTime < delay ) {
+			delay = pml.weaponInfo->rechamberBoltTime;
+		} else {
+			delay = 0;
 		}
-		delay = pml.weaponInfo->rechamberBoltTime;
+		if ( !delay ) {
+			delay = 1;
+		}
 	}
 	if ( delay ) {
 		ps->weaponDelay = delay;
@@ -2236,7 +2133,7 @@ void PM_SetReloadingState( void ) {
 	playerState_t *ps;
 
 	ps = pm->ps;
-	if ( PM_WeaponAmmoAvailable( ps->weapon ) || pml.weaponInfo->weaponType ) {
+	if ( PM_WeaponAmmoAvailable( ps->weapon ) || pml.weaponInfo->weaponType != WEAPTYPE_BULLET ) {
 		PM_StartWeaponAnim( WEAP_RELOAD );
 		pm->ps->weaponTime = pml.weaponInfo->reloadTime;
 		PM_AddEvent( EV_RELOAD );
@@ -2315,15 +2212,14 @@ void PM_BeginWeaponChange( int oldWeapon, int newWeapon ) {
 
 	pm->ps->weaponDelay = 0;
 
-	ps = pm->ps;
 	if ( !oldWeapon
-		 || !( ps->weapons[oldWeapon >> 5] & ( 1 << ( oldWeapon & 31 ) ) )
-		 || ps->grenadeTimeLeft > 0 ) {
-		ps->weaponTime = 0;
-		ps->weaponstate = WEAPON_DROPPING;
-		ps->grenadeTimeLeft = 0;
-		if ( ps->pm_flags & PMF_PRONE ) {
-			ps->pm_flags |= PMF_PRONE_MOVEOVERRIDE;
+		 || !( pm->ps->weapons[oldWeapon >> 5] & ( 1 << ( oldWeapon & 31 ) ) )
+		 || pm->ps->grenadeTimeLeft > 0 ) {
+		pm->ps->weaponTime = 0;
+		pm->ps->weaponstate = WEAPON_DROPPING;
+		pm->ps->grenadeTimeLeft = 0;
+		if ( pm->ps->pm_flags & PMF_PRONE ) {
+			pm->ps->pm_flags |= PMF_PRONE_MOVEOVERRIDE;
 		}
 		return;
 	}
@@ -2332,10 +2228,10 @@ void PM_BeginWeaponChange( int oldWeapon, int newWeapon ) {
 	isAltSwitch = ( newWeapon && newWeapon == weaponInfo->altWeaponIndex ) ? qtrue : qfalse;
 
 	playPutaway = qtrue;
-	if ( weaponInfo->clipOnly ) {
-		playPutaway = ps->ammoclip[weaponInfo->clipIndex] != 0;
+	if ( weaponInfo->clipOnly && !pm->ps->ammoclip[weaponInfo->clipIndex] ) {
+		playPutaway = qfalse;
 	}
-	ps->grenadeTimeLeft = 0;
+	pm->ps->grenadeTimeLeft = 0;
 
 	if ( isAltSwitch ) {
 		PM_AddEvent( EV_WEAPON_ALT );
@@ -2353,13 +2249,15 @@ void PM_BeginWeaponChange( int oldWeapon, int newWeapon ) {
 
 	if ( isAltSwitch ) {
 		pm->ps->weaponTime = weaponInfo->altDropTime;
+	} else {
+		pm->ps->weaponTime = weaponInfo->dropTime;
+	}
+	if ( isAltSwitch ) {
 		ps = pm->ps;
 		slot = BG_IsPlayerWeaponInSlot( ps, oldWeapon, qtrue );
 		if ( slot ) {
 			BG_SetPlayerWeaponForSlot( ps, slot, newWeapon );
 		}
-	} else {
-		pm->ps->weaponTime = weaponInfo->dropTime;
 	}
 }
 
@@ -2374,71 +2272,74 @@ qboolean PM_Weapon_FinishWeaponChange( void ) {
 	int newWeapon;
 
 	ps = pm->ps;
-	if ( ps->weaponstate != WEAPON_DROPPING ) {
-		return qfalse;
-	}
+	if ( ps->weaponstate == WEAPON_DROPPING ) {
+		if ( ps->pm_flags & PMF_LADDER ) {
+			newWeapon = 0;
+		} else {
+			newWeapon = pm->cmd.weapon;
+			if ( !( ps->weapons[newWeapon >> 5] & ( 1 << ( newWeapon & 31 ) ) )
+				 || newWeapon < 0 || newWeapon > bg_numWeapons ) {
+				newWeapon = 0;
+			}
+		}
+		if ( !( ps->weapons[newWeapon >> 5] & ( 1 << ( newWeapon & 31 ) ) ) ) {
+			newWeapon = 0;
+		}
 
-	newWeapon = pm->cmd.weapon;
-	if ( ( ps->pm_flags & PMF_LADDER )
-		 || !( ps->weapons[newWeapon >> 5] & ( 1 << ( newWeapon & 31 ) ) )
-		 || newWeapon > bg_numWeapons ) {
-		newWeapon = 0;
-	}
-	if ( !( ps->weapons[newWeapon >> 5] & ( 1 << ( newWeapon & 31 ) ) ) ) {
-		newWeapon = 0;
-	}
+		oldWeapon = ps->weapon;
+		ps->weapon = (byte)newWeapon;
+		pml.weaponInfo = bg_weaponInfo[pm->ps->weapon];
 
-	oldWeapon = ps->weapon;
-	ps->weapon = (byte)newWeapon;
-	pml.weaponInfo = bg_weaponInfo[pm->ps->weapon];
+		if ( oldWeapon == newWeapon ) {
+			pm->ps->weaponstate = WEAPON_READY;
+			PM_StartWeaponAnim( WEAP_IDLE );
+			return qtrue;
+		}
 
-	if ( oldWeapon == newWeapon ) {
-		pm->ps->weaponstate = WEAPON_READY;
-		PM_StartWeaponAnim( WEAP_IDLE );
-		return qtrue;
-	}
+		// keep: the RAISING store in both paths matches original codegen
+		if ( !oldWeapon ) {
+			pm->ps->weaponstate = WEAPON_RAISING;
+			pm->ps->weaponTime = bg_weaponInfo[newWeapon]->raiseTime;
+			pm->ps->aimSpreadScale = 255.0f;
+			PM_StartWeaponAnim( WEAP_RAISE );
+			ps = pm->ps;
+			if ( ps->pm_flags & PMF_PRONE ) {
+				ps->pm_flags |= PMF_PRONE_MOVEOVERRIDE;
+			}
+			return qtrue;
+		}
 
-	pm->ps->weaponstate = WEAPON_RAISING;
-
-	if ( !oldWeapon ) {
-		pm->ps->weaponTime = bg_weaponInfo[newWeapon]->raiseTime;
-		pm->ps->aimSpreadScale = 255.0f;
-		PM_StartWeaponAnim( WEAP_RAISE );
+		pm->ps->weaponstate = WEAPON_RAISING;
 		ps = pm->ps;
 		if ( ps->pm_flags & PMF_PRONE ) {
 			ps->pm_flags |= PMF_PRONE_MOVEOVERRIDE;
 		}
-		return qtrue;
-	}
 
-	ps = pm->ps;
-	if ( ps->pm_flags & PMF_PRONE ) {
-		ps->pm_flags |= PMF_PRONE_MOVEOVERRIDE;
-	}
-
-	if ( newWeapon && newWeapon == bg_weaponInfo[oldWeapon]->altWeaponIndex ) {
-		pm->ps->weaponTime = bg_weaponInfo[newWeapon]->altRaiseTime;
-	} else {
-		PM_AddEvent( EV_RAISE_WEAPON );
-		pm->ps->weaponTime = bg_weaponInfo[newWeapon]->raiseTime;
-	}
-
-	BG_UpdateConditionValue( pm->ps->clientNum, ANIM_COND_WEAPONS, newWeapon, qtrue );
-	BG_UpdateConditionValue( pm->ps->clientNum, ANIM_COND_WEAPONCLASS, bg_weaponInfo[newWeapon]->weaponClass, qtrue );
-
-	if ( newWeapon && newWeapon == bg_weaponInfo[oldWeapon]->altWeaponIndex ) {
-		ps = pm->ps;
-		if ( ps->aimSpreadScale < 128.0f ) {
-			ps->aimSpreadScale = 128.0f;
+		if ( newWeapon && newWeapon == bg_weaponInfo[oldWeapon]->altWeaponIndex ) {
+			pm->ps->weaponTime = bg_weaponInfo[newWeapon]->altRaiseTime;
+		} else {
+			PM_AddEvent( EV_RAISE_WEAPON );
+			pm->ps->weaponTime = bg_weaponInfo[newWeapon]->raiseTime;
 		}
-		PM_StartWeaponAnim( WEAP_ALTSWITCHTO );
+
+		BG_UpdateConditionValue( pm->ps->clientNum, ANIM_COND_WEAPONS, newWeapon, qtrue );
+		BG_UpdateConditionValue( pm->ps->clientNum, ANIM_COND_WEAPONCLASS, bg_weaponInfo[newWeapon]->weaponClass, qtrue );
+
+		if ( newWeapon && newWeapon == bg_weaponInfo[oldWeapon]->altWeaponIndex ) {
+			ps = pm->ps;
+			if ( ps->aimSpreadScale < 128.0f ) {
+				ps->aimSpreadScale = 128.0f;
+			}
+			PM_StartWeaponAnim( WEAP_ALTSWITCHTO );
+			return qtrue;
+		}
+
+		BG_AnimScriptEvent( pm->ps, ANIM_ET_RAISEWEAPON, qfalse, qfalse );
+		pm->ps->aimSpreadScale = 255.0f;
+		PM_StartWeaponAnim( WEAP_RAISE );
 		return qtrue;
 	}
-
-	BG_AnimScriptEvent( pm->ps, ANIM_ET_RAISEWEAPON, qfalse, qfalse );
-	pm->ps->aimSpreadScale = 255.0f;
-	PM_StartWeaponAnim( WEAP_RAISE );
-	return qtrue;
+	return qfalse;
 }
 
 /*
@@ -2447,12 +2348,12 @@ PM_Weapon_FinishWeaponRaise
 ==============
 */
 qboolean PM_Weapon_FinishWeaponRaise( void ) {
-	if ( pm->ps->weaponstate != WEAPON_RAISING ) {
-		return qfalse;
+	if ( pm->ps->weaponstate == WEAPON_RAISING ) {
+		pm->ps->weaponstate = WEAPON_READY;
+		PM_StartWeaponAnim( WEAP_IDLE );
+		return qtrue;
 	}
-	pm->ps->weaponstate = WEAPON_READY;
-	PM_StartWeaponAnim( WEAP_IDLE );
-	return qtrue;
+	return qfalse;
 }
 
 /*
@@ -2499,23 +2400,21 @@ Move one reload increment out of the reserve and into the clip; boltAction
 weapons eject their case and re-arm the delay first.
 ==============
 */
-int PM_Weapon_ReloadDelayedAction( void ) {
+void PM_Weapon_ReloadDelayedAction( void ) {
 	playerState_t *ps;
-	int weapon;
 	int cap;
 	int delay;
 
 	if ( pml.weaponInfo->boltAction ) {
 		ps = pm->ps;
-		weapon = ps->weapon;
-		if ( ps->weaponrechamber[weapon >> 5] & ( 1 << ( weapon & 31 ) ) ) {
-			ps->weaponrechamber[weapon >> 5] &= ~( 1 << ( weapon & 31 ) );
+		if ( Com_BitCheck( (const int *)ps->weaponrechamber, ps->weapon ) ) {
+			Com_BitClear( (int *)ps->weaponrechamber, ps->weapon );
 			PM_AddEvent( EV_EJECT_BRASS );
 
 			ps = pm->ps;
 			if ( ( ps->weaponstate == WEAPON_RELOAD_START || ps->weaponstate == WEAPON_RELOAD_START_INTERUPT )
 				 && !pml.weaponInfo->reloadStartAddTime ) {
-				return ps->weaponstate;
+				return;
 			}
 			if ( ps->weaponTime ) {
 				if ( ps->weaponstate == WEAPON_RELOAD_START || ps->weaponstate == WEAPON_RELOAD_START_INTERUPT ) {
@@ -2524,7 +2423,7 @@ int PM_Weapon_ReloadDelayedAction( void ) {
 						delay = pml.weaponInfo->reloadStartTime;
 					}
 				} else {
-					if ( ps->ammoclip[bg_weaponInfo[ps->weapon]->clipIndex] || pml.weaponInfo->weaponType ) {
+					if ( ps->ammoclip[bg_weaponInfo[ps->weapon]->clipIndex] || pml.weaponInfo->weaponType != WEAPTYPE_BULLET ) {
 						delay = pml.weaponInfo->reloadTime;
 					} else {
 						delay = pml.weaponInfo->reloadEmptyTime;
@@ -2540,13 +2439,13 @@ int PM_Weapon_ReloadDelayedAction( void ) {
 				delay -= cap;
 				if ( delay >= 1 ) {
 					ps->weaponDelay = delay;
-					return delay;
+					return;
 				}
 			}
 		}
 	}
 
-	return PM_Weapon_ReloadClipAmmo();
+	PM_Weapon_ReloadClipAmmo();
 }
 
 /*
@@ -2564,70 +2463,64 @@ qboolean PM_Weapon_FinishReload( qboolean weaponTimeExpired ) {
 			PM_Weapon_ReloadDelayedAction();
 		}
 		ps = pm->ps;
-		if ( ps->weaponTime ) {
-			return qtrue;
-		}
-		if ( ( ps->weaponstate != WEAPON_RELOAD_START_INTERUPT
-			   || !ps->ammoclip[bg_weaponInfo[ps->weapon]->clipIndex] )
+		if ( !ps->weaponTime ) {
+			if ( ( ps->weaponstate != WEAPON_RELOAD_START_INTERUPT || !pm->ps->ammoclip[BG_ClipForWeapon( ps->weapon )] )
 			 && PM_Weapon_AllowReload() ) {
-			PM_SetReloadingState();
-			return qtrue;
+				PM_SetReloadingState();
+			} else {
+				Com_BitClear( (int *)pm->ps->weaponrechamber, pm->ps->weapon );
+				if ( pml.weaponInfo->reloadEndTime ) {
+					pm->ps->weaponstate = WEAPON_RELOAD_END;
+					PM_StartWeaponAnim( WEAP_RELOAD_END );
+					pm->ps->weaponTime = pml.weaponInfo->reloadEndTime;
+					PM_AddEvent( EV_RELOAD_END );
+				} else {
+					pm->ps->weaponstate = WEAPON_READY;
+					PM_StartWeaponAnim( WEAP_IDLE );
+					return qfalse;
+				}
+			}
 		}
-		weapon = ps->weapon;
-		ps->weaponrechamber[weapon >> 5] &= ~( 1 << ( weapon & 31 ) );
-		if ( pml.weaponInfo->reloadEndTime ) {
-			pm->ps->weaponstate = WEAPON_RELOAD_END;
-			PM_StartWeaponAnim( WEAP_RELOAD_END );
-			pm->ps->weaponTime = pml.weaponInfo->reloadEndTime;
-			PM_AddEvent( EV_RELOAD_END );
-			return qtrue;
-		}
-		pm->ps->weaponstate = WEAPON_READY;
-		PM_StartWeaponAnim( WEAP_IDLE );
-		return qfalse;
+		return qtrue;
 	}
-
 	if ( ps->weaponstate == WEAPON_RELOAD_END ) {
 		ps->weaponstate = WEAPON_READY;
 		PM_StartWeaponAnim( WEAP_IDLE );
 		return qfalse;
-	}
-
-	if ( ps->weaponstate != WEAPON_RELOADING && ps->weaponstate != WEAPON_RELOADING_INTERUPT ) {
-		return qfalse;
-	}
-
-	if ( weaponTimeExpired ) {
-		PM_Weapon_ReloadDelayedAction();
-		if ( pm->ps->weaponTime ) {
+	} else if ( ps->weaponstate == WEAPON_RELOADING || ps->weaponstate == WEAPON_RELOADING_INTERUPT ) {
+		if ( weaponTimeExpired ) {
+			PM_Weapon_ReloadDelayedAction();
+			ps = pm->ps;
+			if ( ps->weaponTime ) {
+				return qtrue;
+			}
+		}
+		if ( !ps->weaponTime ) {
+			weapon = ps->weapon;
+			ps->weaponrechamber[weapon >> 5] &= ~( 1 << ( weapon & 31 ) );
+			if ( pml.weaponInfo->segmentedReload ) {
+				if ( pm->ps->weaponstate != WEAPON_RELOADING_INTERUPT && PM_Weapon_AllowReload() ) {
+					PM_SetReloadingState();
+					return qtrue;
+				}
+				if ( pml.weaponInfo->reloadEndTime ) {
+					pm->ps->weaponstate = WEAPON_RELOAD_END;
+					PM_StartWeaponAnim( WEAP_RELOAD_END );
+					pm->ps->weaponTime = pml.weaponInfo->reloadEndTime;
+					PM_AddEvent( EV_RELOAD_END );
+					return qtrue;
+				}
+				pm->ps->weaponstate = WEAPON_READY;
+			} else {
+				pm->ps->weaponstate = WEAPON_READY;
+			}
+			PM_StartWeaponAnim( WEAP_IDLE );
+		}
+		if ( weaponTimeExpired ) {
 			return qtrue;
 		}
-	} else if ( ps->weaponTime ) {
-		return qfalse;
 	}
-
-	ps = pm->ps;
-	weapon = ps->weapon;
-	ps->weaponrechamber[weapon >> 5] &= ~( 1 << ( weapon & 31 ) );
-
-	if ( pml.weaponInfo->segmentedReload ) {
-		if ( pm->ps->weaponstate != WEAPON_RELOADING_INTERUPT && PM_Weapon_AllowReload() ) {
-			PM_SetReloadingState();
-			return qtrue;
-		}
-		if ( pml.weaponInfo->reloadEndTime ) {
-			pm->ps->weaponstate = WEAPON_RELOAD_END;
-			PM_StartWeaponAnim( WEAP_RELOAD_END );
-			pm->ps->weaponTime = pml.weaponInfo->reloadEndTime;
-			PM_AddEvent( EV_RELOAD_END );
-			return qtrue;
-		}
-		pm->ps->weaponstate = WEAPON_READY;
-	} else {
-		pm->ps->weaponstate = WEAPON_READY;
-	}
-	PM_StartWeaponAnim( WEAP_IDLE );
-	return weaponTimeExpired;
+	return qfalse;
 }
 
 /*
@@ -2638,10 +2531,12 @@ PM_Weapon_CheckForReload
 void PM_Weapon_CheckForReload( void ) {
 	const weaponInfo_t *weaponInfo;
 	playerState_t *ps;
-	qboolean requested;
+	int requested;
 	qboolean wantReload;
+	int ammoIndex;
+	int clipIndex;
 
-	requested = ( pm->cmd.wbuttons & WBUTTON_RELOAD ) ? qtrue : qfalse;
+	requested = pm->cmd.wbuttons & WBUTTON_RELOAD;
 	wantReload = qfalse;
 
 	if ( pml.weaponInfo->segmentedReload ) {
@@ -2650,7 +2545,7 @@ void PM_Weapon_CheckForReload( void ) {
 			 && ( pm->cmd.buttons & BUTTON_ATTACK ) && !( pm->oldcmd.buttons & BUTTON_ATTACK ) ) {
 			if ( ps->weaponstate == WEAPON_RELOAD_START ) {
 				ps->weaponstate = WEAPON_RELOAD_START_INTERUPT;
-			} else {
+			} else if ( ps->weaponstate == WEAPON_RELOADING ) {
 				ps->weaponstate = WEAPON_RELOADING_INTERUPT;
 			}
 		}
@@ -2673,12 +2568,14 @@ void PM_Weapon_CheckForReload( void ) {
 	}
 
 	weaponInfo = bg_weaponInfo[ps->weapon];
+	ammoIndex = weaponInfo->ammoIndex;
+	clipIndex = weaponInfo->clipIndex;
 	if ( requested && PM_Weapon_AllowReload() ) {
 		wantReload = qtrue;
 	}
 
-	if ( ( !ps->ammoclip[weaponInfo->clipIndex]
-		   && ps->ammo[weaponInfo->ammoIndex]
+	if ( ( !ps->ammoclip[clipIndex]
+		   && ps->ammo[ammoIndex]
 		   && ps->weaponstate != WEAPON_FIRING
 		   && ( !( ps->pm_flags & PMF_PRONE ) || ( !pm->cmd.forwardmove && !pm->cmd.rightmove ) ) )
 		 || wantReload ) {
@@ -2689,9 +2586,6 @@ void PM_Weapon_CheckForReload( void ) {
 /*
 ==============
 PM_Weapon_CheckEmptyWeapon
-
-0x20010EE0, no retail symbol: the tail PM_Weapon_FireWeapon jumps to.  Retail
-reaches BG_TakePlayerWeapon here through an LTCG register convention (ecx, eax).
 ==============
 */
 void PM_Weapon_CheckEmptyWeapon( void ) {
@@ -2724,13 +2618,11 @@ void PM_AdjustAimSpreadScale( void ) {
 	float decay;
 	float increase;
 	float invFrametime;
+	rfloat turn;
 	int i;
 
 	decay = pml.weaponInfo->hipSpreadDecayRate;
-	if ( decay == 0.0f ) {
-		decay = 1.0f;
-		increase = 0.0f;
-	} else {
+	if ( decay != 0.0f ) {
 		ps = pm->ps;
 		if ( ps->groundEntityNum == ENTITYNUM_NONE && ps->pm_type != PM_NORMAL_LINKED ) {
 			decay = decay * 0.5f;
@@ -2741,27 +2633,31 @@ void PM_AdjustAimSpreadScale( void ) {
 		}
 		decay = pml.frametime * decay;
 
-		increase = 0.0f;
 		if ( ps->fWeaponPosFrac != 1.0f ) {
+			increase = 0.0f;
 			if ( pml.weaponInfo->hipSpreadTurnAdd != 0.0f ) {
 				invFrametime = 1.0f / pml.frametime;
 				for ( i = 0; i < 2; i++ ) {
-					increase = increase
-							   + (float)fabs( AngleSubtract( pm->cmd.angles[i] * 0.0054931641f,
-															 pm->oldcmd.angles[i] * 0.0054931641f ) )
-								 * pml.weaponInfo->hipSpreadTurnAdd * 0.01f * invFrametime;
+					turn = AngleSubtract( pm->cmd.angles[i] * 0.0054931641f, pm->oldcmd.angles[i] * 0.0054931641f );
+					turn = (float)fabs( turn ) * pml.weaponInfo->hipSpreadTurnAdd * 0.01f;
+					increase = increase + turn * invFrametime;
 				}
 			}
 			if ( pml.weaponInfo->hipSpreadMoveAdd != 0.0f && ( pm->cmd.forwardmove || pm->cmd.rightmove ) ) {
 				increase = increase + pml.weaponInfo->hipSpreadMoveAdd;
 			}
 			if ( ps->groundEntityNum == ENTITYNUM_NONE && ps->pm_type != PM_NORMAL_LINKED ) {
-				/* two separate adds of the same constant in retail */
+				// keep: two separate adds match original codegen
 				increase = increase + 1.28f;
 				increase = increase + 1.28f;
 			}
 			increase = increase * pml.frametime;
+		} else {
+			increase = 0.0f;
 		}
+	} else {
+		decay = 1.0f;
+		increase = 0.0f;
 	}
 
 	pm->ps->aimSpreadScale = pm->ps->aimSpreadScale + ( increase - decay ) * 255.0f;
@@ -2814,16 +2710,15 @@ qboolean PM_Weapon_WeaponTimeAdjust( void ) {
 		}
 	}
 
-	if ( !pm->ps->weaponDelay ) {
-		return qfalse;
+	if ( pm->ps->weaponDelay ) {
+		pm->ps->weaponDelay -= pml.msec;
+		ps = pm->ps;
+		if ( ps->weaponDelay <= 0 ) {
+			ps->weaponDelay = 0;
+			return qtrue;
+		}
 	}
-	pm->ps->weaponDelay -= pml.msec;
-	ps = pm->ps;
-	if ( ps->weaponDelay > 0 ) {
-		return qfalse;
-	}
-	ps->weaponDelay = 0;
-	return qtrue;
+	return qfalse;
 }
 
 /*
@@ -2833,53 +2728,39 @@ PM_Weapon_CheckForChangeWeapon
 */
 void PM_Weapon_CheckForChangeWeapon( void ) {
 	playerState_t *ps;
-	int weapon;
-	int requested;
 
 	ps = pm->ps;
 	if ( ps->weaponTime ) {
-		switch ( ps->weaponstate ) {
-		case WEAPON_RELOADING:
-		case WEAPON_RELOADING_INTERUPT:
-		case WEAPON_RELOAD_START:
-		case WEAPON_RELOAD_START_INTERUPT:
-		case WEAPON_RELOAD_END:
-		case WEAPON_RECHAMBERING:
-			break;
-		case WEAPON_FIRING:
-		case WEAPON_MELEE_INIT:
-		case WEAPON_MELEE_FIRE:
-			return;
-		default:
-			if ( ps->weaponDelay ) {
+		if ( ps->weaponstate != WEAPON_RELOADING && ps->weaponstate != WEAPON_RELOAD_START
+			 && ps->weaponstate != WEAPON_RELOAD_END && ps->weaponstate != WEAPON_RELOAD_START_INTERUPT
+			 && ps->weaponstate != WEAPON_RELOADING_INTERUPT && ps->weaponstate != WEAPON_RECHAMBERING ) {
+			if ( ps->weaponstate == WEAPON_FIRING || ps->weaponstate == WEAPON_MELEE_INIT
+				 || ps->weaponstate == WEAPON_MELEE_FIRE || ps->weaponDelay ) {
 				return;
 			}
-			break;
 		}
 	}
 
-	weapon = ps->weapon;
 	if ( ps->pm_flags & PMF_LADDER ) {
-		if ( weapon ) {
-			PM_BeginWeaponChange( weapon, 0 );
+		if ( ps->weapon ) {
+			PM_BeginWeaponChange( ps->weapon, 0 );
 		}
 		return;
 	}
 
-	requested = (byte)pm->cmd.weapon;
-	if ( weapon != requested ) {
-		if ( !( ps->pm_flags & PMF_IGNORE_INPUT ) || !weapon ) {
-			if ( !requested || ( ps->weapons[requested >> 5] & ( 1 << ( requested & 31 ) ) ) ) {
-				PM_BeginWeaponChange( weapon, requested );
+	if ( ps->weapon != pm->cmd.weapon ) {
+		if ( !( ps->pm_flags & PMF_IGNORE_INPUT ) || !ps->weapon ) {
+			if ( !pm->cmd.weapon || Com_BitCheck( (const int *)ps->weapons, pm->cmd.weapon ) ) {
+				PM_BeginWeaponChange( ps->weapon, pm->cmd.weapon );
 				return;
 			}
 		}
 	}
-	if ( !weapon ) {
+	if ( !ps->weapon ) {
 		return;
 	}
-	if ( !( ps->weapons[weapon >> 5] & ( 1 << ( weapon & 31 ) ) ) ) {
-		PM_BeginWeaponChange( weapon, 0 );
+	if ( !Com_BitCheck( (const int *)ps->weapons, ps->weapon ) ) {
+		PM_BeginWeaponChange( ps->weapon, 0 );
 	}
 }
 
@@ -2912,7 +2793,7 @@ void PM_Weapon_StartFiring( qboolean weaponDelayExpired ) {
 		if ( !weaponDelayExpired ) {
 			if ( PM_WeaponAmmoAvailable( pm->ps->weapon ) ) {
 				pm->ps->grenadeTimeLeft = pml.weaponInfo->fuseTime;
-				PM_StartWeaponAnim( 17 );   /* no recovered name; not in the debug table */
+				PM_StartWeaponAnim( 17 );   // unnamed weapon anim
 				PM_AddEvent( EV_PULLBACK_WEAPON );
 			}
 			pm->ps->weaponDelay = pml.weaponInfo->holdFireTime;
@@ -2992,10 +2873,10 @@ int PM_Weapon_SetFPSFireAnim( void ) {
 	int anim;
 
 	ps = pm->ps;
-	if ( ps->fWeaponPosFrac <= 0.75f ) {
-		anim = ps->ammoclip[bg_weaponInfo[ps->weapon]->clipIndex] ? WEAP_ATTACK : WEAP_ATTACK_LASTSHOT;
-	} else {
+	if ( ps->fWeaponPosFrac > 0.75f ) {
 		anim = ps->ammoclip[bg_weaponInfo[ps->weapon]->clipIndex] ? WEAP_ADS_ATTACK : WEAP_ADS_ATTACK_LASTSHOT;
+	} else {
+		anim = ps->ammoclip[bg_weaponInfo[ps->weapon]->clipIndex] ? WEAP_ATTACK : WEAP_ATTACK_LASTSHOT;
 	}
 	PM_StartWeaponAnim( anim );
 	return anim;
@@ -3040,8 +2921,8 @@ void PM_Weapon_FireWeapon( qboolean weaponDelayExpired ) {
 	}
 
 	clipIndex = bg_weaponInfo[ps->weapon]->clipIndex;
-	if ( ps->ammoclip[clipIndex] != -1 && !( ps->eFlags & EF_MOUNTED ) ) {
-		ps->ammoclip[clipIndex]--;
+	if ( ps->ammoclip[clipIndex] != -1 && !( ps->eFlags & EF_TURRET_ACTIVE ) ) {
+		pm->ps->ammoclip[clipIndex]--;
 	}
 	if ( pml.weaponInfo->weaponType == WEAPTYPE_GRENADE ) {
 		pm->ps->weaponTime = pml.weaponInfo->fireTime;
@@ -3050,10 +2931,10 @@ void PM_Weapon_FireWeapon( qboolean weaponDelayExpired ) {
 	PM_Weapon_SetFPSFireAnim();
 
 	ps = pm->ps;
-	if ( ps->ammoclip[bg_weaponInfo[ps->weapon]->clipIndex] ) {
-		PM_AddEvent( EV_FIRE_WEAPON );
-	} else {
+	if ( !ps->ammoclip[bg_weaponInfo[ps->weapon]->clipIndex] ) {
 		PM_AddEvent( EV_FIRE_WEAPON_LASTSHOT );
+	} else {
+		PM_AddEvent( EV_FIRE_WEAPON );
 	}
 
 	PM_Weapon_AddFiringAimSpreadScale();
@@ -3114,17 +2995,11 @@ void PM_Weapon_CheckForMelee( qboolean weaponDelayExpired ) {
 	}
 
 	ps = pm->ps;
-	if ( ps->weaponDelay ) {
-		switch ( ps->weaponstate ) {
-		case WEAPON_RELOADING:
-		case WEAPON_RELOADING_INTERUPT:
-		case WEAPON_RELOAD_START:
-		case WEAPON_RELOAD_START_INTERUPT:
-		case WEAPON_RELOAD_END:
-			break;
-		default:
-			return;
-		}
+	if ( ps->weaponDelay
+		 && !( ps->weaponstate == WEAPON_RELOADING || ps->weaponstate == WEAPON_RELOAD_START
+			   || ps->weaponstate == WEAPON_RELOAD_END || ps->weaponstate == WEAPON_RELOAD_START_INTERUPT
+			   || ps->weaponstate == WEAPON_RELOADING_INTERUPT ) ) {
+		return;
 	}
 
 	if ( !( pm->cmd.buttons & BUTTON_MELEE ) ) {
@@ -3160,6 +3035,14 @@ void PM_Weapon_CheckForMelee( qboolean weaponDelayExpired ) {
 	}
 }
 
+// bg_debugWeaponState / bg_debugWeaponAnim: 1 traces in both modules, 2 only
+// in cgame, 3 only in game
+#ifdef CGAMEDLL
+#define BG_DEBUG_SKIP_MODULE 3
+#else
+#define BG_DEBUG_SKIP_MODULE 2
+#endif
+
 /*
 ==============
 PM_Weapon
@@ -3179,14 +3062,14 @@ void PM_Weapon( void ) {
 		ps->weapon = 0;
 		return;
 	}
-	if ( ps->eFlags & EF_MOUNTED ) {
+	if ( ps->eFlags & EF_TURRET_ACTIVE ) {
 		return;
 	}
 
-	if ( bg_debugWeaponState.integer && bg_debugWeaponState.integer != 2 ) {
+	if ( bg_debugWeaponState.integer && bg_debugWeaponState.integer != BG_DEBUG_SKIP_MODULE ) {
 		PM_Weapon_PrintWeaponState();
 	}
-	if ( bg_debugWeaponAnim.integer && bg_debugWeaponAnim.integer != 2 ) {
+	if ( bg_debugWeaponAnim.integer && bg_debugWeaponAnim.integer != BG_DEBUG_SKIP_MODULE ) {
 		PM_Weapon_PrintWeaponAnim();
 	}
 
@@ -3294,7 +3177,7 @@ void PM_Weapon_PrintWeaponAnim( void ) {
 	Com_Printf( " %i %s_", pm->cmd.serverTime, bg_szDebugModule );
 	lastWeaponAnim = weaponAnim;
 	Com_Printf( "WEAP_ANIM -- " );
-	switch ( weaponAnim ) {
+	switch ( weaponAnim & ~ANIM_TOGGLEBIT ) {
 	case WEAP_IDLE:                Com_Printf( "WEAP_IDLE\n" ); break;
 	case WEAP_ATTACK:              Com_Printf( "WEAP_ATTACK\n" ); break;
 	case WEAP_ATTACK_LASTSHOT:     Com_Printf( "WEAP_ATTACK_LASTSHOT\n" ); break;
@@ -3314,6 +3197,13 @@ void PM_Weapon_PrintWeaponAnim( void ) {
 	default:                       Com_Printf( "UNKNOWN\n" ); break;
 	}
 }
+
+// keep: unreferenced, matches the original data layout
+#ifdef CGAMEDLL
+const char *bg_szDebugModuleUnused = "CG";
+#else
+const char *bg_szDebugModuleUnused = "G";
+#endif
 
 /*
 =============================================================================
@@ -3345,7 +3235,8 @@ float BG_GetVerticalBobFactor( const playerState_t *ps, float phase, float ampli
 	if ( scaled > maxAmplitude ) {
 		scaled = maxAmplitude;
 	}
-	return (float)( ( sin( phase * 4.0f + 1.5707964f ) * 0.2f + sin( phase + phase ) ) * scaled * 0.75f );
+	// keep: (rfloat), not FCAST, matches original codegen
+	return ( (rfloat)sin( phase * 4.0f + 1.5707964f ) * 0.2f + (rfloat)sin( phase + phase ) ) * scaled * 0.75f;
 }
 
 /*
@@ -3366,7 +3257,7 @@ float BG_GetHorizontalBobFactor( const playerState_t *ps, float phase, float amp
 	if ( scaled > maxAmplitude ) {
 		scaled = maxAmplitude;
 	}
-	return (float)( scaled * sin( phase ) );
+	return scaled * FCAST( sin( phase ) );
 }
 
 /*
@@ -3384,7 +3275,6 @@ void BG_CalculateWeaponPosition_BasePosition_angles( pmWeaponAngleState_t *state
 	float target[3];
 	float minSpeed;
 	float frac;
-	float rate;
 	float delta;
 	float limit;
 	int eFlags;
@@ -3392,7 +3282,7 @@ void BG_CalculateWeaponPosition_BasePosition_angles( pmWeaponAngleState_t *state
 
 	ps = state->ps;
 	eFlags = ps->eFlags;
-	weaponInfo = bg_weaponInfo[ps->weapon];
+	weaponInfo = BG_GetInfoForWeapon( ps->weapon );
 
 	if ( eFlags & EF_PRONE ) {
 		minSpeed = weaponInfo->proneRotMinSpeed;
@@ -3402,18 +3292,17 @@ void BG_CalculateWeaponPosition_BasePosition_angles( pmWeaponAngleState_t *state
 		minSpeed = weaponInfo->standRotMinSpeed;
 	}
 
-	if ( minSpeed >= state->speed || ps->weaponstate == WEAPON_RELOADING ) {
-		target[0] = 0.0f;
-		target[1] = 0.0f;
-		target[2] = 0.0f;
-	} else {
-		frac = (float)( ( state->speed - minSpeed ) / ( (double)ps->speed - minSpeed ) );
-		if ( frac < 0.0f ) {
+	if ( minSpeed < state->speed && ps->weaponstate != WEAPON_RELOADING ) {
+		frac = ( (rfloat)state->speed - minSpeed ) / ( (rfloat)ps->speed - minSpeed );
+		// keep: constant-first compares match original codegen
+		if ( !( 0.0f > frac ) ) {
+			if ( 1.0f < frac ) {
+				frac = 1.0f;
+			}
+		} else {
 			frac = 0.0f;
-		} else if ( frac > 1.0f ) {
-			frac = 1.0f;
 		}
-		if ( ps->eFlags & EF_PRONE ) {
+		if ( eFlags & EF_PRONE ) {
 			target[0] = frac * weaponInfo->proneRotP;
 			target[1] = frac * weaponInfo->proneRotY;
 			target[2] = frac * weaponInfo->proneRotR;
@@ -3426,6 +3315,8 @@ void BG_CalculateWeaponPosition_BasePosition_angles( pmWeaponAngleState_t *state
 			target[1] = frac * weaponInfo->standRotY;
 			target[2] = frac * weaponInfo->standRotR;
 		}
+	} else {
+		VectorClear( target );
 	}
 
 	if ( ps->fWeaponPosFrac != 0.0f ) {
@@ -3440,11 +3331,10 @@ void BG_CalculateWeaponPosition_BasePosition_angles( pmWeaponAngleState_t *state
 			continue;
 		}
 		if ( (float)ps->proneViewHeight == ps->viewHeightCurrent ) {
-			rate = weaponInfo->posProneRotRate;
+			delta = ( target[i] - state->moveOffset[i] ) * weaponInfo->posProneRotRate * state->frametime;
 		} else {
-			rate = weaponInfo->posRotRate;
+			delta = ( target[i] - state->moveOffset[i] ) * weaponInfo->posRotRate * state->frametime;
 		}
-		delta = ( target[i] - state->moveOffset[i] ) * rate * state->frametime;
 		if ( state->moveOffset[i] < target[i] ) {
 			limit = state->frametime * 0.1f;
 			if ( delta < limit ) {
@@ -3466,15 +3356,17 @@ void BG_CalculateWeaponPosition_BasePosition_angles( pmWeaponAngleState_t *state
 		}
 	}
 
-	if ( ps->fWeaponPosFrac == 0.0f ) {
+	if ( ps->fWeaponPosFrac != 0.0f ) {
+		if ( ps->fWeaponPosFrac < 0.5f ) {
+			float fade = 1.0f - ( ps->fWeaponPosFrac + ps->fWeaponPosFrac );
+			angles[0] = fade * state->moveOffset[0] + angles[0];
+			angles[1] = fade * state->moveOffset[1] + angles[1];
+			angles[2] = fade * state->moveOffset[2] + angles[2];
+		}
+	} else {
 		angles[0] = state->moveOffset[0] + angles[0];
 		angles[1] = state->moveOffset[1] + angles[1];
 		angles[2] = state->moveOffset[2] + angles[2];
-	} else if ( ps->fWeaponPosFrac < 0.5f ) {
-		float fade = 1.0f - ( ps->fWeaponPosFrac + ps->fWeaponPosFrac );
-		angles[0] = fade * state->moveOffset[0] + angles[0];
-		angles[1] = fade * state->moveOffset[1] + angles[1];
-		angles[2] = fade * state->moveOffset[2] + angles[2];
 	}
 }
 
@@ -3485,10 +3377,12 @@ BG_CalculateWeaponPosition_BaseAngles
 */
 void BG_CalculateWeaponPosition_BaseAngles( pmWeaponAngleState_t *state, vec3_t angles ) {
 	const weaponInfo_t *weaponInfo;
+	const playerState_t *ps;
 
-	weaponInfo = bg_weaponInfo[state->ps->weapon];
+	ps = state->ps;
+	weaponInfo = bg_weaponInfo[ps->weapon];
 	if ( weaponInfo->aimDownSight ) {
-		angles[0] = weaponInfo->adsAimPitch * state->ps->fWeaponPosFrac + angles[0];
+		angles[0] = weaponInfo->adsAimPitch * ps->fWeaponPosFrac + angles[0];
 	}
 	BG_CalculateWeaponPosition_BasePosition_angles( state, angles );
 }
@@ -3506,19 +3400,18 @@ void BG_CalculateWeaponPosition_IdleAngles( pmWeaponAngleState_t *state, vec3_t 
 	const playerState_t *ps;
 	float amount;
 	float stanceScale;
-	float step;
 	float idle;
 
 	ps = state->ps;
-	weaponInfo = bg_weaponInfo[ps->weapon];
+	weaponInfo = BG_GetInfoForWeapon( ps->weapon );
 
-	if ( weaponInfo->aimDownSight ) {
+	if ( BG_IsAimDownSightWeapon( ps->weapon ) ) {
 		amount = ( weaponInfo->adsIdleAmount - weaponInfo->hipIdleAmount ) * ps->fWeaponPosFrac
 				 + weaponInfo->hipIdleAmount;
-	} else if ( weaponInfo->hipIdleAmount == 0.0f ) {
-		amount = 80.0f;
-	} else {
+	} else if ( weaponInfo->hipIdleAmount != 0.0f ) {
 		amount = weaponInfo->hipIdleAmount;
+	} else {
+		amount = 80.0f;
 	}
 
 	if ( ps->eFlags & EF_PRONE ) {
@@ -3530,32 +3423,31 @@ void BG_CalculateWeaponPosition_IdleAngles( pmWeaponAngleState_t *state, vec3_t 
 	}
 
 	if ( stanceScale != state->idleScale ) {
-		step = state->frametime * 0.5f;
-		if ( stanceScale < state->idleScale ) {
-			state->idleScale = state->idleScale - step;
-			if ( state->idleScale < stanceScale ) {
+		if ( stanceScale > state->idleScale ) {
+			state->idleScale = state->idleScale + state->frametime * 0.5f;
+			if ( state->idleScale > stanceScale ) {
 				state->idleScale = stanceScale;
 			}
 		} else {
-			state->idleScale = state->idleScale + step;
-			if ( state->idleScale > stanceScale ) {
+			state->idleScale = state->idleScale - state->frametime * 0.5f;
+			if ( state->idleScale < stanceScale ) {
 				state->idleScale = stanceScale;
 			}
 		}
 	}
 
 	idle = amount * state->idleScale;
-	angles[2] = (float)( sin( state->time * 0.0005f ) * idle * 0.04f + angles[2] );
-	angles[1] = (float)( sin( state->time * 0.0007f ) * idle * 0.01f + angles[1] );
-	angles[0] = (float)( sin( state->time * 0.001f ) * idle * 0.01f + angles[0] );
+	angles[2] = FCAST( sin( state->time * 0.0005f ) ) * idle * 0.04f + angles[2];
+	angles[1] = FCAST( sin( state->time * 0.0007f ) ) * idle * 0.01f + angles[1];
+	angles[0] = FCAST( sin( state->time * 0.001f ) ) * idle * 0.01f + angles[0];
 }
 
 /*
 ==============
 BG_CalculateWeaponPosition_BobOffset
 
-The roll term is retail's min( horizontal bob, 0 ): only the negative half of
-the cycle rolls the weapon.
+The roll term is min( horizontal bob, 0 ): only the negative half of the
+cycle rolls the weapon.
 ==============
 */
 void BG_CalculateWeaponPosition_BobOffset( pmWeaponAngleState_t *state, vec3_t angles ) {
@@ -3563,34 +3455,36 @@ void BG_CalculateWeaponPosition_BobOffset( pmWeaponAngleState_t *state, vec3_t a
 	const playerState_t *ps;
 	float phase;
 	float amplitude;
-	float pitch;
-	float yaw;
-	float roll;
-	float adsScale;
+	vec3_t bob;
+	float adsFrac;
+	
 
 	ps = state->ps;
 	weaponInfo = bg_weaponInfo[ps->weapon];
 
-	phase = (byte)ps->bobCycle * 0.024639944f + 6.2831855f + 7.0685835f;
+	phase = ( ps->bobCycle & 0xFF ) * 0.024639944f + 6.2831855f;
+	phase = phase + 7.0685835f;
 	amplitude = state->speed * 0.16f;
 
-	pitch = BG_GetVerticalBobFactor( ps, phase, amplitude, 10.0f ) * -1.0f;
-	yaw = BG_GetHorizontalBobFactor( ps, phase, amplitude, 10.0f ) * -1.0f;
-	roll = BG_GetHorizontalBobFactor( ps, phase - 0.47123894f, amplitude * 1.5f, 10.0f );
-	if ( roll >= 0.0f ) {
-		roll = 0.0f;
+	bob[0] = BG_GetVerticalBobFactor( ps, phase, amplitude, 10.0f ) * -1.0f;
+	bob[1] = BG_GetHorizontalBobFactor( ps, phase, amplitude, 10.0f ) * -1.0f;
+	phase = phase - 0.47123894f;
+	amplitude = amplitude * 1.5f;
+	bob[2] = BG_GetHorizontalBobFactor( ps, phase, amplitude, 10.0f ) < 0.0f
+			 ? BG_GetHorizontalBobFactor( ps, phase, amplitude, 10.0f ) : 0.0f;
+
+	adsFrac = ps->fWeaponPosFrac;
+	if ( adsFrac != 0.0f ) {
+		// keep: phase reused for the ADS scale
+		phase = 1.0f - adsFrac * ( 1.0f - weaponInfo->adsBobFactor );
+		bob[0] = bob[0] * phase;
+		bob[1] = bob[1] * phase;
+		bob[2] = bob[2] * phase;
 	}
 
-	if ( ps->fWeaponPosFrac != 0.0f ) {
-		adsScale = 1.0f - ps->fWeaponPosFrac * ( 1.0f - weaponInfo->adsBobFactor );
-		pitch = pitch * adsScale;
-		yaw = yaw * adsScale;
-		roll = roll * adsScale;
-	}
-
-	angles[0] = pitch + angles[0];
-	angles[1] = yaw + angles[1];
-	angles[2] = roll + angles[2];
+	angles[0] = bob[0] + angles[0];
+	angles[1] = bob[1] + angles[1];
+	angles[2] = bob[2] + angles[2];
 }
 
 /*
@@ -3598,7 +3492,9 @@ void BG_CalculateWeaponPosition_BobOffset( pmWeaponAngleState_t *state, vec3_t a
 BG_CalculateWeaponPosition_DamageKick
 
 100 ms in, 400 ms out, both eased; ADS keeps more of the kick on scoped
-weapons.
+weapons.  The ease is GetLeanFraction inlined.
+
+keep: each branch applies the kick itself, matches original codegen
 ==============
 */
 void BG_CalculateWeaponPosition_DamageKick( pmWeaponAngleState_t *state, vec3_t angles ) {
@@ -3619,28 +3515,27 @@ void BG_CalculateWeaponPosition_DamageKick( pmWeaponAngleState_t *state, vec3_t 
 	inTime = 100.0f * scale;
 	outTime = scale * 400.0f;
 	if ( ps->fWeaponPosFrac != 0.0f ) {
-		if ( bg_weaponInfo[ps->weapon]->adsOverlayReticle ) {
+		if ( bg_weaponInfo[ps->weapon]->adsOverlayReticle != WEAPOVERLAYRETICLE_NONE ) {
 			scale = scale * ( 1.0f - ps->fWeaponPosFrac * 0.75f );
 		}
 	}
 
 	elapsed = (float)( state->time - state->viewKickStartTime );
-	if ( elapsed >= inTime ) {
+	if ( elapsed < inTime ) {
+		kick = scale * GetLeanFraction( elapsed / inTime );
+		angles[0] = kick * state->viewKickPitch * 0.5f + angles[0];
+		angles[1] = angles[1] - kick * state->viewKickYaw;
+		angles[2] = kick * state->viewKickYaw * 0.5f + angles[2];
+	} else {
 		ease = 1.0f - ( elapsed - inTime ) / outTime;
-		if ( ease <= 0.0f ) {
+		if ( !( ease > 0.0f ) ) {
 			return;
 		}
-		ease = 1.0f - ease;
-		ease = 1.0f - ( 2.0f - (float)fabs( ease ) ) * ease;
-	} else {
-		ease = elapsed / inTime;
-		ease = ( 2.0f - (float)fabs( ease ) ) * ease;
+		kick = scale * ( 1.0f - GetLeanFraction( 1.0f - ease ) );
+		angles[0] = kick * state->viewKickPitch * 0.5f + angles[0];
+		angles[1] = angles[1] - kick * state->viewKickYaw;
+		angles[2] = kick * state->viewKickYaw * 0.5f + angles[2];
 	}
-
-	kick = scale * ease;
-	angles[0] = kick * state->viewKickPitch * 0.5f + angles[0];
-	angles[1] = angles[1] - kick * state->viewKickYaw;
-	angles[2] = kick * state->viewKickYaw * 0.5f + angles[2];
 }
 
 /*
@@ -3650,61 +3545,63 @@ BG_CalculateWeaponPosition_GunRecoil_SingleAngle
 One axis of the gun kick spring.  Returns qtrue once the axis has settled.
 ==============
 */
-qboolean BG_CalculateWeaponPosition_GunRecoil_SingleAngle( float *speed, float *angle, float frametime,
+qboolean BG_CalculateWeaponPosition_GunRecoil_SingleAngle( float *angle, float *speed, float frametime,
 														   float maxAngle, float accel, float maxSpeed,
 														   float speedDecay, float staticDecay ) {
+	qboolean canStop;
+
+	canStop = qfalse;
 	if ( fabs( *angle ) < 0.25f && fabs( *speed ) < 1.0f ) {
 		*angle = 0.0f;
 		*speed = 0.0f;
-		return qtrue;
-	}
-
-	*angle = frametime * *speed + *angle;
-	if ( *angle > maxAngle ) {
-		*angle = maxAngle;
-		if ( *speed > 0.0f ) {
-			*speed = 0.0f;
-		}
-	} else if ( *angle < -maxAngle ) {
-		*angle = -maxAngle;
-		if ( *speed < 0.0f ) {
-			*speed = 0.0f;
-		}
-	}
-
-	if ( *angle > 0.0f ) {
-		*speed = *speed - frametime * accel;
-	} else if ( *angle < 0.0f ) {
-		*speed = frametime * accel + *speed;
-	}
-
-	*speed = *speed - frametime * *speed * speedDecay;
-	if ( *speed > 0.0f ) {
-		*speed = *speed - frametime * staticDecay;
-		if ( *speed < 0.0f ) {
-			*speed = 0.0f;
-		}
+		canStop = qtrue;
 	} else {
-		*speed = *speed + frametime * staticDecay;
+		*angle = frametime * *speed + *angle;
+		if ( *angle > maxAngle ) {
+			*angle = maxAngle;
+			if ( *speed > 0.0f ) {
+				*speed = 0.0f;
+			}
+		} else if ( *angle < -maxAngle ) {
+			*angle = -maxAngle;
+			if ( *speed < 0.0f ) {
+				*speed = 0.0f;
+			}
+		}
+
+		if ( *angle > 0.0f ) {
+			*speed = *speed - frametime * accel;
+		} else if ( *angle < 0.0f ) {
+			*speed = frametime * accel + *speed;
+		}
+
+		*speed = *speed - frametime * *speed * speedDecay;
 		if ( *speed > 0.0f ) {
-			*speed = 0.0f;
+			*speed = *speed - frametime * staticDecay;
+			if ( *speed < 0.0f ) {
+				*speed = 0.0f;
+			}
+		} else {
+			*speed = *speed + frametime * staticDecay;
+			if ( *speed > 0.0f ) {
+				*speed = 0.0f;
+			}
+		}
+
+		if ( *speed > maxSpeed ) {
+			*speed = maxSpeed;
+		} else if ( -maxSpeed > *speed ) {
+			*speed = -maxSpeed;
 		}
 	}
-
-	if ( *speed > maxSpeed ) {
-		*speed = maxSpeed;
-	} else if ( -maxSpeed > *speed ) {
-		*speed = -maxSpeed;
-	}
-	return qfalse;
+	return canStop;
 }
 
 /*
 ==============
 BG_CalculateWeaponPosition_GunRecoil
 
-Integrated in 5 ms steps.  Weapons without aimDownSight get no gun recoil at
-all -- the whole body is inside that test in retail.
+Integrated in 5 ms steps.  Weapons without aimDownSight get no gun recoil.
 ==============
 */
 void BG_CalculateWeaponPosition_GunRecoil( pmWeaponAngleState_t *state, vec3_t angles ) {
@@ -3719,43 +3616,39 @@ void BG_CalculateWeaponPosition_GunRecoil( pmWeaponAngleState_t *state, vec3_t a
 	qboolean donePitch;
 	qboolean doneYaw;
 
-	weaponInfo = bg_weaponInfo[state->ps->weapon];
-	if ( !weaponInfo->aimDownSight ) {
+	weaponInfo = BG_GetInfoForWeapon( state->ps->weapon );
+	if ( !BG_IsAimDownSightWeapon( state->ps->weapon ) ) {
 		return;
 	}
 
 	adsFrac = state->ps->fWeaponPosFrac;
 	remaining = state->frametime;
+	accel = ( weaponInfo->adsGunKickAccel - weaponInfo->hipGunKickAccel ) * adsFrac
+			+ weaponInfo->hipGunKickAccel;
+	maxSpeed = ( weaponInfo->adsGunKickSpeedMax - weaponInfo->hipGunKickSpeedMax ) * adsFrac
+			   + weaponInfo->hipGunKickSpeedMax;
 	speedDecay = ( weaponInfo->adsGunKickSpeedDecay - weaponInfo->hipGunKickSpeedDecay ) * adsFrac
 				 + weaponInfo->hipGunKickSpeedDecay;
 	staticDecay = ( weaponInfo->adsGunKickStaticDecay - weaponInfo->hipGunKickStaticDecay ) * adsFrac
 				  + weaponInfo->hipGunKickStaticDecay;
 
-	if ( remaining > 0.0f ) {
-		accel = ( weaponInfo->adsGunKickAccel - weaponInfo->hipGunKickAccel ) * adsFrac
-				+ weaponInfo->hipGunKickAccel;
-		maxSpeed = ( weaponInfo->adsGunKickSpeedMax - weaponInfo->hipGunKickSpeedMax ) * adsFrac
-				   + weaponInfo->hipGunKickSpeedMax;
-		while ( 1 ) {
-			if ( remaining > 0.005f ) {
-				step = 0.0049999999f;
-				remaining = remaining - 0.005f;
-			} else {
-				step = remaining;
-				remaining = 0.0f;
-			}
-			donePitch = BG_CalculateWeaponPosition_GunRecoil_SingleAngle( &state->recoilPitchSpeed, &state->recoilPitch,
-																		  step, weaponInfo->gunMaxPitch, accel,
-																		  maxSpeed, speedDecay, staticDecay );
-			doneYaw = BG_CalculateWeaponPosition_GunRecoil_SingleAngle( &state->recoilYawSpeed, &state->recoilYaw,
-																		step, weaponInfo->gunMaxYaw, accel,
-																		maxSpeed, speedDecay, staticDecay );
-			if ( doneYaw && donePitch ) {
-				break;
-			}
-			if ( remaining <= 0.0f ) {
-				break;
-			}
+	while ( remaining > 0.0f ) {
+		// keep: the tests use the double 0.005, the step the float
+		if ( remaining > 0.005 ) {
+			step = 0.0049999999f;
+			remaining = (float)( remaining - 0.005 );
+		} else {
+			step = remaining;
+			remaining = 0.0f;
+		}
+		donePitch = BG_CalculateWeaponPosition_GunRecoil_SingleAngle( &state->recoilPitch, &state->recoilPitchSpeed,
+																	  step, weaponInfo->gunMaxPitch, accel,
+																	  maxSpeed, speedDecay, staticDecay );
+		doneYaw = BG_CalculateWeaponPosition_GunRecoil_SingleAngle( &state->recoilYaw, &state->recoilYawSpeed,
+																	step, weaponInfo->gunMaxYaw, accel,
+																	maxSpeed, speedDecay, staticDecay );
+		if ( doneYaw && donePitch ) {
+			break;
 		}
 	}
 
@@ -3774,14 +3667,14 @@ void BG_CalculateWeaponAngles( pmWeaponAngleState_t *state, vec3_t angles ) {
 	const playerState_t *ps;
 
 	ps = state->ps;
-	angles[0] = 0.0f;
-	angles[1] = 0.0f;
-	angles[2] = 0.0f;
+	VectorClear( angles );
 
 	if ( ps->leanf != 0.0f ) {
-		angles[2] = ( 2.0f - (float)fabs( ps->leanf ) ) * ps->leanf * -2.0f;
+		angles[2] = GetLeanFraction( ps->leanf ) * -2.0f;
 	}
 
+	// keep: re-read matches original codegen
+	ps = state->ps;
 	weaponInfo = bg_weaponInfo[ps->weapon];
 	if ( weaponInfo->aimDownSight ) {
 		angles[0] = weaponInfo->adsAimPitch * ps->fWeaponPosFrac;
@@ -3800,6 +3693,8 @@ void BG_CalculateWeaponAngles( pmWeaponAngleState_t *state, vec3_t angles ) {
 /*
 ==============
 BG_CalculateView_DamageKick
+
+Same shape as BG_CalculateWeaponPosition_DamageKick.
 ==============
 */
 void BG_CalculateView_DamageKick( bgViewAngleState_t *state, vec3_t angles ) {
@@ -3818,27 +3713,25 @@ void BG_CalculateView_DamageKick( bgViewAngleState_t *state, vec3_t angles ) {
 	half = ps->fWeaponPosFrac * 0.5f;
 	scale = 1.0f - half;
 	if ( ps->fWeaponPosFrac != 0.0f ) {
-		if ( bg_weaponInfo[ps->weapon]->adsOverlayReticle ) {
+		if ( bg_weaponInfo[ps->weapon]->adsOverlayReticle != WEAPOVERLAYRETICLE_NONE ) {
 			scale = scale * ( half + 1.0f );
 		}
 	}
 
 	elapsed = (float)( state->time - state->viewKickStartTime );
-	if ( elapsed >= 100.0f ) {
+	if ( elapsed < 100.0f ) {
+		kick = scale * GetLeanFraction( elapsed * 0.0099999998f );
+		angles[0] = kick * state->viewKickPitch + angles[0];
+		angles[2] = kick * state->viewKickRoll + angles[2];
+	} else {
 		ease = 1.0f - ( elapsed - 100.0f ) * 0.0024999999f;
-		if ( ease <= 0.0f ) {
+		if ( !( ease > 0.0f ) ) {
 			return;
 		}
-		ease = 1.0f - ease;
-		ease = 1.0f - ( 2.0f - (float)fabs( ease ) ) * ease;
-	} else {
-		ease = elapsed * 0.0099999998f;
-		ease = ( 2.0f - (float)fabs( ease ) ) * ease;
+		kick = scale * ( 1.0f - GetLeanFraction( 1.0f - ease ) );
+		angles[0] = kick * state->viewKickPitch + angles[0];
+		angles[2] = kick * state->viewKickRoll + angles[2];
 	}
-
-	kick = scale * ease;
-	angles[0] = kick * state->viewKickPitch + angles[0];
-	angles[2] = kick * state->viewKickRoll + angles[2];
 }
 
 /*
@@ -3855,11 +3748,11 @@ void BG_CalculateView_Velocity( bgViewAngleState_t *state, vec3_t angles ) {
 
 	ps = state->ps;
 	weaponInfo = bg_weaponInfo[ps->weapon];
-	if ( ( ps->eFlags & EF_MOUNTED ) || ps->fWeaponPosFrac == 0.0f || weaponInfo->adsViewBobMult == 0.0f ) {
+	if ( ( ps->eFlags & EF_TURRET_ACTIVE ) || ps->fWeaponPosFrac == 0.0f || weaponInfo->adsViewBobMult == 0.0f ) {
 		return;
 	}
 
-	phase = (byte)ps->bobCycle * 0.024639944f + 6.2831855f;
+	phase = ( ps->bobCycle & 0xFF ) * 0.024639944f + 6.2831855f;
 	angles[0] = angles[0] - BG_GetVerticalBobFactor( ps, phase, state->speed, 45.0f )
 				* weaponInfo->adsViewBobMult * ps->fWeaponPosFrac;
 	angles[1] = angles[1] - BG_GetHorizontalBobFactor( ps, phase, state->speed, 45.0f )
@@ -3872,9 +3765,7 @@ BG_CalculateViewAngles
 ==============
 */
 void BG_CalculateViewAngles( bgViewAngleState_t *state, vec3_t angles ) {
-	angles[0] = 0.0f;
-	angles[1] = 0.0f;
-	angles[2] = 0.0f;
+	VectorClear( angles );
 	BG_CalculateView_DamageKick( state, angles );
 	BG_CalculateView_Velocity( state, angles );
 }
@@ -3892,9 +3783,9 @@ float BG_WeaponTrackValue( float target, float current, float rate, int msec ) {
 	float step;
 
 	diff = target - current;
-	step = msec * 0.001f * diff * rate;
-	// the qword at 0x2005f8a8 is (double)0.001f, 0x3F50624DE0000000 -- not 0.001
-	if ( fabs( diff ) <= 0.001f || fabs( diff ) < fabs( step ) ) {
+	step = diff * ( msec * 0.001f ) * rate;
+	// keep: the double (float)0.001f, and !( a > b ) so a NaN diff snaps to target
+	if ( !( fabs( diff ) > 0.001f ) || fabs( diff ) < fabs( step ) ) {
 		return target;
 	}
 	return step + current;
@@ -3906,23 +3797,34 @@ BG_CalculateWeaponPosition_Sway
 
 Track the view-angle delta into the weapon sway offsets and angles.  Scoped
 weapons do not sway once they are up.
+
+keep: improve-float-consistency (/Op) code, matches original codegen
 ==============
 */
-void BG_CalculateWeaponPosition_Sway( vec3_t swayOffsets, vec3_t swayAngles, const playerState_t *ps,
-									  vec3_t previousViewAngles, float scale, int msec ) {
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", on )
+#endif
+#if defined(GAMEDLL)
+void BG_CalculateWeaponPosition_Sway( const playerState_t *ps, vec3_t previousViewAngles,
+                                     vec3_t swayOffsets, vec3_t swayAngles, float scale, int msec )
+#else
+void BG_CalculateWeaponPosition_Sway( const playerState_t *ps, vec3_t swayOffsets,
+                                     vec3_t swayAngles, vec3_t previousViewAngles, float scale, int msec )
+#endif
+{
 	const weaponInfo_t *weaponInfo;
 	float adsFrac;
 	float maxAngle;
 	float lerpSpeed;
 	float pitchScale, yawScale, horizScale, vertScale;
-	float pitchDelta, yawDelta;
-	float target;
+	vec3_t angleDelta;
+	vec3_t offsetTarget;
 
 	weaponInfo = bg_weaponInfo[ps->weapon];
 	adsFrac = ps->fWeaponPosFrac;
 
 	if ( weaponInfo->aimDownSight ) {
-		if ( adsFrac > 0.0f && weaponInfo->adsOverlayReticle ) {
+		if ( adsFrac > 0.0f && weaponInfo->adsOverlayReticle != WEAPOVERLAYRETICLE_NONE ) {
 			return;
 		}
 		maxAngle = ( weaponInfo->adsSwayMaxAngle - weaponInfo->swayMaxAngle ) * adsFrac + weaponInfo->swayMaxAngle;
@@ -3939,42 +3841,47 @@ void BG_CalculateWeaponPosition_Sway( vec3_t swayOffsets, vec3_t swayAngles, con
 		horizScale = weaponInfo->swayHorizScale;
 		vertScale = weaponInfo->swayVertScale;
 	}
-
 	pitchScale = pitchScale * scale;
 	yawScale = yawScale * scale;
 	horizScale = horizScale * scale;
 	vertScale = vertScale * scale;
 
-	pitchDelta = AngleSubtract( ps->viewangles[0], previousViewAngles[0] );
-	yawDelta = AngleSubtract( ps->viewangles[1], previousViewAngles[1] );
+	angleDelta[0] = AngleSubtract( ps->viewangles[0], previousViewAngles[0] );
+	angleDelta[1] = AngleSubtract( ps->viewangles[1], previousViewAngles[1] );
 
-	if ( pitchDelta < -maxAngle ) {
-		pitchDelta = -maxAngle;
-	} else if ( pitchDelta > maxAngle ) {
-		pitchDelta = maxAngle;
+	if ( angleDelta[0] < -maxAngle ) {
+		angleDelta[0] = -maxAngle;
+	} else if ( angleDelta[0] > maxAngle ) {
+		angleDelta[0] = maxAngle;
 	}
-	if ( yawDelta < -maxAngle ) {
-		yawDelta = -maxAngle;
-	} else if ( yawDelta > maxAngle ) {
-		yawDelta = maxAngle;
+	if ( angleDelta[1] < -maxAngle ) {
+		angleDelta[1] = -maxAngle;
+	} else if ( angleDelta[1] > maxAngle ) {
+		angleDelta[1] = maxAngle;
 	}
 
-	swayOffsets[1] = BG_WeaponTrackValue( yawDelta * horizScale, swayOffsets[1], lerpSpeed, msec );
-	swayOffsets[2] = BG_WeaponTrackValue( pitchDelta * vertScale, swayOffsets[2], lerpSpeed, msec );
+	offsetTarget[1] = angleDelta[1] * horizScale;
+	offsetTarget[2] = angleDelta[0] * vertScale;
+	swayOffsets[1] = BG_WeaponTrackValue( offsetTarget[1], swayOffsets[1], lerpSpeed, msec );
+	swayOffsets[2] = BG_WeaponTrackValue( offsetTarget[2], swayOffsets[2], lerpSpeed, msec );
 
-	target = pitchDelta * pitchScale;
-	while ( target - swayAngles[0] > 180.0f ) {
-		target = target - 360.0f;
+	angleDelta[0] = angleDelta[0] * pitchScale;
+	angleDelta[1] = angleDelta[1] * yawScale;
+	while ( angleDelta[0] - swayAngles[0] > 180.0f ) {
+		angleDelta[0] = angleDelta[0] - 360.0f;
 	}
-	swayAngles[0] = AngleNormalize180( BG_WeaponTrackValue( target, swayAngles[0], lerpSpeed, msec ) );
-
-	target = yawDelta * yawScale;
-	while ( target - swayAngles[1] > 180.0f ) {
-		target = target - 360.0f;
+	while ( angleDelta[1] - swayAngles[1] > 180.0f ) {
+		angleDelta[1] = angleDelta[1] - 360.0f;
 	}
-	swayAngles[1] = AngleNormalize180( BG_WeaponTrackValue( target, swayAngles[1], lerpSpeed, msec ) );
+	swayAngles[0] = BG_WeaponTrackValue( angleDelta[0], swayAngles[0], lerpSpeed, msec );
+	swayAngles[1] = BG_WeaponTrackValue( angleDelta[1], swayAngles[1], lerpSpeed, msec );
+	swayAngles[0] = AngleNormalize180( swayAngles[0] );
+	swayAngles[1] = AngleNormalize180( swayAngles[1] );
 
 	previousViewAngles[0] = ps->viewangles[0];
 	previousViewAngles[1] = ps->viewangles[1];
 	previousViewAngles[2] = ps->viewangles[2];
 }
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", off )
+#endif

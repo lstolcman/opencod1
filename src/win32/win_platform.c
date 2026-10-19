@@ -10,7 +10,14 @@
 #include <string.h>
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/cod1_globals.h"
+#include "../qcommon/win_vars.h"
+/* ---- module-owned globals ---- */
+int eventHead;
+int eventTail;
+WinVars_t g_wv;	/* 0x016C35E0 */
+COD1_ASSERT_SIZE( WinVars_t, 0xB0 );
+unsigned char s_userName[1024];
+
 
 extern int      Sys_GetPacket( msg_t *msg, netadr_t *from );
 extern char     *Sys_ConsoleInput( void );
@@ -19,25 +26,32 @@ extern void     Sys_Net_Restart_f( void );
 extern int      Sys_GetProcessorId( void );
 extern int __stdcall MainWndProc( void *hWnd, unsigned Msg,
                                   unsigned wParam, long lParam );
-extern int      FS_ExtractFromPakFile_m( char *ospath, int game, char *qpath );
-extern void     FS_BuildOSPath_Internal( const char *base, const char *qpath,
-                                         char *out, int allowOverflow );
+/* Retail's only caller pushes a fourth 0 (0x00463470) that the callee never reads. */
+extern int      FS_ExtractFromPakFile_m( char *ospath, int game, char *qpath, int unused );
 /* The retail join, universal/com_files.c 0x00428EE0: three components, and an empty `game` defaults to fs_gamedir. */
 extern void     FS_BuildOSPath3( const char *base, const char *game,
                                  const char *qpath, char *out,
                                  int allowOverflow );
 
-extern int      g_wv_hInstance;
+/* win32/win_main.c, retail 0x00462450 (localization.txt key lookup) */
+extern char     *SEH_GetLocalizedString_m( const char *key );
 
-int             g_wv_sysMsgTime;
+
+
+unsigned __int32 sys_timeBase;  /* 0x016C35C0 */
+signed __int32 sys_timeBaseInit;   /* 0x014073B8 */
 
 /* ---- Sys_Milliseconds  0x004659D0 ----  VERIFIED */
 int Sys_Milliseconds( void ) {
+	int sys_curtime;
+
 	if ( !sys_timeBaseInit ) {
 		sys_timeBase = (int) timeGetTime();
 		sys_timeBaseInit = 1;
 	}
-	return (int) timeGetTime() - sys_timeBase;
+	sys_curtime = (int) timeGetTime() - sys_timeBase;
+
+	return sys_curtime;
 }
 
 #define MAX_QUED_EVENTS     256
@@ -105,14 +119,15 @@ sysEvent_t Sys_GetEvent( void ) {
 		char    *b;
 		int     len;
 
+		/* Retail 0x0046373F (Sys_ConsoleInput inlined): the line ends in the
+		 * '\n' InputLineWndProc appended; Q_strncpyz to len - 1 chops it,
+		 * but allocates and queues strlen + 1 bytes (the RTCW form). */
 		len = strlen( s ) + 1;
 		b = Z_MallocInternal( len );
-		Q_strncpyz( b, s, len );
-		/* len, not len - 1: win_syscon_console.c's Sys_ConsoleInput already strips the newline. */
+		Q_strncpyz( b, s, len - 1 );
 		Sys_QueEvent( 0, SE_CONSOLE, 0, 0, len, b );
 	}
 
-	memset( &adr, 0, sizeof( adr ) );
 	MSG_Init( &netmsg, sys_packetReceived, sizeof( sys_packetReceived ) );
 	if ( Sys_GetPacket( &netmsg, &adr ) ) {
 		netadr_t    *buf;
@@ -136,51 +151,75 @@ sysEvent_t Sys_GetEvent( void ) {
 	return ev;
 }
 
-/* ---- Sys_ReadTSC  no-address ----  VERIFIED */
-static unsigned __int64 Sys_ReadTSC( void ) {
-	unsigned int lo, hi;
-
-	__asm {
-		_emit 0x0F
-		_emit 0x31
-		mov     lo, eax
-		mov     hi, edx
-	}
-
-	return ( (unsigned __int64) hi << 32 ) | lo;
-}
-
 /* ---- Sys_GetCPUSpeed  0x00460B80 ---- */
-float Sys_GetCPUSpeed( void ) {
+/* Returns the x87 st0 double; the caller (Sys_DetectHardware_m) does the
+   fstp qword to sys_cpuMHzValue.  Retail has no cache, no store and no
+   zero guard: rdtsc straight into the locals (0x00460BBB / 0x00460BD2),
+   0x00460C11 _allmul( tscEnd - tscStart, freq ) -> fild int64, fmul 1e-6
+   (0x568F08), fild int64 QPC delta, fdivp. */
+double Sys_GetCPUSpeed( void ) {
 	LARGE_INTEGER   freq, start, end;
-	unsigned __int64 tscStart, tscEnd;
-	double          elapsed;
-
-	if ( sys_cpuMHzValue != 0.0 ) {
-		return (float) sys_cpuMHzValue;
-	}
+	__int64         tscStart, tscEnd;
 
 	Sleep( 0 );
 
+	tscStart       = 0;
+	tscEnd         = 0;
+	start.QuadPart = 0;
+	end.QuadPart   = 0;
+
 	QueryPerformanceFrequency( &freq );
 	QueryPerformanceCounter( &start );
-	tscStart = Sys_ReadTSC();
+	__asm {
+		_emit 0x0F
+		_emit 0x31
+		mov     dword ptr [tscStart], eax
+		mov     dword ptr [tscStart + 4], edx
+	}
 	QueryPerformanceCounter( &start );
 
 	Sleep( 250 );
 
-	tscEnd = Sys_ReadTSC();
+	__asm {
+		_emit 0x0F
+		_emit 0x31
+		mov     dword ptr [tscEnd], eax
+		mov     dword ptr [tscEnd + 4], edx
+	}
 	QueryPerformanceCounter( &end );
 
-	elapsed = (double) ( end.QuadPart - start.QuadPart );
-	if ( elapsed <= 0.0 || freq.QuadPart == 0 ) {
-		return 0.0f;
+#ifdef COD1_VC7
+	{
+		double      mhz;	/* the named result gives retail's sub esp,2Ch frame */
+
+		mhz = (double) ( ( tscEnd - tscStart ) * freq.QuadPart ) * 0.000001
+		      / (double) ( end.QuadPart - start.QuadPart );
+		return mhz;
 	}
+#else
+	{
+		__int64     cycles, ticks;
+		double      scale = 0.000001;	/* qword 0x568F08 (0x3EB0C6F7A0B5ED8D) */
+		double      mhz;
 
-	sys_cpuMHzValue = (double) (__int64) ( tscEnd - tscStart )
-	             * (double) freq.QuadPart * 0.000001 / elapsed;
+		cycles = ( tscEnd - tscStart ) * freq.QuadPart;
+		ticks  = end.QuadPart - start.QuadPart;
 
-	return (float) sys_cpuMHzValue;
+		/* Retail fmuls the fild'd 64-bit product straight off the x87 stack, so
+		   the product is rounded once, at _PC_53, by the fmul.  A C (double) cast
+		   compiles to fild / fstp qword / fld under /fp:precise and rounds the
+		   product to 53 bits first, which double-rounds once it exceeds 2^53
+		   (~0.25 s of a 3.6 GHz TSC times a 10 MHz QPC).  st0 after fdivp is
+		   already a 53-bit value, so the fstp here is exact. */
+		__asm fild  qword ptr cycles
+		__asm fmul  qword ptr scale
+		__asm fild  qword ptr ticks
+		__asm fdivp st(1), st
+		__asm fstp  qword ptr mhz
+
+		return mhz;
+	}
+#endif
 }
 
 /* Sys_GetSystemRam 0x00460C50 */
@@ -201,73 +240,75 @@ typedef BOOL ( WINAPI *pfnGlobalMemoryStatusEx_t )( sysMemoryStatusEx_t *lpBuffe
 
 #define SYS_LOW_MEMORY_BYTES    0x8000000
 
-/* ---- Sys_FistpRound  no-address ---- */
-static int Sys_FistpRound( double x ) {
-	int i;
+/* RoundFloatToInt_m (win_shared.c, 0x00460B50): fistp of megs + (0.5 - 2^-30);
+   LTCG inlines it at both sites below, materializing the bias as a double
+   local (0x00460D0B / 0x00460E06) at each inlined copy. */
+extern int      RoundFloatToInt_m( float f );
 
-	__asm {
-		fld     x
-		fistp   i
-	}
+/* Low-memory prompt, written out at both low-memory sites of Sys_GetSystemRam
+   (0x00460C9D and 0x00460DB1; retail has no out-of-line copy, so it is not a
+   static helper): the title is resolved before the body, and anything but Yes
+   deletes the instance marker (DeleteFileA(FileName), 0x00460CC8 / 0x00460DDC)
+   and exits. */
+#define SYS_LOW_MEMORY_PROMPT() \
+	do { \
+		if ( MessageBoxA( NULL, SEH_GetLocalizedString_m( "WIN_LOW_MEMORY_BODY" ), \
+		                  SEH_GetLocalizedString_m( "WIN_LOW_MEMORY_TITLE" ), \
+		                  MB_YESNO | MB_ICONEXCLAMATION /* 0x34 */ ) != IDYES ) { \
+			Sys_DeleteInstanceMarker(); \
+			exit( 0 ); \
+		} \
+	} while ( 0 )
 
-	return i;
-}
-
-/* ---- Sys_MegsFromBytes  no-address ---- */
-static int Sys_MegsFromBytes( double bytes ) {
-	float   megs;
-	int     mb;
-
-	megs = (float) ( bytes * ( 1.0 / 1048576.0 ) );
-	mb = Sys_FistpRound( (double) megs + 0.4999999990686774 );
-
-	if ( bytes > (double) mb * 1048576.0 || mb > 1024 ) {
-		return 1024;
-	}
-	return mb;
-}
+/* VC7 compares the byte count at x87 precision; a modern float compare would
+   round it to 24 bits first. */
+#ifdef COD1_VC7
+#define SYS_RAM_BYTES( x )  ( x )
+#else
+#define SYS_RAM_BYTES( x )  ( (double) ( x ) )
+#endif
 
 /* ---- Sys_GetSystemRam  0x00460C50 ---- */
+/* No cache and no store: the caller (Sys_DetectHardware_m) keeps the result
+   in sys_sysMBValue.  Retail converts the byte count at each use (unsigned
+   __int64 or DWORD, 0x00460CDA / 0x00460DEE) and caps the result at 1 GB. */
 int Sys_GetSystemRam( void ) {
 	HMODULE                     kernel32;
 	pfnGlobalMemoryStatusEx_t   pGlobalMemoryStatusEx;
 	sysMemoryStatusEx_t         statex;
 	MEMORYSTATUS                stat;
+	int                         mb;
 
-	if ( sys_sysMBValue != 0 ) {
-		return sys_sysMBValue;
-	}
-
-	pGlobalMemoryStatusEx = NULL;
 	kernel32 = GetModuleHandleA( "kernel32.dll" );
 	if ( kernel32 ) {
 		pGlobalMemoryStatusEx = (pfnGlobalMemoryStatusEx_t)
 		                        GetProcAddress( kernel32, "GlobalMemoryStatusEx" );
+		if ( pGlobalMemoryStatusEx ) {
+			statex.dwLength = 64;
+			pGlobalMemoryStatusEx( &statex );
+
+			if ( statex.ullAvailVirtual < SYS_LOW_MEMORY_BYTES ) {
+				SYS_LOW_MEMORY_PROMPT();
+			}
+			mb = RoundFloatToInt_m( statex.ullTotalPhys * ( 1.0f / 1048576.0f ) );
+			if ( mb * 1048576.0f < SYS_RAM_BYTES( statex.ullTotalPhys ) || mb > 1024 ) {
+				mb = 1024;
+			}
+			return mb;
+		}
 	}
 
-	if ( pGlobalMemoryStatusEx ) {
-		memset( &statex, 0, sizeof( statex ) );
-		statex.dwLength = 64;
-		pGlobalMemoryStatusEx( &statex );
+	stat.dwLength = sizeof( stat );
+	GlobalMemoryStatus( &stat );
 
-		if ( statex.ullAvailVirtual < SYS_LOW_MEMORY_BYTES ) {
-			Com_Printf( "WARNING: low memory -- only %i MB of address space free\n",
-			            (int) ( statex.ullAvailVirtual >> 20 ) );
-		}
-		sys_sysMBValue = Sys_MegsFromBytes( (double) (__int64) statex.ullTotalPhys );
-	} else {
-		memset( &stat, 0, sizeof( stat ) );
-		stat.dwLength = sizeof( stat );
-		GlobalMemoryStatus( &stat );
-
-		if ( stat.dwAvailVirtual < SYS_LOW_MEMORY_BYTES ) {
-			Com_Printf( "WARNING: low memory -- only %i MB of address space free\n",
-			            (int) ( stat.dwAvailVirtual >> 20 ) );
-		}
-		sys_sysMBValue = Sys_MegsFromBytes( (double) stat.dwTotalPhys );
+	if ( stat.dwAvailVirtual < SYS_LOW_MEMORY_BYTES ) {
+		SYS_LOW_MEMORY_PROMPT();
 	}
-
-	return sys_sysMBValue;
+	mb = RoundFloatToInt_m( stat.dwTotalPhys * ( 1.0f / 1048576.0f ) );
+	if ( mb * 1048576.0f < SYS_RAM_BYTES( stat.dwTotalPhys ) || mb > 1024 ) {
+		mb = 1024;
+	}
+	return mb;
 }
 
 extern int      Sys_VideoRamFromRenderer( const char *renderer );
@@ -289,9 +330,7 @@ int Sys_GetVideoRam( void ) {
 	int         pixelformat;
 	HGLRC       hGLRC;
 	int         vidMem;
-	int         ram;
 
-	ram = 0;
 	vidMem = 0;
 
 	hWnd = CreateWindowEx( 0, "static", "dummy", 0, 0, 0, 1, 1,
@@ -328,56 +367,61 @@ int Sys_GetVideoRam( void ) {
 					}
 				}
 				FreeLibrary( hOpenGL );
-				ram = vidMem;
 			}
 			DeleteDC( hDC );
 		}
 		DestroyWindow( hWnd );
 	}
 
-	return ram;
+	return vidMem;
 }
 
 /* ---- Sys_SetConfigCvars  0x00462850 ----  VERIFIED */
 void Sys_SetConfigCvars( int configSum ) {
-	Cvar_Get( "sys_cpuMHz", "0", CVAR_ARCHIVE | CVAR_ROM );
-	Cvar_Get( "sys_sysMB", "0", CVAR_ARCHIVE | CVAR_ROM );
-	Cvar_Get( "sys_vidMB", "0", CVAR_ARCHIVE | CVAR_ROM );
+	/* retail stores all three (0x0046286D / 0x00462883 / 0x00462893) */
+	sys_cpuMHz = Cvar_Get( "sys_cpuMHz", "0", CVAR_ARCHIVE | CVAR_ROM );
+	sys_sysMB = Cvar_Get( "sys_sysMB", "0", CVAR_ARCHIVE | CVAR_ROM );
+	sys_vidMB = Cvar_Get( "sys_vidMB", "0", CVAR_ARCHIVE | CVAR_ROM );
 
-	Sys_GetCPUSpeed();
-
+	/* retail reads the stored hardware globals; it measures nothing here */
 	Cvar_Set2( "sys_cpuMHz", va( "%lg", sys_cpuMHzValue ), qtrue );
-	Cvar_Set2( "sys_sysMB", va( "%i", Sys_GetSystemRam() ), qtrue );
+	Cvar_Set2( "sys_sysMB", va( "%i", sys_sysMBValue ), qtrue );
 	Cvar_Set2( "sys_vidMB", va( "%i", sys_vidMBValue ), qtrue );
 	Cvar_Set2( "sys_configSum", va( "%i", configSum ), qtrue );
 }
 
-/* ---- Sys_ShouldReconfigure  0x00462750 ----  VERIFIED */
-qboolean Sys_ShouldReconfigure( void ) {
-	cvar_t  *cpuMHz, *sysMB, *vidMB;
-	double  measuredMHz;
-	int     measuredSysMB, measuredVidMB;
-
-	cpuMHz = Cvar_Get( "sys_cpuMHz", "0", CVAR_ARCHIVE | CVAR_ROM );
-	sysMB = Cvar_Get( "sys_sysMB", "0", CVAR_ARCHIVE | CVAR_ROM );
-	vidMB = Cvar_Get( "sys_vidMB", "0", CVAR_ARCHIVE | CVAR_ROM );
-
-	measuredMHz = (double) Sys_GetCPUSpeed();
-	measuredSysMB = Sys_GetSystemRam();
-	measuredVidMB = sys_vidMBValue;
-
-	if ( cpuMHz->value <= measuredMHz * 1.100000023841858
-	     && cpuMHz->value >= measuredMHz * 0.8999999761581421
-	     && sysMB->integer <= measuredSysMB + 32
-	     && sysMB->integer >= measuredSysMB - 32
-	     && vidMB->integer <= measuredVidMB + 16
-	     && vidMB->integer >= measuredVidMB - 16 ) {
-		return qfalse;
-	}
-
+/* ---- Sys_PromptReconfigure  0x00462710 ---- */
+/* Rewrites the cvars and asks with a localized Yes/No box (title resolved
+   before body, 0x0046271C / 0x0046272A).  Retail inlines the first call in
+   Sys_ShouldReconfigure and tail-jumps here from the second (0x00462806). */
+static qboolean Sys_PromptReconfigure( void ) {
 	Sys_SetConfigCvars( 0 );
-	Com_Printf( "Hardware configuration changed since the last run.\n" );
+	return MessageBoxA( NULL, SEH_GetLocalizedString_m( "WIN_COMPUTER_CHANGE_BODY" ),
+	                    SEH_GetLocalizedString_m( "WIN_COMPUTER_CHANGE_TITLE" ),
+	                    MB_YESNO | MB_ICONINFORMATION /* 0x44 */ ) == IDYES;
+}
 
+/* ---- Sys_ShouldReconfigure  0x00462750 ----  VERIFIED */
+/* Compares the archived cvars against the stored hardware globals
+   (sys_cpuMHzValue double, sys_sysMBValue, sys_vidMBValue).  On a mismatch
+   it prompts; Com_Init runs Com_SetRecommended(0) when the answer is Yes. */
+qboolean Sys_ShouldReconfigure( void ) {
+	sys_cpuMHz = Cvar_Get( "sys_cpuMHz", "0", CVAR_ARCHIVE | CVAR_ROM );
+	sys_sysMB = Cvar_Get( "sys_sysMB", "0", CVAR_ARCHIVE | CVAR_ROM );
+	sys_vidMB = Cvar_Get( "sys_vidMB", "0", CVAR_ARCHIVE | CVAR_ROM );
+
+	/* 0x004627B1 test ah,5 / jnp and 0x004627C9 test ah,41h / je fail only on an
+	   ordered compare, so an unordered (NaN) MHz passes both bounds */
+	if ( sys_cpuMHz->value > sys_cpuMHzValue * 1.100000023841858
+	     || sys_cpuMHz->value < sys_cpuMHzValue * 0.8999999761581421 ) {
+		return Sys_PromptReconfigure();
+	}
+	if ( sys_sysMB->integer > sys_sysMBValue + 32
+	     || sys_sysMB->integer < sys_sysMBValue - 32
+	     || sys_vidMB->integer > sys_vidMBValue + 16
+	     || sys_vidMB->integer < sys_vidMBValue - 16 ) {
+		return Sys_PromptReconfigure();
+	}
 	return qfalse;
 }
 
@@ -405,10 +449,9 @@ char *Sys_GetCurrentUser( void ) {
 #define CPUID_AMD_3DNOW             0x30
 
 /* ---- Sys_Init  0x004638C0 ----  VERIFIED */
+/* Retail calls GetVersionEx straight into g_wv.osversion (0x004638EA) and
+   re-reads sys_cpustring for every compare, as Q3 did. */
 void Sys_Init( void ) {
-	OSVERSIONINFOA  osversion;
-	const char      *arch;
-	char            *forced;
 	int             cpuid;
 
 	timeBeginPeriod( 1 );
@@ -416,34 +459,31 @@ void Sys_Init( void ) {
 	Cmd_AddCommand( "in_restart", Sys_In_Restart_f );
 	Cmd_AddCommand( "net_restart", Sys_Net_Restart_f );
 
-	memset( &osversion, 0, sizeof( osversion ) );
-	osversion.dwOSVersionInfoSize = sizeof( osversion );
-	if ( !GetVersionExA( &osversion ) ) {
+	g_wv.osversion.dwOSVersionInfoSize = sizeof( g_wv.osversion );
+	if ( !GetVersionExA( (OSVERSIONINFOA *)&g_wv.osversion ) ) {
 		Sys_Error( "Couldn't get OS info" );
 	}
-	memcpy( VersionInformation, &osversion, sizeof( osversion ) );
 
-	if ( osversion.dwMajorVersion < 4 ) {
+	if ( g_wv.osversion.dwMajorVersion < 4 ) {
 		Sys_Error( "Call of Duty Multiplayer requires Windows version 4 or greater" );
 	}
-	if ( osversion.dwPlatformId == VER_PLATFORM_WIN32s ) {
+	if ( g_wv.osversion.dwPlatformId == VER_PLATFORM_WIN32s ) {
 		Sys_Error( "Call of Duty Multiplayer doesn't run on Win32s" );
 	}
 
-	if ( osversion.dwPlatformId == VER_PLATFORM_WIN32_NT ) {
-		arch = "winnt";
-	} else if ( osversion.dwPlatformId == VER_PLATFORM_WIN32_WINDOWS ) {
-		if ( LOWORD( osversion.dwBuildNumber ) >= 0x7CE ) {
-			arch = "win98";
-		} else if ( LOWORD( osversion.dwBuildNumber ) >= 0x457 ) {
-			arch = "win95 osr2.x";
+	if ( g_wv.osversion.dwPlatformId == VER_PLATFORM_WIN32_NT ) {
+		Cvar_Set2( "arch", "winnt", qtrue );
+	} else if ( g_wv.osversion.dwPlatformId == VER_PLATFORM_WIN32_WINDOWS ) {
+		if ( LOWORD( g_wv.osversion.dwBuildNumber ) >= 0x7CE ) {
+			Cvar_Set2( "arch", "win98", qtrue );
+		} else if ( LOWORD( g_wv.osversion.dwBuildNumber ) >= 0x457 ) {
+			Cvar_Set2( "arch", "win95 osr2.x", qtrue );
 		} else {
-			arch = "win95";
+			Cvar_Set2( "arch", "win95", qtrue );
 		}
 	} else {
-		arch = "unknown Windows variant";
+		Cvar_Set2( "arch", "unknown Windows variant", qtrue );
 	}
-	Cvar_Set2( "arch", arch, qtrue );
 
 	Cvar_Get( "win_hinstance", va( "%i", g_wv_hInstance ), CVAR_ROM );
 #ifndef DEDICATED
@@ -452,8 +492,7 @@ void Sys_Init( void ) {
 
 	Cvar_Get( "sys_cpustring", "detect", 0 );
 
-	forced = Cvar_VariableString( "sys_cpustring" );
-	if ( !Q_stricmp( forced, "detect" ) ) {
+	if ( !Q_stricmp( Cvar_VariableString( "sys_cpustring" ), "detect" ) ) {
 		Com_Printf( "...detecting CPU, found " );
 
 		cpuid = Sys_GetProcessorId();
@@ -487,29 +526,29 @@ void Sys_Init( void ) {
 	} else {
 		Com_Printf( "...forcing CPU type to " );
 
-		if ( !Q_stricmp( forced, "generic" ) ) {
+		if ( !Q_stricmp( Cvar_VariableString( "sys_cpustring" ), "generic" ) ) {
 			cpuid = CPUID_GENERIC;
-		} else if ( !Q_stricmp( forced, "x87" ) ) {
+		} else if ( !Q_stricmp( Cvar_VariableString( "sys_cpustring" ), "x87" ) ) {
 			cpuid = CPUID_INTEL_PENTIUM;
-		} else if ( !Q_stricmp( forced, "mmx" ) ) {
+		} else if ( !Q_stricmp( Cvar_VariableString( "sys_cpustring" ), "mmx" ) ) {
 			cpuid = CPUID_INTEL_MMX;
-		} else if ( !Q_stricmp( forced, "3dnow" ) ) {
+		} else if ( !Q_stricmp( Cvar_VariableString( "sys_cpustring" ), "3dnow" ) ) {
 			cpuid = CPUID_AMD_3DNOW;
-		} else if ( !Q_stricmp( forced, "PentiumIII" ) ) {
+		} else if ( !Q_stricmp( Cvar_VariableString( "sys_cpustring" ), "PentiumIII" ) ) {
 			cpuid = CPUID_INTEL_KATMAI;
-		} else if ( !Q_stricmp( forced, "axp" ) ) {
+		} else if ( !Q_stricmp( Cvar_VariableString( "sys_cpustring" ), "axp" ) ) {
 			cpuid = CPUID_AXP;
 		} else {
-			Com_Printf( "WARNING: unknown sys_cpustring '%s'\n", forced );
+			Com_Printf( "WARNING: unknown sys_cpustring '%s'\n", Cvar_VariableString( "sys_cpustring" ) );
 			cpuid = CPUID_GENERIC;
 		}
 	}
 	Cvar_SetValue( "sys_cpuid", (float) cpuid );
 	Com_Printf( "%s\n", Cvar_VariableString( "sys_cpustring" ) );
 
-	Com_Printf( "Measured CPU speed is %.2lf GHz\n",
-	            (double) Sys_GetCPUSpeed() * 0.001 );
-	Com_Printf( "System memory is %i MB (capped at 1 GB)\n", Sys_GetSystemRam() );
+	/* retail reads the stored hardware globals (0x00463CB1 / 0x00463CCA) */
+	Com_Printf( "Measured CPU speed is %.2lf GHz\n", sys_cpuMHzValue * 0.001 );
+	Com_Printf( "System memory is %i MB (capped at 1 GB)\n", sys_sysMBValue );
 	Com_Printf( "Video card memory is %i MB\n", sys_vidMBValue );
 	Com_Printf( "Streaming SIMD Extensions (SSE) %ssupported\n",
 	            sys_hasSSE ? "" : "not " );
@@ -533,37 +572,30 @@ static void Sys_BuildDllPath( const char *base, const char *game,
 }
 
 /* ---- Sys_LoadDll  0x004633A0 ---- */
+/* Retail keeps fs_basepath as a pointer (no local copy) and copies the path
+   that loaded into fqpath with an inlined Q_strncpyz on each branch. */
 void *Sys_LoadDll( const char *name, char *fqpath,
                    int ( **entryPoint )( int, ... ),
                    int ( *systemcalls )( int, ... ) ) {
 	char        dllName[64];
 	char        ospath[MAX_OSPATH];
-	char        basedir[MAX_OSPATH];
-	const char  *game;
-	cvar_t      *var;
+	const char  *basepath;
+	const char  *gamedir;
 	HMODULE     libHandle;
-	const char  *loadedFrom;
 	void        ( *dllEntry )( int ( *syscallptr )( int, ... ) );
 
 	*fqpath = 0;
 
 	Com_sprintf( dllName, sizeof( dllName ), "%s_mp_x86.dll", name );
 
-	var = Cvar_FindVar( "fs_basepath" );
-	Q_strncpyz( basedir, ( var && var->string ) ? var->string : "", sizeof( basedir ) );
-
+	basepath = Cvar_VariableString( "fs_basepath" );
 	Cvar_FindVar( "fs_cdpath" );
+	gamedir = Cvar_VariableString( "fs_game" );
 
-	game = "";
-	var = Cvar_FindVar( "fs_game" );
-	if ( var ) {
-		game = var->string;
-	}
+	Sys_BuildDllPath( basepath, gamedir, dllName, ospath );
 
-	Sys_BuildDllPath( basedir, game, dllName, ospath );
-
-	if ( strncmp( name, "game", 4 ) != 0 ) {
-		if ( !FS_ExtractFromPakFile_m( ospath, (int) game, dllName ) ) {
+	if ( Q_strncmp( name, "game", 4 ) ) {
+		if ( !FS_ExtractFromPakFile_m( ospath, (int) gamedir, dllName, 0 ) ) {
 			if ( cl_connectedToPureServer ) {
 				Com_Error( ERR_DROP,
 				           va( "EXE_ERR_GAME_FAILED_PURE_CHECK\x15%s", dllName ) );
@@ -571,43 +603,29 @@ void *Sys_LoadDll( const char *name, char *fqpath,
 		}
 	}
 
-	Com_Printf( "Sys_LoadDll(%s)... ", ospath );
+	/* retail prints nothing anywhere in this function */
 	libHandle = LoadLibraryA( ospath );
-	loadedFrom = ospath;
-
 	if ( !libHandle ) {
-		Com_Printf( "failed\n" );
-
-		Sys_BuildDllPath( basedir, "main", dllName, ospath );
-		Com_Printf( "Sys_LoadDll(%s)... ", ospath );
+		Sys_BuildDllPath( basepath, "main", dllName, ospath );
 		libHandle = LoadLibraryA( ospath );
-		loadedFrom = ospath;
-
 		if ( !libHandle ) {
-			Com_Printf( "failed\n" );
-
-			Com_Printf( "Sys_LoadDll(%s)... ", dllName );
 			libHandle = LoadLibraryA( dllName );
-			loadedFrom = dllName;
-
 			if ( !libHandle ) {
-				Com_Printf( "failed with Windows error %i\n",
-				            (int) GetLastError() );
 				return NULL;
 			}
+			Q_strncpyz( fqpath, dllName, 64 );
+		} else {
+			Q_strncpyz( fqpath, ospath, 64 );
 		}
+	} else {
+		Q_strncpyz( fqpath, ospath, 64 );
 	}
-	Com_Printf( "ok\n" );
-
-	strncpy( fqpath, loadedFrom, 63 );
-	fqpath[63] = 0;
 
 	dllEntry = (void ( * )( int ( * )( int, ... ) ))
 	           GetProcAddress( libHandle, "dllEntry" );
 	*entryPoint = (int ( * )( int, ... )) GetProcAddress( libHandle, "vmMain" );
 
 	if ( !*entryPoint || !dllEntry ) {
-		Com_Printf( "Sys_LoadDll(%s) failed to find dllEntry/vmMain\n", name );
 		FreeLibrary( libHandle );
 		return NULL;
 	}

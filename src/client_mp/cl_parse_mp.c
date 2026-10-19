@@ -4,42 +4,75 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "cl_records.h"
+#include "cl_local.h"
+
+/* cl.snap.valid (0x01432964), the head of the cl.snap record (storage in cl_main_mp.c) */
+extern int cl_snap_valid;
+
+/* RTCW cl_parse.c; set from the systeminfo sv_pure, read by Sys_LoadDll */
+int cl_connectedToPureServer;   /* 0x01617460 */
+
+const char *svc_strings[256] = {
+	"svc_bad",
+	"svc_nop",
+	"svc_gamestate",
+	"svc_configstring",
+	"svc_baseline",
+	"svc_serverCommand",
+	"svc_download",
+	"svc_snapshot",
+};
+
+int entLastVisible[64];          /* RTCW cl_parse.c entLastVisible[MAX_CLIENTS] */
 
 extern int CL_AddReliableCommand();
 extern int CL_InitDownloads();
 extern int CL_NextDownload();
 extern int CL_WritePacket();
-struct cmSphereRecord_t;
-extern void CM_Trace( trace_t *results, const vec3_t start, const vec3_t end,
-                      const vec3_t mins, const vec3_t maxs, clipHandle_t model,
-                      const vec3_t origin, int brushmask, qboolean capsule,
-                      const struct cmSphereRecord_t *sphere );
+extern void CM_BoxTrace( trace_t *results, const vec3_t start, const vec3_t end,
+                         const vec3_t mins, const vec3_t maxs, clipHandle_t model,
+                         int brushmask, qboolean capsule );
 
-extern float yaw;
-extern float leanFrac;
 extern int Con_Close();
 extern char *MSG_ReadBigString( msg_t *msg );
 extern int   MSG_ReadShort( msg_t *msg );
 extern int   MSG_ReadBits( msg_t *msg, int bits );
+extern int   MSG_ReadBit( msg_t *msg );
 extern void  CL_ClearState( void );
 extern void  FS_Restart( int checksumFeed );
 extern cvar_t *fs_gamedirvar;
 extern int MSG_ReadBitsCompress( const byte *input, byte *outputBuf, int readsize );
 extern qboolean MSG_ReadDeltaClient( msg_t *msg, const byte *from, byte *to,
                                      int number );
-extern void MSG_ReadDeltaPlayerstate( msg_t *msg, const byte *from, byte *to,
-                                      int number );
+extern void MSG_ReadDeltaPlayerstate( msg_t *msg, const byte *from, byte *to );
 extern int  MSG_ReadLong( msg_t *msg );
 extern int  MSG_ReadByte( msg_t *msg );
+extern void MSG_ReadData( msg_t *msg, void *data, int len );
 extern qboolean MSG_ReadDeltaStruct( msg_t *msg, const byte *from, byte *to,
                                      unsigned int number, int numFields,
                                      int indexBits, const netField_t *stateFields );
-extern int MSG_ReadString();
+extern char *MSG_ReadString( msg_t *msg );
 extern void VectorNormalizeFast( vec3_t v );
 extern int j__atol( const char *s );
+#ifdef COD1_VC7
+#define j__atol atoi	/* retail calls libcmt's atoi (0x00525445, a jmp to _atol) */
+#endif
+
+/*
+ * Typed views over the client-active blobs.  The byte-array storage stays
+ * the storage of record (as do the SNAP_, ES_ and CS_ offset macros); these casts
+ * only put a cl_local.h C type over the same memory so the parser can say
+ * frame->numEntities instead of *(int *)(frame + SNAP_NUMENTITIES).
+ */
+#define cl_parseEntities    ( (entityState_t *)cl_parseEntitiesStorage )  /* cl.parseEntities[2048]   (cl+0x867D4) */
+#define cl_entityBaselines  ( (entityState_t *)cl_entityBaselinesStorage )  /* cl.entityBaselines[1024] (cl+0x4A7D4) */
+#define cl_parseClients     ( (clientState_t *)cl_parseClientsStorage )  /* cl.parseClients[2048]    (cl+0xFE7D4) */
+#define cl_snapshotRing     ( (clSnapshot_t  *)cl_snapshots )  /* cl.snapshots[32]         (cl+0x87D4)  */
+#define cl_snap             ( *(clSnapshot_t *)&cl_snap_valid )  /* cl.snap                  (0x01432964) */
+
+
+#define EF_NODRAW           0x100
 
 /* ---- SHOWNET  0x00414EC0 ----  VERIFIED */
 void SHOWNET( msg_t *msg, const char *s )
@@ -50,190 +83,180 @@ void SHOWNET( msg_t *msg, const char *s )
 }
 
 /* ---- isEntVisible  0x00414EF0 ----  VERIFIED */
-qboolean isEntVisible( const byte *ent )
+/*
+ * The eye position uses cl.snap.ps.viewHeightCurrent (0x01432A50), .viewangles[YAW]
+ * (0x01432A44) and .leanf (0x014329C0).  Retail refreshes these only through the
+ * whole-cl.snap copy in CL_ParseSnapshot and the CL_ClearState memset, so they are
+ * read straight out of the cl.snap blob (cl_snap_valid) that CL_ParseSnapshot copies into.
+ */
+qboolean isEntVisible( const entityState_t *ent )
 {
-	vec3_t  start;
-	vec3_t  body;
-	vec3_t  alt;
-	vec3_t  dir;
-	vec3_t  off10;
-	vec3_t  off18;
-	float   height;
-	qboolean crouched;
-	trace_t trace;
+	const playerState_t *snapPs = (const playerState_t *)( (const byte *)&cl_snap_valid + SNAP_PS );
+	trace_t tr;
+	vec3_t  start, end, temp;
+	vec3_t  forward, up, right, right2;
+	float   view_height;
 
 	start[0] = cgameClientLerpOrigin_x;
 	start[1] = cgameClientLerpOrigin_y;
-	start[2] = cgameClientLerpOrigin_z + ( flt_1432A50 - 1.0f );
-	AddLeanToPosition( start, yaw, leanFrac, 16.0f, 20.0f );
+	start[2] = cgameClientLerpOrigin_z;
+	start[2] += ( snapPs->viewHeightCurrent - 1 );
+	AddLeanToPosition( start, snapPs->viewangles[1], snapPs->leanf, 16, 20 );
 
-	body[0] = *(const float *)( ent + 0x18 );
-	body[1] = *(const float *)( ent + 0x1C );
-	body[2] = *(const float *)( ent + 0x20 );
+	VectorCopy( ent->pos.trBase, end );
 
-	dir[0] = body[0] - start[0];
-	dir[1] = body[1] - start[1];
-	dir[2] = body[2] - start[2];
-	VectorNormalizeFast( dir );
+	/* vector perpendicular to the view-to-ent line */
+	VectorSubtract( end, start, forward );
+	VectorNormalizeFast( forward );
+	VectorSet( up, 0, 0, 1 );
+	CrossProduct( forward, up, right );
+	VectorNormalizeFast( right );
+	VectorScale( right, 10, right2 );
+	VectorScale( right, 18, right );
 
-	off18[0] = dir[1] - dir[2] * 0.0f;
-	off18[1] = dir[2] * 0.0f - dir[0];
-	off18[2] = dir[0] * 0.0f - dir[1] * 0.0f;
-	VectorNormalizeFast( off18 );
+	if ( ent->animMovetype ) {
+		view_height = 16;
+	} else {
+		view_height = 40;
+	}
 
-	crouched = ( *(const int *)( ent + 0xE0 ) != 0 );
-
-	off10[0] = off18[0] * 10.0f;
-	off10[1] = off18[1] * 10.0f;
-	off10[2] = off18[2] * 10.0f;
-
-	off18[0] = off18[0] * 18.0f;
-	off18[1] = off18[1] * 18.0f;
-	off18[2] = off18[2] * 18.0f;
-
-	height = crouched ? 16.0f : 40.0f;
-
-	body[2] = height + body[2];
-	trace.fraction = 1.0f;
-	CM_Trace( &trace, start, body, NULL, NULL, 0, vec3_origin, 1, qfalse, NULL );
-	if ( trace.fraction == 1.0f ) {
+	/* viewpoint to viewpoint */
+	end[2] += view_height;
+	CM_BoxTrace( &tr, start, end, NULL, NULL, 0, 1, qfalse );
+	if ( tr.fraction == 1.f ) {
 		return qtrue;
 	}
 
-	body[2] = body[2] + 16.0f;
-	trace.fraction = 1.0f;
-	CM_Trace( &trace, start, body, NULL, NULL, 0, vec3_origin, 1, qfalse, NULL );
-	if ( trace.fraction == 1.0f ) {
+	/* viewpoint to top of head */
+	end[2] += 16;
+	CM_BoxTrace( &tr, start, end, NULL, NULL, 0, 1, qfalse );
+	if ( tr.fraction == 1.f ) {
+		return qtrue;
+	}
+	end[2] -= 16;
+
+	/* viewpoint to the ent's origin */
+	end[2] -= view_height;
+	CM_BoxTrace( &tr, start, end, NULL, NULL, 0, 1, qfalse );
+	if ( tr.fraction == 1.f ) {
 		return qtrue;
 	}
 
-	body[2] = body[2] - 16.0f;
-	body[2] = body[2] - height;
-	trace.fraction = 1.0f;
-	CM_Trace( &trace, start, body, NULL, NULL, 0, vec3_origin, 1, qfalse, NULL );
-	if ( trace.fraction == 1.0f ) {
+	/* right knee */
+	VectorAdd( end, right, temp );
+	temp[2] += 8;
+	CM_BoxTrace( &tr, start, temp, NULL, NULL, 0, 1, qfalse );
+	if ( tr.fraction == 1.f ) {
 		return qtrue;
 	}
 
-	alt[0] = off18[0] + body[0];
-	alt[1] = off18[1] + body[1];
-	alt[2] = off18[2] + body[2];
-	alt[2] = alt[2] + 8.0f;
-	trace.fraction = 1.0f;
-	CM_Trace( &trace, start, alt, NULL, NULL, 0, vec3_origin, 1, qfalse, NULL );
-	if ( trace.fraction == 1.0f ) {
+	/* right shoulder */
+	VectorAdd( end, right2, temp );
+	if ( ent->animMovetype ) {
+		temp[2] += 28;
+	} else {
+		temp[2] += 52;
+	}
+	CM_BoxTrace( &tr, start, temp, NULL, NULL, 0, 1, qfalse );
+	if ( tr.fraction == 1.f ) {
 		return qtrue;
 	}
 
-	alt[0] = off10[0] + body[0];
-	alt[1] = off10[1] + body[1];
-	alt[2] = off10[2] + body[2];
-	alt[2] = alt[2] + ( crouched ? 28.0f : 52.0f );
-	trace.fraction = 1.0f;
-	CM_Trace( &trace, start, alt, NULL, NULL, 0, vec3_origin, 1, qfalse, NULL );
-	if ( trace.fraction == 1.0f ) {
+	/* left knee */
+	VectorScale( right, -1, right );
+	VectorScale( right2, -1, right2 );
+	VectorAdd( end, right2, temp );
+	temp[2] += 2;
+	CM_BoxTrace( &tr, start, temp, NULL, NULL, 0, 1, qfalse );
+	if ( tr.fraction == 1.f ) {
 		return qtrue;
 	}
 
-	off18[0] = off18[0] * -1.0f;
-	off18[1] = off18[1] * -1.0f;
-	off18[2] = off18[2] * -1.0f;
-	off10[0] = off10[0] * -1.0f;
-	off10[1] = off10[1] * -1.0f;
-	off10[2] = off10[2] * -1.0f;
-
-	alt[0] = off10[0] + body[0];
-	alt[1] = off10[1] + body[1];
-	alt[2] = off10[2] + body[2];
-	alt[2] = alt[2] + 2.0f;
-	trace.fraction = 1.0f;
-	CM_Trace( &trace, start, alt, NULL, NULL, 0, vec3_origin, 1, qfalse, NULL );
-	if ( trace.fraction == 1.0f ) {
+	/* left shoulder */
+	VectorAdd( end, right, temp );
+	if ( ent->animMovetype ) {
+		temp[2] += 16;
+	} else {
+		temp[2] += 36;
+	}
+	CM_BoxTrace( &tr, start, temp, NULL, NULL, 0, 1, qfalse );
+	if ( tr.fraction == 1.f ) {
 		return qtrue;
 	}
 
-	alt[0] = off18[0] + body[0];
-	alt[1] = off18[1] + body[1];
-	alt[2] = off18[2] + body[2];
-	alt[2] = alt[2] + ( crouched ? 16.0f : 36.0f );
-	trace.fraction = 1.0f;
-	CM_Trace( &trace, start, alt, NULL, NULL, 0, vec3_origin, 1, qfalse, NULL );
-
-	return ( trace.fraction == 1.0f );
+	return qfalse;
 }
 
 /* ---- CL_DeltaEntity  0x00415350 ----  VERIFIED */
-void CL_DeltaEntity( msg_t *msg, byte *frame, unsigned int newnum,
-                     const byte *old, qboolean unchanged )
+void CL_DeltaEntity( msg_t *msg, clSnapshot_t *frame, unsigned int newnum,
+                     const entityState_t *old, qboolean unchanged )
 {
-	byte *state;
-	int   number;
-	int   serverTime;
+	entityState_t *state;
 
-	state = &byte_14B9134[ ES_SIZE * ( cl_parseEntitiesNum & 0x7FF ) ];
+	state = &cl_parseEntities[ cl_parseEntitiesNum & 0x7FF ];
 
 	if ( unchanged ) {
-		Com_Memcpy( state, old, ES_SIZE );
-	} else if ( MSG_ReadDeltaStruct( msg, old, state, newnum, 0x3B, 10,
-	                                 (const netField_t *)stateFields ) ) {
+		*state = *old;
+	} else if ( MSG_ReadDeltaStruct( msg, (const byte *)old, (byte *)state, newnum,
+	                                 0x3B, 10, (const netField_t *)stateFields ) ) {
 		return;
 	}
 
-	if ( dword_15CE990 && *(int *)( state + ES_NUMBER ) < 64 ) {
-		number     = *(int *)( state + ES_NUMBER );
-		serverTime = *(int *)( frame + SNAP_SERVERTIME );
-
-		if ( isEntVisible( state ) ) {
-			entLastVisible[ number ] = serverTime;
-			*(int *)( state + ES_EFLAGS ) &= ~0x100;
-		} else if ( entLastVisible[ number ] < serverTime - 600 ) {
-			*(int *)( state + ES_EFLAGS ) |= 0x100;
+	if ( clc_onlyVisibleClients ) {
+		if ( state->number < 64 ) {
+			if ( isEntVisible( state ) ) {
+				entLastVisible[ state->number ] = frame->serverTime;
+				state->eFlags &= ~EF_NODRAW;
+			} else {
+				if ( entLastVisible[ state->number ] < ( frame->serverTime - 600 ) ) {
+					state->eFlags |= EF_NODRAW;
+				}
+			}
 		}
 	}
 
 	cl_parseEntitiesNum++;
-	++*(int *)( frame + SNAP_NUMENTITIES );
+	frame->numEntities++;
 }
 
 /* ---- CL_DeltaClient  0x00415410 ----  VERIFIED */
-void CL_DeltaClient( msg_t *msg, byte *frame, int number,
-                     const byte *old, qboolean unchanged )
+void CL_DeltaClient( msg_t *msg, clSnapshot_t *frame, int number,
+                     const clientState_t *old, qboolean unchanged )
 {
-	byte *state;
+	clientState_t *state;
 
-	state = &byte_1531134[ CS_SIZE * ( cl_parseClientsNum & 0x7FF ) ];
+	state = &cl_parseClients[ cl_parseClientsNum & 0x7FF ];
 
 	if ( unchanged ) {
-		Com_Memcpy( state, old, CS_SIZE );
-	} else if ( MSG_ReadDeltaClient( msg, old, state, number ) ) {
+		*state = *old;
+	} else if ( MSG_ReadDeltaClient( msg, (const byte *)old, (byte *)state, number ) ) {
 		return;
 	}
 
 	cl_parseClientsNum++;
-	++*(int *)( frame + SNAP_NUMCLIENTS );
+	frame->numClients++;
 }
 
 /* ---- CL_ParsePacketEntities  0x00415460 ----  VERIFIED */
-void CL_ParsePacketEntities( msg_t *msg, byte *oldframe, byte *newframe )
+void CL_ParsePacketEntities( msg_t *msg, clSnapshot_t *oldframe, clSnapshot_t *newframe )
 {
-	int   newnum;
-	byte *oldstate;
-	int   oldindex;
-	int   oldnum;
+	int            newnum;
+	entityState_t *oldstate;
+	int            oldindex;
+	int            oldnum;
 
-	*(int *)( newframe + SNAP_PARSEENTITIESNUM ) = cl_parseEntitiesNum;
-	*(int *)( newframe + SNAP_NUMENTITIES )      = 0;
+	newframe->parseEntitiesNum = cl_parseEntitiesNum;
+	newframe->numEntities      = 0;
 
 	oldindex = 0;
 	oldstate = NULL;
 	if ( !oldframe ) {
 		oldnum = 99999;
-	} else if ( oldindex >= *(int *)( oldframe + SNAP_NUMENTITIES ) ) {
+	} else if ( oldindex >= oldframe->numEntities ) {
 		oldnum = 99999;
 	} else {
-		oldstate = &byte_14B9134[ ES_SIZE *
-			( ( *(int *)( oldframe + SNAP_PARSEENTITIESNUM ) + oldindex ) & 0x7FF ) ];
-		oldnum = *(int *)( oldstate + ES_NUMBER );
+		oldstate = &cl_parseEntities[ ( oldframe->parseEntitiesNum + oldindex ) & 0x7FF ];
+		oldnum = oldstate->number;
 	}
 
 	while ( 1 ) {
@@ -255,12 +278,11 @@ void CL_ParsePacketEntities( msg_t *msg, byte *oldframe, byte *newframe )
 			CL_DeltaEntity( msg, newframe, oldnum, oldstate, qtrue );
 
 			oldindex++;
-			if ( oldindex >= *(int *)( oldframe + SNAP_NUMENTITIES ) ) {
+			if ( oldindex >= oldframe->numEntities ) {
 				oldnum = 99999;
 			} else {
-				oldstate = &byte_14B9134[ ES_SIZE *
-					( ( *(int *)( oldframe + SNAP_PARSEENTITIESNUM ) + oldindex ) & 0x7FF ) ];
-				oldnum = *(int *)( oldstate + ES_NUMBER );
+				oldstate = &cl_parseEntities[ ( oldframe->parseEntitiesNum + oldindex ) & 0x7FF ];
+				oldnum = oldstate->number;
 			}
 		}
 
@@ -271,12 +293,11 @@ void CL_ParsePacketEntities( msg_t *msg, byte *oldframe, byte *newframe )
 			CL_DeltaEntity( msg, newframe, newnum, oldstate, qfalse );
 
 			oldindex++;
-			if ( oldindex >= *(int *)( oldframe + SNAP_NUMENTITIES ) ) {
+			if ( oldindex >= oldframe->numEntities ) {
 				oldnum = 99999;
 			} else {
-				oldstate = &byte_14B9134[ ES_SIZE *
-					( ( *(int *)( oldframe + SNAP_PARSEENTITIESNUM ) + oldindex ) & 0x7FF ) ];
-				oldnum = *(int *)( oldstate + ES_NUMBER );
+				oldstate = &cl_parseEntities[ ( oldframe->parseEntitiesNum + oldindex ) & 0x7FF ];
+				oldnum = oldstate->number;
 			}
 			continue;
 		}
@@ -284,8 +305,7 @@ void CL_ParsePacketEntities( msg_t *msg, byte *oldframe, byte *newframe )
 		if ( cl_shownet->integer == 3 ) {
 			Com_Printf( "%3i:  baseline: %i\n", msg->readcount, newnum );
 		}
-		CL_DeltaEntity( msg, newframe, newnum,
-		                &byte_147D134[ ES_SIZE * newnum ], qfalse );
+		CL_DeltaEntity( msg, newframe, newnum, &cl_entityBaselines[ newnum ], qfalse );
 	}
 
 	while ( oldnum != 99999 ) {
@@ -295,46 +315,44 @@ void CL_ParsePacketEntities( msg_t *msg, byte *oldframe, byte *newframe )
 		CL_DeltaEntity( msg, newframe, oldnum, oldstate, qtrue );
 
 		oldindex++;
-		if ( oldindex >= *(int *)( oldframe + SNAP_NUMENTITIES ) ) {
+		if ( oldindex >= oldframe->numEntities ) {
 			oldnum = 99999;
 		} else {
-			oldstate = &byte_14B9134[ ES_SIZE *
-				( ( *(int *)( oldframe + SNAP_PARSEENTITIESNUM ) + oldindex ) & 0x7FF ) ];
-			oldnum = *(int *)( oldstate + ES_NUMBER );
+			oldstate = &cl_parseEntities[ ( oldframe->parseEntitiesNum + oldindex ) & 0x7FF ];
+			oldnum = oldstate->number;
 		}
 	}
 
 	if ( cl_shownuments->integer ) {
-		Com_Printf( "Entities in packet: %i\n",
-		            *(int *)( newframe + SNAP_NUMENTITIES ) );
+		Com_Printf( "Entities in packet: %i\n", newframe->numEntities );
 	}
 }
 
 /* ---- CL_ParsePacketClients  0x004157F0 ----  VERIFIED */
-void CL_ParsePacketClients( msg_t *msg, byte *oldframe, byte *newframe )
+void CL_ParsePacketClients( msg_t *msg, clSnapshot_t *oldframe, clSnapshot_t *newframe )
 {
-	int   newnum;
-	byte *oldstate;
-	int   oldindex;
-	int   oldnum;
+	int            newnum;
+	clientState_t *oldstate;
+	int            oldindex;
+	int            oldnum;
+	clientState_t  dummy;
 
-	*(int *)( newframe + SNAP_PARSECLIENTSNUM ) = cl_parseClientsNum;
-	*(int *)( newframe + SNAP_NUMCLIENTS )      = 0;
+	newframe->parseClientsNum = cl_parseClientsNum;
+	newframe->numClients      = 0;
 
 	oldindex = 0;
 	oldstate = NULL;
 	if ( !oldframe ) {
 		oldnum = 99999;
-	} else if ( oldindex >= *(int *)( oldframe + SNAP_NUMCLIENTS ) ) {
+	} else if ( oldindex >= oldframe->numClients ) {
 		oldnum = 99999;
 	} else {
-		oldstate = &byte_1531134[ CS_SIZE *
-			( ( *(int *)( oldframe + SNAP_PARSECLIENTSNUM ) + oldindex ) & 0x7FF ) ];
-		oldnum = *(int *)( oldstate + CS_NUMBER );
+		oldstate = &cl_parseClients[ ( oldframe->parseClientsNum + oldindex ) & 0x7FF ];
+		oldnum = oldstate->clientNum;
 	}
 
 	while ( 1 ) {
-		if ( !MSG_ReadBits( msg, 1 ) ) {
+		if ( !MSG_ReadBit( msg ) ) {
 			break;
 		}
 
@@ -351,12 +369,11 @@ void CL_ParsePacketClients( msg_t *msg, byte *oldframe, byte *newframe )
 			CL_DeltaClient( msg, newframe, oldnum, oldstate, qtrue );
 
 			oldindex++;
-			if ( oldindex >= *(int *)( oldframe + SNAP_NUMCLIENTS ) ) {
+			if ( oldindex >= oldframe->numClients ) {
 				oldnum = 99999;
 			} else {
-				oldstate = &byte_1531134[ CS_SIZE *
-					( ( *(int *)( oldframe + SNAP_PARSECLIENTSNUM ) + oldindex ) & 0x7FF ) ];
-				oldnum = *(int *)( oldstate + CS_NUMBER );
+				oldstate = &cl_parseClients[ ( oldframe->parseClientsNum + oldindex ) & 0x7FF ];
+				oldnum = oldstate->clientNum;
 			}
 		}
 
@@ -367,12 +384,11 @@ void CL_ParsePacketClients( msg_t *msg, byte *oldframe, byte *newframe )
 			CL_DeltaClient( msg, newframe, newnum, oldstate, qfalse );
 
 			oldindex++;
-			if ( oldindex >= *(int *)( oldframe + SNAP_NUMCLIENTS ) ) {
+			if ( oldindex >= oldframe->numClients ) {
 				oldnum = 99999;
 			} else {
-				oldstate = &byte_1531134[ CS_SIZE *
-					( ( *(int *)( oldframe + SNAP_PARSECLIENTSNUM ) + oldindex ) & 0x7FF ) ];
-				oldnum = *(int *)( oldstate + CS_NUMBER );
+				oldstate = &cl_parseClients[ ( oldframe->parseClientsNum + oldindex ) & 0x7FF ];
+				oldnum = oldstate->clientNum;
 			}
 			continue;
 		}
@@ -380,7 +396,8 @@ void CL_ParsePacketClients( msg_t *msg, byte *oldframe, byte *newframe )
 		if ( cl_shownet->integer == 3 ) {
 			Com_Printf( "%3i:  baseline: %i\n", msg->readcount, newnum );
 		}
-		CL_DeltaClient( msg, newframe, newnum, NULL, qfalse );
+		memset( &dummy, 0, sizeof( dummy ) );
+		CL_DeltaClient( msg, newframe, newnum, &dummy, qfalse );
 	}
 
 	while ( oldnum != 99999 ) {
@@ -390,135 +407,132 @@ void CL_ParsePacketClients( msg_t *msg, byte *oldframe, byte *newframe )
 		CL_DeltaClient( msg, newframe, oldnum, oldstate, qtrue );
 
 		oldindex++;
-		if ( oldindex >= *(int *)( oldframe + SNAP_NUMCLIENTS ) ) {
+		if ( oldindex >= oldframe->numClients ) {
 			oldnum = 99999;
 		} else {
-			oldstate = &byte_1531134[ CS_SIZE *
-				( ( *(int *)( oldframe + SNAP_PARSECLIENTSNUM ) + oldindex ) & 0x7FF ) ];
-			oldnum = *(int *)( oldstate + CS_NUMBER );
+			oldstate = &cl_parseClients[ ( oldframe->parseClientsNum + oldindex ) & 0x7FF ];
+			oldnum = oldstate->clientNum;
 		}
 	}
 
 	if ( cl_shownuments->integer ) {
-		Com_Printf( "Clients in packet: %i\n",
-		            *(int *)( newframe + SNAP_NUMCLIENTS ) );
+		Com_Printf( "Clients in packet: %i\n", newframe->numClients );
 	}
 }
 
-/* cl.outPackets[32], 12 bytes each, based at 0x0143AFB4; serverTime is +4 and realtime +8. */
-#define OUTPACKET_SERVERTIME( i )  dword_143AFB8[ ( (i) & 31 ) * 3 ]
-#define OUTPACKET_REALTIME( i )    dword_143AFBC[ ( (i) & 31 ) * 3 ]
-
-/* ---- CL_PublishSnap  no-address ---- */
-static void CL_PublishSnap( const byte *snap )
-{
-	Com_Memcpy( &cl_snap_valid, snap, SNAP_SIZE );
-
-	*(int *)cl_snap_snapFlags = *(const int *)( snap + SNAP_SNAPFLAGS );
-	cl_snap_serverTime     = *(const int *)( snap + SNAP_SERVERTIME );
-	*(int *)cl_snap_messageNum = *(const int *)( snap + SNAP_MESSAGENUM );
-	cl_snap_deltaNum       = *(const int *)( snap + SNAP_DELTANUM );
-	cl_snap_ping           = *(const int *)( snap + SNAP_PING );
-	cl_snap_ps_commandTime = *(const int *)( snap + SNAP_PS );
-}
+/* cl.outPackets[32], 12 bytes each, based at 0x0143AFB4; serverTime is +4 and realtime +8.
+ * (i) is a packet number already masked to 0..31, as in retail. */
+#define OUTPACKET_SERVERTIME( i )  cl_outPackets_p_serverTime[ (i) * 3 ]
+#define OUTPACKET_REALTIME( i )    cl_outPackets_p_realtime[ (i) * 3 ]
 
 /* ---- CL_ParseSnapshot  0x00415BB0 ----  VERIFIED */
 void CL_ParseSnapshot( msg_t *msg )
 {
-	byte  newSnap[SNAP_SIZE];
-	byte *old;
+	clSnapshot_t  newSnap;
+	clSnapshot_t *old;
 	int   deltaNum;
 	int   oldMessageNum;
 	int   packetNum;
 	int   i;
 
-	Com_Memset( newSnap, 0, sizeof( newSnap ) );
+	memset( &newSnap, 0, sizeof( newSnap ) );
 
-	*(int *)( newSnap + SNAP_SERVERCOMMANDNUM ) = clc_serverCommandSequence;
-	*(int *)( newSnap + SNAP_SERVERTIME )       = MSG_ReadLong( msg );
-	*(int *)( newSnap + SNAP_MESSAGENUM )       = clc_serverMessageSequence;
+	newSnap.serverCommandNum = clc_serverCommandSequence;
+	newSnap.serverTime       = MSG_ReadLong( msg );
+	newSnap.messageNum       = clc_serverMessageSequence;
 
 	deltaNum = MSG_ReadByte( msg );
 	if ( !deltaNum ) {
-		*(int *)( newSnap + SNAP_DELTANUM ) = -1;
+		newSnap.deltaNum = -1;
 	} else {
-		*(int *)( newSnap + SNAP_DELTANUM ) =
-			*(int *)( newSnap + SNAP_MESSAGENUM ) - deltaNum;
+		newSnap.deltaNum = newSnap.messageNum - deltaNum;
 	}
 
-	*(int *)( newSnap + SNAP_SNAPFLAGS ) = MSG_ReadByte( msg );
+	newSnap.snapFlags = MSG_ReadByte( msg );
 
-	if ( *(int *)( newSnap + SNAP_DELTANUM ) <= 0 ) {
-		*(int *)( newSnap + SNAP_VALID ) = qtrue;
+	if ( newSnap.deltaNum <= 0 ) {
+		newSnap.valid = qtrue;
 		old = NULL;
 		clc_demowaiting = qfalse;
 	} else {
-		old = (byte *)cl_snapshots
-		    + SNAP_SIZE * ( *(int *)( newSnap + SNAP_DELTANUM ) & 31 );
+		old = &cl_snapshotRing[ newSnap.deltaNum & 31 ];
 
-		if ( !*(int *)( old + SNAP_VALID ) ) {
+		if ( !old->valid ) {
 			Com_Printf( "Delta from invalid frame (not supposed to happen!).\n" );
-		} else if ( *(int *)( old + SNAP_MESSAGENUM )
-		            != *(int *)( newSnap + SNAP_DELTANUM ) ) {
+		} else if ( old->messageNum != newSnap.deltaNum ) {
 			Com_DPrintf( "Delta frame too old.\n" );
-		} else if ( cl_parseEntitiesNum
-		            - *(int *)( old + SNAP_PARSEENTITIESNUM ) > 0x780 ) {
+		} else if ( cl_parseEntitiesNum - old->parseEntitiesNum > 0x780 ) {
 			Com_DPrintf( "Delta parseEntitiesNum too old.\n" );
-		} else if ( cl_parseClientsNum
-		            - *(int *)( old + SNAP_PARSECLIENTSNUM ) > 0x780 ) {
+		} else if ( cl_parseClientsNum - old->parseClientsNum > 0x780 ) {
 			Com_DPrintf( "Delta parseClientsNum too old.\n" );
 		} else {
-			*(int *)( newSnap + SNAP_VALID ) = qtrue;
+			newSnap.valid = qtrue;
 		}
 	}
 
 	SHOWNET( msg, "playerstate" );
 	if ( old ) {
-		MSG_ReadDeltaPlayerstate( msg, old + SNAP_PS, newSnap + SNAP_PS, 0 );
+		MSG_ReadDeltaPlayerstate( msg, old->ps, newSnap.ps );
 	} else {
-		MSG_ReadDeltaPlayerstate( msg, NULL, newSnap + SNAP_PS, 0 );
+		MSG_ReadDeltaPlayerstate( msg, NULL, newSnap.ps );
 	}
 
 	SHOWNET( msg, "packet entities" );
-	CL_ParsePacketEntities( msg, old, newSnap );
+	CL_ParsePacketEntities( msg, old, &newSnap );
 
 	SHOWNET( msg, "packet clients" );
-	CL_ParsePacketClients( msg, old, newSnap );
+	CL_ParsePacketClients( msg, old, &newSnap );
 
-	if ( !*(int *)( newSnap + SNAP_VALID ) ) {
+	if ( !newSnap.valid ) {
 		return;
 	}
 
-	oldMessageNum = *(int *)cl_snap_messageNum + 1;
+	oldMessageNum = cl_snap.messageNum + 1;
 
-	if ( *(int *)( newSnap + SNAP_MESSAGENUM ) - oldMessageNum >= 32 ) {
-		oldMessageNum = *(int *)( newSnap + SNAP_MESSAGENUM ) - 31;
+	if ( newSnap.messageNum - oldMessageNum >= 32 ) {
+		oldMessageNum = newSnap.messageNum - 31;
 	}
-	for ( ; oldMessageNum < *(int *)( newSnap + SNAP_MESSAGENUM ); oldMessageNum++ ) {
-		*(int *)( (byte *)cl_snapshots + SNAP_SIZE * ( oldMessageNum & 31 )
-		          + SNAP_VALID ) = qfalse;
+	for ( ; oldMessageNum < newSnap.messageNum; oldMessageNum++ ) {
+		cl_snapshotRing[ oldMessageNum & 31 ].valid = qfalse;
 	}
 
-	CL_PublishSnap( newSnap );
-
-	cl_snap_ping = 999;
-	*(int *)( (byte *)&cl_snap_valid + SNAP_PING ) = 999;
+	cl_snap = newSnap;
+	cl_snap.ping = 999;
 
 	for ( i = 0; i < 32; i++ ) {
-		packetNum = *(int *)( chan + 0x24 ) - 1 - i;
-		if ( cl_snap_ps_commandTime >= OUTPACKET_SERVERTIME( packetNum ) ) {
-			cl_snap_ping = cls_realtime - OUTPACKET_REALTIME( packetNum );
-			*(int *)( (byte *)&cl_snap_valid + SNAP_PING ) = cl_snap_ping;
+		packetNum = ( clc.netchan.outgoingSequence - 1 - i ) & 31;
+		if ( *(const int *)cl_snap.ps >= OUTPACKET_SERVERTIME( packetNum ) ) {
+			cl_snap.ping = cls_realtime - OUTPACKET_REALTIME( packetNum );
 			break;
 		}
 	}
 
-	Com_Memcpy( (byte *)cl_snapshots + SNAP_SIZE * ( *(int *)cl_snap_messageNum & 31 ),
-	            &cl_snap_valid, SNAP_SIZE );
+	/* retail has no CL_PublishSnap copy: its `cl.snap = newSnap` (0x415DE6, rep movsd
+	 * 0x2100 bytes) refreshes every cl.snap field at once; the tree refreshes each split
+	 * mirror global that some reader uses (CL_ClearState zeroes the same set) */
+	{
+		const clSnapshot_t  *snap = (const clSnapshot_t *)&cl_snap_valid;
+		const playerState_t *ps   = (const playerState_t *)snap->ps;
+
+		*(int *)cl_snap_snapFlags  = snap->snapFlags;
+		cl_snap_serverTime         = snap->serverTime;
+		*(int *)cl_snap_messageNum = snap->messageNum;
+		cl_snap_deltaNum           = snap->deltaNum;
+		cl_snap_ping               = snap->ping;
+		cl_snap_ps_commandTime     = *(const int *)snap->ps;
+		cl_snap_ps_pm_type         = ps->pm_type;
+		cl_snap_ps_pm_flags        = ps->pm_flags;
+		cl_snap_ps_deltaPitch      = ps->delta_angles[0];
+		cl_snap_ps_eFlags          = ps->eFlags;
+		cl_snap_ps_clientNum       = ps->clientNum;
+		cl_snap_numClients         = snap->numClients;
+		cl_snap_parseClientsNum    = snap->parseClientsNum;
+	}
+	cl_snapshotRing[ cl_snap.messageNum & 31 ] = cl_snap;
 
 	if ( cl_shownet->integer == 3 ) {
 		Com_Printf( "   snapshot:%i  delta:%i  ping:%i\n",
-		            *(int *)cl_snap_messageNum, cl_snap_deltaNum, cl_snap_ping );
+		            cl_snap.messageNum, cl_snap.deltaNum, cl_snap.ping );
 	}
 
 	cl_newSnapshots = qtrue;
@@ -531,13 +545,12 @@ void CL_SystemInfoChanged( void )
 	const char *s, *t;
 	char        key[8192];
 	char        value[8192];
-	cvar_t     *var;
 
 	systemInfo = &cl_gameState_stringData[ cl_gameState_stringOffsets[1] ];
 
 	cl_serverId = j__atol( Info_ValueForKey( systemInfo, "sv_serverid" ) );
 
-	Com_Memset( entLastVisible, 0, sizeof( entLastVisible ) );
+	memset( entLastVisible, 0, sizeof( entLastVisible ) );
 
 	if ( clc_demoplaying ) {
 		return;
@@ -567,8 +580,7 @@ void CL_SystemInfoChanged( void )
 		}
 	}
 
-	var = Cvar_FindVar( "sv_pure" );
-	cl_connectedToPureServer = (int)( var ? var->value : 0.0f );
+	cl_connectedToPureServer = Cvar_VariableValue( "sv_pure" );
 }
 
 /* ---- CL_ParseGamestate  0x00416050 ----  VERIFIED */
@@ -579,12 +591,12 @@ void CL_ParseGamestate( msg_t *msg )
 	int   newnum;
 	int   len;
 	char *s;
-	byte  nullstate[ES_SIZE];
+	entityState_t nullstate;
 
 	Con_Close();
 
-	CL_ClearState();
 	clc_connectPacketCount = 0;
+	CL_ClearState();
 
 	clc_serverCommandSequence = MSG_ReadLong( msg );
 
@@ -611,8 +623,8 @@ void CL_ParseGamestate( msg_t *msg )
 			}
 
 			cl_gameState_stringOffsets[ i ] = cl_gameState_dataCount;
-			Com_Memcpy( &cl_gameState_stringData[ cl_gameState_dataCount ],
-			            s, len + 1 );
+			memcpy( &cl_gameState_stringData[ cl_gameState_dataCount ],
+			        s, len + 1 );
 			cl_gameState_dataCount += len + 1;
 
 		} else if ( cmd == 4 ) {
@@ -621,9 +633,9 @@ void CL_ParseGamestate( msg_t *msg )
 				Com_Error( ERR_DROP, "\x15" "Baseline number out of range: %i",
 				           newnum );
 			}
-			Com_Memset( nullstate, 0, sizeof( nullstate ) );
-			MSG_ReadDeltaStruct( msg, nullstate,
-			                     &byte_147D134[ ES_SIZE * newnum ],
+			memset( &nullstate, 0, sizeof( nullstate ) );
+			MSG_ReadDeltaStruct( msg, (const byte *)&nullstate,
+			                     (byte *)&cl_entityBaselines[ newnum ],
 			                     (unsigned int)newnum, 0x3B, 10,
 			                     (const netField_t *)stateFields );
 
@@ -648,182 +660,99 @@ void CL_ParseGamestate( msg_t *msg )
 }
 
 /* ---- CL_ParseDownload  0x004162A0 ----  [HIGH] */
-void __cdecl CL_ParseDownload( msg_t *v0 )
+void __cdecl CL_ParseDownload( msg_t *msg )
 {
-  msg_t *v1;
-  int cursize;
-  int v3;
-  unsigned __int8 *data;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  unsigned __int8 *v10;
-  __int16 v11;
-  int v12;
-  char *String;
-  char *v14;
-  fileHandle_t v15;
-  char *v16;
-  float value;
-  float valuea;
-  const char *valueb;
-  int v20;
-  int v21;
-  _BYTE Buffer[16388];
+	int          block;
+	int          size;
+	fileHandle_t f;
+	byte         data[16384];
 
-  v1 = v0;
-  cursize = v0->cursize;
-  v3 = v0->readcount + 2;
-  if ( v3 > cursize )
-  {
-    v21 = -1;
-  }
-  else
-  {
-    data = v0->data;
-    v5 = *(__int16 *)&data[v1->readcount];
-    v1->readcount = v3;
-    v21 = v5;
-    if ( !v5 )
-    {
-      v6 = v3 + 4;
-      if ( v3 + 4 > cursize )
-      {
-        v7 = -1;
-      }
-      else
-      {
-        v7 = *(_DWORD *)&data[v3];
-        v1->readcount = v6;
-      }
-      clc_downloadSize = v7;
-      value = (float)v7;
-      Cvar_SetValue("cl_downloadSize", value);
-      if ( clc_downloadSize < 0 )
-      {
-        String = MSG_ReadString(v1);
-        Com_Error(ERR_DROP, String);
-      }
-    }
-  }
-  v8 = v1->cursize;
-  v9 = v1->readcount + 2;
-  if ( v9 > v8 )
-  {
-    v20 = -1;
-    v12 = -1;
-  }
-  else
-  {
-    v10 = v1->data;
-    v11 = *(_WORD *)&v10[v1->readcount];
-    v12 = v11;
-    v1->readcount = v9;
-    v20 = v11;
-    if ( v11 > 0 )
-    {
-      if ( v9 + v11 > v8 )
-      {
-        memset(Buffer, 0xFFu, v11);
-      }
-      else
-      {
-        qmemcpy(Buffer, &v10[v9], v11);
-        v1->readcount = v9 + v11;
-      }
-    }
-  }
-  if ( *(_DWORD *)cls_downloadBlock != v21 )
-  {
-    Com_DPrintf("CL_ParseDownload: Expected block %d, got %d\n", *(_DWORD *)cls_downloadBlock, v21);
-    if ( v21 > *(int *)cls_downloadBlock )
-    {
-      Com_DPrintf("CL_ParseDownload: Sending retransmitt request to get the missed block\n");
-      v14 = va("retransdl %d", *(_DWORD *)cls_downloadBlock);
-      CL_AddReliableCommand(v14);
-    }
-    return;
-  }
-  v15 = clc_download;
-  if ( !clc_download )
-  {
-    if ( !cls_downloadTempName[0] )
-    {
-      Com_Printf("Server sending download, but no download was requested\n");
-      CL_AddReliableCommand("stopdl");
-      return;
-    }
-    v15 = FS_SV_FOpenFileWrite(&cls_downloadTempName);
-    clc_download = v15;
-    if ( !v15 )
-    {
-      Com_Printf("Could not create %s\n", &cls_downloadTempName);
-      CL_AddReliableCommand("stopdl");
-LABEL_30:
-      CL_NextDownload();
-      return;
-    }
-    v12 = v20;
-  }
-  if ( v12 )
-    FS_Write(Buffer, v12, v15);
-  v16 = va("nextdl %d", *(_DWORD *)cls_downloadBlock);
-  CL_AddReliableCommand(v16);
-  cls_downloadCount += v20;
-  valuea = (float)cls_downloadCount;
-  ++*(_DWORD *)cls_downloadBlock;
-  Cvar_SetValue("cl_downloadCount", valuea);
-  if ( !v20 )
-  {
-    if ( clc_download )
-    {
-      FS_FCloseFile(clc_download);
-      clc_download = 0;
-      FS_SV_Rename((const char *)&cls_downloadTempName,
-                   (const char *)&cls_downloadName);
-    }
-    cls_downloadName[0] = 0;
-    cls_downloadTempName[0] = 0;
-    Cvar_Set2("cl_downloadName", &empty_string, qtrue);
-    CL_WritePacket();
-    CL_WritePacket();
-    goto LABEL_30;
-  }
+	block = MSG_ReadShort( msg );
+	if ( !block ) {
+		/* block zero is special: it carries the total file size */
+		clc_downloadSize = MSG_ReadLong( msg );
+		Cvar_SetValue( "cl_downloadSize", (float)clc_downloadSize );
+		if ( clc_downloadSize < 0 ) {
+			Com_Error( ERR_DROP, MSG_ReadString( msg ) );
+			return;
+		}
+	}
+
+	size = MSG_ReadShort( msg );
+	if ( size > 0 ) {
+		MSG_ReadData( msg, data, size );
+	}
+
+	if ( *(int *)cls_downloadBlock != block ) {
+		Com_DPrintf( "CL_ParseDownload: Expected block %d, got %d\n",
+		             *(int *)cls_downloadBlock, block );
+		if ( block > *(int *)cls_downloadBlock ) {
+			Com_DPrintf( "CL_ParseDownload: Sending retransmitt request to get the missed block\n" );
+			CL_AddReliableCommand( va( "retransdl %d", *(int *)cls_downloadBlock ) );
+		}
+		return;
+	}
+
+	f = clc_download;
+	if ( !clc_download ) {
+		if ( !cls_downloadTempName[0] ) {
+			Com_Printf( "Server sending download, but no download was requested\n" );
+			CL_AddReliableCommand( "stopdl" );
+			return;
+		}
+		f = FS_SV_FOpenFileWrite( (const char *)cls_downloadTempName );
+		clc_download = f;
+		if ( !f ) {
+			Com_Printf( "Could not create %s\n", (char *)cls_downloadTempName );
+			CL_AddReliableCommand( "stopdl" );
+			CL_NextDownload();
+			return;
+		}
+	}
+
+	if ( size ) {
+		FS_Write( data, size, f );
+	}
+
+	CL_AddReliableCommand( va( "nextdl %d", *(int *)cls_downloadBlock ) );
+	++*(int *)cls_downloadBlock;
+	cls_downloadCount += size;
+	Cvar_SetValue( "cl_downloadCount", (float)cls_downloadCount );
+
+	if ( !size ) {
+		/* a zero-length block means EOF */
+		if ( clc_download ) {
+			FS_FCloseFile( clc_download );
+			clc_download = 0;
+			FS_SV_Rename( (const char *)cls_downloadTempName,
+			              (const char *)cls_downloadName );
+		}
+		cls_downloadName[0]     = 0;
+		cls_downloadTempName[0] = 0;
+		Cvar_Set2( "cl_downloadName", "", qtrue );
+		CL_WritePacket();
+		CL_WritePacket();
+		CL_NextDownload();
+	}
 }
 
 /* ---- CL_ParseCommandString  0x00416590 ----  [CONFIRMED] */
-char *__cdecl CL_ParseCommandString(msg_t *a1)
+char *__cdecl CL_ParseCommandString( msg_t *msg )
 {
-  int readcount;
-  int v3;
-  int v4;
-  int v5;
-  char *result;
-  char *v7;
+	int   seq;
+	char *s;
+	char *cmd;
 
-  readcount = a1->readcount;
-  v3 = readcount + 4;
-  if ( readcount + 4 > a1->cursize )
-  {
-    v5 = -1;
-  }
-  else
-  {
-    v4 = *(_DWORD *)&a1->data[readcount];
-    a1->readcount = v3;
-    v5 = v4;
-  }
-  result = MSG_ReadString(a1);
-  if ( clc_serverCommandSequence < v5 )
-  {
-    clc_serverCommandSequence = v5;
-    v7 = &clc_serverCommands[1024 * (v5 & 0x3F)];
-    result = strncpy(v7, result, 0x3FFu);
-    v7[1023] = 0;
-  }
-  return result;
+	seq = MSG_ReadLong( msg );
+	s   = MSG_ReadString( msg );
+
+	if ( clc_serverCommandSequence < seq ) {
+		clc_serverCommandSequence = seq;
+		cmd = &clc_serverCommands[ 1024 * ( seq & 0x3F ) ];
+		s   = strncpy( cmd, s, 0x3FF );
+		cmd[1023] = 0;
+	}
+	return s;
 }
 
 /* ---- CL_ParseServerMessage  0x004165F0 ----  VERIFIED */
@@ -839,13 +768,7 @@ void CL_ParseServerMessage( msg_t *source )
 		Com_Printf( "------------------\n" );
 	}
 
-	if ( !msgInit ) {
-		MSG_initHuffman();
-	}
-
-	Com_Memset( &msg, 0, sizeof( msg ) );
-	msg.data    = to;
-	msg.maxsize = sizeof( to );
+	MSG_Init( &msg, to, sizeof( to ) );
 	msg.cursize = MSG_ReadBitsCompress( source->data + source->readcount, to,
 	                                    source->cursize - source->readcount );
 
@@ -878,17 +801,17 @@ void CL_ParseServerMessage( msg_t *source )
 			break;
 		case 1:
 			break;
-		case 2:
-			CL_ParseGamestate( &msg );
-			break;
 		case 5:
 			CL_ParseCommandString( &msg );
 			break;
-		case 6:
-			CL_ParseDownload( &msg );
+		case 2:
+			CL_ParseGamestate( &msg );
 			break;
 		case 7:
 			CL_ParseSnapshot( &msg );
+			break;
+		case 6:
+			CL_ParseDownload( &msg );
 			break;
 		}
 	}

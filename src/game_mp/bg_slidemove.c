@@ -1,47 +1,20 @@
-/*
- * bg_slidemove.c -- part of bg_pmove functionality.
- *
- * Call of Duty 1.1 multiplayer (game_mp_x86.dll, 0x2000C800-0x2000D97F).
- *
- * PM_SlideMove is RTCW's, with MAX_CLIP_PLANES raised from 5 to 8 and two debug
- * prints added.  PM_StepSlideMove is not: CoD replaced RTCW's "trace up, slide,
- * trace down" with a step that measures the real headroom first, refuses to
- * stand on another player, caps the step at the height the jump would have
- * reached, backs the whole thing out when it did not gain ground along the
- * original direction, and raises a step event carrying the signed step height.
- *
- * input:  origin, velocity, bounds, groundPlane, trace function
- * output: origin, velocity, impacts, stairup boolean
- *
- * @fidelity: likely
- */
+// bg_slidemove.c -- part of bg_pmove functionality
 
 #include "bg_local.h"
 
 #include <math.h>
 #include <stdlib.h>
 
-/* bg_misc.c */
-int BG_CheckProneValid( int clientNum, const vec3_t origin, float radius, float height,
-						float yaw, float *groundOffset, float *pitchDown, float *pitchUp,
-						qboolean skipInitialTrace, qboolean allowFallback,
-						const vec3_t groundNormal,
-						void ( *traceFunc )( trace_t *, const vec3_t, const vec3_t, const vec3_t, const vec3_t, int, int ),
-						void ( *traceDownFunc )( trace_t *, const vec3_t, const vec3_t, const vec3_t, const vec3_t, int, int ),
-						qboolean useAltContentMask );
+/*
 
-/* universal */
+input: origin, velocity, bounds, groundPlane, trace function
+
+output: origin, velocity, impacts, stairup boolean
+
+*/
+
 void Com_Printf( const char *fmt, ... );
 float VectorNormalize2( const vec3_t v, vec3_t out );
-
-/* Declarations that belong in a header; see bg_pmove.c for the same block. */
-#define ENTITYNUM_NONE      1023
-#define MAX_CLIENTS         64
-
-#define PMF_PRONE           0x0001
-#define PMF_LADDER          0x0010
-
-#define EV_STEP             143
 
 #define MAX_CLIP_PLANES     8
 #define OVERCLIP            1.001f
@@ -52,12 +25,7 @@ float VectorNormalize2( const vec3_t v, vec3_t out );
 ==================
 Q_ftol
 
-Inline-asm round-to-nearest, the RTCW myftol pattern with a bias (retail
-0x2000C800: fld / fadd qword / fistp, the bias a double 2^-30 built on the
-stack).  The DLL's (int) casts go through __ftol2 and truncate; this one rounds,
-and the bias breaks an x.5 tie upward where the FPU's nearest-even would take
-it down.  Both DLLs link a copy (cgame 0x3000CAC0, unnamed there), and LTCG
-inlines the body into Drop_Weapon (0x20023EF1) and the g_hud / g_scr sites.
+Rounds to the nearest integer, with halves going up
 ==================
 */
 int Q_ftol( float f ) {
@@ -75,22 +43,22 @@ int Q_ftol( float f ) {
 ==================
 PM_VerifyPronePosition
 
-A prone body that ends a move somewhere its capsule no longer fits is put back
-where it started.
+Puts a prone player back where he started if he no longer fits
 ==================
 */
 static qboolean PM_VerifyPronePosition( const vec3_t oldOrigin, const vec3_t oldVelocity ) {
-	if ( !( pm->ps->pm_flags & PMF_PRONE ) ) {
-		return qtrue;
-	}
+	qboolean valid;
 
-	if ( !BG_CheckProneValid( pm->ps->clientNum, pm->ps->origin, pm->ps->maxs[0], 30.0f,
-							  pm->ps->proneDirection,
-							  &pm->ps->fTorsoHeight, &pm->ps->fTorsoPitch, &pm->ps->fWaistPitch,
-							  qtrue, qtrue, NULL, pm->trace3, pm->trace2, qfalse ) ) {
-		VectorCopy( oldOrigin, pm->ps->origin );
-		VectorCopy( oldVelocity, pm->ps->velocity );
-		return qfalse;
+	if ( pm->ps->pm_flags & PMF_PRONE ) {
+		valid = BG_CheckProne( pm->ps->clientNum, pm->ps->origin, pm->ps->maxs[0], 30.0f,
+							   pm->ps->proneDirection,
+							   &pm->ps->fTorsoHeight, &pm->ps->fTorsoPitch, &pm->ps->fWaistPitch,
+							   qtrue, qtrue, NULL, pm->trace3, pm->trace2, qfalse );
+		if ( !valid ) {
+			VectorCopy( oldOrigin, pm->ps->origin );
+			VectorCopy( oldVelocity, pm->ps->velocity );
+		}
+		return valid;
 	}
 
 	return qtrue;
@@ -139,8 +107,8 @@ qboolean PM_SlideMove( qboolean gravity ) {
 
 	// never turn against the ground plane
 	if ( pml.groundPlane ) {
-		numplanes = 1;
 		VectorCopy( pml.groundTrace.normal, planes[0] );
+		numplanes = 1;
 	} else {
 		numplanes = 0;
 	}
@@ -180,7 +148,7 @@ qboolean PM_SlideMove( qboolean gravity ) {
 
 		if ( numplanes >= MAX_CLIP_PLANES ) {
 			// this shouldn't really happen
-			if ( pm->debugLevel > 1 ) {
+			if ( pm->debugLevel >= 2 ) {
 				Com_Printf( "%i:MAX_CLIP_PLANES\n", c_pmove );
 			}
 			VectorClear( pm->ps->velocity );
@@ -194,7 +162,7 @@ qboolean PM_SlideMove( qboolean gravity ) {
 		//
 		for ( i = 0 ; i < numplanes ; i++ ) {
 			if ( DotProduct( trace.normal, planes[i] ) > 0.99900001f ) {
-				if ( pm->debugLevel > 1 ) {
+				if ( pm->debugLevel >= 2 ) {
 					Com_Printf( "%i:recollided with plane normal (%.2f, %.2f, %.2f)\n",
 								c_pmove, trace.normal[0], trace.normal[1], trace.normal[2] );
 				}
@@ -214,7 +182,7 @@ qboolean PM_SlideMove( qboolean gravity ) {
 
 		// find a plane that it enters
 		for ( i = 0 ; i < numplanes ; i++ ) {
-			into = DotProduct( pm->ps->velocity, planes[i] );
+			into = (float)DotProduct( pm->ps->velocity, planes[i] );
 			if ( into >= 0.1 ) {
 				continue;       // move doesn't interact with the plane
 			}
@@ -251,10 +219,10 @@ qboolean PM_SlideMove( qboolean gravity ) {
 				// slide the original velocity along the crease
 				CrossProduct( planes[i], planes[j], dir );
 				VectorNormalize( dir );
-				d = DotProduct( dir, pm->ps->velocity );
+				d = (float)DotProduct( dir, pm->ps->velocity );
 				VectorScale( dir, d, clipVelocity );
 
-				d = DotProduct( dir, endVelocity );
+				d = (float)DotProduct( dir, endVelocity );
 				VectorScale( dir, d, endClipVelocity );
 
 				// see if there is a third plane the new move enters
@@ -294,13 +262,14 @@ qboolean PM_SlideMove( qboolean gravity ) {
 /*
 ==================
 PM_StepSlideMove
+
 ==================
 */
 void PM_StepSlideMove( qboolean gravity ) {
 	vec3_t start_o, start_v;
 	vec3_t down_o, down_v;
 	vec3_t up, down;
-	vec3_t delta;
+	float delta[2];
 	trace_t trace;
 	float stepSize;
 	float stepUp;
@@ -311,16 +280,18 @@ void PM_StepSlideMove( qboolean gravity ) {
 	int magnitude;
 	int bobAdd;
 	int old;
-	float frac;
-	float remaining;
+	rfloat frac;        // keep: rfloat temporaries match original codegen
+	rfloat remaining;
+	rfloat moved[2];
 	float jumpVel;
+	float stepDelta;
 
-	stepDown = qfalse;
 	stepUp = 0;
+	stepDown = qfalse;
 	jumpStep = qfalse;
 
-	if ( pml.groundPlane ) {
-		stepDown = !( pm->ps->pm_flags & PMF_LADDER );
+	if ( pml.groundPlane && !( pm->ps->pm_flags & PMF_LADDER ) ) {
+		stepDown = qtrue;
 	}
 
 	VectorCopy( pm->ps->origin, start_o );
@@ -336,23 +307,21 @@ void PM_StepSlideMove( qboolean gravity ) {
 
 	if ( slid
 		 && ( pm->ps->fJumpOriginZ < -0.001f || pm->ps->fJumpOriginZ > 0.001f )
-		 && pm->ps->groundEntityNum == ENTITYNUM_NONE ) {
-		if ( start_o[2] < pm->ps->fJumpOriginZ ) {
-			// a jump that got stopped by a ledge: step up onto it, but never
-			// higher than the jump would have carried us anyway
-			stepSize = STEPSIZE;
-			if ( start_o[2] + STEPSIZE > pm->ps->fJumpOriginZ ) {
-				stepSize = pm->ps->fJumpOriginZ - start_o[2];
-				if ( stepSize < 1.0f ) {
-					return;
-				}
+		 && pm->ps->groundEntityNum == ENTITYNUM_NONE
+		 && start_o[2] < pm->ps->fJumpOriginZ ) {
+		// a jump that got stopped by a ledge: step up onto it, but never
+		// higher than the jump would have carried us anyway
+		stepSize = STEPSIZE;
+		if ( start_o[2] + STEPSIZE > pm->ps->fJumpOriginZ ) {
+			// keep: assign-and-compare matches original codegen
+			if ( ( stepSize = (rfloat)pm->ps->fJumpOriginZ - start_o[2] ) < 1.0f ) {
+				return;
 			}
-			jumpStep = qtrue;
-		} else if ( !( pm->ps->pm_flags & PMF_LADDER ) || pm->ps->velocity[2] <= 0 ) {
-			return;
 		}
+		jumpStep = qtrue;
 	} else if ( pm->ps->groundEntityNum == ENTITYNUM_NONE
-				&& ( !( pm->ps->pm_flags & PMF_LADDER ) || pm->ps->velocity[2] <= 0 ) ) {
+				&& ( !( pm->ps->pm_flags & PMF_LADDER ) || !( pm->ps->velocity[2] > 0 ) ) ) {
+		// !( > 0 ), not <= 0: NaN returns too
 		return;
 	}
 
@@ -369,8 +338,7 @@ void PM_StepSlideMove( qboolean gravity ) {
 		up[2] = stepSize + start_o[2] + 1.0f;
 		pm->trace( &trace, start_o, pm->mins, pm->maxs, up,
 				   pm->ps->clientNum, pm->tracemask );
-		stepUp = ( stepSize + 1.0f ) * trace.fraction - 1.0f;
-		if ( stepUp < 1.0f ) {
+		if ( ( stepUp = ( (rfloat)stepSize + 1.0f ) * trace.fraction - 1.0f ) < 1.0f ) {
 			if ( pm->debugLevel ) {
 				Com_Printf( "%i:not enough step room\n", c_pmove );
 			}
@@ -378,7 +346,7 @@ void PM_StepSlideMove( qboolean gravity ) {
 		} else {
 			pm->ps->origin[0] = up[0];
 			pm->ps->origin[1] = up[1];
-			pm->ps->origin[2] = start_o[2] + stepUp;
+			pm->ps->origin[2] = FCAST( start_o[2] + stepUp );   // keep: FCAST matches original codegen
 			VectorCopy( start_v, pm->ps->velocity );
 
 			if ( pm->debugLevel && jumpStep ) {
@@ -416,9 +384,10 @@ void PM_StepSlideMove( qboolean gravity ) {
 
 	// only keep the step if it actually got us further along the direction the
 	// unstepped move was already going, and if a jump step did not overshoot
-	if ( delta[0] * pm->ps->velocity[0] + delta[1] * pm->ps->velocity[1] + 0.001f
-		 >= ( pm->ps->origin[0] - start_o[0] ) * pm->ps->velocity[0]
-			+ ( pm->ps->origin[1] - start_o[1] ) * pm->ps->velocity[1]
+	moved[0] = pm->ps->origin[0] - start_o[0];
+	moved[1] = pm->ps->origin[1] - start_o[1];
+	if ( moved[0] * pm->ps->velocity[0] + moved[1] * pm->ps->velocity[1]
+		 <= delta[0] * pm->ps->velocity[0] + delta[1] * pm->ps->velocity[1] + 0.001f
 		 || ( jumpStep && pm->ps->origin[2] >= pm->ps->fJumpOriginZ ) ) {
 		VectorCopy( down_o, pm->ps->origin );
 		VectorCopy( down_v, pm->ps->velocity );
@@ -435,7 +404,8 @@ void PM_StepSlideMove( qboolean gravity ) {
 		if ( stepDown ) {
 			down[0] = pm->ps->origin[0];
 			down[1] = pm->ps->origin[1];
-			down[2] = pm->ps->origin[2] - stepSize * 0.5f;
+			down[2] = pm->ps->origin[2];     // keep: two statements match original codegen
+			down[2] -= stepSize * 0.5f;
 			pm->trace( &trace, pm->ps->origin, pm->mins, pm->maxs, down,
 					   pm->ps->clientNum, pm->tracemask );
 			if ( trace.fraction < 1.0f ) {
@@ -452,12 +422,11 @@ void PM_StepSlideMove( qboolean gravity ) {
 		// the step ate part of the jump: take the same amount off the upward
 		// velocity so the peak stays where it was
 		if ( pm->ps->origin[2] - down_o[2] > 0 ) {
-			remaining = pm->ps->fJumpOriginZ - pm->ps->origin[2];
+			remaining = (rfloat)pm->ps->fJumpOriginZ - pm->ps->origin[2];
 			if ( remaining < 0.1f ) {
 				pm->ps->velocity[2] = 0;
 			} else {
-				jumpVel = (float)sqrt( (double)( (float)pm->ps->gravity
-												 * ( remaining + remaining ) ) );
+				jumpVel = (float)sqrt( pm->ps->gravity * ( remaining + remaining ) );
 				if ( pm->ps->velocity[2] > jumpVel ) {
 					if ( pm->debugLevel ) {
 						Com_Printf( "%i:adjusted jump vel: %.1f -> %.1f\n", c_pmove,
@@ -477,7 +446,7 @@ void PM_StepSlideMove( qboolean gravity ) {
 		return;
 	}
 
-	if ( fabs( (double)( pm->ps->origin[2] - down_o[2] ) ) <= 0.5 ) {
+	if ( !( fabs( (double)( pm->ps->origin[2] - down_o[2] ) ) > 0.5 ) ) {
 		return;
 	}
 
@@ -500,12 +469,17 @@ void PM_StepSlideMove( qboolean gravity ) {
 		step = 24;
 	}
 
-	BG_AddPredictableEventToPlayerstate( EV_STEP, (byte)( step + 128 ), pm->ps );
+	// keep: biasing step in place matches original codegen
+	step += 128;
+	BG_AddPredictableEventToPlayerstate( EV_STEP_VIEW, step, pm->ps );
+	step -= 128;
 
 	// bleed off speed in proportion to how much of the step budget was used
-	frac = ( 1.0f - PM_FloatAbs( pm->ps->origin[2] - start_o[2] ) / stepSize ) * 0.80000001f
-		   + 0.19999999f;
-	VectorScale( pm->ps->velocity, frac, pm->ps->velocity );
+	stepDelta = pm->ps->origin[2] - start_o[2];
+	frac = ( 1.0f - (rfloat)PM_FloatAbs( stepDelta ) / stepSize ) * 0.80000001f + 0.19999999f;
+	pm->ps->velocity[0] = frac * pm->ps->velocity[0];
+	pm->ps->velocity[1] = frac * pm->ps->velocity[1];
+	pm->ps->velocity[2] = frac * pm->ps->velocity[2];
 
 	magnitude = abs( step );
 	if ( magnitude <= 3 ) {
@@ -519,11 +493,12 @@ void PM_StepSlideMove( qboolean gravity ) {
 	}
 
 	// push the bob cycle forward so a tall step lands a footstep
-	bobAdd = magnitude / 2;
+	bobAdd = abs( step ) / 2;   // keep: not magnitude, matches original codegen
 	if ( bobAdd > 4 ) {
 		bobAdd = 4;
 	}
 	old = pm->ps->bobCycle;
-	pm->ps->bobCycle = (int)( (float)bobAdd * 1.25f + 7.0f + (float)old ) & 255;
-	PM_FootstepEvent( old, qtrue, pm->ps->bobCycle );
+	// keep: FCAST matches original codegen
+	pm->ps->bobCycle = (int)( FCAST( (float)bobAdd * 1.25f + 7.0f ) + (float)old ) & 255;
+	PM_FootstepEvent( old, pm->ps->bobCycle, qtrue );
 }

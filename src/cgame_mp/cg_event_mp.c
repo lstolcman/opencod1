@@ -1,28 +1,6 @@
-/*
- * cg_event.c -- entity events and effects.
- *
- * Call of Duty 1.1 multiplayer client game (cgame_mp_x86.dll, imagebase
- * 0x30000000).  RTCW's cgame/cg_event.c is the ancestor of CG_Obituary,
- * CG_ItemPickup, CG_EntityEvent and CG_CheckEvents, but only the skeletons
- * survived:
- *
- *   - the event enum is CoD's own 202-value list, recovered verbatim as
- *     eventnames[] in game_mp/bg_misc.c.  Six 23-wide footstep blocks (run,
- *     walk, prone, jump, landing, landing-pain) replace RTCW's EV_FOOTSTEP_*,
- *     and each one indexes a 23-entry surface-sound table in cgs.media.
- *   - every sound is a sound ALIAS name, not a handle: cgs.media's sound slots
- *     hold the string trap_Com_SoundAliasString returned, and cg_public.h types
- *     them sfxHandle_t, hence the casts.
- *   - explosions and impacts are FX-system effect ids (traps 227..229), not
- *     local entities.
- *   - CoD added CG_EntityPreEvent / CG_CheckPreEvents: a second event stream
- *     carried in centity_t::nextState that fires one frame early, so muzzle
- *     flashes and bullet impacts are not a frame late.
- *
- * Functions are in address order, which is the original file order.
- *
- * @fidelity: likely
- */
+// cg_event.c -- handle entity events at snapshot or playerstate transitions
+// Sounds are played by alias name, and impacts and explosions go through the
+// effects system.  The nextState events are run a frame early by CG_CheckPreEvents.
 
 #include <string.h>
 #include <stdlib.h>
@@ -30,14 +8,10 @@
 #include "cg_local.h"
 #include "../game_mp/bg_public.h"
 
-#define MAX_EVENTS                  4           /* entityState_t::events[] */
-#define SURF_TYPE_NUM               23
+#define MAX_EVENTS                  4           // max events per frame before we drop events
 #define STEP_TIME                   100
 
-/*
- * The events this unit names.  Indices into eventnames[] (game_mp/bg_misc.c),
- * which is the authority on both the ordering and the spelling.
- */
+// entity_event_t; must match eventnames[] in bg_misc.c
 #define EV_NONE                         0
 #define EV_FOOTSTEP_RUN_DEFAULT         1
 #define EV_FOOTSTEP_RUN_ASPHALT         23
@@ -110,28 +84,23 @@
 #define EV_PLAYER_TELEPORT_OUT          200
 #define EV_OBITUARY                     201
 
-/* entityState_t::eType > ET_EVENTS is the event-only entity (0x3001EA10). */
+// any of the EV_* events can be added freestanding
+// by setting eType to ET_EVENTS + eventNum
 #define ET_EVENTS                       12
 
-/* configstrings.  524 is cg_ent_mp.c's CS_SOUNDALIAS; 844 is the block
-   CG_PlayFxOnTag reads (0x3001DB86), one past CS_EFFECTS' 780..843. */
+// configstrings
 #define CS_SOUNDALIAS                   524
 #define CS_EFFECTS_ONTAG                844
 #define MAX_CONFIGSTRINGS               2048
 
-/* CG_PlayFx' bounds test against cgs.gameEffects (0x3001DB2A). */
+// size of cgs.gameEffects
 #define MAX_FX_CG                       64
 
-/* CG_EntityEvent's world-sound entity number (0x3001E4AE); Q3's
-   ENTITYNUM_WORLD, MAX_GENTITIES - 2. */
 #define ENTITYNUM_WORLD                 ( MAX_GENTITIES - 2 )
 
-/* cg_ent_mp.c spells this same 0x50000 pm_flags mask PMF_VIEWLOCKED
-   (0x3001BF47); CG_EntityEvent tests it at 0x3001E0E2. */
 #define PMF_VIEWLOCKED                  0x00050000
 
-/* CG_Obituary's means-of-death byte carries this flag when the low bits are a
-   meansOfDeath_t rather than a weapon index (0x3001D6F8). */
+// set when eventParm is a meansOfDeath_t rather than a weapon index
 #define MOD_FLAG                        0x80
 #define MOD_MELEE                       0x07
 #define MOD_HEAD_SHOT                   0x08
@@ -142,72 +111,37 @@
 #define MOD_SUICIDE                     0x16
 #define MOD_TRIGGER_HURT                0x17
 
-/*
- * cgs.media's ten 23-entry surface-sound tables live in the 920-byte hole
- * cg_local.h spells unknown_0x2F8, and the nine impact-effect tables in the
- * 832-byte unknown_0x70C (the same nine CG_RegisterImpactEffects fills).
- */
-#define MEDIA_SURFACE_SOUNDS( k )   ( (const char **)&cgs.media.unknown_0x2F8[ (k) * SURF_TYPE_NUM * 4 ] )
-#define MEDIA_IMPACT_EFFECTS( k )   ( (const int *)&cgs.media.unknown_0x70C[ (k) * SURF_TYPE_NUM * 4 ] )
-
-#define footstepRunSounds       MEDIA_SURFACE_SOUNDS( 6 )   /* cgs+0x9F04; the jump block reads it too */
-#define footstepWalkSounds      MEDIA_SURFACE_SOUNDS( 7 )   /* cgs+0x9F60 */
-#define footstepProneSounds     MEDIA_SURFACE_SOUNDS( 8 )   /* cgs+0x9FBC */
-#define landingSounds           MEDIA_SURFACE_SOUNDS( 9 )   /* cgs+0xA018; landing-pain reads it too */
-#define grenadeBounceSounds     MEDIA_SURFACE_SOUNDS( 0 )   /* cgs+0x9CDC */
-#define grenadeExplodeSounds    MEDIA_SURFACE_SOUNDS( 1 )   /* cgs+0x9D38 */
-#define rocketExplodeSounds     MEDIA_SURFACE_SOUNDS( 2 )   /* cgs+0x9D94 */
-
-#define grenadeBounceEffects    MEDIA_IMPACT_EFFECTS( 4 )   /* cgs+0xA260 */
-#define grenadeExplodeEffects   MEDIA_IMPACT_EFFECTS( 5 )   /* cgs+0xA2BC */
-#define rocketExplodeEffects    MEDIA_IMPACT_EFFECTS( 6 )   /* cgs+0xA318 */
-
-/* centity_t::miscTime, +0x1F4 inside cg_local.h's unknown_0x1F0 hole. */
-#define CENT_MISCTIME( c )  ( *(int *)&( c )->unknown_0x1F0[4] )
-
-/* cg.markSuppress: CG_EntityEvent raises it around EV_ROCKET_EXPLODE_NOMARKS
-   (0x3001E59F) and CG_ImpactMark returns early while it is set. */
-#define cg_noMarks          ( *(int *)&cg.unknown_0x2A87C[4] )
-
-/*
- * cg_items[] -- cgame's per-item visual record, 36 bytes, indexed by item
- * number (CG_RegisterItemVisuals 0x30036080, base 0x301DC3E0).  Only the two
- * pickup sound aliases this unit reads are named; cg_weapons.c owns the type.
- */
+// cg_items[] -- per-item visuals; only the pickup sounds are used here
 typedef struct cgItemInfo_t {
-	byte        unknown_0x00[0x1C];
-	const char  *pickupSound;               /* +0x1C EV_ITEM_PICKUP  0x3001E0BD */
-	const char  *ammoPickupSound;           /* +0x20 EV_AMMO_PICKUP  0x3001E0CE */
+	qboolean    registered;
+	qhandle_t   models[MAX_ITEM_MODELS];
+	qhandle_t   icons[MAX_ITEM_ICONS];
+	const char  *pickupSound;
+	const char  *ammoPickupSound;
 } cgItemInfo_t;
 
-extern cgItemInfo_t cg_items[];                                 /* 0x301DC3E0 */
+extern cgItemInfo_t cg_items[];
 
-/* Owned by other units. */
-void        CG_Printf( const char *msg, ... );                  /* cg_main.c 0x300206F0 */
-void        CG_Error( const char *msg, ... );                   /* cg_main.c 0x30020750 */
-void        Com_DPrintf( const char *msg, ... );                /* cg_main.c 0x300208F0 */
+void        CG_Printf( const char *msg, ... );
+void        CG_Error( const char *msg, ... );
+void        Com_DPrintf( const char *msg, ... );
 int         CG_PlaySoundAliasByName( const char *name, int entnum, const vec3_t origin );
-                                                                /* cg_main.c 0x30021BF0 */
 void        CG_PriorityCenterPrint( const char *str, float y, float charWidth, int priority );
-                                                                /* cg_draw.c 0x300159E0 */
 void        CG_DrawScoreboard_GetTeamColor( vec4_t color, int team );
-                                                                /* cg_scoreboard.c 0x3002A810 */
-/* CG_FireWeapon, CG_EjectWeaponBrass, CG_RailTrail, CG_BulletHitEvent,
-   CG_BulletHitClientEvent and CG_OutOfAmmoChange all come in from cg_local.h's
-   cg_weapons_mp.c section. */
 void        CG_StartShakeCamera( float amplitude, int duration, float radius, const vec3_t origin );
-                                                                /* cg_shellshock.c 0x30017DD0 */
 
-/* game_mp/bg_misc.c -- the 202-value event-name table, recovered verbatim. */
-extern char *eventnames[];
+// eventnames[] is reached through bg_misc.c's pointer to it
+extern char **pEventNamesList;
+#define eventnames pEventNamesList
 
 /*
 =================
-CG_Obituary     0x3001D6C0
+CG_Obituary
 =================
 */
 static void CG_Obituary( entityState_t *ent ) {
 	int         mod;
+	int         means;
 	int         target, attacker;
 	const char  *icon;
 	float       iconWidth;
@@ -221,37 +155,51 @@ static void CG_Obituary( entityState_t *ent ) {
 	clientInfo_t *attackerInfo;
 	const char  *s;
 
+	attackerColor[0] = 1.0f;
+	attackerColor[1] = 1.0f;
+	attackerColor[2] = 1.0f;
+	attackerColor[3] = 1.0f;
+	targetColor[0] = 1.0f;
+	targetColor[1] = 1.0f;
+	targetColor[2] = 1.0f;
+	targetColor[3] = 1.0f;
+	iconColor[0] = 1.0f;
+	iconColor[1] = 1.0f;
+	iconColor[2] = 1.0f;
+	iconColor[3] = 1.0f;
+
 	target = ent->otherEntityNum;
 	attacker = ent->attackerEntityNum;
 	mod = ent->eventParm;
 
-	attackerColor[0] = attackerColor[1] = attackerColor[2] = attackerColor[3] = 1.0f;
-	targetColor[0] = targetColor[1] = targetColor[2] = targetColor[3] = 1.0f;
-	iconColor[0] = iconColor[1] = iconColor[2] = iconColor[3] = 1.0f;
-
-	icon = "killIconDied";
 	iconWidth = 1.4f;
 	iconHeight = 1.4f;
 
 	if ( mod & MOD_FLAG ) {
-		switch ( mod & ~MOD_FLAG ) {
-		case MOD_MELEE:         icon = "killIconMelee";     break;
-		case MOD_HEAD_SHOT:     icon = "killIconHeadShot";  break;
-		case MOD_WATER:         icon = "killIconDrown";     break;
-		case MOD_SLIME:         icon = "killIconSlime";     break;
-		case MOD_CRUSH:         icon = "killIconCrush";     break;
-		case MOD_FALLING:       icon = "killIconFalling";   break;
-		case MOD_SUICIDE:       icon = "killIconSuicide";   break;
-		case MOD_TRIGGER_HURT:  icon = "killIconDied";      break;
-		default:                                            break;
-		}
+		means = mod & ~MOD_FLAG;
+		icon = "killIconDied";
 	} else {
+		means = 0;
 		if ( bg_weaponInfo[mod]->killIcon[0] ) {
 			icon = bg_weaponInfo[mod]->killIcon;
 			if ( bg_weaponInfo[mod]->wideKillIcon ) {
 				iconWidth = 2.8f;
 			}
+		} else {
+			icon = "killIconDied";
 		}
+	}
+
+	switch ( means ) {
+	case MOD_MELEE:         iconWidth = 1.4f;   icon = "killIconMelee";     break;
+	case MOD_HEAD_SHOT:     iconWidth = 1.4f;   icon = "killIconHeadShot";  break;
+	case MOD_SUICIDE:       iconWidth = 1.4f;   icon = "killIconSuicide";   break;
+	case MOD_FALLING:       iconWidth = 1.4f;   icon = "killIconFalling";   break;
+	case MOD_CRUSH:         iconWidth = 1.4f;   icon = "killIconCrush";     break;
+	case MOD_WATER:         iconWidth = 1.4f;   icon = "killIconDrown";     break;
+	case MOD_SLIME:         iconWidth = 1.4f;   icon = "killIconSlime";     break;
+	case MOD_TRIGGER_HURT:  iconWidth = 1.4f;   icon = "killIconDied";      break;
+	default:                                                                break;
 	}
 
 	if ( target < 0 || target >= MAX_CLIENTS ) {
@@ -265,7 +213,7 @@ static void CG_Obituary( entityState_t *ent ) {
 
 	strncpy( targetName, targetInfo->name, 31 );
 	targetName[31] = 0;
-	strcpy( targetName + strlen( targetName ), "^7" );
+	strcat( targetName, "^7" );
 	CG_DrawScoreboard_GetTeamColor( targetColor, targetInfo->team );
 
 	if ( !bg_clientinfo[ cg.clientNum ].infoValid ) {
@@ -283,7 +231,7 @@ static void CG_Obituary( entityState_t *ent ) {
 		}
 		strncpy( attackerName, attackerInfo->name, 31 );
 		attackerName[31] = 0;
-		strcpy( attackerName + strlen( attackerName ), "^7" );
+		strcat( attackerName, "^7" );
 		CG_DrawScoreboard_GetTeamColor( attackerColor, attackerInfo->team );
 
 		if ( target == cg.snap->ps.clientNum ) {
@@ -309,31 +257,33 @@ static void CG_Obituary( entityState_t *ent ) {
 
 /*
 ===============
-CG_ItemPickup     0x3001DA80
+CG_ItemPickup
 
 A new item was picked up this frame
 ===============
 */
 static void CG_ItemPickup( int itemNum ) {
+	int     weapon;
+
 	cg.itemPickup = itemNum;
 	cg.itemPickupTime = cg.time;
 	cg.itemPickupBlendTime = cg.time;
 
 	// see if it should be the grabbed weapon
-	if ( bg_itemlist[itemNum].giType != IT_WEAPON ) {
-		return;
+	if ( bg_itemlist[itemNum].giType == IT_WEAPON ) {
+		weapon = bg_itemlist[itemNum].giTag;
+		if ( !cg_weaponSelect.integer ) {
+			cg.weaponSelectTime = cg.time;
+			trap_Cvar_Set( "cg_weaponSelect", va( "%i", weapon ) );
+		}
 	}
-	if ( cg_weaponSelect.integer ) {
-		return;
-	}
-
-	cg.weaponSelectTime = cg.time;
-	trap_Cvar_Set( "cg_weaponSelect", va( "%i", bg_itemlist[itemNum].giTag ) );
 }
 
 /*
 ===============
-CG_EquipmentSound     0x3001DAE0
+CG_EquipmentSound
+
+Gear rattle that goes with each footstep
 ===============
 */
 static void CG_EquipmentSound( int entnum, qboolean running ) {
@@ -346,28 +296,29 @@ static void CG_EquipmentSound( int entnum, qboolean running ) {
 
 /*
 ===============
-CG_PlayFx     0x3001DB20
+CG_PlayFx
 ===============
 */
 static void CG_PlayFx( centity_t *cent, const vec3_t dir ) {
+	int     fx;
+
 	if ( cent->currentState.eventParm <= 0 || cent->currentState.eventParm >= MAX_FX_CG ) {
 		CG_Printf( "ERROR: CG_PlayFx called with invalid effect id %i\n",
 				   cent->currentState.eventParm );
 		return;
 	}
 
+	fx = cgs.gameEffects[ cent->currentState.eventParm ];
 	if ( dir ) {
-		trap_syscall_0xE4( cgs.gameEffects[ cent->currentState.eventParm ],
-						   (int)cent->lerpOrigin, (int)dir );
+		trap_FX_PlayEffectID( fx, cent->lerpOrigin, dir );
 	} else {
-		trap_syscall_0xE3( cgs.gameEffects[ cent->currentState.eventParm ],
-						   (int)cent->lerpOrigin );
+		trap_FX_PlaySimpleEffectID( fx, cent->lerpOrigin );
 	}
 }
 
 /*
 ===============
-CG_PlayFxOnTag     0x3001DB80
+CG_PlayFxOnTag
 
 The configstring is "%02i" of the effect index followed by the tag name.
 ===============
@@ -375,25 +326,23 @@ The configstring is "%02i" of the effect index followed by the tag name.
 static void CG_PlayFxOnTag( centity_t *cent, int eventParm ) {
 	const char  *cs;
 	int         effect;
-	int         boneIndex;
 	int         bolt[2];
 
 	cs = CG_ConfigString( CS_EFFECTS_ONTAG + eventParm );
 	effect = cgs.gameEffects[ ( cs[0] - '0' ) * 10 + ( cs[1] - '0' ) ];
 
-	boneIndex = trap_syscall_0xDF( cent->currentState.number, cs + 2 );
-	if ( boneIndex < 0 ) {
+	bolt[0] = cent->currentState.number;
+	bolt[1] = trap_FX_GetBoneIndex( cent->currentState.number, cs + 2 );
+	if ( bolt[1] < 0 ) {
 		return;
 	}
 
-	bolt[0] = cent->currentState.number;
-	bolt[1] = boneIndex;
-	trap_syscall_0xE5( effect, (int)cent->lerpOrigin, 0, (int)bolt );
+	trap_FX_PlayOrientedEffectID( effect, cent->lerpOrigin, NULL, bolt );
 }
 
 /*
 ==============
-CG_EntityEvent     0x3001DC10
+CG_EntityEvent
 
 An entity has an event value
 also called by CG_CheckPlayerstateEvents
@@ -404,8 +353,11 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 	int             clientNum;
 	int             eventParm;
 	int             item;
+	cgItemInfo_t    *itemInfo;
 	int             kick;
-	float           height;
+	rfloat          height;     // keep: rfloat, matches original codegen
+	float           *position;
+	const char      *s;
 	vec3_t          dir;
 
 	if ( !event ) {
@@ -417,6 +369,7 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 
 	es = &cent->currentState;
 	eventParm = es->eventParm;
+	position = cent->lerpOrigin;
 
 	if ( cg_debugevents.integer ) {
 		CG_Printf( "ent:%3i  event:%3i ", es->number, event );
@@ -433,7 +386,7 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 	if ( event >= EV_FOOTSTEP_RUN_DEFAULT && event < EV_FOOTSTEP_WALK_DEFAULT ) {
 		if ( cg_footsteps.integer ) {
 			CG_PlayEntitySoundAliasByName( es->number,
-										   footstepRunSounds[ event - EV_FOOTSTEP_RUN_DEFAULT ] );
+										   (const char *)cgs.media.footstepRunSounds[ event - EV_FOOTSTEP_RUN_DEFAULT ] );
 		}
 		CG_EquipmentSound( es->number, qtrue );
 		return;
@@ -442,7 +395,7 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 	if ( event >= EV_FOOTSTEP_WALK_DEFAULT && event < EV_FOOTSTEP_PRONE_DEFAULT ) {
 		if ( cg_footsteps.integer ) {
 			CG_PlayEntitySoundAliasByName( es->number,
-										   footstepWalkSounds[ event - EV_FOOTSTEP_WALK_DEFAULT ] );
+										   (const char *)cgs.media.footstepWalkSounds[ event - EV_FOOTSTEP_WALK_DEFAULT ] );
 		}
 		CG_EquipmentSound( es->number, qfalse );
 		return;
@@ -451,7 +404,7 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 	if ( event >= EV_FOOTSTEP_PRONE_DEFAULT && event < EV_JUMP_DEFAULT ) {
 		if ( cg_footsteps.integer ) {
 			CG_PlayEntitySoundAliasByName( es->number,
-										   footstepProneSounds[ event - EV_FOOTSTEP_PRONE_DEFAULT ] );
+										   (const char *)cgs.media.footstepProneSounds[ event - EV_FOOTSTEP_PRONE_DEFAULT ] );
 		}
 		CG_EquipmentSound( es->number, qfalse );
 		return;
@@ -459,43 +412,45 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 
 	if ( event >= EV_JUMP_DEFAULT && event < EV_LANDING_DEFAULT ) {
 		CG_PlayEntitySoundAliasByName( es->number,
-									   footstepRunSounds[ event - EV_JUMP_DEFAULT ] );
+									   (const char *)cgs.media.footstepRunSounds[ event - EV_JUMP_DEFAULT ] );
 		CG_EquipmentSound( es->number, qtrue );
 		return;
 	}
 
 	if ( event >= EV_LANDING_DEFAULT && event < EV_LANDING_PAIN_DEFAULT ) {
 		CG_PlayEntitySoundAliasByName( es->number,
-									   landingSounds[ event - EV_LANDING_DEFAULT ] );
+									   (const char *)cgs.media.landingSounds[ event - EV_LANDING_DEFAULT ] );
 		if ( clientNum == cg.predictedPlayerState.clientNum ) {
 			// smooth landing z changes
 			cg.landTime = cg.time;
-			cg.landChange = (float)-eventParm;
+			cg.landChange = -(float)eventParm;
 		}
 		return;
 	}
 
 	if ( event >= EV_LANDING_PAIN_DEFAULT && event < EV_FOLIAGE_SOUND ) {
 		CG_PlayEntitySoundAliasByName( es->number,
-									   landingSounds[ event - EV_LANDING_PAIN_DEFAULT ] );
+									   (const char *)cgs.media.landingSounds[ event - EV_LANDING_PAIN_DEFAULT ] );
 		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.landDamageSound );
 		if ( clientNum == cg.predictedPlayerState.clientNum ) {
 			height = ( bg_fallDamageMaxHeight.value - bg_fallDamageMinHeight.value )
 					 * ( eventParm * 0.01f ) + bg_fallDamageMinHeight.value;
-			if ( height > 12.0f ) {
-				kick = (int)( ( ( height - 12.0f ) * ( 1.0f / 26.0f ) + 1.0f ) * 4.0f );
-				if ( kick > 24 ) {
-					kick = 24;
-				} else if ( kick <= 0 ) {
-					return;
-				}
-				cg.landTime = cg.time;
-				cg.landChange = (float)-kick;
+			if ( height <= 12.0f ) {
+				return;
 			}
+			kick = (int)( ( ( height - 12.0f ) * ( 1.0f / 26.0f ) + 1.0f ) * 4.0f );
+			if ( kick > 24 ) {
+				kick = 24;
+			} else if ( kick <= 0 ) {
+				return;
+			}
+			cg.landTime = cg.time;
+			cg.landChange = -(float)kick;
 		}
 		return;
 	}
 
+	// keep: case order matches original codegen
 	switch ( event ) {
 	case EV_FOLIAGE_SOUND:
 		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.movementFoliage );
@@ -505,7 +460,7 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 		if ( clientNum != cg.predictedPlayerState.clientNum ) {
 			Com_DPrintf( "Event %s just for client %i was sent to other clients\n",
 						 eventnames[event], clientNum );
-			break;
+			return;     // keep: return, not break (original codegen)
 		}
 		if ( !cl_stanceTemp.integer ) {
 			trap_Cvar_Setvar( &cl_stance, "0" );
@@ -534,10 +489,10 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 		}
 		break;
 
-	case EV_STEP_VIEW:
+	case EV_STEP_VIEW:      // smooth out step up transitions
 		{
 			int     delta;
-			float   oldStep;
+			rfloat  oldStep;    // keep: rfloat, matches original codegen
 			float   step;
 
 			if ( clientNum != cg.predictedPlayerState.clientNum ) {
@@ -545,18 +500,22 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 							 eventnames[event], clientNum );
 				break;
 			}
+			// if we are interpolating, we don't need to smooth steps
 			if ( cg.demoPlayback || cg_nopredict.integer || g_synchronousClients.integer ) {
 				break;
 			}
 
-			// smooth out stair climbing
+			// check for stepping up before a previous step is completed
 			delta = cg.time - cg.stepTime;
 			if ( delta < STEP_TIME ) {
-				oldStep = ( cg.stepChange * ( STEP_TIME - delta ) / STEP_TIME ) * 0.9f;
+				// keep: two statements, matches original codegen
+				oldStep = cg.stepChange * (rfloat)( STEP_TIME - delta ) * 0.01f;
+				oldStep *= 0.9f;
 			} else {
 				oldStep = 0.0f;
 			}
 
+			// add this amount
 			step = (float)( eventParm - 128 );
 			cg.stepChange = step + oldStep;
 			if ( cg.stepChange > 24.0f ) {
@@ -579,43 +538,25 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 	case EV_ITEM_PICKUP:
 	case EV_ITEM_PICKUP_QUIET:
 	case EV_AMMO_PICKUP:
-		item = es->eventParm;
+		item = es->eventParm;      // player predicted
 		if ( item < 1 || item >= 70 ) {
 			break;
 		}
+		itemInfo = &cg_items[item];
 		if ( event == EV_ITEM_PICKUP ) {
-			CG_PlayEntitySoundAliasByName( es->number, cg_items[item].pickupSound );
+			CG_PlayEntitySoundAliasByName( es->number, itemInfo->pickupSound );
 		} else if ( event == EV_AMMO_PICKUP ) {
-			CG_PlayEntitySoundAliasByName( es->number, cg_items[item].ammoPickupSound );
+			CG_PlayEntitySoundAliasByName( es->number, itemInfo->ammoPickupSound );
 		}
-		// powerups and team items will have a separate global sound, this one
-		// is for items and weapons
+		// show icon and name on status bar
 		if ( ( cg.snap->ps.pm_flags & PMF_VIEWLOCKED ) && es->number == cg.snap->ps.clientNum ) {
 			CG_ItemPickup( item );
 		}
 		break;
 
-	case EV_NOAMMO:
-		if ( !bg_weaponInfo[ es->weapon ]->clipOnly ) {
-			CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.noAmmoSound );
-		}
-		if ( ( cg.snap->ps.pm_flags & PMF_VIEWLOCKED ) && es->number == cg.snap->ps.clientNum ) {
-			CG_OutOfAmmoChange();
-		}
-		break;
-
-	case EV_DROPWEAPON:
-		if ( cg_weapons[ es->weapon ].putawaySound ) {
-			CG_PlayEntitySoundAliasByName( es->number, cg_weapons[ es->weapon ].putawaySound );
-		}
-		if ( ( cg.snap->ps.pm_flags & PMF_VIEWLOCKED ) && es->number == cg.snap->ps.clientNum ) {
-			CG_OutOfAmmoChange();
-		}
-		break;
-
-	case EV_EMPTYCLIP:
-		break;
-
+		//
+		// weapon events
+		//
 	case EV_RELOAD:
 		if ( cg_weapons[ es->weapon ].reloadSound ) {
 			CG_PlayEntitySoundAliasByName( es->number, cg_weapons[ es->weapon ].reloadSound );
@@ -644,6 +585,27 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 		}
 		break;
 
+	case EV_NOAMMO:
+		if ( !bg_weaponInfo[ es->weapon ]->clipOnly ) {
+			CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.noAmmoSound );
+		}
+		if ( ( cg.snap->ps.pm_flags & PMF_VIEWLOCKED ) && es->number == cg.snap->ps.clientNum ) {
+			CG_OutOfAmmoChange();
+		}
+		break;
+
+	case EV_DROPWEAPON:
+		if ( cg_weapons[ es->weapon ].putawaySound ) {
+			CG_PlayEntitySoundAliasByName( es->number, cg_weapons[ es->weapon ].putawaySound );
+		}
+		if ( ( cg.snap->ps.pm_flags & PMF_VIEWLOCKED ) && es->number == cg.snap->ps.clientNum ) {
+			CG_OutOfAmmoChange();
+		}
+		break;
+
+	case EV_EMPTYCLIP:
+		break;
+
 	case EV_RAISE_WEAPON:
 		if ( cg_weapons[ es->weapon ].raiseSound ) {
 			CG_PlayEntitySoundAliasByName( es->number, cg_weapons[ es->weapon ].raiseSound );
@@ -662,9 +624,17 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 		}
 		break;
 
-	case EV_PULLBACK_WEAPON:
-		if ( cg_weapons[ es->weapon ].pullbackSound ) {
-			CG_PlayEntitySoundAliasByName( es->number, cg_weapons[ es->weapon ].pullbackSound );
+	case EV_FIRE_QUADBARREL_1:
+		if ( predicted ) {
+			CG_FireWeapon( cent, es, event, 0 );
+			CG_FireWeapon( cent, es, event, 1 );
+		}
+		break;
+
+	case EV_FIRE_QUADBARREL_2:
+		if ( predicted ) {
+			CG_FireWeapon( cent, es, event, 2 );
+			CG_FireWeapon( cent, es, event, 3 );
 		}
 		break;
 
@@ -677,17 +647,9 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 		}
 		break;
 
-	case EV_FIRE_QUADBARREL_1:
-		if ( predicted ) {
-			CG_FireWeapon( cent, es, event, 0 );
-			CG_FireWeapon( cent, es, event, 1 );
-		}
-		break;
-
-	case EV_FIRE_QUADBARREL_2:
-		if ( predicted ) {
-			CG_FireWeapon( cent, es, event, 2 );
-			CG_FireWeapon( cent, es, event, 3 );
+	case EV_PULLBACK_WEAPON:
+		if ( cg_weapons[ es->weapon ].pullbackSound ) {
+			CG_PlayEntitySoundAliasByName( es->number, cg_weapons[ es->weapon ].pullbackSound );
 		}
 		break;
 
@@ -720,9 +682,35 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 		CG_PlayEntitySoundAliasByName( es->otherEntityNum, (const char *)cgs.media.meleeHit );
 		break;
 
-	case EV_SOUND_ALIAS:
-		CG_PlaySoundAliasByName( CG_ConfigString( CS_SOUNDALIAS + es->eventParm ),
-								 es->number, es->pos.trBase );
+		//=================================================================
+
+		//
+		// other events
+		//
+	case EV_PLAYER_TELEPORT_IN:
+		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.teleInSound );
+		break;
+
+	case EV_PLAYER_TELEPORT_OUT:
+		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.teleOutSound );
+		break;
+
+	case EV_ITEM_POP:
+		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.respawnSound );
+		break;
+
+	case EV_ITEM_RESPAWN:
+		cent->miscTime = cg.time;    // scale up from this
+		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.respawnSound );
+		break;
+
+	case EV_FLAMEBARREL_BOUNCE:
+		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.flamebarrelBounce );
+		break;
+
+	case EV_RAILTRAIL:
+		// ev_railtrail is now sent standalone rather than by a player entity
+		CG_RailTrail( es->dmgFlags, es->origin2, es->pos.trBase );
 		break;
 
 	case EV_BULLET_HIT_SMALL:
@@ -733,58 +721,59 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 
 	case EV_GRENADE_BOUNCE:
 		ByteToDir( es->eventParm, dir );
-		CG_PlaySoundAliasByName( grenadeBounceSounds[ es->surfType ],
-								 ENTITYNUM_WORLD, cent->lerpOrigin );
-		if ( grenadeBounceEffects[ es->surfType ] ) {
-			trap_syscall_0xE4( grenadeBounceEffects[ es->surfType ],
-							   (int)cent->lerpOrigin, (int)dir );
+		CG_PlaySoundAliasByName( (const char *)cgs.media.grenadeBounceSounds[ es->surfType ],
+								 ENTITYNUM_WORLD, position );
+		if ( cgs.media.grenadeBounceEffects[ es->surfType ] ) {
+			trap_FX_PlayEffectID( cgs.media.grenadeBounceEffects[ es->surfType ],
+							   position, dir );
 		}
 		break;
 
 	case EV_GRENADE_EXPLODE:
 		ByteToDir( es->eventParm, dir );
-		CG_PlaySoundAliasByName( grenadeExplodeSounds[ es->surfType ],
-								 ENTITYNUM_WORLD, cent->lerpOrigin );
-		if ( grenadeExplodeEffects[ es->surfType ] ) {
-			trap_syscall_0xE4( grenadeExplodeEffects[ es->surfType ],
-							   (int)cent->lerpOrigin, (int)dir );
+		CG_PlaySoundAliasByName( (const char *)cgs.media.grenadeExplodeSounds[ es->surfType ],
+								 ENTITYNUM_WORLD, position );
+		if ( cgs.media.grenadeExplodeEffects[ es->surfType ] ) {
+			trap_FX_PlayEffectID( cgs.media.grenadeExplodeEffects[ es->surfType ],
+							   position, dir );
 		}
 		if ( cg_weapons[ es->weapon ].projExplosionEffect ) {
-			trap_syscall_0xE4( cg_weapons[ es->weapon ].projExplosionEffect,
-							   (int)cent->lerpOrigin, (int)dir );
+			trap_FX_PlayEffectID( cg_weapons[ es->weapon ].projExplosionEffect,
+							   position, dir );
 		}
 		if ( cg_weapons[ es->weapon ].projExplosionSound
 			 && cg_weapons[ es->weapon ].projExplosionSound[0] ) {
 			CG_PlaySoundAliasByName( cg_weapons[ es->weapon ].projExplosionSound,
-									 ENTITYNUM_WORLD, cent->lerpOrigin );
+									 ENTITYNUM_WORLD, position );
 		}
 		break;
 
 	case EV_ROCKET_EXPLODE_NOMARKS:
-		cg_noMarks = 1;
-		/* fall through */
+		cg.noMarks = 1;
+		// fall through
 	case EV_ROCKET_EXPLODE:
 		ByteToDir( es->eventParm, dir );
-		CG_PlaySoundAliasByName( rocketExplodeSounds[ es->surfType ],
-								 ENTITYNUM_WORLD, cent->lerpOrigin );
-		if ( rocketExplodeEffects[ es->surfType ] ) {
-			trap_syscall_0xE4( rocketExplodeEffects[ es->surfType ],
-							   (int)cent->lerpOrigin, (int)dir );
+		CG_PlaySoundAliasByName( (const char *)cgs.media.rocketExplodeSounds[ es->surfType ],
+								 ENTITYNUM_WORLD, position );
+		if ( cgs.media.rocketExplodeEffects[ es->surfType ] ) {
+			trap_FX_PlayEffectID( cgs.media.rocketExplodeEffects[ es->surfType ],
+							   position, dir );
 		}
 		if ( cg_weapons[ es->weapon ].projExplosionEffect ) {
-			trap_syscall_0xE4( cg_weapons[ es->weapon ].projExplosionEffect,
-							   (int)cent->lerpOrigin, (int)dir );
+			trap_FX_PlayEffectID( cg_weapons[ es->weapon ].projExplosionEffect,
+							   position, dir );
 		}
 		if ( cg_weapons[ es->weapon ].projExplosionSound
 			 && cg_weapons[ es->weapon ].projExplosionSound[0] ) {
 			CG_PlaySoundAliasByName( cg_weapons[ es->weapon ].projExplosionSound,
-									 ENTITYNUM_WORLD, cent->lerpOrigin );
+									 ENTITYNUM_WORLD, position );
 		}
-		cg_noMarks = 0;
+		cg.noMarks = 0;
 		break;
 
-	case EV_RAILTRAIL:
-		CG_RailTrail( es->dmgFlags, es->pos.trBase, es->origin2 );
+	case EV_SOUND_ALIAS:
+		s = CG_ConfigString( CS_SOUNDALIAS + es->eventParm );
+		CG_PlaySoundAliasByName( s, es->number, es->pos.trBase );
 		break;
 
 	case EV_PAIN:
@@ -792,7 +781,7 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 		break;
 
 	case EV_DEATH:
-		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.unknown_0x2E4[0] );
+		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.deathSound );
 		break;
 
 	case EV_OBITUARY:
@@ -808,8 +797,7 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 		break;
 
 	case EV_PLAY_FX_DIR:
-		/* cg_public.h names entityState_t +0xD8 `scale`; this event uses it as
-		   the packed direction byte (0x3001E6CE). */
+		// the direction is packed into scale
 		ByteToDir( es->scale, dir );
 		CG_PlayFx( cent, dir );
 		break;
@@ -818,28 +806,7 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 		CG_PlayFxOnTag( cent, es->eventParm );
 		break;
 
-	case EV_FLAMEBARREL_BOUNCE:
-		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.flamebarrelBounce );
-		break;
-
 	case EV_EARTHQUAKE:
-		break;
-
-	case EV_ITEM_RESPAWN:
-		CENT_MISCTIME( cent ) = cg.time;    // scale up from this
-		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.unknown_0x2E4[3] );
-		break;
-
-	case EV_ITEM_POP:
-		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.unknown_0x2E4[3] );
-		break;
-
-	case EV_PLAYER_TELEPORT_IN:
-		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.unknown_0x2E4[1] );
-		break;
-
-	case EV_PLAYER_TELEPORT_OUT:
-		CG_PlayEntitySoundAliasByName( es->number, (const char *)cgs.media.unknown_0x2E4[2] );
 		break;
 
 	default:
@@ -850,7 +817,7 @@ void CG_EntityEvent( centity_t *cent, int event, qboolean predicted ) {
 
 /*
 ==============
-CG_EntityPreEvent     0x3001E820
+CG_EntityPreEvent
 
 The nextState half of the event stream: the same event fires one frame early so
 the muzzle flash and the bullet impact are not a snapshot late.
@@ -880,13 +847,13 @@ static void CG_EntityPreEvent( centity_t *cent, int event ) {
 	case EV_BULLET_HIT_LARGE:
 		ByteToDir( ns->eventParm, dir );
 		ByteToDir( ns->scale, dir2 );
-		CG_BulletHitEvent( event, cent->lerpOrigin, ns->surfType, ns->otherEntityNum,
+		CG_BulletHitEvent( ns->otherEntityNum, cent->lerpOrigin, ns->surfType, event,
 						   dir, dir2 );
 		break;
 
 	case EV_BULLET_HIT_CLIENT_SMALL:
 	case EV_BULLET_HIT_CLIENT_LARGE:
-		CG_BulletHitClientEvent( event, cent->lerpOrigin, ns->surfType, ns->otherEntityNum );
+		CG_BulletHitClientEvent( ns->otherEntityNum, cent->lerpOrigin, ns->surfType, event );
 		break;
 
 	case EV_FIRE_QUADBARREL_1:
@@ -901,7 +868,7 @@ static void CG_EntityPreEvent( centity_t *cent, int event ) {
 
 	case EV_FIRE_WEAPON_MG42:
 		CG_StartShakeCamera( 0.05f, 100, 100.0f, cent->lerpOrigin );
-		/* fall through */
+		// fall through
 	case EV_FIRE_WEAPON:
 	case EV_FIRE_WEAPONB:
 	case EV_FIRE_WEAPON_LASTSHOT:
@@ -929,7 +896,8 @@ static void CG_EntityPreEvent( centity_t *cent, int event ) {
 
 /*
 ==============
-CG_CheckEvents     0x3001EA10
+CG_CheckEvents
+
 ==============
 */
 void CG_CheckEvents( centity_t *cent ) {
@@ -953,36 +921,40 @@ void CG_CheckEvents( centity_t *cent ) {
 		return;
 	}
 
-	// eventSequence is sent as an 8-bit value through the network
+	// check the sequencial list
+	// if we've added more events than can fit into the list, make sure we only add them once
 	if ( cent->currentState.eventSequence < cent->previousEventSequence ) {
-		cent->previousEventSequence -= ( 1 << 8 );
+		cent->previousEventSequence -= ( 1 << 8 );    // eventSequence is sent as an 8-bit through network stream
 	}
 	if ( cent->currentState.eventSequence - cent->previousEventSequence > MAX_EVENTS ) {
 		cent->previousEventSequence = cent->currentState.eventSequence - MAX_EVENTS;
 	}
 
-	if ( cent->previousEventSequence < cent->currentState.eventSequence ) {
-		CG_CalcEntityLerpPositions( cent );
-
-		oldEventParm = (byte)cent->currentState.eventParm;
-		for ( i = cent->previousEventSequence ; i != cent->currentState.eventSequence ; i++ ) {
-			event = cent->currentState.events[ i & ( MAX_EVENTS - 1 ) ];
-			cent->currentState.eventParm = cent->currentState.eventParms[ i & ( MAX_EVENTS - 1 ) ];
-			CG_EntityEvent( cent, event, qfalse );
-		}
-		cent->currentState.eventParm = oldEventParm;
+	if ( cent->previousEventSequence >= cent->currentState.eventSequence ) {
+		cent->previousEventSequence = cent->currentState.eventSequence;
+		return;
 	}
+
+	CG_CalcEntityLerpPositions( cent );
+
+	oldEventParm = (byte)cent->currentState.eventParm;
+	for ( i = cent->previousEventSequence ; i != cent->currentState.eventSequence ; i++ ) {
+		event = cent->currentState.events[ i & ( MAX_EVENTS - 1 ) ];
+		cent->currentState.eventParm = cent->currentState.eventParms[ i & ( MAX_EVENTS - 1 ) ];
+		CG_EntityEvent( cent, event, qfalse );
+	}
+	cent->currentState.eventParm = oldEventParm;
 
 	cent->previousEventSequence = cent->currentState.eventSequence;
 }
 
 /*
 ==============
-CG_CheckPreEvents     0x3001EB10
+CG_CheckPreEvents
 
-Note the eventParm save/restore: the loop clobbers nextState.eventParm
-(cent+0x190) but the save and the restore both hit currentState.eventParm
-(cent+0x0A0) -- 0x3001EBAD / 0x3001EBF4.  Retail quirk.
+Same as CG_CheckEvents, for the nextState events.
+The loop changes nextState.eventParm but saves and restores
+currentState.eventParm; keep: that is how the original does it.
 ==============
 */
 void CG_CheckPreEvents( centity_t *cent ) {
@@ -1021,8 +993,11 @@ void CG_CheckPreEvents( centity_t *cent ) {
 			cent->nextState.eventParm = cent->nextState.eventParms[ i & ( MAX_EVENTS - 1 ) ];
 			CG_EntityPreEvent( cent, event );
 		}
+		event = cent->nextState.eventSequence;
 		cent->currentState.eventParm = oldEventParm;
+	} else {
+		event = cent->nextState.eventSequence;
 	}
 
-	cent->previousPreEventSequence = cent->nextState.eventSequence;
+	cent->previousPreEventSequence = event;
 }

@@ -1,19 +1,4 @@
-/*
- * g_syscalls_mp.c -- every call the multiplayer game module makes into the
- * engine.  game_mp_x86.dll is a native DLL, so this is the DLL half of the
- * RTCW game/g_syscalls.c pattern: the engine hands dllEntry a single vararg
- * function pointer and each trap below is one line of body around it.
- *
- * Function order is binary order (0x20038740 .. 0x20039580).  Signatures come
- * from SV_GameSystemCalls in server_mp/sv_game_mp.c -- the argument each `case`
- * hands to the engine function is the argument the wrapper pushes.
- *
- * Wrappers tagged "inferred" are not in the Mac symbol table; the name is taken
- * from the gameImport_t constant they dispatch.  The Hunk family keeps the
- * `Internal` suffix its recovered siblings carry.
- *
- * @fidelity: likely
- */
+// g_syscalls_mp.c -- the game module's system calls into the engine
 
 #include "g_local.h"
 
@@ -43,7 +28,7 @@ void    trap_Error( const char *fmt ) {
 	syscall( G_ERROR, fmt );
 }
 
-void    trap_ErrorNoPrefix( const char *fmt ) {      /* inferred */
+void    trap_Error_Localized( const char *fmt ) {
 	syscall( G_ERROR_NOPREFIX, fmt );
 }
 
@@ -59,7 +44,7 @@ void    trap_Argv( int n, char *buffer, int bufferLength ) {
 	syscall( G_ARGV, n, buffer, bufferLength );
 }
 
-void    *trap_Hunk_AllocInternal( int size ) {       /* inferred */
+void    *trap_Hunk_AllocInternal( int size ) {
 	return (void *)syscall( G_HUNK_ALLOC, size );
 }
 
@@ -67,7 +52,7 @@ void    *trap_Hunk_AllocLowInternal( int size ) {
 	return (void *)syscall( G_HUNK_ALLOC_LOW, size );
 }
 
-void    *trap_Hunk_AllocAlignInternal( int size, int align ) {      /* inferred */
+void    *trap_Hunk_AllocAlignInternal( int size, int align ) {
 	return (void *)syscall( G_HUNK_ALLOC_ALIGN, size, align );
 }
 
@@ -75,11 +60,11 @@ void    *trap_Hunk_AllocLowAlignInternal( int size, int align ) {
 	return (void *)syscall( G_HUNK_ALLOC_LOW_ALIGN, size, align );
 }
 
-void    *trap_Hunk_AllocateTempMemoryInternal( int size ) {         /* inferred */
+void    *trap_Hunk_AllocateTempMemoryInternal( int size ) {
 	return (void *)syscall( G_HUNK_ALLOC_TEMP, size );
 }
 
-void    trap_Hunk_FreeTempMemoryInternal( void *buf ) {             /* inferred */
+void    trap_Hunk_FreeTempMemoryInternal( void *buf ) {
 	syscall( G_HUNK_FREE_TEMP, buf );
 }
 
@@ -95,7 +80,7 @@ int     trap_FS_Write( const void *buffer, int len, fileHandle_t f ) {
 	return syscall( G_FS_WRITE, buffer, len, f );
 }
 
-void    trap_FS_Rename( const char *from, const char *to ) {        /* inferred */
+void    trap_FS_Rename( const char *from, const char *to ) {
 	syscall( G_FS_RENAME, from, to );
 }
 
@@ -127,7 +112,7 @@ int     trap_Cvar_VariableIntegerValue( const char *var_name ) {
 	return syscall( G_CVAR_VARIABLE_INTEGER_VALUE, var_name );
 }
 
-/* The engine writes the result through the second argument; nothing comes back in eax. */
+// the engine writes the result through the second argument
 float   trap_Cvar_VariableValue( const char *var_name ) {
 	float value;
 
@@ -168,7 +153,7 @@ void    trap_GetUserinfo( int num, char *buffer, int bufferSize ) {
 	syscall( G_GET_USERINFO, num, buffer, bufferSize );
 }
 
-void    trap_SetUserinfo( int num, const char *buffer ) {           /* inferred */
+void    trap_SetUserinfo( int num, const char *buffer ) {
 	syscall( G_SET_USERINFO, num, buffer );
 }
 
@@ -190,12 +175,12 @@ void    trap_TraceCapsule( trace_t *results, const vec3_t start, const vec3_t mi
 	syscall( G_TRACE_CAPSULE, results, start, mins, maxs, end, passEntityNum, contentmask );
 }
 
-void    trap_SightTrace( int *hitOut, const vec3_t start, const vec3_t mins, const vec3_t maxs,      /* inferred */
+void    trap_SightTrace( int *hitOut, const vec3_t start, const vec3_t mins, const vec3_t maxs,
 						 const vec3_t end, int passEntityNum, int passOwnerNum, int contentmask ) {
 	syscall( G_SIGHT_TRACE, hitOut, start, mins, maxs, end, passEntityNum, passOwnerNum, contentmask );
 }
 
-void    trap_SightTraceCapsule( int *hitOut, const vec3_t start, const vec3_t mins, const vec3_t maxs,   /* inferred */
+void    trap_SightTraceCapsule( int *hitOut, const vec3_t start, const vec3_t mins, const vec3_t maxs,
 								const vec3_t end, int passEntityNum, int passOwnerNum, int contentmask ) {
 	syscall( G_SIGHT_TRACE_CAPSULE, hitOut, start, mins, maxs, end, passEntityNum, passOwnerNum, contentmask );
 }
@@ -205,23 +190,23 @@ int     trap_SightTraceToEntity( const vec3_t start, const vec3_t mins, const ve
 	return syscall( G_SIGHT_TRACE_TO_ENTITY, start, mins, maxs, end, entityNum, contentmask );
 }
 
-void    trap_CM_BoxTrace( trace_t *results, const vec3_t start, const vec3_t end,        /* inferred */
+void    trap_CM_BoxTrace( trace_t *results, const vec3_t start, const vec3_t end,
 						  const vec3_t mins, const vec3_t maxs, clipHandle_t model, int brushmask ) {
 	syscall( G_CM_BOX_TRACE, results, start, end, mins, maxs, model, brushmask );
 }
 
-void    trap_CM_BoxTrace2( trace_t *results, const vec3_t start, const vec3_t end,       /* inferred */
-						   const vec3_t mins, const vec3_t maxs, clipHandle_t model, int brushmask ) {
+void    trap_CM_CapsuleTrace( trace_t *results, const vec3_t start, const vec3_t end,
+							  const vec3_t mins, const vec3_t maxs, clipHandle_t model, int brushmask ) {
 	syscall( G_CM_BOX_TRACE_2, results, start, end, mins, maxs, model, brushmask );
 }
 
-int     trap_CM_BoxSightTrace( const vec3_t start, const vec3_t end, const vec3_t mins,  /* inferred */
+int     trap_CM_BoxSightTrace( const vec3_t start, const vec3_t end, const vec3_t mins,
 							   const vec3_t maxs, clipHandle_t model, int brushmask ) {
 	return syscall( G_CM_BOX_SIGHT_TRACE, start, end, mins, maxs, model, brushmask );
 }
 
-int     trap_CM_BoxSightTrace2( const vec3_t start, const vec3_t end, const vec3_t mins, /* inferred */
-								const vec3_t maxs, clipHandle_t model, int brushmask ) {
+int     trap_CM_CapsuleSightTrace( const vec3_t start, const vec3_t end, const vec3_t mins,
+								   const vec3_t maxs, clipHandle_t model, int brushmask ) {
 	return syscall( G_CM_BOX_SIGHT_TRACE_2, start, end, mins, maxs, model, brushmask );
 }
 
@@ -238,7 +223,7 @@ int     trap_InPVS( const vec3_t p1, const vec3_t p2 ) {
 	return syscall( G_IN_PVS, p1, p2 );
 }
 
-int     trap_InPVSIgnorePortals( const vec3_t p1, const vec3_t p2 ) {        /* inferred */
+int     trap_InPVSIgnorePortals( const vec3_t p1, const vec3_t p2 ) {
 	return syscall( G_IN_PVS_IGNORE_PORTALS, p1, p2 );
 }
 
@@ -250,7 +235,7 @@ void    trap_AdjustAreaPortalState( gentity_t *ent, qboolean open ) {
 	syscall( G_ADJUST_AREA_PORTAL_STATE, ent, open );
 }
 
-int     trap_AreasConnected( int area1, int area2 ) {                       /* inferred */
+int     trap_AreasConnected( int area1, int area2 ) {
 	return syscall( G_AREAS_CONNECTED, area1, area2 );
 }
 
@@ -292,12 +277,11 @@ void    trap_AddDebugLine( const vec3_t start, const vec3_t end, const vec3_t co
 	syscall( G_ADD_DEBUG_LINE, start, end, color, depthTest, duration );
 }
 
-/* Recovered name; the constant it dispatches is G_ENABLE_ARCHIVED_SNAPSHOT. */
 void    trap_SetArchive( qboolean enable ) {
 	syscall( G_ENABLE_ARCHIVED_SNAPSHOT, enable );
 }
 
-int     trap_RealTime( void *qtime ) {                                      /* inferred */
+int     trap_RealTime( void *qtime ) {
 	return syscall( G_REAL_TIME, qtime );
 }
 
@@ -305,19 +289,19 @@ void    trap_SnapVector( float *v ) {
 	syscall( G_SNAPVECTOR, v );
 }
 
-int     trap_FindSoundAlias( const char *name ) {                           /* inferred */
+int     trap_Com_SoundAliasString( const char *name ) {
 	return syscall( G_FIND_SOUND_ALIAS, name );
 }
 
-int     trap_PickSoundAlias( const char *name ) {                           /* inferred */
+int     trap_Com_PickSoundAlias( const char *name ) {
 	return syscall( G_PICK_SOUND_ALIAS, name );
 }
 
-int     trap_SoundAliasIndex( void *alias ) {                               /* inferred */
+int     trap_Com_SoundAliasIndex( void *alias ) {
 	return syscall( G_SOUND_ALIAS_INDEX, alias );
 }
 
-int     trap_SurfaceTypeFromName( const char *name ) {                      /* inferred */
+int     trap_SurfaceTypeFromName( const char *name ) {
 	return syscall( G_SURFACE_TYPE_FROM_NAME, name );
 }
 
@@ -325,49 +309,50 @@ const char *trap_SurfaceTypeToName( int surfaceType ) {
 	return (const char *)syscall( G_SURFACE_TYPE_TO_NAME, surfaceType );
 }
 
-void    *trap_Z_MallocInternal( int size ) {                                /* inferred */
+void    *trap_Z_MallocInternal( int size ) {
 	return (void *)syscall( G_Z_MALLOC, size );
 }
 
-void    trap_Z_Free( void *ptr ) {                                          /* inferred */
+void    trap_Z_FreeInternal( void *ptr ) {
 	syscall( G_Z_FREE, ptr );
 }
 
-/*
- * Retail (0x20038D70) turns the client number into `level.gentities + clientNum`
- * before returning it.  level_locals_t belongs to g_local.h, so the wrapper
- * hands the number back and the caller resolves the entity; the trap itself is
- * unchanged.  The engine's SV_AddTestClient returns void, so this is always 0.
- */
-int     trap_AddTestClient( void ) {
-	return syscall( G_ADD_TEST_CLIENT );
+// returns NULL if no client slot is free
+gentity_t *trap_AddTestClient( void ) {
+	int clientNum;
+
+	clientNum = syscall( G_ADD_TEST_CLIENT );
+	if ( clientNum >= 0 ) {
+		return &level.gentities[clientNum];
+	}
+	return NULL;
 }
 
-qboolean trap_GetArchivedClientInfo( int clientNum, int *frameTime, void *clientInfo ) {
-	return syscall( G_GET_ARCHIVED_CLIENT_INFO, clientNum, frameTime, clientInfo );
+qboolean trap_GetArchivedPlayerState( int clientNum, int *frameTime, playerState_t *ps ) {
+	return syscall( G_GET_ARCHIVED_CLIENT_INFO, clientNum, frameTime, ps );
 }
 
-void    *trap_XAnimCreateTree( void *anims ) {                              /* inferred */
-	return (void *)syscall( G_XANIM_CREATE_TREE, anims );
+XAnimTree *trap_XAnimCreateTree( XAnim *anims ) {
+	return (XAnimTree *)syscall( G_XANIM_CREATE_TREE, anims );
 }
 
-void    *trap_XAnimCreateSmallTree( void *anims ) {                         /* inferred */
-	return (void *)syscall( G_XANIM_CREATE_SMALL_TREE, anims );
+XAnimTree *trap_XAnimCreateSmallTree( XAnim *anims ) {
+	return (XAnimTree *)syscall( G_XANIM_CREATE_SMALL_TREE, anims );
 }
 
-void    trap_XAnimFreeSmallTree( void *tree ) {                             /* inferred */
+void    trap_XAnimFreeSmallTree( XAnimTree *tree ) {
 	syscall( G_XANIM_FREE_SMALL_TREE, tree );
 }
 
-int     trap_XModelExists( const char *name ) {                             /* inferred */
+int     trap_XModelExists( const char *name ) {
 	return syscall( G_XMODEL_EXISTS, name );
 }
 
-void    *trap_XModelGet( const char *name ) {
-	return (void *)syscall( G_XMODEL_GET, name );
+XModel  *trap_XModelGet( const char *name ) {
+	return (XModel *)syscall( G_XMODEL_GET, name );
 }
 
-void    trap_DObjCreate( void *models, unsigned short modelCount, void *tree,
+void    trap_DObjCreate( DObjModel *models, unsigned short modelCount, XAnimTree *tree,
 						 int handle, unsigned short scrNotifyId ) {
 	syscall( G_DOBJ_CREATE, models, modelCount, tree, handle, scrNotifyId );
 }
@@ -376,25 +361,18 @@ void    trap_SafeDObjFree( int handle, unsigned int releaseTree ) {
 	syscall( G_DOBJ_FREE, handle, releaseTree );
 }
 
-/*
- * The DObj traps take the entity and hand the engine its number.  gentity_t
- * starts with its entityState_t, so `ent->s.number` is the first dword of the
- * entity; g_local.h owns the full definition, hence the cast onto the shared
- * head declared in g_public.h.
- */
+// the DObj traps hand the engine the entity number, which is the entity's DObj handle
 qboolean trap_DObjExists( gentity_t *ent ) {
-	return syscall( G_DOBJ_EXISTS, ( (const entityState_t *)ent )->number );
+	return syscall( G_DOBJ_EXISTS, ent->s.number );
 }
 
-int     trap_DerefDword( const int *p ) {                                   /* inferred */
-	return syscall( G_DEREF_DWORD, p );
+// a tree's first field is its XAnim, so the engine just dereferences the pointer
+XAnim   *trap_XAnimGetAnims( const XAnimTree *tree ) {
+	return (XAnim *)syscall( G_DEREF_DWORD, tree );
 }
 
-/*
- * inferred.  Reads the anims pointer out of an engine-owned tree and turns it
- * into a script anims handle, yielding a reference to that tree's root anim.
- */
-scr_anim_t trap_XAnimGetRootAnim( const int *tree ) {
+// returns a script reference to the tree's root anim
+scr_anim_t trap_XAnimGetRoot( const XAnimTree *tree ) {
 	scr_anim_t anim;
 
 	anim.index = 0;
@@ -402,59 +380,54 @@ scr_anim_t trap_XAnimGetRootAnim( const int *tree ) {
 	return anim;
 }
 
-void    trap_XAnimClearTreeGoalWeights( void *tree, unsigned short animIndex, float goalWeight ) {  /* inferred */
-	syscall( G_XANIM_CLEAR_ANIM, tree, animIndex, PASSFLOAT( goalWeight ) );
+// keep: the scr_anim_t / int anim parameters below match original codegen
+
+void    trap_XAnimClearTreeGoalWeights( XAnimTree *tree, scr_anim_t anim, float goalWeight ) {
+	syscall( G_XANIM_CLEAR_ANIM, tree, anim.index, PASSFLOAT( goalWeight ) );
 }
 
-void    trap_XAnimClearGoalWeight( void *tree, unsigned short animIndex, float goalWeight ) {
-	syscall( G_XANIM_CLEAR_ANIM_NODE, tree, animIndex, PASSFLOAT( goalWeight ) );
+void    trap_XAnimClearGoalWeight( XAnimTree *tree, int animIndex, float goalWeight ) {
+	syscall( G_XANIM_CLEAR_ANIM_NODE, tree, (unsigned short)animIndex, PASSFLOAT( goalWeight ) );
 }
 
-void    trap_XAnimClearTreeGoalWeightsStrict( void *tree, unsigned short animIndex, float goalWeight ) {
-	syscall( G_XANIM_CLEAR_ANIM_CHILDREN, tree, animIndex, PASSFLOAT( goalWeight ) );
+void    trap_XAnimClearTreeGoalWeightsStrict( XAnimTree *tree, scr_anim_t anim, float goalWeight ) {
+	syscall( G_XANIM_CLEAR_ANIM_CHILDREN, tree, anim.index, PASSFLOAT( goalWeight ) );
 }
 
-/*
- * The four set-weight traps below share one shape; past goalWeight only the
- * types are known, the argument names are not recovered.
- */
-void    trap_XAnimSetAnimKnob( void *tree, unsigned short animIndex, float goalWeight,      /* inferred */
-							   int goalTime, float rate, unsigned short notifyIndex, int notifyFlags ) {
-	syscall( G_XANIM_SET_ANIM_KNOB, tree, animIndex, PASSFLOAT( goalWeight ), goalTime,
+void    trap_XAnimSetCompleteGoalWeightKnob( XAnimTree *tree, unsigned short animIndex, float goalWeight,
+											 float goalTime, float rate, unsigned short notifyIndex, int notifyFlags ) {
+	syscall( G_XANIM_SET_ANIM_KNOB, tree, animIndex, PASSFLOAT( goalWeight ), PASSFLOAT( goalTime ),
 			 PASSFLOAT( rate ), notifyIndex, notifyFlags );
 }
 
-void    trap_XAnimSetCompleteGoalWeightKnobAll( void *tree, unsigned short animIndex,
-												unsigned short childIndex, float goalWeight,
+void    trap_XAnimSetCompleteGoalWeightKnobAll( XAnimTree *tree, scr_anim_t anim,
+												scr_anim_t childAnim, float goalWeight,
 												float goalTime, float rate,
 												unsigned short notifyIndex, int notifyFlags ) {
-	syscall( G_XANIM_SET_ANIM_KNOB_ALL, tree, animIndex, childIndex, PASSFLOAT( goalWeight ),
+	syscall( G_XANIM_SET_ANIM_KNOB_ALL, tree, anim.index, childAnim.index, PASSFLOAT( goalWeight ),
 			 PASSFLOAT( goalTime ), PASSFLOAT( rate ), notifyIndex, notifyFlags );
 }
 
-void    trap_XAnimSetAnimRate( void *tree, unsigned short animIndex, float rate ) {
-	syscall( G_XANIM_SET_ANIM_RATE, tree, animIndex, PASSFLOAT( rate ) );
+void    trap_XAnimSetAnimRate( XAnimTree *tree, scr_anim_t anim, float rate ) {
+	syscall( G_XANIM_SET_ANIM_RATE, tree, anim.index, PASSFLOAT( rate ) );
 }
 
-void    trap_XAnimSetTime( void *tree, unsigned short animIndex, float time ) {
-	syscall( G_XANIM_SET_TIME, tree, animIndex, PASSFLOAT( time ) );
+void    trap_XAnimSetTime( XAnimTree *tree, int animIndex, float time ) {
+	syscall( G_XANIM_SET_TIME, tree, (unsigned short)animIndex, PASSFLOAT( time ) );
 }
 
-void    trap_XAnimSetAnimLimited( void *tree, unsigned short animIndex, float goalWeight,   /* inferred */
-								  int goalTime, float rate, unsigned short notifyIndex, int notifyFlags ) {
-	syscall( G_XANIM_SET_ANIM_LIMITED, tree, animIndex, PASSFLOAT( goalWeight ), goalTime,
+void    trap_XAnimSetGoalWeightKnob( XAnimTree *tree, unsigned short animIndex, float goalWeight,
+									 float goalTime, float rate, unsigned short notifyIndex, int notifyFlags ) {
+	syscall( G_XANIM_SET_ANIM_LIMITED, tree, animIndex, PASSFLOAT( goalWeight ), PASSFLOAT( goalTime ),
 			 PASSFLOAT( rate ), notifyIndex, notifyFlags );
 }
 
-void    trap_XAnimClearTree( void *tree ) {                                 /* inferred */
+void    trap_XAnimClearTree( XAnimTree *tree ) {
 	syscall( G_XANIM_CLEAR_TREE, tree );
 }
 
-/*
- * inferred.  The engine enum labels 91/92 the other way round; the Mac symbol
- * for 92 is trap_XAnimIsPrimitive, so this one takes the remaining label.
- */
-int     trap_XAnimIsLeaf( scr_anim_t anim ) {
+// G_XANIM_IS_PRIMITIVE is really XAnimHasTime, and G_XANIM_IS_LEAF XAnimIsPrimitive
+int     trap_XAnimHasTime( scr_anim_t anim ) {
 	return syscall( G_XANIM_IS_PRIMITIVE, anim.anims, anim.index );
 }
 
@@ -462,7 +435,7 @@ int     trap_XAnimIsPrimitive( scr_anim_t anim ) {
 	return syscall( G_XANIM_IS_LEAF, anim.anims, anim.index );
 }
 
-int     trap_XAnimGetLength( void *tree, unsigned short animIndex ) {
+int     trap_XAnimGetLength( XAnimTree *tree, unsigned short animIndex ) {
 	return syscall( G_XANIM_LENGTH_MSEC, tree, animIndex );
 }
 
@@ -470,40 +443,36 @@ float   trap_XAnimGetLengthSeconds( scr_anim_t anim ) {
 	return IntAsFloat( syscall( G_XANIM_LENGTH_SEC, anim.anims, anim.index ) );
 }
 
-void    trap_XAnimSetCompleteGoalWeight( void *tree, unsigned short animIndex, float goalWeight,
+void    trap_XAnimSetCompleteGoalWeight( XAnimTree *tree, scr_anim_t anim, float goalWeight,
 										 float goalTime, float rate, unsigned short notifyIndex,
 										 int notifyFlags ) {
-	syscall( G_XANIM_SET_ANIM_KNOB_INT, tree, animIndex, PASSFLOAT( goalWeight ),
+	syscall( G_XANIM_SET_ANIM_KNOB_INT, tree, anim.index, PASSFLOAT( goalWeight ),
 			 PASSFLOAT( goalTime ), PASSFLOAT( rate ), notifyIndex, notifyFlags );
 }
 
-void    trap_XAnimSetGoalWeight( void *tree, unsigned short animIndex, float goalWeight,
+void    trap_XAnimSetGoalWeight( XAnimTree *tree, scr_anim_t anim, float goalWeight,
 								 float goalTime, float rate, unsigned short notifyIndex,
 								 int notifyFlags ) {
-	syscall( G_XANIM_SET_ANIM_INT_LIMITED, tree, animIndex, PASSFLOAT( goalWeight ),
+	syscall( G_XANIM_SET_ANIM_INT_LIMITED, tree, anim.index, PASSFLOAT( goalWeight ),
 			 PASSFLOAT( goalTime ), PASSFLOAT( rate ), notifyIndex, notifyFlags );
 }
 
-/* The third syscall pointer is the rotation quaternion and the fourth the
-   movement delta (turret_think_init 0x20027AED / 0x20027F26). */
-void    trap_XAnimCalcAbsDelta( void *tree, unsigned short animIndex, float *deltaRot, float *deltaMove ) {
-	syscall( G_XANIM_GET_ABS_DELTA, tree, animIndex, deltaRot, deltaMove );
+void    trap_XAnimCalcAbsDelta( XAnimTree *tree, scr_anim_t anim, float *deltaRot, float *deltaMove ) {
+	syscall( G_XANIM_GET_ABS_DELTA, tree, anim.index, deltaRot, deltaMove );
 }
 
-void    trap_XAnimCalcRelDelta( void *tree, unsigned short animIndex, float *deltaPos,       /* inferred */
-								void *deltaQuat, int animIndexEnd ) {
+void    trap_XAnimCalcDelta( XAnimTree *tree, unsigned short animIndex, float *deltaPos,
+							 void *deltaQuat, int animIndexEnd ) {
 	syscall( G_XANIM_GET_REL_DELTA, tree, animIndex, deltaPos, deltaQuat, animIndexEnd );
 }
 
-/* Rotation second, translation third, as GScr_GetMoveDelta pushes them
-   (0x200333F5). */
 void    trap_XAnimGetRelDelta( scr_anim_t anim, float *deltaRot, float *deltaMove,
 							   float startTime, float endTime ) {
 	syscall( G_XANIM_GET_REL_DELTA_TIME, anim.anims, anim.index, deltaRot, deltaMove,
 			 PASSFLOAT( startTime ), PASSFLOAT( endTime ) );
 }
 
-void    trap_XAnimGetAbsDelta( scr_anim_t anim, float *deltaPos, void *deltaQuat, float time ) {  /* inferred */
+void    trap_XAnimGetAbsDelta( scr_anim_t anim, float *deltaPos, void *deltaQuat, float time ) {
 	syscall( G_XANIM_GET_ABS_DELTA_TIME, anim.anims, anim.index, deltaPos, deltaQuat,
 			 PASSFLOAT( time ) );
 }
@@ -516,109 +485,110 @@ int     trap_XAnimNotetrackExists( scr_anim_t anim, unsigned short notetrack ) {
 	return syscall( G_XANIM_HAS_NOTETRACK, anim.anims, anim.index, notetrack );
 }
 
-float   trap_XAnimGetTime( void *tree, unsigned short animIndex ) {
-	return IntAsFloat( syscall( G_XANIM_GET_TIME, tree, animIndex ) );
+float   trap_XAnimGetTime( XAnimTree *tree, scr_anim_t anim ) {
+	return IntAsFloat( syscall( G_XANIM_GET_TIME, tree, anim.index ) );
 }
 
-float   trap_XAnimGetWeight( void *tree, unsigned short animIndex ) {
-	return IntAsFloat( syscall( G_XANIM_GET_WEIGHT, tree, animIndex ) );
+float   trap_XAnimGetWeight( XAnimTree *tree, scr_anim_t anim ) {
+	return IntAsFloat( syscall( G_XANIM_GET_WEIGHT, tree, anim.index ) );
 }
 
 void    trap_DObjDumpInfo( gentity_t *ent ) {
-	syscall( G_DOBJ_DUMP_INFO, ( (const entityState_t *)ent )->number );
+	syscall( G_DOBJ_DUMP_INFO, ent->s.number );
 }
 
 qboolean trap_DObjCreateSkelForBone( gentity_t *ent, int boneIndex ) {
-	return syscall( G_DOBJ_CREATE_SKEL_FOR_BONE, ( (const entityState_t *)ent )->number, boneIndex );
+	return syscall( G_DOBJ_CREATE_SKEL_FOR_BONE, ent->s.number, boneIndex );
 }
 
 qboolean trap_DObjCreateSkelForBones( gentity_t *ent, const int *partBits ) {
-	return syscall( G_DOBJ_SKEL_UP_TO_DATE, ( (const entityState_t *)ent )->number, partBits );
+	return syscall( G_DOBJ_SKEL_UP_TO_DATE, ent->s.number, partBits );
 }
 
 int     trap_DObjUpdateServerTime( gentity_t *ent, float serverTime, int stopOnNotetrack ) {
-	return syscall( G_DOBJ_UPDATE_SERVER_TIME, ( (const entityState_t *)ent )->number,
+	return syscall( G_DOBJ_UPDATE_SERVER_TIME, ent->s.number,
 					PASSFLOAT( serverTime ), stopOnNotetrack );
 }
 
 void    trap_DObjInitServerTime( gentity_t *ent, float serverTime ) {
-	syscall( G_DOBJ_INIT_SERVER_TIME, ( (const entityState_t *)ent )->number,
+	syscall( G_DOBJ_INIT_SERVER_TIME, ent->s.number,
 			 PASSFLOAT( serverTime ) );
 }
 
 void    trap_DObjGetHierarchyBits( gentity_t *ent, int boneIndex, int *partBits ) {
-	syscall( G_DOBJ_GET_HIERARCHY_BITS, ( (const entityState_t *)ent )->number, boneIndex, partBits );
+	syscall( G_DOBJ_GET_HIERARCHY_BITS, ent->s.number, boneIndex, partBits );
 }
 
 int     trap_DObjCalcAnim( gentity_t *ent, void *partBits ) {
-	return syscall( G_DOBJ_CALC_ANIM, ( (const entityState_t *)ent )->number, partBits );
+	return syscall( G_DOBJ_CALC_ANIM, ent->s.number, partBits );
 }
 
 int     trap_DObjCalcSkel( gentity_t *ent, void *partBits ) {
-	return syscall( G_DOBJ_CALC_SKEL, ( (const entityState_t *)ent )->number, partBits );
+	return syscall( G_DOBJ_CALC_SKEL, ent->s.number, partBits );
 }
 
-void    trap_XAnimRestoreTree( int tree ) {                                 /* inferred */
+void    trap_XAnimLoadAnimTree( int tree ) {
 	syscall( G_XANIM_RESTORE_TREE, tree );
 }
 
-void    trap_XAnimSaveTree( void *tree ) {                                  /* inferred */
+void    trap_XAnimSaveAnimTree( XAnimTree *tree ) {
 	syscall( G_XANIM_SAVE_TREE, tree );
 }
 
-void    trap_XAnimCopyTree( const void *from, void *to ) {                  /* inferred */
+void    trap_XAnimCloneAnimTree( const XAnimTree *from, XAnimTree *to ) {
 	syscall( G_XANIM_COPY_TREE, from, to );
 }
 
-int     trap_DObjNumParts( gentity_t *ent ) {                               /* inferred */
-	return syscall( G_DOBJ_NUM_PARTS, ( (const entityState_t *)ent )->number );
+int     trap_DObjNumBones( gentity_t *ent ) {
+	return syscall( G_DOBJ_NUM_PARTS, ent->s.number );
 }
 
 int     trap_DObjGetBoneIndex( gentity_t *ent, const char *boneName ) {
-	return syscall( G_DOBJ_GET_PART_INDEX, ( (const entityState_t *)ent )->number, boneName );
+	return syscall( G_DOBJ_GET_PART_INDEX, ent->s.number, boneName );
 }
 
-void    *trap_DObjGetMatrixArray( gentity_t *ent ) {
-	return (void *)syscall( G_DOBJ_GET_SKEL_BASE, ( (const entityState_t *)ent )->number );
+float   *trap_DObjGetMatrixArray( gentity_t *ent ) {
+	return (float *)syscall( G_DOBJ_GET_SKEL_BASE, ent->s.number );
 }
 
 void    trap_DObjDisplayAnim( gentity_t *ent ) {
-	syscall( G_DOBJ_DISPLAY_ANIM, ( (const entityState_t *)ent )->number );
+	syscall( G_DOBJ_DISPLAY_ANIM, ent->s.number );
 }
 
-int     trap_XAnimHasTime( void *tree, unsigned short animIndex ) {         /* inferred */
-	return syscall( G_XANIM_HAS_TIME, tree, animIndex );
+// G_XANIM_HAS_TIME is really XAnimHasFinished
+int     trap_XAnimHasFinished( XAnimTree *tree, scr_anim_t anim ) {
+	return syscall( G_XANIM_HAS_TIME, tree, anim.index );
 }
 
 int     trap_XAnimGetNumChildren( scr_anim_t anim ) {
 	return syscall( G_XANIM_CHILD_COUNT, anim.anims, anim.index );
 }
 
-/* Only the index half is replaced; the anims handle rides through untouched. */
+// only the index is replaced; the anims handle is kept
 scr_anim_t trap_XAnimGetChildAt( scr_anim_t anim, int childIndex ) {
 	anim.index = (unsigned short)syscall( G_XANIM_CHILD_BASE, anim.anims, anim.index, childIndex );
 	return anim;
 }
 
-int     trap_XModelNumBones( void *model ) {
+int     trap_XModelNumBones( XModel *model ) {
 	return syscall( G_XANIM_ROOT_PART_COUNT, model );
 }
 
-unsigned short *trap_XModelGetBoneNames( void *model ) {
+unsigned short *trap_XModelGetBoneNames( XModel *model ) {
 	return (unsigned short *)syscall( G_XANIM_ROOT_PART_LIST, model );
 }
 
-void    *trap_DObjGetRotTransArray( gentity_t *ent ) {
-	return (void *)syscall( G_DOBJ_GET_SKEL_END, ( (const entityState_t *)ent )->number );
+DObjAnimMat *trap_DObjGetRotTransArray( gentity_t *ent ) {
+	return (DObjAnimMat *)syscall( G_DOBJ_GET_SKEL_END, ent->s.number );
 }
 
 qboolean trap_DObjSetRotTransIndex( gentity_t *ent, const int *partBits, int boneIndex ) {
-	return syscall( G_DOBJ_SET_ROT_TRANS_INDEX, ( (const entityState_t *)ent )->number,
+	return syscall( G_DOBJ_SET_ROT_TRANS_INDEX, ent->s.number,
 					partBits, boneIndex );
 }
 
 qboolean trap_DObjSetControlRotTransIndex( gentity_t *ent, const int *partBits, int boneIndex ) {
-	return syscall( G_DOBJ_SET_CONTROL_ROT_TRANS_INDEX, ( (const entityState_t *)ent )->number,
+	return syscall( G_DOBJ_SET_CONTROL_ROT_TRANS_INDEX, ent->s.number,
 					partBits, boneIndex );
 }
 
@@ -626,16 +596,16 @@ const char *trap_XAnimGetAnimName( scr_anim_t anim ) {
 	return (const char *)syscall( G_XANIM_GET_ANIM_NAME, anim.anims, anim.index );
 }
 
-void    *trap_DObjGetTree( gentity_t *ent ) {                               /* inferred */
-	return (void *)syscall( G_DOBJ_GET_TREE, ( (const entityState_t *)ent )->number );
+XAnimTree *trap_DObjGetTree( gentity_t *ent ) {
+	return (XAnimTree *)syscall( G_DOBJ_GET_TREE, ent->s.number );
 }
 
-int     trap_XAnimGetAnimTreeSize( void *tree ) {
-	return syscall( G_XANIM_TREE_FIELD, tree );
+int     trap_XAnimGetAnimTreeSize( XAnim *anims ) {
+	return syscall( G_XANIM_TREE_FIELD, anims );
 }
 
 void    trap_XModelDebugBoxes( gentity_t *ent ) {
-	syscall( G_DOBJ_DEBUG_DRAW_BOUNDS, ( (const entityState_t *)ent )->number );
+	syscall( G_DOBJ_DEBUG_DRAW_BOUNDS, ent->s.number );
 }
 
 void    *trap_GetWeaponInfoMemory( int size, int *pPrevOwner ) {
@@ -650,6 +620,6 @@ void    trap_FreeClientScriptPers( void ) {
 	syscall( G_FREE_CLIENT_SCRIPT_PERS );
 }
 
-void    trap_ResetEntityParsePoint( void ) {                                /* inferred */
+void    trap_ResetEntityParsePoint( void ) {
 	syscall( G_RESET_ENTITY_PARSE_POINT );
 }

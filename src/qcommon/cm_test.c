@@ -168,8 +168,9 @@ int CM_PointContents( const vec3_t p, clipHandle_t model ) {
 	int brushnum;
 	cLeaf_t *leaf;
 	cbrush_t *b;
+	cbrushside_t *side;
 	int contents;
-	float d;
+	rfloat d;
 
 	if ( model ) {
 		leaf = &CM_ClipHandleToModel( model )->leaf;
@@ -183,24 +184,23 @@ int CM_PointContents( const vec3_t p, clipHandle_t model ) {
 		brushnum = cm_leafbrushes[leaf->firstLeafBrush + k];
 		b = &cm_brushes[brushnum];
 
+		/* retail leaves both tests straight for the next brush (no i == 3 / i == numSides recheck) */
 		for ( i = 0; i < 3; i++ ) {
 			if ( p[i] < b->mins[i] || p[i] > b->maxs[i] ) {
-				break;
+				goto next;
 			}
-		}
-		if ( i != 3 ) {
-			continue;
 		}
 
-		for ( i = 0; i < b->numSides; i++ ) {
-			d = DotProduct( p, b->sides[i].plane->normal ) - b->sides[i].plane->dist;
-			if ( d > 0 ) {
-				break;
+		side = b->sides;
+		for ( i = b->numSides; i != 0; i--, side++ ) {
+			d = DotProduct( side->plane->normal, p );
+			if ( d > side->plane->dist ) {
+				goto next;
 			}
 		}
-		if ( i == b->numSides ) {
-			contents |= b->contents;
-		}
+		contents |= b->contents;
+next:
+		;
 	}
 
 	return contents;
@@ -265,13 +265,15 @@ void CM_FloodArea_r( int areaNum, int floodnum ) {
 /* ---- CM_FloodAreaConnections  0x00422190 ---- VERIFIED */
 void CM_FloodAreaConnections( void ) {
 	int i;
+	cArea_t *area;
 	int floodnum;
 
 	cm_floodvalid++;
 	floodnum = 0;
 
-	for ( i = 0; i < cm_numAreas; i++ ) {
-		if ( cm_areas[i].floodvalid == cm_floodvalid ) {
+	area = cm_areas;
+	for ( i = 0; i < cm_numAreas; i++, area++ ) {
+		if ( area->floodvalid == cm_floodvalid ) {
 			continue;
 		}
 		floodnum++;
@@ -290,11 +292,11 @@ void CM_ChangeAreaPortalState( int area1, int area2, qboolean open ) {
 	}
 
 	if ( open ) {
-		cm_areaPortals[area1 + area2 * cm_numAreas]++;
-		cm_areaPortals[area2 + area1 * cm_numAreas]++;
-	} else if ( cm_areaPortals[area2 + area1 * cm_numAreas] ) {
-		cm_areaPortals[area1 + area2 * cm_numAreas]--;
-		if ( --cm_areaPortals[area2 + area1 * cm_numAreas] < 0 ) {
+		cm_areaPortals[area1 * cm_numAreas + area2]++;
+		cm_areaPortals[area2 * cm_numAreas + area1]++;
+	} else if ( cm_areaPortals[area2 * cm_numAreas + area1] ) {
+		cm_areaPortals[area1 * cm_numAreas + area2]--;
+		if ( --cm_areaPortals[area2 * cm_numAreas + area1] < 0 ) {
 			Com_Error( ERR_DROP, "\x15" "CM_AdjustAreaPortalState: negative reference count" );
 		}
 	}

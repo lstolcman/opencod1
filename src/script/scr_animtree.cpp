@@ -10,29 +10,19 @@
  * @fidelity-default: verified
  */
 
+#ifdef __cplusplus
+/* retail built this unit as C++ with exceptions (/TP /GX); every name keeps C linkage */
+extern "C" {
+#endif
+
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
 
 #include <ctype.h>
 #include <string.h>
 
-#define scrAnimPub_treeCount        cod1_globals_scalar_decl_8E58D0
-#define scrAnimPub_treeNames         cod1_globals_scalar_decl_8E58D8
-#define scrAnimPub_trees        cod1_globals_scalar_decl_8E5AD8
-#define scrAnimPub_parseStart        cod1_globals_scalar_decl_8E58C8
-#define scrAnimPub_parseState        cod1_globals_scalar_decl_8E58CC
-#define scrAnimPub_propertyNames          cod1_globals_scalar_decl_575818
-#define FindNextSibling     cod1_globals_bogus_decl_FindNextSibling
-#define FindObject          cod1_globals_bogus_decl_FindObject
-#include "../qcommon/cod1_globals.h"
-#undef scrAnimPub_treeCount
-#undef scrAnimPub_treeNames
-#undef scrAnimPub_trees
-#undef scrAnimPub_parseStart
-#undef scrAnimPub_parseState
-#undef scrAnimPub_propertyNames
-#undef FindNextSibling
-#undef FindObject
+/* retail's 16-bit object handles (never address-taken) */
+unsigned short  scrAnimPub_treeRoot;        /* 0x008E60C0 */
+unsigned short  scrAnimPub_usingTreeNames;  /* 0x008E60B0 */
 
 #define SCR_ANIMTREE_POOL_COUNT     2       /* 0x00A9CC58 selects one */
 #define SCR_ANIMTREE_SLOTS          128
@@ -46,9 +36,6 @@ int             scrAnimPub_trees[SCR_ANIMTREE_POOL_COUNT * SCR_ANIMTREE_SLOTS];
 #define scrAnimPub_trees        scrAnimPub_trees
 #define scrAnimPub_pool         xanim_activePoolSlot
 
-#define SCR_ANIMTREE_SLOT_VALID( slot ) \
-	( (unsigned int)(slot) < (unsigned int)SCR_ANIMTREE_SLOTS )
-
 #define SCR_ANIMTREE_AT( slot ) \
 	scrAnimPub_trees[ SCR_ANIMTREE_SLOTS * scrAnimPub_pool + (slot) ]
 #define SCR_ANIMTREE_NAME_AT( slot ) \
@@ -59,25 +46,31 @@ extern int FindVariableIndexInternal__FUsUi();
 extern int FreeValue__FP21VariableValueInternal();
 extern int GetObject__FUs();
 extern int GetVariableIndexInternal__FUsUi();
-extern int Hunk_AllocAlignInternal();
+extern void *Hunk_AllocAlignInternal( int size, int align );
 extern int MakeVariableExternal__FP8VariableP21VariableValueInternal();
 extern int RemoveRefToObject__FUs();
 extern int RemoveVariable__FUsUi();
 extern int SL_FreeString__FUsPCcUi();
 extern int Scr_IsIdentifier__FPCc();
 extern int SetVariableValue__FUsP13VariableValue();
-extern void *XAnimPrecacheAnimTree_m( const char *animName,
-                                      void *( __cdecl *allocFn )( unsigned int ) );
+extern void XAnimPrecacheAnimTree_m( const char *animName,
+                                     void *( __cdecl *allocFn )( unsigned int ) );
 #define XAnimLoadFile XAnimPrecacheAnimTree_m
 
 extern void __cdecl XAnimCheckSyncNodes_r( void *tree, int nodeIndex );
 
 extern void QDECL CompileError( unsigned int sourcePos, const char *format, ... );
 extern void QDECL CompileError2( const char *codePos, const char *format, ... );
+#ifdef COD1_VC7
+extern unsigned char Scr_IsIdentifier( const char *name );
+#else
 extern qboolean   Scr_IsIdentifier( const char *name );
+#endif
+extern qboolean   Scr_IsInOpcodeMemory( const char *pos );
+extern qboolean   Scr_IsInOpcodeBuffer_m( const char *pos );
 extern char      *Com_GetLastTokenPos( void );
 extern char      *Com_ParseOnLine( char **data_p );
-extern char      *Scr_AddSourceBuffer( const char *filename, void *a2, void *a3 );
+extern char      *Scr_AddSourceBuffer( const char *filename, void *codeStart, void *developerCodeStart );
 extern int        Hunk_ClearTempMemoryHigh( void );
 
 extern void      *FS_GetDataForFile( const char *dir, const char *name, const char *ext );
@@ -94,21 +87,34 @@ typedef struct scrXAnimEntry_s {
 	} u;
 } scrXAnimEntry_t;
 
+/* the dword an emitted animation reference is patched with */
+typedef struct scrAnimRef_s {
+	unsigned short  index;           /* +0x00  node index */
+	unsigned short  tree;            /* +0x02  tree slot */
+} scrAnimRef_t;
+
 typedef struct scrXAnim_s {
 	const char      *name;           /* +0x00 */
 	int              nodeCount;      /* +0x04 */
 	scrXAnimEntry_t  entries[1];     /* +0x08  [nodeCount] */
 } scrXAnim_t;
 
-extern void *__cdecl XAnimSetLeafNode( const char *animName, scrXAnim_t *tree,
-									   unsigned short index );
+extern void __cdecl XAnimSetLeafNode( const char *animName, scrXAnim_t *tree,
+									  unsigned short index );
+/* xanim/dobj.cpp */
+unsigned short *__cdecl XAnimSetParentNode( unsigned short childCount, unsigned short flags,
+									  scrXAnim_t *tree, unsigned short index, int unused,
+									  unsigned short firstChildIndex );
 
 #define SCR_HANDLE( g )     ( *(unsigned short *)&(g) )
 
-#define scrAnimPub_treeRoot         SCR_HANDLE( scrAnimPub_treeRoot )  /* 0x008E60C0 */
-#define scrAnimPub_currentTreeRoot  SCR_HANDLE( scrAnimPub_currentTreeRoot )  /* 0x008E5EDC */
-#define scrAnimPub_currentUsingTree SCR_HANDLE( dword_8E60B0 )  /* 0x008E60B0 */
-#define scrAnimPub_checksum         ( *(unsigned int *)&scrCompilePub_checksum )
+/* retail 0x008E5EDC: the tree being loaded, a real 16-bit handle (Scr_EndLoadAnimTrees
+   loads it with xor eax,eax / mov ax) */
+unsigned short scrAnimPub_currentTreeRoot;
+#define scrAnimPub_currentUsingTree scrAnimPub_usingTreeNames  /* 0x008E60B0 */
+/* the compiler's running checksum; a plain int (an address-taken view stops VC7 from
+   scheduling other loads past pointer stores) */
+#define scrAnimPub_checksum         scrCompilePub_checksum
 #define scrCompilePub_sourceBuf     scrCompilePub_sourceBuf               /* 0x01407370 */
 #define scrCompilePub_scriptfilename scrCompilePub_scriptfilename              /* 0x01407374 */
 
@@ -129,12 +135,15 @@ static const char * const scrAnimPub_propertyNames[3] = {
 #define SCR_ANIMTREE_NAME_TYPE      4
 
 #include "scr_local.h"
+/* ---- module-owned globals ---- */
+unsigned char firstFreeVariable[786424];
+
 
 /* ---- SetAnimCheck  0x00467180 ---- VERIFIED */
-static int __cdecl SetAnimCheck(int result)
+/* Com_Frame's (com_animCheck latch), LTCG-inlined there (0x0043800C). */
+void SetAnimCheck(int result)
 {
-  com_animCheckCached = result;
-  return result;
+  com_animCheckCached = (qboolean)result;
 }
 
 /* ---- AnimTreeCompileError  0x00467190 ---- VERIFIED */
@@ -165,7 +174,8 @@ unsigned int GetAnimTreeParseProperties( void )
 		}
 
 		for ( i = 0; i < 3; i++ ) {
-			if ( !Q_stricmp( token, scrAnimPub_propertyNames[i] ) ) {
+			/* retail 0x00467260: CRT _stricmp, not Q_stricmp */
+			if ( !_stricmp( token, scrAnimPub_propertyNames[i] ) ) {
 				break;
 			}
 		}
@@ -195,18 +205,17 @@ void Scr_EmitAnimationInternal( char *animRef, unsigned short animName,
 	}
 
 	handle = FindVariable( tree, animName );
-	if ( handle ) {
-		stored = GetVariableValueAddress( handle );
-		*(unsigned int *)animRef = (unsigned int)stored->u.pointerValue;
-		stored->u.pointerValue   = animRef;
+	if ( !handle ) {
+		handle = GetVariable( tree, animName );
+		*(unsigned int *)animRef = 0;
+		value.type = VAR_CODEPOS;
+		value.u.pointerValue = animRef;
+		SetVariableValue( handle, &value );
 		return;
 	}
-
-	handle = GetVariable( tree, animName );
-	*(unsigned int *)animRef = 0;
-	value.u.pointerValue = animRef;
-	value.type           = VAR_CODEPOS;
-	SetVariableValue( handle, &value );
+	stored = GetVariableValueAddress( handle );
+	*(unsigned int *)animRef = (unsigned int)stored->u.pointerValue;
+	stored->u.pointerValue = animRef;
 }
 
 /* ---- Scr_EmitAnimation  0x004673A0 ---- VERIFIED */
@@ -225,6 +234,21 @@ int Scr_EmitAnimation__FPcUsUi( char *animRef, unsigned short animName,
 	return 0;
 }
 
+/* Retail hands each token byte to the VC7.1 _isalnum (0x00525CCD) through
+ * movsx (0x00467443, 0x004675F4), so a byte >= 0x80 becomes a negative index
+ * into the "C" locale _pctype at 0x0053DF42 (_setlocale has no callers) and
+ * reads the CRT runtime-error strings in .rdata just below the table.  Bit
+ * (byte - 0x80) is set where that word & 0x107 is nonzero: 104 of the 128
+ * high bytes pass as name characters in retail. */
+static const unsigned int animTreeHighByteAlnum[4] = {
+	0xFEF6BFFF, 0x6BFFBDBF, 0xDDFF9FFF, 0x0FDE77F9
+};
+
+static int AnimTree_IsAlnum( char c )
+{
+	return isalnum( (int)c );
+}
+
 /* AnimTree_TokenIsName  0x004674AC */
 static qboolean AnimTree_TokenIsName( const char *token )
 {
@@ -233,7 +257,7 @@ static qboolean AnimTree_TokenIsName( const char *token )
 	if ( !*p ) {
 		return qtrue;
 	}
-	while ( isalnum( (unsigned char)*p ) || *p == '_' ) {
+	while ( AnimTree_IsAlnum( *p ) || *p == '_' ) {
 		if ( !*++p ) {
 			return qtrue;
 		}
@@ -242,22 +266,32 @@ static qboolean AnimTree_TokenIsName( const char *token )
 }
 
 /* ---- AnimTreeParseInternal  0x004673D0 ---- VERIFIED */
-static qboolean AnimTreeParseInternal( unsigned short parentHandle,
-									   unsigned short treeHandle,
-									   qboolean addEmptyVoid,
-									   qboolean addLoopingVoid,
-									   qboolean forceLoadedChildren )
+unsigned char AnimTreeParseInternal( unsigned short parentHandle,
+									 unsigned short treeHandle,
+									 unsigned char addEmptyVoid,
+									 unsigned char addLoopingVoid,
+									 unsigned char forceLoadedChildren )
 {
-	unsigned short  animName   = 0;
-	unsigned short  animNode   = 0;
-	unsigned int    properties = 0;
-	qboolean        missingFromTree = qfalse;
-	qboolean        hitEndOfFile    = qtrue;
+	unsigned short  animName;
+	unsigned short  animNode;
+	unsigned int    properties;
+	unsigned char   missingFromTree;
+	unsigned char   hitEndOfFile;
 	const char     *token;
+	VariableValue   value;
+
+	/* retail 0x004673D9 stores value.type before zeroing the others */
+	value.type = VAR_INTEGER;
+	animName = 0;
+	animNode = 0;
+	properties = 0;
+	missingFromTree = qfalse;
 
 	for ( ;; ) {
-		token = Com_ParseExt( &scrAnimPub_parseState, qtrue );
+		/* retail 0x004673F2: Com_Parse inlined (unget restore, then Com_ParseExt qtrue) */
+		token = Com_Parse( &scrAnimPub_parseState );
 		if ( scrAnimPub_parseState == NULL ) {
+			hitEndOfFile = qtrue;
 			break;
 		}
 
@@ -274,12 +308,9 @@ static qboolean AnimTreeParseInternal( unsigned short parentHandle,
 			}
 			animNode = GetVariable( parentHandle, animName );
 
-			missingFromTree = qfalse;
-			if ( !forceLoadedChildren
-			  && !FindVariable( treeHandle, animName )
-			  && !com_animCheckCached ) {
-				missingFromTree = qtrue;
-			}
+			missingFromTree = !forceLoadedChildren
+						   && !FindVariable( treeHandle, animName )
+						   && !com_animCheckCached;
 
 			properties = 0;
 			token = Com_ParseOnLine( &scrAnimPub_parseState );
@@ -294,7 +325,7 @@ static qboolean AnimTreeParseInternal( unsigned short parentHandle,
 			}
 
 			properties = GetAnimTreeParseProperties();
-			token = Com_ParseExt( &scrAnimPub_parseState, qtrue );
+			token = Com_Parse( &scrAnimPub_parseState );	/* retail 0x00467686 */
 			if ( token[0] != '{' || token[1] ) {
 				AnimTreeCompileError(
 					"properties cannot be applied to primitive animations" );
@@ -303,7 +334,6 @@ static qboolean AnimTreeParseInternal( unsigned short parentHandle,
 
 		if ( token[0] == '{' ) {
 			unsigned short  childArray;
-			qboolean        childForce;
 
 			if ( token[1] ) {
 				AnimTreeCompileError( "bad token" );
@@ -318,25 +348,20 @@ static qboolean AnimTreeParseInternal( unsigned short parentHandle,
 			}
 
 			childArray = GetArray( animNode );
-			childForce = ( forceLoadedChildren
-						|| ( ( properties & SCR_ANIM_PROP_COMPLETE ) && !missingFromTree ) )
-						? qtrue : qfalse;
+
 
 			if ( AnimTreeParseInternal( childArray, treeHandle,
 										missingFromTree ? qfalse : qtrue,
 										( properties & SCR_ANIM_PROP_LOOPSYNC ) ? qtrue : qfalse,
-										childForce ) ) {
+										forceLoadedChildren || ( ( properties & 0x08 ) && !missingFromTree ) ) ) {
 				AnimTreeCompileError( "unexpected end of file" );
 			}
 
-			if ( GetArraySize( childArray ) == 0 ) {
-				RemoveVariable( parentHandle, animName );
-			} else {
-				VariableValue value;
-
+			if ( GetArraySize( childArray ) ) {
 				value.u.intValue = (int)properties;
-				value.type       = VAR_INTEGER;
 				SetVariableValue( GetArrayVariable( childArray, 0 ), &value );
+			} else {
+				RemoveVariable( parentHandle, animName );
 			}
 
 			animNode        = 0;
@@ -444,8 +469,9 @@ void ConnectScriptToAnim( unsigned short unresolvedRoot, int nodeIndex,
 {
 	unsigned short  handle;
 	VariableValue  *stored;
-	unsigned int    packed;
+	scrAnimRef_t    anim;
 	char           *ref;
+	char           *next;
 
 	handle = FindVariable( unresolvedRoot, animName );
 	if ( !handle ) {
@@ -458,13 +484,11 @@ void ConnectScriptToAnim( unsigned short unresolvedRoot, int nodeIndex,
 				   SL_ConvertToString( animName ), SL_ConvertToString( treeName ) );
 	}
 
-	packed = ( (unsigned int)treeIndex << 16 ) | (unsigned short)nodeIndex;
-	ref    = (char *)stored->u.pointerValue;
-	while ( ref != NULL ) {
-		char *next = (char *)( *(unsigned int *)ref );
-
-		*(unsigned int *)ref = packed;
-		ref = next;
+	anim.index = (unsigned short)nodeIndex;
+	anim.tree  = (unsigned short)treeIndex;
+	for ( ref = (char *)stored->u.pointerValue; ref != NULL; ref = next ) {
+		next = *(char **)ref;
+		*(scrAnimRef_t *)ref = anim;
 	}
 	stored->u.pointerValue = NULL;
 }
@@ -479,11 +503,12 @@ int ConnectScriptToAnim__FUsiUsUsi( unsigned short unresolvedRoot, int nodeIndex
 /* ---- Scr_GetAnimsIndex  0x00467D30 ---- VERIFIED */
 int __cdecl Scr_GetAnimsIndex( void *anims )
 {
-	int slot;
+	int  slot;
+	int *trees = &scrAnimPub_trees[ SCR_ANIMTREE_SLOTS * scrAnimPub_pool ];
 
+	/* retail 0x00467D50: no range check on slot */
 	for ( slot = scrAnimPub_treeCount[ scrAnimPub_pool ]; slot != 0; slot-- ) {
-		if ( SCR_ANIMTREE_SLOT_VALID( slot )
-		  && SCR_ANIMTREE_AT( slot ) == (int)anims ) {
+		if ( trees[slot] == (int)anims ) {
 			break;
 		}
 	}
@@ -499,30 +524,24 @@ int __cdecl Scr_GetAnimTreeCount( void )
 /* ---- Scr_GetAnims  0x00467D60 ---- VERIFIED */
 int __cdecl Scr_GetAnims( int slot )
 {
-	if ( !SCR_ANIMTREE_SLOT_VALID( slot ) ) {
-		return 0;
-	}
+	/* retail 0x00467D6E: no range check on slot */
 	return SCR_ANIMTREE_AT( slot );
 }
 
 /* ---- Scr_CreateAnimationTree  0x00467D80 ---- VERIFIED */
-static unsigned int Scr_CreateAnimationTree( unsigned short sourceHandle,
-											 unsigned short unresolvedRoot,
-											 scrXAnim_t *tree,
-											 unsigned int firstChildIndex,
-											 const char *nodeName,
-											 unsigned int nodeIndex,
-											 unsigned short treeName,
-											 int treeIndex )
+unsigned int Scr_CreateAnimationTree( unsigned short sourceHandle,
+									  unsigned short unresolvedRoot,
+									  scrXAnim_t *tree,
+									  unsigned int firstChildIndex,
+									  const char *nodeName,
+									  unsigned int nodeIndex,
+									  unsigned short treeName,
+									  int treeIndex )
 {
 	unsigned short   child;
-	unsigned short   childCount = 0;
-	unsigned short   properties = 0;
+	unsigned int     childCount = 0;
+	unsigned short   properties;
 	unsigned short   propertyHandle;
-	unsigned int     childNodeIndex;
-	unsigned int     nextFreeNodeIndex;
-	unsigned int     i;
-	scrXAnimEntry_t *entry;
 
 	for ( child = FindNextSibling( sourceHandle ); child != 0; child = FindNextSibling( child ) ) {
 		if ( GetVariableName( child ) < VAR_NAME_OBJECT_BASE ) {
@@ -533,24 +552,21 @@ static unsigned int Scr_CreateAnimationTree( unsigned short sourceHandle,
 	propertyHandle = FindArrayVariable( sourceHandle, 0 );
 	if ( propertyHandle ) {
 		properties = (unsigned short)GetVariableValueAddress( propertyHandle )->u.intValue;
+	} else {
+		properties = 0;
 	}
 
 	scrAnimPub_checksum = properties + 31u * ( childCount + 31u *
 						  ( firstChildIndex + 31u * ( nodeIndex + 31u * scrAnimPub_checksum ) ) );
 
-	/* --- XAnimSetParentNode, inlined as retail does --- */
-	entry = &tree->entries[nodeIndex];
-	entry->childCount             = childCount;
-	entry->u.parent.flags         = properties;
-	entry->u.parent.firstChildIndex = (unsigned short)firstChildIndex;
-	for ( i = 0; i < childCount; i++ ) {
-		tree->entries[ entry->u.parent.firstChildIndex + i ].parentIndex =
-			(unsigned short)nodeIndex;
-	}
-	(void)nodeName;
+	/* retail inlines XAnimSetParentNode (0x00483FC0) here; nodeIndex then becomes the
+	   running child index and firstChildIndex the next free node (retail keeps them in
+	   nodeIndex's home and ebp) */
+	XAnimSetParentNode( (unsigned short)childCount, properties, tree, (unsigned short)nodeIndex,
+						0, (unsigned short)firstChildIndex );
 
-	childNodeIndex    = firstChildIndex;
-	nextFreeNodeIndex = firstChildIndex + childCount;
+	nodeIndex = firstChildIndex;
+	firstChildIndex += childCount;
 
 	for ( child = FindNextSibling( sourceHandle ); child != 0; child = FindNextSibling( child ) ) {
 		unsigned int    name = GetVariableName( child );
@@ -561,23 +577,23 @@ static unsigned int Scr_CreateAnimationTree( unsigned short sourceHandle,
 		}
 		animName = (unsigned short)name;
 
-		ConnectScriptToAnim( unresolvedRoot, (int)childNodeIndex, treeName, animName,
+		ConnectScriptToAnim( unresolvedRoot, (int)nodeIndex, treeName, animName,
 							 treeIndex );
 
 		if ( GetVarType( child ) == VAR_OBJECT ) {
-			nextFreeNodeIndex = Scr_CreateAnimationTree(
+			firstChildIndex = Scr_CreateAnimationTree(
 									FindObject( child ), unresolvedRoot, tree,
-									nextFreeNodeIndex, SL_ConvertToString( animName ),
-									childNodeIndex, treeName, treeIndex );
+									firstChildIndex, SL_ConvertToString( animName ),
+									nodeIndex, treeName, treeIndex );
 		} else {
-			scrAnimPub_checksum = childNodeIndex + 31u * scrAnimPub_checksum;
+			scrAnimPub_checksum = nodeIndex + 31u * scrAnimPub_checksum;
 			XAnimSetLeafNode( SL_ConvertToString( animName ), tree,
-							  (unsigned short)childNodeIndex );
+							  (unsigned short)nodeIndex );
 		}
-		childNodeIndex++;
+		nodeIndex++;
 	}
 
-	return nextFreeNodeIndex;
+	return firstChildIndex;
 }
 
 int Scr_CreateAnimationTree__FUsUsP7XAnim_sUiPCcUiUsi(
@@ -596,28 +612,25 @@ void Scr_CheckAnimsDefined( unsigned short unresolvedRoot, unsigned short treeNa
 
 	for ( child = FindNextSibling( unresolvedRoot ); child != 0;
 		  child = FindNextSibling( child ) ) {
-		VariableValue  *stored = GetVariableValueAddress( child );
 		unsigned short  animName;
-		unsigned int    codePos;
+		const char     *codePos;
 		char           *message;
 
-		if ( stored->u.pointerValue == NULL ) {
+		animName = (unsigned short)GetVariableName( child );
+		if ( GetVariableValueAddress( child )->u.pointerValue == NULL ) {
 			continue;
 		}
 
-		animName = (unsigned short)GetVariableName( child );
 		message  = va( "animation '%s' not defined in anim tree '%s'",
 					   SL_ConvertToString( animName ),
 					   SL_ConvertToString( treeName ) );
 
-		codePos = stored->u.uintValue;
-		if ( ( codePos < (unsigned int)scrVarPub_programBuffer
-			|| codePos >= (unsigned int)scrVarPub_programBuffer + (unsigned int)scrCompilePub_programLen )
-		  && ( codePos < (unsigned int)scrCompileGlob_devOpBuffer
-			|| codePos >= (unsigned int)developerCodeStart ) ) {
+		codePos = GetVariableValueAddress( child )->u.codePosValue;
+		if ( Scr_IsInOpcodeMemory( codePos ) || Scr_IsInOpcodeBuffer_m( codePos ) ) {
+			CompileError2( codePos, "%s", message );
+		} else {
 			Com_Error( ERR_DROP, "\x15%s", message );
 		}
-		CompileError2( (const char *)codePos, "%s", message );
 	}
 }
 
@@ -639,7 +652,7 @@ void __cdecl Scr_PrecacheAnimationTree( unsigned short animsId )
 		}
 
 		if ( ( scrVarNodes[id].status & VAR_STATUS_TYPE_MASK ) == VAR_OBJECT ) {
-			Scr_PrecacheAnimationTree( scrVarNodes[id].u.halfword[0] );
+			Scr_PrecacheAnimationTree( scrVarNodes[id].u.halfword.lo );
 		} else {
 			XAnimLoadFile( SL_ConvertToString( (unsigned short)name ),
 						   Hunk_AllocXAnimPrecache );
@@ -651,51 +664,6 @@ int Scr_PrecacheAnimationTree__FUs( unsigned short animsId ) {
 	Scr_PrecacheAnimationTree( animsId );
 	return 0;
 }
-#if 0
-int __cdecl Scr_PrecacheAnimationTree(unsigned __int16 a1)
-{
-  unsigned __int16 v1;
-  int result;
-  int v3;
-  unsigned int v4;
-  unsigned int v5;
-  int *v6;
-
-  v1 = FindNextSibling[2 * HIWORD(firstFreeVariable[3 * a1])];
-  result = FindObject[3 * v1] & 0x1F;
-  if ( (unsigned __int8)result < 0xCu )
-  {
-    if ( v1 )
-    {
-      do
-      {
-        v3 = 3 * v1;
-        v4 = FindObject[v3];
-        v5 = v4 >> 8;
-        if ( v4 >> 8 < 0x10000 )
-        {
-          if ( (v4 & 0x1F) == 7 )
-          {
-            Scr_PrecacheAnimationTree(dword_9B6478[v3]);
-          }
-          else
-          {
-            if ( (_WORD)v5 )
-              v6 = (int *)(GetRefString_var + 8 * (unsigned __int16)v5 + 4);
-            else
-              v6 = 0;
-            XAnimLoadFile(v6, (int (__cdecl *)(int))Hunk_AllocXAnimPrecache);
-          }
-        }
-        v1 = FindNextSibling[2 * *(unsigned __int16 *)(v3 * 4 + 10183810)];
-        result = FindObject[3 * v1] & 0x1F;
-      }
-      while ( (unsigned __int8)result < 0xCu && v1 );
-    }
-  }
-  return result;
-}
-#endif
 
 /* ---- Scr_UsingTreeInternal  0x004681E0 ---- VERIFIED */
 unsigned short __cdecl Scr_UsingTreeInternal( const char *name, int *slot )
@@ -703,176 +671,63 @@ unsigned short __cdecl Scr_UsingTreeInternal( const char *name, int *slot )
 	unsigned short  canonical;
 	unsigned short  entryNode;
 	unsigned short  object;
-	unsigned short  animsHandle;
-	unsigned short  animsNode;
+	unsigned short *names;
 	int             count;
 	int             i;
 
 	canonical = Scr_CreateCanonicalFilename( name );
 
-	entryNode = scrVarIndirections[
-		FindVariableIndexInternal( (unsigned short)scrAnimPub_treeRoot, canonical ) ].id;
+	entryNode = FindVariable( scrAnimPub_treeRoot, canonical );
+	if ( !entryNode ) {
+		entryNode = GetVariable( scrAnimPub_treeRoot, canonical );
+		object    = GetObject( entryNode );
 
-	if ( entryNode != 0 ) {
-		object  = scrVarNodes[entryNode].u.halfword[0];
-		*slot   = 0;
-		count   = scrAnimPub_treeCount[ scrAnimPub_pool ];
-		for ( i = 1; i <= count; i++ ) {
-			if ( !SCR_ANIMTREE_SLOT_VALID( i ) ) {
-				break;
-			}
-			if ( SCR_ANIMTREE_NAME_AT( i ) == entryNode ) {
+		/* retail 0x00468232-0x00468254: no bound; pool 1 past slot 127 relies on
+		   retail's contiguous treeCount/treeNames/trees layout (0x8E58D0/0x8E58D8/0x8E5AD8) */
+		count = scrAnimPub_treeCount[ scrAnimPub_pool ] + 1;
+		scrAnimPub_treeCount[ scrAnimPub_pool ] = count;
+		SCR_ANIMTREE_NAME_AT( count ) = entryNode;
+		*slot = count;
+	} else {
+		object = FindObject( entryNode );
+		*slot  = 0;
+		names  = &scrAnimPub_treeNames[ SCR_ANIMTREE_SLOTS * scrAnimPub_pool ];
+		for ( i = 1; i <= scrAnimPub_treeCount[ scrAnimPub_pool ]; i++ ) {
+			if ( names[i] == entryNode ) {
 				*slot = i;
 				break;
 			}
 		}
-	} else {
-		entryNode = scrVarIndirections[
-			GetVariableIndexInternal( (unsigned short)scrAnimPub_treeRoot, canonical ) ].id;
-		object = GetObject( entryNode );
-
-		count = scrAnimPub_treeCount[ scrAnimPub_pool ] + 1;
-		scrAnimPub_treeCount[ scrAnimPub_pool ] = count;
-		if ( SCR_ANIMTREE_SLOT_VALID( count ) ) {
-			SCR_ANIMTREE_NAME_AT( count ) = entryNode;
-		} else {
-			Com_Printf( "^3too many #using_animtree names (max %d)\n",
-						SCR_ANIMTREE_SLOTS - 1 );
-		}
-		*slot = count;
 	}
 
-	animsHandle = GetVariableIndexInternal( object, 0 );
-	animsNode   = scrVarIndirections[animsHandle].id;
-
-	if ( ( scrVarNodes[animsNode].status & VAR_STATUS_TYPE_MASK ) == VAR_UNDEFINED ) {
-		scrVarNodes[animsNode].status |= VAR_OBJECT;
-		scrVarNodes[animsNode].u.halfword[0] = Scr_AllocArray();
-	}
-
-	animsHandle = scrVarNodes[animsNode].u.halfword[0];
+	object = GetArray( GetVariable( object, 0 ) );
 	SL_RemoveRefToString( canonical );
-	return animsHandle;
+	return object;
 }
-
-#if 0
-__int16 __cdecl Scr_UsingTreeInternal(char *a1, int *a2)
-{
-  unsigned __int16 CanonicalFilename;
-  unsigned __int16 v4;
-  unsigned int v5;
-  unsigned __int16 v6;
-  unsigned __int16 v7;
-  unsigned __int16 Object;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  char *v15;
-  unsigned __int16 VariableIndexInternal;
-  int v17;
-  int v18;
-  int v19;
-  int v20;
-  __int16 v21;
-  __int16 v22;
-  unsigned __int16 v24;
-
-  CanonicalFilename = Scr_CreateCanonicalFilename(a1);
-  v4 = scrAnimPub_treeRoot;
-  v5 = CanonicalFilename;
-  v24 = CanonicalFilename;
-  v6 = FindNextSibling[2 * (unsigned __int16)FindVariableIndexInternal(scrAnimPub_treeRoot, CanonicalFilename)];
-  if ( v6 )
-  {
-    v11 = xanim_activePoolSlot;
-    Object = dword_9B6478[3 * v6];
-    v12 = xanim_activePoolSlot << 8;
-    *a2 = 0;
-    v13 = scrAnimPub_treeCount[v11];
-    v14 = 1;
-    v15 = (char *)scrAnimPub_treeNames + v12;
-    if ( v13 >= 1 )
-    {
-      while ( *(_WORD *)&v15[2 * v14] != v6 )
-      {
-        if ( ++v14 > v13 )
-          goto LABEL_8;
-      }
-      *a2 = v14;
-    }
-  }
-  else
-  {
-    v7 = FindNextSibling[2 * GetVariableIndexInternal(v4, v5)];
-    Object = GetObject(v7);
-    v9 = xanim_activePoolSlot;
-    v10 = scrAnimPub_treeCount[xanim_activePoolSlot] + 1;
-    scrAnimPub_treeCount[xanim_activePoolSlot] = v10;
-    scrAnimPub_treeNames[128 * v9 + v10] = v7;
-    *a2 = v10;
-  }
-LABEL_8:
-  VariableIndexInternal = GetVariableIndexInternal(Object, 0);
-  v17 = 3 * (unsigned __int16)FindNextSibling[2 * VariableIndexInternal];
-  v18 = FindObject[3 * (unsigned __int16)FindNextSibling[2 * VariableIndexInternal]];
-  v19 = 4 * v17 + 10183800;
-  if ( (v18 & 0x1F) == 0 )
-  {
-    *(_DWORD *)(v19 + 4) = v18 | 7;
-    v20 = AllocVariable();
-    *(_DWORD *)(v20 + 4) = 111;
-    *(_WORD *)v20 = 0;
-    *(_WORD *)(v20 + 2) = 0;
-    *(_WORD *)v19 = (v20 - (int)dword_9B6478) / 12;
-  }
-  v21 = *(_WORD *)v19;
-  v22 = *(_WORD *)(GetRefString_var + 8 * v5);
-  if ( v22 )
-    *(_WORD *)(GetRefString_var + 8 * v5) = v22 - 1;
-  else
-    SL_FreeString(
-      (char *)(GetRefString_var + 8 * v5 + 4),
-      v24,
-      GetRefString_var
-    + 8 * v5
-    + 4
-    + strlen((const char *)(GetRefString_var + 8 * v5 + 4))
-    + 1
-    - (GetRefString_var
-     + 8 * v5
-     + 5)
-    + 1);
-  return v21;
-}
-#endif
 
 /* ---- Scr_UsingTree__FPCcUi  0x00468350 ---- VERIFIED */
-__int16 __cdecl Scr_UsingTree(char *a1, int a2)
+void Scr_UsingTree( const char *name, unsigned int sourcePos )
 {
-  __int16 result;
+	if ( !Scr_IsIdentifier( name ) ) {
+		CompileError( sourcePos, "bad anim tree name" );
+		return;
+	}
 
-  if ( !Scr_IsIdentifier(a1) )
-    CompileError(a2, "bad anim tree name");
-  result = Scr_UsingTreeInternal(a1, &scrCompileGlob_animTreeValue);
-  LOWORD(dword_8E60B0) = result;
-  return result;
+	scrAnimPub_currentUsingTree = Scr_UsingTreeInternal( name, &scrCompileGlob_animTreeValue );
 }
 
 /* ---- Scr_LoadAnimTreeInternal  0x00468390 ---- VERIFIED */
-static qboolean Scr_LoadAnimTreeInternal( const char *animTreeName,
-										  unsigned short parentHandle,
-										  unsigned short treeHandle )
+unsigned char Scr_LoadAnimTreeInternal( const char *animTreeName,
+										unsigned short parentHandle,
+										unsigned short treeHandle )
 {
-	char        filename[64];
-	const char *savedSourcePos;
-	const char *savedFilename;
-	char       *source;
-	qboolean    parsedSomething;
+	char            filename[64];
+	const char     *savedSourcePos;
+	const char     *savedFilename;
+	char           *source;
 
-	Com_sprintf( filename, sizeof( filename ), "animtrees/%s.atr", animTreeName );
+	/* retail 0x004683B0: unbounded CRT sprintf (0x00525208) into char[64] */
+	sprintf( filename, "animtrees/%s.atr", animTreeName );
 
 	savedSourcePos = (const char *)scrCompilePub_sourceBuf;
 
@@ -886,13 +741,11 @@ static qboolean Scr_LoadAnimTreeInternal( const char *animTreeName,
 
 	Scr_AnimTreeParse( source, parentHandle, treeHandle );
 
-	Hunk_ClearTempMemoryHigh();
-	parsedSomething = GetArraySize( parentHandle ) != 0 ? qtrue : qfalse;
-
+	/* Mac 1.3 order: restore the compile state, then release the source buffer */
 	scrCompilePub_scriptfilename = (int)savedFilename;
 	scrCompilePub_sourceBuf      = (int)savedSourcePos;
-
-	return parsedSomething;
+	Hunk_ClearTempMemoryHigh();
+	return GetArraySize( parentHandle ) != 0 ? qtrue : qfalse;
 }
 
 int Scr_LoadAnimTreeInternal__FPCcUsUs( const char *animTreeName,
@@ -954,8 +807,7 @@ void Scr_LoadAnimTreeAtIndex( int treeIndex, void *(__cdecl *allocFn)( int ) )
 	tree->name      = name;
 	tree->nodeCount = nodeCount;
 
-	rootName = SL_GetStringOfLen( "root", 0, strlen( "root" ) + 1,
-								  SCR_ANIMTREE_NAME_TYPE );
+	rootName = SL_GetString_( "root", 0, SCR_ANIMTREE_NAME_TYPE );
 	ConnectScriptToAnim( unresolvedRoot, SCR_ANIMTREE_CHILD_ANIMS, treeName, rootName,
 						 treeIndex );
 	SL_RemoveRefToString( rootName );
@@ -970,8 +822,8 @@ void Scr_LoadAnimTreeAtIndex( int treeIndex, void *(__cdecl *allocFn)( int ) )
 	RemoveRefToObject( scrAnimPub_currentTreeRoot );
 	scrAnimPub_currentTreeRoot = 0;
 
-	value.u.pointerValue = tree;
 	value.type           = VAR_CODEPOS;
+	value.u.pointerValue = tree;
 	SetVariableValue( GetVariable( treeData, SCR_ANIMTREE_CHILD_TREE ), &value );
 
 	XAnimCheckSyncNodes_r( tree, 0 );
@@ -985,71 +837,50 @@ int Scr_LoadAnimTreeAtIndex__FiPFi_Pv( int treeIndex, void *(__cdecl *allocFn)( 
 }
 
 /* ---- Scr_FindAnimTree  0x004686E0 ---- VERIFIED */
-void * __cdecl Scr_FindAnimTree( const char *name )
+/* returns scr_animtree_t by value (Mac 1.3 Scr_FindAnimTree writes it through the
+   hidden result pointer); a 4-byte struct comes back in eax like the import's void * */
+typedef struct scr_animtree_s {
+	void           *anims;
+} scr_animtree_t;
+
+scr_animtree_t __cdecl Scr_FindAnimTree( const char *name )
 {
 	unsigned short  canonical;
 	unsigned short  entryNode;
 	unsigned short  treeNode;
+	scr_animtree_t  tree;
 
 	canonical = Scr_CreateCanonicalFilename( name );
 	entryNode = scrVarIndirections[
 		FindVariableIndexInternal( (unsigned short)scrAnimPub_treeRoot, canonical ) ].id;
 	SL_RemoveRefToString( canonical );
 
-	if ( entryNode == 0 ) {
-		return NULL;
+	tree.anims = NULL;
+	if ( !entryNode ) {
+		return tree;
 	}
-
 	treeNode = scrVarIndirections[
-		FindVariableIndexInternal( scrVarNodes[entryNode].u.halfword[0], 1 ) ].id;
-	if ( treeNode == 0 ) {
-		return NULL;
+		FindVariableIndexInternal( scrVarNodes[entryNode].u.halfword.lo, 1 ) ].id;
+	if ( !treeNode ) {
+		return tree;
 	}
-	return scrVarNodes[treeNode].u.pointerValue;
+	tree.anims = scrVarNodes[treeNode].u.pointerValue;
+	return tree;
 }
-#if 0
-int __cdecl Scr_FindAnimTree(char *a1)
-{
-  unsigned __int16 CanonicalFilename;
-  unsigned __int16 v2;
-  __int16 v3;
-  unsigned __int16 v4;
-
-  CanonicalFilename = Scr_CreateCanonicalFilename(a1);
-  v2 = FindNextSibling[2 * (unsigned __int16)FindVariableIndexInternal(scrAnimPub_treeRoot, CanonicalFilename)];
-  v3 = *(_WORD *)(GetRefString_var + 8 * CanonicalFilename);
-  if ( v3 )
-    *(_WORD *)(GetRefString_var + 8 * CanonicalFilename) = v3 - 1;
-  else
-    SL_FreeString(
-      (char *)(GetRefString_var + 8 * CanonicalFilename + 4),
-      CanonicalFilename,
-      GetRefString_var
-    + 8 * CanonicalFilename
-    + 4
-    + strlen((const char *)(GetRefString_var + 8 * CanonicalFilename + 4))
-    + 1
-    - (GetRefString_var
-     + 8 * CanonicalFilename
-     + 5)
-    + 1);
-  if ( v2 && (v4 = FindNextSibling[2 * (unsigned __int16)FindVariableIndexInternal(dword_9B6478[3 * v2], 1)]) != 0 )
-    return dword_9B6478[3 * v4];
-  else
-    return 0;
-}
-#endif
 
 /* ---- Scr_FindAnim  0x00468790 ---- VERIFIED */
 void Scr_FindAnim( const char *treeName, const char *animName, void *animRef )
 {
 	unsigned short  animHandle;
-	unsigned short  treeHandle;
 	int             treeIndex;
 
 	animHandle = SL_GetLowercaseStringOfLen( animName, 0, strlen( animName ) + 1,
 											 SCR_ANIMTREE_NAME_TYPE );
-	treeHandle = Scr_UsingTreeInternal( treeName, &treeIndex );
-	Scr_EmitAnimationInternal( (char *)animRef, animHandle, treeHandle, 0 );
+	Scr_EmitAnimationInternal( (char *)animRef, animHandle,
+							   Scr_UsingTreeInternal( treeName, &treeIndex ), 0 );
 	SL_RemoveRefToString( animHandle );
 }
+
+#ifdef __cplusplus
+}
+#endif

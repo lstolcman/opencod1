@@ -41,15 +41,16 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "l_libvar.h"
+/* ---- module-owned globals ---- */
+FILE *logfile_fp;
+
 
 #define MAX_LOGFILENAMESIZE     1024
 
 /*
  * Retail's storage is one record at 0x008BBC48; see the banner.  `logfile_fp`
- * is declared in cod1_globals.h, so only the filename half is declared here.
+ * is defined above, so only the filename half is declared here.
  * File-local because RTCW's `logfile` is `static`.
  */
 static char logfile_filename[MAX_LOGFILENAMESIZE];

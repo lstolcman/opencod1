@@ -1,21 +1,6 @@
-/*
- * cg_main_mp.c -- initialization and primary entry point for the multiplayer
- * client game module (cgame_mp_x86.dll, CoD 1.1, imagebase 0x30000000).
- *
- * Descended from RTCW's cgame/cg_main.c: vmMain, the cvar table, the media
- * registration, the ui_shared display-context wiring and the menu loader are
- * all recognisably RTCW's, with CoD's additions (sound aliases, XAnim, the
- * shell-shock configstrings, the string-localization traps) grafted on.
- *
- * Function order is the binary's (0x300203B0 .. 0x30023434), which is the order
- * they appeared in the original file.
- *
- * @fidelity: likely
- */
+// cg_main.c -- initialization and primary entry point for cgame
 
 #include "cg_local.h"
-/* cgDC lives here; ui_shared.h owns displayContextDef_t, cachedAssets_t and
-   fontInfo_t. */
 #include "../ui_mp/ui_shared.h"
 
 #include <stdarg.h>
@@ -23,73 +8,55 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * ---------------------------------------------------------------------------
- * Declarations for code this unit calls that no header carries.  Where a
- * spelling is inferred rather than recovered the comment says so.
- * ---------------------------------------------------------------------------
- */
-
-/* universal/q_shared.c and universal/q_parse.c. */
-
-/* universal/com_math.c (0x3003C770 / 0x3003C730 in this module). */
-
-/* cg_animtree.c */
+// cg_animtree.c
 void        CGScr_LoadAnimTrees( void );
 void        CG_FreeClientDObjInfo( void );
 void        CG_FreeEntityDObjInfo( void );
 
-/* cg_consolecmds.c */
+// cg_consolecmds.c
 int         CG_ConsoleCommand( void );
 void        CG_InitConsoleCommands( void );
 
-/* cg_effects.c */
+// cg_effects.c
 void        CG_RegisterImpactEffects( void );
 
-/* cg_localents.c */
+// cg_localents.c
 void        CG_InitLocalEntities( void );
 
-/* cg_marks.c.  Twelve parameters (vmMain case 14 pushes eleven and leaves the
-   twelfth in ecx); several are floats reaching cgame as bit patterns, so they
-   are spelled int here. */
+// cg_marks.c
 void        CG_InitMarkPolys( void );
 
-/* cg_scoreboard.c */
+// cg_scoreboard.c
 void        CG_RegisterScoreboardGraphics( void );
 
-/* cg_servercmds.c */
+// cg_servercmds.c
 void        CG_ParseServerinfo( void );
 void        CG_ParseWolfinfo( void );
 void        CG_SetConfigValues( void );
 
-/* cg_shellshock.c */
+// cg_shellshock.c
 qboolean    CG_LoadShellShockCvars( const char *name );
 void        CG_SetShellShockParmsFromCvars( shellshockParms_t *parms );
 
-/* cg_view.c */
+// cg_view.c
 void        CG_DrawActiveFrame( int serverTime, int arg1, int demoPlayback, int arg3, int arg4 );
 
-/* game_mp/bg_weapon.c */
+// bg_weapon.c
 void        BG_SetupWeaponInfo( void );
 
-/* cg_weapons.c */
+// cg_weapons.c
 void        CG_RegisterItems( void );
 void        CG_FreeWeapons( void );
 
-/* 0x30020260, 0x30020320, 0x30020390 and 0x300203A0 sit between
-   cg_localents.c's last function and vmMain; they are this file's by address
-   and are written below. */
 void        CG_GetDObjOrientation( int entnum, vec3_t origin, vec3_t axis[3] );
 void        CG_GetEntityOrientation( int entnum, vec3_t origin, vec3_t axis[3] );
 int         CG_SaveState( void *buffer, int size );
 int         CG_RestoreState( void *buffer, int size );
 
-/* 0x3003FDE0, in the ui_shared.c address range but named Scr_FarHook; vmMain
-   export 16 is a straight tail call to it. */
 int         *Scr_FarHook( const void *hooks );
 
-/* ui_shared.c */
-extern int  menuCount;                                  /* 0x300EEEE8 */
+// ui_shared.c
+extern int  menuCount;
 void        String_Init( void );
 void        Menu_Reset( void );
 void        Menu_New( int handle, int loadMode );
@@ -99,58 +66,16 @@ qboolean    PC_Float_Parse( int handle, float *out );
 qboolean    PC_Color_Parse( int handle, vec4_t *out );
 void        Controls_GetConfig( void );
 
-/* bg_animation.c, compiled into this DLL as well as into the game DLL.  Same
-   objects, same names, same one-rep-stosd clear that G_InitGame does -- see
-   game_mp/g_main_mp.c, which carries the identical block for 0x200A1C80. */
-extern int  bgs_time;                                   /* 0x300F0310 */
-extern int  bgs_animTime;                               /* 0x300F0314 */
-extern int  bgs_frametime;                              /* 0x300F0318 */
-extern animScriptData_t bgs_animScriptData;             /* 0x300F0520 */
-extern void *bgs_animTree;                              /* 0x3018BBF8 */
-extern scr_anim_t bgs_rootAnim;                         /* 0x3018BBFC */
-extern scr_anim_t bgs_torsoAnim;                        /* 0x3018BC00 */
-extern scr_anim_t bgs_legsAnim;                         /* 0x3018BC04 */
-extern scr_anim_t bgs_turningAnim;                      /* 0x3018BC08 */
 
-/* The two per-team voice-chat lists are cg_servercmds.c's voiceChatLists[0]
-   and [1] (0x302F7D80 / 0x30340EC8, the same CG_LoadVoiceChats reads); the
-   type and the extern are in cg_local.h. */
+cg_t cg;
+cgs_t cgs;
+centity_t cg_entities[MAX_GENTITIES];
+cgWeaponInfo_t cg_weapons[MAX_WEAPONS_CG];
 
+// itemInfo_t cg_items[MAX_ITEMS]; the record type is private to cg_weapons.c
+byte cg_items[256 * 36];
 
-/*
-=============================================================================
-
-		GLOBALS
-
-	RTCW's cg_main.c owns these five objects; their sizes are CG_Init's four
-	rep stosd (0x30022F9F..0x30022FCF).
-
-=============================================================================
-*/
-
-cg_t cg;                                                /* 0x301E2140 */
-cgs_t cgs;                                              /* 0x301CC0A0 */
-centity_t cg_entities[MAX_GENTITIES];                   /* 0x3020DB80 */
-cgWeaponInfo_t cg_weapons[MAX_WEAPONS_CG];              /* 0x301A6940 */
-
-/* cg_weapons_mp.c's itemInfo_t: 256 records of 36 bytes (CG_RegisterItemVisuals
-   0x30036082 indexes with `lea ebp,[eax+eax*8]`, and CG_Init clears 0x2400).
-   RTCW defines cg_items in cg_main.c, so it is defined here. */
-byte cg_items[256 * 36];                                /* 0x301DC3E0 */
-
-displayContextDef_t cgDC;                               /* 0x301AD720 */
-
-/*
-=============================================================================
-
-		THE CVAR TABLE
-
-	173 entries at 0x300749A0, walked by CG_RegisterCvars (0x300205E0) and
-	CG_UpdateCvars (0x300206A0) with a 16-byte stride.  The vmCvar_t handles
-	are declared in cg_local.h with their addresses.
-
-=============================================================================
-*/
+displayContextDef_t cgDC;
 
 vmCvar_t cg_ignore;
 vmCvar_t cg_drawGun;
@@ -333,10 +258,8 @@ typedef struct cvarTable_t {
 	int cvarFlags;
 } cvarTable_t;
 
-/* NOT static: cg_view_mp.c's CG_DrawActiveFrame walks this table every frame
-   (0x30033A2A). */
-cvarTable_t cvarTable[] = {                  /* 0x300749A0 */
-	{ &cg_ignore, "cg_ignore", "0", 0 },
+cvarTable_t cvarTable[] = {
+	{ &cg_ignore, "cg_ignore", "0", 0 },  // used for debugging
 	{ &cg_drawGun, "cg_drawGun", "1", CVAR_ARCHIVE | CVAR_CHEAT },
 	{ &cg_cursorHints, "cg_cursorHints", "3", CVAR_ARCHIVE },
 	{ &cg_hintFadeTime, "cg_hintFadeTime", "100", CVAR_ARCHIVE },
@@ -459,19 +382,19 @@ cvarTable_t cvarTable[] = {                  /* 0x300749A0 */
 	{ &cg_descriptiveText, "cg_descriptiveText", "1", CVAR_ARCHIVE },
 	{ &cg_r_optimize, "r_optimize", "1", CVAR_LATCH },
 	{ &cg_r_optimizeXModels, "r_optimizeXModels", "1", CVAR_LATCH },
-	{ &bg_viewheight_standing, "bg_viewheight_standing", "60", CVAR_CHEAT | CVAR_NORESTART },
-	{ &bg_viewheight_crouched, "bg_viewheight_crouched", "40", CVAR_CHEAT | CVAR_NORESTART },
-	{ &bg_viewheight_prone, "bg_viewheight_prone", "11", CVAR_CHEAT | CVAR_NORESTART },
-	{ &bg_duck2prone_time, "bg_duck2prone_time", "400", CVAR_CHEAT | CVAR_NORESTART },
-	{ &bg_prone2duck_time, "bg_prone2duck_time", "400", CVAR_CHEAT | CVAR_NORESTART },
-	{ &bg_ladder_yawcap, "bg_ladder_yawcap", "100", CVAR_CHEAT | CVAR_NORESTART },
-	{ &bg_prone_yawcap, "bg_prone_yawcap", "85", CVAR_CHEAT | CVAR_NORESTART },
-	{ &bg_prone_softyawedge, "bg_prone_softyawedge", "1", CVAR_CHEAT | CVAR_NORESTART },
-	{ &bg_foliagesnd_minspeed, "bg_foliagesnd_minspeed", "40", CVAR_CHEAT | CVAR_NORESTART },
-	{ &bg_foliagesnd_maxspeed, "bg_foliagesnd_maxspeed", "180", CVAR_CHEAT | CVAR_NORESTART },
-	{ &bg_foliagesnd_slowinterval, "bg_foliagesnd_slowinterval", "1500", CVAR_CHEAT | CVAR_NORESTART },
-	{ &bg_foliagesnd_fastinterval, "bg_foliagesnd_fastinterval", "500", CVAR_CHEAT | CVAR_NORESTART },
-	{ &bg_foliagesnd_resetinterval, "bg_foliagesnd_resetinterval", "500", CVAR_CHEAT | CVAR_NORESTART },
+	{ &bg_viewheight_standing, "bg_viewheight_standing", "60", CVAR_CHEAT | CVAR_WOLFINFO },
+	{ &bg_viewheight_crouched, "bg_viewheight_crouched", "40", CVAR_CHEAT | CVAR_WOLFINFO },
+	{ &bg_viewheight_prone, "bg_viewheight_prone", "11", CVAR_CHEAT | CVAR_WOLFINFO },
+	{ &bg_duck2prone_time, "bg_duck2prone_time", "400", CVAR_CHEAT | CVAR_WOLFINFO },
+	{ &bg_prone2duck_time, "bg_prone2duck_time", "400", CVAR_CHEAT | CVAR_WOLFINFO },
+	{ &bg_ladder_yawcap, "bg_ladder_yawcap", "100", CVAR_CHEAT | CVAR_WOLFINFO },
+	{ &bg_prone_yawcap, "bg_prone_yawcap", "85", CVAR_CHEAT | CVAR_WOLFINFO },
+	{ &bg_prone_softyawedge, "bg_prone_softyawedge", "1", CVAR_CHEAT | CVAR_WOLFINFO },
+	{ &bg_foliagesnd_minspeed, "bg_foliagesnd_minspeed", "40", CVAR_CHEAT | CVAR_WOLFINFO },
+	{ &bg_foliagesnd_maxspeed, "bg_foliagesnd_maxspeed", "180", CVAR_CHEAT | CVAR_WOLFINFO },
+	{ &bg_foliagesnd_slowinterval, "bg_foliagesnd_slowinterval", "1500", CVAR_CHEAT | CVAR_WOLFINFO },
+	{ &bg_foliagesnd_fastinterval, "bg_foliagesnd_fastinterval", "500", CVAR_CHEAT | CVAR_WOLFINFO },
+	{ &bg_foliagesnd_resetinterval, "bg_foliagesnd_resetinterval", "500", CVAR_CHEAT | CVAR_WOLFINFO },
 	{ &bg_fallDamageMinHeight, "bg_fallDamageMinHeight", "256", CVAR_SYSTEMINFO | CVAR_CHEAT },
 	{ &bg_fallDamageMaxHeight, "bg_fallDamageMaxHeight", "480", CVAR_SYSTEMINFO | CVAR_CHEAT },
 	{ &bg_debugWeaponAnim, "bg_debugWeaponAnim", "0", CVAR_CHEAT },
@@ -511,53 +434,36 @@ cvarTable_t cvarTable[] = {                  /* 0x300749A0 */
 	{ &cl_serverloadwaiting, "cl_serverloadwaiting", "0", CVAR_ROM }
 };
 
-/* retail 0x30020600 counts down from a folded 0xad -- no cvarTableSize global */
-#define cvarTableSize   ( sizeof( cvarTable ) / sizeof( cvarTable[0] ) )
+// keep: static const, matches original codegen
+static const int cvarTableSize = sizeof( cvarTable ) / sizeof( cvarTable[0] );
 
 void CG_Init( int serverMessageNum, int serverCommandSequence, int clientNum );
 void CG_Shutdown( void );
 
 /*
- * cg.unknown_0x2AA40[96] is the view-model placement block; cg_weapons_mp.c
- * names the whole of it.  CG_AddPlayerWeapon writes these two (0x30037014 /
- * 0x30037031) and CG_GetDObjOrientation is the only other reader.
- */
-#define CG_VIEWMODELORIGIN()    ( (float *)&cg.unknown_0x2AA40[0x2C] )   /* cg+0x2AA6C */
-#define CG_VIEWMODELAXIS()      ( (vec3_t *)&cg.unknown_0x2AA40[0x38] )  /* cg+0x2AA78 */
-
-/*
 ================
-CG_GetDObjOrientation         0x30020260
+CG_GetDObjOrientation
 
-vmMain export 12.  Retail is __usercall( entnum@<ecx>, origin@<edx>,
-axis@<eax> ) and tail-jumps into AnglesToAxis, which is why it has no epilogue
-of its own.
-
-DObj handles 0..MAX_GENTITIES-1 are entities; MAX_GENTITIES..+MAX_CLIENTS are
-the view-model DObjs, and every one of those answers with the single view-model
-placement -- the index is bounds-checked and then discarded (0x300202A7).
+DObj handles below MAX_GENTITIES are entities; the next MAX_CLIENTS are
+view-model DObjs, which all use the view-model placement.
 ================
 */
 void CG_GetDObjOrientation( int entnum, vec3_t origin, vec3_t axis[3] ) {
+	centity_t *cent;
+
 	if ( entnum >= 0 && entnum < MAX_GENTITIES ) {
-		VectorCopy( cg_entities[entnum].lerpOrigin, origin );
-		AnglesToAxis( cg_entities[entnum].lerpAngles, axis );
+		cent = &cg_entities[entnum];
+		VectorCopy( cent->lerpOrigin, origin );
+		AnglesToAxis( cent->lerpAngles, axis );
 	} else if ( entnum >= MAX_GENTITIES && entnum - MAX_GENTITIES < MAX_CLIENTS ) {
-		VectorCopy( CG_VIEWMODELORIGIN(), origin );
-		AxisCopy( CG_VIEWMODELAXIS(), axis );
+		VectorCopy( cg.viewModelOrigin, origin );
+		AxisCopy( cg.viewModelAxis, axis );
 	}
 }
 
 /*
 ================
-CG_GetEntityOrientation       0x30020320
-
-vmMain export 13.  __usercall( entnum@<eax>, axis@<edx>, origin@<ecx> ), and
-unlike export 12 it bounds-checks nothing.  AnglesToAxis is inlined here rather
-than called: the AngleVectors at 0x30020355 takes axis[0] as `forward`, a stack
-temporary as `right` and axis[2] as `up`, and 0x3002035B..0x3002037F is the
-`VectorSubtract( vec3_origin, right, axis[1] )` tail -- flt_300608E8..F0 are the
-three zeroes of vec3_origin.
+CG_GetEntityOrientation
 ================
 */
 void CG_GetEntityOrientation( int entnum, vec3_t origin, vec3_t axis[3] ) {
@@ -567,19 +473,11 @@ void CG_GetEntityOrientation( int entnum, vec3_t origin, vec3_t axis[3] ) {
 
 /*
 ================
-CG_SaveState                  0x30020390
-CG_RestoreState               0x300203A0
+CG_SaveState
+CG_RestoreState
 
-The cgame halves of CL_SaveCgameState / CL_RestoreCgameState
-(client_mp/cl_cgame_mp.c 0x00404F80 / 0x00404FB0): the engine appends
-VM_Call( cgvm, 17/18, buffer + used, size - used ) to the export table it wrote
-itself and adds the returned byte count.  Retail's cgame stores nothing, so
-both are `xor eax, eax; retn` and neither touches its arguments -- the parameter
-list below comes from the engine call site, not from these bodies.
-
-Nothing in the DLL references either symbol: vmMain inlined both, which is why
-cases 17 and 18 share one `xor esi, esi` at 0x3002056E.  The out-of-line copies
-survived anyway.
+The cgame half of a client state save / restore; returns the number of
+bytes used.  The multiplayer cgame keeps nothing.
 ================
 */
 int CG_SaveState( void *buffer, int size ) {
@@ -599,79 +497,78 @@ This is the only way control passes into the module.
 */
 int vmMain( int command, int arg0, int arg1, int arg2, int arg3, int arg4, int arg5,
 			int arg6, int arg7, int arg8, int arg9, int arg10, int arg11 ) {
+	int result;
+
+	// keep: case order and single exit match original codegen
+	result = 0;
 	switch ( command ) {
-	case CG_INIT:
-		CG_Init( arg0, arg1, arg2 );
-		return 0;
-	case CG_SHUTDOWN:
-		CG_Shutdown();
-		return 0;
-	case CG_CONSOLE_COMMAND:
-		return CG_ConsoleCommand();
 	case CG_DRAW_ACTIVE_FRAME:
 		CG_DrawActiveFrame( arg0, arg1, arg2, arg3, arg4 );
-		return 0;
+		break;
+	case CG_INIT:
+		CG_Init( arg0, arg1, arg2 );
+		break;
+	case CG_SHUTDOWN:
+		CG_Shutdown();
+		break;
+	case CG_CONSOLE_COMMAND:
+		result = CG_ConsoleCommand();
+		break;
+	case CG_PROFILE_DRAW_TRAP:
+		// arg3 is the drop shadow flag
+		CG_DrawStringExt( (float)arg0, (float)arg1, (const char *)arg2, NULL,
+						  qfalse, arg3, (float)arg4, (float)arg5, arg6, qtrue );
+		break;
 	case CG_CROSSHAIR_PLAYER:
-		return CG_CrosshairPlayer();
+		result = CG_CrosshairPlayer();
+		break;
 	case CG_KEY_EVENT:
-		return 0;
+		break;
 	case CG_CHECK_EXEC_KEY:
-		return CG_KeyInterceptEvent( arg0, arg1 );
+		result = CG_KeyInterceptEvent( arg0, arg1 );
+		break;
 	case CG_MOUSE_EVENT:
 		cgDC.cursorx = cgs.cursorX;
 		cgDC.cursory = cgs.cursorY;
-		return 0;
+		break;
 	case CG_EVENT_HANDLING:
-		return 0;
+		break;
 	case 9:
-		return cgs.gameModels[arg0];
+		result = cgs.gameModels[arg0];
+		break;
 	case 10:
-		/* ( owner, dobj, partBits ): 0x300204C0 pushes arg0 and leaves arg1 in
-		   edi / arg2 in eax, and the callee's three traps take edi as the DObj
-		   and eax as the bitset.  The renderer agrees -- tr_xanim.c passes
-		   refEntity+0x94, which is RE_OWNER. */
-		CG_DObjCalcPose( (centity_t *)arg0, arg1, (int *)arg2 );
-		return 0;
+		CG_DObjCalcPose( (centity_t *)arg0, (DObj *)arg1, (int *)arg2 );
+		break;
 	case 11:
 		CG_DObjCalcBoneGeneric( arg0, arg1 );
-		return 0;
+		break;
 	case 12:
 		CG_GetDObjOrientation( arg0, (float *)arg1, (vec3_t *)arg2 );
-		return 0;
+		break;
 	case 13:
-		/* arg1 reaches the callee in ecx and arg2 in edx (0x30020506), which
-		   is the same (entnum, origin, axis) order case 12 uses -- the two
-		   differ only in which register carries which. */
 		CG_GetEntityOrientation( arg0, (float *)arg1, (vec3_t *)arg2 );
-		return 0;
+		break;
 	case 14:
-		/* raw pass-through -- 0x3002051D..0x30020548 pushes the dwords
-		   unchanged, so the six slots CG_ImpactMark reads as floats are
-		   reinterpreted in place; IntAsFloat is an out-of-line call under
-		   /Ob1 and retail does not call it here. */
+		// float args arrive as raw bit patterns
 		CG_ImpactMark( arg0, (const float *)arg1, (const float *)arg2, *(float *)&arg3,
 					   *(float *)&arg4, *(float *)&arg5, *(float *)&arg6,
 					   *(float *)&arg7, arg8, *(float *)&arg9, arg10, arg11 );
-		return 0;
-	case CG_PROFILE_DRAW_TRAP:
-		/* arg3 is SHADOW: 0x30020448 pushes a literal 0 into the setColor slot
-		   and leaves arg3 in eax; the callee never touches eax until
-		   0x300196C7, where `neg eax / sbb eax,eax / and eax,3` -- eax ? 3 : 0
-		   -- becomes trap_R_Text_Paint's last argument, which is the drop
-		   shadow.  edx = virtualScreen and ecx = setColor. */
-		CG_DrawStringExt( (float)arg0, (float)arg1, (const char *)arg2, NULL,
-						  qfalse, arg3, (float)arg4, (float)arg5, arg6, qtrue );
-		return 0;
+		break;
 	case CG_SCRIPT_HOOK:
-		return (int)Scr_FarHook( (const void *)arg0 );
+		result = (int)Scr_FarHook( (const void *)arg0 );
+		break;
 	case 17:
+		result = CG_SaveState( (void *)arg0, arg1 );
+		break;
 	case 18:
-		return 0;
+		result = CG_RestoreState( (void *)arg0, arg1 );
+		break;
 	default:
 		CG_Error( "vmMain: unknown command %i", command );
+		result = -1;
 		break;
 	}
-	return -1;
+	return result;
 }
 
 /*
@@ -688,7 +585,7 @@ void CG_RegisterCvars( void ) {
 		trap_Cvar_Register( cv->vmCvar, cv->cvarName, cv->defaultString, cv->cvarFlags );
 	}
 
-	/* see if we are also running the server on this machine */
+	// see if we are also running the server on this machine
 	trap_Cvar_VariableStringBuffer( "sv_running", var, sizeof( var ) );
 	cgs.localServer = atoi( var );
 
@@ -757,8 +654,7 @@ void CG_BoldGameMessage( const char *msg ) {
 ===============
 CG_DreathMessage
 
-The retail spelling of the name, and dead code in 1.1 -- nothing in the module
-calls it.
+(sic) -- the original spelling
 ===============
 */
 void CG_DreathMessage( const char *attacker, const float *attackerColor, const char *victim,
@@ -767,6 +663,8 @@ void CG_DreathMessage( const char *attacker, const float *attackerColor, const c
 	trap_DeathMessage( attacker, attackerColor, victim, victimColor, icon,
 					   iconWidth, iconHeight, iconColor );
 }
+
+// this is only here so the functions in q_shared.c and bg_*.c can link (FIXME)
 
 void QDECL Com_Error( int level, const char *error, ... ) {
 	va_list argptr;
@@ -822,12 +720,10 @@ const char *CG_Argv( int arg ) {
 =================
 CG_RegisterSurfaceTypeSounds
 
-One alias per surface type, "<baseName>_<surfaceName>".  The argument order is
-INFERRED: both parameters arrive in registers (ebx/edi at 0x30020980), so the
-binary does not fix it.
+One alias per surface type, "<baseName>_<surfaceName>".
 =================
 */
-static void CG_RegisterSurfaceTypeSounds( sfxHandle_t *table, const char *baseName ) {
+static void CG_RegisterSurfaceTypeSounds( const char *baseName, sfxHandle_t *table ) {
 	int i;
 	char name[256];
 
@@ -845,12 +741,8 @@ called during a precache command
 =================
 */
 static void CG_RegisterSounds( void ) {
-	int size;
-
-	size = trap_MemoryRemaining();
-	CG_ParseVoiceChats( "mp/axis_chat.voice", &voiceChatLists[0], MAX_VOICECHATS );
-	CG_ParseVoiceChats( "mp/allies_chat.voice", &voiceChatLists[1], MAX_VOICECHATS );
-	CG_Printf( "voice chat memory size = %d\n", size - trap_MemoryRemaining() );
+	// voice commands
+	CG_LoadVoiceChats();
 
 	cgs.media.announceGermanTwoMinutes = trap_Com_SoundAliasString( "mp_announce_g_twominutes" );
 	cgs.media.announceAlliedTwoMinutes = trap_Com_SoundAliasString( "mp_announce_a_twominutes" );
@@ -877,18 +769,16 @@ static void CG_RegisterSounds( void ) {
 	cgs.media.flameCrackSound = trap_Com_SoundAliasString( "flame_crack_sound" );
 	cgs.media.playerBoneBounce = trap_Com_SoundAliasString( "player_bone_bounce" );
 
-	/* The ten 23-entry surface tables live in cgMedia_t's unknown_0x2F8 hole
-	   (92-byte stride, cgs+0x9CDC..).  Table 3 (cgs+0x9DF0) is registered
-	   somewhere else -- CG_RegisterSounds skips it. */
-	CG_RegisterSurfaceTypeSounds( (sfxHandle_t *)&cgs.media.unknown_0x2F8[0 * 92], "grenade_bounce" );
-	CG_RegisterSurfaceTypeSounds( (sfxHandle_t *)&cgs.media.unknown_0x2F8[1 * 92], "grenade_explode" );
-	CG_RegisterSurfaceTypeSounds( (sfxHandle_t *)&cgs.media.unknown_0x2F8[2 * 92], "rocket_explode" );
-	CG_RegisterSurfaceTypeSounds( (sfxHandle_t *)&cgs.media.unknown_0x2F8[4 * 92], "bullet_small" );
-	CG_RegisterSurfaceTypeSounds( (sfxHandle_t *)&cgs.media.unknown_0x2F8[5 * 92], "bullet_large" );
-	CG_RegisterSurfaceTypeSounds( (sfxHandle_t *)&cgs.media.unknown_0x2F8[6 * 92], "step_run" );
-	CG_RegisterSurfaceTypeSounds( (sfxHandle_t *)&cgs.media.unknown_0x2F8[7 * 92], "step_walk" );
-	CG_RegisterSurfaceTypeSounds( (sfxHandle_t *)&cgs.media.unknown_0x2F8[8 * 92], "step_prone" );
-	CG_RegisterSurfaceTypeSounds( (sfxHandle_t *)&cgs.media.unknown_0x2F8[9 * 92], "land" );
+	// molotovExplodeSounds is never registered
+	CG_RegisterSurfaceTypeSounds( "grenade_bounce", cgs.media.grenadeBounceSounds );
+	CG_RegisterSurfaceTypeSounds( "grenade_explode", cgs.media.grenadeExplodeSounds );
+	CG_RegisterSurfaceTypeSounds( "rocket_explode", cgs.media.rocketExplodeSounds );
+	CG_RegisterSurfaceTypeSounds( "bullet_small", cgs.media.bulletSmallSounds );
+	CG_RegisterSurfaceTypeSounds( "bullet_large", cgs.media.bulletLargeSounds );
+	CG_RegisterSurfaceTypeSounds( "step_run", cgs.media.footstepRunSounds );
+	CG_RegisterSurfaceTypeSounds( "step_walk", cgs.media.footstepWalkSounds );
+	CG_RegisterSurfaceTypeSounds( "step_prone", cgs.media.footstepProneSounds );
+	CG_RegisterSurfaceTypeSounds( "land", cgs.media.landingSounds );
 
 	cgs.media.gearRattleRun = trap_Com_SoundAliasString( "gear_rattle_run" );
 	cgs.media.gearRattleWalk = trap_Com_SoundAliasString( "gear_rattle_walk" );
@@ -911,9 +801,6 @@ This function may execute for a couple of minutes with a slow disk.
 */
 static void CG_RegisterGraphics( void ) {
 	int i;
-	char name[10];
-	vec3_t mins, maxs;
-	int j;
 	const char *modelName;
 	const char *fxName;
 	const char *shellShockName;
@@ -932,9 +819,10 @@ static void CG_RegisterGraphics( void ) {
 	};
 
 	Com_Printf( "^5---------- Fx System Initialization ---------\n" );
-	trap_syscall_0xE7();
+	trap_FX_Init();
 	Com_Printf( "^5----- Fx System Initialization Complete -----\n" );
 
+	// precache status bar pics
 	CG_LoadingString( " - textures" );
 
 	for ( i = 0 ; i < 11 ; i++ ) {
@@ -946,7 +834,7 @@ static void CG_RegisterGraphics( void ) {
 	cgs.media.headiconDisconnected = trap_R_RegisterShader( "headiconDisconnected", 5 );
 	cgs.media.headiconYouInKillCam = trap_R_RegisterShader( "headiconYouInKillCam", 5 );
 
-	/* precache only -- the module never keeps these handles */
+	// precache only
 	trap_R_RegisterShader( "killIconMelee", 5 );
 	trap_R_RegisterShader( "killIconSuicide", 5 );
 	trap_R_RegisterShader( "killIconFalling", 5 );
@@ -1002,27 +890,33 @@ static void CG_RegisterGraphics( void ) {
 
 	CG_RegisterItems();
 
+	// wall marks
 	cgs.media.markShadowShader = trap_R_RegisterShader( "markShadow", 4 );
 	cgs.media.wakeMarkShader = trap_R_RegisterShader( "wake", 4 );
 
 	CG_LoadingString( " - inline models" );
 
-	cgs.unknown_0x0711C = trap_CM_NumInlineModels();
-	for ( i = 1 ; i < cgs.unknown_0x0711C ; i++ ) {
+	// register the inline models
+	cgs.numInlineModels = trap_CM_NumInlineModels();
+	for ( i = 1 ; i < cgs.numInlineModels ; i++ ) {
+		char name[10];
+		vec3_t mins, maxs;
+		int j;
+
 		Com_sprintf( name, sizeof( name ), "*%i", i );
 		cgs.inlineDrawModel[i] = trap_R_RegisterModel( name, 7 );
 		trap_R_ModelBounds( cgs.inlineDrawModel[i], mins, maxs );
 		for ( j = 0 ; j < 3 ; j++ ) {
-			/* cgs+0x7920: the inline-model midpoint table inside unknown_0x07520 */
-			( (vec3_t *)&cgs.unknown_0x07520[0x400] )[i][j] =
+			cgs.inlineModelMidpoints[i][j] =
 				mins[j] + 0.5 * ( maxs[j] - mins[j] );
 		}
 	}
 
 	CG_LoadingString( " - server models" );
 
+	// register all the server specified models
 	for ( i = 1 ; i < MAX_MODELS ; i++ ) {
-		modelName = CG_ConfigString( 268 + i );      /* CS_MODELS */
+		modelName = CG_ConfigString( 268 + i );      // CS_MODELS
 		if ( !modelName[0] ) {
 			break;
 		}
@@ -1030,15 +924,15 @@ static void CG_RegisterGraphics( void ) {
 	}
 
 	for ( i = 1 ; i < MAX_FX ; i++ ) {
-		fxName = CG_ConfigString( 780 + i );         /* CS_FX */
+		fxName = CG_ConfigString( 780 + i );         // CS_FX
 		if ( !fxName[0] ) {
 			break;
 		}
-		cgs.gameEffects[i] = trap_syscall_0xDE( fxName );
+		cgs.gameEffects[i] = trap_FX_RegisterEffect( fxName );
 	}
 
 	for ( i = 1 ; i < MAX_SHELLSHOCK_PARMS ; i++ ) {
-		shellShockName = CG_ConfigString( 1100 + i );    /* CS_SHELLSHOCKS */
+		shellShockName = CG_ConfigString( 1100 + i );    // CS_SHELLSHOCKS
 		if ( !shellShockName[0] ) {
 			break;
 		}
@@ -1050,9 +944,8 @@ static void CG_RegisterGraphics( void ) {
 
 	CG_RegisterImpactEffects();
 
-	/* cgs+0xA42C, inside cgMedia_t's unknown_0x70C hole */
-	*(int *)&cgs.media.unknown_0x70C[0x33C] =
-		trap_syscall_0xDE( "fx/impacts/flesh_hit_noblood.efx" );
+	cgs.media.fleshHitNoBloodEffect =
+		trap_FX_RegisterEffect( "fx/impacts/flesh_hit_noblood.efx" );
 
 	CG_LoadingString( " - game media done" );
 }
@@ -1079,7 +972,7 @@ void CG_StartAmbient( void ) {
 	const char *alias;
 	int t;
 
-	info = CG_ConfigString( 3 );                     /* CS_AMBIENT */
+	info = CG_ConfigString( 3 );                     // CS_AMBIENT
 	alias = trap_Com_PickSoundAlias( Info_ValueForKey( info, "n" ) );
 
 	t = atoi( Info_ValueForKey( info, "t" ) ) - cg.time;
@@ -1087,7 +980,7 @@ void CG_StartAmbient( void ) {
 		t = 0;
 	}
 
-	trap_syscall_0xD6( (int)alias, t );
+	trap_MSS_PlayAmbientAlias( alias, t );
 }
 
 void CG_PlayClientSoundAliasByName( const char *name ) {
@@ -1103,17 +996,11 @@ void CG_PlayEntitySoundAliasByName( int entnum, const char *name ) {
 CG_PlaySoundAliasByName
 
 Returns the length of the sound in milliseconds, and posts the alias' subtitle
-if it has one.  The engine's sound-alias record is not typed here: cgame only
-ever reaches its +0x08 member, which is the subtitle reference.
-
-`name` arrives in eax (0x30021BF5), so the binary only fixes the relative
-order of entnum and origin.  The binary loads eax from the msec at both exits,
-so the return is an int.
+if it has one.
 ================
 */
 int CG_PlaySoundAliasByName( const char *name, int entnum, const vec3_t origin ) {
 	const char *alias;
-	const char *subtitle;
 	int msec;
 
 	alias = trap_Com_PickSoundAlias( name );
@@ -1123,11 +1010,9 @@ int CG_PlaySoundAliasByName( const char *name, int entnum, const vec3_t origin )
 
 	msec = trap_MSS_PlaySoundAlias( alias, entnum, origin, 0 );
 
-	subtitle = ( (const char **)alias )[2];
-	if ( msec && subtitle ) {
-		/* MAX with Q_ftol evaluated twice: retail inlines the first (0x30021C38)
-		   and calls the out-of-line copy at 0x3000CAC0 for the second. */
-		trap_Subtitle( subtitle, Q_ftol( cg_subtitleMinTime.value * 1000 ) > msec
+	// the third member of a sound alias is its subtitle
+	if ( msec && ( (const char **)alias )[2] ) {
+		trap_Subtitle( ( (const char **)alias )[2], Q_ftol( cg_subtitleMinTime.value * 1000 ) > msec
 					   ? Q_ftol( cg_subtitleMinTime.value * 1000 ) : msec,
 					   cg_subtitleWidth.integer );
 	}
@@ -1135,13 +1020,14 @@ int CG_PlaySoundAliasByName( const char *name, int entnum, const vec3_t origin )
 	return msec;
 }
 
+//
+// ==============================
+// new hud stuff ( mission pack )
+// ==============================
+//
 /*
 =================
 CG_Asset_Parse
-
-`loadMode` is the value the sole caller chain passes down from CG_LoadHudMenu
-(5); it is the second argument of every shader/font registration below.  The
-spelling is UO's, not a recovered one.
 =================
 */
 static qboolean CG_Asset_Parse( int handle, int loadMode ) {
@@ -1164,7 +1050,7 @@ static qboolean CG_Asset_Parse( int handle, int loadMode ) {
 			return qtrue;
 		}
 
-		/* font */
+		// font
 		if ( Q_stricmp( token.string, "font" ) == 0 ) {
 			int pointSize;
 			if ( !PC_String_Parse( handle, &tempStr ) || !PC_Int_Parse( handle, &pointSize ) ) {
@@ -1174,7 +1060,7 @@ static qboolean CG_Asset_Parse( int handle, int loadMode ) {
 			continue;
 		}
 
-		/* smallFont */
+		// smallFont
 		if ( Q_stricmp( token.string, "smallFont" ) == 0 ) {
 			int pointSize;
 			if ( !PC_String_Parse( handle, &tempStr ) || !PC_Int_Parse( handle, &pointSize ) ) {
@@ -1184,7 +1070,7 @@ static qboolean CG_Asset_Parse( int handle, int loadMode ) {
 			continue;
 		}
 
-		/* bigfont */
+		// bigfont
 		if ( Q_stricmp( token.string, "bigfont" ) == 0 ) {
 			int pointSize;
 			if ( !PC_String_Parse( handle, &tempStr ) || !PC_Int_Parse( handle, &pointSize ) ) {
@@ -1194,7 +1080,7 @@ static qboolean CG_Asset_Parse( int handle, int loadMode ) {
 			continue;
 		}
 
-		/* extrabigfont */
+		// extrabigfont
 		if ( Q_stricmp( token.string, "extrabigfont" ) == 0 ) {
 			int pointSize;
 			if ( !PC_String_Parse( handle, &tempStr ) || !PC_Int_Parse( handle, &pointSize ) ) {
@@ -1204,7 +1090,7 @@ static qboolean CG_Asset_Parse( int handle, int loadMode ) {
 			continue;
 		}
 
-		/* boldFont */
+		// boldFont
 		if ( Q_stricmp( token.string, "boldFont" ) == 0 ) {
 			int pointSize;
 			if ( !PC_String_Parse( handle, &tempStr ) || !PC_Int_Parse( handle, &pointSize ) ) {
@@ -1214,7 +1100,7 @@ static qboolean CG_Asset_Parse( int handle, int loadMode ) {
 			continue;
 		}
 
-		/* consoleFont */
+		// consoleFont
 		if ( Q_stricmp( token.string, "consoleFont" ) == 0 ) {
 			int pointSize;
 			if ( !PC_String_Parse( handle, &tempStr ) || !PC_Int_Parse( handle, &pointSize ) ) {
@@ -1224,7 +1110,7 @@ static qboolean CG_Asset_Parse( int handle, int loadMode ) {
 			continue;
 		}
 
-		/* gradientbar */
+		// gradientbar
 		if ( Q_stricmp( token.string, "gradientbar" ) == 0 ) {
 			if ( !PC_String_Parse( handle, &tempStr ) ) {
 				return qfalse;
@@ -1233,7 +1119,7 @@ static qboolean CG_Asset_Parse( int handle, int loadMode ) {
 			continue;
 		}
 
-		/* enterMenuSound */
+		// enterMenuSound
 		if ( Q_stricmp( token.string, "menuEnterSound" ) == 0 ) {
 			if ( !PC_String_Parse( handle, &tempStr ) ) {
 				return qfalse;
@@ -1242,7 +1128,7 @@ static qboolean CG_Asset_Parse( int handle, int loadMode ) {
 			continue;
 		}
 
-		/* exitMenuSound */
+		// exitMenuSound
 		if ( Q_stricmp( token.string, "menuExitSound" ) == 0 ) {
 			if ( !PC_String_Parse( handle, &tempStr ) ) {
 				return qfalse;
@@ -1251,7 +1137,7 @@ static qboolean CG_Asset_Parse( int handle, int loadMode ) {
 			continue;
 		}
 
-		/* itemFocusSound */
+		// itemFocusSound
 		if ( Q_stricmp( token.string, "itemFocusSound" ) == 0 ) {
 			if ( !PC_String_Parse( handle, &tempStr ) ) {
 				return qfalse;
@@ -1260,7 +1146,7 @@ static qboolean CG_Asset_Parse( int handle, int loadMode ) {
 			continue;
 		}
 
-		/* menuBuzzSound */
+		// menuBuzzSound
 		if ( Q_stricmp( token.string, "menuBuzzSound" ) == 0 ) {
 			if ( !PC_String_Parse( handle, &tempStr ) ) {
 				return qfalse;
@@ -1364,7 +1250,7 @@ void CG_ParseMenu( const char *menuFile, int loadMode ) {
 		}
 
 		if ( Q_stricmp( token.string, "menudef" ) == 0 ) {
-			/* start a new menu */
+			// start a new menu
 			Menu_New( handle, loadMode );
 		}
 	}
@@ -1404,7 +1290,6 @@ qboolean CG_Load_Menu( char **p, int loadMode ) {
 	}
 }
 
-/* 4096; the fixed buffer CG_LoadMenus reads the hud file into (0x30094B20). */
 #define MAX_MENUDEFFILE     4096
 
 /*
@@ -1437,7 +1322,7 @@ void CG_LoadMenus( const char *menuFile, int loadMode ) {
 	}
 
 	trap_FS_Read( fileText, len, f );
-	fileText[len] = 0;
+	*( fileText + len ) = 0;    // keep: pointer store, matches original codegen
 	trap_FS_FCloseFile( f );
 
 	Com_Compress( fileText );
@@ -1475,19 +1360,19 @@ static int CG_FeederCount( float feederID ) {
 	int i, count;
 
 	count = 0;
-	if ( feederID == 5 ) {                  /* FEEDER_REDTEAM_LIST */
+	if ( feederID == 5 ) {                  // FEEDER_REDTEAM_LIST
 		for ( i = 0 ; i < cg.numScores ; i++ ) {
 			if ( cg.scores[i].team == 1 ) {
 				count++;
 			}
 		}
-	} else if ( feederID == 6 ) {            /* FEEDER_BLUETEAM_LIST */
+	} else if ( feederID == 6 ) {            // FEEDER_BLUETEAM_LIST
 		for ( i = 0 ; i < cg.numScores ; i++ ) {
 			if ( cg.scores[i].team == 2 ) {
 				count++;
 			}
 		}
-	} else if ( feederID == 11 ) {           /* FEEDER_SCOREBOARD */
+	} else if ( feederID == 11 ) {           // FEEDER_SCOREBOARD
 		return cg.numScores;
 	}
 
@@ -1520,10 +1405,7 @@ static int CG_OwnerDrawWidth( int ownerDraw, int font, float scale ) {
 	case 39:
 		return trap_R_Text_Width( cgs.gametype, font, scale, 0 );
 	case 50:
-		s = "";
-		if ( cg.killerName[0] ) {
-			s = va( "Fragged by %s", cg.killerName );
-		}
+		s = CG_GetKillerText();
 		return trap_R_Text_Width( s, font, scale, 0 );
 	}
 	return 0;
@@ -1550,11 +1432,11 @@ static void CG_RunCinematicFrame( int handle ) {
 ================
 CG_SafeTranslateString_Internal
 
-The argument order is INFERRED (both parameters arrive in registers, eax/ecx at
-0x30022842); `domain` is the one that prints first in the warning.
+Localizes a string reference, flagging it as unlocalized when it has
+no translation and cl_languagewarnings is set.
 ================
 */
-const char *CG_SafeTranslateString_Internal( const char *domain, const char *reference ) {
+const char *CG_SafeTranslateString_Internal( const char *reference, const char *domain ) {
 	static char translated[MAX_STRING_CHARS];
 	const char *localized;
 
@@ -1580,7 +1462,7 @@ const char *CG_SafeTranslateString_Internal( const char *domain, const char *ref
 }
 
 const char *CG_SafeTranslateString( const char *reference ) {
-	return CG_SafeTranslateString_Internal( "cgame", reference );
+	return CG_SafeTranslateString_Internal( reference, "cgame" );
 }
 
 const char *CG_TranslateMessage( const char *src, const char *reference );
@@ -1589,7 +1471,7 @@ const char *CG_SafeTranslateHudElemString( int index ) {
 	if ( !index ) {
 		return "";
 	}
-	/* CS_HUDELEM_STRINGS */
+	// CS_HUDELEM_STRINGS
 	return CG_TranslateMessage( CG_ConfigString( index + 1244 ), "hudelem string" );
 }
 
@@ -1608,36 +1490,44 @@ const char *CG_TranslateMessage( const char *src, const char *reference ) {
 	const char *s;
 	const char *start, *end;
 	char *keyName;
-	char *out;
+	char *p;
 	int i, keyLen;
+	char c, n;
 
 	s = trap_SE_LocalizeMessage( src, reference );
 
-	for ( i = 0 ; s[i] ; i++ ) {
-		if ( !s[i + 1] || !s[i + 2] || !s[i + 3] || !s[i + 4] ) {
-			return s;
-		}
-		if ( s[i] == '[' && s[i + 1] == '{' ) {
+	start = NULL;
+	i = 0;
+	c = s[0];
+	while ( c ) {
+		n = s[i + 1];
+		if ( !n || !s[i + 2] || !s[i + 3] || !s[i + 4] ) {
 			break;
 		}
+		if ( c == '[' && n == '{' ) {
+			start = &s[i];
+			break;
+		}
+		c = s[++i];
 	}
-	if ( !s[i] ) {
+	if ( !start ) {
 		return s;
 	}
-	start = &s[i];
 
+	end = NULL;
 	for ( ; s[i] ; i++ ) {
-		if ( !s[i + 1] ) {
-			return s;
+		// keep: redundant test matches original codegen
+		if ( !s[i] || !s[i + 1] ) {
+			break;
 		}
 		if ( s[i] == '}' && s[i + 1] == ']' ) {
+			end = &s[i];
 			break;
 		}
 	}
-	if ( !s[i] ) {
+	if ( !end ) {
 		return s;
 	}
-	end = &s[i];
 
 	Q_strncpyz( command, start + 2, ( end - start ) - 1 );
 
@@ -1648,12 +1538,10 @@ const char *CG_TranslateMessage( const char *src, const char *reference ) {
 	keyLen = strlen( keyName );
 
 	index ^= 1;
-	out = buf[index];
+	p = buf[index];
 
-	if ( *end ) {
-		while ( s[i] ) {
-			i++;
-		}
+	while ( s[i] ) {
+		i++;
 	}
 
 	if ( keyLen + i - ( end - start ) >= MAX_STRING_CHARS ) {
@@ -1661,12 +1549,13 @@ const char *CG_TranslateMessage( const char *src, const char *reference ) {
 		return s;
 	}
 
-	Q_strncpyz( out, s, ( start - s ) + 2 );
-	Q_strncpyz( out + ( start - s ) + 1, keyName, keyLen + 1 );
-	Q_strncpyz( out + ( start - s ) + 1 + keyLen, end + 1,
-				MAX_STRING_CHARS - ( ( start - s ) + 1 + keyLen ) );
+	Q_strncpyz( p, s, start - s + 2 );
+	p += start - s + 1;
+	Q_strncpyz( p, keyName, keyLen + 1 );
+	p += keyLen;
+	Q_strncpyz( p, end + 1, sizeof( buf[index] ) - ( p - buf[index] ) );
 
-	return out;
+	return buf[index];
 }
 
 /*
@@ -1677,8 +1566,6 @@ CG_LoadHudMenu
 static void CG_LoadHudMenu( void ) {
 	char buff[MAX_STRING_CHARS];
 	const char *hudSet;
-
-	trap_Cvar_Set( "cg_hudFiles", "ui_mp/hud.txt" );
 
 	cgDC.registerShaderNoMip = &trap_R_RegisterShaderNoMip;
 	cgDC.setColor = &trap_R_SetColor;
@@ -1699,8 +1586,6 @@ static void CG_LoadHudMenu( void ) {
 	cgDC.clearScene = &trap_R_ClearScene;
 	cgDC.addRefEntityToScene = &trap_R_AddRefEntityToScene;
 	cgDC.renderScene = &trap_R_RenderScene;
-	/* cg_syscalls_mp.c types trap_R_RegisterFont's third argument int; here it
-	   is the fontInfo_t CG_Asset_Parse fills in */
 	cgDC.registerFont = ( int ( * )( const char *, int, fontInfo_t *, int ) )&trap_R_RegisterFont;
 	cgDC.ownerDrawItem = &CG_OwnerDraw;
 	cgDC.getValue = &CG_GetValue;
@@ -1718,9 +1603,6 @@ static void CG_LoadHudMenu( void ) {
 	cgDC.feederItemImage = &CG_FeederItemImage;
 	cgDC.feederItemText = &CG_FeederItemText;
 	cgDC.feederSelection = &CG_FeederSelection;
-	/* +0xB4/+0xB0/+0xAC in store order (0x30022D2E..0x30022D42).  Nothing
-	   assigns trap_MSS_GetSoundOverlay (218) -- the three slots take traps
-	   220, 219 and 221. */
 	cgDC.setBinding = &trap_Key_SetBinding;
 	cgDC.getBindingBuf = &trap_Key_GetBindingBuf;
 	cgDC.keynumToStringBuf = &trap_Key_KeynumToStringBuf;
@@ -1736,6 +1618,8 @@ static void CG_LoadHudMenu( void ) {
 	Init_Display( &cgDC );
 
 	Menu_Reset();
+
+	trap_Cvar_Set( "cg_hudFiles", "ui_mp/hud.txt" ); // we need to hardwire for wolfMP
 
 	trap_Cvar_VariableStringBuffer( "cg_hudFiles", buff, sizeof( buff ) );
 	hudSet = buff;
@@ -1767,8 +1651,7 @@ static void CG_AssetCache( void ) {
 =================
 CG_InitVote
 
-0x30022F10 -- the compiler laid it down as a tail chunk of CG_Init rather than
-a function of its own.  CG_Init's last act is a tail jump into it (0x300233E2).
+Picks up a vote already in progress.
 =================
 */
 static void CG_InitVote( void ) {
@@ -1784,7 +1667,7 @@ static void CG_InitVote( void ) {
 =================
 CG_Init
 
-Called after every level change or subsystem restart.
+Called after every level change or subsystem restart
 Will perform callbacks to make the loading info screen update.
 =================
 */
@@ -1792,28 +1675,18 @@ void CG_Init( int serverMessageNum, int serverCommandSequence, int clientNum ) {
 	const char *s;
 	int i;
 
-	/* clear everything */
+	// clear everything
 	memset( &cgs, 0, sizeof( cgs ) );
 	memset( &cg, 0, sizeof( cg ) );
 	memset( cg_entities, 0, sizeof( cg_entities ) );
 	memset( cg_weapons, 0, sizeof( cg_weapons ) );
 	memset( cg_items, 0, sizeof( cg_items ) );
 
-	/* retail: one rep stosd over 0x300F0520..0x3019CE0C (0x30022FDB), exactly
-	   the G_InitGame clear the game DLL does over its own copy */
-	memset( &bgs_animScriptData, 0, sizeof( bgs_animScriptData ) );
-	bgs_animTree = NULL;
-	memset( &bgs_rootAnim, 0, sizeof( bgs_rootAnim ) );
-	memset( &bgs_torsoAnim, 0, sizeof( bgs_torsoAnim ) );
-	memset( &bgs_legsAnim, 0, sizeof( bgs_legsAnim ) );
-	memset( &bgs_turningAnim, 0, sizeof( bgs_turningAnim ) );
-	memset( bg_clientinfo, 0, sizeof( bg_clientinfo ) );
+	memset( &bgs, 0, sizeof( bgs ) );
 
-	bgs_time = 0;
-	bgs_animTime = 0;
-	bgs_frametime = 0;
+	memset( &bg, 0, sizeof( bg ) );
 
-	/* RF, init the anim scripting */
+	// RF, init the anim scripting
 	bgs_animScriptData.soundIndex = trap_Com_SoundAliasString;
 	bgs_animScriptData.playSound = CG_PlayEntitySoundAliasByName;
 
@@ -1822,34 +1695,35 @@ void CG_Init( int serverMessageNum, int serverCommandSequence, int clientNum ) {
 	cgs.processedSnapshotNum = serverMessageNum;
 	cgs.serverCommandSequence = serverCommandSequence;
 
+	// load a few needed things before we do any screen updates
 	cgs.media.whiteShader = trap_R_RegisterShader( "white", 5 );
 	cgs.media.hudSoftLineShader = trap_R_RegisterShader( "hudSoftLine", 5 );
 	cgs.media.hudSoftLineHShader = trap_R_RegisterShader( "hudSoftLineH", 5 );
 
-	/* load a few needed things before we do any screen updates */
 	CG_RegisterCvars();
 
 	CG_InitConsoleCommands();
 
+	// get the rendering configuration from the client system
 	trap_GetGlconfig( &cgs.glconfig );
-	cgs.screenXScale = cgs.glconfig.vidWidth * ( 1.0 / 640.0 );
-	cgs.screenYScale = cgs.glconfig.vidHeight * ( 1.0 / 480.0 );
+	cgs.screenXScale = cgs.glconfig.vidWidth * ( 1.0f / 640.0f );
+	cgs.screenYScale = cgs.glconfig.vidHeight * ( 1.0f / 480.0f );
 
-	/* get the rendering configuration from the client system */
+	// get the gamestate from the client system
 	trap_GetGameState( &cgs.gameState );
 
-	/* check version */
-	s = CG_ConfigString( 2 );                /* CS_GAME_VERSION */
+	// check version
+	s = CG_ConfigString( 2 );                // CS_GAME_VERSION
 	if ( strcmp( s, "cod" ) ) {
 		CG_Error( "Client/Server game mismatch: %s/%s", "cod", s );
 	}
 
-	s = CG_ConfigString( 13 );               /* CS_LEVEL_START_TIME */
+	s = CG_ConfigString( 13 );               // CS_LEVEL_START_TIME
 	cgs.levelStartTime = atoi( s );
 
-	/* cgs+0x0A438 is a float, not the int cg_local.h declares (0x300230FB) */
+	// pick a direction for smoke drift on the client
 	i = rand();
-	*(float *)&cgs.unknown_0x0A438 = 2.0f * ( i * ( 1.0f / 32768.0f ) ) - 1.0f;
+	cgs.smokeWindDir = 2.0f * ( i * ( 1.0f / 32768.0f ) ) - 1.0f;
 
 	CG_ParseServerinfo();
 	CG_ParseWolfinfo();
@@ -1857,6 +1731,7 @@ void CG_Init( int serverMessageNum, int serverCommandSequence, int clientNum ) {
 	BG_SetupWeaponInfo();
 	CGScr_LoadAnimTrees();
 
+	// load the new map
 	CG_LoadingString( "collision map" );
 
 	trap_CM_LoadMap( cgs.mapname );
@@ -1887,23 +1762,25 @@ void CG_Init( int serverMessageNum, int serverCommandSequence, int clientNum ) {
 	CG_LoadingString( "clients" );
 
 	CG_AssetCache();
-	CG_LoadHudMenu();
+	CG_LoadHudMenu();      // load new hud stuff
 
 	CG_InitLocalEntities();
 	CG_InitMarkPolys();
 
-	/* remove the last loading update */
+	// remove the last loading update
 	cg.infoScreenText[0] = 0;
 
+	// Make sure we have update values (scores)
 	CG_SetConfigValues();
 
 	CG_LoadingString( "" );
 
-	cg.compassNorthYaw = atof( CG_ConfigString( 11 ) );  /* CS_COMPASS_NORTHYAW */
+	s = CG_ConfigString( 11 );               // CS_COMPASS_NORTHYAW
+	cg.compassNorthYaw = atof( s );
 
 	trap_R_FinishLoadingModels();
 
-	trap_syscall_0xD3( 0 );
+	trap_MSS_StopSounds( 0 );
 
 	CG_StartAmbient();
 
@@ -1914,16 +1791,16 @@ void CG_Init( int serverMessageNum, int serverCommandSequence, int clientNum ) {
 =================
 CG_Shutdown
 
-Called before every level change or subsystem restart.
+Called before every level change or subsystem restart
 =================
 */
 void CG_Shutdown( void ) {
-	trap_syscall_0x6B( 0 );
-	trap_syscall_0xD7( 1.0f, 0 );
+	trap_R_TrackStatistics( NULL );
+	trap_MSS_FadeAllSounds( 1.0f, 0 );
 
 	CG_FreeWeapons();
 	CG_FreeClientDObjInfo();
 	CG_FreeEntityDObjInfo();
 
-	trap_syscall_0xC8( 0 );
+	trap_FreeWeaponInfoMemory( 0 );
 }

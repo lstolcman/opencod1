@@ -3,9 +3,8 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "cl_vm.h"
+#include "cl_local.h"
 
 extern void NET_SendPacket( netsrc_t sock, int length, const void *data,
 							netadr_t to );
@@ -17,9 +16,8 @@ extern void Netchan_Transmit( netchan_t *chan, int length, const byte *data );
 extern void Netchan_TransmitNextFragment( netchan_t *chan );
 
 /* qcommon/net_chan_mp.c, 0x015F7060 -- the CLIENT's out-of-band profile block. The server's counterpart is svs.pOOBProf. */
-extern netProfileInfo_t *pProf;
 
-#define clc_netchan             ( *(netchan_t *)chan )
+#define clc_netchan             clc.netchan
 
 #define MAX_RELIABLE_COMMANDS   64
 #define MAX_STRING_CHARS_CMD    1024
@@ -38,15 +36,15 @@ void CL_Netchan_Encode( byte *data, int length ) {
 	string = &clc_serverCommands[ MAX_STRING_CHARS_CMD *
 								  ( clc_serverCommandSequence & ( MAX_RELIABLE_COMMANDS - 1 ) ) ];
 	index = 0;
-	key = (byte) ( clc_serverMessageSequence ^ cl_serverId ^ clc_challenge[0] );
+	key = (byte) ( *(int*)clc_challenge ^ cl_serverId ^ clc_serverMessageSequence );
 
-	for ( i = 0; i < length; i++ ) {
+	for ( i = 0; i < length; i++, data++ ) {
 		if ( !string[index] ) {
 			index = 0;
 		}
 		key ^= (byte) ( string[index] << ( i & 1 ) );
 		index++;
-		data[i] ^= key;
+		*data ^= key;
 	}
 }
 
@@ -60,15 +58,15 @@ void CL_Netchan_Decode( byte *data, int length ) {
 	string = &clc_reliableCommands[ MAX_STRING_CHARS_CMD *
 							( clc_reliableAcknowledge & ( MAX_RELIABLE_COMMANDS - 1 ) ) ];
 	index = 0;
-	key = (byte) ( clc_serverMessageSequence ^ clc_challenge[0] );
+	key = (byte) ( *(int*)clc_challenge ^ clc_serverMessageSequence );
 
-	for ( i = 0; i < length; i++ ) {
+	for ( i = 0; i < length; i++, data++ ) {
 		if ( !string[index] ) {
 			index = 0;
 		}
 		key ^= (byte) ( string[index] << ( i & 1 ) );
 		index++;
-		data[i] ^= key;
+		*data ^= key;
 	}
 }
 
@@ -89,8 +87,8 @@ void CL_Netchan_AddOOBProfilePacket( int iSize ) {
 		return;
 	}
 
-	NetProf_PrepProfiling( &pProf );
-	NetProf_AddPacket( (netProfileStream_t *)pProf, iSize, 0 );
+	NetProf_PrepProfiling( &clc.pProf );
+	NetProf_AddPacket( (netProfileStream_t *)clc.pProf, iSize, 0 );
 }
 
 /* ---- CL_Netchan_SendOOBPacket  0x00414840 ----  VERIFIED */
@@ -99,12 +97,12 @@ void CL_Netchan_SendOOBPacket( int length, const void *data, netadr_t to ) {
 		Com_Printf( "CL_Netchan_SendOOBPacket used to send non-OOB packet.\n" );
 	}
 
-	NetProf_PrepProfiling( &pProf );
+	NetProf_PrepProfiling( &clc.pProf );
 	NET_SendPacket( NS_CLIENT, length, data, to );
 
 	if ( net_profile->integer ) {
-		NetProf_PrepProfiling( &pProf );
-		NetProf_AddPacket( (netProfileStream_t *)pProf, length, 0 );
+		NetProf_PrepProfiling( &clc.pProf );
+		NetProf_AddPacket( (netProfileStream_t *)clc.pProf, length, 0 );
 	}
 }
 
@@ -115,9 +113,9 @@ void CL_Netchan_UpdateProfileStats( void ) {
 		NetProf_UpdateStatistics( &clc_netchan.pProf->receive );
 	}
 
-	if ( pProf ) {
-		NetProf_UpdateStatistics( &pProf->send );
-		NetProf_UpdateStatistics( &pProf->receive );
+	if ( clc.pProf ) {
+		NetProf_UpdateStatistics( &clc.pProf->send );
+		NetProf_UpdateStatistics( &clc.pProf->receive );
 	}
 }
 
@@ -146,24 +144,22 @@ void CL_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 
 	if ( bPrintToConsole ) {
 		Com_Printf( "\n\n" );
-	} else {
-		y = 90;
 	}
 
 	Com_sprintf( line, PROFILE_LINE_SIZE, "====================" );
 	if ( bPrintToConsole ) {
 		Com_Printf( "%s\n", line );
 	} else {
-		CL_ProfDraw( y, line );
 		y += 10;
+		CL_ProfDraw( y, line );
 	}
 
 	Com_sprintf( line, PROFILE_LINE_SIZE, "Client Network Profile:" );
 	if ( bPrintToConsole ) {
 		Com_Printf( "%s\n\n", line );
 	} else {
-		CL_ProfDraw( y, line );
 		y += 10;
+		CL_ProfDraw( y, line );
 		y += 10;
 	}
 
@@ -172,12 +168,12 @@ void CL_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 	if ( bPrintToConsole ) {
 		Com_Printf( "%s\n", line );
 	} else {
-		CL_ProfDraw( y, line );
 		y += 10;
+		CL_ProfDraw( y, line );
 	}
 
-	oob = pProf;
-	if ( oob ) {
+	if ( clc.pProf ) {
+		oob = clc.pProf;
 		sendBps = oob->send.iBytesPerSecond;
 		recvBps = oob->receive.iBytesPerSecond;
 
@@ -188,8 +184,8 @@ void CL_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 		if ( bPrintToConsole ) {
 			Com_Printf( "%s\n", line );
 		} else {
-			CL_ProfDraw( y, line );
 			y += 10;
+			CL_ProfDraw( y, line );
 		}
 
 		Com_sprintf( line, PROFILE_LINE_SIZE, "OOB Recieved: %5i %5i %5i    -",
@@ -199,8 +195,8 @@ void CL_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 		if ( bPrintToConsole ) {
 			Com_Printf( "%s\n", line );
 		} else {
-			CL_ProfDraw( y, line );
 			y += 10;
+			CL_ProfDraw( y, line );
 		}
 	} else {
 		Com_sprintf( line, PROFILE_LINE_SIZE,
@@ -208,8 +204,8 @@ void CL_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 		if ( bPrintToConsole ) {
 			Com_Printf( "%s\n", line );
 		} else {
-			CL_ProfDraw( y, line );
 			y += 10;
+			CL_ProfDraw( y, line );
 		}
 
 		Com_sprintf( line, PROFILE_LINE_SIZE,
@@ -217,13 +213,13 @@ void CL_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 		if ( bPrintToConsole ) {
 			Com_Printf( "%s\n", line );
 		} else {
-			CL_ProfDraw( y, line );
 			y += 10;
+			CL_ProfDraw( y, line );
 		}
 	}
 
-	prof = clc_netchan.pProf;
-	if ( prof ) {
+	if ( clc_netchan.pProf ) {
+		prof = clc_netchan.pProf;
 		sendBps += prof->send.iBytesPerSecond;
 		recvBps += prof->receive.iBytesPerSecond;
 
@@ -236,8 +232,8 @@ void CL_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 		if ( bPrintToConsole ) {
 			Com_Printf( "%s\n", line );
 		} else {
-			CL_ProfDraw( y, line );
 			y += 10;
+			CL_ProfDraw( y, line );
 		}
 
 		Com_sprintf( line, PROFILE_LINE_SIZE,
@@ -249,8 +245,8 @@ void CL_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 		if ( bPrintToConsole ) {
 			Com_Printf( "%s\n", line );
 		} else {
-			CL_ProfDraw( y, line );
 			y += 10;
+			CL_ProfDraw( y, line );
 		}
 	} else {
 		Com_sprintf( line, PROFILE_LINE_SIZE,
@@ -258,8 +254,8 @@ void CL_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 		if ( bPrintToConsole ) {
 			Com_Printf( "%s\n", line );
 		} else {
-			CL_ProfDraw( y, line );
 			y += 10;
+			CL_ProfDraw( y, line );
 		}
 
 		Com_sprintf( line, PROFILE_LINE_SIZE,
@@ -267,8 +263,8 @@ void CL_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 		if ( bPrintToConsole ) {
 			Com_Printf( "%s\n", line );
 		} else {
-			CL_ProfDraw( y, line );
 			y += 10;
+			CL_ProfDraw( y, line );
 		}
 	}
 
@@ -277,6 +273,7 @@ void CL_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 	if ( bPrintToConsole ) {
 		Com_Printf( "%s\n", line );
 	} else {
+		y += 10;
 		CL_ProfDraw( y, line );
 	}
 }

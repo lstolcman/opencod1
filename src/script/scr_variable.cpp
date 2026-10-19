@@ -9,16 +9,19 @@
  * @fidelity: likely
  */
 
-#include "scr_local.h"
-#include "../qcommon/hexrays_shim.h"
+#ifdef __cplusplus
+/* retail built this unit as C++ with exceptions (/TP /GX); every name keeps C linkage */
+extern "C" {
+#endif
 
-#define FindNextSibling     cod1_globals_FindNextSibling_data
-#define FindObject          cod1_globals_FindObject_data
-#define dword_976468        cod1_globals_scalar_decl_976468
-#include "../qcommon/cod1_globals.h"
-#undef FindNextSibling
-#undef FindObject
-#undef dword_976468
+#include "scr_local.h"
+
+/* the save-state cursors and id maps */
+unsigned short  *scrSave_idToSaveId;    /* 0x0097645C */
+unsigned short  *scrSave_saveIdToId;    /* 0x0097646C */
+char            *scrSave_readPos;       /* 0x00976470 */
+void Hunk_FreeTempMemory( void *buf );   /* universal/com_memory.c */
+unsigned short  scrSave_numSaveObjects; /* 0x00976458 */
 
 extern void  Com_Meminfo_f( void );
 extern char **FS_ListFilteredFiles( const char *path, const char *extension,
@@ -33,7 +36,7 @@ extern void  qsort_m( void *base, unsigned int count, unsigned int width,
 
 extern int Hunk_ReallocateTempMemory();
 
-extern unsigned short scrVarPub_gameId;
+extern ScriptArrayRootStorage scrVarPub_gameId;
 
 extern unsigned short scrVarPub_pauseArrayId;
 
@@ -58,6 +61,7 @@ unsigned short   ReadId( void );
 void             AddSaveObject( unsigned short id );
 void             DoLoadEntryInternal( VariableValue *value );
 void             DoSaveEntryInternal( unsigned char type, VariableUnion u );
+void             AddSaveEntry( unsigned char type, VariableUnion u );
 
 void            AddSaveStack( const struct VariableStackBuffer_s *buf );
 float           Scr_GetObjectUsage( unsigned short id );
@@ -71,15 +75,27 @@ VariableValueInternal   scrVarNodes[VARIABLELIST_SIZE];
 
 unsigned short          scrVarPub_tempVariable;
 
-unsigned short          scrVarPub_classId;
-unsigned short          scrVarPub_entId;
+/* retail 0x0140735C / 0x01407360: halfwords inside one struct, so VC7 may read them as dwords */
+struct {
+	unsigned short      classId;
+	unsigned short      pad0;
+	unsigned short      entId;
+	unsigned short      pad1;
+} scrVarPub_ids;
+#define scrVarPub_classId   scrVarPub_ids.classId
+#define scrVarPub_entId     scrVarPub_ids.entId
 
 scrClassMapEntry_t     *scrVarPub_classMap;
 unsigned int            scrVarPub_classNum;
 
 int                     scrVarPub_error_index;
 
-char                   *scrVarPub_fieldBuffer;
+char                   *scrVarPub_fieldBuffer;  /* 0x00976468 */
+int scrVarPub_programBuffer;   /* 0x01407380 */
+int scrVarPub_endScriptBuffer;   /* 0x01407384 */
+int scrVarPub_developer;   /* 0x008E60D0 */
+int scrVarPub_developerScript;   /* 0x008E60C4 */
+int scrVarPub_canonicalStrCountAndLoadFlags;   /* 0x008E60BC */
 
 /* retail 0x005757C8 */
 const char * const var_typename[VAR_TYPE_COUNT] = {
@@ -104,14 +120,14 @@ const char * const var_typename[VAR_TYPE_COUNT] = {
 	"dead object"
 };
 
-#define VAR_REFCOUNT( n )   ( (n)->u.halfword[0] )
-#define VAR_OBJECTID( n )   ( (n)->u.halfword[0] )
-#define VAR_PREVFREE( n )   ( (n)->u.halfword[0] )
-#define VAR_KVENTNUM( n )   ( (n)->u.halfword[0] )
-#define VAR_SELF( n )       ( (n)->u.halfword[1] )
-#define VAR_ENTNUM( n )     ( (n)->u.halfword[1] )
-#define VAR_ARRAYSIZE( n )  ( (n)->u.halfword[1] )
-#define VAR_KVOFFSET( n )   ( (n)->u.halfword[1] )
+#define VAR_REFCOUNT( n )   ( (n)->u.halfword.lo )
+#define VAR_OBJECTID( n )   ( (n)->u.halfword.lo )
+#define VAR_PREVFREE( n )   ( (n)->u.halfword.lo )
+#define VAR_KVENTNUM( n )   ( (n)->u.halfword.lo )
+#define VAR_SELF( n )       ( (n)->u.halfword.hi )
+#define VAR_ENTNUM( n )     ( (n)->u.halfword.hi )
+#define VAR_ARRAYSIZE( n )  ( (n)->u.halfword.hi )
+#define VAR_KVOFFSET( n )   ( (n)->u.halfword.hi )
 
 #define VAR_NODEINDEX( n )  ( (unsigned short)( (n) - scrVarNodes ) )
 #define VAR_HANDLEINDEX( s )( (unsigned short)( (s) - scrVarIndirections ) )
@@ -144,11 +160,15 @@ int __cdecl ThreadInfoCompare( const void *a, const void *b ) {
 	int i;
 
 	for ( i = 0; i < ta->callStackCount; i++ ) {
+		const char *left;
+		const char *right;
 		if ( i >= tb->callStackCount ) {
 			break;
 		}
-		if ( ta->callStack[i] != tb->callStack[i] ) {
-			return (int)( ta->callStack[i] - tb->callStack[i] );
+		left = ta->callStack[i];
+		right = tb->callStack[i];
+		if ( left != right ) {
+			return (int)( left - right );
 		}
 	}
 	return ta->callStackCount - tb->callStackCount;
@@ -157,20 +177,23 @@ int __cdecl ThreadInfoCompare( const void *a, const void *b ) {
 /* ---- Scr_DumpScriptThreads  0x00470580 ---- VERIFIED */
 void Scr_DumpScriptThreads( void ) {
 	scrThreadInfo_t            *threadInfo;
-	scrThreadInfo_t            *info;
+	scrThreadInfo_t            *nextInfo;
+	scrThreadInfo_t            *pInfo;
+	scrThreadInfo_t             info;
 	VariableValueInternal      *node;
-	const VariableStackBuffer  *buf;
-	const char                 *entry;
-	const char                 *callStack[32];
-	int                         callStackCount;
+	const VariableStackBuffer  *stackBuf;
+	const unsigned char        *buf;
+	const char                 *pos;
+	unsigned char               type;
+	const char                 *codePos;
+	int                         size;
 	int                         numThreads;
 	int                         count;
 	int                         t;
 	int                         j;
 	unsigned int                i;
-	unsigned short              classRoot;
 	unsigned short              child;
-	float                       varUsage;
+	float                       threadVarUsage;
 	float                       endonUsage;
 
 	threadInfo = (scrThreadInfo_t *)malloc( sizeof( scrThreadInfo_t ) * VARIABLELIST_SIZE );
@@ -180,31 +203,36 @@ void Scr_DumpScriptThreads( void ) {
 	Com_Memset( threadInfo, 0, sizeof( scrThreadInfo_t ) * VARIABLELIST_SIZE );
 
 	numThreads = 0;
-	info = threadInfo;
+	nextInfo = threadInfo;
 	for ( i = 1; i < VARIABLELIST_SIZE; i++ ) {
 		node = &scrVarNodes[i];
 		if ( VAR_STAT( node ) == VAR_STAT_FREE || VAR_TYPE( node ) != VAR_STACK ) {
 			continue;
 		}
-		buf = (const VariableStackBuffer *)node->u.pointerValue;
+		stackBuf = (const VariableStackBuffer *)node->u.pointerValue;
+		pos = stackBuf->codePos;
 		numThreads++;
+		size = stackBuf->size;
+		pInfo = nextInfo++;
 
-		callStackCount = 0;
-		entry = (const char *)buf + SCR_STACKBUFFER_HEADER;
-		for ( j = buf->size; j != 0; j-- ) {
-			if ( *entry == VAR_CODEPOS ) {
-				callStack[callStackCount++] = ( (const VariableUnion *)( entry + 1 ) )->codePosValue;
+		info.callStackCount = 0;
+		buf = (const unsigned char *)stackBuf + SCR_STACKBUFFER_HEADER;
+		while ( size ) {
+			size--;
+			type = *buf++;
+			codePos = *(const char * const *)buf;
+			buf += sizeof( VariableUnion );
+			if ( type == VAR_CODEPOS ) {
+				info.callStack[info.callStackCount++] = codePos;
 			}
-			entry += SCR_STACKENTRY_SIZE;
 		}
-		callStack[callStackCount++] = buf->codePos;
+		info.callStack[info.callStackCount++] = pos;
 
-		info->varUsage       = Scr_GetThreadUsage( buf, &info->endonUsage );
-		info->callStackCount = callStackCount;
-		for ( j = 0; j < info->callStackCount; j++ ) {
-			info->callStack[j] = callStack[callStackCount - 1 - j];
+		pInfo->varUsage       = Scr_GetThreadUsage( stackBuf, &pInfo->endonUsage );
+		pInfo->callStackCount = info.callStackCount--;
+		for ( j = 0; j < pInfo->callStackCount; j++ ) {
+			pInfo->callStack[j] = info.callStack[info.callStackCount - j];
 		}
-		info++;
 	}
 
 	qsort_m( threadInfo, numThreads, sizeof( scrThreadInfo_t ), ThreadInfoCompare );
@@ -212,23 +240,26 @@ void Scr_DumpScriptThreads( void ) {
 	Com_Printf( "********************************\n" );
 	t = 0;
 	while ( t < numThreads ) {
-		info       = &threadInfo[t];
-		varUsage   = 0;
-		endonUsage = 0;
-		count      = 0;
+		/* 0x004706F4..0x00470740: both group sums live in st0/st1 for the
+		   whole do-while (fadd dword, no fstp, kept across ThreadInfoCompare)
+		   and go straight to __ftol2, retaining extended precision while live. */
+		pInfo          = &threadInfo[t];
+		threadVarUsage = 0;
+		endonUsage     = 0;
+		count          = 0;
 		do {
 			count++;
-			varUsage   += threadInfo[t].varUsage;
-			endonUsage += threadInfo[t].endonUsage;
+			threadVarUsage += threadInfo[t].varUsage;
+			endonUsage     += threadInfo[t].endonUsage;
 			t++;
-		} while ( t < numThreads && !ThreadInfoCompare( info, &threadInfo[t] ) );
+		} while ( t < numThreads && !ThreadInfoCompare( pInfo, &threadInfo[t] ) );
 
 		Com_Printf( "count: %d, var usage: %d, endon usage: %d\n",
-					count, (int)varUsage, (int)endonUsage );
-		Scr_PrintPrevCodePos( info->callStack[0], 0 );
-		for ( j = 1; j < info->callStackCount; j++ ) {
+					count, (int)threadVarUsage, (int)endonUsage );
+		Scr_PrintPrevCodePos( pInfo->callStack[0], 0 );
+		for ( j = 1; j < pInfo->callStackCount; j++ ) {
 			Com_Printf( "called from:\n" );
-			Scr_PrintPrevCodePos( info->callStack[j], 0 );
+			Scr_PrintPrevCodePos( pInfo->callStack[j], 0 );
 		}
 	}
 	free( threadInfo );
@@ -238,18 +269,15 @@ void Scr_DumpScriptThreads( void ) {
 		if ( !FindVariable( scrVarPub_entId, i ) ) {
 			continue;
 		}
-		varUsage = 0;
+		info.varUsage = 0;
 		count    = 0;
-		classRoot = VAR_OBJECTID( &scrVarNodes[
-			scrVarIndirections[ FindVariableIndexInternal( scrVarPub_entId, i ) ].id ] );
-		for ( child = scrVarIndirections[ scrVarNodes[classRoot].nextSibling ].id;
-		      VAR_TYPE( &scrVarNodes[child] ) < VAR_THREAD && child != 0;
-		      child = scrVarIndirections[ scrVarNodes[child].nextSibling ].id ) {
+		for ( child = FindNextSibling( FindObject( FindVariable( scrVarPub_entId, i ) ) ); child;
+		      child = FindNextSibling( child ) ) {
 			count++;
-			varUsage += Scr_GetObjectUsage( VAR_OBJECTID( &scrVarNodes[child] ) );
+			info.varUsage += Scr_GetObjectUsage( FindObject( child ) );
 		}
 		Com_Printf( "ent type '%s'... count: %d, var usage: %d\n",
-					scrVarPub_classMap[i].name, count, (int)varUsage );
+					scrVarPub_classMap[i].name, count, (int)info.varUsage );
 	}
 	Com_Printf( "********************************\n" );
 }
@@ -293,6 +321,7 @@ int Scr_GetNumScriptVars( void ) {
 /* ---- AllocVariable  0x004713F0 ---- VERIFIED */
 VariableValueInternal *AllocVariable( void ) {
 	unsigned short          freeHandle;
+	Variable               *entry;
 	VariableValueInternal  *node;
 
 	freeHandle = scrVarNodes[0].hashNext;
@@ -300,14 +329,15 @@ VariableValueInternal *AllocVariable( void ) {
 		Scr_TerminalError( "exceeded maximum number of script variables" );
 	}
 
-	node = &scrVarNodes[ scrVarIndirections[freeHandle].id ];
+	entry = &scrVarIndirections[freeHandle];
+	node = &scrVarNodes[ entry->id ];
 
 	scrVarNodes[0].hashNext = node->hashNext;
 	VAR_PREVFREE( &scrVarNodes[ scrVarIndirections[ scrVarNodes[0].hashNext ].id ] ) = 0;
 
 	node->hashNext    = freeHandle;
 	node->nextSibling = freeHandle;
-	scrVarIndirections[freeHandle].prevSibling = freeHandle;
+	entry->prevSibling = freeHandle;
 
 	return node;
 }
@@ -316,8 +346,8 @@ VariableValueInternal *AllocVariable( void ) {
 void FreeVariable( unsigned short id ) {
 	VariableValueInternal  *node = &scrVarNodes[id];
 	unsigned short          handle = node->hashNext;
-	unsigned short          next   = node->nextSibling;
 	unsigned short          prev   = scrVarIndirections[handle].prevSibling;
+	unsigned short          next   = node->nextSibling;
 
 	scrVarIndirections[next].prevSibling = prev;
 	scrVarNodes[ scrVarIndirections[prev].id ].nextSibling = next;
@@ -366,8 +396,10 @@ unsigned short AllocEntity( int classnum, unsigned short entnum ) {
 	return VAR_NODEINDEX( node );
 }
 
-/* ---- AllocThread  0x004715C0 ---- VERIFIED */
-unsigned short AllocThread( unsigned short self ) {
+/* ---- AllocThread  0x004715C0 ---- VERIFIED
+   Retail inlines this into VM_Execute (self read before AllocVariable); VC7 only
+   does so here with __forceinline. The out-of-line copy is unchanged. */
+__forceinline unsigned short AllocThread( unsigned short self ) {
 	VariableValueInternal *node = AllocVariable();
 
 	node->status = VAR_PACKED_THREAD;
@@ -383,20 +415,23 @@ void AddRefToObject( unsigned short id ) {
 
 /* ---- RemoveRefToObject  0x004716B0 ---- VERIFIED */
 void RemoveRefToObject( unsigned short id ) {
-	if ( VAR_REFCOUNT( &scrVarNodes[id] ) == 0 ) {
-		ClearObject( id );
-		FreeVariable( id );
+	/* through a pointer: ClearObject's inlined AddRef stays an inc word, as in retail */
+	VariableValueInternal *entry = &scrVarNodes[id];
+
+	if ( VAR_REFCOUNT( entry ) ) {
+		VAR_REFCOUNT( entry )--;
 		return;
 	}
-	VAR_REFCOUNT( &scrVarNodes[id] )--;
+	ClearObject( id );
+	FreeVariable( id );
 }
 
 /* ---- AllocVector  0x00471700 ---- VERIFIED */
 float *AllocVector( void ) {
-	unsigned short *refCount = (unsigned short *)MT_Alloc( SCR_VECTOR_ALLOC_SIZE, 2 );
+	float *v = (float *)( (unsigned short *)MT_Alloc( SCR_VECTOR_ALLOC_SIZE, 2 ) + 1 );
 
-	*refCount = 0;
-	return (float *)( refCount + 1 );
+	( (unsigned short *)v )[-1] = 0;
+	return v;
 }
 
 /* ---- AllocVector  0x00471720 ---- VERIFIED */
@@ -412,52 +447,44 @@ VariableUnion AllocVectorValue( const float *v ) {
 }
 
 /* ---- AddRefToVector  0x00471750 ---- VERIFIED */
+extern const char *scrMemTree_constBase;
+extern int scrMemTree_constLen;
 void AddRefToVector( const float *v ) {
+	if ( (unsigned int)((const char *)v - scrMemTree_constBase) < (unsigned int)scrMemTree_constLen ) return;
 	( (unsigned short *)v )[-1]++;
 }
 
 /* ---- RemoveRefToVector  0x00471770 ---- VERIFIED */
 void RemoveRefToVector( const float *v ) {
-	unsigned short *refCount = (unsigned short *)v - 1;
-
-	if ( *refCount == 0 ) {
-		MT_Free( refCount, SCR_VECTOR_ALLOC_SIZE );
+	unsigned short refCount;
+	if ( (unsigned int)((const char *)v - scrMemTree_constBase) < (unsigned int)scrMemTree_constLen ) return;
+	refCount = ((unsigned short *)v)[-1];
+	if ( refCount ) {
+		((unsigned short *)v)[-1] = refCount - 1;
 		return;
 	}
-	( *refCount )--;
+	MT_Free( (unsigned short *)v - 1, SCR_VECTOR_ALLOC_SIZE );
 }
 
 /* ---- AddRefToValue  0x004717B0 ---- VERIFIED */
 void AddRefToValue( int type, VariableUnion u ) {
-	if ( type == VAR_VECTOR ) {
-		AddRefToVector( u.vectorValue );
-		return;
-	}
-	if ( type < VAR_FLOAT ) {
-		if ( type > VAR_UNDEFINED ) {
-			SL_AddRefToString( u.stringValue );
-		}
-		return;
-	}
-	if ( type == VAR_OBJECT ) {
-		AddRefToObject( u.halfword[0] );
+	switch ( type ) {
+	case VAR_OBJECT: AddRefToObject( u.halfword.lo ); break;
+	case VAR_STRING:
+	case VAR_ISTRING: SL_AddRefToString( u.stringValue ); break;
+	case VAR_VECTOR: AddRefToVector( u.vectorValue ); break;
+	default: break;
 	}
 }
 
 /* ---- RemoveRefToValue  0x00471820 ---- VERIFIED */
 void RemoveRefToValue( int type, VariableUnion u ) {
-	if ( type == VAR_VECTOR ) {
-		RemoveRefToVector( u.vectorValue );
-		return;
-	}
-	if ( type < VAR_FLOAT ) {
-		if ( type > VAR_UNDEFINED ) {
-			SL_RemoveRefToString( u.stringValue );
-		}
-		return;
-	}
-	if ( type == VAR_OBJECT ) {
-		RemoveRefToObject( u.halfword[0] );
+	switch ( type ) {
+	case VAR_OBJECT: RemoveRefToObject( u.halfword.lo ); break;
+	case VAR_STRING:
+	case VAR_ISTRING: SL_RemoveRefToString( u.stringValue ); break;
+	case VAR_VECTOR: RemoveRefToVector( u.vectorValue ); break;
+	default: break;
 	}
 }
 
@@ -474,7 +501,7 @@ void FreeValue( unsigned short id ) {
 
 /* ---- IsValidArrayIndex  0x00471870 ---- VERIFIED */
 qboolean IsValidArrayIndex( unsigned int index ) {
-	return ( index + 0x7E0000u ) < 0xFE0000u ? qtrue : qfalse;
+	return 0xFDFFFFu >= ( index + 0x7E0000u ) ? qtrue : qfalse;
 }
 
 /* ---- GetInternalVariableIndex  0x00471880 ---- VERIFIED */
@@ -503,108 +530,121 @@ unsigned short FindVariableIndexInternal( unsigned short parentId, unsigned int 
 
 	link = node->hashNext;
 	slot = &scrVarIndirections[link];
+	node = &scrVarNodes[ slot->id ];
 	while ( slot != bucketSlot ) {
-		node = &scrVarNodes[ slot->id ];
 		if ( VAR_NAME( node ) == name ) {
 			return link;
 		}
 		link = node->hashNext;
 		slot = &scrVarIndirections[link];
+		node = &scrVarNodes[ slot->id ];
 	}
 	return 0;
 }
 
 /* ---- GetVariableIndexInternal  0x00470AE0 ---- VERIFIED */
 unsigned short GetVariableIndexInternal( unsigned short parentId, unsigned int name ) {
-	unsigned short          bucket = Var_HashBucket( parentId, name );
-	Variable               *bucketSlot = &scrVarIndirections[bucket];
-	VariableValueInternal  *node = &scrVarNodes[ bucketSlot->id ];
-	VariableValueInternal  *parentNode;
-	unsigned short          childHandle = bucket;
-	unsigned short          firstChild;
-	qboolean                becomesHead = qtrue;
-	unsigned int            stat = VAR_STAT( node );
+	unsigned short          index;
+	unsigned short          newIndex;
+	unsigned short          link;
+	unsigned short          id;
+	Variable               *entry;
+	Variable               *newEntry;
+	Variable               *walkEntry;
+	VariableValueInternal  *entryValue;
+	VariableValueInternal  *newEntryValue;
+	VariableValueInternal  *walkValue;
+	VariableValueInternal  *parentValue;
+	unsigned short          prevFree;
+	unsigned short          nextFree;
+	unsigned short          nextSibling;
 
-	if ( stat == VAR_STAT_HEAD ) {
-		unsigned short          link;
-		Variable               *slot;
-		VariableValueInternal  *chained;
+	/* Mac 1.3 shape: the free-list pop is written out here (no AllocVariable call) */
+	index      = Var_HashBucket( parentId, name );
+	entry      = &scrVarIndirections[index];
+	entryValue = &scrVarNodes[entry->id];
 
-		if ( VAR_NAME( node ) == name ) {
-			return bucket;
+	if ( VAR_STAT( entryValue ) == VAR_STAT_HEAD ) {
+		if ( VAR_NAME( entryValue ) == name ) {
+			return index;
 		}
 
-		link = node->hashNext;
-		slot = &scrVarIndirections[link];
-		while ( slot != bucketSlot ) {
-			VariableValueInternal *walk = &scrVarNodes[ slot->id ];
-
-			if ( VAR_NAME( walk ) == name ) {
+		link      = entryValue->hashNext;
+		walkEntry = &scrVarIndirections[link];
+		walkValue = &scrVarNodes[walkEntry->id];
+		while ( walkEntry != entry ) {
+			if ( VAR_NAME( walkValue ) == name ) {
 				return link;
 			}
-			link = walk->hashNext;
-			slot = &scrVarIndirections[link];
+			link      = walkValue->hashNext;
+			walkEntry = &scrVarIndirections[link];
+			walkValue = &scrVarNodes[walkEntry->id];
 		}
 
-		chained = AllocVariable();
-		childHandle = chained->hashNext;
-		chained->status   = VAR_STAT_CHAINED;
-		chained->hashNext = scrVarNodes[ bucketSlot->id ].hashNext;
-		scrVarNodes[ bucketSlot->id ].hashNext = childHandle;
-		bucketSlot = &scrVarIndirections[childHandle];
-		node = chained;
-		becomesHead = qfalse;
-	} else if ( stat == VAR_STAT_FREE ) {
-		unsigned short prevFree = VAR_PREVFREE( node );
-		unsigned short nextFree = node->hashNext;
-
-		scrVarNodes[ scrVarIndirections[prevFree].id ].hashNext = nextFree;
-		VAR_PREVFREE( &scrVarNodes[ scrVarIndirections[nextFree].id ] ) = prevFree;
+		newIndex = scrVarNodes[0].hashNext;
+		if ( !newIndex ) {
+			Scr_TerminalError( "exceeded maximum number of script variables" );
+		}
+		newEntry      = &scrVarIndirections[newIndex];
+		newEntryValue = &scrVarNodes[newEntry->id];
+		scrVarNodes[0].hashNext = newEntryValue->hashNext;
+		VAR_PREVFREE( &scrVarNodes[ scrVarIndirections[ scrVarNodes[0].hashNext ].id ] ) = 0;
+		newEntryValue->status   = VAR_STAT_CHAINED;
+		newEntryValue->hashNext = entryValue->hashNext;
+		entryValue->hashNext    = newIndex;
 	} else {
-		VariableValueInternal  *newNode = AllocVariable();
-		unsigned short          newHandle  = newNode->hashNext;
-		unsigned short          newIndex   = VAR_NODEINDEX( newNode );
-		unsigned short          oldIndex   = bucketSlot->id;
-		unsigned short          oldPrev    = bucketSlot->prevSibling;
-		unsigned short          oldNext    = node->nextSibling;
-
-		scrVarNodes[ scrVarIndirections[oldPrev].id ].nextSibling = newHandle;
-		scrVarIndirections[oldNext].prevSibling = newHandle;
-
-		if ( stat == VAR_STAT_CHAINED ) {
-			unsigned short walk = scrVarIndirections[ node->hashNext ].id;
-
-			while ( scrVarNodes[walk].hashNext != bucket ) {
-				walk = scrVarIndirections[ scrVarNodes[walk].hashNext ].id;
-			}
-			scrVarNodes[walk].hashNext = newHandle;
+		if ( VAR_STAT( entryValue ) == VAR_STAT_FREE ) {
+			prevFree = VAR_PREVFREE( entryValue );
+			nextFree = entryValue->hashNext;
+			scrVarNodes[ scrVarIndirections[prevFree].id ].hashNext = nextFree;
+			VAR_PREVFREE( &scrVarNodes[ scrVarIndirections[nextFree].id ] ) = prevFree;
+			/* Mac 1.3 recomputes the node from the bucket slot here */
+			newEntryValue = &scrVarNodes[entry->id];
 		} else {
-			node->hashNext = newHandle;
+			newIndex = scrVarNodes[0].hashNext;
+			if ( !newIndex ) {
+				Scr_TerminalError( "exceeded maximum number of script variables" );
+			}
+			newEntry      = &scrVarIndirections[newIndex];
+			newEntryValue = &scrVarNodes[newEntry->id];
+			scrVarNodes[0].hashNext = newEntryValue->hashNext;
+			VAR_PREVFREE( &scrVarNodes[ scrVarIndirections[ scrVarNodes[0].hashNext ].id ] ) = 0;
+
+			nextSibling = entryValue->nextSibling;
+			scrVarNodes[ scrVarIndirections[entry->prevSibling].id ].nextSibling = newIndex;
+			scrVarIndirections[nextSibling].prevSibling = newIndex;
+
+			if ( VAR_STAT( entryValue ) == VAR_STAT_CHAINED ) {
+				for ( id = scrVarIndirections[entryValue->hashNext].id;
+					  scrVarNodes[id].hashNext != index;
+					  id = scrVarIndirections[ scrVarNodes[id].hashNext ].id ) {
+				}
+				scrVarNodes[id].hashNext = newIndex;
+			} else {
+				entryValue->hashNext = newIndex;
+			}
+
+			newEntry->prevSibling = entry->prevSibling;
+			id           = newEntry->id;
+			newEntry->id = entry->id;
+			entry->id    = id;
 		}
-
-		scrVarIndirections[newHandle].prevSibling = bucketSlot->prevSibling;
-		scrVarIndirections[newHandle].id = oldIndex;
-		bucketSlot->id = newIndex;
-		node = newNode;
+		newIndex = index;
+		newEntryValue->status   = VAR_STAT_HEAD;
+		newEntry = entry;
+		newEntryValue->hashNext = index;
 	}
 
-	if ( becomesHead ) {
-		node->status   = VAR_STAT_HEAD;
-		node->hashNext = childHandle;
-	}
+	parentValue = &scrVarNodes[parentId];
+	nextSibling = parentValue->nextSibling;
+	newEntryValue->nextSibling = nextSibling;
+	scrVarIndirections[nextSibling].prevSibling = newIndex;
+	parentValue->nextSibling = newIndex;
+	newEntry->prevSibling = parentValue->hashNext;
+	newEntryValue->status = ( newEntryValue->status & 0xFF ) | ( name << VAR_STATUS_NAME_SHIFT );
 
-	parentNode = &scrVarNodes[parentId];
-	firstChild = parentNode->nextSibling;
-	node->nextSibling = firstChild;
-	scrVarIndirections[firstChild].prevSibling = childHandle;
-	bucketSlot->prevSibling = parentNode->hashNext;
-	parentNode->nextSibling = childHandle;
-
-	node->status  = (unsigned char)node->status;
-	node->status |= name << VAR_STATUS_NAME_SHIFT;
-
-	if ( VAR_TYPE( parentNode ) == VAR_ARRAY ) {
-		VAR_ARRAYSIZE( parentNode )++;
+	if ( VAR_TYPE( parentValue ) == VAR_ARRAY ) {
+		VAR_ARRAYSIZE( parentValue )++;
 		if ( name < VAR_NAME_OBJECT_BASE ) {
 			SL_AddRefToString( (unsigned short)name );
 		} else if ( name < VAR_NAME_OBJECT_LIMIT ) {
@@ -612,19 +652,28 @@ unsigned short GetVariableIndexInternal( unsigned short parentId, unsigned int n
 		}
 	}
 
-	return childHandle;
+	return newIndex;
 }
 
 /* ---- MakeVariableExternal  0x00470E00 ---- VERIFIED */
 void MakeVariableExternal( Variable *slot, VariableValueInternal *parentNode ) {
-	unsigned short          handle = VAR_HANDLEINDEX( slot );
-	VariableValueInternal  *node = &scrVarNodes[ slot->id ];
+	unsigned short          index = VAR_HANDLEINDEX( slot );
+	VariableValueInternal  *entryValue = &scrVarNodes[ slot->id ];
+	unsigned int            name;
+	unsigned short          newIndex;
+	Variable               *newEntry;
+	VariableValueInternal  *newEntryValue;
+	Variable               *prev;
+	Variable               *walkEntry;
+	VariableValueInternal  *walkValue;
+	Variable                tmp;
+	unsigned short          removedPrev;
+	unsigned short          removedNext;
+	unsigned short          promotedPrev;
 
 	if ( VAR_TYPE( parentNode ) == VAR_ARRAY ) {
-		unsigned int name;
-
 		VAR_ARRAYSIZE( parentNode )--;
-		name = VAR_NAME( node );
+		name = VAR_NAME( entryValue );
 		if ( name < VAR_NAME_OBJECT_BASE ) {
 			SL_RemoveRefToString( (unsigned short)name );
 		} else if ( name < VAR_NAME_OBJECT_LIMIT ) {
@@ -632,49 +681,40 @@ void MakeVariableExternal( Variable *slot, VariableValueInternal *parentNode ) {
 		}
 	}
 
-	if ( VAR_STAT( node ) == VAR_STAT_HEAD ) {
-		unsigned short  nextHandle = node->hashNext;
-		Variable       *nextSlot = &scrVarIndirections[nextHandle];
+	/* Mac 1.3 shape: both paths end in the one EXTERNAL store */
+	if ( VAR_STAT( entryValue ) == VAR_STAT_HEAD ) {
+		newIndex      = entryValue->hashNext;
+		newEntry      = &scrVarIndirections[newIndex];
+		newEntryValue = &scrVarNodes[newEntry->id];
+		if ( newEntry != slot ) {
+			newEntryValue->status = ( newEntryValue->status & ~VAR_STATUS_STAT_MASK ) | VAR_STAT_HEAD;
+			removedPrev  = slot->prevSibling;
+			removedNext  = entryValue->nextSibling;
+			promotedPrev = newEntry->prevSibling;
+			scrVarIndirections[newEntryValue->nextSibling].prevSibling = index;
+			scrVarNodes[ scrVarIndirections[promotedPrev].id ].nextSibling = index;
+			scrVarIndirections[removedNext].prevSibling = newIndex;
+			scrVarNodes[ scrVarIndirections[removedPrev].id ].nextSibling = newIndex;
 
-		if ( nextSlot != slot ) {
-			VariableValueInternal  *nextNode = &scrVarNodes[ nextSlot->id ];
-			unsigned short          removedPrev = slot->prevSibling;
-			unsigned short          removedNext = node->nextSibling;
-			unsigned short          promotedPrev = nextSlot->prevSibling;
-			Variable                tmp;
-
-			nextNode->status &= ~VAR_STATUS_STAT_MASK;
-			nextNode->status |= VAR_STAT_HEAD;
-
-			scrVarIndirections[ nextNode->nextSibling ].prevSibling = handle;
-			scrVarNodes[ scrVarIndirections[promotedPrev].id ].nextSibling = handle;
-			scrVarIndirections[removedNext].prevSibling = nextHandle;
-			scrVarNodes[ scrVarIndirections[removedPrev].id ].nextSibling = nextHandle;
-
-			tmp = *slot;
-			*slot = *nextSlot;
-			*nextSlot = tmp;
-
-			node->status  |= VAR_STAT_EXTERNAL;
-			node->hashNext = nextHandle;
-			return;
+			tmp       = *slot;
+			*slot     = *newEntry;
+			*newEntry = tmp;
+			index = newIndex;
 		}
 	} else {
-		Variable               *prevSlot = slot;
-		Variable               *walkSlot = slot;
-		VariableValueInternal  *walkNode = node;
-
+		walkEntry = slot;
+		walkValue = entryValue;
 		do {
-			prevSlot = walkSlot;
-			walkSlot = &scrVarIndirections[ walkNode->hashNext ];
-			walkNode = &scrVarNodes[ walkSlot->id ];
-		} while ( walkSlot != slot );
+			prev      = walkEntry;
+			walkEntry = &scrVarIndirections[walkValue->hashNext];
+			walkValue = &scrVarNodes[walkEntry->id];
+		} while ( walkEntry != slot );
 
-		scrVarNodes[ prevSlot->id ].hashNext = node->hashNext;
+		scrVarNodes[prev->id].hashNext = entryValue->hashNext;
 	}
 
-	node->status  |= VAR_STAT_EXTERNAL;
-	node->hashNext = handle;
+	entryValue->status = ( entryValue->status & ~VAR_STATUS_STAT_MASK ) | VAR_STAT_EXTERNAL;
+	entryValue->hashNext = index;
 }
 
 /* ---- FindArrayVariableIndex  0x00471890 ---- VERIFIED */
@@ -725,7 +765,8 @@ unsigned short GetVariableField( unsigned short parentId, unsigned short name ) 
 	VariableValueInternal  *parentNode;
 	VariableValueInternal  *tempNode;
 	unsigned short          fieldId;
-	int                     parentType;
+	unsigned int            parentType;
+	unsigned short entnum;
 
 	handle = FindVariableIndexInternal( parentId, name );
 	if ( handle ) {
@@ -735,10 +776,7 @@ unsigned short GetVariableField( unsigned short parentId, unsigned short name ) 
 	parentNode = &scrVarNodes[parentId];
 	parentType = VAR_TYPE( parentNode );
 
-	if ( parentType >= VAR_DEADTHREAD ) {
-		ClearVariableValue( scrVarPub_tempVariable );
-		return scrVarPub_tempVariable;
-	}
+	if ( parentType < VAR_DEADTHREAD ) {
 
 	if ( parentType != VAR_ENTITY ) {
 		return scrVarIndirections[ GetVariableIndexInternal( parentId, name ) ].id;
@@ -749,12 +787,16 @@ unsigned short GetVariableField( unsigned short parentId, unsigned short name ) 
 		return scrVarIndirections[ GetVariableIndexInternal( parentId, name ) ].id;
 	}
 
+	entnum = VAR_ENTNUM(parentNode);
 	ClearVariableValue( scrVarPub_tempVariable );
 	tempNode = &scrVarNodes[ scrVarPub_tempVariable ];
 	tempNode->status = ( parentNode->status & ~0xFFu ) | tempNode->status | VAR_KEYVALUE;
-	VAR_KVENTNUM( tempNode ) = VAR_ENTNUM( parentNode );
+	VAR_KVENTNUM( tempNode ) = entnum;
 	VAR_KVOFFSET( tempNode ) = VAR_ARRAYSIZE( &scrVarNodes[fieldId] );
 
+	return scrVarPub_tempVariable;
+	}
+	ClearVariableValue( scrVarPub_tempVariable );
 	return scrVarPub_tempVariable;
 }
 
@@ -768,6 +810,7 @@ void ClearVariableField( unsigned short parentId, unsigned short name ) {
 	}
 
 	parentNode = &scrVarNodes[parentId];
+	if ( (parentNode->status & VAR_STATUS_TYPE_MASK) >= VAR_DEADTHREAD ) return;
 	if ( VAR_TYPE( parentNode ) == VAR_ENTITY ) {
 		if ( FindArrayVariable( scrVarPub_classMap[ VAR_NAME( parentNode ) ].id, name ) ) {
 			Scr_Error( "cannot set entity builtin key/value to undefined" );
@@ -777,11 +820,13 @@ void ClearVariableField( unsigned short parentId, unsigned short name ) {
 
 /* ---- RemoveVariable  0x00471B80 ---- VERIFIED */
 void RemoveVariable( unsigned short parentId, unsigned int name ) {
-	unsigned short handle = FindVariableIndexInternal( parentId, name );
-	unsigned short childId = scrVarIndirections[handle].id;
+	unsigned short          handle = FindVariableIndexInternal( parentId, name );
+	/* slot->id through the pointer: VC7 then folds both into [handle*4+X] like retail */
+	Variable               *slot = &scrVarIndirections[handle];
+	VariableValueInternal  *entry = &scrVarNodes[slot->id];
 
-	MakeVariableExternal( &scrVarIndirections[handle], &scrVarNodes[parentId] );
-	FreeValueInternal( &scrVarNodes[childId] );
+	MakeVariableExternal( slot, &scrVarNodes[parentId] );
+	FreeValueInternal( entry );
 }
 
 /* ---- RemoveObjectVariable  0x00471BD0 ---- VERIFIED */
@@ -801,36 +846,38 @@ void RemoveArrayVariable( unsigned short parentId, unsigned int index ) {
 
 /* ---- SafeRemoveVariable  0x00471CD0 ---- VERIFIED */
 void SafeRemoveVariable( unsigned short parentId, unsigned int name ) {
-	unsigned short handle = FindVariableIndexInternal( parentId, name );
-	unsigned short childId;
+	unsigned short          handle = FindVariableIndexInternal( parentId, name );
+	Variable               *slot;
+	VariableValueInternal  *entry;
 
 	if ( !handle ) {
 		return;
 	}
-	childId = scrVarIndirections[handle].id;
-	MakeVariableExternal( &scrVarIndirections[handle], &scrVarNodes[parentId] );
-	FreeValueInternal( &scrVarNodes[childId] );
+	slot = &scrVarIndirections[handle];
+	entry = &scrVarNodes[slot->id];
+	MakeVariableExternal( slot, &scrVarNodes[parentId] );
+	FreeValueInternal( entry );
 }
 
 /* ---- ClearObjectInternal  0x00470F70 ---- VERIFIED */
 void ClearObjectInternal( unsigned short id ) {
 	Variable       *slot;
 	unsigned short  childId;
+	VariableValueInternal *parent = &scrVarNodes[id];
 
-	slot = &scrVarIndirections[ scrVarNodes[id].nextSibling ];
+	slot = &scrVarIndirections[ parent->nextSibling ];
 	childId = slot->id;
 	while ( childId != id ) {
-		MakeVariableExternal( slot, &scrVarNodes[id] );
+		MakeVariableExternal( slot, parent );
 		slot = &scrVarIndirections[ scrVarNodes[childId].nextSibling ];
 		childId = slot->id;
 	}
 
-	childId = scrVarIndirections[ scrVarNodes[id].nextSibling ].id;
+	childId = scrVarIndirections[ parent->nextSibling ].id;
 	while ( childId != id ) {
-		unsigned short next = scrVarIndirections[ scrVarNodes[childId].nextSibling ].id;
-
-		FreeValueInternal( &scrVarNodes[childId] );
-		childId = next;
+		VariableValueInternal *child = &scrVarNodes[childId];
+		childId = scrVarIndirections[child->nextSibling].id;
+		FreeValueInternal( child );
 	}
 }
 
@@ -855,7 +902,7 @@ void SetThreadNotifyName( unsigned short id, unsigned short name ) {
 /* ---- ClearThreadNotifyName  0x00471090 ---- VERIFIED */
 void ClearThreadNotifyName( unsigned short id ) {
 	SL_RemoveRefToString( GetThreadNotifyName( id ) );
-	scrVarNodes[id].status = (unsigned char)scrVarNodes[id].status;
+	scrVarNodes[id].status &= 0xFF;
 }
 
 /* ---- KillThread  0x00471100 ---- VERIFIED */
@@ -881,7 +928,6 @@ void KillThread( unsigned short id ) {
 			unsigned short          entry;
 			unsigned short          waiter;
 			unsigned short          handle;
-			VariableValueInternal  *entryNode;
 
 			entry = FindNextSibling( bucket );
 			if ( !entry ) {
@@ -897,11 +943,7 @@ void KillThread( unsigned short id ) {
 			scrVarNodes[waiter].status =
 				( scrVarNodes[waiter].status & ~VAR_STATUS_TYPE_MASK ) | VAR_DEADTHREAD;
 
-			handle = FindVariableIndexInternal( bucket,
-					(unsigned int)waiter + VAR_NAME_OBJECT_BASE );
-			entryNode = &scrVarNodes[ scrVarIndirections[handle].id ];
-			MakeVariableExternal( &scrVarIndirections[handle], &scrVarNodes[bucket] );
-			FreeValueInternal( entryNode );
+			RemoveVariable( bucket, (unsigned int)waiter + VAR_NAME_OBJECT_BASE );
 
 			RemoveRefToObject( id );
 		}
@@ -963,64 +1005,89 @@ void ClearVariableValue( unsigned short id ) {
 /* ---- SetVariableFieldValue  0x00471F80 ---- VERIFIED */
 void SetVariableFieldValue( unsigned short id, VariableValue *value ) {
 	VariableValueInternal *node = &scrVarNodes[id];
-
-	if ( VAR_TYPE( node ) == VAR_KEYVALUE ) {
-		SetEntityFieldValue__FUiiiP13VariableValue( VAR_NAME( node ),
-			VAR_KVENTNUM( node ), VAR_KVOFFSET( node ), value );
+	switch (node->status & VAR_STATUS_TYPE_MASK) {
+	case VAR_KEYVALUE:
+		SetEntityFieldValue__FUiiiP13VariableValue(node->status >> 8, VAR_KVENTNUM(node), VAR_KVOFFSET(node), value);
 		return;
+	case VAR_OBJECT:
+		RemoveRefToObject(VAR_OBJECTID(node));
+		break;
+	case VAR_STRING:
+	case VAR_ISTRING:
+		SL_RemoveRefToString(node->u.stringValue);
+		break;
+	case VAR_VECTOR:
+		RemoveRefToVector(node->u.vectorValue);
+		break;
 	}
-	SetVariableValue( id, value );
+	node->status &= ~VAR_STATUS_TYPE_MASK;
+	node->status |= (unsigned int)value->type;
+	node->u = value->u;
 }
 
 /* ---- GetVariableValue  0x00472020 ---- VERIFIED */
 void GetVariableValue( unsigned short id, VariableValue *value ) {
-	value->type = VAR_TYPE( &scrVarNodes[id] );
-	value->u = scrVarNodes[id].u;
+	VariableValueInternal *entry = &scrVarNodes[id];
+
+	value->type = VAR_TYPE( entry );
+	value->u = entry->u;
 }
 
 /* ---- GetVariableFieldValue  0x00472040 ---- VERIFIED */
-void GetVariableFieldValue( unsigned short id, VariableValue *value ) {
+/* id is volatile: LTCG then leaves it on the stack (callers push it, the body reads
+   [esp+4]) and passes only value in a register (edi), as retail does */
+void GetVariableFieldValue( volatile unsigned short id, VariableValue *value ) {
 	VariableValueInternal *node = &scrVarNodes[id];
-
-	if ( VAR_TYPE( node ) == VAR_KEYVALUE ) {
-		GetEntityFieldValue__FUiiiP13VariableValue( VAR_NAME( node ),
-			VAR_KVENTNUM( node ), VAR_KVOFFSET( node ), value );
-
-		if ( value->type == VAR_OBJECT
-		  && GetVarType( value->u.halfword[0] ) == VAR_ARRAY ) {
-			unsigned short source = value->u.halfword[0];
-
-			RemoveRefToObject( source );
-			value->u.halfword[0] = Scr_AllocArray();
-			CopyArray( source, value->u.halfword[0] );
+	unsigned int type = node->status & VAR_STATUS_TYPE_MASK;
+	switch(type) {
+	case VAR_KEYVALUE:
+		GetEntityFieldValue__FUiiiP13VariableValue(VAR_NAME(node), VAR_KVENTNUM(node), VAR_KVOFFSET(node), value);
+		if (value->type == VAR_OBJECT && GetVarType(value->u.halfword.lo) == VAR_ARRAY) {
+			unsigned short source = value->u.halfword.lo;
+			RemoveRefToObject(source);
+			value->u.halfword.lo = Scr_AllocArray();
+			CopyArray(source, value->u.halfword.lo);
 		}
 		return;
+	case VAR_OBJECT:
+		AddRefToObject(VAR_OBJECTID(node));
+		break;
+	case VAR_STRING:
+	case VAR_ISTRING:
+		SL_AddRefToString(node->u.stringValue);
+		break;
+	case VAR_VECTOR:
+		AddRefToVector(node->u.vectorValue);
+		break;
 	}
-
-	GetVariableValue( id, value );
-	AddRefToValue( value->type, value->u );
+	value->type = type;
+	value->u = node->u;
 }
 
 /* ---- GetSizeValue  0x00472140 ---- VERIFIED */
 void GetSizeValue( VariableValue *value ) {
 	if ( value->type == VAR_OBJECT ) {
-		unsigned short object = value->u.halfword[0];
+		unsigned short object = value->u.halfword.lo;
+		VariableValueInternal *objectNode = &scrVarNodes[object];
+		int size;
 
 		value->type = VAR_INTEGER;
-		if ( GetVarType( object ) == VAR_ARRAY ) {
-			value->u.intValue = VAR_ARRAYSIZE( &scrVarNodes[object] );
+		if ( VAR_TYPE(objectNode) == VAR_ARRAY ) {
+			size = VAR_ARRAYSIZE(objectNode);
 		} else {
-			value->u.intValue = 1;
+			size = 1;
 		}
+		value->u.intValue = size;
 		RemoveRefToObject( object );
 		return;
 	}
 
 	if ( value->type == VAR_STRING ) {
 		unsigned short  handle = value->u.stringValue;
-		const char     *text = SL_ConvertToString( handle );
+		const char     *text;
 
 		value->type = VAR_INTEGER;
+		text = SL_ConvertToString( handle );
 		value->u.intValue = (int)strlen( text );
 		SL_RemoveRefToString( handle );
 		return;
@@ -1030,15 +1097,23 @@ void GetSizeValue( VariableValue *value ) {
 }
 
 /* ---- GetArraySize  0x004721F0 ---- VERIFIED */
-unsigned short GetArraySize( unsigned short id ) {
+unsigned int GetArraySize( unsigned short id ) {
 	return VAR_ARRAYSIZE( &scrVarNodes[id] );
 }
 
 /* ---- FindNextSibling  0x00472200 ---- VERIFIED */
 unsigned short FindNextSibling( unsigned short id ) {
-	unsigned short next = scrVarIndirections[ scrVarNodes[id].nextSibling ].id;
+	unsigned short nextSibling = scrVarNodes[id].nextSibling;
 
-	return VAR_TYPE( &scrVarNodes[next] ) < VAR_THREAD ? next : 0;
+	/* Only the sibling slot is a local; the handle is read through the
+	   indirection twice. That is what lets the inlined copies (KillThread,
+	   CopyEntity, VM_TerminateNotifyList, ...) allocate it like retail. */
+	if ( ( scrVarNodes[ scrVarIndirections[nextSibling].id ].status
+			& VAR_STATUS_TYPE_MASK ) < VAR_THREAD ) {
+		return scrVarIndirections[nextSibling].id;
+	}
+	return 0;
+
 }
 
 /* ---- GetVariableName  0x00472230 ---- VERIFIED */
@@ -1048,12 +1123,15 @@ unsigned int GetVariableName( unsigned short id ) {
 
 /* ---- GetVariableKeyObject  0x004709F0 ---- VERIFIED */
 unsigned short GetVariableKeyObject( unsigned short id ) {
-	return (unsigned short)VAR_NAME( &scrVarNodes[id] );
+	return (unsigned short)( VAR_NAME( &scrVarNodes[id] ) - VAR_NAME_OBJECT_BASE );
 }
 
 /* ---- GetEntityType  0x00470A10 ---- VERIFIED */
 unsigned int GetEntityType( unsigned short id ) {
-	return VAR_NAME( &scrVarNodes[id] );
+	/* the named node pointer keeps Scr_GetEntityNum's second status load (retail 0x0047D95B) */
+	VariableValueInternal *entityValue = &scrVarNodes[id];
+
+	return VAR_NAME( entityValue );
 }
 
 /* ---- GetSelf  0x00471600 ---- VERIFIED */
@@ -1062,7 +1140,7 @@ unsigned short GetSelf( unsigned short id ) {
 }
 
 /* ---- GetEntnum  0x00473580 ---- VERIFIED */
-unsigned short GetEntnum( unsigned short id ) {
+unsigned int GetEntnum( unsigned short id ) {
 	return VAR_ENTNUM( &scrVarNodes[id] );
 }
 
@@ -1095,7 +1173,8 @@ unsigned short FindObject( unsigned short id ) {
 
 /* ---- IsFieldObject  0x00472310 ---- VERIFIED */
 qboolean IsFieldObject( unsigned short id ) {
-	return VAR_TYPE( &scrVarNodes[id] ) < VAR_ARRAY ? qtrue : qfalse;
+	/* unsigned compare (sbb/neg), not VAR_TYPE's int */
+	return (qboolean)( ( scrVarNodes[id].status & VAR_STATUS_TYPE_MASK ) < VAR_ARRAY );
 }
 
 /* ---- Scr_IsThreadAlive  0x00472330 ---- VERIFIED */
@@ -1110,143 +1189,132 @@ int GetVarType( unsigned short id ) {
 
 /* ---- CastFieldObject  0x00472350 ---- VERIFIED */
 unsigned short CastFieldObject( VariableValue *value ) {
-	unsigned short  object;
 	VariableValue   objectValue;
+	int             type;
 
-	if ( value->type != VAR_OBJECT ) {
-		Scr_Error( va( "%s is not an object", var_typename[value->type] ) );
-		return 0;
+	/* Mac 1.3 shape: the type is read once and the id is returned from objectValue */
+	if ( value->type == VAR_OBJECT ) {
+		type = GetVarType( value->u.halfword.lo );
+		if ( type < VAR_ARRAY ) {
+			objectValue.type = VAR_OBJECT;
+			objectValue.u.halfword.lo = value->u.halfword.lo;
+			SetVariableValue( scrVarPub_tempVariable, &objectValue );
+			return objectValue.u.halfword.lo;
+		}
+		Scr_Error( va( "%s is not an object", var_typename[type] ) );
 	}
-
-	object = value->u.halfword[0];
-	if ( !IsFieldObject( object ) ) {
-		Scr_Error( va( "%s is not an object", var_typename[ GetVarType( object ) ] ) );
-		return 0;
-	}
-
-	objectValue.u.halfword[0] = object;
-	objectValue.u.halfword[1] = 0;
-	objectValue.type = VAR_OBJECT;
-	SetVariableValue( scrVarPub_tempVariable, &objectValue );
-	return object;
+	Scr_Error( va( "%s is not an object", var_typename[value->type] ) );
+	return 0;
 }
 
 /* ---- CopyArray  0x00471D20 ---- VERIFIED */
 void CopyArray( unsigned short sourceId, unsigned short destId ) {
-	unsigned short childId = scrVarIndirections[ scrVarNodes[sourceId].nextSibling ].id;
+	Variable *childSlot = &scrVarIndirections[scrVarNodes[sourceId].nextSibling];
+	unsigned short childId = childSlot->id;
 
 	while ( childId != sourceId ) {
 		VariableValueInternal  *childNode = &scrVarNodes[childId];
 		int                     childType = GetVarType( childId );
-		unsigned short          destChild = GetVariable( destId, GetVariableName( childId ) );
+		Variable *destSlot = &scrVarIndirections[GetVariableIndexInternal(destId, GetVariableName(childId))];
+		unsigned short          destChild = destSlot->id;
 		VariableValueInternal  *destNode = &scrVarNodes[destChild];
 
 		destNode->status |= (unsigned int)childType;
 
-		if ( childType == VAR_OBJECT ) {
-			unsigned short childObject = VAR_OBJECTID( childNode );
-
-			if ( GetVarType( childObject ) == VAR_ARRAY ) {
-				VAR_OBJECTID( destNode ) = Scr_AllocArray();
-				CopyArray( childObject, VAR_OBJECTID( destNode ) );
-			} else {
-				VAR_OBJECTID( destNode ) = childObject;
-				AddRefToObject( childObject );
-			}
-		} else {
+		if ( childType != VAR_OBJECT ) {
 			destNode->u = childNode->u;
 			AddRefToValue( childType, childNode->u );
+		} else {
+			if ( GetVarType( VAR_OBJECTID(childNode) ) == VAR_ARRAY ) {
+				VAR_OBJECTID(destNode) = Scr_AllocArray();
+				CopyArray( VAR_OBJECTID(childNode), VAR_OBJECTID(destNode) );
+			} else {
+				VAR_OBJECTID(destNode) = VAR_OBJECTID(childNode);
+				AddRefToObject( VAR_OBJECTID(childNode) );
+			}
 		}
 
-		childId = scrVarIndirections[ scrVarNodes[childId].nextSibling ].id;
+		childSlot = &scrVarIndirections[childNode->nextSibling];
+		childId = childSlot->id;
 	}
 }
 
 /* ---- EvalArray  0x00472970 ---- VERIFIED */
 void EvalArray( VariableValue *index, VariableValue *container ) {
-	unsigned short  arrayId;
-	unsigned short  handle;
 	unsigned short  childId;
+	unsigned short  stringValue;
+	const char     *s;
+	const float    *vectorValue;
+	VariableValueInternal *arrayValue;
+	char            c[2];
 
-	if ( container->type == VAR_STRING ) {
-		unsigned short  stringHandle;
-		const char     *text;
-		int             at;
-		char            single[2];
-
-		if ( index->type != VAR_INTEGER ) {
-			Scr_Error( va( "%s is not a string index", var_typename[index->type] ) );
+	/* Mac 1.3 shape: each failed index check raises and falls into the next case */
+	switch ( container->type ) {
+	case VAR_STRING:
+		if ( index->type == VAR_INTEGER ) {
+			if ( index->u.intValue >= 0 ) {
+				stringValue = container->u.stringValue;
+				s = SL_ConvertToString( stringValue );
+				if ( (unsigned int)index->u.intValue < strlen( s ) ) {
+					index->type = VAR_STRING;
+					c[0] = s[index->u.intValue];
+					c[1] = 0;
+					index->u.stringValue = SL_GetStringOfLen( c, 0, 2, 14 );
+					SL_RemoveRefToString( stringValue );
+					return;
+				}
+			}
+			Scr_Error( va( "string index %d out of range", index->u.intValue ) );
 		}
-		at = index->u.intValue;
-		stringHandle = container->u.stringValue;
-		text = SL_ConvertToString( stringHandle );
-		if ( at < 0 || (unsigned int)at >= strlen( text ) ) {
-			Scr_Error( va( "string index %d out of range", at ) );
-		}
-		single[0] = text[at];
-		single[1] = '\0';
-		index->type = VAR_STRING;
-		index->u.stringValue = SL_GetStringOfLen( single, 0, 2, SCR_STRING_MT_TYPE_TEMP );
-		SL_RemoveRefToString( stringHandle );
-		return;
-	}
-
-	if ( container->type == VAR_VECTOR ) {
-		if ( index->type != VAR_INTEGER ) {
-			Scr_Error( va( "%s is not a vector index", var_typename[index->type] ) );
-		}
-		if ( index->u.uintValue >= 3 ) {
+		Scr_Error( va( "%s is not a string index", var_typename[index->type] ) );
+	case VAR_VECTOR:
+		if ( index->type == VAR_INTEGER ) {
+			if ( index->u.uintValue < 3 ) {
+				vectorValue = container->u.vectorValue;
+				index->type = VAR_FLOAT;
+				index->u.floatValue = vectorValue[index->u.intValue];
+				RemoveRefToVector( vectorValue );
+				return;
+			}
 			Scr_Error( va( "vector index %d out of range", index->u.intValue ) );
 		}
-		{
-			const float *v = container->u.vectorValue;
-			unsigned int component = index->u.uintValue;
-
-			index->u.floatValue = v[component];
-			index->type = VAR_FLOAT;
-			RemoveRefToVector( v );
+		Scr_Error( va( "%s is not a vector index", var_typename[index->type] ) );
+	case VAR_OBJECT:
+		arrayValue = &scrVarNodes[container->u.halfword.lo];
+		if ( VAR_TYPE( arrayValue ) != VAR_ARRAY ) {
+			scrVarPub_error_index = 1;
+			Scr_Error( va( "%s is not an array", var_typename[ VAR_TYPE( arrayValue ) ] ) );
 		}
-		return;
-	}
 
-	if ( container->type != VAR_OBJECT ) {
-		scrVarPub_error_index = 1;
-		Scr_Error( va( "%s is not an array, string, or vector",
-			var_typename[container->type] ) );
-		return;
-	}
-
-	arrayId = container->u.halfword[0];
-	if ( GetVarType( arrayId ) != VAR_ARRAY ) {
-		scrVarPub_error_index = 1;
-		Scr_Error( va( "%s is not an array", var_typename[ GetVarType( arrayId ) ] ) );
-	}
-
-	if ( index->type == VAR_STRING ) {
-		unsigned short stringHandle = index->u.stringValue;
-
-		handle = FindVariableIndexInternal( arrayId, stringHandle );
-		SL_RemoveRefToString( stringHandle );
-	} else if ( index->type == VAR_INTEGER ) {
-		if ( !IsValidArrayIndex( index->u.uintValue ) ) {
+		switch ( index->type ) {
+		case VAR_INTEGER:
+			if ( IsValidArrayIndex( index->u.uintValue ) ) {
+				childId = FindArrayVariable( container->u.halfword.lo, index->u.intValue );
+				break;
+			}
 			Scr_Error( va( "array index %d out of range", index->u.intValue ) );
+		case VAR_STRING:
+			childId = FindVariable( container->u.halfword.lo, index->u.stringValue );
+			SL_RemoveRefToString( index->u.stringValue );
+			break;
+		default:
+			Scr_Error( va( "%s is not an array index", var_typename[index->type] ) );
+			return;
 		}
-		handle = FindArrayVariableIndex( arrayId, index->u.uintValue );
-	} else {
-		Scr_Error( va( "%s is not an array index", var_typename[index->type] ) );
+		if ( childId ) {
+			GetVariableValue( childId, index );
+			AddRefToValue( index->type, index->u );
+			RemoveRefToObject( container->u.halfword.lo );
+		} else {
+			RemoveRefToObject( container->u.halfword.lo );
+			index->type = VAR_UNDEFINED;
+		}
+		return;
+	default:
+		scrVarPub_error_index = 1;
+		Scr_Error( va( "%s is not an array, string, or vector", var_typename[container->type] ) );
 		return;
 	}
-
-	childId = scrVarIndirections[handle].id;
-	if ( !childId ) {
-		RemoveRefToObject( arrayId );
-		index->type = VAR_UNDEFINED;
-		return;
-	}
-
-	GetVariableValue( childId, index );
-	AddRefToValue( index->type, index->u );
-	RemoveRefToObject( arrayId );
 }
 
 /* Var_ResolveArrayObject -- the KEYVALUE unwrapping the three array functions
@@ -1256,17 +1324,25 @@ void EvalArray( VariableValue *index, VariableValue *container ) {
    wrong, not merely different: IncInParam refuses any top above scrVmPub_maxstack
    (0x0047C58D), and a C-stack local sits above the .bss stack whenever the loader
    puts the thread stack above the image -- "Internal script stack overflow" on
-   the first self.field[i] a script evaluates. */
-static int Var_ResolveArrayObject( VariableValueInternal *node, unsigned short *arrayId,
+   the first self.field[i] a script evaluates.
+   The whole union is handed back, as retail keeps it (a full dword local,
+   0x00472EE1 / 0x00472F40): EvalArrayRef writes it back into node->u with
+   only halfword.lo replaced. */
+extern VariableValue *scrVmPub_top;
+extern int scrVmPub_inparamcount;
+static __forceinline int Var_ResolveArrayObject( VariableValueInternal *node, VariableUnion *arrayU,
 								   VariableValue *index ) {
 	int type = VAR_TYPE( node );
 
-	*arrayId = VAR_OBJECTID( node );
+	*arrayU = node->u;
 
-	while ( type == VAR_KEYVALUE ) {
-		GetEntityFieldValue__FUiiiP13VariableValue( VAR_NAME( node ),
-			VAR_KVENTNUM( node ), VAR_KVOFFSET( node ), index + 1 );
-		*arrayId = index[1].u.halfword[0];
+	while ( type != VAR_OBJECT ) {
+		if (type != VAR_KEYVALUE) break;
+		scrVmPub_top = index;
+		index[1].type = VAR_UNDEFINED;
+		( (int (*)( unsigned int, int, int ))scrImport_GetObjectField )( VAR_NAME(node), VAR_KVENTNUM(node), VAR_KVOFFSET(node) );
+		scrVmPub_inparamcount = 0;
+		*arrayU = index[1].u;
 		type = index[1].type;
 		RemoveRefToValue( type, index[1].u );
 	}
@@ -1275,140 +1351,177 @@ static int Var_ResolveArrayObject( VariableValueInternal *node, unsigned short *
 
 /* ---- Scr_EvalArrayIndex_m  0x00472BE0 ---- VERIFIED */
 unsigned short Scr_EvalArrayIndex_m( unsigned short id, VariableValue *index ) {
-	unsigned short  arrayId;
-	unsigned short  handle;
-	int             type;
+	VariableValueInternal  *entryValue;
+	VariableValueInternal  *arrayValue;
+	VariableUnion           arrayU;
+	unsigned short          handle;
+	unsigned short          name;
+	int                     type;
 
-	type = Var_ResolveArrayObject( &scrVarNodes[id], &arrayId, index );
-	if ( type != VAR_OBJECT ) {
-		scrVarPub_error_index = 1;
-		Scr_Error( va( "%s is not an array", var_typename[type] ) );
-		return 0;
+	entryValue = &scrVarNodes[id];
+	arrayU = entryValue->u;
+	type = VAR_TYPE( entryValue );
+	while ( type != VAR_OBJECT ) {
+		if ( type != VAR_KEYVALUE ) {
+			scrVarPub_error_index = 1;
+			Scr_Error( va( "%s is not an array", var_typename[type] ) );
+			break;
+		}
+		GetEntityFieldValue__FUiiiP13VariableValue( VAR_NAME( entryValue ), VAR_KVENTNUM( entryValue ),
+													 VAR_KVOFFSET( entryValue ), index + 1 );
+		arrayU = index[1].u;
+		type = index[1].type;
+		RemoveRefToValue( type, arrayU );
 	}
 
-	if ( GetVarType( arrayId ) != VAR_ARRAY ) {
+	arrayValue = &scrVarNodes[arrayU.halfword.lo];
+	if ( VAR_TYPE( arrayValue ) != VAR_ARRAY ) {
 		scrVarPub_error_index = 1;
-		Scr_Error( va( "%s is not an array", var_typename[ GetVarType( arrayId ) ] ) );
+		Scr_Error( va( "%s is not an array", var_typename[ VAR_TYPE( arrayValue ) ] ) );
 	}
 
 	if ( index->type == VAR_INTEGER ) {
-		if ( !IsValidArrayIndex( index->u.uintValue ) ) {
+		if ( IsValidArrayIndex( index->u.uintValue ) ) {
+			handle = FindArrayVariableIndex( arrayU.halfword.lo, index->u.uintValue );
+			if ( handle ) {
+				return scrVarIndirections[handle].id;
+			}
+		} else {
 			Scr_Error( va( "array index %d out of range", index->u.intValue ) );
 		}
-		handle = FindArrayVariableIndex( arrayId, index->u.uintValue );
-		if ( !handle ) {
-			Scr_Error( "array index does not exist" );
+	} else if ( index->type == VAR_STRING ) {
+		name = index->u.stringValue;
+		handle = FindVariableIndexInternal( arrayU.halfword.lo, name );
+		if ( handle ) {
+			SL_RemoveRefToString( name );
+			return scrVarIndirections[handle].id;
 		}
-		return scrVarIndirections[handle].id;
-	}
-
-	if ( index->type != VAR_STRING ) {
+	} else {
 		Scr_Error( va( "%s is not an array index", var_typename[index->type] ) );
-		return 0;
 	}
-
-	handle = FindVariableIndexInternal( arrayId, index->u.stringValue );
-	if ( !handle ) {
-		Scr_Error( "array index does not exist" );
-	}
-	SL_RemoveRefToString( index->u.stringValue );
-	return scrVarIndirections[handle].id;
+	Scr_Error( "array index does not exist" );
+	return 0;
 }
 
 /* ---- EvalArrayRef  0x00472EC0 ---- VERIFIED */
 unsigned short EvalArrayRef( unsigned short id, VariableValue *index ) {
-	VariableValueInternal  *node = &scrVarNodes[id];
-	unsigned short          arrayId;
+	VariableValueInternal  *entryValue;
+	VariableValueInternal  *arrayValue;
+	VariableValue           resolvedArray;
+	unsigned short          source;
 	unsigned short          handle;
-	int                     type;
 
-	type = Var_ResolveArrayObject( node, &arrayId, index );
-
-	if ( type == VAR_UNDEFINED ) {
-		arrayId = Scr_AllocArray();
-		node->status |= VAR_OBJECT;
-		VAR_OBJECTID( node ) = arrayId;
-	} else if ( type != VAR_OBJECT ) {
-		scrVarPub_error_index = 1;
-		if ( type == VAR_STRING ) {
-			Scr_Error( "string characters cannot be individually changed" );
-		} else if ( type == VAR_VECTOR ) {
-			Scr_Error( "vector components cannot be individually changed" );
-		} else {
-			Scr_Error( va( "%s is not an array", var_typename[type] ) );
+	entryValue = &scrVarNodes[id];
+	resolvedArray.u = entryValue->u;
+	resolvedArray.type = VAR_TYPE( entryValue );
+	for ( ;; ) {
+		if ( resolvedArray.type == VAR_UNDEFINED ) {
+			resolvedArray.u.halfword.lo = Scr_AllocArray();
+			entryValue->status |= VAR_OBJECT;
+			entryValue->u = resolvedArray.u;
+			goto add_index;
 		}
-		return 0;
-	} else {
-		if ( GetVarType( arrayId ) != VAR_ARRAY ) {
+		if ( resolvedArray.type == VAR_OBJECT ) {
+			break;
+		}
+		if ( resolvedArray.type != VAR_KEYVALUE ) {
 			scrVarPub_error_index = 1;
-			Scr_Error( va( "%s is not an array", var_typename[ GetVarType( arrayId ) ] ) );
+			switch ( resolvedArray.type ) {
+			case VAR_STRING:
+				Scr_Error( "string characters cannot be individually changed" );
+			case VAR_VECTOR:
+				Scr_Error( "vector components cannot be individually changed" );
+			default:
+				Scr_Error( va( "%s is not an array", var_typename[resolvedArray.type] ) );
+			}
+			break;
 		}
-
-		if ( VAR_REFCOUNT( &scrVarNodes[arrayId] ) ) {
-			unsigned short source = arrayId;
-
-			RemoveRefToObject( source );
-			arrayId = Scr_AllocArray();
-			CopyArray( source, arrayId );
-			VAR_OBJECTID( node ) = arrayId;
-		}
+		GetEntityFieldValue__FUiiiP13VariableValue( VAR_NAME( entryValue ), VAR_KVENTNUM( entryValue ),
+													 VAR_KVOFFSET( entryValue ), index + 1 );
+		resolvedArray = index[1];
+		RemoveRefToValue( resolvedArray.type, resolvedArray.u );
 	}
 
+	arrayValue = &scrVarNodes[resolvedArray.u.halfword.lo];
+	if ( VAR_TYPE( arrayValue ) != VAR_ARRAY ) {
+		scrVarPub_error_index = 1;
+		Scr_Error( va( "%s is not an array", var_typename[ VAR_TYPE( arrayValue ) ] ) );
+	}
+
+	if ( VAR_REFCOUNT( arrayValue ) ) {
+		source = resolvedArray.u.halfword.lo;
+		RemoveRefToObject( source );
+		resolvedArray.u.halfword.lo = Scr_AllocArray();
+		CopyArray( source, resolvedArray.u.halfword.lo );
+		entryValue->u = resolvedArray.u;
+	}
+
+add_index:
 	if ( index->type == VAR_INTEGER ) {
-		if ( !IsValidArrayIndex( index->u.uintValue ) ) {
-			Scr_Error( va( "array index %d out of range", index->u.intValue ) );
+		if ( IsValidArrayIndex( index->u.uintValue ) ) {
+			return scrVarIndirections[ GetArrayVariableIndex( resolvedArray.u.halfword.lo, index->u.uintValue ) ].id;
 		}
-		return scrVarIndirections[ GetArrayVariableIndex( arrayId, index->u.uintValue ) ].id;
+		Scr_Error( va( "array index %d out of range", index->u.intValue ) );
 	}
 
-	if ( index->type != VAR_STRING ) {
-		Scr_Error( va( "%s is not an array index", var_typename[index->type] ) );
-		return 0;
+	if ( index->type == VAR_STRING ) {
+		handle = scrVarIndirections[ GetVariableIndexInternal( resolvedArray.u.halfword.lo, index->u.stringValue ) ].id;
+		SL_RemoveRefToString( index->u.stringValue );
+		return handle;
 	}
-
-	handle = GetVariableIndexInternal( arrayId, index->u.stringValue );
-	SL_RemoveRefToString( index->u.stringValue );
-	return scrVarIndirections[handle].id;
+	Scr_Error( va( "%s is not an array index", var_typename[index->type] ) );
+	return 0;
 }
 
 /* ---- ClearArray  0x00473250 ---- VERIFIED */
 void ClearArray( unsigned short id, VariableValue *index ) {
-	unsigned short  arrayId;
-	int             type;
+	VariableValueInternal  *entryValue;
+	VariableValueInternal  *arrayValue;
+	VariableUnion           arrayU;
+	int                     type;
 
-	type = Var_ResolveArrayObject( &scrVarNodes[id], &arrayId, index );
-	if ( type != VAR_OBJECT ) {
-		scrVarPub_error_index = 1;
-		Scr_Error( va( "%s is not an array", var_typename[type] ) );
-		return;
+	entryValue = &scrVarNodes[id];
+	arrayU = entryValue->u;
+	type = VAR_TYPE( entryValue );
+	while ( type != VAR_OBJECT ) {
+		if ( type != VAR_KEYVALUE ) {
+			scrVarPub_error_index = 1;
+			Scr_Error( va( "%s is not an array", var_typename[type] ) );
+			break;
+		}
+		GetEntityFieldValue__FUiiiP13VariableValue( VAR_NAME( entryValue ), VAR_KVENTNUM( entryValue ),
+													 VAR_KVOFFSET( entryValue ), index + 1 );
+		arrayU = index[1].u;
+		type = index[1].type;
+		RemoveRefToValue( type, arrayU );
 	}
 
-	if ( GetVarType( arrayId ) != VAR_ARRAY ) {
+	arrayValue = &scrVarNodes[arrayU.halfword.lo];
+	if ( VAR_TYPE( arrayValue ) != VAR_ARRAY ) {
 		scrVarPub_error_index = 1;
-		Scr_Error( va( "%s is not an array", var_typename[ GetVarType( arrayId ) ] ) );
+		Scr_Error( va( "%s is not an array", var_typename[ VAR_TYPE( arrayValue ) ] ) );
 	}
 
 	if ( index->type == VAR_INTEGER ) {
-		if ( !IsValidArrayIndex( index->u.uintValue ) ) {
-			Scr_Error( va( "array index %d out of range", index->u.intValue ) );
+		if ( IsValidArrayIndex( index->u.uintValue ) ) {
+			SafeRemoveArrayVariable( arrayU.halfword.lo, index->u.uintValue );
+			return;
 		}
-		SafeRemoveArrayVariable( arrayId, index->u.uintValue );
-		return;
+		Scr_Error( va( "array index %d out of range", index->u.intValue ) );
 	}
 
-	if ( index->type != VAR_STRING ) {
+	if ( index->type == VAR_STRING ) {
+		SafeRemoveVariable( arrayU.halfword.lo, index->u.stringValue );
+		SL_RemoveRefToString( index->u.stringValue );
+	} else {
 		Scr_Error( va( "%s is not an array index", var_typename[index->type] ) );
-		return;
 	}
-
-	SafeRemoveVariable( arrayId, index->u.stringValue );
-	SL_RemoveRefToString( index->u.stringValue );
 }
 
 /* ---- GetEmptyArray  0x004734F0 ---- VERIFIED */
 void GetEmptyArray( VariableValue *value ) {
 	value->type = VAR_OBJECT;
-	value->u.halfword[0] = Scr_AllocArray();
+	value->u.halfword.lo = Scr_AllocArray();
 }
 
 /* ---- SetEmptyArray  0x00473530 ---- VERIFIED */
@@ -1461,20 +1574,22 @@ void Scr_RemoveClassMap( void ) {
 
 		handle = FindVariableIndexInternal( scrVarPub_classId, i );
 		if ( handle ) {
-			unsigned short childId = scrVarIndirections[handle].id;
+			Variable *slot = &scrVarIndirections[handle];
+			VariableValueInternal *child = &scrVarNodes[slot->id];
 
-			MakeVariableExternal( &scrVarIndirections[handle],
+			MakeVariableExternal( slot,
 				&scrVarNodes[ scrVarPub_classId ] );
-			FreeValueInternal( &scrVarNodes[childId] );
+			FreeValueInternal( child );
 		}
 
 		handle = FindVariableIndexInternal( scrVarPub_entId, i );
 		if ( handle ) {
-			unsigned short childId = scrVarIndirections[handle].id;
+			Variable *slot = &scrVarIndirections[handle];
+			VariableValueInternal *child = &scrVarNodes[slot->id];
 
-			MakeVariableExternal( &scrVarIndirections[handle],
+			MakeVariableExternal( slot,
 				&scrVarNodes[ scrVarPub_entId ] );
-			FreeValueInternal( &scrVarNodes[childId] );
+			FreeValueInternal( child );
 		}
 	}
 }
@@ -1509,10 +1624,10 @@ int Scr_GetOffset( unsigned short classId, const char *name ) {
 	unsigned short handle = SL_ConvertFromString( name );
 	unsigned short childId = FindVariable( classId, handle );
 
-	if ( !childId ) {
-		return -1;
+	if ( childId ) {
+		return VAR_KVOFFSET( &scrVarNodes[childId] );
 	}
-	return VAR_KVOFFSET( &scrVarNodes[childId] );
+	return -1;
 }
 
 /* ---- FindEntityId  0x00472850 ---- VERIFIED */
@@ -1535,9 +1650,11 @@ unsigned short Scr_GetEntityId( int entnum, int classnum ) {
 	unsigned short          classRoot;
 	unsigned short          childId;
 	VariableValueInternal  *node;
+	unsigned short object;
 
 	classRoot = VAR_OBJECTID( &scrVarNodes[
 		scrVarIndirections[ FindVariableIndexInternal( scrVarPub_entId, classnum ) ].id ] );
+
 
 	childId = GetArrayVariable( classRoot, entnum );
 	node = &scrVarNodes[childId];
@@ -1546,16 +1663,21 @@ unsigned short Scr_GetEntityId( int entnum, int classnum ) {
 		return VAR_OBJECTID( node );
 	}
 
-	VAR_OBJECTID( node ) = AllocEntity( classnum, (unsigned short)entnum );
+	object = AllocEntity( classnum, (unsigned short)entnum );
+	/* re-derived after the call: retail keeps childId*3 live across it, not the pointer */
+	node = &scrVarNodes[childId];
 	node->status |= VAR_OBJECT;
-	return VAR_OBJECTID( node );
+	VAR_OBJECTID(node) = object;
+	return object;
+
 }
 
 /* ---- Scr_FreeEntityNum  0x00472440 ---- VERIFIED */
 void Scr_FreeEntityNum( int entnum, int classnum ) {
-	unsigned short classRoot;
-	unsigned short childId;
-	unsigned short entityId;
+	unsigned short          classRoot;
+	unsigned short          childId;
+	unsigned short          entityId;
+	VariableValueInternal  *entry;
 
 	if ( !scr_inited ) {
 		return;
@@ -1570,8 +1692,8 @@ void Scr_FreeEntityNum( int entnum, int classnum ) {
 	}
 
 	entityId = VAR_OBJECTID( &scrVarNodes[childId] );
-	scrVarNodes[entityId].status =
-		( scrVarNodes[entityId].status & ~VAR_STATUS_TYPE_MASK ) | VAR_DEADENTITY;
+	entry = &scrVarNodes[entityId];
+	entry->status = ( entry->status & ~VAR_STATUS_TYPE_MASK ) | VAR_DEADENTITY;
 
 	AddRefToObject( entityId );
 	VM_TerminateNotifyList__FUs( entityId );
@@ -1583,9 +1705,9 @@ void Scr_FreeEntityNum( int entnum, int classnum ) {
 
 /* ---- CopyEntity  0x00473590 ---- VERIFIED */
 void CopyEntity( unsigned short sourceId, unsigned short destId ) {
-	unsigned short childId = FindNextSibling( sourceId );
+	unsigned short childId;
 
-	while ( childId ) {
+	for ( childId = FindNextSibling( sourceId ); childId; childId = FindNextSibling( childId ) ) {
 		VariableValueInternal *childNode = &scrVarNodes[childId];
 
 		if ( VAR_NAME( childNode ) != VAR_NAME_OBJECT_LIMIT ) {
@@ -1599,11 +1721,10 @@ void CopyEntity( unsigned short sourceId, unsigned short destId ) {
 
 			status = childNode->status & ~VAR_STATUS_STAT_MASK;
 			destNode->status |= status;
-			destNode->u = childNode->u;
-			AddRefToValue( (int)( status & VAR_STATUS_TYPE_MASK ), childNode->u );
+			{ VariableUnion value = childNode->u;
+			  destNode->u = value;
+			  AddRefToValue((int)(status & VAR_STATUS_TYPE_MASK), value); }
 		}
-
-		childId = FindNextSibling( childId );
 	}
 }
 
@@ -1712,7 +1833,7 @@ VariableValue *GetVariableValueAddress__FUs( unsigned short id ) {
 	return GetVariableValueAddress( id );
 }
 void GetSizeValue__FP13VariableValue( VariableValue *v ) { GetSizeValue( v ); }
-unsigned short GetArraySize__FUs( unsigned short id ) { return GetArraySize( id ); }
+unsigned int GetArraySize__FUs( unsigned short id ) { return GetArraySize( id ); }
 unsigned short FindNextSibling__FUs( unsigned short id ) { return FindNextSibling( id ); }
 unsigned int GetVariableName__FUs( unsigned short id ) { return GetVariableName( id ); }
 unsigned short GetVariableKeyObject__FUs( unsigned short id ) {
@@ -1723,7 +1844,7 @@ unsigned short GetThreadNotifyName__FUs( unsigned short id ) {
 	return GetThreadNotifyName( id );
 }
 unsigned short GetSelf__FUs( unsigned short id ) { return GetSelf( id ); }
-unsigned short GetEntnum__FUs( unsigned short id ) { return GetEntnum( id ); }
+unsigned int GetEntnum__FUs( unsigned short id ) { return GetEntnum( id ); }
 unsigned short GetObject__FUs( unsigned short id ) { return GetObject( id ); }
 unsigned short GetArray__FUs( unsigned short id ) { return GetArray( id ); }
 unsigned short FindObject__FUs( unsigned short id ) { return FindObject( id ); }
@@ -1761,251 +1882,140 @@ unsigned short FindEntityId__Fii( int e, int c ) { return FindEntityId( e, c ); 
 
 #define SCR_SAVE_IDMAP_SIZE     ( VARIABLELIST_SIZE * (int)sizeof( unsigned short ) )
 
-#define scrSave_idToSaveId      ( (unsigned short *)scrSave_idToSaveId )
-#define scrSave_saveIdToId      ( (unsigned short *)scrSave_saveIdToId )
-#define scrSave_numSaveObjects  ( *(unsigned short *)&scrSave_numSaveObjects )
-#define scrSave_readPos         ( (char *)scrSave_readPos )
+/* the import table declares these unprototyped; spell the call types out for C++ */
+#define SCR_LOAD_READ           ( (char *(*)( int ))scrImport_LoadRead )
 
 /* ---- WriteByte__FUc  0x004736D0 ---- VERIFIED */
-_BYTE *__cdecl WriteByte(char a1)
-{
-  int v1;
-  _BYTE *result;
-
-  v1 = currentPos + 1;
-  result = (_BYTE *)(currentPos + Hunk_ReallocateTempMemory(currentPos + 1));
-  currentPos = v1;
-  *result = a1;
-  return result;
+void WriteByte( unsigned char value ) {
+	*(unsigned char *)TempMalloc( 1 ) = value;
 }
 
 /* ---- ReadByte__Fv  0x00473700 ---- VERIFIED */
-char ReadByte()
-{
-  return *(_BYTE *)scrSave_readPos++;
+char ReadByte( void ) {
+	return *(unsigned char *)scrSave_readPos++;
 }
 
 /* ---- WriteShort__FUs  0x00473710 ---- VERIFIED */
-_WORD *__cdecl WriteShort(__int16 a1)
-{
-  int v1;
-  _WORD *result;
-
-  v1 = currentPos + 2;
-  result = (_WORD *)(currentPos + Hunk_ReallocateTempMemory(currentPos + 2));
-  currentPos = v1;
-  *result = a1;
-  return result;
+void WriteShort( unsigned short value ) {
+	*(unsigned short *)TempMalloc( 2 ) = value;
 }
 
 /* ---- ReadShort__Fv  0x00473740 ---- VERIFIED */
-__int16 ReadShort()
-{
-  __int16 result;
+__int16 ReadShort( void ) {
+	__int16 value = *(unsigned short *)scrSave_readPos;
 
-  result = *(_WORD *)scrSave_readPos;
-  scrSave_readPos += 2;
-  return result;
+	scrSave_readPos += 2;
+	return value;
 }
 
 /* ---- WriteString  0x00473760 ---- VERIFIED */
 void WriteString( unsigned short id ) {
-	const char *text = SL_ConvertToString( id );
-	int         len  = (int)strlen( text );
-	char       *dest;
-
-	dest = (char *)( currentPos + Hunk_ReallocateTempMemory( currentPos + len + 1 ) );
-	currentPos += len + 1;
-
-	do {
-		*dest++ = *text;
-	} while ( *text++ );
+	const char *text = SL_ConvertToString(id);
+	strcpy((char *)TempMalloc((int)strlen(text)+1),text);
 }
 
 void WriteString__FUs( unsigned short id ) { WriteString( id ); }
 
 /* ---- SafeWriteString__FUs  0x004737C0 ---- VERIFIED */
 void SafeWriteString( unsigned short id ) {
-	char *present;
-
-	present = (char *)( currentPos + Hunk_ReallocateTempMemory( currentPos + 1 ) );
-	currentPos += 1;
-
-	if ( id ) {
-		*present = 1;
-		WriteString( id );
+	if ( !id ) {
+		WriteByte( 0 );
 		return;
 	}
-	*present = 0;
+	WriteByte( 1 );
+	WriteString( id );
 }
 
 /* ---- ReadString__Fv  0x004737F0 ---- VERIFIED */
-__int16 ReadString()
-{
-  unsigned int v0;
-  __int16 result;
+__int16 ReadString( void ) {
+	unsigned int  len = strlen( (const char *)scrSave_readPos ) + 1;
+	__int16       handle;
 
-  v0 = strlen((const char *)scrSave_readPos);
-  result = SL_GetStringOfLen((char *)scrSave_readPos, 0, v0 + 1, SCR_STRING_MT_TYPE_TEMP);
-  scrSave_readPos += v0 + 1;
-  return result;
+	handle = SL_GetStringOfLen( (char *)scrSave_readPos, 0, len, SCR_STRING_MT_TYPE_TEMP );
+	scrSave_readPos += len;
+	return handle;
 }
 
 /* ---- SafeReadString__Fv  0x00473830 ---- VERIFIED */
-__int16 SafeReadString()
-{
-  char *v0;
-  unsigned int v2;
-  __int16 result;
+__int16 SafeReadString( void ) {
+	/* a named local: retail zeroes it with xor eax,eax (`return 0` gives xor ax,ax) */
+	__int16 string;
 
-  v0 = (char *)(scrSave_readPos + 1);
-  if ( *(_BYTE *)scrSave_readPos++ == 0 )
-    return 0;
-  v2 = strlen(v0);
-  result = SL_GetStringOfLen(v0, 0, v2 + 1, SCR_STRING_MT_TYPE_TEMP);
-  scrSave_readPos += v2 + 1;
-  return result;
+	if ( ReadByte() ) {
+		string = ReadString();
+	} else {
+		string = 0;
+	}
+	return string;
 }
 
 /* ---- WriteFloat__Ff  0x00473880 ---- VERIFIED */
-_DWORD *__cdecl WriteFloat(int a1)
-{
-  int v1;
-  _DWORD *result;
-
-  v1 = currentPos + 4;
-  result = (_DWORD *)(currentPos + Hunk_ReallocateTempMemory(currentPos + 4));
-  currentPos = v1;
-  *result = a1;
-  return result;
+void WriteFloat( float value ) {
+	*(float *)TempMalloc( 4 ) = value;
 }
 
 /* ---- ReadFloat__Fv  0x004738B0 ---- VERIFIED */
-double ReadFloat()
-{
-  double result;
+float ReadFloat( void ) {
+	float value = *(float *)scrSave_readPos;
 
-  result = *(float *)scrSave_readPos;
-  scrSave_readPos += 4;
-  return result;
+	scrSave_readPos += 4;
+	return value;
 }
 
 /* ---- WriteVector__FPCf  0x004738C0 ---- VERIFIED */
-int *__cdecl WriteVector(int *a1)
-{
-  int v1;
-  int v2;
-  int v3;
-  int *result;
-  int v5;
-  int v6;
-
-  v1 = currentPos + 4;
-  v5 = *a1;
-  *(_DWORD *)(currentPos + Hunk_ReallocateTempMemory(currentPos + 4)) = v5;
-  v2 = a1[1];
-  currentPos = v1;
-  v1 += 4;
-  *(_DWORD *)(currentPos + Hunk_ReallocateTempMemory(v1)) = v2;
-  v3 = a1[2];
-  currentPos = v1;
-  v1 += 4;
-  v6 = v3;
-  result = (int *)(currentPos + Hunk_ReallocateTempMemory(v1));
-  currentPos = v1;
-  *result = v6;
-  return result;
+void WriteVector( const float *v ) {
+	WriteFloat(v[0]);
+	WriteFloat(v[1]);
+	WriteFloat(v[2]);
 }
 
 /* ---- ReadVector__Fv  0x00473930 ---- VERIFIED */
-_DWORD *ReadVector()
-{
-  _DWORD *result;
-  int v1;
-  int v2;
-  int v3;
-
-  v1 = *(_DWORD *)scrSave_readPos;
-  v2 = *(_DWORD *)(scrSave_readPos + 4);
-  v3 = *(_DWORD *)(scrSave_readPos + 8);
-  scrSave_readPos += 12;
-  result = (_DWORD *)((char *)MT_Alloc(SCR_VECTOR_ALLOC_SIZE, 2) + 2);
-  *result = v1;
-  *((_WORD *)result - 1) = 0;
-  result[1] = v2;
-  result[2] = v3;
-  return result;
+float *ReadVector( void ) {
+	float value[3];
+	value[0] = (float)ReadFloat();
+	value[1] = (float)ReadFloat();
+	value[2] = (float)ReadFloat();
+	return (float *)AllocVectorValue(value).vectorValue;
 }
 
 /* ---- WriteInt__Fi  0x00473990 ---- VERIFIED */
-_DWORD *__cdecl WriteInt(int a1)
-{
-  int v1;
-  _DWORD *result;
-
-  v1 = currentPos + 4;
-  result = (_DWORD *)(currentPos + Hunk_ReallocateTempMemory(currentPos + 4));
-  currentPos = v1;
-  *result = a1;
-  return result;
+void WriteInt( int value ) {
+	*(int *)TempMalloc( 4 ) = value;
 }
 
 /* ---- ReadInt__Fv  0x004739C0 ---- VERIFIED */
-int ReadInt()
-{
-  int result;
+int ReadInt( void ) {
+	int value = *(unsigned int *)scrSave_readPos;
 
-  result = *(_DWORD *)scrSave_readPos;
-  scrSave_readPos += 4;
-  return result;
+	scrSave_readPos += 4;
+	return value;
 }
 
 /* ---- WriteCodepos__FPCc  0x004739E0 ---- VERIFIED */
-int *__cdecl WriteCodepos(int a1)
-{
-  int v1;
-  int v2;
-  int *result;
+int *__cdecl WriteCodepos( int codePos ) {
+	int  offset;
+	int *dest;
 
-  if ( a1 )
-    v1 = a1 - scrVarPub_programBuffer;
-  else
-    v1 = -1;
-  v2 = currentPos + 4;
-  result = (int *)(currentPos + Hunk_ReallocateTempMemory(currentPos + 4));
-  *result = v1;
-  currentPos = v2;
-  return result;
+	offset = codePos ? codePos - scrVarPub_programBuffer : -1;
+	dest = (int *)TempMalloc( 4 );
+	*dest = offset;
+	return dest;
 }
 
 /* ---- ReadCodepos__Fv  0x00473A20 ---- VERIFIED */
-int ReadCodepos()
-{
-  int v0;
-  bool v1;
+int ReadCodepos( void ) {
+	int offset = *(int *)scrSave_readPos;
 
-  v0 = *(_DWORD *)scrSave_readPos;
-  v1 = *(int *)scrSave_readPos < 0;
-  scrSave_readPos += 4;
-  if ( v1 )
-    return 0;
-  else
-    return scrVarPub_programBuffer + v0;
+	scrSave_readPos += 4;
+	if ( offset >= 0 ) {
+		return scrVarPub_programBuffer + offset;
+	}
+	return 0;
 }
 
 /* ---- WriteId__FUs  0x00473A50 ---- VERIFIED */
-_WORD *__cdecl WriteId(unsigned __int16 a1)
-{
-  __int16 v1;
-  int v2;
-  _WORD *result;
-
-  v1 = *((_WORD *)scrSave_idToSaveId + a1);
-  v2 = currentPos + 2;
-  result = (_WORD *)(currentPos + Hunk_ReallocateTempMemory(currentPos + 2));
-  *result = v1;
-  currentPos = v2;
-  return result;
+void WriteId( unsigned short id ) {
+	WriteShort( scrSave_idToSaveId[id] );
 }
 
 /* ---- ReadId  0x00473A80 ---- VERIFIED */
@@ -2025,8 +2035,7 @@ unsigned short ReadId__Fv( void ) { return ReadId(); }
 void WriteBuffer( int len, const void *buf ) {
 	char *dest;
 
-	dest = (char *)( currentPos + Hunk_ReallocateTempMemory( currentPos + len ) );
-	currentPos += len;
+	dest = (char *)TempMalloc( len );
 	Com_Memcpy( dest, buf, len );
 }
 
@@ -2039,16 +2048,18 @@ void ReadBuffer( char *buf, int len ) {
 void ReadBuffer__FPci( char *buf, int len ) { ReadBuffer( buf, len ); }
 
 /* ---- Scr_ConvertThreadToSave  0x00473B00 ---- VERIFIED */
-__int16 __cdecl Scr_ConvertThreadToSave(unsigned __int16 a1)
-{
-  if ( !a1 )
-    return 0;
-  AddSaveObject(a1);
-  return *((_WORD *)scrSave_idToSaveId + a1);
+__int16 __cdecl Scr_ConvertThreadToSave( unsigned __int16 id ) {
+	if ( !id ) {
+		return 0;
+	}
+	AddSaveObject( id );
+	return scrSave_idToSaveId[id];
 }
 
-/* ---- Scr_ConvertThreadFromLoad  0x00473B30 ---- VERIFIED */
-unsigned short Scr_ConvertThreadFromLoad( unsigned short saveId ) {
+/* ---- Scr_ConvertThreadFromLoad  0x00473B30 ---- VERIFIED
+ * retail reads the argument slot as a dword and tests only its low half. */
+unsigned short Scr_ConvertThreadFromLoad( unsigned int handle ) {
+	unsigned short saveId = (unsigned short)handle;
 	unsigned short id;
 
 	if ( !saveId ) {
@@ -2061,47 +2072,28 @@ unsigned short Scr_ConvertThreadFromLoad( unsigned short saveId ) {
 
 /* ---- WriteStack__FPC19VariableStackBuffer  0x00473B60 ---- VERIFIED */
 void WriteStack( const VariableStackBuffer *buf ) {
-	unsigned short  count;
-	unsigned short  saveId;
-	int             codePos;
-	const char     *entry;
-	char           *p;
-	int             i;
-
-	count = buf->size;
-	p = (char *)( currentPos + Hunk_ReallocateTempMemory( currentPos + 2 ) );
-	currentPos += 2;
-	*(unsigned short *)p = count;
-
-	p = (char *)( currentPos + Hunk_ReallocateTempMemory( currentPos + 4 ) );
-	currentPos += 4;
-	*(const char **)p = buf->pos;
-
-	codePos = buf->codePos ? (int)buf->codePos - scrVarPub_programBuffer : -1;
-	p = (char *)( currentPos + Hunk_ReallocateTempMemory( currentPos + 4 ) );
-	saveId = scrSave_idToSaveId[ buf->objectId ];
-	*(int *)p = codePos;
-	currentPos += 4;
-
-	p = (char *)( currentPos + Hunk_ReallocateTempMemory( currentPos + 2 ) );
-	currentPos += 2;
-	*(unsigned short *)p = saveId;
-
+	unsigned short count = buf->size;
+	const char *entry;
+	int remaining;
+	WriteShort(count);
+	WriteInt((int)buf->pos);
+	WriteCodepos((int)buf->codePos);
+	WriteId(buf->objectId);
 	entry = (const char *)buf + SCR_STACKBUFFER_HEADER;
-	for ( i = count; i != 0; i-- ) {
-		unsigned char   type = (unsigned char)entry[0];
-		VariableUnion   u    = *(const VariableUnion *)( entry + 1 );
-
-		entry += SCR_STACKENTRY_SIZE;
-		DoSaveEntryInternal( type, u );
-	}
+	if (!count) return;
+	remaining = count;
+	do {
+		unsigned char type = (unsigned char)*entry++;
+		VariableUnion value = *(const VariableUnion *)entry;
+		entry += sizeof(VariableUnion);
+		DoSaveEntryInternal(type,value);
+	} while (--remaining);
 }
 
 /* ---- ReadStack  0x00473C30 ---- VERIFIED */
 VariableStackBuffer *ReadStack( void ) {
 	VariableStackBuffer *buf;
 	unsigned short       count;
-	unsigned short       saveId;
 	int                  codePos;
 	char                *entry;
 	int                  i;
@@ -2109,8 +2101,9 @@ VariableStackBuffer *ReadStack( void ) {
 	count = *(unsigned short *)scrSave_readPos;
 	scrSave_readPos += 2;
 
+	i = count;
 	buf = (VariableStackBuffer *)MT_Alloc(
-			SCR_STACKENTRY_SIZE * count + SCR_STACKBUFFER_HEADER, 1 );
+			SCR_STACKENTRY_SIZE * i + SCR_STACKBUFFER_HEADER, 1 );
 	buf->size = count;
 
 	buf->pos = *(const char **)scrSave_readPos;
@@ -2118,54 +2111,49 @@ VariableStackBuffer *ReadStack( void ) {
 
 	codePos = *(const int *)scrSave_readPos;
 	scrSave_readPos += 4;
-	buf->codePos = codePos < 0 ? NULL : (const char *)( scrVarPub_programBuffer + codePos );
+	buf->codePos = codePos >= 0 ? (const char *)(scrVarPub_programBuffer + codePos) : NULL;
 
-	saveId = *(unsigned short *)scrSave_readPos;
-	scrSave_readPos += 2;
-	buf->objectId = scrSave_saveIdToId[saveId];
-	AddRefToObject( buf->objectId );
+	buf->objectId = ReadId();
 
 	entry = (char *)buf + SCR_STACKBUFFER_HEADER;
-	for ( i = count; i != 0; i-- ) {
+	if (count) do {
 		VariableValue value;
 
 		DoLoadEntryInternal( &value );
-		entry[0] = (char)value.type;
-		*(VariableUnion *)( entry + 1 ) = value.u;
-		entry += SCR_STACKENTRY_SIZE;
-	}
+		*entry++ = (char)value.type;
+		*(VariableUnion *)entry = value.u;
+		entry += sizeof(VariableUnion);
+	} while (--i);
 	return buf;
 }
 
 /* ---- AddSaveStack__FPC19VariableStackBuffer  0x00473CF0 ---- VERIFIED */
 void AddSaveStack( const VariableStackBuffer *buf ) {
-	const char *entry;
-	int         i;
-
-	AddSaveObject( buf->objectId );
-
-	entry = (const char *)buf + SCR_STACKBUFFER_HEADER;
-	for ( i = buf->size; i != 0; i-- ) {
-		unsigned char   type = (unsigned char)entry[0];
-		VariableUnion   u    = *(const VariableUnion *)( entry + 1 );
-
-		entry += SCR_STACKENTRY_SIZE;
-		if ( type == VAR_OBJECT ) {
-			AddSaveObject( u.halfword[0] );
-		} else if ( type == VAR_STACK ) {
-			AddSaveStack( (const VariableStackBuffer *)u.pointerValue );
-		}
-	}
+	const char *entry = (const char *)buf;
+	unsigned short count;
+	int remaining;
+	AddSaveObject(((const VariableStackBuffer *)entry)->objectId);
+	count = ((const VariableStackBuffer *)entry)->size;
+	entry += SCR_STACKBUFFER_HEADER;
+	if (!count) return;
+	remaining = count;
+	do {
+		unsigned char type = (unsigned char)*entry++;
+		VariableUnion value = *(const VariableUnion *)entry;
+		entry += sizeof(VariableUnion);
+		AddSaveEntry(type,value);
+	} while (--remaining);
 }
 
 /* ---- AddSaveEntry__FUc13VariableUnion  0x00473D40 ---- VERIFIED */
 void AddSaveEntry( unsigned char type, VariableUnion u ) {
-	if ( type == VAR_OBJECT ) {
-		AddSaveObject( u.halfword[0] );
-		return;
-	}
-	if ( type == VAR_STACK ) {
+	switch ( type ) {
+	case VAR_OBJECT:
+		AddSaveObject( u.halfword.lo );
+		break;
+	case VAR_STACK:
 		AddSaveStack( (const VariableStackBuffer *)u.pointerValue );
+		break;
 	}
 }
 
@@ -2174,25 +2162,29 @@ void AddSaveEntry__FP21VariableValueInternal( VariableValueInternal *node ) {
 	AddSaveEntry( (unsigned char)VAR_TYPE( node ), node->u );
 }
 
-/* ---- Scr_GetEntryUsage  0x00473D90 ---- VERIFIED */
+/* ---- Scr_GetEntryUsage  0x00473D90 ---- VERIFIED
+   Retail returns the quotient unrounded in st0 (fild / fadd 1.0f / fdivp, no
+   fstp; FPU at _PC_53). The original float API preserves that x87 return
+   precision in VC7; single-precision literals select the retail DWORD operands. */
 float Scr_GetEntryUsage( unsigned char type, VariableUnion u ) {
-	VariableValueInternal *node;
-
-	if ( type != VAR_OBJECT ) {
-		return 0.0f;
+	if (type == VAR_OBJECT) {
+		VariableValueInternal *node = &scrVarNodes[u.halfword.lo];
+		if (VAR_TYPE(node) == VAR_ARRAY) {
+			float usage = Scr_GetObjectUsage(u.halfword.lo);
+			return usage / ((float)VAR_REFCOUNT(node) + 1.0f);
+		}
 	}
-	node = &scrVarNodes[ u.halfword[0] ];
-	if ( VAR_TYPE( node ) != VAR_ARRAY ) {
-		return 0.0f;
-	}
-	return Scr_GetObjectUsage( u.halfword[0] ) / ( (float)VAR_REFCOUNT( node ) + 1.0f );
+	return 0.0f;
 }
 
 float Scr_GetEntryUsage__FUc13VariableUnion( unsigned char type, VariableUnion u ) {
 	return Scr_GetEntryUsage( type, u );
 }
 
-/* ---- Scr_GetEntryUsage  0x00473DE0 ---- VERIFIED */
+/* ---- Scr_GetEntryUsage  0x00473DE0 ---- VERIFIED
+   Result stays in st0 (fadd 1.0f, no fstp).  Retail has no callers:
+   Scr_GetObjectUsage inlines it with its own association; kept for address
+   fidelity only. */
 float Scr_GetEntryUsage__FP21VariableValueInternal( VariableValueInternal *node ) {
 	return Scr_GetEntryUsage( (unsigned char)VAR_TYPE( node ), node->u ) + 1.0f;
 }
@@ -2207,21 +2199,24 @@ void DoSaveEntryInternal( unsigned char type, VariableUnion u ) {
 		WriteString( u.stringValue );
 		break;
 	case VAR_VECTOR:
-		WriteVector( (int *)u.vectorValue );
+		WriteVector(u.vectorValue);
 		break;
 	case VAR_FLOAT:
-		WriteFloat( u.intValue );
+		WriteFloat( u.floatValue );
 		break;
 	case VAR_INTEGER:
-	case VAR_ANIMATION:
 		WriteInt( u.intValue );
+		break;
+	case VAR_ANIMATION:
+		/* own case body: retail keeps a second, unmerged WriteInt call */
+		WriteInt( (int)u.uintValue );
 		break;
 	case VAR_CODEPOS:
 	case VAR_FUNCTION:
 		WriteCodepos( (int)u.codePosValue );
 		break;
 	case VAR_OBJECT:
-		WriteId( u.halfword[0] );
+		WriteId( u.halfword.lo );
 		break;
 	case VAR_STACK:
 		WriteStack( (const VariableStackBuffer *)u.pointerValue );
@@ -2236,31 +2231,30 @@ void DoSaveEntry( VariableValue *value, unsigned int name, char bIntern ) {
 	DoSaveEntryInternal( (unsigned char)value->type, value->u );
 
 	if ( bIntern && name < VAR_NAME_OBJECT_LIMIT ) {
-		if ( name >= VAR_NAME_OBJECT_BASE ) {
-			WriteByte( 3 );
-			WriteId( (unsigned short)name );
-		} else {
+		if ( name < VAR_NAME_OBJECT_BASE ) {
 			WriteByte( 2 );
 			WriteString( (unsigned short)name );
+		} else {
+			WriteByte( 3 );
+			WriteId( (unsigned short)name );
 		}
 		return;
 	}
 
-	if ( name >= VAR_NAME_OBJECT_BASE ) {
+	if ( name < VAR_NAME_OBJECT_BASE ) {
+		WriteByte( 0 );
+		WriteShort( (unsigned short)name );
+	} else {
 		WriteByte( 1 );
 		WriteInt( (int)name );
-	} else {
-		WriteByte( 0 );
-		WriteShort( (short)name );
 	}
 }
 
 /* ---- DoLoadEntryInternal  0x00473F80 ---- VERIFIED */
 void DoLoadEntryInternal( VariableValue *value ) {
-	unsigned char type = (unsigned char)*scrSave_readPos;
+	unsigned char type = (unsigned char)ReadByte();
 
 	value->type = type;
-	scrSave_readPos += 1;
 
 	switch ( type & VAR_STATUS_TYPE_MASK ) {
 	case VAR_STRING:
@@ -2271,20 +2265,20 @@ void DoLoadEntryInternal( VariableValue *value ) {
 		value->u.vectorValue = (const float *)ReadVector();
 		break;
 	case VAR_FLOAT:
-		value->u.floatValue = *(const float *)scrSave_readPos;
-		scrSave_readPos += 4;
+		value->u.floatValue = ReadFloat();
 		break;
 	case VAR_INTEGER:
+		value->u.intValue = ReadInt();
+		break;
 	case VAR_ANIMATION:
-		value->u.intValue = *(const int *)scrSave_readPos;
-		scrSave_readPos += 4;
+		value->u.intValue = ReadInt();
 		break;
 	case VAR_CODEPOS:
 	case VAR_FUNCTION:
 		value->u.codePosValue = (const char *)ReadCodepos();
 		break;
 	case VAR_OBJECT:
-		value->u.halfword[0] = ReadId();
+		value->u.halfword.lo = ReadId();
 		break;
 	case VAR_STACK:
 		value->u.pointerValue = ReadStack();
@@ -2310,8 +2304,7 @@ unsigned int DoLoadEntry( VariableValue *value ) {
 
 	switch ( tag ) {
 	case 0:
-		name = *(unsigned short *)scrSave_readPos;
-		scrSave_readPos += 2;
+		name = (unsigned short)ReadShort();
 		break;
 	case 1:
 		name = *(unsigned int *)scrSave_readPos;
@@ -2336,44 +2329,29 @@ unsigned int DoLoadEntry__FP13VariableValue( VariableValue *value ) {
 
 /* ---- AddSaveObject  0x00474090 ---- VERIFIED */
 void AddSaveObject( unsigned short id ) {
-	while ( scrSave_idToSaveId[id] == 0 ) {
-		VariableValueInternal  *node;
-		int                     parentType;
-		qboolean                bArray;
-		unsigned short          child;
-
-		scrSave_numSaveObjects++;
-		scrSave_idToSaveId[id] = scrSave_numSaveObjects;
-		scrSave_saveIdToId[ scrSave_numSaveObjects ] = id;
-
-		node       = &scrVarNodes[id];
-		parentType = VAR_TYPE( node );
-		bArray     = parentType == VAR_ARRAY ? qtrue : qfalse;
-
-		for ( child = scrVarIndirections[ node->nextSibling ].id;
-		      VAR_TYPE( &scrVarNodes[child] ) < VAR_THREAD && child != 0;
-		      child = scrVarIndirections[ scrVarNodes[child].nextSibling ].id ) {
+	unsigned short *saveMap = scrSave_idToSaveId;
+	while (!saveMap[id]) {
+		VariableValueInternal *node;
+		int parentType;
+		unsigned char isArray;
+		unsigned short child;
+		++scrSave_numSaveObjects;
+		saveMap[id] = scrSave_numSaveObjects;
+		scrSave_saveIdToId[scrSave_numSaveObjects] = id;
+		node = &scrVarNodes[id];
+		parentType = VAR_TYPE(node);
+		isArray = parentType == VAR_ARRAY;
+		for ( child = FindNextSibling( id ); child; child = FindNextSibling( child ) ) {
 			VariableValueInternal *entry = &scrVarNodes[child];
-
-			if ( bArray ) {
-				unsigned int name = VAR_NAME( entry );
-
-				if ( name >= VAR_NAME_OBJECT_BASE && name < VAR_NAME_OBJECT_LIMIT ) {
-					AddSaveObject( (unsigned short)name );
-				}
+			if (isArray) {
+				unsigned int name = VAR_NAME(entry);
+				if (name >= VAR_NAME_OBJECT_BASE && name < VAR_NAME_OBJECT_LIMIT) AddSaveObject((unsigned short)name);
 			}
-
-			if ( VAR_TYPE( entry ) == VAR_OBJECT ) {
-				AddSaveObject( VAR_OBJECTID( entry ) );
-			} else if ( VAR_TYPE( entry ) == VAR_STACK ) {
-				AddSaveStack( (const VariableStackBuffer *)entry->u.pointerValue );
-			}
+			AddSaveEntry((unsigned char)VAR_TYPE(entry),entry->u);
 		}
-
-		if ( parentType != VAR_THREAD ) {
-			return;
-		}
-		id = VAR_SELF( node );
+		saveMap = scrSave_idToSaveId;
+		if (parentType != VAR_THREAD) return;
+		id = VAR_SELF(node);
 	}
 }
 
@@ -2387,22 +2365,23 @@ float Scr_GetEndonUsage( unsigned short id ) {
 	handle = FindVariableIndexInternal( scrVarPub_pauseArrayId,
 										id + VAR_NAME_OBJECT_BASE );
 	node = scrVarIndirections[handle].id;
-	if ( !node ) {
-		return 0.0f;
+	if ( node ) {
+		return Scr_GetObjectUsage( VAR_OBJECTID( &scrVarNodes[node] ) );
 	}
-	return Scr_GetObjectUsage( VAR_OBJECTID( &scrVarNodes[node] ) );
+	return 0.0f;
 }
 
 float Scr_GetEndonUsage__FUs( unsigned short id ) { return Scr_GetEndonUsage( id ); }
 
+float Scr_GetEntryUsage__FP21VariableValueInternal( VariableValueInternal *node );
+
 /* ---- Scr_GetObjectUsage  0x00474220 ---- VERIFIED */
 float Scr_GetObjectUsage( unsigned short id ) {
-	float           usage = 1.0f;
+	float           usage;
 	unsigned short  child;
 
-	for ( child = scrVarIndirections[ scrVarNodes[id].nextSibling ].id;
-	      VAR_TYPE( &scrVarNodes[child] ) < VAR_THREAD && child != 0;
-	      child = scrVarIndirections[ scrVarNodes[child].nextSibling ].id ) {
+	usage = 1.0f;
+	for ( child = FindNextSibling( id ); child; child = FindNextSibling( child ) ) {
 		usage += Scr_GetEntryUsage__FP21VariableValueInternal( &scrVarNodes[child] );
 	}
 	return usage;
@@ -2412,38 +2391,34 @@ float Scr_GetObjectUsage__FUs( unsigned short id ) { return Scr_GetObjectUsage( 
 
 /* ---- Scr_GetThreadUsage  0x00474310 ---- VERIFIED */
 float Scr_GetThreadUsage( const VariableStackBuffer *buf, float *endonUsage ) {
+	int             size;
+	const char     *pos;
 	float           usage;
-	const char     *entry;
-	int             i;
 
-	usage       = Scr_GetObjectUsage( buf->objectId );
+	size  = buf->size;
+	pos   = (const char *)buf + SCR_STACKBUFFER_HEADER + SCR_STACKENTRY_SIZE * size;
+	usage = Scr_GetObjectUsage( buf->objectId );
 	*endonUsage = Scr_GetEndonUsage( buf->objectId );
 
-	entry = (const char *)buf + SCR_STACKBUFFER_HEADER
-			+ SCR_STACKENTRY_SIZE * buf->size;
-
-	for ( i = buf->size; i != 0; ) {
+	while ( size ) {
 		unsigned char   type;
 		VariableUnion   u;
 
-		u = *(const VariableUnion *)( entry - 4 );
-		entry -= SCR_STACKENTRY_SIZE;
-		type  = (unsigned char)entry[0];
-		i--;
-
-		if ( type == VAR_CODEPOS ) {
-			VariableUnion frame;
-
-			frame  = *(const VariableUnion *)( entry - 4 );
-			entry -= SCR_STACKENTRY_SIZE;
-			i--;
-
-			usage       += Scr_GetObjectUsage( frame.halfword[0] );
-			*endonUsage += Scr_GetEndonUsage( frame.halfword[0] );
-			continue;
+		pos -= 4;
+		u = *(const VariableUnion *)pos;
+		pos--;
+		type = (unsigned char)*pos;
+		size--;
+		if ( type != VAR_CODEPOS ) {
+			usage += Scr_GetEntryUsage( type, u );
+		} else {
+			pos -= 4;
+			u = *(const VariableUnion *)pos;
+			pos--;
+			size--;
+			usage += Scr_GetObjectUsage( u.halfword.lo );
+			*endonUsage += Scr_GetEndonUsage( u.halfword.lo );
 		}
-
-		usage += Scr_GetEntryUsage( type, u );
 	}
 	return usage;
 }
@@ -2457,8 +2432,8 @@ float Scr_GetThreadUsage__FPC19VariableStackBufferPf( const VariableStackBuffer 
 void DoSaveObjectInfo( unsigned short id ) {
 	VariableValueInternal  *node = &scrVarNodes[id];
 	unsigned char           status;
-	int                     type;
-	char                    bArray;
+	unsigned char           type;
+	unsigned char           bArray;
 	unsigned short          count;
 	unsigned short          child;
 
@@ -2477,21 +2452,17 @@ void DoSaveObjectInfo( unsigned short id ) {
 	bArray = (char)( VAR_TYPE( node ) == VAR_ARRAY );
 
 	count = 0;
-	for ( child = scrVarIndirections[ node->nextSibling ].id;
-	      VAR_TYPE( &scrVarNodes[child] ) < VAR_THREAD && child != 0;
-	      child = scrVarIndirections[ scrVarNodes[child].nextSibling ].id ) {
+	for (child = FindNextSibling(id); child; child = FindNextSibling(child)) {
 		count++;
 	}
 	WriteShort( (short)count );
 
-	for ( child = scrVarIndirections[ node->nextSibling ].id;
-	      VAR_TYPE( &scrVarNodes[child] ) < VAR_THREAD && child != 0;
-	      child = scrVarIndirections[ scrVarNodes[child].nextSibling ].id ) {
+	for (child = FindNextSibling(id); child; child = FindNextSibling(child)) {
 		VariableValueInternal  *entry = &scrVarNodes[child];
 		VariableValue           value;
 
+		value.type = (unsigned char)( entry->status & 0x9F );
 		value.u    = entry->u;
-		value.type = (int)( entry->status & 0x9F );
 		DoSaveEntry( &value, VAR_NAME( entry ), bArray );
 	}
 }
@@ -2501,18 +2472,18 @@ void DoSaveObjectInfo__FUs( unsigned short id ) { DoSaveObjectInfo( id ); }
 /* ---- DoLoadObjectInfo  0x004746C0 ---- VERIFIED */
 void DoLoadObjectInfo( unsigned short id ) {
 	VariableValueInternal  *node = &scrVarNodes[id];
-	unsigned char           status;
-	int                     type;
-	qboolean                bArray;
+	int                     status;
+	unsigned char           type;
+	unsigned char           bArray;
 	unsigned short          count;
 	int                     i;
 
-	status = (unsigned char)*scrSave_readPos;
+	type = *(unsigned char *)scrSave_readPos;
 	scrSave_readPos += 1;
 
-	node->status = ( node->status & ~VAR_STATUS_TYPE_MASK ) | status;
-
-	type = status & VAR_STATUS_TYPE_MASK;
+	status = ( node->status & ~VAR_STATUS_TYPE_MASK ) | type;
+	node->status = status;
+	type &= VAR_STATUS_TYPE_MASK;
 	if ( type == VAR_THREAD ) {
 		unsigned short saveId;
 		unsigned short self;
@@ -2526,27 +2497,23 @@ void DoLoadObjectInfo( unsigned short id ) {
 		node->status |= (unsigned int)(unsigned short)SafeReadString()
 						<< VAR_STATUS_NAME_SHIFT;
 	} else if ( type == VAR_ENTITY || type == VAR_DEADENTITY ) {
-		VAR_ENTNUM( node ) = *(unsigned short *)scrSave_readPos;
-		scrSave_readPos += 2;
-		node->status |= (unsigned int)*(unsigned short *)scrSave_readPos
-						<< VAR_STATUS_NAME_SHIFT;
-		scrSave_readPos += 2;
+		VAR_ENTNUM( node ) = ReadShort();
+		node->status = status | (unsigned int)(unsigned short)ReadShort() << VAR_STATUS_NAME_SHIFT;
 	} else if ( type == VAR_ARRAY ) {
 		VAR_ARRAYSIZE( node ) = 0;
 	}
 
 	bArray = type == VAR_ARRAY ? qtrue : qfalse;
 
-	count = *(unsigned short *)scrSave_readPos;
-	scrSave_readPos += 2;
+	count = (unsigned short)ReadShort();
 
-	for ( i = count; i != 0; i-- ) {
+	for ( i = count; i > 0; i-- ) {
 		VariableValue   value;
 		unsigned int    name;
-		unsigned short  child;
+		VariableValueInternal *entry;
 
 		name  = DoLoadEntry( &value );
-		child = scrVarIndirections[ GetVariableIndexInternal( id, name ) ].id;
+		entry = &scrVarNodes[ scrVarIndirections[ GetVariableIndexInternal( id, name ) ].id ];
 
 		if ( bArray ) {
 			if ( name < VAR_NAME_OBJECT_BASE ) {
@@ -2556,18 +2523,19 @@ void DoLoadObjectInfo( unsigned short id ) {
 			}
 		}
 
-		SetNewVariableValue( child, &value );
+		entry->status |= (unsigned int)value.type;
+		entry->u = value.u;
 	}
 }
 
 void DoLoadObjectInfo__FUs( unsigned short id ) { DoLoadObjectInfo( id ); }
 
 /* ---- Scr_SavePre  0x00474880 ---- VERIFIED */
-void Scr_SavePre( void ) {
+void Scr_SavePre( int sys ) {
 	unsigned int i;
 
-	scrSave_idToSaveId = Hunk_AllocateTempMemoryHighInternal( SCR_SAVE_IDMAP_SIZE );
-	scrSave_saveIdToId = Hunk_AllocateTempMemoryHighInternal( SCR_SAVE_IDMAP_SIZE );
+	scrSave_idToSaveId = (unsigned short *)Hunk_AllocateTempMemoryHighInternal( SCR_SAVE_IDMAP_SIZE );
+	scrSave_saveIdToId = (unsigned short *)Hunk_AllocateTempMemoryHighInternal( SCR_SAVE_IDMAP_SIZE );
 	Com_Memset( scrSave_idToSaveId, 0, SCR_SAVE_IDMAP_SIZE );
 
 	scrSave_numSaveObjects = 0;
@@ -2584,23 +2552,24 @@ void Scr_SavePre( void ) {
 			scrVarIndirections[ FindVariableIndexInternal( scrVarPub_classId, i ) ].id ] ) );
 	}
 
-	AddSaveEntry__FP21VariableValueInternal( &scrVarNodes[scrVarPub_gameId] );
+	AddSaveEntry__FP21VariableValueInternal( &scrVarNodes[scrVarPub_gameId.handle] );
 }
 
 /* ---- WriteGameEntry  0x00474A30 ---- VERIFIED */
 void WriteGameEntry__Fv( void ) {
-	VariableValueInternal *node = &scrVarNodes[scrVarPub_gameId];
-
-	DoSaveEntryInternal( (unsigned char)( node->status & 0x9F ), node->u );
+	DoSaveEntryInternal( (unsigned char)( scrVarNodes[scrVarPub_gameId.handle].status & 0x9F ),
+						 scrVarNodes[scrVarPub_gameId.handle].u );
 }
 
 /* ---- ReadGameEntry  0x00474A60 ---- VERIFIED */
 void ReadGameEntry__Fv( void ) {
 	VariableValue value;
 
-	scrVarPub_gameId = AllocValue();
+	scrVarPub_gameId.handle = AllocValue();
 	DoLoadEntryInternal( &value );
-	SetNewVariableValue( scrVarPub_gameId, &value );
+	/* indexed twice, not SetNewVariableValue: retail addresses [id*12+base] */
+	scrVarNodes[scrVarPub_gameId.handle].status |= (unsigned int)value.type;
+	scrVarNodes[scrVarPub_gameId.handle].u = value.u;
 }
 
 /* ---- Scr_SavePost  0x00474AC0 ---- VERIFIED */
@@ -2628,13 +2597,8 @@ void Scr_SavePost( void ) {
 }
 
 /* ---- Scr_SaveShutdown  0x00474DA0 ---- VERIFIED */
-int Scr_SaveShutdown()
-{
-  int result;
-
-  result = *(_DWORD *)hunk_highUsed;
-  *(_DWORD *)hunk_highTemp = *(_DWORD *)hunk_highUsed;
-  return result;
+int Scr_SaveShutdown( void ) {
+	return Hunk_ClearTempMemoryHigh();
 }
 
 /* ---- Scr_LoadPre  0x00474DB0 ---- VERIFIED */
@@ -2642,16 +2606,14 @@ void Scr_LoadPre( void ) {
 	unsigned int    i;
 	VariableValue   value;
 
-	scrSave_readPos = scrImport_LoadRead( 4 );
-	scrSave_readPos = scrImport_LoadRead( *(int *)scrSave_readPos );
+	scrSave_readPos = SCR_LOAD_READ( 4 );
+	scrSave_readPos = SCR_LOAD_READ( *(int *)scrSave_readPos );
 
-	scrVarPub_time = (unsigned int)*(int *)scrSave_readPos;
-	scrSave_readPos += 4;
-	scrSave_numSaveObjects = *(unsigned short *)scrSave_readPos;
-	scrSave_readPos += 2;
+	scrVarPub_time = (unsigned int)ReadInt();
+	scrSave_numSaveObjects = (unsigned short)ReadShort();
 
-	scrSave_idToSaveId = Hunk_AllocateTempMemoryInternal( SCR_SAVE_IDMAP_SIZE );
-	scrSave_saveIdToId = Hunk_AllocateTempMemoryInternal(
+	scrSave_idToSaveId = (unsigned short *)Hunk_AllocateTempMemoryInternal( SCR_SAVE_IDMAP_SIZE );
+	scrSave_saveIdToId = (unsigned short *)Hunk_AllocateTempMemoryInternal(
 						2 * (int)scrSave_numSaveObjects + 2 );
 
 	for ( i = 1; i <= scrSave_numSaveObjects; i++ ) {
@@ -2674,7 +2636,7 @@ void Scr_LoadPre( void ) {
 
 	value.type = VAR_OBJECT;
 	for ( i = 0; i < scrVarPub_classNum; i++ ) {
-		value.u.halfword[0] = ReadId();
+		value.u.halfword.lo = ReadId();
 		SetVariableValue(
 			scrVarIndirections[ FindVariableIndexInternal( scrVarPub_entId, i ) ].id,
 			&value );
@@ -2689,8 +2651,8 @@ void Scr_LoadShutdown( void ) {
 		RemoveRefToObject( scrSave_saveIdToId[i] );
 	}
 
-	Hunk_FreeTempMemoryInternal( scrSave_saveIdToId );
-	Hunk_FreeTempMemoryInternal( scrSave_idToSaveId );
+	Hunk_FreeTempMemory( scrSave_saveIdToId );
+	Hunk_FreeTempMemory( scrSave_idToSaveId );
 }
 
 /* ---- Scr_FindField  0x004751B0 ---- VERIFIED */
@@ -2700,11 +2662,15 @@ short __cdecl Scr_FindField( const char *name, int *typeOut ) {
 	while ( *cursor ) {
 		unsigned int nameSize = strlen( cursor ) + 1;
 
-		if ( !Q_stricmp( name, cursor ) ) {
+		/* retail 0x004751D5: CRT _stricmp (0x0053549F), not Q_stricmp */
+		if ( !_stricmp( name, cursor ) ) {
 			unsigned short offset;
+			int            type;
 
-			memcpy( &offset, cursor + nameSize, sizeof( offset ) );
-			*typeOut = (int)(signed char)cursor[ nameSize + 2 ];
+			cursor += nameSize;
+			type = (int)(signed char)cursor[2];
+			memcpy( &offset, cursor, sizeof( offset ) );
+			*typeOut = type;
 			return (short)offset;
 		}
 		cursor += nameSize + 3;
@@ -2739,8 +2705,9 @@ static void Scr_AddFieldsForFile( const char *filename ) {
 		unsigned short  canonical;
 		int             existingType;
 		char           *record;
+		int             i;
 
-		token = Com_ParseExt( &parse, qtrue );
+		token = Com_Parse( &parse );
 		if ( parse == NULL ) {
 			break;
 		}
@@ -2756,22 +2723,17 @@ static void Scr_AddFieldsForFile( const char *filename ) {
 			return;
 		}
 
-		token = Com_ParseExt( &parse, qtrue );
+		token = Com_Parse( &parse );
 		if ( parse == NULL ) {
 			Com_Error( ERR_DROP, va( "\x15" "missing field name in '%s'", filename ) );
-			return;
 		}
 
 		nameSize = strlen( token ) + 1;
-		{
-			unsigned int i;
-
-			for ( i = 0; i < nameSize; i++ ) {
-				token[i] = (char)tolower( (unsigned char)token[i] );
-			}
+		for ( i = nameSize - 1; i >= 0; i-- ) {
+			token[i] = (char)tolower( token[i] );
 		}
 
-		canonical = scrString_canonicalMap[ SL_FindStringOfLen( token, nameSize ) ];
+		canonical = SL_FindCanonicalString( token );
 		if ( !canonical ) {
 			continue;
 		}
@@ -2782,9 +2744,11 @@ static void Scr_AddFieldsForFile( const char *filename ) {
 
 		record = (char *)TempMalloc( (int)nameSize + 3 );
 		strcpy( record, token );
-		memcpy( record + nameSize, &canonical, sizeof( canonical ) );
-		record[ nameSize + 2 ] = (char)fieldType;
-		record[ nameSize + 3 ] = '\0';
+		record += nameSize;
+		*(unsigned short *)record = canonical;
+		record += 2;
+		record[0] = (char)fieldType;
+		record[1] = '\0';
 	}
 
 	Com_EndParseSession();
@@ -2812,7 +2776,8 @@ void __cdecl Scr_AddFields( const char *path, const char *extension ) {
 	for ( i = 0; i < numfiles; i++ ) {
 		char qpath[64];
 
-		Com_sprintf( qpath, sizeof( qpath ), "%s/%s", path, files[i] );
+		/* retail 0x00475551: unbounded CRT sprintf (0x00525208) into char[64] */
+		sprintf( qpath, "%s/%s", path, files[i] );
 		Scr_AddFieldsForFile( qpath );
 	}
 
@@ -2831,48 +2796,38 @@ void __cdecl Scr_FreeValue( unsigned short id ) {
 }
 
 /* ---- Scr_MakeValuePrimitive  0x00475660 ---- VERIFIED */
-int __cdecl Scr_MakeValuePrimitive( unsigned short arrayId ) {
-	if ( VAR_TYPE( &scrVarNodes[arrayId] ) != VAR_ARRAY ) {
+int __cdecl Scr_MakeValuePrimitive( unsigned short parentId ) {
+	unsigned short          id;
+	VariableValueInternal  *entryValue;
+	unsigned int            status;
+	unsigned int            name;
+
+	if ( VAR_TYPE( &scrVarNodes[parentId] ) != VAR_ARRAY ) {
 		return 0;
 	}
 
-	for ( ;; ) {
-		unsigned short child = FindNextSibling( arrayId );
-
-		while ( child ) {
-			unsigned int    name = VAR_NAME( &scrVarNodes[child] );
-			int             strip;
-
-			switch ( VAR_TYPE( &scrVarNodes[child] ) ) {
-			case VAR_CODEPOS:
-			case VAR_FUNCTION:
-			case VAR_STACK:
-			case VAR_ANIMATION:
-				strip = 1;
-				break;
-			case VAR_OBJECT:
-				strip = !Scr_MakeValuePrimitive( VAR_OBJECTID( &scrVarNodes[child] ) );
-				break;
-			default:
-				strip = 0;
-				break;
+	/* Mac 1.3 shape: removing a child restarts the walk */
+restart:
+	for ( id = FindNextSibling( parentId ); id; id = FindNextSibling( id ) ) {
+		entryValue = &scrVarNodes[id];
+		status = entryValue->status;
+		name = status >> VAR_STATUS_NAME_SHIFT;
+		switch ( status & VAR_STATUS_TYPE_MASK ) {
+		case VAR_CODEPOS:
+		case VAR_FUNCTION:
+		case VAR_STACK:
+		case VAR_ANIMATION:
+			RemoveVariable( parentId, name );
+			goto restart;
+		case VAR_OBJECT:
+			if ( !Scr_MakeValuePrimitive( entryValue->u.halfword.lo ) ) {
+				RemoveVariable( parentId, name );
+				goto restart;
 			}
-
-			if ( strip ) {
-				unsigned short          handle = FindVariableIndexInternal( arrayId, name );
-				VariableValueInternal  *doomed = &scrVarNodes[ scrVarIndirections[handle].id ];
-
-				MakeVariableExternal( &scrVarIndirections[handle], &scrVarNodes[arrayId] );
-				FreeValueInternal( doomed );
-				break;
-			}
-			child = FindNextSibling( child );
-		}
-
-		if ( !child ) {
-			return 1;
+			break;
 		}
 	}
+	return 1;
 }
 
 int Scr_MakeValuePrimitive__FUs( unsigned short arrayId ) {
@@ -2881,34 +2836,30 @@ int Scr_MakeValuePrimitive__FUs( unsigned short arrayId ) {
 
 /* ---- Scr_AllocGameVariable  0x00475790 ---- VERIFIED */
 void __cdecl Scr_AllocGameVariable( void ) {
-	if ( !scrVarPub_gameId ) {
-		scrVarPub_gameId = AllocValue();
-		SetEmptyArray( scrVarPub_gameId );
+	if ( !scrVarPub_gameId.handle ) {
+		scrVarPub_gameId.handle = AllocValue();
+		SetEmptyArray( scrVarPub_gameId.word );
 	}
 }
 
 /* ---- Scr_FreeGameVariable  0x004757D0 ---- VERIFIED */
 void __cdecl Scr_FreeGameVariable( int bComplete ) {
-	if ( !bComplete ) {
-		Scr_MakeValuePrimitive( VAR_OBJECTID( &scrVarNodes[ scrVarPub_gameId ] ) );
+	if ( bComplete ) {
+		FreeValueInternal( &scrVarNodes[ scrVarPub_gameId.handle ] );
+		scrVarPub_gameId.handle = 0;
 		return;
 	}
-	FreeValueInternal( &scrVarNodes[ scrVarPub_gameId ] );
-	scrVarPub_gameId = 0;
+	Scr_MakeValuePrimitive( VAR_OBJECTID( &scrVarNodes[ scrVarPub_gameId.handle ] ) );
 }
 
 /* ---- Scr_GetChecksum  0x00475810 ---- VERIFIED */
-_DWORD *__cdecl Scr_GetChecksum(_DWORD *a1)
-{
-  _DWORD *result;
-  int v2;
-  int v3;
-
-  result = a1;
-  v2 = scrCompilePub_programLen;
-  *a1 = scrCompilePub_checksum;
-  v3 = dword_1407384;
-  a1[1] = v2;
-  a1[2] = v3 - scrVarPub_programBuffer;
-  return result;
+unsigned int *__cdecl Scr_GetChecksum( unsigned int *out ) {
+	out[0] = scrCompilePub_checksum;
+	out[1] = scrCompilePub_programLen;
+	out[2] = scrVarPub_endScriptBuffer - scrVarPub_programBuffer;
+	return out;
 }
+
+#ifdef __cplusplus
+}
+#endif

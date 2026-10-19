@@ -7,24 +7,32 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "../qcommon/vc7_compat.h"
+
 extern char *CopyStringInternal( const char *in );
 extern void *Cvar_Set2( const char *var_name, const char *value, int force );
 extern void  Sys_QueEvent( int time, int type, int value, int value2,
                            int ptrLength, void *ptr );
 extern char *SEH_GetLocalizedString_m( const char *key );
 extern char *va( char *format, ... );
+extern void  Sys_Error( const char *error, ... );
 
 extern const char *com_quitReason;
 
 void Conbuf_AppendText( const char *msg );
 
+/* Tree-only dedicated-build extension (no retail counterpart): the stdout TTY
+ * mirror / reader (win_syscon_console.c) and the "-nowindow" headless switch.
+ * Everything under #ifdef DEDICATED below is compiled out of the CodMP client,
+ * which follows retail 0x00465C90..0x00466980 exactly. */
+#ifdef DEDICATED
 extern void  Sys_TtyConsole_Init( void );
 extern void  Sys_TtyConsole_Shutdown( void );
 extern void  Sys_TtyConsole_Print( const char *msg );
 extern char *Sys_TtyConsole_Input( void );
+#endif
 
-extern void *g_wv_hInstance;
-extern void *g_splashWnd;
+#include "../qcommon/win_vars.h"
 
 extern void *com_dedicated;
 extern void *com_viewlog;
@@ -55,13 +63,18 @@ typedef struct {
 	HWND        hwndButtonCopy;
 	HWND        hwndButtonQuit;
 	HWND        hwndErrorBox;
-	HWND        hwndInputLine;
+	HWND        hwndErrorText;
+
+	HBITMAP     hbmLogo;
+	HBITMAP     hbmClearBitmap;
 
 	HBRUSH      hbrEditBackground;
 	HBRUSH      hbrErrorBackground;
-	HFONT       hfBufferFont;
 
-	WNDPROC     SysInputLineWndProc;
+	HFONT       hfBufferFont;
+	HFONT       hfButtonFont;
+
+	HWND        hwndInputLine;
 
 	char        errorString[512];
 	char        consoleText[512];
@@ -71,23 +84,31 @@ typedef struct {
 	int         quitOnClose;
 	int         windowWidth;
 	int         windowHeight;
+
+	WNDPROC     SysInputLineWndProc;
+
 	int         timePolarity;
-} WinConData;
+} WinConData;   /* retail s_wcd 0x8E5270, 0x650 bytes (Q3 layout + timePolarity) */
+
+void               *g_splashWnd;   /* 0x008E5268, the splash window (HWND) */
 
 static WinConData   s_wcd;
 
 static int          s_totalChars;
 
+#ifdef DEDICATED
 static int          s_noWindow = -1;
 
 static int          s_consoleInitialized;
+#endif
 
 static LRESULT CALLBACK ConWndProc( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam );
 
 static LRESULT CALLBACK InputLineWndProc( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam );
 
+#ifdef DEDICATED
 /* ---- Sys_ConsoleWindowWanted  no-address ---- */
-static int Sys_ConsoleWindowWanted( void ) {
+int Sys_ConsoleWindowWanted( void ) {
 	char    cmd[1024];
 	LPSTR   raw;
 
@@ -108,22 +129,16 @@ static int Sys_ConsoleWindowWanted( void ) {
 
 	return !s_noWindow;
 }
+#endif
 
 /* ---- ConWndProc  0x00465E80 ---- */
 static LRESULT CALLBACK ConWndProc( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam ) {
-	int     cx, cy;
-	int     bw;
-	int     x, y, w, h;
 	char    *cmdString;
-	HDC     hdc;
+	int     cx, cy;
+	rfloat  sx;
+	int     x, y, w, h;
 
 	switch ( uMsg ) {
-
-	case WM_CREATE:
-		s_wcd.hbrEditBackground  = CreateSolidBrush( CONSOLE_BG_COLOR );
-		s_wcd.hbrErrorBackground = CreateSolidBrush( ERRORBOX_BG_COLOR );
-		SetTimer( hWnd, 1, 1000, NULL );
-		break;
 
 	case WM_SIZE:
 		cx = (int) LOWORD( lParam );
@@ -135,17 +150,33 @@ static LRESULT CALLBACK ConWndProc( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM 
 		h = cy - 100;
 		SetWindowPos( s_wcd.hwndBuffer, NULL, x, y, w, h, 0 );
 
-		y = h + 48;
-		SetWindowPos( s_wcd.hwndInputLine, NULL, x, y, w, 20, 0 );
+		y = y + h + 8;
+		h = 20;
+		SetWindowPos( s_wcd.hwndInputLine, NULL, x, y, w, h, 0 );
 
-		y = h + 72;
-		bw = (int) ( (double) cx * ( 1.0 / (double) SYSCON_DEFAULT_WIDTH ) * 72.0 );
-		SetWindowPos( s_wcd.hwndButtonCopy,  NULL, 5,             y, bw, 24, 0 );
-		SetWindowPos( s_wcd.hwndButtonClear, NULL, bw + 7,        y, bw, 24, 0 );
-		SetWindowPos( s_wcd.hwndButtonQuit,  NULL, cx - bw - 15,  y, bw, 24, 0 );
+		y = y + h + 4;
+		/* 0x00465EF5: fild cx; fmul dword [5690D4h] (1/540 as float, 0x3AF2B9D6);
+		 * fmul dword [5690D0h] (72.0f); __ftol at _PC_53.  The scale is the
+		 * float-rounded 1/540 widened to double, so multiples of 15 truncate
+		 * one lower than exact 1/540 would (cx=540 gives 71). */
+#ifdef COD1_VC7
+		sx = (float) cx / SYSCON_DEFAULT_WIDTH;
+		w = (int) ( 72 * sx );
+#else
+		sx = (double) cx * (double) (float) ( 1.0 / (double) SYSCON_DEFAULT_WIDTH );
+		w = (int) ( sx * 72.0 );
+#endif
+		h = 24;
+		SetWindowPos( s_wcd.hwndButtonCopy, NULL, x, y, w, h, 0 );
 
-		s_wcd.windowHeight = cy;
+		x = x + w + 2;
+		SetWindowPos( s_wcd.hwndButtonClear, NULL, x, y, w, h, 0 );
+
+		x = cx - 15 - w;
+		SetWindowPos( s_wcd.hwndButtonQuit, NULL, x, y, w, h, 0 );
+
 		s_wcd.windowWidth  = cx;
+		s_wcd.windowHeight = cy;
 		break;
 
 	case WM_ACTIVATE:
@@ -168,7 +199,10 @@ static LRESULT CALLBACK ConWndProc( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM 
 
 	case WM_CLOSE:
 		if ( com_dedicated && CVAR_INTEGER( com_dedicated ) ) {
+#ifdef DEDICATED
+			/* tree-only diagnostic; retail 0x00465FFE stores nothing */
 			com_quitReason = "console window closed";
+#endif
 			cmdString = CopyStringInternal( "quit" );
 			Sys_QueEvent( 0, SE_CONSOLE, 0, 0, (int) strlen( cmdString ) + 1, cmdString );
 			return 0;
@@ -187,28 +221,53 @@ static LRESULT CALLBACK ConWndProc( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM 
 		Cvar_Set2( "viewlog", "0", 1 );
 		return 0;
 
+	case WM_CTLCOLORSTATIC:
+		if ( (HWND) lParam == s_wcd.hwndBuffer ) {
+			SetBkColor( (HDC) wParam, CONSOLE_BG_COLOR );
+			SetTextColor( (HDC) wParam, 0x00FFFFFF );
+			return (LRESULT) s_wcd.hbrEditBackground;
+		} else if ( (HWND) lParam == s_wcd.hwndErrorBox ) {
+			if ( s_wcd.timePolarity & 1 ) {
+				SetBkColor( (HDC) wParam, ERRORBOX_BG_COLOR );
+				SetTextColor( (HDC) wParam, 0x000000FF );
+			} else {
+				SetBkColor( (HDC) wParam, ERRORBOX_BG_COLOR );
+				SetTextColor( (HDC) wParam, 0x00000000 );
+			}
+			return (LRESULT) s_wcd.hbrErrorBackground;
+		}
+		break;
+
 	case WM_COMMAND:
-		switch ( wParam ) {
-		case COPY_ID:
+		if ( wParam == COPY_ID ) {
 			SendMessage( s_wcd.hwndBuffer, EM_SETSEL, 0, (LPARAM) -1 );
 			SendMessage( s_wcd.hwndBuffer, WM_COPY, 0, 0 );
-			break;
-		case QUIT_ID:
+		} else if ( wParam == QUIT_ID ) {
 			if ( s_wcd.quitOnClose ) {
 				PostQuitMessage( 0 );
 			} else {
+#ifdef DEDICATED
+				/* tree-only diagnostic; retail 0x00466210 stores nothing */
 				com_quitReason = "console quit button";
+#endif
 				cmdString = CopyStringInternal( "quit" );
 				Sys_QueEvent( 0, SE_CONSOLE, 0, 0, (int) strlen( cmdString ) + 1, cmdString );
 			}
-			break;
-		case CLEAR_ID:
+		} else if ( wParam == CLEAR_ID ) {
 			SendMessage( s_wcd.hwndBuffer, EM_SETSEL, 0, (LPARAM) -1 );
 			SendMessage( s_wcd.hwndBuffer, EM_REPLACESEL, 0, (LPARAM) "" );
 			UpdateWindow( s_wcd.hwndBuffer );
-			break;
 		}
 		break;
+
+	case WM_CREATE:
+		s_wcd.hbrEditBackground  = CreateSolidBrush( CONSOLE_BG_COLOR );
+		s_wcd.hbrErrorBackground = CreateSolidBrush( ERRORBOX_BG_COLOR );
+		SetTimer( hWnd, 1, 1000, NULL );
+		break;
+
+	case WM_ERASEBKGND:
+		return DefWindowProc( hWnd, uMsg, wParam, lParam );	/* 0x004660C7 */
 
 	case WM_TIMER:
 		if ( wParam == 1 ) {
@@ -216,20 +275,6 @@ static LRESULT CALLBACK ConWndProc( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM 
 			if ( s_wcd.hwndErrorBox ) {
 				InvalidateRect( s_wcd.hwndErrorBox, NULL, FALSE );
 			}
-		}
-		break;
-
-	case WM_CTLCOLORSTATIC:
-		hdc = (HDC) wParam;
-		if ( (HWND) lParam == s_wcd.hwndBuffer ) {
-			SetBkColor( hdc, CONSOLE_BG_COLOR );
-			SetTextColor( hdc, 0x00FFFFFF );
-			return (LRESULT) s_wcd.hbrEditBackground;
-		}
-		if ( (HWND) lParam == s_wcd.hwndErrorBox ) {
-			SetBkColor( hdc, ERRORBOX_BG_COLOR );
-			SetTextColor( hdc, s_wcd.timePolarity ? 0x000000FF : 0x00000000 );
-			return (LRESULT) s_wcd.hbrErrorBackground;
 		}
 		break;
 	}
@@ -274,6 +319,8 @@ void Sys_CreateConsole( void ) {
 	int         swidth, sheight;
 	int         nHeight;
 
+#ifdef DEDICATED
+	/* Tree-only: retail starts directly at memset( &wc ) (0x004663F0). */
 	if ( s_consoleInitialized ) {
 		return;
 	}
@@ -284,6 +331,7 @@ void Sys_CreateConsole( void ) {
 	if ( !Sys_ConsoleWindowWanted() ) {
 		return;
 	}
+#endif
 
 	memset( &wc, 0, sizeof( wc ) );
 	wc.style         = 0;
@@ -321,8 +369,8 @@ void Sys_CreateConsole( void ) {
 	                             CONSOLE_WINDOW_STYLE,
 	                             ( swidth - 600 ) / 2,
 	                             ( sheight - SYSCON_DEFAULT_HEIGHT ) / 2,
-	                             s_wcd.windowWidth,
-	                             s_wcd.windowHeight,
+	                             rect.right - rect.left + 1,
+	                             rect.bottom - rect.top + 1,
 	                             NULL, NULL,
 	                             (HINSTANCE) g_wv_hInstance, NULL );
 	if ( s_wcd.hWnd == NULL ) {
@@ -392,7 +440,9 @@ void Sys_DestroyConsole( void ) {
 		DestroyWindow( s_wcd.hWnd );
 		s_wcd.hWnd = NULL;
 	}
-	Sys_TtyConsole_Shutdown();
+#ifdef DEDICATED
+	Sys_TtyConsole_Shutdown();	/* tree-only */
+#endif
 }
 
 /* ---- Sys_ShowConsole  0x00466750 ---- */
@@ -420,40 +470,43 @@ void Sys_ShowConsole( int visLevel, int quitOnClose ) {
 		ShowWindow( s_wcd.hWnd, SW_MINIMIZE );
 		break;
 	default:
-		Sys_TtyConsole_Print( "Invalid visLevel sent to Sys_ShowConsole\n" );
-		ShowWindow( s_wcd.hWnd, SW_SHOWNORMAL );
+		Sys_Error( "Invalid visLevel %d sent to Sys_ShowConsole\n", visLevel );	/* 0x0046677A */
 		break;
 	}
 }
 
 /* ---- Sys_ConsoleInput  0x004667C0 ---- */
 char *Sys_ConsoleInput( void ) {
-	int len;
-
-	if ( s_wcd.consoleText[0] ) {
-		strcpy( s_wcd.returnedText, s_wcd.consoleText );
-		s_wcd.consoleText[0] = 0;
-
-		len = strlen( s_wcd.returnedText );
-		while ( len > 0 && ( s_wcd.returnedText[len - 1] == '\n' ||
-		                     s_wcd.returnedText[len - 1] == '\r' ) ) {
-			s_wcd.returnedText[--len] = 0;
-		}
-		return s_wcd.returnedText;
+	if ( !s_wcd.consoleText[0] ) {
+#ifdef DEDICATED
+		/* Tree-only, dedicated build only: retail returns NULL here.  The
+		 * headless tty reader (win_syscon_console.c) returns its line
+		 * '\n'-terminated like consoleText, since Sys_GetEvent chops the
+		 * last char. */
+		return Sys_TtyConsole_Input();
+#else
+		return NULL;	/* 0x004667C9 */
+#endif
 	}
 
-	return Sys_TtyConsole_Input();
+	strcpy( s_wcd.returnedText, s_wcd.consoleText );
+	s_wcd.consoleText[0] = 0;
+	return s_wcd.returnedText;
 }
 
 /* ---- Conbuf_AppendText  0x004667F0 ---- */
 void Conbuf_AppendText( const char *msg ) {
-	char        buffer[0x8004];
-	char        *b;
+	char        buffer[0x8000];	/* 0x004667F0: 0x8004 frame = 0x8000 buffer + /GS cookie */
+	char        *b = buffer;
 	const char  *p;
-	int         i;
+	int         i = 0;
 	int         n;
-	size_t      msgLen;
 
+#ifdef DEDICATED
+	/* Tree-only NULL guard, stdout mirror, and skip the conversion when
+	 * -nowindow left no buffer.  Retail (0x004667F0) has none of these: it
+	 * strlen()s msg unchecked (0x00466820), and with no window it still
+	 * converts, counts s_totalChars and sends to a NULL hwndBuffer. */
 	if ( !msg ) {
 		return;
 	}
@@ -463,40 +516,36 @@ void Conbuf_AppendText( const char *msg ) {
 	if ( !s_wcd.hwndBuffer ) {
 		return;
 	}
+#endif
 
-	p = msg;
-	msgLen = strlen( p );
-	if ( msgLen > 0x3fff ) {
-		p += msgLen - 0x3fff;
+	if ( strlen( msg ) > 0x3fff ) {
+		p = msg + strlen( msg ) - 0x3fff;
+	} else {
+		p = msg;
 	}
 
-	b = buffer;
-	n = 0;
-	if ( *p ) {
-		i = 0;
-		do {
-			if ( n >= 0x7fff ) {
-				break;
-			}
-			if ( p[i] == '\n' && p[i + 1] == '\r' ) {
-				*b++ = '\r'; *b++ = '\n';
-				n += 2;
-				i++;
-			} else if ( p[i] == '\r' ) {
-				*b++ = '\r'; *b++ = '\n';
-				n += 2;
-			} else if ( p[i] == '\n' ) {
-				*b++ = '\r'; *b++ = '\n';
-				n += 2;
-			} else if ( p[i] == '^' && p[i + 1] && p[i + 1] != '^' &&
-			            p[i + 1] >= '0' && p[i + 1] <= '7' ) {
-				i++;
-			} else {
-				*b++ = p[i];
-				n++;
-			}
+	while ( p[i] && (unsigned int) ( b - buffer ) < sizeof( buffer ) - 1 ) {
+		if ( p[i] == '\n' && p[i + 1] == '\r' ) {
+			b[0] = '\r';
+			b[1] = '\n';
+			b += 2;
 			i++;
-		} while ( p[i] );
+		} else if ( p[i] == '\r' ) {
+			b[0] = '\r';
+			b[1] = '\n';
+			b += 2;
+		} else if ( p[i] == '\n' ) {
+			b[0] = '\r';
+			b[1] = '\n';
+			b += 2;
+		} else if ( &p[i] && p[i] == '^' && p[i + 1] && p[i + 1] != '^' &&
+		            p[i + 1] >= '0' && p[i + 1] <= '7' ) {	/* Q_IsColorString */
+			i++;
+		} else {
+			*b = p[i];
+			b++;
+		}
+		i++;
 	}
 	*b = 0;
 
@@ -520,14 +569,20 @@ void Sys_SetErrorText( const char *text ) {
 	strncpy( s_wcd.errorString, text, sizeof( s_wcd.errorString ) - 1 );
 	s_wcd.errorString[sizeof( s_wcd.errorString ) - 1] = 0;
 
+#ifdef DEDICATED
+	/* Tree-only, dedicated build only: under the tree's -nowindow headless
+	 * mode there is no console window, so print instead of blocking on a
+	 * MessageBox.  Retail (0x00466980) has no hWnd test; the only guard is
+	 * hwndErrorBox, and the CodMP client build follows that exactly. */
 	if ( !s_wcd.hWnd ) {
 		Sys_TtyConsole_Print( "\n" );
 		Sys_TtyConsole_Print( s_wcd.errorString );
 		Sys_TtyConsole_Print( "\n" );
 		return;
 	}
+#endif
 
-	if ( s_wcd.hwndErrorBox ) {
+	if ( s_wcd.hwndErrorBox ) {	/* 0x004669A1 */
 		return;
 	}
 
@@ -552,13 +607,14 @@ void Sys_CreateSplashWindow( void ) {
 	HBITMAP     bm;
 	HWND        image;
 	int         swidth, sheight;
+	int         w, h;
 
+#ifdef DEDICATED
+	/* Tree-only: retail starts directly at memset( &wc ) (0x00465C90). */
 	if ( !Sys_ConsoleWindowWanted() ) {
 		return;
 	}
-	if ( g_splashWnd ) {
-		return;
-	}
+#endif
 
 	memset( &wc, 0, sizeof( wc ) );
 	wc.lpfnWndProc   = (WNDPROC) DefWindowProc;
@@ -572,8 +628,8 @@ void Sys_CreateSplashWindow( void ) {
 		return;
 	}
 
-	swidth  = GetSystemMetrics( SM_CXSCREEN );
-	sheight = GetSystemMetrics( SM_CYSCREEN );
+	swidth  = GetSystemMetrics( SM_CXFULLSCREEN );	/* 0x00465CFE push 10h */
+	sheight = GetSystemMetrics( SM_CYFULLSCREEN );	/* 0x00465D02 push 11h */
 
 	bm = (HBITMAP) LoadImage( NULL, "cod.bmp", IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE );
 	if ( !bm ) {
@@ -605,11 +661,12 @@ void Sys_CreateSplashWindow( void ) {
 	SendMessage( image, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM) bm );
 
 	GetWindowRect( image, &rect );
+	w = rect.right - rect.left;
+	h = rect.bottom - rect.top;
 	SetWindowPos( (HWND) g_splashWnd, NULL,
-	              ( swidth - ( rect.right - rect.left ) ) / 2,
-	              ( sheight - ( rect.bottom - rect.top ) ) / 2,
-	              rect.right - rect.left,
-	              rect.bottom - rect.top,
+	              ( swidth - w ) / 2,
+	              ( sheight - h ) / 2,
+	              w, h,
 	              SWP_NOZORDER );
 }
 
@@ -619,5 +676,23 @@ void Sys_DestroySplashWindow( void ) {
 		ShowWindow( (HWND) g_splashWnd, SW_HIDE );
 		DestroyWindow( (HWND) g_splashWnd );
 		g_splashWnd = NULL;
+	}
+}
+
+/* ---- Sys_ShowSplashWindow  0x00465E40 ---- */
+/* WinMain's, LTCG-inlined there (0x004641A8). */
+void Sys_ShowSplashWindow( void ) {
+	if ( g_splashWnd ) {
+		ShowWindow( (HWND) g_splashWnd, SW_SHOW );
+		UpdateWindow( (HWND) g_splashWnd );
+	}
+}
+
+/* ---- Sys_HideSplashWindow  0x00465E60 ---- */
+/* Hide only: no DestroyWindow, and the handle is kept.  Retail inlines this
+ * body into Com_Init's dedicated branch (0x0043779D-0x004377AE). */
+void Sys_HideSplashWindow( void ) {
+	if ( g_splashWnd ) {
+		ShowWindow( (HWND) g_splashWnd, SW_HIDE );
 	}
 }

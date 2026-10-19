@@ -1,50 +1,42 @@
-/*
- * @fidelity: likely
- *
- * g_svcmds_mp.c -- the console commands the server hands the game module.
- *
- * This is RTCW's game/g_svcmds.c with the forceteam / game_memory commands
- * dropped and the say fall-through folded into one call: ConsoleCommand
- * (0x20038590) dispatches through a plain compare chain, not a table.  The
- * whole IP-ban half survives unchanged, including ClientForString, which 1.1
- * keeps but never calls -- forceteam was its only caller in RTCW.
- *
- * Function order is binary order (0x20037E80 .. 0x20038590).
- */
+// this file holds commands that can be executed by the server console, but not remote clients
 
 #include <stdlib.h>
 #include <string.h>
 
 #include "g_local.h"
 
-/* Q_strncpyz's buffer and trap_Argv's; RTCW's MAX_TOKEN_CHARS. */
-#define MAX_TOKEN_CHARS         1024
-
-/* UpdateIPBans' iplist buffer (0x20037F40 reserves 0x400). */
 #define MAX_INFO_STRING         1024
 
-/* trap_SendConsoleCommand's exec_when; g_main_mp.c carries EXEC_APPEND 2. */
-#ifndef EXEC_INSERT
-#define EXEC_INSERT             1
-#endif
+vmCvar_t g_filterBan;                           // never registered, so always 0
 
-/* entityState_t.eType, from Svcmd_EntityList_f's own switch.  Value 2 has no
- * case of its own in 1.1.  g_utils_mp.c carries the same subset. */
-#define ET_GENERAL              0
-#define ET_PLAYER               1
-#define ET_ITEM                 3
-#define ET_MISSILE              4
-#define ET_MOVER                5
-#define ET_PORTAL               6
-#define ET_INVISIBLE            7
-#define ET_SCRIPTMOVER          8
 
-/* g_filterBan is NOT registered in 1.1 -- G_FilterPacket is the only thing
-   that ever touches it and only reads .integer, so it stays 0 and the ban
-   list is effectively inverted (reproduced).  Nothing else in the module
-   references it, so the object lives here rather than in G_RegisterCvars'
-   table, which does not carry a row for it. */
-vmCvar_t g_filterBan;                           /* 0x2016F100 */
+/*
+==============================================================================
+
+PACKET FILTERING
+
+
+You can add or remove addresses from the filter list with:
+
+addip <ip>
+removeip <ip>
+
+The ip address is specified in dot format, and any unspecified digits will match any value,
+so you can specify an entire class C network with "addip 192.246.40".
+
+Removeip will only remove an address specified exactly the same way.  You cannot addip a subnet, then removeip a single host.
+
+listip
+Prints the current list of filters.
+
+g_filterban <0 or 1>
+
+If 1, then ip addresses matching the current list will be prohibited from entering the game.
+
+If 0, then only addresses matching the list will be allowed.  This lets you easily set up a private game, or a game that only allows players from your local network.
+
+==============================================================================
+*/
 
 typedef struct ipFilter_s {
 	unsigned mask;
@@ -53,16 +45,13 @@ typedef struct ipFilter_s {
 
 #define MAX_IPFILTERS           1024
 
-static ipFilter_t   ipFilters[MAX_IPFILTERS];       /* 0x20089F40 */
-static int          numIPFilters;                   /* 0x20089F3C */
+static ipFilter_t   ipFilters[MAX_IPFILTERS];
+static int          numIPFilters;
 
 /*
-==================
+=================
 StringToFilter
-
-RTCW's, minus the '*' wildcard branch -- 1.1 rejects anything that is not a
-digit outright.
-==================
+=================
 */
 static qboolean StringToFilter( char *s, ipFilter_t *f ) {
 	char    num[128];
@@ -85,7 +74,8 @@ static qboolean StringToFilter( char *s, ipFilter_t *f ) {
 		while ( *s >= '0' && *s <= '9' ) {
 			num[j++] = *s++;
 		}
-		num[j] = 0;
+		// keep: pointer store matches original codegen
+		*( num + j ) = 0;
 		b[i] = atoi( num );
 		if ( b[i] != 0 ) {
 			m[i] = 255;
@@ -104,9 +94,9 @@ static qboolean StringToFilter( char *s, ipFilter_t *f ) {
 }
 
 /*
-==================
+=================
 UpdateIPBans
-==================
+=================
 */
 static void UpdateIPBans( void ) {
 	byte    b[4];
@@ -128,9 +118,9 @@ static void UpdateIPBans( void ) {
 }
 
 /*
-==================
+=================
 G_FilterPacket
-==================
+=================
 */
 qboolean G_FilterPacket( char *from ) {
 	int         i;
@@ -164,9 +154,9 @@ qboolean G_FilterPacket( char *from ) {
 }
 
 /*
-==================
+=================
 AddIP
-==================
+=================
 */
 static void AddIP( char *str ) {
 	int i;
@@ -192,9 +182,9 @@ static void AddIP( char *str ) {
 }
 
 /*
-==================
+=================
 G_ProcessIPBans
-==================
+=================
 */
 void G_ProcessIPBans( void ) {
 	char *s, *t;
@@ -220,9 +210,9 @@ void G_ProcessIPBans( void ) {
 }
 
 /*
-==================
+=================
 Svcmd_AddIP_f
-==================
+=================
 */
 static void Svcmd_AddIP_f( void ) {
 	char str[MAX_TOKEN_CHARS];
@@ -238,9 +228,9 @@ static void Svcmd_AddIP_f( void ) {
 }
 
 /*
-==================
+=================
 Svcmd_RemoveIP_f
-==================
+=================
 */
 static void Svcmd_RemoveIP_f( void ) {
 	ipFilter_t  f;
@@ -272,9 +262,9 @@ static void Svcmd_RemoveIP_f( void ) {
 }
 
 /*
-==================
+===================
 Svcmd_EntityList_f
-==================
+===================
 */
 void Svcmd_EntityList_f( void ) {
 	int         e;
@@ -324,12 +314,11 @@ void Svcmd_EntityList_f( void ) {
 }
 
 /*
-==================
+===================
 ClientForString
 
-No caller in 1.1: RTCW reached it from forceteam, which this module does not
-have.
-==================
+Unused: forceteam was its only caller
+===================
 */
 gclient_t *ClientForString( const char *s ) {
 	gclient_t   *cl;
@@ -353,11 +342,12 @@ gclient_t *ClientForString( const char *s ) {
 	}
 
 	// check for a name match
-	for ( i = 0, cl = level.clients; i < level.maxclients; i++, cl++ ) {
+	for ( i = 0; i < level.maxclients; i++ ) {
+		cl = &level.clients[i];
 		if ( cl->sess.connected == CON_DISCONNECTED ) {
 			continue;
 		}
-		if ( !Q_stricmp( s, cl->sess.name ) ) {
+		if ( !Q_stricmp( cl->sess.name, s ) ) {
 			return cl;
 		}
 	}
@@ -368,13 +358,10 @@ gclient_t *ClientForString( const char *s ) {
 }
 
 /*
-==================
+=================
 ConsoleCommand
 
-The dedicated-server fall-through of RTCW's version, folded: "say" and anything
-else differ only in where ConcatArgs starts.  \x15 is the localization escape,
-so the client renders GAME_SERVER out of its own string table.
-==================
+=================
 */
 qboolean ConsoleCommand( void ) {
 	char cmd[MAX_TOKEN_CHARS];
@@ -401,10 +388,14 @@ qboolean ConsoleCommand( void ) {
 		return qtrue;
 	}
 
-	if ( dedicated.integer ) {
-		// everything that is not "say" is also printed as a say command
-		trap_SendServerCommand( -1, 0, va( "e \"GAME_SERVER\x15: %s\"",
-										   ConcatArgs( Q_stricmp( cmd, "say" ) == 0 ) ) );
+	// "GAME_SERVER\x15" is localized by the client
+	if ( g_dedicated.integer ) {
+		if ( Q_stricmp( cmd, "say" ) == 0 ) {
+			trap_SendServerCommand( -1, 0, va( "e \"GAME_SERVER\x15: %s\"", ConcatArgs( 1 ) ) );
+			return qtrue;
+		}
+		// everything else will also be printed as a say command
+		trap_SendServerCommand( -1, 0, va( "e \"GAME_SERVER\x15: %s\"", ConcatArgs( 0 ) ) );
 		return qtrue;
 	}
 

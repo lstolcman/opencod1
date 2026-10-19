@@ -20,9 +20,7 @@
  * their generated name as a POINTER to the real word, these read it as the
  * value itself and assign to it.
  *
- * Include AFTER qcommon/qcommon.h (needs `byte`) and after qcommon/cod1_globals.h
- * where a unit includes that at all -- the macros below would otherwise rewrite
- * the generated declarations themselves.
+ * Include AFTER qcommon/qcommon.h (needs `byte`).
  *
  *   0x008931D0  const char       *snd_currentFile
  *   0x008931D4  byte              snd_aliasSetLoaded[4]      (.D4/.D5/.D6 live)
@@ -38,7 +36,6 @@
  * also a local variable name in a dozen other units, so a macro would rewrite
  * them.  Its four live call sites say snd_aliasTable[1].
  *
- * cod1_globals.c still reserves the storage under the generated names; dead.
  *
  * @fidelity: verified
  */
@@ -49,7 +46,7 @@ struct snd_alias_s;
 struct snd_aliasBuild_s;
 
 #define SND_ALIAS_LOCALE_COUNT      3       /* 0 = menu/UI, 1 = in-game, 2 = localized/map */
-#define SND_ALIAS_LOADED_SLOTS      4
+#define SND_ALIAS_LOADED_SLOTS      SND_ALIAS_LOCALE_COUNT
 #define SND_ALIAS_HASH_SIZE         256
 #define SND_ALIAS_HASH_SLICE_BYTES  ( SND_ALIAS_HASH_SIZE * (int) sizeof( struct snd_alias_s * ) )
 
@@ -58,11 +55,21 @@ struct snd_aliasBuild_s;
 #define SND_LOCALE_LOCALIZED        2
 
 extern const char   *snd_currentFile;                                   /* 0x008931D0 */
-extern byte         snd_aliasSetLoaded[SND_ALIAS_LOADED_SLOTS];         /* 0x008931D4 */
-extern struct snd_alias_s *snd_aliasHashTable[SND_ALIAS_LOCALE_COUNT][SND_ALIAS_HASH_SIZE];
-																		/* 0x008931D8 */
-extern struct snd_alias_s *snd_aliasTable[SND_ALIAS_LOCALE_COUNT];      /* 0x00893DD8 */
-extern int          snd_aliasTableCount[SND_ALIAS_LOCALE_COUNT];        /* 0x00893DE4 */
+/* One record in retail: Com_Memset of a hash slice is never reordered past
+   stores to the table/count words (CL_ShutdownCGame 0x00401A20). */
+typedef struct snd_aliasGlobals_s {
+	byte                aliasSetLoaded[SND_ALIAS_LOADED_SLOTS];         /* 0x008931D4 */
+	struct snd_alias_s *aliasHashTable[SND_ALIAS_LOCALE_COUNT][SND_ALIAS_HASH_SIZE];   /* 0x008931D8 */
+	struct snd_alias_s *aliasTable[SND_ALIAS_LOCALE_COUNT];          /* 0x00893DD8 */
+	int                 aliasTableCount[SND_ALIAS_LOCALE_COUNT];     /* 0x00893DE4 */
+} snd_aliasGlobals_t;
+
+extern snd_aliasGlobals_t snd_aliasGlobals;
+
+#define snd_aliasSetLoaded      snd_aliasGlobals.aliasSetLoaded
+#define snd_aliasHashTable      snd_aliasGlobals.aliasHashTable
+#define snd_aliasTable          snd_aliasGlobals.aliasTable
+#define snd_aliasTableCount     snd_aliasGlobals.aliasTableCount
 extern struct snd_aliasBuild_s *snd_aliasBuildHead;                     /* 0x00893DF0 */
 extern char         snd_aliasLocalizedName[64];                         /* 0x00893DF4 */
 extern int          snd_aliasTableChecksum[SND_ALIAS_LOCALE_COUNT];     /* 0x00893E34 */
@@ -70,25 +77,20 @@ extern char         snd_subtitleReference[1024];                        /* 0x008
 
 /* ---- generated spellings -> the one real object ------------------------- */
 
-/* cod1_globals types this char[4]; every consumer immediately casts it back to
+/* The generated name was a char[4]; every consumer immediately casts it back to
  * `const char *`, which is what the retail word is.  The macro therefore has to
  * present as the ADDRESS of the pointer, not as an array of char. */
 #define snd_currentFilename     ( (char *) (void *) &snd_currentFile )
 
 #define snd_aliasLoaded         snd_aliasSetLoaded
 #define snd_aliasLoaded_ui      ( snd_aliasSetLoaded[SND_LOCALE_INGAME] )     /* 0x008931D5 */
-#define byte_8931D6             ( snd_aliasSetLoaded[SND_LOCALE_LOCALIZED] )  /* 0x008931D6 */
 
 #define snd_aliasHash           snd_aliasHashTable
-#define unk_8935D8              ( snd_aliasHashTable[SND_LOCALE_INGAME] )     /* 0x008935D8 */
-#define dword_8939D8            ( snd_aliasHashTable[SND_LOCALE_LOCALIZED] )  /* 0x008939D8 */
 
 #define snd_aliasList           snd_aliasTable
 #define snd_aliasList_uiOwned   ( snd_aliasTable[SND_LOCALE_LOCALIZED] )      /* 0x00893DE0 */
 
 #define snd_aliasCount          snd_aliasTableCount
-#define dword_893DE8            ( snd_aliasTableCount[SND_LOCALE_INGAME] )    /* 0x00893DE8 */
-#define dword_893DEC            ( snd_aliasTableCount[SND_LOCALE_LOCALIZED] ) /* 0x00893DEC */
 
 #define snd_tempBuildHead       snd_aliasBuildHead
 
@@ -98,7 +100,6 @@ extern char         snd_subtitleReference[1024];                        /* 0x008
 #define snd_subtitleStr         snd_aliasLocalizedName
 
 #define snd_aliasChecksum       snd_aliasTableChecksum
-#define dword_893E38            ( snd_aliasTableChecksum[SND_LOCALE_INGAME] ) /* 0x00893E38 */
 
 #define snd_subtitleBuf         snd_subtitleReference
 

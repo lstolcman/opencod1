@@ -4,830 +4,655 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "tr_records.h"
 #include "tr_gl_types.h"
 #include "tr_tess.h"
+#include "tr_local.h"
+
+/* -------------------------------------------------------------------------
+ *  The ARB_vertex_buffer_object storage backend of the shader/tess system.
+ *  For each shader stage it packs the tessellated vertices into a dynamic
+ *  ARB buffer (interleaved by RB_SingleStageGenericARB, or one array per
+ *  attribute by RB_SingleStageGenericARB2) and issues the draw.
+ *
+ *  Only the shader STAGE is retyped here (RB_SingleStageGenericARB's `a3`);
+ *  the tess arrays and the backEnd/tr globals keep the retail storage-of-record
+ *  in tr_tess.h / tr_records.h / tr_local.h per the hybrid blob+symbol
+ *  scheme.
+ * ------------------------------------------------------------------------- */
+
+#define R_MAX_SHADER_STAGES         8
+#define R_MAX_TEXTURE_UNITS         8
+#define RB_ARB_MAX_UPLOADS          11           /* 8 texcoords + colour + normal + position */
+
+#define SHADER_STAGE_PER_LIGHT      0x80         /* stage.flags: replay this stage once per entity light */
+#define SHADER_LIGHTING_PER_ENTITY  0x80         /* shader.lightingFlags: shader is lit per entity */
+
+#define CGEN_LIGHTING_PRECALC       11           /* stage.rgbGen: take the entity's constant colour */
+
+/* shaderStage_t.flags -- which vertex arrays this stage feeds.  The per-unit
+ * texcoord bit for unit n is (SS_TEXCOORD_ARRAY0 << n).  Masks proven by the
+ * decompiled bit tests; names from CoDUO renderer_shader_stage_flag_e. */
+#define SS_TEXCOORD_ARRAY0          0x00000100
+#define SS_COLOR_ARRAY              0x00010000
+#define SS_NORMAL_ARRAY             0x00020000
+#define SS_VERTEX_ARRAY_MASK        0x0003FF00   /* 8 texcoords + colour + normal */
+
+/* -------------------------------------------------------------------------
+ *  shaderStage_t (0x688) and its per-unit textureBundle_t (0xC8).
+ *
+ *  The ARB backend only reads: the vertex-array flags (+0x000), each unit's
+ *  texcoord component count (bundle +0x8c) and lightmap marker (bundle +0xC4),
+ *  the rgbGen selector (+0x664), the constant colour (+0x680) and the GL state
+ *  bits (+0x684).  Offsets are proven by the decompiled reads (stage +0x90 +
+ *  0xC8 * unit for the component count; stage[409]==rgbGen@0x664,
+ *  stage+1664==constantColor@0x680, stage[417]==stateBits@0x684); the bundle
+ *  layout (base = image[0] = stage + 4) is the one documented in tr_shade.c.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+	void  *image[32];               /* +0x00 */
+	int   numImageAnimations;       /* +0x80 */
+	float imageAnimationSpeed;      /* +0x84 */
+	void  *waterMap;                /* +0x88  waterMap_t (tr_shader.c) */
+	int   texCoordComponentCount;   /* +0x8c  texcoord components uploaded for this unit */
+	int   textureEnvMode;           /* +0x90 */
+	void  *texEnvCombine;           /* +0x94  ShaderTexEnvCombine (tr_shader.c) */
+	void  *nvTextureShader;         /* +0x98  ShaderNVTextureOperation (tr_shader.c) */
+	int   tcGen;                    /* +0x9c */
+	float tcGenVectors[2][3];       /* +0xa0  TCGEN_VECTOR (RB_ComputeTexCoords) */
+	int   numTexMods;               /* +0xb8 */
+	void  *texMods;                 /* +0xbc  texModInfo_t[numTexMods] */
+	int   videoMapHandle;           /* +0xc0 */
+	byte  isLightmap;               /* +0xc4  r_lightmap forces this unit to REPLACE */
+	byte  isVideoMap;               /* +0xc5 */
+	byte  clampAnimation;           /* +0xc6 */
+	byte  reserved_0xc7;            /* +0xc7  alignment */
+} textureBundle_t;
+COD1_ASSERT_SIZE(textureBundle_t, 0xC8);
+ASSERT_OFF(textureBundle_t, texCoordComponentCount, 0x8c);
+ASSERT_OFF(textureBundle_t, isLightmap, 0xc4);
+
+typedef struct shaderStage_s {
+	unsigned int    flags;                        /* +0x000  SS_* vertex-array + stage-type bits */
+	textureBundle_t bundle[R_MAX_TEXTURE_UNITS];  /* +0x004  stride 0xC8 */
+	int             atiFragmentShader;            /* +0x644 */
+	void           *registerCombiners;            /* +0x648 */
+	char           *vertexProgram;                /* +0x64c */
+	byte            rgbWave[0x14];                /* +0x650  waveForm_t */
+	int             rgbGen;                        /* +0x664  shader_color_gen_t */
+	byte            alphaWave[0x14];              /* +0x668  waveForm_t */
+	int             alphaGen;                     /* +0x67c */
+	byte            constantColor[4];             /* +0x680  RGBA */
+	unsigned int    stateBits;                    /* +0x684  GL_State bits */
+} shaderStage_t;
+COD1_ASSERT_SIZE(shaderStage_t, 0x688);
+ASSERT_OFF(shaderStage_t, bundle, 0x04);
+ASSERT_OFF(shaderStage_t, rgbGen, 0x664);
+ASSERT_OFF(shaderStage_t, constantColor, 0x680);
+ASSERT_OFF(shaderStage_t, stateBits, 0x684);
+
 
 extern int GL_Cull();
 extern int GL_State();
-int __fastcall RB_BuildDlightArrays( unsigned char *a1, float *a2, float *a3, int a4 );
+int __cdecl RB_BuildDlightArrays( float *texCoords, unsigned char *colors, float *dlight, int hitIndexes );
 void __cdecl RB_ComputeColors( int stage );
 extern int RB_ComputeTexCoords();
 extern int RB_DeformTessGeometry();
 void __cdecl RB_SetIteratorFog( void );
 extern int RB_SetupMultitexture();
 
-#define tess_numVertexes            tess_numVertexes   /* 0x0197FFA8 */
-#define tess_numIndexes             tess_numIndexes   /* 0x0197FFA4 */
-#define tess_vertexComponentCount   tess_vertexComponentCount   /* 0x0197FF80 */
-#define tess_shader                 tess_shader   /* 0x0197FF90 */
-#define tess_dlightBits             tess_dlightBits   /* 0x0197FFA0 */
-#define tess_activeStageCount       tess_activeStageCount   /* 0x019BFFBC */
-#define tess_activeStages           tess_activeStages   /* 0x019BFFC4 */
-#define tess_indexes_base           tess_indexes    /* 0x017A7F60 = tess base */
+void __cdecl RB_SingleStageGenericARB( shaderStage_t *stage, GLsizei numIndexes, GLvoid *indexes );
+void __cdecl RB_SingleStageGenericARB2( shaderStage_t *stage, GLsizei numIndexes, GLvoid *indexes );
 
-#define rb_clientStateBits          glState_clientStateBits   /* 0x016C3954 */
-#define tr_dlightShader             tr_dlightShader   /* 0x016C4E14 */
-#define rb_arbBuffer                backEnd_dynamicBuffer_storage   /* 0x016D93EC */
-#define rb_arbBufferSize            backEnd_dynamicBuffer_capacity   /* 0x016D93F0 */
-#define rb_arbBufferCursor          backEnd_dynamicBuffer_currentOffset   /* 0x016D93F4 */
-#define rb_arbInterleave            tr_vboInterleaved   /* 0x016D8888 */
+/* RB_SingleStageGenericARB's general interleave path, one texcoord unit
+ * (retail has the 8 units unrolled with constant masks) */
+#define RB_ARB_INTERLEAVE_TEXCOORDS( n ) \
+  if ( ( stage->flags & (SS_TEXCOORD_ARRAY0 << (n)) ) != 0 ) \
+  { \
+    *(int *)( (char *)out + texCoordOfs[n] + 0 ) = *texCoordSrc[n]++; \
+    *(int *)( (char *)out + texCoordOfs[n] + 4 ) = *texCoordSrc[n]++; \
+    if ( texCoordComps[n] >= 3 ) \
+    { \
+      *(int *)( (char *)out + texCoordOfs[n] + 8 ) = *texCoordSrc[n]++; \
+      if ( texCoordComps[n] == 4 ) \
+        *(int *)( (char *)out + texCoordOfs[n] + 12 ) = *texCoordSrc[n]++; \
+    } \
+  }
 
-#define backEnd_currentEntity       backEnd_currentEntity   /* 0x016D8E5C */
-#define backEnd_currentLight        backEnd_currentDlight   /* 0x016D8E60 */
-#define backEnd_currentLightScale   backEnd_currentLightScale     /* 0x016D8E64 */
-#define backEnd_num_dlights         backEnd_refdef_num_dlights   /* 0x016D8B1C */
-#define backEnd_dlights             backEnd_refdef_dlights   /* 0x016D8B24 */
+/* RB_SingleStageGenericARB's draw, written once per upload path (retail merged the copies) */
+#define RB_ARB_DRAW_ELEMENTS( count, elements ) \
+  { \
+    GLsizei  drawCount = (count); \
+    GLvoid  *drawElements = (elements); \
+    backEnd_pc_drawnIndexCount += drawCount; \
+    ++backEnd_pc_drawCallCount; \
+    glDrawElements( 4u, drawCount, 0x1403u, drawElements );   /* GL_TRIANGLES, GL_UNSIGNED_SHORT */ \
+  }
 
-#define R_MAX_SHADER_STAGES         8
-#define R_DLIGHT_STRIDE             0x88
-#define SHADER_STAGE_PER_LIGHT      0x80
-#define SHADER_LIGHTING_PER_ENTITY  0x80
 
-#define RB_ARB_MAX_UPLOADS          11
-
-void __cdecl RB_SingleStageGenericARB(GLubyte *a3, GLsizei count, GLvoid *indices);
-void __cdecl RB_SingleStageGenericARB2(_DWORD *a2, GLsizei count, GLvoid *indices);
-
-/* ---- RB_SingleStageGenericARB  0x0050C9D0 ----  VERIFIED */
-void __cdecl RB_SingleStageGenericARB(GLubyte *a3, GLsizei count, GLvoid *indices)
+/* ---- RB_SingleStageGenericARB  0x0050C9D0 ----  VERIFIED
+ * Interleaved path (r_vbo_interleave): pack every vertex as
+ * [texcoord0..N][colour][normal][position] into one dynamic ARB buffer, wire
+ * the client-array pointers to the interleaved offsets, then draw.  Four common
+ * attribute layouts get a flat copy loop; anything else uses the general path.
+ * The write target is a Hunk scratch buffer (uploaded with one qglBufferSubDataARB)
+ * when a persistent VBO exists or the buffer map fails, otherwise the mapped
+ * buffer itself -- and there the unmap result GATES the draw. */
+void __cdecl RB_SingleStageGenericARB( shaderStage_t *stage, GLsizei numIndexes, GLvoid *indexes )
 {
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int *v10;
-  int v11;
-  GLsizei v12;
-  int v13;
-  int *v14;
-  int v15;
-  int i;
-  _DWORD *v18;
-  _DWORD *v19;
-  int v20;
-  int v21;
-  _DWORD *v22;
-  float *v23;
-  int *v24;
-  int v25;
-  int *v26;
-  int v27;
-  _DWORD *v28;
-  int *v29;
-  int v30;
-  int *v31;
-  int v32;
-  _DWORD *v33;
-  int *v34;
-  int v35;
-  int *v36;
-  int v37;
-  int *v38;
-  _DWORD *v39;
-  int *v40;
-  int v41;
-  int *v42;
-  int v43;
-  _DWORD *v44;
-  _DWORD *v45;
-  int *v46;
-  int v47;
-  int v48;
-  int v49;
-  _DWORD *v50;
-  int *v51;
-  int *v52;
-  int v53;
-  int v54;
-  int v55;
-  int v56;
-  int v57;
-  int v58;
-  int v59;
-  int v60;
-  int v61;
-  int v62;
-  int v63;
-  int v64;
-  int v65;
-  int *v66;
-  int v67;
-  int v68;
-  int v69;
-  int v70;
-  int v80;
-  float *v81;
-  int v82;
-  int v83;
-  int v84;
-  _DWORD *v85;
-  GLsizei v86;
-  int v103;
-  int v104;
-  int v105;
-  int v106;
-  int v107;
-  int v108;
-  int v109;
-  int v110;
-  int v111;
-  int v112;
-  int v113;
-  _DWORD *texCoordSrc[8];   /* [esp+40h] [ebp-C8h] */
-  int     texCoordComps[8]; /* [esp+7Ch] [ebp-8Ch] */
-  int     texCoordOfs[8];   /* [esp+9Ch] [ebp-6Ch] */
-  _DWORD v114[8]; // [esp+E8h] [ebp-20h] BYREF -- 8 dword stores, not char[32]
+  int   texCoordOfs[R_MAX_TEXTURE_UNITS];          /* byte offset of each unit's texcoords in the vertex */
+  int   texCoordComps[R_MAX_TEXTURE_UNITS];        /* components per unit (2/3/4) */
+  int  *texCoordSrc[R_MAX_TEXTURE_UNITS];          /* source array per unit (advances per vertex) */
+  int   uploadTexCoordOffsets[R_MAX_TEXTURE_UNITS];/* buffer offsets handed to RB_SetupMultitexture */
+  int  *stageColors;                               /* tess.stageVertexColors as packed RGBA dwords */
+  int  *xyz;                                        /* tess.xyz read cursor */
+  int  *out;                                        /* interleave write cursor */
+  int  *tempMem;                                    /* Hunk scratch (NULL when writing a mapped VBO) */
+  int   colorOfs;
+  int   normalOfs;
+  int   positionOfs;
+  int   vertexStride;                               /* running attribute offset, then bytes per vertex */
+  int   totalBytes;                                 /* vertexStride * tess_numVertexes */
+  int   bufBase;                                    /* base byte offset into the persistent VBO */
+  int   unit;
+  int   v;
 
-  v5 = 0;
-  v6 = 0;
-  v82 = 0;
-  RB_ComputeTexCoords((int)a3);   /* takes ONE argument, shader@EAX -- 0x00500400 */
-  v7 = Value;
-  v8 = 0;
-  if ( Value > 0 )
+  colorOfs     = 0;
+  vertexStride = 0;
+  normalOfs    = 0;
+  stageColors  = (int *)tess_stageVertexColors;
+
+  RB_ComputeTexCoords( (int)stage );
+
+  /* reserve a texcoord block for each active unit */
+  for ( unit = 0; unit < glConfig_maxActiveTextures; ++unit )
   {
-    v9 = *(_DWORD *)a3;
-    v10 = (int *)(a3 + 144);
-    do
+    if ( ( stage->flags & (SS_TEXCOORD_ARRAY0 << unit) ) != 0 )
     {
-      if ( ((256 << v8) & v9) != 0 )
-      {
-        v11 = *v10;
-        texCoordOfs[v8] = v5;
-        texCoordComps[v8] = v11;
-        v5 += 4 * v11;
-        texCoordSrc[v8] = (_DWORD *)(&tess_activeTexCoords)[v8];
-      }
-      ++v8;
-      v10 += 50;
+      int comps = stage->bundle[unit].texCoordComponentCount;
+      texCoordOfs[unit]   = vertexStride;
+      texCoordComps[unit] = comps;
+      vertexStride += 4 * comps;
+      texCoordSrc[unit]   = (int *)tess_activeTexCoords[unit];   /* retail 0x0050CA28: loads the pointer in slot `unit` */
     }
-    while ( v8 < v7 );
   }
-  if ( (*(_DWORD *)a3 & 0x10000) != 0 )
+
+  if ( ( stage->flags & SS_COLOR_ARRAY ) != 0 )
   {
-    v6 = v5;
-    v5 += 4;
-    RB_ComputeColors((int)a3);   /* ONE argument, the stage -- 0x0050CA51 */
+    colorOfs = vertexStride;
+    vertexStride += 4;
+    RB_ComputeColors( (int)stage );
   }
-  if ( (*(_DWORD *)a3 & 0x20000) != 0 )
+  if ( ( stage->flags & SS_NORMAL_ARRAY ) != 0 )
   {
-    v82 = v5;
-    v5 += 12;
+    normalOfs = vertexStride;
+    vertexStride += 12;
   }
-  v12 = v5 + 4 * tess_vertexComponentCount;
-  v13 = v12 * tess_numVertexes;
-  v84 = v5;
-  v86 = v12;
-  v14 = tess_xyz;
-  v80 = 0;
-  v106 = v12 * tess_numVertexes;
+
+  positionOfs  = vertexStride;
+  vertexStride += 4 * tess_vertexComponentCount;
+  xyz          = (int *)tess_xyz;
+  bufBase      = 0;
+  totalBytes   = vertexStride * tess_numVertexes;
+
   if ( backEnd_dynamicBuffer_storage )
   {
-    qglBindBufferARB(34962, backEnd_dynamicBuffer_storage);
-    if ( backEnd_dynamicBuffer_currentOffset + v13 <= backEnd_dynamicBuffer_capacity )
-      v80 = backEnd_dynamicBuffer_currentOffset;
+    qglBindBufferARB( 34962, backEnd_dynamicBuffer_storage );   /* GL_ARRAY_BUFFER_ARB */
+    if ( backEnd_dynamicBuffer_currentOffset + totalBytes <= backEnd_dynamicBuffer_capacity )
+      bufBase = backEnd_dynamicBuffer_currentOffset;
   }
   else
   {
-    qglBindBufferARB(34962, ++backEnd_dynamicBuffer_frameSerial);
+    qglBindBufferARB( 34962, ++backEnd_dynamicBuffer_frameSerial );
   }
-  v15 = Value;
-  for ( i = 0; i < v15; ++i )
-    v114[i] = v80 + texCoordOfs[i];
-  RB_SetupMultitexture(a3, (int)v114, v12);
-  if ( (*(_DWORD *)a3 & 0x10000) != 0 )
+
+  for ( unit = 0; unit < glConfig_maxActiveTextures; ++unit )
+    uploadTexCoordOffsets[unit] = bufBase + texCoordOfs[unit];
+  RB_SetupMultitexture( stage, uploadTexCoordOffsets, vertexStride );
+
+  /* colour: a client array, else the entity colour or the stage constant */
+  if ( ( stage->flags & SS_COLOR_ARRAY ) != 0 )
   {
-    if ( (glState_clientStateBits & 0x100) == 0 )
+    if ( ( glState_clientStateBits & 0x100 ) == 0 )
     {
-      glEnableClientState(0x8076u);
+      glEnableClientState( 0x8076u );              /* GL_COLOR_ARRAY */
       glState_clientStateBits |= 0x100u;
     }
-    glColorPointer(4, 0x1401u, v12, (const GLvoid *)(v6 + v80));
+    glColorPointer( 4, 0x1401u, vertexStride, (const GLvoid *)( colorOfs + bufBase ) );   /* GL_UNSIGNED_BYTE */
   }
   else
   {
-    if ( (glState_clientStateBits & 0x100) != 0 )
+    if ( ( glState_clientStateBits & 0x100 ) != 0 )
     {
-      glDisableClientState(0x8076u);
+      glDisableClientState( 0x8076u );
       glState_clientStateBits &= ~0x100u;
     }
-    if ( *((_DWORD *)a3 + 409) == 11 )
-      glColor4ubv((const GLubyte *)(backEnd_currentEntity + 108));
+    if ( stage->rgbGen == CGEN_LIGHTING_PRECALC )
+      glColor4ubv( (const GLubyte *)( backEnd_currentEntity + 108 ) );   /* entity shaderRGBA */
     else
-      glColor4ubv(a3 + 1664);
+      glColor4ubv( (const GLubyte *)stage->constantColor );
   }
-  if ( (*(_DWORD *)a3 & 0x20000) != 0 )
+
+  /* normal client array */
+  if ( ( stage->flags & SS_NORMAL_ARRAY ) != 0 )
   {
-    if ( (glState_clientStateBits & 0x200) == 0 )
+    if ( ( glState_clientStateBits & 0x200 ) == 0 )
     {
-      glEnableClientState(0x8075u);
+      glEnableClientState( 0x8075u );              /* GL_NORMAL_ARRAY */
       glState_clientStateBits |= 0x200u;
     }
-    glNormalPointer(0x1406u, v12, (const GLvoid *)(v82 + v80));
+    glNormalPointer( 0x1406u, vertexStride, (const GLvoid *)( normalOfs + bufBase ) );    /* GL_FLOAT */
   }
-  else if ( (glState_clientStateBits & 0x200) != 0 )
+  else if ( ( glState_clientStateBits & 0x200 ) != 0 )
   {
-    glDisableClientState(0x8075u);
+    glDisableClientState( 0x8075u );
     glState_clientStateBits &= ~0x200u;
   }
-  if ( (glState_clientStateBits & 0x400) == 0 )
+
+  /* position client array (always present) */
+  if ( ( glState_clientStateBits & 0x400 ) == 0 )
   {
-    glEnableClientState(0x8074u);
+    glEnableClientState( 0x8074u );                /* GL_VERTEX_ARRAY */
     glState_clientStateBits |= 0x400u;
   }
-  glVertexPointer(tess_vertexComponentCount, 0x1406u, v12, (const GLvoid *)(v84 + v80));
-  if ( backEnd_dynamicBuffer_storage
-    || (v18 = 0, v85 = 0, qglBufferDataARB(34962, v13, 0, 35040), (v19 = (_DWORD *)qglMapBufferARB(34962, 35001)) == 0) )
+  glVertexPointer( tess_vertexComponentCount, 0x1406u, vertexStride, (const GLvoid *)( positionOfs + bufBase ) );
+
+  /* choose the interleave target */
+  if ( backEnd_dynamicBuffer_storage )
   {
-    v19 = (_DWORD *)ri_Hunk_AllocateTempMemory(v13);
-    v18 = v19;
-    v85 = v19;
+    out     = (int *)ri.Hunk_AllocateTempMemory( totalBytes );
+    tempMem = out;
   }
-  v20 = *(_DWORD *)a3 & 0x3FF00;
-  if ( v20 == 131328 && texCoordComps[0] == 2 && tess_vertexComponentCount == 3 )
+  else
   {
-    v21 = 0;
-    if ( tess_numVertexes > 0 )
+    tempMem = 0;
+    qglBufferDataARB( 34962, totalBytes, 0, 35040 );             /* GL_STREAM_DRAW_ARB */
+    out = (int *)qglMapBufferARB( 34962, 35001 );               /* GL_WRITE_ONLY_ARB */
+    if ( !out )
     {
-      v22 = texCoordSrc[0];
-      v23 = flt_1827F64;
-      do
-      {
-        *v19 = *v22;
-        v19[1] = v22[1];
-        v24 = v19 + 1;
-        v24[1] = *((_DWORD *)v23 - 1);
-        ++v24;
-        v24[1] = *(_DWORD *)v23;
-        ++v24;
-        v24[1] = *((_DWORD *)v23 + 1);
-        v24 += 2;
-        *v24 = *v14;
-        v25 = v14[1];
-        v26 = v14 + 1;
-        *++v24 = v25;
-        *++v24 = v26[1];
-        v22 += 2;
-        v19 = v24 + 1;
-        v14 = v26 + 2;
-        ++v21;
-        v23 += 3;
-      }
-      while ( v21 < tess_numVertexes );
+      out     = (int *)ri.Hunk_AllocateTempMemory( totalBytes );
+      tempMem = out;
     }
   }
-  else if ( v20 == 65792 && texCoordComps[0] == 2 && tess_vertexComponentCount == 3 )
+
+  /* ---- interleave the vertices ---- */
+  if ( (stage->flags & SS_VERTEX_ARRAY_MASK) == (SS_TEXCOORD_ARRAY0 | SS_NORMAL_ARRAY)
+       && texCoordComps[0] == 2 && tess_vertexComponentCount == 3 )
   {
-    v27 = 0;
-    if ( tess_numVertexes > 0 )
+    for ( v = 0; v < tess_numVertexes; ++v )
     {
-      v28 = texCoordSrc[0];
-      do
-      {
-        *v19 = *v28;
-        v19[1] = v28[1];
-        v29 = v19 + 1;
-        v29[1] = dword_186FF60[v27];   /* +0 shard: retail 0x0050CD7A is `mov edi, tess_stageVertexColors[edx*4]`, a DWORD load; the bare name is unsigned char[] and read one byte */
-        v29 += 2;
-        *v29 = *v14;
-        v30 = v14[1];
-        v31 = v14 + 1;
-        *++v29 = v30;
-        *++v29 = v31[1];
-        v28 += 2;
-        v19 = v29 + 1;
-        v14 = v31 + 2;
-        ++v27;
-      }
-      while ( v27 < tess_numVertexes );
+      *out++ = *texCoordSrc[0]++;
+      *out++ = *texCoordSrc[0]++;
+      *out++ = ((int *)tess_stageNormals)[3 * v + 0];
+      *out++ = ((int *)tess_stageNormals)[3 * v + 1];
+      *out++ = ((int *)tess_stageNormals)[3 * v + 2];
+      *out++ = *xyz++;
+      *out++ = *xyz++;
+      *out++ = *xyz++;
     }
   }
-  else if ( v20 == 256 && texCoordComps[0] == 2 && tess_vertexComponentCount == 3 )
+  else if ( (stage->flags & SS_VERTEX_ARRAY_MASK) == (SS_TEXCOORD_ARRAY0 | SS_COLOR_ARRAY)
+            && texCoordComps[0] == 2 && tess_vertexComponentCount == 3 )
   {
-    v32 = 0;
-    if ( tess_numVertexes > 0 )
+    for ( v = 0; v < tess_numVertexes; ++v )
     {
-      v33 = texCoordSrc[0];
-      do
-      {
-        *v19 = *v33;
-        v19[1] = v33[1];
-        v34 = v19 + 2;
-        *v34 = *v14;
-        v35 = v14[1];
-        v36 = v14 + 1;
-        *++v34 = v35;
-        *++v34 = v36[1];
-        v33 += 2;
-        v19 = v34 + 1;
-        v14 = v36 + 2;
-        ++v32;
-      }
-      while ( v32 < tess_numVertexes );
+      *out++ = *texCoordSrc[0]++;
+      *out++ = *texCoordSrc[0]++;
+      *out++ = stageColors[v];
+      *out++ = *xyz++;
+      *out++ = *xyz++;
+      *out++ = *xyz++;
     }
   }
-  else if ( v20 == 66304 && texCoordComps[0] == 2 && texCoordComps[1] == 2 && tess_vertexComponentCount == 3 )
+  else if ( (stage->flags & SS_VERTEX_ARRAY_MASK) == SS_TEXCOORD_ARRAY0
+            && texCoordComps[0] == 2 && tess_vertexComponentCount == 3 )
   {
-    v37 = 0;
-    if ( tess_numVertexes > 0 )
+    for ( v = 0; v < tess_numVertexes; ++v )
     {
-      v38 = texCoordSrc[1];
-      v39 = texCoordSrc[0];
-      do
-      {
-        *v19 = *v39;
-        v19[1] = v39[1];
-        v40 = v19 + 1;
-        v40[1] = *v38;
-        ++v40;
-        v40[1] = v38[1];
-        ++v40;
-        v40[1] = dword_186FF60[v37];   /* +0 shard; retail 0x0050CE94 */
-        v40 += 2;
-        *v40 = *v14;
-        v41 = v14[1];
-        v42 = v14 + 1;
-        *++v40 = v41;
-        *++v40 = v42[1];
-        v39 += 2;
-        v38 += 2;
-        v19 = v40 + 1;
-        v14 = v42 + 2;
-        ++v37;
-      }
-      while ( v37 < tess_numVertexes );
+      *out++ = *texCoordSrc[0]++;
+      *out++ = *texCoordSrc[0]++;
+      *out++ = *xyz++;
+      *out++ = *xyz++;
+      *out++ = *xyz++;
+    }
+  }
+  else if ( (stage->flags & SS_VERTEX_ARRAY_MASK)
+              == (SS_TEXCOORD_ARRAY0 | (SS_TEXCOORD_ARRAY0 << 1) | SS_COLOR_ARRAY)
+            && texCoordComps[0] == 2 && texCoordComps[1] == 2 && tess_vertexComponentCount == 3 )
+  {
+    for ( v = 0; v < tess_numVertexes; ++v )
+    {
+      *out++ = *texCoordSrc[0]++;
+      *out++ = *texCoordSrc[0]++;
+      *out++ = *texCoordSrc[1]++;
+      *out++ = *texCoordSrc[1]++;
+      *out++ = stageColors[v];
+      *out++ = *xyz++;
+      *out++ = *xyz++;
+      *out++ = *xyz++;
     }
   }
   else
   {
-    v83 = 0;
-    if ( tess_numVertexes > 0 )
+    /* general path: each attribute written at its own byte offset */
+    for ( v = 0; v < tess_numVertexes; ++v )
     {
-      v43 = texCoordOfs[1];
-      v112 = texCoordOfs[0] - texCoordOfs[1];
-      v108 = texCoordOfs[2] - texCoordOfs[1];
-      v110 = texCoordOfs[3] - texCoordOfs[1];
-      v103 = texCoordOfs[4] - texCoordOfs[1];
-      v105 = texCoordOfs[5] - texCoordOfs[1];
-      v113 = texCoordOfs[6] - texCoordOfs[1];
-      v107 = texCoordOfs[7] - texCoordOfs[1];
-      v109 = v82 - texCoordOfs[1];
-      v104 = v84 - texCoordOfs[1];
-      v44 = texCoordSrc[7];
-      v45 = (_DWORD *)((char *)v19 + texCoordOfs[1]);
-      v81 = flt_1827F64;
-      v111 = v6 - texCoordOfs[1];
-      do
+      RB_ARB_INTERLEAVE_TEXCOORDS( 0 );
+      RB_ARB_INTERLEAVE_TEXCOORDS( 1 );
+      RB_ARB_INTERLEAVE_TEXCOORDS( 2 );
+      RB_ARB_INTERLEAVE_TEXCOORDS( 3 );
+      RB_ARB_INTERLEAVE_TEXCOORDS( 4 );
+      RB_ARB_INTERLEAVE_TEXCOORDS( 5 );
+      RB_ARB_INTERLEAVE_TEXCOORDS( 6 );
+      RB_ARB_INTERLEAVE_TEXCOORDS( 7 );
+      if ( ( stage->flags & SS_COLOR_ARRAY ) != 0 )
+        *(int *)( (char *)out + colorOfs ) = stageColors[v];
+      if ( ( stage->flags & SS_NORMAL_ARRAY ) != 0 )
       {
-        v46 = texCoordSrc[1];
-        if ( (a3[1] & 1) != 0 )
-        {
-          *(_DWORD *)((char *)v45 + v112) = *texCoordSrc[0];
-          v47 = texCoordSrc[0][1];
-          ++texCoordSrc[0];
-          v48 = texCoordOfs[0];
-          *(_DWORD *)((char *)v19 + texCoordOfs[0] + 4) = v47;
-          ++texCoordSrc[0];
-          if ( texCoordComps[0] >= 3 )
-          {
-            *(_DWORD *)((char *)v19 + v48 + 8) = *texCoordSrc[0]++;
-            if ( texCoordComps[0] == 4 )
-              *(_DWORD *)((char *)v19 + v48 + 12) = *texCoordSrc[0]++;
-          }
-          v46 = texCoordSrc[1];
-        }
-        if ( (a3[1] & 2) != 0 )
-        {
-          v49 = *v46;
-          v50 = v46 + 1;
-          *v45 = v49;
-          *(_DWORD *)((char *)v19 + v43 + 4) = *v50;
-          v51 = v50 + 1;
-          texCoordSrc[1] = v51;
-          if ( texCoordComps[1] >= 3 )
-          {
-            *(_DWORD *)((char *)v19 + v43 + 8) = *v51;
-            v52 = v51 + 1;
-            texCoordSrc[1] = v52;
-            if ( texCoordComps[1] == 4 )
-            {
-              *(_DWORD *)((char *)v19 + v43 + 12) = *v52;
-              texCoordSrc[1] = v52 + 1;
-            }
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x400) != 0 )
-        {
-          *(_DWORD *)((char *)v45 + v108) = *texCoordSrc[2];
-          v53 = texCoordSrc[2][1];
-          ++texCoordSrc[2];
-          v54 = texCoordOfs[2];
-          *(_DWORD *)((char *)v19 + texCoordOfs[2] + 4) = v53;
-          ++texCoordSrc[2];
-          if ( texCoordComps[2] >= 3 )
-          {
-            *(_DWORD *)((char *)v19 + v54 + 8) = *texCoordSrc[2]++;
-            if ( texCoordComps[2] == 4 )
-              *(_DWORD *)((char *)v19 + v54 + 12) = *texCoordSrc[2]++;
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x800) != 0 )
-        {
-          *(_DWORD *)((char *)v45 + v110) = *texCoordSrc[3];
-          v55 = texCoordSrc[3][1];
-          ++texCoordSrc[3];
-          v56 = texCoordOfs[3];
-          *(_DWORD *)((char *)v19 + texCoordOfs[3] + 4) = v55;
-          ++texCoordSrc[3];
-          if ( texCoordComps[3] >= 3 )
-          {
-            *(_DWORD *)((char *)v19 + v56 + 8) = *texCoordSrc[3]++;
-            if ( texCoordComps[3] == 4 )
-              *(_DWORD *)((char *)v19 + v56 + 12) = *texCoordSrc[3]++;
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x1000) != 0 )
-        {
-          *(_DWORD *)((char *)v45 + v103) = *texCoordSrc[4];
-          v57 = texCoordSrc[4][1];
-          ++texCoordSrc[4];
-          v58 = texCoordOfs[4];
-          *(_DWORD *)((char *)v19 + texCoordOfs[4] + 4) = v57;
-          ++texCoordSrc[4];
-          if ( texCoordComps[4] >= 3 )
-          {
-            *(_DWORD *)((char *)v19 + v58 + 8) = *texCoordSrc[4]++;
-            if ( texCoordComps[4] == 4 )
-              *(_DWORD *)((char *)v19 + v58 + 12) = *texCoordSrc[4]++;
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x2000) != 0 )
-        {
-          *(_DWORD *)((char *)v45 + v105) = *texCoordSrc[5];
-          v59 = texCoordSrc[5][1];
-          ++texCoordSrc[5];
-          v60 = texCoordOfs[5];
-          *(_DWORD *)((char *)v19 + texCoordOfs[5] + 4) = v59;
-          ++texCoordSrc[5];
-          if ( texCoordComps[5] >= 3 )
-          {
-            *(_DWORD *)((char *)v19 + v60 + 8) = *texCoordSrc[5]++;
-            if ( texCoordComps[5] == 4 )
-              *(_DWORD *)((char *)v19 + v60 + 12) = *texCoordSrc[5]++;
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x4000) != 0 )
-        {
-          *(_DWORD *)((char *)v45 + v113) = *texCoordSrc[6];
-          v61 = texCoordSrc[6][1];
-          ++texCoordSrc[6];
-          v62 = texCoordOfs[6];
-          *(_DWORD *)((char *)v19 + texCoordOfs[6] + 4) = v61;
-          ++texCoordSrc[6];
-          if ( texCoordComps[6] >= 3 )
-          {
-            *(_DWORD *)((char *)v19 + v62 + 8) = *texCoordSrc[6]++;
-            if ( texCoordComps[6] == 4 )
-              *(_DWORD *)((char *)v19 + v62 + 12) = *texCoordSrc[6]++;
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x8000) != 0 )
-        {
-          *(_DWORD *)((char *)v45 + v107) = *v44;
-          v63 = texCoordOfs[7];
-          *(_DWORD *)((char *)v19 + texCoordOfs[7] + 4) = v44[1];
-          v44 += 2;
-          if ( texCoordComps[7] >= 3 )
-          {
-            *(_DWORD *)((char *)v19 + v63 + 8) = *v44++;
-            if ( texCoordComps[7] == 4 )
-              *(_DWORD *)((char *)v19 + v63 + 12) = *v44++;
-          }
-        }
-        if ( (*(_DWORD *)a3 & 0x10000) != 0 )
-          *(_DWORD *)((char *)v45 + v111) = dword_186FF60[v83];   /* +0 shard; retail 0x0050D2C3 */
-        if ( (*(_DWORD *)a3 & 0x20000) != 0 )
-        {
-          *(_DWORD *)((char *)v45 + v109) = *((_DWORD *)v81 - 1);
-          v64 = v82;
-          *(float *)((char *)v19 + v82 + 4) = *v81;
-          *(_DWORD *)((char *)v19 + v64 + 8) = *((_DWORD *)v81 + 1);
-        }
-        v65 = *v14;
-        v66 = v14 + 1;
-        *(_DWORD *)((char *)v45 + v104) = v65;
-        v67 = *v66;
-        v68 = v84;
-        ++v66;
-        *(_DWORD *)((char *)v19 + v84 + 4) = v67;
-        *(_DWORD *)((char *)v19 + v68 + 8) = *v66;
-        v14 = v66 + 1;
-        if ( tess_vertexComponentCount == 4 )
-          *(_DWORD *)((char *)v19 + v68 + 12) = *v14++;
-        v19 = (_DWORD *)((char *)v19 + v86);
-        v45 = (_DWORD *)((char *)v45 + v86);
-        v81 += 3;
-        ++v83;
+        *(int *)( (char *)out + normalOfs + 0 ) = ((int *)tess_stageNormals)[3 * v + 0];
+        *(int *)( (char *)out + normalOfs + 4 ) = ((int *)tess_stageNormals)[3 * v + 1];
+        *(int *)( (char *)out + normalOfs + 8 ) = ((int *)tess_stageNormals)[3 * v + 2];
       }
-      while ( v83 < tess_numVertexes );
-      v18 = v85;
+      *(int *)( (char *)out + positionOfs + 0 ) = *xyz++;
+      *(int *)( (char *)out + positionOfs + 4 ) = *xyz++;
+      *(int *)( (char *)out + positionOfs + 8 ) = *xyz++;
+      if ( tess_vertexComponentCount == 4 )
+        *(int *)( (char *)out + positionOfs + 12 ) = *xyz++;
+      out = (int *)( (char *)out + vertexStride );
     }
   }
-  GL_State(*((_DWORD *)a3 + 417));
+
+  GL_State( stage->stateBits );
+
   if ( backEnd_dynamicBuffer_storage )
   {
-    v69 = v106;
-    v70 = v80;
-    qglBufferSubDataARB(34962, v80, v106, v18);
-    backEnd_dynamicBuffer_currentOffset = (v69 + v70 + 31) & 0xFFFFFFE0;
-LABEL_114:
-    ri_Hunk_FreeTempMemory(v18);
-LABEL_115:
-    ++backEnd_pc_drawCallCount;
-    backEnd_pc_drawnIndexCount += count;
-    glDrawElements(4u, count, 0x1403u, indices);
-    qglBindBufferARB(34962, 0);
-    return;
+    qglBufferSubDataARB( 34962, bufBase, totalBytes, tempMem );
+    backEnd_dynamicBuffer_currentOffset = ( totalBytes + bufBase + 31 ) & 0xFFFFFFE0;
+    ri.Hunk_FreeTempMemory( tempMem );
+    RB_ARB_DRAW_ELEMENTS( numIndexes, indexes );
   }
-  if ( v18 )
+  else
   {
-    qglBufferDataARB(34962, v86 * tess_numVertexes, v18, 35040);
-    goto LABEL_114;
+    if ( !tempMem )
+    {
+      if ( !(unsigned char)qglUnmapBufferARB( 34962 ) )   /* the buffer contents are lost: skip the draw */
+        goto done;
+    }
+    else
+    {
+      qglBufferDataARB( 34962, vertexStride * tess_numVertexes, tempMem, 35040 );
+      ri.Hunk_FreeTempMemory( tempMem );
+    }
+    RB_ARB_DRAW_ELEMENTS( numIndexes, indexes );
   }
-  if ( (unsigned __int8)qglUnmapBufferARB(34962) )
-    goto LABEL_115;
-  qglBindBufferARB(34962, 0);
+done:
+  qglBindBufferARB( 34962, 0 );
 }
 
-/* ---- RB_PickBufferOffsetARB  0x0050D440 ----  VERIFIED */
-int __cdecl RB_PickBufferOffsetARB(int a1, int a2, int *a3)
+/* ---- RB_PickBufferOffsetARB  0x0050D440 ----  VERIFIED
+ * Reserve `size` bytes in the dynamic buffer: return the current cursor, or 0
+ * (wrap to the start) when the block would overrun `capacity`, then advance the
+ * cursor past the reservation.  The capacity compare is signed.  The compiler
+ * outlined this and inlined a copy at every ARB2 upload site, so it has no
+ * callers of its own; kept for the 1:1 mapping.  The (cursor, size, capacity)
+ * parameter order gives retail's register convention (esi, ecx, edi). */
+int __cdecl RB_PickBufferOffsetARB( int *cursor, int size, int capacity )
 {
   int result;
 
-  result = *a3 + a1 > a2 ? 0 : *a3;
-  *a3 = result + a1;
+  result  = ( *cursor + size > capacity ) ? 0 : *cursor;
+  *cursor = result + size;
   return result;
 }
 
-/* ---- RB_SingleStageGenericARB2  0x0050D460 ----  VERIFIED */
-void __cdecl RB_SingleStageGenericARB2(_DWORD *a2, GLsizei count, GLvoid *indices)
+/* ---- RB_SingleStageGenericARB2  0x0050D460 ----  VERIFIED
+ * Non-interleaved path: upload each attribute array to its own region of the
+ * dynamic ARB buffer (colour and normal only when present) and draw.  Without a
+ * persistent VBO the capacity is treated as unbounded and the buffer name is a
+ * frame serial rather than a real GL object.  uploadOffset/uploadSource/uploadSize
+ * are three parallel runs of RB_ARB_MAX_UPLOADS entries; position is the last. */
+void __cdecl RB_SingleStageGenericARB2( shaderStage_t *stage, GLsizei numIndexes, GLvoid *indexes )
 {
-  int v4;
-  int v5;
-  GLubyte *v6;
-  int v7;
-  int v9;
-  _DWORD *v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  GLint v16;
-  int v17;
-  BOOL v18;
-  GLint v19;
-  bool v20; // zf
-  int v21;
-  GLint v22;
-  int v23;
-  int v24;
-  int i;
-  int v27;
-  int v28;
-  GLint         uploadOffset[RB_ARB_MAX_UPLOADS];  /* [esp+28h] [ebp-A4h] */
-  const GLvoid *uploadSource[RB_ARB_MAX_UPLOADS];  /* [esp+54h] [ebp-78h] */
-  GLsizei       uploadSize[RB_ARB_MAX_UPLOADS];    /* [esp+80h] [ebp-4Ch] */
-  _DWORD v30[8]; // [esp+ACh] [ebp-20h] BYREF
+  GLint         uploadOffset[RB_ARB_MAX_UPLOADS];
+  const GLvoid *uploadSource[RB_ARB_MAX_UPLOADS];
+  GLsizei       uploadSize[RB_ARB_MAX_UPLOADS];
+  int           texCoordUploadOffsets[R_MAX_TEXTURE_UNITS];
+  int           buffer;
+  int           cursor;
+  int           capacity;
+  int           uploadCount;
+  int           size;
+  int           ofs;
+  int           positionEnd;
+  int           totalUploads;
+  int           unit;
+  int           i;
 
-  v4 = backEnd_dynamicBuffer_storage;
   if ( backEnd_dynamicBuffer_storage )
   {
-    v5 = backEnd_dynamicBuffer_currentOffset;
-    v27 = backEnd_dynamicBuffer_capacity;
+    buffer   = backEnd_dynamicBuffer_storage;
+    cursor   = backEnd_dynamicBuffer_currentOffset;
+    capacity = backEnd_dynamicBuffer_capacity;
   }
   else
   {
-    v5 = 0;
-    v4 = backEnd_dynamicBuffer_frameSerial + 1;
-    v27 = 0x7FFFFFFF;
-    ++backEnd_dynamicBuffer_frameSerial;
+    cursor   = 0;
+    capacity = 0x7FFFFFFF;
+    buffer   = ++backEnd_dynamicBuffer_frameSerial;
   }
-  qglBindBufferARB(34962, v4);
-  v6 = (GLubyte *)a2;
-  v7 = 0;
-  RB_ComputeTexCoords((int)a2);   /* takes ONE argument, shader@EAX -- 0x00500400 */
-  v9 = 0;
-  if ( Value > 0 )
+  qglBindBufferARB( 34962, buffer );
+
+  uploadCount = 0;
+  RB_ComputeTexCoords( (int)stage );
+
+  /* one upload per active texcoord unit */
+  for ( unit = 0; unit < glConfig_maxActiveTextures; ++unit )
   {
-    v28 = *a2;
-    v10 = a2 + 36;
-    do
+    texCoordUploadOffsets[unit] = 0;
+    if ( ( stage->flags & (SS_TEXCOORD_ARRAY0 << unit) ) != 0 )
     {
-      v30[v9] = 0;
-      if ( ((256 << v9) & v28) != 0 )
-      {
-        v11 = 4 * tess_numVertexes * *v10;
-        uploadSize[v7] = v11;
-        v12 = v11 + v5 > v27 ? 0 : v5;
-        v6 = (GLubyte *)a2;
-        v5 = v12 + v11;
-        v13 = (int)*(&tess_activeTexCoords + v9);
-        uploadOffset[v7] = v12;
-        uploadSource[v7] = (const GLvoid *)v13;
-        v30[v9] = v12;
-        ++v7;
-      }
-      ++v9;
-      v10 += 50;
+      size = 4 * tess_numVertexes * stage->bundle[unit].texCoordComponentCount;
+      ofs  = ( cursor + size > capacity ) ? 0 : cursor;
+      cursor = ofs + size;
+      uploadSize[uploadCount]     = size;
+      uploadOffset[uploadCount]   = ofs;
+      uploadSource[uploadCount]   = (const GLvoid *)tess_activeTexCoords[unit];   /* retail 0x0050D516: pointer in slot `unit` */
+      texCoordUploadOffsets[unit] = ofs;
+      ++uploadCount;
     }
-    while ( v9 < Value );
   }
-  RB_SetupMultitexture(v6, (int)v30, 0);
-  if ( (*(_DWORD *)v6 & 0x10000) != 0 )
+  RB_SetupMultitexture( stage, texCoordUploadOffsets, 0 );
+
+  /* colour */
+  if ( ( stage->flags & SS_COLOR_ARRAY ) != 0 )
   {
-    v14 = 4 * tess_numVertexes;
-    v15 = 4 * tess_numVertexes + v5;
-    uploadSize[v7] = 4 * tess_numVertexes;
-    uploadSource[v7] = (const GLvoid *)tess_stageVertexColors;
-    v16 = v15 > v27 ? 0 : v5;
-    v5 = v16 + v14;
-    uploadOffset[v7] = v16;
-    RB_ComputeColors((int)a2);
-    if ( (glState_clientStateBits & 0x100) == 0 )
+    size = 4 * tess_numVertexes;
+    ofs  = ( cursor + size > capacity ) ? 0 : cursor;
+    cursor = ofs + size;
+    uploadSize[uploadCount]   = size;
+    uploadSource[uploadCount] = (const GLvoid *)tess_stageVertexColors;
+    uploadOffset[uploadCount] = ofs;
+    RB_ComputeColors( (int)stage );
+    if ( ( glState_clientStateBits & 0x100 ) == 0 )
     {
-      glEnableClientState(0x8076u);
+      glEnableClientState( 0x8076u );
       glState_clientStateBits |= 0x100u;
     }
-    glColorPointer(4, 0x1401u, 0, (const GLvoid *)v16);
-    v6 = (GLubyte *)a2;
-    ++v7;
+    glColorPointer( 4, 0x1401u, 0, (const GLvoid *)ofs );
+    ++uploadCount;
   }
   else
   {
-    if ( (glState_clientStateBits & 0x100) != 0 )
+    if ( ( glState_clientStateBits & 0x100 ) != 0 )
     {
-      glDisableClientState(0x8076u);
+      glDisableClientState( 0x8076u );
       glState_clientStateBits &= ~0x100u;
     }
-    if ( *((_DWORD *)v6 + 409) == 11 )
-      glColor4ubv((const GLubyte *)(backEnd_currentEntity + 108));
+    if ( stage->rgbGen == CGEN_LIGHTING_PRECALC )
+      glColor4ubv( (const GLubyte *)( backEnd_currentEntity + 108 ) );
     else
-      glColor4ubv(v6 + 1664);
+      glColor4ubv( (const GLubyte *)stage->constantColor );
   }
-  if ( (*(_DWORD *)v6 & 0x20000) != 0 )
+
+  /* normal */
+  if ( ( stage->flags & SS_NORMAL_ARRAY ) != 0 )
   {
-    v17 = 12 * tess_numVertexes;
-    v18 = 12 * tess_numVertexes + v5 > v27;
-    uploadSize[v7] = 12 * tess_numVertexes;
-    uploadSource[v7] = (const GLvoid *)tess_stageNormals;
-    v19 = v18 ? 0 : v5;
-    v5 = v19 + v17;
-    v20 = (glState_clientStateBits & 0x200) == 0;
-    uploadOffset[v7] = v19;
-    if ( v20 )
+    size = 12 * tess_numVertexes;
+    ofs  = ( cursor + size > capacity ) ? 0 : cursor;
+    cursor = ofs + size;
+    uploadSize[uploadCount]   = size;
+    uploadSource[uploadCount] = (const GLvoid *)tess_stageNormals;
+    uploadOffset[uploadCount] = ofs;
+    if ( ( glState_clientStateBits & 0x200 ) == 0 )
     {
-      glEnableClientState(0x8075u);
+      glEnableClientState( 0x8075u );
       glState_clientStateBits |= 0x200u;
     }
-    glNormalPointer(0x1406u, 0, (const GLvoid *)v19);
-    v6 = (GLubyte *)a2;
-    ++v7;
+    glNormalPointer( 0x1406u, 0, (const GLvoid *)ofs );
+    ++uploadCount;
   }
-  else if ( (glState_clientStateBits & 0x200) != 0 )
+  else if ( ( glState_clientStateBits & 0x200 ) != 0 )
   {
-    glDisableClientState(0x8075u);
+    glDisableClientState( 0x8075u );
     glState_clientStateBits &= ~0x200u;
   }
-  v21 = 4 * tess_numVertexes * tess_vertexComponentCount;
-  uploadSize[v7] = v21;
-  uploadSource[v7] = (const GLvoid *)tess_xyz;
-  v22 = v21 + v5 > v27 ? 0 : v5;
-  v23 = v22 + v21;
-  v20 = (glState_clientStateBits & 0x400) == 0;
-  uploadOffset[v7] = v22;
-  if ( v20 )
+
+  /* position -- always uploaded, and the final upload */
+  size = 4 * tess_numVertexes * tess_vertexComponentCount;
+  ofs  = ( cursor + size > capacity ) ? 0 : cursor;
+  positionEnd = ofs + size;
+  uploadSize[uploadCount]   = size;
+  uploadSource[uploadCount] = (const GLvoid *)tess_xyz;
+  uploadOffset[uploadCount] = ofs;
+  if ( ( glState_clientStateBits & 0x400 ) == 0 )
   {
-    glEnableClientState(0x8074u);
+    glEnableClientState( 0x8074u );
     glState_clientStateBits |= 0x400u;
   }
-  glVertexPointer(tess_vertexComponentCount, 0x1406u, 0, (const GLvoid *)v22);
-  v24 = v7 + 1;   /* `inc esi` 0x0050D707 -- the position array is upload v7 */
-  if ( backEnd_dynamicBuffer_storage )
-    backEnd_dynamicBuffer_currentOffset = v23;
+  glVertexPointer( tess_vertexComponentCount, 0x1406u, 0, (const GLvoid *)ofs );
+  totalUploads = uploadCount + 1;
+
+  if ( !backEnd_dynamicBuffer_storage )
+    qglBufferDataARB( 34962, positionEnd, 0, 35040 );
   else
-    qglBufferDataARB(34962, v23, 0, 35040);
-  for ( i = 0; i < v24; ++i )
-    qglBufferSubDataARB(34962, uploadOffset[i], uploadSize[i], uploadSource[i]);
-  GL_State(*((_DWORD *)v6 + 417));
-  backEnd_pc_drawnIndexCount += count;
+    backEnd_dynamicBuffer_currentOffset = positionEnd;
+
+  for ( i = 0; i < totalUploads; ++i )
+    qglBufferSubDataARB( 34962, uploadOffset[i], uploadSize[i], uploadSource[i] );
+
+  GL_State( stage->stateBits );
+  backEnd_pc_drawnIndexCount += numIndexes;
   ++backEnd_pc_drawCallCount;
-  glDrawElements(4u, count, 0x1403u, indices);
-  qglBindBufferARB(34962, 0);
+  glDrawElements( 4u, numIndexes, 0x1403u, indexes );
+  qglBindBufferARB( 34962, 0 );
 }
 
-/* ---- RB_IterateStagesGenericARB  0x0050D7B0 ----  VERIFIED */
-void __cdecl RB_IterateStagesGenericARB( void )
+/* ---- RB_IterateStagesGenericARB  0x0050D7B0 ----  VERIFIED
+ * Draw every ordinary (non per-light) stage of the current surface.  With
+ * r_lightmap, stop after the first stage whose first or second unit is a
+ * lightmap.  `input` is &tess (Q3's shaderCommands_t *input; retail passes it
+ * in ebx). */
+void __cdecl RB_IterateStagesGenericARB( shaderCommands_t *input )
 {
-  int      i;
-  GLubyte *stage;
+  int            i;
+  shaderStage_t *stage;
 
-  for ( i = 0; i < 4 * R_MAX_SHADER_STAGES; i += 4 )
+  for ( i = 0; i < R_MAX_SHADER_STAGES; ++i )
   {
-    stage = *(GLubyte **)( i + tess_activeStages );
+    stage = ((shaderStage_t **)tess_activeStages)[i];
     if ( !stage )
       break;
 
-    if ( (char)*stage >= 0 )
+    if ( ( stage->flags & SHADER_STAGE_PER_LIGHT ) == 0 )
     {
-      if ( rb_arbInterleave )
-        RB_SingleStageGenericARB( stage, tess_numIndexes, (GLvoid *)tess_indexes_base );
+      if ( tr_vboInterleaved )
+        RB_SingleStageGenericARB( stage, input->numIndexes, (GLvoid *)input->indexes );
       else
-        RB_SingleStageGenericARB2( (_DWORD *)stage, tess_numIndexes,
-                                   (GLvoid *)tess_indexes_base );
+        RB_SingleStageGenericARB2( stage, input->numIndexes, (GLvoid *)input->indexes );
 
       if ( r_lightmap->integer )
       {
-        if ( stage[200] )
+        if ( stage->bundle[0].isLightmap )
           break;
-        if ( stage[400] )
+        if ( stage->bundle[1].isLightmap )
           break;
       }
     }
   }
 }
 
-/* ---- ProjectDlightTextureARB  0x0050D820 ----  VERIFIED */
+/* ---- ProjectDlightTextureARB  0x0050D820 ----  VERIFIED
+ * For every dynamic light touching this surface, build its projected index /
+ * colour arrays and draw either the shared dlight stage (shader not lit per
+ * entity) or each per-light stage of the surface. */
 void __cdecl ProjectDlightTextureARB( void )
 {
-  int      i;
-  int      dlightOffset;
+  shaderStage_t *stage;
+  shaderStage_t *dlightStage;
   int      stageIndex;
+  int      i;
   GLsizei  hitIndexCount;
-  GLubyte *stage;
-  GLubyte *dlightStage;
-  unsigned short hitIndexes[49152];   /* 0x18004 bytes incl. 4 pad */
+  unsigned short hitIndexes[49152];
 
-  if ( !backEnd_num_dlights )
+  if ( !backEnd_refdef_num_dlights )
     return;
 
-  dlightOffset = 0;
-  for ( i = 0; i < backEnd_num_dlights; i++, dlightOffset += R_DLIGHT_STRIDE )
+  for ( i = 0; i < backEnd_refdef_num_dlights; ++i )
   {
     if ( ( ( 1 << i ) & tess_dlightBits ) == 0 )
       continue;
 
-    hitIndexCount = RB_BuildDlightArrays( (unsigned char *)tess_vertexColors,
-                                          (float *)tess_texCoords1,
-                                          (float *)( backEnd_dlights + dlightOffset ),
+    hitIndexCount = RB_BuildDlightArrays( (float *)tess_texCoords1,
+                                          (unsigned char *)tess_vertexColors,
+                                          (float *)&( (dlight_t *)backEnd_refdef_dlights )[i],
                                           (int)hitIndexes );
     if ( !hitIndexCount )
       continue;
 
-    if ( *(char *)( tess_shader + 84 ) >= 0 )
+    if ( *(char *)( tess_shader + 84 ) & SHADER_LIGHTING_PER_ENTITY )   /* shader.lightingFlags */
     {
-      dlightStage = *(GLubyte **)( tr_dlightShader + 340  );
-      if ( dlightStage )
+      backEnd_currentDlight = (int)&( (dlight_t *)backEnd_refdef_dlights )[i];
+      for ( stageIndex = 0; stageIndex < R_MAX_SHADER_STAGES; ++stageIndex )
       {
-        if ( rb_arbInterleave )
-          RB_SingleStageGenericARB( dlightStage, hitIndexCount, hitIndexes );
-        else
-          RB_SingleStageGenericARB2( (_DWORD *)dlightStage, hitIndexCount, hitIndexes );
+        stage = ((shaderStage_t **)tess_activeStages)[stageIndex];
+        if ( !stage )
+          break;
+        if ( ( stage->flags & SHADER_STAGE_PER_LIGHT ) != 0 )
+        {
+          if ( tr_vboInterleaved )
+            RB_SingleStageGenericARB( stage, hitIndexCount, hitIndexes );
+          else
+            RB_SingleStageGenericARB2( stage, hitIndexCount, hitIndexes );
+        }
       }
     }
     else
     {
-      backEnd_currentLight = backEnd_dlights + dlightOffset;
-      for ( stageIndex = 0; stageIndex < 4 * R_MAX_SHADER_STAGES; stageIndex += 4 )
+      dlightStage = *(shaderStage_t **)( tr_dlightShader + 340 );   /* tr.dlightShader->stages[0] */
+      if ( dlightStage )
       {
-        stage = *(GLubyte **)( stageIndex + tess_activeStages );
-        if ( !stage )
-          break;
-        if ( (char)*stage < 0 )
-        {
-          if ( rb_arbInterleave )
-            RB_SingleStageGenericARB( stage, hitIndexCount, hitIndexes );
-          else
-            RB_SingleStageGenericARB2( (_DWORD *)stage, hitIndexCount, hitIndexes );
-        }
+        if ( tr_vboInterleaved )
+          RB_SingleStageGenericARB( dlightStage, hitIndexCount, hitIndexes );
+        else
+          RB_SingleStageGenericARB2( dlightStage, hitIndexCount, hitIndexes );
       }
     }
   }
 }
 
-/* ---- RB_StageIteratorGenericARB  0x0050D970 ----  VERIFIED */
+/* ---- RB_StageIteratorGenericARB  0x0050D970 ----  VERIFIED
+ * ARB backend stage iterator (tr.stageIteratorFunc): deform, fog and cull the
+ * current surface, draw the ordinary stages, then run the dynamic-light pass --
+ * either the projected dlight texture or, for per-entity-lit shaders, each
+ * per-light stage once for every entity light. */
 void __cdecl RB_StageIteratorGenericARB( int portalPass )
 {
-  char    *logText;
-  int      entity;
-  int      lightCount;
-  int      lightIndex;
-  int      stageIndex;
-  GLubyte *stage;
+  char          *logText;
+  shaderStage_t *stage;
+  int            entity;
+  int            lightCount;
+  int            lightIndex;
+  int            stageIndex;
 
   if ( tess_activeStageCount <= 0 )
     return;
@@ -836,25 +661,25 @@ void __cdecl RB_StageIteratorGenericARB( int portalPass )
 
   if ( r_logFile->integer )
   {
-    logText = va( "--- RB_StageIteratorGenericARB( %s ) ---\n",
-                  (const char *)tess_shader );
+    logText = va( "--- RB_StageIteratorGenericARB( %s ) ---\n", (const char *)tess_shader );
     if ( Stream )
-      fprintf( Stream, "%s", (int)logText );
+      fprintf( Stream, "%s", logText );
   }
 
   RB_DeformTessGeometry();
   RB_SetIteratorFog();
-  GL_Cull( *(_DWORD *)( tess_shader + 168  ) );
+  GL_Cull( ((shader_t *)tess_shader)->cullType );          /* shader.cullType */
 
   if ( !portalPass )
-    RB_IterateStagesGenericARB();
+    RB_IterateStagesGenericARB( &tess );
 
+  /* dynamic-light pass */
   if ( tess_dlightBits )
   {
-    if ( *(float *)( tess_shader + 88  ) <= 5.0
-      || ( *(_BYTE *)( tess_shader + 84 ) & SHADER_LIGHTING_PER_ENTITY ) != 0 )
+    if ( ((shader_t *)tess_shader)->sort <= 5.0f      /* shader.sort */
+      || ( *(unsigned char *)( tess_shader + 84 ) & SHADER_LIGHTING_PER_ENTITY ) != 0 )
     {
-      if ( ( *(_DWORD *)( tess_shader + 92  ) & 0x20004 ) == 0 )
+      if ( ( ((shader_t *)tess_shader)->surfaceParmFlags & 0x20004 ) == 0 )
       {
         ProjectDlightTextureARB();
         return;
@@ -862,42 +687,41 @@ void __cdecl RB_StageIteratorGenericARB( int portalPass )
     }
   }
 
-  if ( ( *(_BYTE *)( tess_shader + 84 ) & SHADER_LIGHTING_PER_ENTITY ) == 0 )
+  /* per-entity light stages */
+  if ( ( *(unsigned char *)( tess_shader + 84 ) & SHADER_LIGHTING_PER_ENTITY ) == 0 )
     return;
 
   entity = backEnd_currentEntity;
   if ( !entity )
     return;
-  lightCount = *(_DWORD *)( entity + 204  );
+  lightCount = *(int *)( entity + 204 );             /* trRefEntity.lightCount */
   if ( !lightCount )
     return;
 
-  for ( lightIndex = 0; lightIndex < lightCount; lightIndex++ )
+  for ( lightIndex = 0; lightIndex < lightCount; ++lightIndex )
   {
-    backEnd_currentLight = *(_DWORD *)( entity + 8 * lightIndex + 208  );
-    if ( *(_DWORD *)backEnd_currentLight != 8  )
+    backEnd_currentDlight = *(int *)( entity + 8 * lightIndex + 208 );   /* lights[i].light */
+    if ( *(int *)backEnd_currentDlight != 8 )        /* light.type != R_LIGHT_TYPE (8) */
     {
-      backEnd_currentLightScale = *(float *)( entity + 8 * lightIndex + 212  );
+      backEnd_currentLightScale = *(float *)( entity + 8 * lightIndex + 212 );   /* lights[i].scale */
 
-      for ( stageIndex = 0; stageIndex < 4 * R_MAX_SHADER_STAGES; stageIndex += 4 )
+      for ( stageIndex = 0; stageIndex < R_MAX_SHADER_STAGES; ++stageIndex )
       {
-        stage = *(GLubyte **)( stageIndex + tess_activeStages );
+        stage = ((shaderStage_t **)tess_activeStages)[stageIndex];
         if ( !stage )
           break;
-        if ( ( *stage & SHADER_STAGE_PER_LIGHT ) != 0 )
+        if ( ( stage->flags & SHADER_STAGE_PER_LIGHT ) != 0 )
         {
-          if ( rb_arbInterleave )
-            RB_SingleStageGenericARB( stage, tess_numIndexes,
-                                      (GLvoid *)tess_indexes_base );
+          if ( tr_vboInterleaved )
+            RB_SingleStageGenericARB( stage, tess_numIndexes, (GLvoid *)tess_indexes );
           else
-            RB_SingleStageGenericARB2( (_DWORD *)stage, tess_numIndexes,
-                                       (GLvoid *)tess_indexes_base );
-          entity = backEnd_currentEntity;
+            RB_SingleStageGenericARB2( stage, tess_numIndexes, (GLvoid *)tess_indexes );
         }
+        entity = backEnd_currentEntity;
       }
     }
-    lightCount = *(_DWORD *)( entity + 204 );
+    lightCount = *(int *)( entity + 204 );
   }
 
-  backEnd_currentLight = 0;
+  backEnd_currentDlight = 0;
 }

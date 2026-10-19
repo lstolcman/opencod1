@@ -6,13 +6,22 @@
 #include <malloc.h>
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
+#include "tr_records.h"
 #include "tr_gl_types.h"
 #include "tr_tess.h"
+#include "tr_local.h"         /* typed structs + asserts; after tr_records.h (TRG) */
 
 #include "../jpeg-6/jinclude.h"
 #include "../jpeg-6/jpeglib.h"
+/* ---- renderer-owned globals ---- */
+int rendererImageAllocationCount;   /* 0x014072F0 */
+int hackSize;
+int r_usedImageFrame;
+int hashtable[4096];
+int r_usedImageMemory;
+int r_usedLightmapMemory;
+int r_usedTextureMemory;
+
 
 int param         = 0x2701;   /* 0x005712F0  gl_filter_min, GL_LINEAR_MIPMAP_NEAREST */
 int gl_filter_max  = 0x2601;   /* 0x005712F4  gl_filter_max, GL_LINEAR               */
@@ -20,40 +29,22 @@ int gl_filter_max  = 0x2601;   /* 0x005712F4  gl_filter_max, GL_LINEAR          
 
 void CoD_jpeg_mem_src( j_decompress_ptr cinfo, const unsigned char *inbuffer );
 
-int __fastcall CompareMergableShaders( int a1, int a2, int a3, int a4 );
-extern int GL_Bind();
+typedef struct image_s image_t;   /* full definition below; forward-declared for the prototypes here */
+
+int __cdecl CompareMergableShaders( int shaderA, int shaderB, int mergeImageA, int mergeImageB );
+void __cdecl GL_Bind( image_t *image );
+void __cdecl GL_SelectTexture( int tmu );
 extern int __cdecl GL_CheckErrors( const char *location );
 extern int R_FindShader();
 float VectorNormalize2( const float *v, float *out );
 
-char __cdecl R_LoadImage( const char *name, int *data, unsigned __int16 *width, unsigned __int16 *height, int *a4, _DWORD *a5, int flags );
+void __cdecl R_LoadImage( const char *name, int *data, unsigned __int16 *width, unsigned __int16 *height, int *format, unsigned int *hasMipmaps, int readFlag );
 
 extern int j__atol();
 extern int jinit_compress_master();
 extern int qsort_m();
 extern void GLimp_SetGamma( unsigned char *red, unsigned char *green, unsigned char *blue );
 
-
-typedef struct image_s
-{
-	char            imgName[64];    /* +0x00  strcpy in R_AllocImage        */
-	unsigned short  width;          /* +0x40                                */
-	unsigned short  height;         /* +0x42                                */
-	unsigned short  uploadWidth;    /* +0x44  out-param of UploadImage      */
-	unsigned short  uploadHeight;   /* +0x46                                */
-	int             cardMemory;     /* +0x48  += level cost                 */
-	int             textureMemory;  /* +0x4C                                */
-	int             imageTrack;     /* +0x50                                */
-	unsigned int    target;         /* +0x54  glBindTexture(target,0)       */
-	unsigned int    texnum;         /* +0x58  = index + 1024                */
-	int             frameUsed;      /* +0x5C                                */
-	unsigned int    internalFormat; /* +0x60  out-param of UploadImage      */
-	unsigned int    flags;          /* +0x64  IMAGE_FLAG_*                  */
-	void           *link;           /* +0x68  sheet image | delayed shader  */
-	int             state0;         /* +0x6C  sheet x/y | delay group       */
-	int             state1;         /* +0x70  sheet rotated | groupTriCount */
-	struct image_s *hashNext;       /* +0x74                                */
-} image_t;
 
 #define IMAGE_FLAG_MIPMAP            0x0001
 #define IMAGE_FLAG_ALLOW_PICMIP      0x0002
@@ -73,7 +64,111 @@ typedef struct image_s
 #define R_IMAGE_NAME_SIZE         64
 #define R_MAX_IMAGE_ALLOCATIONS   32
 
-#define tr_images ( (image_t **)(void *)dword_16C9840 )
+/* image track categories (image->imageTrack); r_imageTrackNames indexes these */
+#define R_IMAGE_TRACK_LIGHTMAP   3
+
+/* ------------------------------------------------------------------------- *
+ *  image_t (0x78) -- the tr.images record.
+ *
+ *  R_AllocImage requests exactly 0x78 bytes and R_LoadSingleDelayedImage
+ *  copies all 0x78 when it swaps a failed delayed image for the default one.
+ *  The +0x68 `link` slot is a shader/sheet handle: the merge-target shader
+ *  while IMAGE_FLAG_DELAYED_UPLOAD is set, otherwise NULL or the physical
+ *  texture-sheet image.  The +0x6c `state` slot is either the sheet x/y/
+ *  rotated triple or the delayed group / groupTriCount pair.
+ *
+ *  This file owns the FULL layout (tr_backend.c keeps a partial file-local
+ *  copy of the same record); the tr_* image globals are declared `int` but
+ *  hold an image_t*, so tr_images / imageHashTable cast them here.  Retyping
+ *  never moves storage; every offset is pinned so a wrong one is a build error.
+ * ------------------------------------------------------------------------- */
+struct shader_s;   /* tr_local.h already forward-declares this */
+
+typedef union {
+	struct image_s  *textureSheet;    /* sheet image once DELAYED is cleared */
+	struct shader_s *delayedShader;   /* merge-target shader while DELAYED set */
+} imageLink_t;
+COD1_ASSERT_SIZE(imageLink_t, 0x04);
+
+typedef struct {
+	unsigned short x;                 /* +0x6c */
+	unsigned short y;                 /* +0x6e */
+	unsigned char  rotated;           /* +0x70  set when width < height */
+} imageSheetState_t;
+
+typedef struct {
+	int group;                        /* +0x6c */
+	int groupTriCount;                /* +0x70 */
+} imageDelayState_t;
+
+typedef union {
+	imageSheetState_t sheet;
+	imageDelayState_t delay;
+} imageState_t;
+COD1_ASSERT_SIZE(imageState_t, 0x08);
+
+typedef struct image_s
+{
+	char            imgName[R_IMAGE_NAME_SIZE]; /* +0x00  strcpy in R_AllocImage */
+	unsigned short  width;          /* +0x40 */
+	unsigned short  height;         /* +0x42 */
+	unsigned short  uploadWidth;    /* +0x44  out-param of UploadImage */
+	unsigned short  uploadHeight;   /* +0x46 */
+	int             cardMemory;     /* +0x48  += level cost */
+	int             textureMemory;  /* +0x4c */
+	int             imageTrack;     /* +0x50 */
+	unsigned int    target;         /* +0x54  glBindTexture(target,0) */
+	unsigned int    texnum;         /* +0x58  = index + 1024 */
+	int             frameUsed;      /* +0x5c */
+	unsigned int    internalFormat; /* +0x60  out-param of UploadImage */
+	unsigned int    flags;          /* +0x64  IMAGE_FLAG_* */
+	imageLink_t     link;           /* +0x68 */
+	imageState_t    state;          /* +0x6c */
+	struct image_s *hashNext;       /* +0x74 */
+} image_t;
+COD1_ASSERT_SIZE(image_t, 0x78);
+ASSERT_OFF(image_t, width, 0x40);
+ASSERT_OFF(image_t, uploadWidth, 0x44);
+ASSERT_OFF(image_t, cardMemory, 0x48);
+ASSERT_OFF(image_t, textureMemory, 0x4c);
+ASSERT_OFF(image_t, imageTrack, 0x50);
+ASSERT_OFF(image_t, target, 0x54);
+ASSERT_OFF(image_t, texnum, 0x58);
+ASSERT_OFF(image_t, frameUsed, 0x5c);
+ASSERT_OFF(image_t, internalFormat, 0x60);
+ASSERT_OFF(image_t, flags, 0x64);
+ASSERT_OFF(image_t, link, 0x68);
+ASSERT_OFF(image_t, state, 0x6c);
+ASSERT_OFF(image_t, state.sheet.rotated, 0x70);
+ASSERT_OFF(image_t, hashNext, 0x74);
+
+/* ------------------------------------------------------------------------- *
+ *  imageGroupNode_t (0x18) -- texture-sheet packing list/tree node.  A
+ *  nonterminal element uses `u.child`; the terminal one (next == NULL) uses
+ *  `u.image`.  MergeImageList builds these lists/trees and UploadImageGroup_r
+ *  consumes the same tagged shape.  `width` holds the larger of the source
+ *  dimensions, `height` the smaller (the packer rotates so width >= height).
+ * ------------------------------------------------------------------------- */
+typedef struct imageGroupNode_s imageGroupNode_t;
+struct imageGroupNode_s {
+	union {
+		imageGroupNode_t *child;      /* +0x00  nonterminal */
+		image_t          *image;      /* +0x00  terminal (next == NULL) */
+	} u;
+	imageGroupNode_t *next;           /* +0x04 */
+	int               triangleCount;  /* +0x08  packing priority, not pixel area */
+	int               group;          /* +0x0c */
+	int               width;          /* +0x10  larger dimension */
+	int               height;         /* +0x14  smaller dimension */
+};
+COD1_ASSERT_SIZE(imageGroupNode_t, 0x18);
+ASSERT_OFF(imageGroupNode_t, next, 0x04);
+ASSERT_OFF(imageGroupNode_t, triangleCount, 0x08);
+ASSERT_OFF(imageGroupNode_t, group, 0x0c);
+ASSERT_OFF(imageGroupNode_t, width, 0x10);
+ASSERT_OFF(imageGroupNode_t, height, 0x14);
+
+#define tr_images ( (image_t **)(void *)tr_imageSlots )
 
 #define imageHashTable ( (image_t **)(void *)hashtable )
 
@@ -91,7 +186,7 @@ typedef struct
 
 imageAllocation_t r_imageAllocations[ R_MAX_IMAGE_ALLOCATIONS ];
 
-static const unsigned char mipBlendColors[16][4] = {
+static unsigned char mipBlendColors[16][4] = {
 	{   0,   0,   0,   0 },
 	{ 255,   0,   0, 128 },
 	{   0, 255,   0, 128 },
@@ -111,15 +206,15 @@ static const unsigned char mipBlendColors[16][4] = {
 };
 
 #define ri_Hunk_Alloc(sz) \
-	( (void *)( (*(int (__cdecl **)(int))&ri_Hunk_Alloc)( (int)(sz) ) ) )
+	( (void *)( (*(int (__cdecl **)(int))&ri.Hunk_Alloc)( (int)(sz) ) ) )
 #define ri_Hunk_AllocateTempMemory(sz) \
-	( (void *)( (*(int (__cdecl **)(int))&ri_Hunk_AllocateTempMemory)( (int)(sz) ) ) )
+	( (void *)( (*(int (__cdecl **)(int))&ri.Hunk_AllocateTempMemory)( (int)(sz) ) ) )
 #define ri_Hunk_FreeTempMemory(p) \
-	( (*(void (__cdecl **)(void *))&ri_Hunk_FreeTempMemory)( (p) ) )
+	( (*(void (__cdecl **)(void *))&ri.Hunk_FreeTempMemory)( (p) ) )
 #define ri_FS_ReadFile(name, buf) \
-	( (*(int (__cdecl **)(const char *, void **))&ri_FS_ReadFile)( (name), (buf) ) )
+	( (*(int (__cdecl **)(const char *, void **))&ri.FS_ReadFile)( (name), (buf) ) )
 #define ri_FS_FreeFile(p) \
-	( (*(void (__cdecl **)(void *))&ri_FS_FreeFile)( (p) ) )
+	( (*(void (__cdecl **)(void *))&ri.FS_FreeFile)( (p) ) )
 
 #define R_CVAR(g) ( *(cvar_t **)&(g) )
 
@@ -130,6 +225,7 @@ void __cdecl R_RememberImageAllocation( void *memory, int kind );
 int __cdecl R_PicmipForImageFlags( int flags )
 {
 	int picmip;
+	int clamped;
 
 	if ( flags & IMAGE_FLAG_USE_PICMIP2 )
 		picmip = R_CVAR( r_picmip2 )->integer;
@@ -139,43 +235,45 @@ int __cdecl R_PicmipForImageFlags( int flags )
 	if ( !( flags & IMAGE_FLAG_ALLOW_PICMIP ) )
 		return 0;
 
-	if ( picmip > 3 )
-		picmip = 3;
-	if ( picmip < 0 )
-		picmip = 0;
-	return picmip;
+	clamped = picmip > 3 ? 3 : picmip;
+	return ~( clamped >> 31 ) & clamped;
 }
 
 /* ---- R_RememberImageAllocation  0x004EA3C0 ----  VERIFIED */
 void __cdecl R_RememberImageAllocation( void *memory, int kind )
 {
-	r_imageAllocations[ dword_14072F0 ].kind   = kind;
-	r_imageAllocations[ dword_14072F0 ].memory = memory;
-	++dword_14072F0;
+	r_imageAllocations[ rendererImageAllocationCount ].kind   = kind;
+	r_imageAllocations[ rendererImageAllocationCount ].memory = memory;
+	++rendererImageAllocationCount;
 }
 
 /* ---- R_ResetImageAllocations  0x004EA3E0 ----  VERIFIED */
 void R_ResetImageAllocations( void )
 {
-	dword_14072F0 = 0;
+	rendererImageAllocationCount = 0;
 }
 
 /* ---- R_FreeImageAllocations  0x004EA3F0 ----  VERIFIED */
 void R_FreeImageAllocations( void )
 {
-	while ( dword_14072F0 > 0 )
+	while ( rendererImageAllocationCount > 0 )
 	{
-		imageAllocation_t *a = &r_imageAllocations[ --dword_14072F0 ];
+		imageAllocation_t *a = &r_imageAllocations[ --rendererImageAllocationCount ];
 
-		if ( a->kind == R_IMAGE_ALLOCATION_FILE )
+		switch ( a->kind )
+		{
+		case R_IMAGE_ALLOCATION_FILE:
 			ri_FS_FreeFile( a->memory );
-		else if ( a->kind == R_IMAGE_ALLOCATION_TEMP_MEMORY )
+			break;
+		case R_IMAGE_ALLOCATION_TEMP_MEMORY:
 			ri_Hunk_FreeTempMemory( a->memory );
+			break;
+		}
 	}
 }
 
 /* ---- R_AllocTempMemory  0x004EA440 ----  VERIFIED */
-void * __cdecl R_AllocTempMemory( int size )
+void * __cdecl R_AllocTempMemory( int size, const char *name )
 {
 	void *memory = ri_Hunk_AllocateTempMemory( size );
 
@@ -204,35 +302,29 @@ void __cdecl R_GammaCorrect( unsigned char *buffer, int bytes )
 }
 
 /* ---- tr_image_generateHashValue  0x004EA4E0 ----  [HIGH] */
-int __cdecl tr_image_generateHashValue(char *a1)
+/* Q3 generateHashValue: hash = sum over path chars (until '.') of
+ * tolower(c) * (119 + index), masked to 12 bits.  VC7 strength-reduces i into
+ * the walking pointer (119 - name + p == 119 + i).  '\' folds to '/'. */
+int __cdecl tr_image_generateHashValue( char *name )
 {
-  char *v1;
-  __int16 v2;
-  __int16 v3;
-  int v4;
-  __int16 v5;
-  char v6;
+	int  i;
+	long hash;
+	int  letter;
 
-  v1 = a1;
-  v2 = 0;
-  if ( *a1 )
-  {
-    v3 = 119 - (_WORD)a1;
-    do
-    {
-      v4 = tolower(*v1);
-      if ( v4 == 46 )
-        break;
-      if ( v4 == 92 )
-        LOWORD(v4) = 47;
-      v5 = v4 * (v3 + (_WORD)v1);
-      v6 = v1[1];
-      v2 += v5;
-      ++v1;
-    }
-    while ( v6 );
-  }
-  return v2 & 0xFFF;
+	hash = 0;
+	i = 0;
+	while ( name[i] != '\0' )
+	{
+		letter = tolower( name[i] );
+		if ( letter == '.' )
+			break;
+		if ( letter == '\\' )
+			letter = '/';
+		hash += (long)( letter ) * ( i + 119 );
+		i++;
+	}
+	hash &= 0xFFF;
+	return hash;
 }
 
 typedef struct textureMode_s
@@ -255,136 +347,91 @@ static const textureMode_t r_textureModes[6] =      /* 0x005712F8 */
 static const char *const r_imageTrackNames[11] =    /* 0x00571340 */
 {
 	"misc  ", "debug ", "ui    ", "lmap  ", "effect", "hud   ",
-	"vmodel", "model ", "world ", "f/x   ", "$tex+?"
+	"vmodel", "model ", "world ", "f/x ", "$tex+?"    /* "f/x " is 4 chars in retail (0x0054C108) */
 };
 
 /* ---- GL_TextureMode  0x004EA530 ----  [HIGH] */
-void __cdecl GL_TextureMode(int a1)
+void __cdecl GL_TextureMode( const char *string )
 {
-  int v2;
-  char **v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
+	int i;
 
-  v2 = 0;
-  v3 = 0;
-  do
-  {
-    if ( r_textureModes[v2].name && a1
-      && !Q_stricmpn( (const char *)a1, r_textureModes[v2].name, 99999 ) )
-      break;
-    ++v2;
-  }
-  while ( v2 < 6 );
-  if ( v2 == 6 )
-  {
-    ri_Printf(0, "bad filter name\n");
-  }
-  else
-  {
-    v4 = r_textureModes[v2].minimize;
-    v5 = r_textureModes[v2].maximize;
-    v6 = 0;
-    param = v4;
-    for ( gl_filter_max = v5; v6 < tr_numImages; ++v6 )
-    {
-      v7 = dword_16C9840[v6];
-      if ( (*(_BYTE *)(v7 + 100) & 1) != 0 )
-      {
-        GL_Bind((GLenum *)v7);
-        glTexParameteri(*(_DWORD *)(v7 + 84), 0x2801u, param);
-        glTexParameteri(*(_DWORD *)(v7 + 84), 0x2800u, gl_filter_max);
-      }
-    }
-  }
+	for ( i = 0; i < 6; ++i )
+	{
+		if ( !Q_stricmp( r_textureModes[i].name, string ) )
+			break;
+	}
+	if ( i == 6 )
+	{
+		ri.Printf( 0, "bad filter name\n" );
+		return;
+	}
+
+	param          = r_textureModes[i].minimize;   /* gl_filter_min */
+	gl_filter_max  = r_textureModes[i].maximize;
+
+	for ( i = 0; i < tr_numImages; ++i )
+	{
+		image_t *image = tr_images[i];
+
+		if ( image->flags & IMAGE_FLAG_MIPMAP )
+		{
+			GL_Bind( image );
+			glTexParameteri( image->target, 0x2801u , param );
+			glTexParameteri( image->target, 0x2800u , gl_filter_max );
+		}
+	}
 }
 
 /* ---- R_SumOfUsedImages  0x004EA600 ----  VERIFIED */
-_DWORD *__cdecl R_SumOfUsedImages(int *a1, _DWORD *a2, _DWORD *a3)
+void __cdecl R_SumOfUsedImages( int *imageMemoryOut, unsigned int *lightmapMemoryOut,
+                                   unsigned int *textureMemoryOut )
 {
-  int v3;
-  int v4;
-  int v5;
-  _DWORD *v6;
-  int v7;
-  int v8;
-  _DWORD *result;
+	int      i;
+	image_t *image;
 
-  if ( r_usedImageFrame == tr_frameCount )
-    goto LABEL_19;
-  v3 = 0;
-  v4 = 0;
-  v5 = 0;
-  r_usedImageFrame = tr_frameCount;
-  r_usedImageMemory = 0;
-  r_usedLightmapMemory = 0;
-  r_usedTextureMemory = 0;
-  if ( tr_numImages > 0 )
-  {
-    do
-    {
-      v6 = (_DWORD *)dword_16C9840[v5];
-      v7 = v6[23];
-      if ( v7 == tr_frameCount || v7 == tr_frameCount - 1 )
-      {
-        v8 = v6[18];
-        v3 += v8;
-        if ( v6[20] == 3 )
-          r_usedLightmapMemory += v8;
-        v4 += v6[19];
-      }
-      ++v5;
-    }
-    while ( v5 < tr_numImages );
-    r_usedTextureMemory = v4;
-    r_usedImageMemory = v3;
-  }
-  if ( com_statmon->integer && v4 > 0x1400000 )
-  {
-    if ( !sys_timeBaseInit )
-    {
-      sys_timeBase = timeGetTime();
-      sys_timeBaseInit = 1;
-    }
-    dword_8E1C00 = 3000 - sys_timeBase + timeGetTime();
-    if ( !dword_8E1C04 )
-    {
-      if ( cls_rendererStarted )
-        dword_8E1C04 = Material_RegisterHandle("gfx/2d/warning@textures.jpg", 1);
-    }
-LABEL_19:
-    v3 = r_usedImageMemory;
-    v4 = r_usedTextureMemory;
-  }
-  if ( a1 )
-    *a1 = v3;
-  if ( a2 )
-    *a2 = r_usedLightmapMemory;
-  result = a3;
-  if ( a3 )
-    *a3 = v4;
-  return result;
+	if ( r_usedImageFrame != tr_frameCount )
+	{
+		r_usedImageFrame     = tr_frameCount;
+		r_usedImageMemory    = 0;
+		r_usedLightmapMemory = 0;
+		r_usedTextureMemory  = 0;
+
+		for ( i = 0; i < tr_numImages; i++ )
+		{
+			image = ( (image_t **)(void *)tr_imageSlots )[i];
+			if ( image->frameUsed == tr_frameCount || image->frameUsed == tr_frameCount - 1 )
+			{
+				r_usedImageMemory += image->cardMemory;
+				if ( image->imageTrack == 3 )
+					r_usedLightmapMemory += image->cardMemory;
+				r_usedTextureMemory += image->textureMemory;
+			}
+		}
+
+		if ( com_statmon->integer && r_usedTextureMemory > 0x1400000 )
+			StatMon_Warning( 6, 3000, "gfx/2d/warning@textures.jpg" );
+	}
+
+	if ( imageMemoryOut )
+		*imageMemoryOut = r_usedImageMemory;
+	if ( lightmapMemoryOut )
+		*lightmapMemoryOut = r_usedLightmapMemory;
+	if ( textureMemoryOut )
+		*textureMemoryOut = r_usedTextureMemory;
 }
 
 /* ---- imagecompare  0x004EA750 ----  [HIGH] */
-int __cdecl imagecompare(_DWORD *a1, _DWORD *a2)
+/* qsort comparator over image indices: sort by imageTrack, then cardMemory */
+int __cdecl imagecompare( unsigned int *indexA, unsigned int *indexB )
 {
-  int v2;
-  int v3;
-  int v4;
-  int v5;
+	image_t *imageA = tr_images[ *indexA ];
+	image_t *imageB = tr_images[ *indexB ];
 
-  v2 = dword_16C9840[*a1];
-  v3 = *(_DWORD *)(v2 + 80);
-  v4 = dword_16C9840[*a2];
-  v5 = *(_DWORD *)(v4 + 80);
-  if ( v3 < v5 )
-    return -1;
-  if ( v3 <= v5 )
-    return *(_DWORD *)(v2 + 72) - *(_DWORD *)(v4 + 72);
-  return 1;
+	if ( imageA->imageTrack < imageB->imageTrack )
+		return -1;
+	if ( imageA->imageTrack > imageB->imageTrack )
+		return 1;
+	return imageA->cardMemory - imageB->cardMemory;
 }
 
 /* ---- RE_GetImageMemory  0x004EA790 ----  [HIGH] */
@@ -393,871 +440,517 @@ int RE_GetImageMemory()
   return tr_imageMemory;
 }
 
-static const unsigned char r_imageListClampCase[49] =   /* 0x004EAA50 */
-{
-  0, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-  1, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-  2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-  3
-};
-
 /* ---- R_ImageList_f  0x004EA7A0 ----  VERIFIED */
 void R_ImageList_f()
 {
-  signed int v0;
-  signed int v1;
-  int v2;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  bool v13; // cc
-  int i;
-  const char *v15;
-  int v16;
-  _DWORD v17[2];
-  _DWORD v18[11]; // [esp+28h] [ebp-202Ch] BYREF
-  _DWORD v19[2048]; // [esp+54h] [ebp-2000h] BYREF
+  int          i;
+  image_t     *image;
+  int          texels;
+  int          totalBytes;
+  int          trackBytes[11];
+  int          sorted[2048];
+  const char  *yesno[] = { "no ", "yes" };
 
-  v0 = 0;
-  memset(v18, 0, sizeof(v18));
-  v1 = tr_numImages;
-  v17[0] = (int)"no ";
-  v17[1] = (int)"yes";
-  v16 = 0;
-  if ( tr_numImages > 0 )
+  totalBytes = 0;
+  memset( trackBytes, 0, sizeof( trackBytes ) );
+
+  for ( i = 0; i < tr_numImages; i++ )
+    sorted[i] = i;
+
+  qsort_m( (unsigned int)sorted, tr_numImages, 4u,
+           (int (__cdecl *)(unsigned int, byte *))imagecompare );
+
+  ri.Printf( 0, "\n      -w-- -h-- -mm- -if--- wrap- -type- -KB--- --name-------\n" );
+
+  texels = 0;
+  for ( i = 0; i < tr_numImages; i++ )
   {
-    do
+    image = ( (image_t **)(void *)tr_imageSlots )[ sorted[i] ];
+
+    texels += image->uploadWidth * image->uploadHeight;
+    ri.Printf( 0, "%4i: %4i %4i  %s  ",
+               sorted[i], image->uploadWidth, image->uploadHeight, yesno[ image->flags & 0x0001 ] );
+
+    switch ( (int)image->internalFormat )
     {
-      v19[v0] = v0;
-      ++v0;
+      case 1:
+        ri.Printf( 0, "I    " );
+        break;
+      case 2:
+        ri.Printf( 0, "IA   " );
+        break;
+      case 3:
+        ri.Printf( 0, "RGB  " );
+        break;
+      case 4:
+      case 6408:
+        ri.Printf( 0, "RGBA " );
+        break;
+      case 32856:
+        ri.Printf( 0, "RGBA8" );
+        break;
+      case 32849:
+        ri.Printf( 0, "RGB8 " );
+        break;
+      case 33697:
+        ri.Printf( 0, "S3TC4" );
+        break;
+      case 32854:
+        ri.Printf( 0, "RGBA4" );
+        break;
+      case 32848:
+        ri.Printf( 0, "RGB5 " );
+        break;
+      case 33776:
+      case 33777:
+        ri.Printf( 0, "DXT1 " );
+        break;
+      case 33778:
+        ri.Printf( 0, "DXT3 " );
+        break;
+      case 33779:
+        ri.Printf( 0, "DXT5 " );
+        break;
+      default:
+        ri.Printf( 0, "?????" );
+        break;
     }
-    while ( v0 < v1 );
-  }
-  qsort_m((unsigned int)v19, v1, 4u, (int (__cdecl *)(unsigned int, _BYTE *))imagecompare);
-  ri_Printf(0, "\n      -w-- -h-- -mm- -if--- wrap- -type- -KB--- --name-------\n");
-  v2 = 0;
-  v3 = 0;
-  if ( tr_numImages > 0 )
-  {
-    do
+
+    switch ( image->flags & 0x30 )
     {
-      v4 = dword_16C9840[v19[v3]];
-      v5 = *(unsigned __int16 *)(v4 + 70);
-      v2 += v5 * *(unsigned __int16 *)(v4 + 68);
-      ri_Printf(
-        0,
-        "%4i: %4i %4i  %s  ",
-        v19[v3],
-        *(unsigned __int16 *)(v4 + 68),
-        v5,
-        (const char *)v17[*(_DWORD *)(v4 + 100) & 1]);
-      v6 = *(_DWORD *)(v4 + 96);
-      if ( v6 > 32849 )
-      {
-        if ( v6 > 33777 )
-        {
-          v11 = v6 - 33778;
-          if ( !v11 )
-          {
-            v15 = "DXT3 ";
-            goto LABEL_33;
-          }
-          if ( v11 == 1 )
-          {
-            v15 = "DXT5 ";
-            goto LABEL_33;
-          }
-LABEL_30:
-          v15 = "?????";
-          goto LABEL_33;
-        }
-        if ( v6 >= 33776 )
-        {
-          v15 = "DXT1 ";
-        }
-        else
-        {
-          v9 = v6 - 32854;
-          if ( v9 )
-          {
-            v10 = v9 - 2;
-            if ( v10 )
-            {
-              if ( v10 != 841 )
-                goto LABEL_30;
-              v15 = "S3TC4";
-            }
-            else
-            {
-              v15 = "RGBA8";
-            }
-          }
-          else
-          {
-            v15 = "RGBA4";
-          }
-        }
-      }
-      else
-      {
-        if ( v6 == 32849 )
-        {
-          v15 = "RGB8 ";
-          goto LABEL_33;
-        }
-        if ( v6 > 4 )
-        {
-          if ( v6 == 6408 )
-          {
-LABEL_17:
-            v15 = "RGBA ";
-            goto LABEL_33;
-          }
-          if ( v6 != 32848 )
-            goto LABEL_30;
-          v15 = "RGB5 ";
-        }
-        else
-        {
-          if ( v6 == 4 )
-            goto LABEL_17;
-          v7 = v6 - 1;
-          if ( v7 )
-          {
-            v8 = v7 - 1;
-            if ( v8 )
-            {
-              if ( v8 != 1 )
-                goto LABEL_30;
-              v15 = "RGB  ";
-            }
-            else
-            {
-              v15 = "IA   ";
-            }
-          }
-          else
-          {
-            v15 = "I    ";
-          }
-        }
-      }
-LABEL_33:
-      ri_Printf(0, v15);
-      switch ( r_imageListClampCase[*(_DWORD *)(v4 + 100) & 0x30] )
-      {
-        case 0:
-          ri_Printf(0, " repeat ");
-          break;
-        case 1:
-          ri_Printf(0, " clampx ");
-          break;
-        case 2:
-          ri_Printf(0, " clampy ");
-          break;
-        case 3:
-          ri_Printf(0, " clamp  ");
-          break;
-        case 4:
-          break;
-      }
-      ri_Printf(
-        0,
-        " %s %6.1f %s\n",
-        r_imageTrackNames[*(_DWORD *)(v4 + 80)],
-        (double)*(int *)(v4 + 72) * 0.0009765625,
-        (const char *)v4);
-      v12 = *(_DWORD *)(v4 + 72);
-      v13 = ++v3 < tr_numImages;
-      v16 += v12;
-      v18[*(_DWORD *)(v4 + 80)] += v12;
+      case 0x00:
+        ri.Printf( 0, " repeat " );
+        break;
+      case 0x10:
+        ri.Printf( 0, " clampx " );
+        break;
+      case 0x20:
+        ri.Printf( 0, " clampy " );
+        break;
+      case 0x30:
+        ri.Printf( 0, " clamp  " );
+        break;
     }
-    while ( v13 );
+
+    ri.Printf( 0, " %s %6.1f %s\n", r_imageTrackNames[ image->imageTrack ], image->cardMemory / 1024.0f, image->imgName );
+    totalBytes += image->cardMemory;
+    trackBytes[ image->imageTrack ] += image->cardMemory;
   }
-  ri_Printf(0, " ---------\n");
-  ri_Printf(0, " %i total texels (not including mipmaps)\n", v2);
-  ri_Printf(0, " %i total images\n", tr_numImages);
-  ri_Printf(0, " %.2f MB total image size\n\n", (double)v16 * 0.00000095367432);
-  for ( i = 0; i < 11; ++i )
-    ri_Printf(0, "%s: %.2f MB\n", r_imageTrackNames[i], (double)(int)v18[i] * 0.00000095367432);
+
+  ri.Printf( 0, " ---------\n" );
+  ri.Printf( 0, " %i total texels (not including mipmaps)\n", texels );
+  ri.Printf( 0, " %i total images\n", tr_numImages );
+  ri.Printf( 0, " %.2f MB total image size\n\n", totalBytes / ( 1024.0f * 1024.0f ) );
+  for ( i = 0; i < 11; i++ )
+    ri.Printf( 0, "%s: %.2f MB\n", r_imageTrackNames[i], trackBytes[i] / ( 1024.0f * 1024.0f ) );
 }
 
 /* ---- R_LightScaleTexture  0x004EAA90 ----  VERIFIED */
 void __cdecl R_LightScaleTexture( unsigned char *pixels, int width, int height,
                                   int onlyGamma, int format )
 {
-	int count = width * height;
-	int i;
-
-	if ( format != 0x1908  )
+	if ( format != 0x1908 )                      /* GL_RGBA */
 		return;
 
 	if ( onlyGamma )
 	{
-		if ( glConfig_deviceSupportsGamma )
-			return;
-
-		for ( i = 0; i < count; ++i, pixels += 4 )
+		if ( !glConfig.deviceSupportsGamma )
 		{
-			pixels[0] = s_gammatable[ pixels[0] ];
-			pixels[1] = s_gammatable[ pixels[1] ];
-			pixels[2] = s_gammatable[ pixels[2] ];
-		}
-		return;
-	}
+			int   i, c;
+			byte *p;
 
-	if ( glConfig_deviceSupportsGamma )
+			p = pixels;
+			c = width * height;
+			for ( i = 0; i < c; i++, p += 4 )
+			{
+				p[0] = s_gammatable[p[0]];
+				p[1] = s_gammatable[p[1]];
+				p[2] = s_gammatable[p[2]];
+			}
+		}
+	}
+	else
 	{
-		for ( i = 0; i < count; ++i, pixels += 4 )
+		int   i, c;
+		byte *p;
+
+		p = pixels;
+		c = width * height;
+		if ( glConfig.deviceSupportsGamma )
 		{
-			pixels[0] = s_intensitytable[ pixels[0] ];
-			pixels[1] = s_intensitytable[ pixels[1] ];
-			pixels[2] = s_intensitytable[ pixels[2] ];
+			for ( i = 0; i < c; i++, p += 4 )
+			{
+				p[0] = s_intensitytable[p[0]];
+				p[1] = s_intensitytable[p[1]];
+				p[2] = s_intensitytable[p[2]];
+			}
 		}
-		return;
-	}
-
-	for ( i = 0; i < count; ++i, pixels += 4 )
-	{
-		pixels[0] = s_gammatable[ s_intensitytable[ pixels[0] ] ];
-		pixels[1] = s_gammatable[ s_intensitytable[ pixels[1] ] ];
-		pixels[2] = s_gammatable[ s_intensitytable[ pixels[2] ] ];
+		else
+		{
+			for ( i = 0; i < c; i++, p += 4 )
+			{
+				p[0] = s_gammatable[s_intensitytable[p[0]]];
+				p[1] = s_gammatable[s_intensitytable[p[1]]];
+				p[2] = s_gammatable[s_intensitytable[p[2]]];
+			}
+		}
 	}
 }
 
 /* ---- GetCardMemoryAmount  0x004EABA0 ----  VERIFIED */
-int __cdecl GetCardMemoryAmount(int a1, int a2, int a3)
+/* (format, width, height): retail callers load width before format. */
+int __cdecl GetCardMemoryAmount(int format, int width, int height)
 {
-  int result;
-  int v4;
-
-  if ( a2 <= 32849 )
+  switch ( format )
   {
-    if ( a2 == 32849 )
-      return 4 * a3 * a1;
-    if ( a2 <= 6408 )
-    {
-      if ( a2 != 6408 )
-      {
-        if ( a2 >= 3 )
-        {
-          if ( a2 > 4 )
-          {
-            if ( a2 == 6407 )
-              return a3 * a1 * (2 * (glConfig_colorBits > 16) + 2);
-            return 0;
-          }
-          return 4 * a3 * a1;
-        }
-        return 0;
-      }
-      return 4 * a3 * a1;
-    }
-    if ( a2 == 6409 )
-      return a3 * a1;
-    if ( a2 != 32848 )
-      return 0;
-    return 2 * a3 * a1;
-  }
-  if ( a2 <= 32993 )
-  {
-    if ( a2 >= 32992 )
-      return 4 * a3 * a1;
-    v4 = a2 - 32854;
-    if ( v4 )
-    {
-      if ( v4 != 2 )
-        return 0;
-      return 4 * a3 * a1;
-    }
-    return 2 * a3 * a1;
-  }
-  switch ( a2 )
-  {
+    case 3:
+    case 4:
+    case 6408:    /* GL_RGBA */
+    case 32849:   /* GL_RGB8 */
+    case 32856:   /* GL_RGBA8 */
+    case 32992:   /* GL_BGR_EXT */
+    case 32993:   /* GL_BGRA_EXT */
+      return 4 * width * height;
+    case 6407:    /* GL_RGB */
+      return ( glConfig_colorBits > 16 ? 4 : 2 ) * width * height;
+    case 6409:    /* GL_LUMINANCE */
+      return width * height;
+    case 32848:   /* GL_RGB5 */
+    case 32854:   /* GL_RGBA4 */
+      return 2 * width * height;
     case 33776:   /* GL_COMPRESSED_RGB_S3TC_DXT1_EXT   0x83F0 */
     case 33777:   /* GL_COMPRESSED_RGBA_S3TC_DXT1_EXT  0x83F1 */
-      result = 8 * ( ( a3 + 3 ) / 4 ) * ( ( a1 + 3 ) / 4 );
-      break;
+      return 8 * ( ( width + 3 ) / 4 ) * ( ( height + 3 ) / 4 );
     case 33778:   /* GL_COMPRESSED_RGBA_S3TC_DXT3_EXT  0x83F2 */
     case 33779:   /* GL_COMPRESSED_RGBA_S3TC_DXT5_EXT  0x83F3 */
-      /* 16 * blocksX * blocksY.  0x004EAC6B-0x004EAC74. */
-      result = 16 * ( ( a3 + 3 ) / 4 ) * ( ( a1 + 3 ) / 4 );
-      break;
+      return 16 * ( ( width + 3 ) / 4 ) * ( ( height + 3 ) / 4 );
     default:
       return 0;
   }
-  return result;
 }
 
 /* ---- R_MipMap2  0x004EAC90 ----  VERIFIED */
-int __cdecl R_MipMap2(int a1, int a2, int a3)
+/* In-place quarter-size downsample with a proper 4x4 linear filter (RTCW
+ * R_MipMap2).  The retail form folds the wrap masks and tap addresses into a
+ * long chain of temporaries; the weight pattern is corners*1 / edges*2 /
+ * centre*4, summed and divided by 36.  Called as R_MipMap2(data,width,height). */
+void __cdecl R_MipMap2( unsigned char *data, int inWidth, int inHeight )
 {
-  int v3;
-  int v5;
-  int *v6;
-  int v7;
-  int v8;
-  _BYTE *v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  int v16;
-  _BYTE *v17;
-  _BYTE *v18;
-  int v19;
-  bool v20; // zf
-  int v22;
-  int v23;
-  _BYTE *v24;
-  _BYTE *v25;
-  _BYTE *v26;
-  _BYTE *v27;
-  _BYTE *v28;
-  _BYTE *v29;
-  _BYTE *v30;
-  _BYTE *v31;
-  _BYTE *v32;
-  _BYTE *v33;
-  _BYTE *v34;
-  _BYTE *v35;
-  _BYTE *v36;
-  int v37;
-  _BYTE *v38;
-  int v39;
-  _BYTE *v40;
-  int v41;
-  int v42;
-  int v43;
-  int v44;
-  int v45;
-  int *v46;
-  int v47;
-  int v48;
+	unsigned int *in        = (unsigned int *)data;
+	int           outWidth  = inWidth  >> 1;
+	int           outHeight = inHeight >> 1;
+	int           tempBytes = 4 * outWidth * outHeight;
+	unsigned int *temp      = (unsigned int *)( (void *)( (*(int (__cdecl **)(int))&ri.Hunk_AllocateTempMemory)( (int)(tempBytes) ) ) );
+	int           widthMask  = inWidth  - 1;
+	int           heightMask = inHeight - 1;
+	int           i, j, k;
 
-  v3 = a3;
-  v5 = a1 >> 1;
-  v39 = a3 >> 1;
-  v48 = 4 * (a3 >> 1) * (a1 >> 1);
-  v6 = (int *)ri_Hunk_AllocateTempMemory(v48);
-  v7 = a1 - 1;
-  v46 = v6;
-  v47 = v7;
-  if ( v5 > 0 )
-  {
-    v8 = 2;
-    v44 = 2;
-    v40 = (char *)v6 + 2;
-    v45 = v5;
-    do
-    {
-      if ( v39 > 0 )
-      {
-        v22 = v3 * (v7 & (v8 - 2));
-        v9 = v40;
-        v23 = v3 * (v7 & v8);
-        v10 = v3 * (v7 & (v8 - 1));
-        v41 = v3 * (v7 & (v8 - 3));
-        v11 = 2;
-        v37 = v10;
-        v42 = 2;
-        v43 = a3 >> 1;
-        while ( 1 )
-        {
-          v12 = v3 - 1;
-          v13 = v12 & (v11 - 1);
-          v27 = (_BYTE *)(a2 + 4 * (v10 + v13));
-          v26 = (_BYTE *)(a2 + 4 * (v13 + v22));
-          v14 = v12 & (v11 - 2);
-          v25 = (_BYTE *)(a2 + 4 * (v14 + v10));
-          v24 = (_BYTE *)(a2 + 4 * (v14 + v22));
-          v15 = v12 & v11;
-          v34 = (_BYTE *)(a2 + 4 * ((v12 & v11) + v37));
-          v32 = (_BYTE *)(a2 + 4 * (v13 + v23));
-          v16 = v12 & (v11 - 3);
-          v31 = (_BYTE *)(a2 + 4 * (v16 + v37));
-          v17 = (_BYTE *)(a2 + 4 * (v41 + v13));
-          v33 = (_BYTE *)(a2 + 4 * (v15 + v22));
-          v30 = (_BYTE *)(a2 + 4 * (v16 + v22));
-          v29 = (_BYTE *)(a2 + 4 * (v14 + v23));
-          v28 = (_BYTE *)(a2 + 4 * (v41 + v14));
-          v36 = (_BYTE *)(a2 + 4 * (v41 + v15));
-          v35 = (_BYTE *)(a2 + 4 * (v16 + v23));
-          v38 = (_BYTE *)(a2 + 4 * (v15 + v23));
-          v18 = (_BYTE *)(a2 + 4 * (v41 + v16));
-          *(v9 - 2) = (*v18
-                     + *v35
-                     + *v36
-                     + *v38
-                     + 2
-                     * (*v32 + *v31 + *v17 + *v30 + *v29 + *v28 + *v33 + *v34 + 2 * (*v26 + *v27 + *v25 + *v24)))
-                    / 36;
-          *(v9 - 1) = (v38[1]
-                           + v36[1]
-                           + v35[1]
-                           + v18[1]
-                           + 2
-                           * (v34[1]
-                            + v33[1]
-                            + v32[1]
-                            + v31[1]
-                            + v17[1]
-                            + v30[1]
-                            + v29[1]
-                            + v28[1]
-                            + 2 * (v27[1] + v26[1] + v25[1] + v24[1])))
-                    / 36;
-          *v9 = (v38[2]
-                     + v36[2]
-                     + v35[2]
-                     + v18[2]
-                     + 2
-                     * (v34[2]
-                      + v33[2]
-                      + v32[2]
-                      + v31[2]
-                      + v17[2]
-                      + v30[2]
-                      + v29[2]
-                      + v28[2]
-                      + 2 * (v27[2] + v26[2] + v25[2] + v24[2])))
-              / 36;
-          v19 = (unsigned __int8)v36[3]
-              + (unsigned __int8)v35[3]
-              + (unsigned __int8)v18[3]
-              + 2
-              * ((unsigned __int8)v34[3]
-               + (unsigned __int8)v33[3]
-               + (unsigned __int8)v32[3]
-               + (unsigned __int8)v31[3]
-               + (unsigned __int8)v17[3]
-               + (unsigned __int8)v30[3]
-               + (unsigned __int8)v29[3]
-               + (unsigned __int8)v28[3]
-               + 2
-               * ((unsigned __int8)v27[3] + (unsigned __int8)v26[3] + (unsigned __int8)v25[3] + (unsigned __int8)v24[3]));
-          v3 = a3;
-          v9[1] = ((unsigned __int8)v38[3] + v19) / 36;
-          v11 = v42 + 2;
-          v9 += 4;
-          v42 += 2;
-          if ( !--v43 )
-            break;
-          v10 = v37;
-        }
-        v7 = v47;
-        v8 = v44;
-      }
-      v8 += 2;
-      v20 = v45 == 1;
-      v44 = v8;
-      v40 += 4 * v39;
-      --v45;
-    }
-    while ( !v20 );
-    v6 = v46;
-  }
-  Com_Memcpy(a2, v6, v48);
-  ri_Hunk_FreeTempMemory(v46);
-  return 0;
+	for ( i = 0; i < outHeight; ++i )
+	{
+		for ( j = 0; j < outWidth; ++j )
+		{
+			unsigned char *out = (unsigned char *)( temp + i * outWidth + j );
+
+			for ( k = 0; k < 4; ++k )
+			{
+				int total =
+				    1 * ((unsigned char *)&in[((i*2-1)&heightMask)*inWidth + ((j*2-1)&widthMask)])[k]
+				  + 2 * ((unsigned char *)&in[((i*2-1)&heightMask)*inWidth + ((j*2  )&widthMask)])[k]
+				  + 2 * ((unsigned char *)&in[((i*2-1)&heightMask)*inWidth + ((j*2+1)&widthMask)])[k]
+				  + 1 * ((unsigned char *)&in[((i*2-1)&heightMask)*inWidth + ((j*2+2)&widthMask)])[k]
+
+				  + 2 * ((unsigned char *)&in[((i*2  )&heightMask)*inWidth + ((j*2-1)&widthMask)])[k]
+				  + 4 * ((unsigned char *)&in[((i*2  )&heightMask)*inWidth + ((j*2  )&widthMask)])[k]
+				  + 4 * ((unsigned char *)&in[((i*2  )&heightMask)*inWidth + ((j*2+1)&widthMask)])[k]
+				  + 2 * ((unsigned char *)&in[((i*2  )&heightMask)*inWidth + ((j*2+2)&widthMask)])[k]
+
+				  + 2 * ((unsigned char *)&in[((i*2+1)&heightMask)*inWidth + ((j*2-1)&widthMask)])[k]
+				  + 4 * ((unsigned char *)&in[((i*2+1)&heightMask)*inWidth + ((j*2  )&widthMask)])[k]
+				  + 4 * ((unsigned char *)&in[((i*2+1)&heightMask)*inWidth + ((j*2+1)&widthMask)])[k]
+				  + 2 * ((unsigned char *)&in[((i*2+1)&heightMask)*inWidth + ((j*2+2)&widthMask)])[k]
+
+				  + 1 * ((unsigned char *)&in[((i*2+2)&heightMask)*inWidth + ((j*2-1)&widthMask)])[k]
+				  + 2 * ((unsigned char *)&in[((i*2+2)&heightMask)*inWidth + ((j*2  )&widthMask)])[k]
+				  + 2 * ((unsigned char *)&in[((i*2+2)&heightMask)*inWidth + ((j*2+1)&widthMask)])[k]
+				  + 1 * ((unsigned char *)&in[((i*2+2)&heightMask)*inWidth + ((j*2+2)&widthMask)])[k];
+
+				out[k] = (unsigned char)( total / 36 );
+			}
+		}
+	}
+
+	Com_Memcpy( data, temp, tempBytes );
+	( (*(void (__cdecl **)(void *))&ri.Hunk_FreeTempMemory)( (temp) ) );
+
 }
 
 /* ---- R_MipMap8  0x004EB120 ----  VERIFIED */
-int __cdecl R_MipMap8(int result, unsigned __int8 *a2, int a3)
+/* In-place quarter-size box filter for single-byte (alpha/luminance) images.
+ * 2D path averages each 2x2 block; when one dimension is 1 it averages pairs
+ * along the other.  Called as R_MipMap8(data,width,height).  The int return is
+ * a dead-EAX value (0 on the 2D path, the last computed average otherwise). */
+void __cdecl R_MipMap8( unsigned char *data, int width, int height )
 {
-  int v3;
-  int v4;
-  unsigned __int8 *v5;
-  unsigned __int8 *v6;
-  int v7;
-  int v8;
-  int v10;
+	int            i, j;
+	unsigned char *out;
+	int            row;
 
-  if ( a3 != 1 || result != 1 )
-  {
-    v3 = a3;
-    v4 = a3 >> 1;
-    result >>= 1;
-    v5 = a2;
-    v10 = v4;
-    if ( v4 && result )
-    {
-      if ( result > 0 )
-      {
-        v8 = result;
-        do
-        {
-          if ( v4 > 0 )
-          {
-            v6 = &a2[v3];
-            do
-            {
-              *v5++ = (*a2 + *v6 + v6[1] + v6[1 - v3]) >> 2;
-              a2 += 2;
-              v6 += 2;
-              --v4;
-            }
-            while ( v4 );
-            v4 = v10;
-            v3 = a3;
-          }
-          a2 += v3;
-          result = --v8;
-        }
-        while ( v8 );
-      }
-    }
-    else
-    {
-      v7 = result + v4;
-      if ( v7 > 0 )
-      {
-        do
-        {
-          result = (*a2 + a2[1]) >> 1;
-          *v5++ = result;
-          a2 += 2;
-          --v7;
-        }
-        while ( v7 );
-      }
-    }
-  }
-  return result;
+	if ( width == 1 && height == 1 )
+		return;
+
+	row = width;
+	out = data;
+	width >>= 1;
+	height >>= 1;
+
+	if ( width && height )
+	{
+		for ( i = 0; i < height; i++, data += row )
+		{
+			for ( j = 0; j < width; j++, out++, data += 2 )
+				out[0] = (unsigned char)( ( data[0] + data[1] + data[row] + data[row + 1] ) >> 2 );
+		}
+	}
+	else
+	{
+		width += height;
+		for ( i = 0; i < width; i++, out++, data += 2 )
+			out[0] = (unsigned char)( ( data[0] + data[1] ) >> 1 );
+	}
 }
 
-/* ---- R_MipMap  0x004EB1D0 ----  VERIFIED */
-unsigned __int8 *__fastcall R_MipMap(unsigned int format, unsigned __int8 *data,
-                                     char *name, int width, int height, int flags)
+/* ---- R_MipMap  0x004EB1D0 ----  VERIFIED
+ * Quarter one mip level in place and return the start of the next level's
+ * data.  RGBA levels may be replaced by a custom "name#N+1" image; otherwise
+ * they are box filtered (r_simpleMipMaps), optionally weighted toward the
+ * top-left texel by r_weightMipMaps, or 4x4 filtered by R_MipMap2. */
+unsigned __int8 *__cdecl R_MipMap(unsigned int format, unsigned __int8 *data,
+                                  char *name, int width, int height, int flags)
 {
-	unsigned __int8 *src;              /* edi -- the row being consumed   */
-	unsigned __int8 *out;              /* esi -- the halved row           */
-	unsigned __int8 *next;             /* eax -- src + one source row     */
-	char            *hash;
-	char            *digits;
-	const char      *scan;
-	int              rowBytes;         /* ebx = 4 * width                 */
-	int              halfWidth;
-	int              halfHeight;
-	int              rows, cols, n, c, sum;
-	float            weight, blend;
+	int               i, j;
+	unsigned __int8  *out;
+	unsigned __int8  *result;
+	int               row;
+	float             weight, blend;
+	char             *hash;
+	char             *p;
+	unsigned __int8  *pic;
+	unsigned __int16  picWidth;
+	unsigned __int16  picHeight;
+	int               picFormat;
+	int               picHasMipMaps;
+	char              tail[64];
 
-	int              loadedData;
-	unsigned __int16 loadedWidth;
-	unsigned __int16 loadedHeight;
-	int              loadedSpare;
-	unsigned __int8 *loadedEnd;
-	char             tail[64];
-
-	if ( format > 0x1909 )
+	switch ( format )
 	{
-		if ( format < 0x83F0 || format > 0x83F3 )
-			return data;
-		return &data[ GetCardMemoryAmount( width, format, height ) ];
-	}
-
-	if ( format == 0x1909 )
-	{
-		R_MipMap8( height, data, width );
+	case 0x1908:   /* GL_RGBA */
+		break;
+	case 0x1909:   /* GL_LUMINANCE */
+		R_MipMap8( data, width, height );
+		return data;
+	case 0x83F0:   /* GL_COMPRESSED_RGB_S3TC_DXT1_EXT */
+	case 0x83F1:   /* GL_COMPRESSED_RGBA_S3TC_DXT1_EXT */
+	case 0x83F2:   /* GL_COMPRESSED_RGBA_S3TC_DXT3_EXT */
+	case 0x83F3:   /* GL_COMPRESSED_RGBA_S3TC_DXT5_EXT */
+		return &data[ GetCardMemoryAmount( format, width, height ) ];
+	default:
 		return data;
 	}
-
-	if ( format != 0x1908 )
-		return data;
 
 	hash = strstr( name, "#" );
 	if ( hash )
 	{
-		digits = hash + 1;
-		scan   = hash + 1;
-		if ( isdigit( hash[1] ) )
-		{
-			do
-				c = *++scan;
-			while ( isdigit( c ) );
-		}
-		strcpy( tail, scan );                    /* inlined in retail at 0x004EB260 */
-		*(char *)scan = 0;
-		sprintf( digits, "%i%s", j__atol( digits ) + 1, tail );
+		for ( p = hash + 1; isdigit( *p ); p++ )
+			;
+		strcpy( tail, p );
+		*p = 0;
+		i = j__atol( hash + 1 );
+		sprintf( hash + 1, "%i%s", i + 1, tail );
 
-		R_LoadImage( name, &loadedData, &loadedWidth, &loadedHeight,
-		             &loadedSpare, (_DWORD *)&loadedEnd, flags );
-
-		if ( loadedData )
+		R_LoadImage( name, (int *)&pic, &picWidth, &picHeight, &picFormat, (unsigned int *)&picHasMipMaps, flags );
+		if ( pic )
 		{
-			if ( loadedWidth  != (unsigned __int16)( ( width  + 1 ) >> 1 )
-			  || loadedHeight != (unsigned __int16)( ( height + 1 ) >> 1 ) )
+			if ( picWidth == ( width + 1 ) >> 1 && picHeight == ( height + 1 ) >> 1 )
 			{
-				ri_Printf( 2,
-				           "WARNING: custom mipmap image '%s' should have dimensions %i x %i instead of %i x %i, refusing to load\n",
-				           name,
-				           ( width  + 1 ) >> 1,
-				           ( height + 1 ) >> 1,
-				           loadedWidth,
-				           loadedHeight );
-				return 0;
+				Com_Memcpy( data, pic, 4 * picWidth * picHeight );
+				return data;
 			}
-			Com_Memcpy( data, (void *)loadedData, 4 * loadedWidth * loadedHeight );
-			return data;
+			ri.Printf( 2,
+			           "WARNING: custom mipmap image '%s' should have dimensions %i x %i instead of %i x %i, refusing to load\n",
+			           name, ( width + 1 ) >> 1, ( height + 1 ) >> 1, picWidth, picHeight );
+			return 0;
 		}
 	}
 
 	if ( !r_simpleMipMaps->integer )
 	{
-		R_MipMap2( height, data, width );
+		R_MipMap2( data, width, height );
 		return data;
 	}
 
 	if ( width == 1 && height == 1 )
 		return data;
 
-	rowBytes   = 4 * width;
-	halfWidth  = width  >> 1;
-	halfHeight = height >> 1;
-	src = data;
+	row = width * 4;
 	out = data;
+	width >>= 1;
+	height >>= 1;
+	result = data;
 
-	if ( halfWidth && halfHeight )
+	if ( width && height )
 	{
 		weight = r_weightMipMaps->value;
-
-		if ( weight <= 0.0 || weight > 1.0 )
+		if ( weight <= 0.0f || weight > 1.0f )
 		{
-			/* Plain 2x2 box filter, `sar ecx,2`.  0x004EB9A0-0x004EBAAF. */
-			if ( halfHeight > 0 )
+			for ( i = 0; i < height; i++, data += row )
 			{
-				rows = halfHeight;
-				do
+				for ( j = 0; j < width; j++, out += 4, data += 8 )
 				{
-					if ( halfWidth > 0 )
-					{
-						next = &src[ rowBytes ];
-						cols = halfWidth;
-						do
-						{
-							out[0] = (unsigned __int8)( ( next[0] + next[4] + src[0] + src[4] ) >> 2 );
-							out[1] = (unsigned __int8)( ( next[1] + next[5] + src[1] + src[5] ) >> 2 );
-							out[2] = (unsigned __int8)( ( next[2] + next[6] + src[2] + src[6] ) >> 2 );
-							out[3] = (unsigned __int8)( ( next[3] + next[7] + src[3] + src[7] ) >> 2 );
-							out  += 4;
-							src  += 8;
-							next += 8;
-						}
-						while ( --cols );
-					}
-					src += rowBytes;
+					out[0] = (unsigned __int8)( ( data[0] + data[4] + data[row + 0] + data[row + 4] ) >> 2 );
+					out[1] = (unsigned __int8)( ( data[1] + data[5] + data[row + 1] + data[row + 5] ) >> 2 );
+					out[2] = (unsigned __int8)( ( data[2] + data[6] + data[row + 2] + data[row + 6] ) >> 2 );
+					out[3] = (unsigned __int8)( ( data[3] + data[7] + data[row + 3] + data[row + 7] ) >> 2 );
 				}
-				while ( --rows );
 			}
 		}
 		else
 		{
 			blend = ( 1.0f - weight ) * 0.25f;
-
-			if ( halfHeight > 0 )
+			for ( i = 0; i < height; i++, data += row )
 			{
-				rows = halfHeight;
-				do
+				for ( j = 0; j < width; j++, out += 4, data += 8 )
 				{
-					if ( halfWidth > 0 )
-					{
-						next = &src[ rowBytes ];
-						cols = halfWidth;
-						do
-						{
-							for ( c = 0; c < 4; ++c )
-							{
-								sum = next[c] + src[c] + next[c + 4] + src[c + 4];
-								out[c] = (unsigned __int8)( (float)sum * blend
-								                          + (float)src[c] * weight );
-							}
-							out  += 4;
-							src  += 8;
-							next += 8;
-						}
-						while ( --cols );
-					}
-					src += rowBytes;
+					out[0] = (unsigned __int8)( ( data[0] + data[4] + data[row + 4] + data[row + 0] ) * blend + data[0] * weight );
+					out[1] = (unsigned __int8)( ( data[1] + data[5] + data[row + 5] + data[row + 1] ) * blend + data[1] * weight );
+					out[2] = (unsigned __int8)( ( data[2] + data[6] + data[row + 6] + data[row + 2] ) * blend + data[2] * weight );
+					out[3] = (unsigned __int8)( ( data[3] + data[7] + data[row + 7] + data[row + 3] ) * blend + data[3] * weight );
 				}
-				while ( --rows );
 			}
 		}
-		return data;
+		return result;
 	}
 
-	n = halfWidth + halfHeight;
-	if ( n > 0 )
+	width += height;   /* one dimension is already 1: average along the other */
+	for ( i = 0; i < width; i++, out += 4, data += 8 )
 	{
-		do
-		{
-			out[0] = (unsigned __int8)( ( src[0] + src[4] ) >> 1 );
-			out[1] = (unsigned __int8)( ( src[1] + src[5] ) >> 1 );
-			out[2] = (unsigned __int8)( ( src[2] + src[6] ) >> 1 );
-			out[3] = (unsigned __int8)( ( src[3] + src[7] ) >> 1 );
-			out += 4;
-			src += 8;
-		}
-		while ( --n );
+		out[0] = (unsigned __int8)( ( data[0] + data[4] ) >> 1 );
+		out[1] = (unsigned __int8)( ( data[1] + data[5] ) >> 1 );
+		out[2] = (unsigned __int8)( ( data[2] + data[6] ) >> 1 );
+		out[3] = (unsigned __int8)( ( data[3] + data[7] ) >> 1 );
 	}
-	return data;
+	return result;
 }
 
 /* ---- R_BlendOverTexture_RGBA  0x004EBB90 ----  VERIFIED */
 unsigned __int8 *__cdecl R_BlendOverTexture_RGBA(
-        unsigned __int8 *result,
-        int a2,
-        unsigned __int8 *a3)
+        unsigned __int8 *pixels,
+        int count,
+        unsigned __int8 *blendColor)
 {
-  int v3;  /* alpha */
-  int v4;  /* alpha * colour[0] */
-  int v5;  /* alpha * colour[1] */
-  int v7;  /* alpha * colour[2] */
-  int v8;  /* 255 - alpha */
-  int v9;
+  int i;
+  int inverseAlpha;
+  int premult[3];
 
-  v3 = a3[3];
-  v4 = v3 * *a3;
-  v5 = v3 * a3[1];
-  v7 = v3 * a3[2];
-  v8 = 255 - v3;
-  if ( a2 > 0 )
+  inverseAlpha = 255 - blendColor[3];
+  premult[0] = blendColor[0] * blendColor[3];
+  premult[1] = blendColor[1] * blendColor[3];
+  premult[2] = blendColor[2] * blendColor[3];
+
+  for ( i = 0; i < count; i++, pixels += 4 )
   {
-    v9 = a2;
-    do
-    {
-      *result = (unsigned __int8)( ( v4 + v8 * *result ) >> 8 );
-      result[1] = (unsigned __int8)( ( v5 + v8 * result[1] ) >> 8 );
-      result[2] = (unsigned __int8)( ( v7 + v8 * result[2] ) >> 8 );
-      result += 4;
-      --v9;
-    }
-    while ( v9 );
+    pixels[0] = (unsigned __int8)( ( pixels[0] * inverseAlpha + premult[0] ) >> 8 );
+    pixels[1] = (unsigned __int8)( ( pixels[1] * inverseAlpha + premult[1] ) >> 8 );
+    pixels[2] = (unsigned __int8)( ( pixels[2] * inverseAlpha + premult[2] ) >> 8 );
   }
-  return result;
+  return pixels;
 }
 
 /* ---- R_BlendOverTexture_S3TC  0x004EBC00 ----  VERIFIED */
-unsigned int __cdecl R_BlendOverTexture_S3TC(int a1, _BYTE *a2, int a3, int a4)
+/* Blends the two RGB565 endpoint colours of each DXT colour block toward
+ * blendColor.  For 16-byte blocks the endpoints are swapped back (and the
+ * 0/1 indices flipped) when the blend reversed their order. */
+void __cdecl R_BlendOverTexture_S3TC( int pixelCount, const unsigned char *blendColor,
+                                      unsigned char *data, int stride )
 {
-  unsigned int result;
-  unsigned int v6;
-  unsigned int v7;
-  int v8;
-  int v9;
-  int i;
-  __int16 v11;
-  int v12;
-  int v13;
-  int v14; // kr00_4
-  int v15;
-  bool v16; // zf
-  _WORD v17[2]; // [esp+10h] [ebp-34h] BYREF
-  int v18;
-  int v19;
-  unsigned int v20;
-  _DWORD v21[7];
-  unsigned int v22;
+  int alpha;
+  int inverseAlpha;
+  int premult[3];
+  int p, i;
+  unsigned short oldColor[2];
+  unsigned short newColor[2];
+  int r[2], g[2], b[2];
 
-  result = (unsigned __int8)a2[3];
-  v6 = result * ((*a2 & 0xF8) << 8);
-  v7 = result * ((unsigned __int8)a2[2] >> 3);
-  v8 = 255 - result;
-  v22 = result * 8 * (a2[1] & 0xFC);
-  if ( a1 > 0 )
+  alpha        = blendColor[3];
+  premult[0]   = alpha * ( ( blendColor[0] >> 3 ) << 11 );
+  premult[1]   = alpha * ( ( blendColor[1] >> 2 ) << 5 );
+  premult[2]   = alpha * ( blendColor[2] >> 3 );
+  inverseAlpha = 255 - alpha;
+
+  for ( p = 0; p < pixelCount; p += 16 )
   {
-    v18 = a3 - (_DWORD)v17;
-    v20 = ((unsigned int)(a1 - 1) >> 4) + 1;
-    do
+    for ( i = 0; i < 2; i++ )
     {
-      v9 = 0;
-      for ( i = 0; i < 2; ++i )
-      {
-        v11 = *(_WORD *)((char *)&v17[v9] + v18);
-        v17[v9] = v11;
-        v21[i + 4] = ((int)(v6 + v8 * (v11 & 0xF800)) >> 8) & 0xF800;
-        v12 = ((int)(v7 + v8 * (v11 & 0x1F)) >> 8) & 0x1F;
-        v13 = ((int)(v22 + v8 * (v11 & 0x7E0)) >> 8) & 0x7E0;
-        v21[i + 2] = v12;
-        LOWORD(v12) = LOWORD(v21[i + 2]) | v13;
-        v21[i] = v13;
-        LOWORD(v12) = LOWORD(v21[i + 4]) | v12;
-        *(_WORD *)((char *)&v19 + v9 * 2) = v12;
-        ++v9;
-      }
-      v14 = v19;
-      if ( a4 == 8 || v17[1] < v17[0] == HIWORD(v19) < (unsigned __int16)v19 )
-      {
-        v15 = a3;
-        *(_WORD *)a3 = v19;
-        *(_WORD *)(a3 + 2) = HIWORD(v14);
-      }
-      else
-      {
-        v15 = a3;
-        *(_WORD *)a3 = HIWORD(v19);
-        *(_WORD *)(a3 + 2) = v14;
-        *(_DWORD *)(a3 + 4) ^= ((unsigned int)~*(_DWORD *)(a3 + 4) >> 1) & 0x55555555;
-      }
-      a3 = a4 + v15;
-      result = v20 - 1;
-      v16 = v20 == 1;
-      v18 += a4;
-      --v20;
+      oldColor[i] = ( (unsigned short *)data )[i];
+      r[i] = ( ( oldColor[i] & 0xF800 ) * inverseAlpha + premult[0] ) >> 8 & 0xF800;
+      g[i] = ( ( oldColor[i] & 0x07E0 ) * inverseAlpha + premult[1] ) >> 8 & 0x07E0;
+      b[i] = ( ( oldColor[i] & 0x001F ) * inverseAlpha + premult[2] ) >> 8 & 0x001F;
+      newColor[i] = (unsigned short)( g[i] | b[i] | r[i] );
     }
-    while ( !v16 );
+    if ( stride == 8 || ( oldColor[1] < oldColor[0] ) == ( newColor[1] < newColor[0] ) )
+    {
+      ( (unsigned short *)data )[0] = newColor[0];
+      ( (unsigned short *)data )[1] = newColor[1];
+    }
+    else
+    {
+      ( (unsigned short *)data )[0] = newColor[1];
+      ( (unsigned short *)data )[1] = newColor[0];
+      ( (unsigned int *)data )[1] ^= ( ~( (unsigned int *)data )[1] >> 1 ) & 0x55555555;
+    }
+    data += stride;
   }
-  return result;
 }
 
 /* ---- R_BlendOverTexture  0x004EBD60 ----  VERIFIED */
-unsigned __int8 *__cdecl R_BlendOverTexture(
-        unsigned __int8 *result,
-        unsigned __int8 *a2,
-        unsigned __int8 *a3,
-        unsigned int a4)
+void __cdecl R_BlendOverTexture(
+        unsigned char *pixels,
+        int pixelCount,
+        unsigned char *blendColor,
+        unsigned int format)
 {
-  if ( a4 > 0x83F1 )
+  switch ( format )
   {
-    if ( a4 <= 0x83F3 )
-      return (unsigned __int8 *)R_BlendOverTexture_S3TC((int)result, a2, (int)(a3 + 8), 16);
+    case 6408:      /* GL_RGBA */
+      R_BlendOverTexture_RGBA(pixels, pixelCount, blendColor);
+      break;
+    case 0x83F0:    /* DXT1 */
+    case 0x83F1:
+      R_BlendOverTexture_S3TC(pixelCount, blendColor, pixels, 8);
+      break;
+    case 0x83F2:    /* DXT3 / DXT5: colour block follows the 8-byte alpha block */
+    case 0x83F3:
+      R_BlendOverTexture_S3TC(pixelCount, blendColor, pixels + 8, 16);
+      break;
   }
-  else if ( a4 >= 0x83F0 )
-  {
-    return (unsigned __int8 *)R_BlendOverTexture_S3TC((int)result, a2, (int)a3, 8);
-  }
-  else if ( a4 == 6408 )
-  {
-    return R_BlendOverTexture_RGBA(a3, (int)result, a2);
-  }
-  return result;
 }
 
 /* ---- R_TexImage2D  0x004EBDC0 ----  VERIFIED */
 void __cdecl R_TexImage2D( unsigned int target, int level,
-                           unsigned int internalFormat, int width, int height,
+                           int internalFormat, int width, int height,
                            unsigned int format, const void *pixels )
 {
 	qglGetError_0();
 
-	if ( internalFormat >= 0x83F0u && internalFormat <= 0x83F3u )
+	if ( internalFormat >= 0x83F0 && internalFormat <= 0x83F3 )
 	{
 		qglCompressedTexImage2DARB(
 			target, level, internalFormat, width, height, 0,
-			GetCardMemoryAmount( width, (int)internalFormat, height ),
+			GetCardMemoryAmount( internalFormat, width, height ),
 			pixels );
 	}
 	else
 	{
-		glTexImage2D( target, level, (int)internalFormat, width, height, 0,
+		glTexImage2D( target, level, internalFormat, width, height, 0,
 		              format, 0x1401u , pixels );
 	}
 
@@ -1271,7 +964,7 @@ int __cdecl PickInternalFormat( const unsigned char *pixels, int format,
 {
 	int count;
 	int i;
-	int bits;
+	int samples;
 
 	if ( format != 0x1908  )
 		return format;
@@ -1283,41 +976,49 @@ int __cdecl PickInternalFormat( const unsigned char *pixels, int format,
 	{
 		switch ( glConfig_colorBits )
 		{
+		case 32:
+			return 0x1908;
+		case 24:
+			return 0x1907;
 		case 15:
 		case 16:
 			return 0x8050;
-		case 24:
-			return 0x1907;
-		case 32:
-			return 0x1908;
 		default:
 			break;
 		}
 	}
 
-	count = width * height;
+	samples = 3;
+	count   = width * height;
 	for ( i = 0; i < count; ++i )
 	{
 		if ( pixels[ 4 * i + 3 ] != 0xFF )
 		{
-			bits = R_CVAR( r_texturebits )->integer;
-			if ( bits == 16 )
-				return 0x8056;
-			if ( bits == 32 )
-				return 0x8058;
-			return 4;
+			samples = 4;
+			break;
 		}
 	}
 
-	bits = R_CVAR( r_texturebits )->integer;
-	if ( bits == 16 )
-		return 0x8050;
-	if ( bits == 32 )
-		return 0x8051;
-	return 3;
+	if ( samples == 3 )
+	{
+		if ( R_CVAR( r_texturebits )->integer == 16 )
+			return 0x8050;
+		if ( R_CVAR( r_texturebits )->integer == 32 )
+			return 0x8051;
+		return 3;
+	}
+	if ( R_CVAR( r_texturebits )->integer == 16 )
+		return 0x8056;
+	if ( R_CVAR( r_texturebits )->integer == 32 )
+		return 0x8058;
+	return 4;
 }
 
-/* ---- UploadImage  0x004EBF20 ----  VERIFIED */
+/* ---- UploadImage  0x004EBF20 ----  VERIFIED
+ * RTCW Upload32 shape: a full-size non-mipmapped image is uploaded directly;
+ * otherwise it is mipped down to the scaled size, light-scaled, uploaded, and
+ * (when mipmapped) each further level is generated and uploaded.  The card and
+ * texture memory totals skip the levels that picmip would have dropped. */
 int __cdecl UploadImage( const char *name, unsigned char *pixels,
                          unsigned int textureTarget, unsigned int uploadTarget,
                          unsigned int format, int width, int height,
@@ -1328,8 +1029,6 @@ int __cdecl UploadImage( const char *name, unsigned char *pixels,
                          int *cardMemory, int *textureMemory )
 {
 	char mipName[ 64 ];
-	int  sourceWidth  = width;
-	int  sourceHeight = height;
 	int  scaledWidth;
 	int  scaledHeight;
 	int  picmip;
@@ -1345,19 +1044,20 @@ int __cdecl UploadImage( const char *name, unsigned char *pixels,
 
 	if ( ( ( width - 1 ) & width ) != 0 || ( ( height - 1 ) & height ) != 0 )
 	{
-		ri_Printf( 2, "WARNING: image '%s' is %i x %i, which is not a power of 2 on both sides\n",
+		ri.Printf( 2, "WARNING: image '%s' is %i x %i, which is not a power of 2 on both sides\n",
 		           name, width, height );
 		return 0;
 	}
 
 	picmip = R_PicmipForImageFlags( flags );
 
-	textureMipSkips = 0;
 	if ( flags & IMAGE_FLAG_ALLOW_PICMIP )
 	{
-		textureMipSkips = 2 - picmip;
-		if ( textureMipSkips < 0 )
-			textureMipSkips = 0;
+		textureMipSkips = 2 - picmip < 0 ? 0 : 2 - picmip;
+	}
+	else
+	{
+		textureMipSkips = 0;
 	}
 
 	scaledWidth  = width  >> picmip;
@@ -1374,99 +1074,105 @@ int __cdecl UploadImage( const char *name, unsigned char *pixels,
 
 	selectedFormat = PickInternalFormat( pixels, (int)format, width, height,
 	                                     flags, isLightmap );
-	mipmap = ( flags & IMAGE_FLAG_MIPMAP ) != 0;
 
-	if ( scaledWidth == width && scaledHeight == height && !mipmap )
+	if ( scaledWidth == width && scaledHeight == height )
 	{
-		R_TexImage2D( uploadTarget, 0, (unsigned int)selectedFormat,
-		              scaledWidth, scaledHeight, format, pixels );
+		mipmap = flags & IMAGE_FLAG_MIPMAP;
+		if ( !( flags & IMAGE_FLAG_MIPMAP ) )
+		{
+			R_TexImage2D( uploadTarget, 0, (unsigned int)selectedFormat,
+			              scaledWidth, scaledHeight, format, pixels );
 
-		*uploadWidth    = (unsigned short)scaledWidth;
-		*uploadHeight   = (unsigned short)scaledHeight;
-		*internalFormat = (unsigned int)selectedFormat;
+			*uploadWidth    = (unsigned short)scaledWidth;
+			*uploadHeight   = (unsigned short)scaledHeight;
+			*internalFormat = (unsigned int)selectedFormat;
 
-		levelCost = GetCardMemoryAmount( scaledWidth, selectedFormat, scaledHeight );
-		*cardMemory    += levelCost;
-		*textureMemory += levelCost;
+			levelCost = GetCardMemoryAmount( selectedFormat, scaledWidth, scaledHeight );
+			*cardMemory    += levelCost;
+			*textureMemory += levelCost;
+			goto done;
+		}
 	}
 	else
 	{
-		while ( sourceWidth > scaledWidth || sourceHeight > scaledHeight )
+		/* use the normal mip-mapping function to go down from here */
+		while ( width > scaledWidth || height > scaledHeight )
 		{
-			pixels = R_MipMap( format, pixels, mipName, sourceWidth, sourceHeight, 1 );
+			pixels = R_MipMap( format, pixels, mipName, width, height, 1 );
 			if ( !pixels )
 				return 0;
 
-			sourceWidth  >>= 1;
-			sourceHeight >>= 1;
-			if ( sourceWidth < 1 )
-				sourceWidth = 1;
-			if ( sourceHeight < 1 )
-				sourceHeight = 1;
-		}
-
-		R_LightScaleTexture( pixels, scaledWidth, scaledHeight, !mipmap, (int)format );
-
-		*uploadWidth    = (unsigned short)scaledWidth;
-		*uploadHeight   = (unsigned short)scaledHeight;
-		*internalFormat = (unsigned int)selectedFormat;
-
-		levelCost = GetCardMemoryAmount( scaledWidth, selectedFormat, scaledHeight );
-		*cardMemory += levelCost;
-
-		if ( textureMipSkips == 0 )
-		{
-			*textureMemory += levelCost;
-		}
-		else if ( mipmap )
-		{
-			--textureMipSkips;
-		}
-		else
-		{
-			*textureMemory += levelCost >> ( 2 * textureMipSkips );
-		}
-
-		R_TexImage2D( uploadTarget, 0, (unsigned int)selectedFormat,
-		              scaledWidth, scaledHeight, format, pixels );
-
-		if ( mipmap )
-		{
-			level = 0;
-
-			while ( scaledWidth > 1 || scaledHeight > 1 )
-			{
-				pixels = R_MipMap( format, pixels, mipName, scaledWidth, scaledHeight, 1 );
-				if ( !pixels )
-					return 0;
-
-				scaledWidth  >>= 1;
-				scaledHeight >>= 1;
-				if ( scaledWidth < 1 )
-					scaledWidth = 1;
-				if ( scaledHeight < 1 )
-					scaledHeight = 1;
-
-				++level;
-
-				levelCost = GetCardMemoryAmount( scaledWidth, selectedFormat, scaledHeight );
-				*cardMemory += levelCost;
-				if ( textureMipSkips )
-					--textureMipSkips;
-				else
-					*textureMemory += levelCost;
-
-				if ( R_CVAR( r_colorMipLevels )->integer )
-					R_BlendOverTexture( (unsigned char *)( scaledWidth * scaledHeight ),
-					                    (unsigned char *)mipBlendColors[ level & 15 ],
-					                    pixels, format );
-
-				R_TexImage2D( uploadTarget, level, (unsigned int)selectedFormat,
-				              scaledWidth, scaledHeight, format, pixels );
-			}
+			width  >>= 1;
+			height >>= 1;
+			if ( width < 1 )
+				width = 1;
+			if ( height < 1 )
+				height = 1;
 		}
 	}
 
+	R_LightScaleTexture( pixels, scaledWidth, scaledHeight, !( flags & IMAGE_FLAG_MIPMAP ), (int)format );
+
+	*uploadWidth    = (unsigned short)scaledWidth;
+	*uploadHeight   = (unsigned short)scaledHeight;
+	*internalFormat = (unsigned int)selectedFormat;
+
+	levelCost = GetCardMemoryAmount( selectedFormat, scaledWidth, scaledHeight );
+	*cardMemory += levelCost;
+
+	if ( textureMipSkips == 0 )
+	{
+		*textureMemory += levelCost;
+	}
+	else if ( flags & IMAGE_FLAG_MIPMAP )
+	{
+		--textureMipSkips;
+	}
+	else
+	{
+		*textureMemory += levelCost >> ( 2 * textureMipSkips );
+	}
+
+	R_TexImage2D( uploadTarget, 0, (unsigned int)selectedFormat,
+	              scaledWidth, scaledHeight, format, pixels );
+
+	mipmap = flags & IMAGE_FLAG_MIPMAP;
+	if ( flags & IMAGE_FLAG_MIPMAP )
+	{
+		level = 0;
+
+		while ( scaledWidth > 1 || scaledHeight > 1 )
+		{
+			pixels = R_MipMap( format, pixels, mipName, scaledWidth, scaledHeight, 1 );
+			if ( !pixels )
+				return 0;
+
+			scaledWidth  >>= 1;
+			scaledHeight >>= 1;
+			if ( scaledWidth < 1 )
+				scaledWidth = 1;
+			if ( scaledHeight < 1 )
+				scaledHeight = 1;
+
+			++level;
+
+			levelCost = GetCardMemoryAmount( selectedFormat, scaledWidth, scaledHeight );
+			*cardMemory += levelCost;
+			if ( textureMipSkips )
+				--textureMipSkips;
+			else
+				*textureMemory += levelCost;
+
+			if ( R_CVAR( r_colorMipLevels )->integer )
+				R_BlendOverTexture( pixels, scaledWidth * scaledHeight,
+				                    mipBlendColors[ level ], format );
+
+			R_TexImage2D( uploadTarget, level, (unsigned int)selectedFormat,
+			              scaledWidth, scaledHeight, format, pixels );
+		}
+	}
+
+done:
 	if ( mipmap )
 	{
 		glTexParameteri( textureTarget, 0x2801u , param );
@@ -1490,14 +1196,14 @@ image_t * __cdecl R_AllocImage( const char *name, unsigned int target,
 	image_t *image;
 	int      hash;
 
-	if ( strlen( name ) >= R_IMAGE_NAME_SIZE )
-		ri_Error( 1, "\025R_AllocImage: \"%s\" is too long\n", name );
-	if ( tr_numImages == R_MAX_IMAGES )
-		ri_Error( 1, "\025R_AllocImage: MAX_DRAWIMAGES hit\n" );
+	if ( strlen( name ) >= 64 )
+		ri.Error( 1, "\025R_AllocImage: \"%s\" is too long\n", name );
+	if ( tr_numImages == 2048 )
+		ri.Error( 1, "\025R_AllocImage: MAX_DRAWIMAGES hit\n" );
 
-	image = (image_t *)ri_Hunk_Alloc( sizeof( *image ) );
-	tr_images[ tr_numImages ] = image;
-	image->texnum = (unsigned int)tr_numImages + R_IMAGE_FIRST_TEXTURE;
+	( (image_t **)(void *)tr_imageSlots )[ tr_numImages ] = (image_t *)( (void *)( (*(int (__cdecl **)(int))&ri.Hunk_Alloc)( (int)(sizeof( *image )) ) ) );
+	image = ( (image_t **)(void *)tr_imageSlots )[ tr_numImages ];
+	image->texnum = (unsigned int)tr_numImages + 1024;
 	++tr_numImages;
 
 	strcpy( image->imgName, name );
@@ -1507,12 +1213,13 @@ image_t * __cdecl R_AllocImage( const char *name, unsigned int target,
 	image->target        = target;
 	image->cardMemory    = 0;
 	image->textureMemory = 0;
-	image->imageTrack    = imageTrack;
+
 
 
 	hash = tr_image_generateHashValue( (char *)name );
-	image->hashNext = imageHashTable[ hash ];
-	imageHashTable[ hash ] = image;
+	image->hashNext = ( (image_t **)(void *)hashtable )[ hash ];
+	( (image_t **)(void *)hashtable )[ hash ] = image;
+	image->imageTrack = imageTrack;
 	return image;
 }
 
@@ -1543,6 +1250,9 @@ void __cdecl R_FreeImage( image_t *image )
 	qglDeleteTextures( 1, &image->texnum );
 }
 
+#define IMAGE_MAX( a, b ) ( ( a ) > ( b ) ? ( a ) : ( b ) )
+#define IMAGE_MIN( a, b ) ( ( a ) < ( b ) ? ( a ) : ( b ) )
+
 /* ---- R_CreateImageInternal  0x004EC490 ----  VERIFIED */
 int __cdecl R_CreateImageInternal( image_t *image, const float *colorScale,
                                    unsigned char *pixels,
@@ -1552,35 +1262,26 @@ int __cdecl R_CreateImageInternal( image_t *image, const float *colorScale,
 	int isLightmap;
 	int cardMemory;
 	int textureMemory;
-	int count;
 	int i;
 	int c;
 
-	isLightmap = ( strncmp( image->imgName, "*lightmap", 9 ) == 0 );
-
+	isLightmap = 0;
+	if ( !strncmp( image->imgName, "*lightmap", 9 ) )
+		isLightmap = 1;
 
 	if ( colorScale )
 	{
-		count = (int)image->width * (int)image->height;
-		for ( i = 0; i < count; ++i )
+		for ( i = 0; i < image->width * image->height; ++i )
 		{
-			unsigned char *p = pixels + 4 * i;
+			/* a NaN product is left alone and reaches __ftol2 (integer
+			 * indefinite -> low byte 0) */
 			for ( c = 0; c < 4; ++c )
-			{
-				double v = (double)p[ c ] * (double)colorScale[ c ];
-				if ( !( v < 255.0 ) )
-					v = 255.0;
-				else if ( v < 0.0 )
-					v = 0.0;
-				p[ c ] = (unsigned char)v;
-			}
+				pixels[ 4 * i + c ] = (unsigned char)(int)IMAGE_MIN( 255.0f,
+					IMAGE_MAX( 0.0f, (rfloat)pixels[ 4 * i + c ] * colorScale[ c ] ) );
 		}
 	}
 
 	GL_Bind( image );
-
-	cardMemory    = 0;
-	textureMemory = 0;
 
 	if ( !UploadImage( image->imgName, pixels, image->target, uploadTarget,
 	                   format, (int)image->width, (int)image->height,
@@ -1608,412 +1309,458 @@ int __cdecl R_CreateImage( char *name, int flags, int imageTrack,
                            unsigned __int8 *pixels, int width, int height,
                            int format, float *colorScale )
 {
-  _DWORD *v7;
+  image_t *image = R_AllocImage( name, 3553, width, height, flags, imageTrack );
 
-  v7 = (_DWORD *)R_AllocImage(name, 3553, width, height, flags, imageTrack);
-  if ( ( flags & 0x80 ) != 0 )          /* 0x004EC74B `test bl, bl / jns` */
+  if ( flags & IMAGE_FLAG_DELAYED_UPLOAD )   /* 0x004EC74B `test bl, bl / jns` */
   {
-    if ( format == 6408 || width >= 4 && height >= 4 )
+    if ( format == 6408 || ( width >= 4 && height >= 4 ) )
     {
-      v7[24] = format;
-      v7[26] = 0;
-      v7[27] = tr_delayedImageGroup;
-      v7[28] = tr_delayedImageGroupTriCount;
-      return (int)v7;
+      image->internalFormat            = format;
+      image->link.delayedShader        = 0;
+      image->state.delay.group         = tr_delayedImageGroup;
+      image->state.delay.groupTriCount = tr_delayedImageGroupTriCount;
+      return (int)image;
     }
-    v7[25] &= ~0x80u;
+    image->flags &= ~IMAGE_FLAG_DELAYED_UPLOAD;
     --tr_delayedImageCount;
   }
-  if ( !R_CreateImageInternal((int)v7, colorScale, pixels, 0xDE1u, format) )
+  if ( !R_CreateImageInternal( image, colorScale, pixels, 0xDE1u, format ) )
   {
-    R_FreeImage((int)v7);
-    return 0;                           /* 0x004EC797 `xor esi, esi`      */
+    R_FreeImage( image );
+    image = 0;                          /* 0x004EC797 `xor esi, esi`      */
   }
-  return (int)v7;
+  return (int)image;
 }
 
 /* ---- TransposeDDSBlockDXT1  0x004EC7C0 ----  [HIGH] */
-char __cdecl TransposeDDSBlockDXT1(int a1, int a2)
+/* Transposes one 4x4 DXT1 colour block: copies the two endpoint colours and
+ * swaps the 2-bit index of pixel (r,c) with pixel (c,r). */
+void __cdecl TransposeDDSBlockDXT1( const unsigned char *src, unsigned char *dst )
 {
-  unsigned __int8 v2;
-  char v3;
-  char result;
-
-  *(_DWORD *)a2 = *(_DWORD *)a1;
-  *(_BYTE *)(a2 + 4) = *(_BYTE *)(a1 + 4) & 3
-                     | (4 * (*(_BYTE *)(a1 + 5) & 3 | (4 * ((4 * *(_BYTE *)(a1 + 7)) | *(_BYTE *)(a1 + 6) & 3))));
-  *(_BYTE *)(a2 + 5) = *(_BYTE *)(a1 + 5) & 0xC
-                     | (*(_BYTE *)(a1 + 4) >> 2) & 3
-                     | (4 * (*(_BYTE *)(a1 + 6) & 0xC | (4 * (*(_BYTE *)(a1 + 7) & 0xFC))));
-  *(_BYTE *)(a2 + 6) = *(_BYTE *)(a1 + 6) & 0x30
-                     | (4 * (*(_BYTE *)(a1 + 7) & 0xF0))
-                     | ((unsigned __int8)(*(_BYTE *)(a1 + 5) & 0x30 | (*(_BYTE *)(a1 + 4) >> 2) & 0xC) >> 2);
-  v2 = *(_BYTE *)(a1 + 5) & 0xCF | (*(_BYTE *)(a1 + 4) >> 2);
-  v3 = *(_BYTE *)(a1 + 6) & 0xC3;
-  result = *(_BYTE *)(a1 + 7) & 0xC0;
-  *(_BYTE *)(a2 + 7) = result | ((unsigned __int8)(v3 | (v2 >> 2)) >> 2);
-  return result;
+  *(int *)dst = *(const int *)src;
+  dst[4] = (unsigned char)( ( ( ( ( src[7] << 2 ) | ( src[6] & 3 ) ) << 2 | ( src[5] & 3 ) ) << 2 ) | ( src[4] & 3 ) );
+  dst[5] = (unsigned char)( ( ( ( ( src[7] & 0xFC ) << 2 ) | ( src[6] & 0x0C ) ) << 2 | ( ( src[4] >> 2 ) & 3 ) ) | ( src[5] & 0x0C ) );
+  dst[6] = (unsigned char)( ( ( ( ( src[4] >> 2 ) & 0x0C ) | ( src[5] & 0x30 ) ) >> 2 ) | ( ( src[7] & 0xF0 ) << 2 ) | ( src[6] & 0x30 ) );
+  dst[7] = (unsigned char)( ( ( ( ( ( src[4] >> 2 ) | ( src[5] & 0xCF ) ) >> 2 ) | ( src[6] & 0xC3 ) ) >> 2 ) | ( src[7] & 0xC0 ) );
 }
 
 /* ---- TransposeDDSBlockDXT3  0x004EC870 ----  [HIGH] */
-char __cdecl TransposeDDSBlockDXT3(_BYTE *a1, _BYTE *a2)
+/* DXT1 colour block at +8, then the 4-bit explicit alpha nibbles transposed. */
+void __cdecl TransposeDDSBlockDXT3( unsigned char *dst, const unsigned char *src )
 {
-  char result;
-
-  TransposeDDSBlockDXT1((int)(a2 + 8), (int)(a1 + 8));
-  *a1 = *a2 & 0xF | (16 * a2[2]);
-  a1[1] = (16 * a2[6]) | a2[4] & 0xF;
-  a1[2] = (*a2 >> 4) | a2[2] & 0xF0;
-  a1[3] = (a2[4] >> 4) | a2[6] & 0xF0;
-  a1[4] = (16 * a2[3]) | a2[1] & 0xF;
-  a1[5] = (16 * a2[7]) | a2[5] & 0xF;
-  a1[6] = (a2[1] >> 4) | a2[3] & 0xF0;
-  result = a2[5] >> 4;
-  a1[7] = result | a2[7] & 0xF0;
-  return result;
+  TransposeDDSBlockDXT1( src + 8, dst + 8 );
+  dst[0] = (unsigned char)( ( src[0] & 0x0F ) | ( src[2] << 4 ) );
+  dst[1] = (unsigned char)( ( src[6] << 4 ) | ( src[4] & 0x0F ) );
+  dst[2] = (unsigned char)( ( src[0] >> 4 ) | ( src[2] & 0xF0 ) );
+  dst[3] = (unsigned char)( ( src[4] >> 4 ) | ( src[6] & 0xF0 ) );
+  dst[4] = (unsigned char)( ( src[3] << 4 ) | ( src[1] & 0x0F ) );
+  dst[5] = (unsigned char)( ( src[7] << 4 ) | ( src[5] & 0x0F ) );
+  dst[6] = (unsigned char)( ( src[1] >> 4 ) | ( src[3] & 0xF0 ) );
+  dst[7] = (unsigned char)( ( src[5] >> 4 ) | ( src[7] & 0xF0 ) );
 }
 
 /* ---- TransposeDDSBlockDXT5  0x004EC910 ----  [HIGH] */
-unsigned int __cdecl TransposeDDSBlockDXT5(_BYTE *a1, int a2)
+void __cdecl TransposeDDSBlockDXT5( const unsigned char *in, unsigned char *out )
 {
-  unsigned int result;
-  unsigned int v3;
-  int v4;
-  unsigned int v5;
+  /* the sixteen 3-bit alpha indices: rows 0-1 in in[2..4], rows 2-3 in in[5..7] */
+  unsigned int bits[4];
 
-  TransposeDDSBlockDXT1((int)(a1 + 8), a2 + 8);
-  LOBYTE(v3) = a1[2];
-  BYTE2(v3) = a1[4];
-  LOBYTE(v4) = a1[5];
-  BYTE1(v3) = a1[3];
-  BYTE2(v4) = a1[7];
-  BYTE1(v4) = a1[6];
-  v5 = 0xE001C0 & v4
-     | (8 * (v3 & 0xE00 | ((v4 & 0xE00) << 6)))
-     | ((0xE001C0 & v3 | ((v4 & 0x1C0000 | (v3 >> 6) & 0x7000) >> 3)) >> 6);
-  *(_BYTE *)a2 = *a1;
-  *(_BYTE *)(a2 + 1) = a1[1];
-  *(_BYTE *)(a2 + 3) = (unsigned __int16)(v3 & 0x8007
-                                        | (((v3 >> 6) & 0x1C0 | v4 & 0x7000) >> 3)
-                                        | ((v4 & 0x8007 | (unsigned __int16)(8 * (v3 & 0x38 | ((v4 & 0x38) << 6)))) << 6)) >> 8;
-  *(_BYTE *)(a2 + 4) = (v3 & 0x38007
-                      | (((v3 >> 6) & 0x1C0 | v4 & 0x7000) >> 3)
-                      | ((v4 & 0x38007 | (8 * (v3 & 0x38 | ((v4 & 0x38) << 6)))) << 6)) >> 16;
-  *(_BYTE *)(a2 + 2) = v3 & 7
-                     | (((v3 >> 6) & 0x1C0 | v4 & 0x7000) >> 3)
-                     | ((v4 & 7 | (unsigned __int8)(8 * (v3 & 0x38 | ((v4 & 0x38) << 6)))) << 6);
-  result = v5 >> 8;
-  *(_WORD *)(a2 + 5) = v5;
-  *(_BYTE *)(a2 + 7) = BYTE2(v5);
-  return result;
+  TransposeDDSBlockDXT1( in + 8, out + 8 );
+
+  ( (unsigned char *)bits )[0] = in[2];
+  ( (unsigned char *)bits )[1] = in[3];
+  ( (unsigned char *)bits )[2] = in[4];
+  ( (unsigned char *)bits )[4] = in[5];
+  ( (unsigned char *)bits )[5] = in[6];
+  ( (unsigned char *)bits )[6] = in[7];
+
+  bits[2] = ( ( ( ( ( bits[1] & 0x38 ) << 6 | ( bits[0] & 0x38 ) ) << 3 | ( bits[1] & 0x38007 ) ) << 6 )
+             | ( ( ( bits[1] & 0x7000 ) | ( ( bits[0] >> 6 ) & 0x1C0 ) ) >> 3 )
+             | ( bits[0] & 0x38007 ) );
+  bits[3] = ( ( ( ( ( bits[0] >> 6 ) & 0x7000 ) | ( bits[1] & 0x1C0000 ) ) >> 3 | ( bits[0] & 0xE001C0 ) ) >> 6 )
+             | ( ( bits[1] & 0xE00 ) << 6 | ( bits[0] & 0xE00 ) ) << 3
+             | ( bits[1] & 0xE001C0 );
+
+  out[0] = in[0];
+  out[1] = in[1];
+  out[2] = ( (unsigned char *)bits )[8];
+  out[3] = ( (unsigned char *)bits )[9];
+  out[4] = ( (unsigned char *)bits )[10];
+  out[5] = ( (unsigned char *)bits )[12];
+  out[6] = ( (unsigned char *)bits )[13];
+  out[7] = ( (unsigned char *)bits )[14];
 }
 
 /* ---- LoadDDS  0x004ECA30 ----  VERIFIED */
-void __cdecl LoadDDS(_DWORD *a1, const char *a2, int *a3, _WORD *a4, _WORD *a5, _DWORD *a6, int a7)
+void __cdecl LoadDDS(const char *name, int *pixels, unsigned short *width, unsigned short *height, unsigned int *internalFormat, unsigned int *hasMipmaps, int loadData)
 {
-  _DWORD *v7;
-  int v8;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  unsigned int v13;
-  unsigned int v14;
-  int v15; // [esp+4h] [ebp-88h] BYREF
-  int v16; // [esp+8h] [ebp-84h] BYREF
-  _BYTE v17[128]; // [esp+Ch] [ebp-80h] BYREF
+  unsigned int *header;
+  int fileLen;
+  int fileData;
+  int allocIndex;
+  int fourCC;
+  int ddsWidth;
+  unsigned int mipMapCount;
+  unsigned int maxDim;
+  int fileHandle; 
+  int fileBuffer; 
+  unsigned int headerBuf[32]; 
 
-  if ( a7 )
+  if ( !loadData )
   {
-    v8 = ri_FS_ReadFile(a2, &v16);
-    v9 = v16;
-    if ( v8 >= 0 )
-    {
-      v10 = dword_14072F0;
-      r_imageAllocations[dword_14072F0].kind = 0;
-      *(int *)&r_imageAllocations[v10].memory = v9;
-      dword_14072F0 = v10 + 1;
-    }
-    if ( v8 <= 128 )
+
+    if ( ri.FS_FOpenFileByMode(name, &fileHandle, 0) <= 128 )
       return;
-    v7 = (_DWORD *)v9;
+    ri.FS_Read(headerBuf, 128, fileHandle);
+    ri.FS_FCloseFile(fileHandle);
+    header = headerBuf;
   }
   else
   {
-    if ( ri_FS_FOpenFileByMode(a2, &v15, 0) <= 128 )
+    fileLen = ( (*(int (__cdecl **)(const char *, void **))&ri.FS_ReadFile)( (name), (&fileBuffer) ) );
+    fileData = fileBuffer;
+    if ( fileLen >= 0 )
+    {
+      allocIndex = rendererImageAllocationCount;
+      r_imageAllocations[rendererImageAllocationCount].kind = 0;
+      *(int *)&r_imageAllocations[allocIndex].memory = fileData;
+      rendererImageAllocationCount = allocIndex + 1;
+    }
+    if ( fileLen <= 128 )
       return;
-    ri_FS_Read(v17, 128, v15);
-    ri_FS_FCloseFile(v15);
-    v7 = v17;
+    header = (unsigned int *)fileData;
   }
-  if ( *v7 != 542327876 )
+  if ( *header != 542327876 )
     return;
-  v11 = v7[21];
-  switch ( v11 )
+  fourCC = header[21];
+  switch ( fourCC )
   {
     case 827611204:
-      *a1 = 33777;
+      *internalFormat = 33777;
       break;
     case 861165636:
-      *a1 = 33778;
+      *internalFormat = 33778;
       break;
     case 894720068:
-      *a1 = 33779;
+      *internalFormat = 33779;
       break;
     default:
       return;
   }
-  if ( v7[1] == 124 )
+  if ( header[1] == 124 )
   {
-    v12 = v7[4];
-    if ( ((v12 - 1) & v12) != 0 || ((v7[3] - 1) & v7[3]) != 0 )
+    ddsWidth = header[4];
+    if ( ((ddsWidth - 1) & ddsWidth) != 0 || ((header[3] - 1) & header[3]) != 0 )
     {
-      ri_Printf(2, "WARNING: image '%s' is %i x %i, which is not a power of 2 on both sides\n", a2, v12, v7[3]);
-      *a1 = 0;
+      ri.Printf(2, "WARNING: image '%s' is %i x %i, which is not a power of 2 on both sides\n", name, ddsWidth, header[3]);
+      *internalFormat = 0;
     }
     else
     {
-      *a6 = 0;
-      v13 = v7[7];
-      if ( v13 >= 2 )
+      *hasMipmaps = 0;
+      mipMapCount = header[7];
+      if ( mipMapCount != 0 && mipMapCount != 1 )
       {
-        v14 = v7[4];
-        if ( v14 <= v7[3] )
-          v14 = v7[3];
-        if ( 1 << v13 != 2 * v14 )
+        maxDim = header[4];
+        if ( maxDim <= header[3] )
+          maxDim = header[3];
+        if ( 1 << mipMapCount != 2 * maxDim )
         {
-          ri_Printf(2, "WARNING: image '%s' does not have the correct number of mipmaps", a2);
-          *a1 = 0;
+          ri.Printf(2, "WARNING: image '%s' does not have the correct number of mipmaps", name);
+          *internalFormat = 0;
           return;
         }
-        *a6 = 1;
+        *hasMipmaps = 1;
       }
-      if ( v7[4] > 0x8000u || v7[3] > 0x8000u )
+      if ( header[4] > 0x8000u || header[3] > 0x8000u )
       {
-        ri_Printf(2, "WARNING: image '%s' is greater than %i on one or more axes", a2, 0x8000);
-        *a1 = 0;
+        ri.Printf(2, "WARNING: image '%s' is greater than %i on one or more axes", name, 0x8000);
+        *internalFormat = 0;
       }
       else
       {
-        *a4 = *((_WORD *)v7 + 8);
-        *a5 = *((_WORD *)v7 + 6);
-        if ( a7 )
-          *a3 = (int)(v7 + 32);
+        *width = *((unsigned short *)header + 8);
+        *height = *((unsigned short *)header + 6);
+        if ( loadData )
+          *pixels = (int)(header + 32);
       }
     }
   }
 }
 
 /* ---- LoadTGA  0x004ECC20 ----  [HIGH] */
-char __cdecl LoadTGA( int a1, int *a2, unsigned __int16 *a3, unsigned __int16 *a4,
-                      _DWORD *a5, int a6 )
+#pragma pack( push, 1 )
+typedef struct _TargaHeader
 {
-	const char    *name = (const char *)a1;
-	unsigned char  headerBytes[18];
-	const unsigned char *hdr;
-	const unsigned char *src = 0;
-	void          *fileBuffer = 0;
+	unsigned char  id_length, colormap_type, image_type;
+	unsigned short colormap_index, colormap_length;
+	unsigned char  colormap_size;
+	unsigned short x_origin, y_origin, width, height;
+	unsigned char  pixel_size, attributes;
+} TargaHeader;
+#pragma pack( pop )
 
-	int idLength, colorMapType, imageType, pixelSize, imageDescriptor;
-	int srcWidth, srcHeight;
-	int pixelStride, rowAdvance;
-	unsigned char *out, *dst;
-	int row, col;
+void __cdecl LoadTGA( const char *name, int *pic, unsigned __int16 *width, unsigned __int16 *height,
+                      unsigned int *format, int readMode )
+{
+	unsigned short columns, rows;
+	int            numPixels;
+	unsigned char *pixbuf;
+	int            row, column;
+	unsigned char *buf_p;
+	TargaHeader    targa_header;
+	unsigned char *targa_rgba;
+	int            pixelStride, rowAdvance;
 
-	if ( a6 )
+	if ( !readMode )
 	{
-		if ( R_ReadFile( name, &fileBuffer ) < 0 || !fileBuffer )
-			return 0;
-		hdr = (const unsigned char *)fileBuffer;
-		src = hdr + 18;
+		int f;
+
+		if ( ri.FS_FOpenFileByMode( name, &f, 0 ) < 18 )
+			return;
+		ri.FS_Read( &targa_header, 18, f );
+		ri.FS_FCloseFile( f );
+		buf_p = 0;
 	}
 	else
 	{
-		int handle;
+		void *buffer;
 
-		if ( ri_FS_FOpenFileByMode( name, &handle, 0 ) < 18 )
-			return 0;
-		ri_FS_Read( headerBytes, 18, handle );
-		ri_FS_FCloseFile( handle );
-		hdr = headerBytes;
+		R_ReadFile( name, &buffer );
+		if ( !buffer )
+			return;
+		buf_p = (unsigned char *)buffer;
+
+		targa_header.id_length       = *buf_p++;
+		targa_header.colormap_type   = *buf_p++;
+		targa_header.image_type      = *buf_p++;
+		targa_header.colormap_index  = *(unsigned short *)buf_p;
+		buf_p += 2;
+		targa_header.colormap_length = *(unsigned short *)buf_p;
+		buf_p += 2;
+		targa_header.colormap_size   = *buf_p++;
+		targa_header.x_origin        = *(unsigned short *)buf_p;
+		buf_p += 2;
+		targa_header.y_origin        = *(unsigned short *)buf_p;
+		buf_p += 2;
+		targa_header.width           = *(unsigned short *)buf_p;
+		buf_p += 2;
+		targa_header.height          = *(unsigned short *)buf_p;
+		buf_p += 2;
+		targa_header.pixel_size      = *buf_p++;
+		targa_header.attributes      = *buf_p++;
 	}
 
-	idLength        = hdr[0];
-	colorMapType    = hdr[1];
-	imageType       = hdr[2];
-	pixelSize       = hdr[16];
-	imageDescriptor = hdr[17];
+	if ( targa_header.image_type != 2 && targa_header.image_type != 10 && targa_header.image_type != 3 )
+		ri.Error( 1, "\x15" "LoadTGA: Only type 2 (RGB), 3 (gray), and 10 (RGB) TGA images supported\n" );
+	if ( targa_header.colormap_type != 0 )
+		ri.Error( 1, "\x15" "LoadTGA: colormaps not supported\n" );
+	if ( ( targa_header.pixel_size != 32 && targa_header.pixel_size != 24 ) && targa_header.image_type != 3 )
+		ri.Error( 1, "\x15" "LoadTGA: Only 32 or 24 bit images supported (no colormaps)\n" );
 
-	if ( imageType != 2 && imageType != 10 && imageType != 3 )
+	columns   = targa_header.width;
+	rows      = targa_header.height;
+	numPixels = columns * rows;
+
+	*width  = columns;
+	*height = rows;
+	*format = 0x1908;
+
+	if ( !readMode )
+		return;
+
+	if ( targa_header.attributes & 0x20 )
 	{
-		ri_Error( 1, "\x15" "LoadTGA: Only type 2 (RGB), 3 (gray), and 10 (RGB) TGA images supported\n" );
-	}
-	if ( colorMapType )
-	{
-		ri_Error( 1, "\x15" "LoadTGA: colormaps not supported\n" );
-	}
-	if ( pixelSize != 32 && pixelSize != 24 && imageType != 3 )
-	{
-		ri_Error( 1, "\x15" "LoadTGA: Only 32 or 24 bit images supported (no colormaps)\n" );
-	}
-
-	srcWidth  = hdr[12] | ( hdr[13] << 8 );
-	srcHeight = hdr[14] | ( hdr[15] << 8 );
-
-	*a3 = (unsigned __int16) srcWidth;
-	*a4 = (unsigned __int16) srcHeight;
-	*a5 = 0x1908;
-
-	if ( !a6 )
-		return 1;
-
-	out = (unsigned char *) R_AllocTempMemory( 4 * srcWidth * srcHeight );
-	*a2 = (int) out;
-	if ( !out )
-		return 0;
-
-	pixelStride = 4;
-	if ( imageDescriptor & 0x20 )
-	{
+		pixelStride = 4;
 		rowAdvance = 0;
-		dst = out;
 	}
 	else
 	{
-		rowAdvance = -srcWidth * 8;
-		dst = out + 4 * srcWidth * ( srcHeight - 1 );
+		pixelStride = 4;
+		rowAdvance = -columns * 8;
 	}
 
-	if ( a6 == 2 && srcWidth < srcHeight )
-	{
-		*a3 = (unsigned __int16) srcHeight;
-		*a4 = (unsigned __int16) srcWidth;
-		pixelStride = 4 * srcHeight;
+	targa_rgba = (unsigned char *)R_AllocTempMemory( numPixels * 4, "LoadTGA" );
+	*pic       = (int)targa_rgba;
 
-		if ( imageDescriptor & 0x20 )
+	pixbuf = targa_rgba;
+	if ( rowAdvance < 0 )
+		pixbuf = targa_rgba + ( rows - 1 ) * columns * 4;
+
+	if ( readMode == 2 && *width < *height )
+	{
+		/* sheet load of a tall image: store it transposed (landscape) */
+		*width  = rows;
+		*height = columns;
+		pixbuf  = targa_rgba;
+		if ( targa_header.attributes & 0x20 )
 		{
-			rowAdvance = 4 - srcWidth * pixelStride;
-			dst = out;
+			pixelStride = rows * 4;
+			rowAdvance  = 4 - columns * pixelStride;
 		}
 		else
 		{
-			rowAdvance = -4 - srcWidth * pixelStride;
-			dst = out + 4 * ( srcHeight - 1 );
+			pixelStride = rows * 4;
+			rowAdvance  = -4 - columns * pixelStride;
+			pixbuf      = targa_rgba + 4 * ( rows - 1 );
 		}
 	}
 
-	src += idLength;
+	if ( targa_header.id_length != 0 )
+		buf_p += targa_header.id_length;  /* skip TARGA image comment */
 
-	if ( imageType == 2 || imageType == 3 )
+	if ( targa_header.image_type == 2 || targa_header.image_type == 3 )
 	{
-		for ( row = 0; row < srcHeight; row++ )
+		/* uncompressed RGB or gray scale image */
+		for ( row = 0; row < rows; row++ )
 		{
-			for ( col = 0; col < srcWidth; col++ )
+			for ( column = 0; column < columns; column++ )
 			{
-				if ( pixelSize == 32 )
+				unsigned char red, green, blue, alphabyte;
+
+				switch ( targa_header.pixel_size )
 				{
-					unsigned char b = *src++, g = *src++, r = *src++, a = *src++;
-					dst[0] = r; dst[1] = g; dst[2] = b; dst[3] = a;
+				case 8:
+					blue  = *buf_p++;
+					green = blue;
+					red   = blue;
+					pixbuf[0] = red;
+					pixbuf[1] = green;
+					pixbuf[2] = blue;
+					pixbuf[3] = 255;
+					break;
+				case 24:
+					blue  = *buf_p++;
+					green = *buf_p++;
+					red   = *buf_p++;
+					pixbuf[0] = red;
+					pixbuf[1] = green;
+					pixbuf[2] = blue;
+					pixbuf[3] = 255;
+					break;
+				case 32:
+					blue      = *buf_p++;
+					green     = *buf_p++;
+					red       = *buf_p++;
+					alphabyte = *buf_p++;
+					pixbuf[0] = red;
+					pixbuf[1] = green;
+					pixbuf[2] = blue;
+					pixbuf[3] = alphabyte;
+					break;
+				default:
+					ri.Error( 1, "\x15" "LoadTGA: illegal pixel_size '%d' in file '%s'\n", targa_header.pixel_size, name );
+					break;
 				}
-				else if ( pixelSize == 24 )
+				pixbuf += pixelStride;
+			}
+			pixbuf += rowAdvance;
+		}
+	}
+	else if ( targa_header.image_type == 10 )
+	{
+		/* run-length encoded RGB images */
+		unsigned char red, green, blue, alphabyte, packetHeader, j;
+		int           packetSize;
+
+		red       = 0;
+		green     = 0;
+		blue      = 0;
+		alphabyte = 0xff;
+
+		for ( row = 0; row < rows; )
+		{
+			for ( column = 0; column < columns; )
+			{
+				packetHeader = *buf_p++;
+				packetSize   = 1 + ( packetHeader & 0x7f );
+				if ( packetHeader & 0x80 )
 				{
-					unsigned char b = *src++, g = *src++, r = *src++;
-					dst[0] = r; dst[1] = g; dst[2] = b; dst[3] = 255;
-				}
-				else if ( pixelSize == 8 )
-				{
-					unsigned char v = *src++;
-					dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = 255;
+					/* run-length packet */
+					switch ( targa_header.pixel_size )
+					{
+					case 24:
+						blue      = *buf_p++;
+						green     = *buf_p++;
+						red       = *buf_p++;
+						alphabyte = 255;
+						break;
+					case 32:
+						blue      = *buf_p++;
+						green     = *buf_p++;
+						red       = *buf_p++;
+						alphabyte = *buf_p++;
+						break;
+					default:
+						ri.Error( 1, "\x15" "LoadTGA: illegal pixel_size '%d' in file '%s'\n", targa_header.pixel_size, name );
+						break;
+					}
+
+					for ( j = 0; j < packetSize; j++ )
+					{
+						pixbuf[0] = red;
+						pixbuf[1] = green;
+						pixbuf[2] = blue;
+						pixbuf[3] = alphabyte;
+						pixbuf += pixelStride;
+						column++;
+						if ( column == columns )
+						{
+							/* run spans across rows */
+							column = 0;
+							row++;
+							if ( row == rows )
+								return;
+							pixbuf += rowAdvance;
+						}
+					}
 				}
 				else
 				{
-					ri_Error( 1, "\x15" "LoadTGA: illegal pixel_size '%d' in file '%s'\n",
-					          pixelSize, name );
-				}
-				dst += pixelStride;
-			}
-			dst += rowAdvance;
-		}
-		return 1;
-	}
-
-	row = 0;
-	col = 0;
-	while ( row < srcHeight )
-	{
-		unsigned char packetHeader = *src++;
-		int           packetLength = ( packetHeader & 0x7F ) + 1;
-		int           i;
-
-		if ( ( packetHeader & 0x80 ) == 0 )
-		{
-			for ( i = 0; i < packetLength; i++ )
-			{
-				unsigned char r, g, b, a;
-
-				if ( pixelSize == 32 )
-				{
-					b = *src++; g = *src++; r = *src++; a = *src++;
-				}
-				else if ( pixelSize == 24 )
-				{
-					b = *src++; g = *src++; r = *src++; a = 255;
-				}
-				else
-				{
-					ri_Error( 1, "\x15" "LoadTGA: illegal pixel_size '%d' in file '%s'\n",
-					          pixelSize, name );
-					return 0;
-				}
-
-				dst[0] = r; dst[1] = g; dst[2] = b; dst[3] = a;
-				dst += pixelStride;
-
-				if ( ++col == srcWidth )
-				{
-					col = 0;
-					if ( ++row == srcHeight )
-						return 1;
-					dst += rowAdvance;
-				}
-			}
-		}
-		else
-		{
-			unsigned char r, g, b, a;
-
-			if ( pixelSize == 32 )
-			{
-				b = *src++; g = *src++; r = *src++; a = *src++;
-			}
-			else if ( pixelSize == 24 )
-			{
-				b = *src++; g = *src++; r = *src++; a = 255;
-			}
-			else
-			{
-				ri_Error( 1, "\x15" "LoadTGA: illegal pixel_size '%d' in file '%s'\n",
-				          pixelSize, name );
-				return 0;
-			}
-
-			for ( i = 0; i < packetLength; i++ )
-			{
-				dst[0] = r; dst[1] = g; dst[2] = b; dst[3] = a;
-				dst += pixelStride;
-
-				if ( ++col == srcWidth )
-				{
-					col = 0;
-					if ( ++row == srcHeight )
-						return 1;
-					dst += rowAdvance;
+					/* non run-length packet */
+					for ( j = 0; j < packetSize; j++ )
+					{
+						switch ( targa_header.pixel_size )
+						{
+						case 24:
+							blue  = *buf_p++;
+							green = *buf_p++;
+							red   = *buf_p++;
+							pixbuf[0] = red;
+							pixbuf[1] = green;
+							pixbuf[2] = blue;
+							pixbuf[3] = 255;
+							break;
+						case 32:
+							blue      = *buf_p++;
+							green     = *buf_p++;
+							red       = *buf_p++;
+							alphabyte = *buf_p++;
+							pixbuf[0] = red;
+							pixbuf[1] = green;
+							pixbuf[2] = blue;
+							pixbuf[3] = alphabyte;
+							break;
+						default:
+							ri.Error( 1, "\x15" "LoadTGA: illegal pixel_size '%d' in file '%s'\n", targa_header.pixel_size, name );
+							break;
+						}
+						pixbuf += pixelStride;
+						column++;
+						if ( column == columns )
+						{
+							/* pixel packet run spans across rows */
+							column = 0;
+							row++;
+							if ( row == rows )
+								return;
+							pixbuf += rowAdvance;
+						}
+					}
 				}
 			}
 		}
 	}
-
-	return 1;
 }
 
 #define JPEG_DECOMPRESS_SIZE        424
@@ -2037,96 +1784,87 @@ typedef char cod1_jpeg_abi_check[
      && offsetof( struct jpeg_memory_mgr,        self_destruct )     == JM_SELF_DESTRUCT
      && sizeof( boolean ) == 1 ) ? 1 : -1 ];
 /* ---- LoadJPG  0x004ED160 ----  VERIFIED */
-int __cdecl LoadJPG( const char *name, _DWORD *a1, _WORD *a2, _WORD *a3, _DWORD *a4, int a5 )
+void __cdecl LoadJPG( const char *name, unsigned int *pixelsOut, unsigned short *widthOut, unsigned short *heightOut, unsigned int *formatOut, int readMode )
 {
   struct jpeg_decompress_struct cinfo;
   struct jpeg_error_mgr         jerr;
 
   void         *fileBuf;
-  void         *scratch;
   JSAMPROW      rowPtr;
-  unsigned int  width, height;
   unsigned int  x;
-  _BYTE        *out;
-  _BYTE        *src;
+  byte        *out;
+  byte        *src;
   int           rowBytes;
-  int           result;
   int           j;
 
-  fileBuf = 0;
-  result  = ri_FS_ReadFile( name, &fileBuf );
-  if ( result >= 0 )
-    R_RememberImageAllocation( fileBuf, R_IMAGE_ALLOCATION_FILE );
+  if ( ( (*(int (__cdecl **)(const char *, void **))&ri.FS_ReadFile)( (name), (&fileBuf) ) ) >= 0 )
+    R_RememberImageAllocation( fileBuf, 0 );
   if ( !fileBuf )
-    return result;
+    return;
 
-  cinfo.err = jpeg_std_error( &jerr );   /* inlined by retail, 0x004ED1C0 */
+  cinfo.err = jpeg_std_error( &jerr );
 
-  jpeg_create_decompress( &cinfo );      /* 0x005164A0 */
-  CoD_jpeg_mem_src( &cinfo, (const unsigned char *)fileBuf );   /* 0x00516430 */
-  jpeg_read_header( &cinfo, TRUE );      /* 0x00516770, `push 1`             */
-  jpeg_start_decompress( &cinfo );       /* 0x005160F0 */
+  jpeg_create_decompress( &cinfo );
+  CoD_jpeg_mem_src( &cinfo, (const unsigned char *)fileBuf );
+  jpeg_read_header( &cinfo, 1 );
+  jpeg_start_decompress( &cinfo );
 
-  width  = cinfo.output_width;
-  height = cinfo.output_height;
-
-  if ( width > 0x8000 || height > 0x8000 )
+  if ( cinfo.output_width > 0x8000 || cinfo.output_height > 0x8000 )
   {
-    ri_Printf( 2, "WARNING: image '%s' is larger than %i on at least one side\n", name, 0x8000 );
+    ri.Printf( 2, "WARNING: image '%s' is larger than %i on at least one side\n", name, 0x8000 );
     if ( cinfo.mem )
       ( *cinfo.mem->self_destruct )( (j_common_ptr)&cinfo );
-    return result;
+    return;
   }
 
   if ( cinfo.output_components != 4 )
   {
-    ri_Printf( 2, "WARNING: jpeg image '%s' is not RGB\n", name );
+    ri.Printf( 2, "WARNING: jpeg image '%s' is not RGB\n", name );
     if ( cinfo.mem )
       ( *cinfo.mem->self_destruct )( (j_common_ptr)&cinfo );
-    return result;
+    return;
   }
 
-  *a2 = (_WORD)width;
-  *a3 = (_WORD)height;
-  *a4 = 6408;
+  *widthOut  = (unsigned short)cinfo.output_width;
+  *heightOut = (unsigned short)cinfo.output_height;
+  *formatOut = 6408;
 
-  if ( !a5 )
+  if ( !readMode )
   {
-    jpeg_destroy( (j_common_ptr)&cinfo );  /* 0x004ED2B1; dimensions only */
-    return result;
+    jpeg_destroy_decompress( &cinfo );
+    return;
   }
 
-  out      = (_BYTE *)R_AllocTempMemory( 4 * width * height );
-  *a1      = (_DWORD)out;
-  rowBytes = 4 * width;
+  out        = (byte *)R_AllocTempMemory( 4 * cinfo.output_width * cinfo.output_height, "LoadJPG" );
+  *pixelsOut = (unsigned int)out;
+  rowBytes   = 4 * cinfo.output_width;
 
-  if ( a5 == 2 && width < height )
+  if ( readMode == 2 && cinfo.output_width < cinfo.output_height )
   {
-    scratch = alloca( rowBytes );
-    while ( cinfo.output_scanline < height )
+    /* sheet load of a tall image: read each row into a scratch line and store
+       it as a column, so the tile comes out rotated to landscape */
+    src = (byte *)_alloca( rowBytes );
+    while ( cinfo.output_scanline < cinfo.output_height )
     {
-      rowPtr = (JSAMPROW)scratch;
+      rowPtr = (JSAMPROW)src;
       jpeg_read_scanlines( &cinfo, &rowPtr, 1 );
 
-      src = (_BYTE *)scratch;
-      for ( x = 0; x < width; ++x )
+      for ( x = 0; x < cinfo.output_width; x++ )
       {
-        out[0] = src[0];
-        out[1] = src[1];
-        out[2] = src[2];
-        out[3] = 0xFF;                    /* 0x004ED350 mov byte[edi+3],0FFh */
-        out   += rowBytes;                /* down one row -- 0x004ED35A     */
-        src   += 4;
+        out[0] = src[4 * x + 0];
+        out[1] = src[4 * x + 1];
+        out[2] = src[4 * x + 2];
+        out[3] = 0xFF;
+        out   += rowBytes;
       }
-      /* back to the top of the image, one texel right.  0x004ED36A-0x004ED37A */
-      out += 4 - (int)width * rowBytes;
+      out += 4 - cinfo.output_width * rowBytes;
     }
-    *a2 = (_WORD)height;                  /* extents swap -- 0x004ED384 */
-    *a3 = (_WORD)width;
+    *widthOut  = (unsigned short)cinfo.output_height;
+    *heightOut = (unsigned short)cinfo.output_width;
   }
   else
   {
-    while ( cinfo.output_scanline < height )
+    while ( cinfo.output_scanline < cinfo.output_height )
     {
       rowPtr = (JSAMPROW)out;
       jpeg_read_scanlines( &cinfo, &rowPtr, 1 );
@@ -2136,109 +1874,9 @@ int __cdecl LoadJPG( const char *name, _DWORD *a1, _WORD *a2, _WORD *a3, _DWORD 
     }
   }
 
-  jpeg_finish_decompress( &cinfo );       /* 0x00516930 */
+  jpeg_finish_decompress( &cinfo );
   if ( cinfo.mem )
-    ( *cinfo.mem->self_destruct )( (j_common_ptr)&cinfo );   /* 0x004ED423 */
-  return result;
-}
-
-/* ---- init_destination  0x004ED450 ----  [HIGH] */
-_DWORD *__cdecl init_destination(int a1)
-{
-  _DWORD *result;
-  int v2;
-
-  result = *(_DWORD **)(a1 + 20);
-  v2 = result[6];
-  *result = result[5];
-  result[1] = v2;
-  return result;
-}
-
-/* ---- empty_output_buffer  0x004ED470 ----  VERIFIED */
-int __cdecl empty_output_buffer( void *cinfo )
-{
-  (void)cinfo;
-  return 1;
-}
-
-/* ---- jpeg_start_compress  0x004ED480 ----  VERIFIED */
-void __cdecl jpeg_start_compress( j_compress_ptr cinfo, boolean write_all_tables )
-{
-  _DWORD *a1 = (_DWORD *)cinfo;
-  char v3;
-
-  if ( a1[4] != 100 )
-  {
-    *(_DWORD *)(*a1 + 20) = 17;
-    *(_DWORD *)(*a1 + 24) = a1[4];
-    (*(void (__cdecl **)(_DWORD *))*a1)(a1);
-  }
-  if ( write_all_tables )
-    jpeg_suppress_tables(cinfo, FALSE);
-  (*(void (__cdecl **)(_DWORD *))(*a1 + 16))(a1);
-  (*(void (__cdecl **)(_DWORD *))(a1[5] + 8))(a1);
-  jinit_compress_master((int)a1);
-  (*(void (__cdecl **)(_DWORD *))a1[76])(a1);
-  v3 = *((_BYTE *)a1 + 168);
-  a1[49] = 0;
-  a1[4] = (v3 != 0) + 101;
-}
-
-/* ---- jpeg_write_scanlines  0x004ED4F0 ----  VERIFIED */
-unsigned int __cdecl jpeg_write_scanlines( j_compress_ptr cinfo, JSAMPARRAY scanlines,
-                                           unsigned int num_lines )
-{
-  unsigned int a1 = num_lines;
-  _DWORD *a2 = (_DWORD *)cinfo;
-  int a3 = (int)scanlines;
-  {
-  int v4;
-  int v5;
-  int v6;
-  int result;
-  int v8; // [esp+4h] [ebp-4h] BYREF
-
-  if ( a2[4] != 101 )
-  {
-    *(_DWORD *)(*a2 + 20) = 17;
-    *(_DWORD *)(*a2 + 24) = a2[4];
-    (*(void (__cdecl **)(_DWORD *))*a2)(a2);
-  }
-  if ( a2[49] >= a2[7] )
-  {
-    *(_DWORD *)(*a2 + 20) = 117;
-    (*(void (__cdecl **)(_DWORD *, int))(*a2 + 4))(a2, -1);
-  }
-  v4 = a2[2];
-  if ( v4 )
-  {
-    *(_DWORD *)(v4 + 4) = a2[49];
-    *(_DWORD *)(a2[2] + 8) = a2[7];
-    (*(void (__cdecl **)(_DWORD *))a2[2])(a2);
-  }
-  v5 = a2[76];
-  if ( *(_BYTE *)(v5 + 12) )
-    (*(void (__cdecl **)(_DWORD *))(v5 + 4))(a2);
-  if ( a1 > a2[7] - a2[49] )
-    a1 = a2[7] - a2[49];
-  v6 = a2[77];
-  v8 = 0;
-  (*(void (__cdecl **)(_DWORD *, int, int *, unsigned int))(v6 + 4))(a2, a3, &v8, a1);
-  result = v8;
-  a2[49] += v8;
-  return (unsigned int)result;
-  }
-}
-
-/* ---- term_destination  0x004ED5B0 ----  [HIGH] */
-int __cdecl term_destination(int a1)
-{
-  int result;
-
-  result = *(_DWORD *)(a1 + 20);
-  hackSize = *(_DWORD *)(result + 24) - *(_DWORD *)(result + 4);
-  return result;
+    ( *cinfo.mem->self_destruct )( (j_common_ptr)&cinfo );
 }
 
 typedef struct {
@@ -2248,6 +1886,102 @@ typedef struct {
 } cod_destination_mgr;
 
 typedef cod_destination_mgr *cod_dest_ptr;
+
+/* ---- init_destination  0x004ED450 ----  [HIGH] */
+unsigned int *__cdecl init_destination(int cinfo)
+{
+  cod_dest_ptr dest;
+  int bufferSize;
+
+  dest = (cod_dest_ptr)((j_compress_ptr)cinfo)->dest;
+  bufferSize = dest->bufferSize;
+  dest->pub.next_output_byte = dest->buffer;
+  dest->pub.free_in_buffer = bufferSize;
+  return (unsigned int *)dest;
+}
+
+/* ---- empty_output_buffer  0x004ED470 ----  VERIFIED */
+boolean __cdecl empty_output_buffer( j_compress_ptr cinfo )
+{
+  (void)cinfo;
+  return TRUE;
+}
+
+/* ---- jpeg_start_compress  0x004ED480 ----  VERIFIED */
+void __cdecl jpeg_start_compress( j_compress_ptr cinfo, boolean write_all_tables )
+{
+  char rawDataIn;
+
+  if ( cinfo->global_state != 100 )                    /* CSTATE_START */
+  {
+    cinfo->err->msg_code = 17;                         /* ERREXIT1(JERR_BAD_STATE) */
+    cinfo->err->msg_parm.i[0] = cinfo->global_state;
+    (*cinfo->err->error_exit)((j_common_ptr)cinfo);
+  }
+  if ( write_all_tables )
+    jpeg_suppress_tables(cinfo, FALSE);
+  (*cinfo->err->reset_error_mgr)((j_common_ptr)cinfo);
+  (*cinfo->dest->init_destination)(cinfo);
+  jinit_compress_master((int)cinfo);
+  (*(void (__cdecl **)(j_compress_ptr))cinfo->master)(cinfo);   /* master->prepare_for_pass */
+  rawDataIn = cinfo->raw_data_in;
+  cinfo->next_scanline = 0;
+  cinfo->global_state = (rawDataIn != 0) + 101;        /* CSTATE_RAW_OK : CSTATE_SCANNING */
+}
+
+/* ---- jpeg_write_scanlines  0x004ED4F0 ----  VERIFIED */
+unsigned int __cdecl jpeg_write_scanlines( j_compress_ptr cinfo, JSAMPARRAY scanlines,
+                                           unsigned int num_lines )
+{
+  unsigned int lineCount = num_lines;
+  {
+  struct jpeg_progress_mgr *progress;
+  int masterMgr;                  /* struct jpeg_comp_master * (jpegint.h, not included here) */
+  int mainMgr;                    /* struct jpeg_c_main_controller * */
+  int result;
+  int rowsWritten; // [esp+4h] [ebp-4h] BYREF
+
+  if ( cinfo->global_state != 101 )                    /* CSTATE_SCANNING */
+  {
+    cinfo->err->msg_code = 17;                         /* ERREXIT1(JERR_BAD_STATE) */
+    cinfo->err->msg_parm.i[0] = cinfo->global_state;
+    (*cinfo->err->error_exit)((j_common_ptr)cinfo);
+  }
+  if ( cinfo->next_scanline >= cinfo->image_height )
+  {
+    cinfo->err->msg_code = 117;                        /* WARNMS(JWRN_TOO_MUCH_DATA) */
+    (*cinfo->err->emit_message)((j_common_ptr)cinfo, -1);
+  }
+  progress = cinfo->progress;
+  if ( progress )
+  {
+    progress->pass_counter = cinfo->next_scanline;
+    cinfo->progress->pass_limit = cinfo->image_height;
+    (*cinfo->progress->progress_monitor)((j_common_ptr)cinfo);
+  }
+  masterMgr = (int)cinfo->master;
+  if ( *(byte *)(masterMgr + 12) )                    /* master->call_pass_startup */
+    (*(void (__cdecl **)(j_compress_ptr))(masterMgr + 4))(cinfo);   /* master->pass_startup */
+  if ( lineCount > cinfo->image_height - cinfo->next_scanline )
+    lineCount = cinfo->image_height - cinfo->next_scanline;
+  mainMgr = (int)cinfo->main;
+  rowsWritten = 0;
+  (*(void (__cdecl **)(j_compress_ptr, JSAMPARRAY, int *, unsigned int))(mainMgr + 4))(cinfo, scanlines, &rowsWritten, lineCount);   /* main->process_data */
+  result = rowsWritten;
+  cinfo->next_scanline += rowsWritten;
+  return (unsigned int)result;
+  }
+}
+
+/* ---- term_destination  0x004ED5B0 ----  [HIGH] */
+int __cdecl term_destination(int cinfo)
+{
+  cod_dest_ptr dest;
+
+  dest = (cod_dest_ptr)((j_compress_ptr)cinfo)->dest;
+  hackSize = dest->bufferSize - dest->pub.free_in_buffer;
+  return (int)dest;
+}
 
 /* ---- jpegDest  0x004ED5D0 ----  VERIFIED */
 void
@@ -2269,40 +2003,21 @@ jpegDest( j_compress_ptr cinfo, unsigned char *buffer, unsigned int bufferSize )
   dest->bufferSize               = bufferSize;
 }
 
-#if 0
-_DWORD *__cdecl jpegDest_raw(int a1, int a2, int a3)
-{
-  _DWORD *result;
-
-  if ( !*(_DWORD *)(a1 + 20) )
-    *(_DWORD *)(a1 + 20) = (**(int (__cdecl ***)(int, _DWORD, int))(a1 + 4))(a1, 0, 28);
-  result = *(_DWORD **)(a1 + 20);
-  result[2] = init_destination;
-  result[3] = empty_output_buffer;
-  result[4] = term_destination;
-  result[5] = a2;
-  result[6] = a3;
-  return result;
-}
-#endif   /* jpegDest_raw */
-
 /* ---- SaveJPG  0x004ED610 ----  [HIGH] */
-int __cdecl SaveJPG(int fileName, int quality, int width, unsigned int height, int flipped, int pixels)
+void __cdecl SaveJPG(int fileName, int quality, int width, unsigned int height, int flipped, int pixels)
 {
   struct jpeg_compress_struct cinfo;
   struct jpeg_error_mgr       jerr;
   unsigned char *buffer;
   unsigned int   bufferSize;
   unsigned int   rowBytes;
-  unsigned int   prevLine;
   JSAMPROW       rowPointer[1];
-  int            result;
 
   cinfo.err = jpeg_std_error( &jerr );
   jpeg_create_compress( &cinfo );
 
   bufferSize = 4 * height * width;
-  buffer = (unsigned char *)ri_Hunk_AllocateTempMemory( bufferSize );
+  buffer = (unsigned char *)( (void *)( (*(int (__cdecl **)(int))&ri.Hunk_AllocateTempMemory)( (int)(bufferSize) ) ) );
   jpegDest( &cinfo, buffer, bufferSize );
 
   cinfo.image_width      = width;
@@ -2311,480 +2026,324 @@ int __cdecl SaveJPG(int fileName, int quality, int width, unsigned int height, i
   cinfo.in_color_space   = JCS_RGB;
 
   jpeg_set_defaults( &cinfo );
-  jpeg_set_quality( &cinfo, quality, TRUE );
-  jpeg_start_compress( &cinfo, TRUE );
+  jpeg_set_quality( &cinfo, quality, 1 );
+  jpeg_start_compress( &cinfo, 1 );
 
   rowBytes = 4 * width;
-  prevLine = 0;
   while ( cinfo.next_scanline < cinfo.image_height )
   {
     if ( flipped )
-      rowPointer[0] = (JSAMPROW)(pixels + rowBytes * (height - prevLine - 1));
+      rowPointer[0] = (JSAMPROW)(pixels + rowBytes * ( cinfo.image_height - 1 - cinfo.next_scanline ));
     else
-      rowPointer[0] = (JSAMPROW)(pixels + rowBytes * prevLine);
+      rowPointer[0] = (JSAMPROW)(pixels + cinfo.next_scanline * rowBytes);
     jpeg_write_scanlines( &cinfo, rowPointer, 1u );
-    prevLine = cinfo.next_scanline;
   }
 
   jpeg_finish_compress( &cinfo );
-  ri_FS_WriteFile( fileName, buffer, hackSize );
-  ri_Hunk_FreeTempMemory( buffer );
+  ri.FS_WriteFile( fileName, buffer, hackSize );
+  ( (*(void (__cdecl **)(void *))&ri.Hunk_FreeTempMemory)( (buffer) ) );
 
-  result = (int)cinfo.mem;
   if ( cinfo.mem )
     (*cinfo.mem->self_destruct)( (j_common_ptr)&cinfo );
-  return result;
 }
 
 /* ---- R_MangleTextureName  0x004ED8E0 ----  VERIFIED */
-char *__cdecl R_MangleTextureName(int a1, int a2, float *a3, const char *a4, float a5)
+/* Encodes the target/flags (and optional colour scale or height scale) into a
+ * synthetic "$tex_"/"$h2n_" image name.  The retail 1.0f comparisons are exact
+ * bit tests (0x3F800000); colour scales are only ever set to exact 1.0f, so
+ * the ordered float compares here are equivalent (the retail __UNORDERED__
+ * terms only diverge for NaN inputs, which never occur). */
+char *__cdecl R_MangleTextureName( int target, int flags, float *colorScale,
+                                   const char *name, float heightScale )
 {
-  char *result;
+	char *result;
 
-  if ( (a2 & 0x40) != 0 )
-  {
-    result = va("$h2n_%s:%x/%x/%g", a4, a1, a2, a5);
-    goto LABEL_12;
-  }
-  if ( !a3 )
-    goto LABEL_4;
-  if ( *((_DWORD *)a3 + 3) == 1065353216 )
-  {
-    if ( (*a3 == a3[1]) | __UNORDERED__(*a3, a3[1]) && (*a3 == a3[2]) | __UNORDERED__(*a3, a3[2]) )
-    {
-      if ( *(_DWORD *)a3 == 1065353216 )
-      {
-LABEL_4:
-        result = va("$tex_%s:%x/%x", a4, a1, a2);
-        goto LABEL_12;
-      }
-      result = va("$tex_%s:%x/%x/%g", a4, a1, a2, *a3);
-    }
-    else
-    {
-      result = va("$tex_%s:%x/%x/%g/%g/%g", a4, a1, a2, *a3, a3[1], a3[2]);
-    }
-  }
-  else
-  {
-    result = va("$tex_%s:%x/%x/%g/%g/%g/%g", a4, a1, a2, *a3, a3[1], a3[2], a3[3]);
-  }
-LABEL_12:
-  if ( strlen(result) >= 0x40 )
-  {
-    ri_Printf(2, "WARNING: mangled name for $texturename + %s is too long\n", a4);
-    return 0;
-  }
-  return result;
+	if ( flags & 0x0040 )
+	{
+		result = va( "$h2n_%s:%x/%x/%g", name, target, flags, heightScale );
+	}
+	else if ( !colorScale )
+	{
+		result = va( "$tex_%s:%x/%x", name, target, flags );
+	}
+	else if ( *(const unsigned int *)&colorScale[3] != 0x3F800000u )
+	{
+		result = va( "$tex_%s:%x/%x/%g/%g/%g/%g", name, target, flags,
+		             colorScale[0], colorScale[1], colorScale[2], colorScale[3] );
+	}
+	else
+	{
+		if ( colorScale[0] == colorScale[1] && colorScale[0] == colorScale[2] )
+		{
+			if ( *(const unsigned int *)&colorScale[0] != 0x3F800000u )
+				result = va( "$tex_%s:%x/%x/%g", name, target, flags, colorScale[0] );
+			else
+				result = va( "$tex_%s:%x/%x", name, target, flags );
+		}
+		else
+		{
+			result = va( "$tex_%s:%x/%x/%g/%g/%g", name, target, flags,
+			             colorScale[0], colorScale[1], colorScale[2] );
+		}
+	}
+
+	if ( strlen( result ) >= 0x40 )
+	{
+		ri.Printf( 2, "WARNING: mangled name for $texturename + %s is too long\n", name );
+		return 0;
+	}
+	return result;
 }
 
 /* ---- R_UnmangleTextureName  0x004ED9F0 ----  VERIFIED */
-int __cdecl R_UnmangleTextureName(
-        char *a1,
-        int *a2,
-        char *a3,
-        char *Str1,
-        int a5,
-        int a6,
-        _DWORD *a7)
+/* Splits a "$tex_<prefix>:<params>" / "$h2n_<prefix>:<params>" instance name:
+ * outName = baseName (extension stripped and <prefix> appended when present),
+ * then the hex target/flags and the colour or height scales from <params>. */
+void __cdecl R_UnmangleTextureName( char *outName, float *colorScale,
+                                    const char *baseName, const char *mangledName,
+                                    int *outTarget, int *outFlags,
+                                    float *outHeightScale )
 {
-  char *v8;
-  int v9;
-  char *v10;
-  int v11;
-  char v12;
-  char v13;
-  char *i;
-  char *v15;
-  int v16;
-  const char *v17;
-  int result;
-  int v19;
-  char *v20;
+	const char *colon;
+	const char *prefix;
+	int         prefixLen;
+	int         nameLen;
+	int         count;
 
-  v8 = strchr(Str1 + 5, 58);
-  v9 = v8 - (Str1 + 5);
-  v20 = v8;
-  if ( v8 == Str1 + 5 )
-  {
-    v10 = a3;
-    v11 = a1 - a3;
-    do
-    {
-      v12 = *v10;
-      v10[v11] = *v10;
-      ++v10;
-    }
-    while ( v12 );
-  }
-  else
-  {
-    v13 = *a3;
-    for ( i = a1; v13; v13 = (i++)[a3 - a1 + 1] )
-    {
-      if ( v13 == 46 )
-        break;
-      *i = v13;
-    }
-    *i = 0;
-    v15 = &a1[strlen(a1) + 1];
-    v16 = v15 - (a1 + 1);
-    Com_Memcpy((int)(v15 - 1), (int *)(Str1 + 5), v9);
-    a1[v9 + v16] = 0;
-    v8 = v20;
-  }
-  v17 = v8 + 1;
-  if ( !strncmp(Str1, "$h2n", 4u) )
-  {
-    result = sscanf(v17, "%x/%x/%g", a5, a6, a7);
-    *a2 = 1065353216;
-    a2[1] = 1065353216;
-    a2[2] = 1065353216;
-    a2[3] = 1065353216;
-  }
-  else
-  {
-    result = sscanf(v17, "%x/%x/%g/%g/%g/%g", a5, a6, a2, a2 + 1, a2 + 2, a2 + 3);
-    if ( result < 3 )
-      *a2 = 1065353216;
-    if ( result < 5 )
-    {
-      v19 = *a2;
-      a2[1] = *a2;
-      a2[2] = v19;
-    }
-    if ( result < 6 )
-    {
-      result = (int)(a2 + 3);
-      a2[3] = 1065353216;
-    }
-    *a7 = 1065353216;
-  }
-  return result;
+	prefix    = mangledName + 5;
+	colon     = strchr( prefix, ':' );
+	prefixLen = colon - prefix;
+	if ( !prefixLen )
+	{
+		strcpy( outName, baseName );
+	}
+	else
+	{
+		Com_StripExtension( baseName, outName );
+		nameLen = strlen( outName );
+		Com_Memcpy( outName + nameLen, prefix, prefixLen );
+		outName[ nameLen + prefixLen ] = 0;
+	}
+
+	colon++;
+	if ( !strncmp( mangledName, "$h2n", 4 ) )
+	{
+		sscanf( colon, "%x/%x/%g", outTarget, outFlags, outHeightScale );
+		colorScale[0] = 1.0f;
+		colorScale[1] = 1.0f;
+		colorScale[2] = 1.0f;
+		colorScale[3] = 1.0f;
+	}
+	else
+	{
+		count = sscanf( colon, "%x/%x/%g/%g/%g/%g", outTarget, outFlags,
+		                &colorScale[0], &colorScale[1], &colorScale[2], &colorScale[3] );
+		if ( count < 3 )
+			colorScale[0] = 1.0f;
+		if ( count < 5 )
+		{
+			colorScale[1] = colorScale[0];
+			colorScale[2] = colorScale[0];
+		}
+		if ( count < 6 )
+			colorScale[3] = 1.0f;
+		*outHeightScale = 1.0f;
+	}
+}
+
+/* ---- R_ImageFistpBias  no-address ----
+ * retail's inlined fld dword / fadd qword 2^-30 / fistp dword: round-to-nearest
+ * under the default control word, the bias breaking x.5 ties upward.  An (int)
+ * cast truncates (__ftol2 under /arch:IA32).  Same pattern as the DLLs'
+ * Q_ftol (game_mp/bg_slidemove.c). */
+static int R_ImageFistpBias( float f )
+{
+	double bias = 9.313225746154785e-10;
+	int    i;
+
+	__asm fld   f
+	__asm fadd  bias
+	__asm fistp i
+
+	return i;
 }
 
 /* ---- R_HeightmapImage  0x004EDB30 ----  VERIFIED */
-int __cdecl R_HeightmapImage(int a1, int a2, int a3, float a4)
+void __cdecl R_HeightmapImage( unsigned char *pixels, int width, int height, float heightScale )
 {
-  int v4;
-  int *v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  double v16;
-  double v17;
-  long double v18;
-  float v20;
-  float v21;
-  int v22;
-  int v23;
-  int v24;
-  float v25;
-  float v26;
-  int *v27;
-  int v28;
-  int v29;
-  int v30;
-  float v31;
-  float v32;
-  float v33;
+	float          invScale;
+	unsigned char *out;
+	int            x, y;
+	int            yUp, yDown;
+	int            xLeft, xRight;
+	int            left, right, up, down, center;
+	float          dx, dy, invLen;
 
-  v4 = a2;
-  v20 = 1.0;
-  if ( a4 > 0.0 )
-    v20 = 1.0 / a4;
-  v5 = (int *)ri_Hunk_AllocateTempMemory(4 * a3 * a2);
-  v6 = 0;
-  v27 = v5;
-  if ( a3 > 0 )
-  {
-    do
-    {
-      v7 = a3;
-      if ( v6 )
-        v7 = v6;
-      v8 = v7 - 1;
-      v9 = v6 + 1;
-      v28 = v6 + 1;
-      v29 = v6 + 1 == a3 ? 0 : v6 + 1;
-      v10 = 0;
-      if ( v4 > 0 )
-      {
-        v11 = v4 * v6;
-        v12 = v4 * v8;
-        v23 = v11;
-        v22 = v4 * v8;
-        v24 = v4 * v29;
-        while ( 1 )
-        {
-          v30 = v10 ? v10 : a3;
-          v13 = 4 * (v11 + v30 - 1);
-          v14 = v11 + v10;
-          v15 = 4 * ((v10 + 1 == a3 ? 0 : v10 + 1) + v11);
-          v16 = (double)(*(unsigned __int8 *)(v15 + a1)
-                       + *(unsigned __int8 *)(a1 + v15 + 2)
-                       + *(unsigned __int8 *)(a1 + v15 + 1)
-                       - *(unsigned __int8 *)(a1 + v13 + 1)
-                       - *(unsigned __int8 *)(a1 + v13 + 2)
-                       - *(unsigned __int8 *)(v13 + a1))
-              * 0.00065359479;
-          v14 *= 4;
-          v17 = (double)(*(unsigned __int8 *)(4 * (v24 + v10) + a1)
-                       + *(unsigned __int8 *)(a1 + 4 * (v24 + v10) + 2)
-                       + *(unsigned __int8 *)(a1 + 4 * (v24 + v10) + 1)
-                       - *(unsigned __int8 *)(a1 + 4 * (v10 + v12) + 1)
-                       - *(unsigned __int8 *)(a1 + 4 * (v10 + v12) + 2)
-                       - *(unsigned __int8 *)(4 * (v10 + v12) + a1))
-              * 0.00065359479;
-          v31 = v17;
-          v25 = v20 * v20;
-          v18 = 1.0 / sqrt(v17 * v31 + v16 * v16 + v25);
-          v21 = v18;
-          v26 = (v18 * v16 + 1.0) * 127.5;
-          v5 = v27;
-          *((_BYTE *)v27 + v14) = (int)(v26 + 9.313225746154785e-10);
-          v32 = (v21 * v31 + 1.0) * 127.5;
-          *((_BYTE *)v27 + v14 + 1) = (int)(v32 + 9.313225746154785e-10);
-          v33 = (v21 * v20 + 1.0) * 127.5;
-          v4 = a2;
-          *((_BYTE *)v27 + v14 + 2) = (int)(v33 + 9.313225746154785e-10);
-          *((_BYTE *)v27 + v14 + 3) = *(_BYTE *)(a1 + v14 + 3);
-          if ( ++v10 >= a2 )
-            break;
-          v12 = v22;
-          v11 = v23;
-        }
-        v9 = v28;
-      }
-      v6 = v9;
-    }
-    while ( v9 < a3 );
-  }
-  Com_Memcpy(a1, v5, 4 * a3 * a2);
-  ri_Hunk_FreeTempMemory(v5);
-  return 0;
+	invScale = 1.0f;
+	if ( heightScale > 0.0f )
+		invScale = 1.0f / heightScale;
+
+	out = (unsigned char *)( (void *)( (*(int (__cdecl **)(int))&ri.Hunk_AllocateTempMemory)( (int)(4 * width * height) ) ) );
+	for ( y = 0; y < height; y++ )
+	{
+		/* neighbours wrap around; the column wrap uses the height (square maps) */
+		yUp   = ( !y ? height : y ) - 1;
+		yDown = ( y + 1 == height ) ? 0 : y + 1;
+		for ( x = 0; x < width; x++ )
+		{
+			xLeft  = ( !x ? height : x ) - 1;
+			xRight = ( x + 1 == height ) ? 0 : x + 1;
+
+			center = 4 * ( y * width + x );
+			left   = 4 * ( y * width + xLeft );
+			right  = 4 * ( y * width + xRight );
+			up     = 4 * ( yUp * width + x );
+			down   = 4 * ( yDown * width + x );
+
+			dx = (float)( ( pixels[right + 0] + pixels[right + 1] + pixels[right + 2] ) - ( pixels[left + 0] + pixels[left + 1] + pixels[left + 2] ) ) * ( 1.0f / 1530.0f );
+			dy = (float)( ( pixels[down + 0] + pixels[down + 1] + pixels[down + 2] ) - ( pixels[up + 0] + pixels[up + 1] + pixels[up + 2] ) ) * ( 1.0f / 1530.0f );
+			invLen = 1.0 / sqrt( dx * dx + dy * dy + invScale * invScale );
+
+			out[center + 0] = (unsigned char)R_ImageFistpBias( ( invLen * dx + 1.0f ) * 127.5f );
+			out[center + 1] = (unsigned char)R_ImageFistpBias( ( (float)(invLen * dy) + 1.0f ) * 127.5f );
+			out[center + 2] = (unsigned char)R_ImageFistpBias( ( invLen * invScale + 1.0f ) * 127.5f );
+			out[center + 3] = pixels[center + 3];
+		}
+	}
+	Com_Memcpy( pixels, out, 4 * width * height );
+	( (*(void (__cdecl **)(void *))&ri.Hunk_FreeTempMemory)( (out) ) );
 }
 
 /* ---- R_FlipImageDiagonally  0x004EDDC0 ----  VERIFIED */
-int __fastcall R_FlipImageDiagonally(int a1, int a2, int a3)
+/* In-place transpose of a square (width == height) RGBA image; swaps (i,j)
+ * with (j,i).  Called as R_FlipImageDiagonally(pixels, height, width). */
+void R_FlipImageDiagonally( unsigned int *pixels, int height, int width )
 {
-  int result;
-  int v4;
-  int *v5;
-  int v6;
-  _DWORD *v7;
-  int *v8;
-  int *v9;
-  int v10;
-  int v11;
-  int *v12;
-  _DWORD *v13;
+	int i, j;
 
-  result = a3;
-  if ( a3 == a2 )
-  {
-    v4 = 1;
-    if ( a3 > 1 )
-    {
-      v5 = (int *)(a1 + 4);
-      v6 = 4 * a3;
-      v7 = (_DWORD *)(4 * a3 + a1);
-      v12 = v5;
-      v13 = v7;
-      do
-      {
-        if ( v4 > 0 )
-        {
-          v8 = v7;
-          v9 = v12;
-          v10 = v4;
-          do
-          {
-            v11 = *v9;
-            *v9 = *v8;
-            *v8++ = v11;
-            v9 = (int *)((char *)v9 + v6);
-            --v10;
-          }
-          while ( v10 );
-          result = a3;
-        }
-        ++v4;
-        v7 = &v13[v6 / 4u];
-        v13 = (_DWORD *)((char *)v13 + v6);
-        ++v12;
-      }
-      while ( v4 < result );
-    }
-  }
-  return result;
+	if ( width == height )
+	{
+		for ( i = 1; i < width; ++i )
+		{
+			for ( j = 0; j < i; ++j )
+			{
+				unsigned int tmp = pixels[ j * width + i ];
+				pixels[ j * width + i ] = pixels[ i * width + j ];
+				pixels[ i * width + j ] = tmp;
+			}
+		}
+	}
 }
 
 /* ---- R_FlipImageHorizontally  0x004EDE40 ----  VERIFIED */
-int __cdecl R_FlipImageHorizontally(int result, int a2, int a3)
+/* Mirror each row left-to-right.  Called as R_FlipImageHorizontally(width,height,pixels). */
+void R_FlipImageHorizontally( int width, int height, unsigned int *pixels )
 {
-  int v3;
-  int v5;
-  _DWORD *v6;
-  int v7;
-  int v8;
+	int i, j;
 
-  if ( a2 > 0 )
-  {
-    v3 = 4 * result;
-    result /= 2;
-    v8 = a2;
-    do
-    {
-      v5 = 0;
-      if ( result > 0 )
-      {
-        v6 = (_DWORD *)(a3 + v3 - 4);
-        do
-        {
-          v7 = *(_DWORD *)(a3 + 4 * v5);
-          *(_DWORD *)(a3 + 4 * v5) = *v6;
-          *v6 = v7;
-          ++v5;
-          --v6;
-        }
-        while ( v5 < result );
-      }
-      a3 += v3;
-      --v8;
-    }
-    while ( v8 );
-  }
-  return result;
+	for ( i = 0; i < height; ++i )
+	{
+		unsigned int *left  = pixels + i * width;
+		unsigned int *right = left + width - 1;
+
+		for ( j = 0; j < width / 2; ++j )
+		{
+			unsigned int tmp = left[j];
+			left[j]   = right[-j];
+			right[-j] = tmp;
+		}
+	}
 }
 
 /* ---- R_FlipImageVertically  0x004EDEA0 ----  VERIFIED */
-int __cdecl R_FlipImageVertically(int result, _DWORD *a2, int a3)
+/* Mirror rows top-to-bottom, column by column.  Called as
+ * R_FlipImageVertically(height,pixels,width). */
+void R_FlipImageVertically( int height, unsigned int *pixels, int width )
 {
-  int v3;
-  int v4;
-  _DWORD *v5;
-  int v6;
-  int v7;
-  int v8;
-  _DWORD *v9;
-  int v10;
-  bool v11; // zf
-  _DWORD *v12;
-  int v13;
-  int v14;
-  int v15;
+	int i, j;
+	int lastRow = ( height - 1 ) * width;
 
-  v3 = a3;
-  v4 = a3 * (result - 1);
-  v14 = v4;
-  if ( a3 > 0 )
-  {
-    v5 = a2;
-    v6 = result / 2;
-    v15 = result / 2;
-    v12 = a2;
-    v13 = a3;
-    do
-    {
-      if ( v6 > 0 )
-      {
-        v7 = 4 * v3;
-        v8 = -4 * v3;
-        v9 = &v5[v4];
-        do
-        {
-          v10 = *v5;
-          *v5 = *v9;
-          *v9 = v10;
-          v5 = (_DWORD *)((char *)v5 + v7);
-          v9 = (_DWORD *)((char *)v9 + v8);
-          --v6;
-        }
-        while ( v6 );
-        v3 = a3;
-        v4 = v14;
-        v6 = v15;
-        v5 = v12;
-      }
-      ++v5;
-      result = v13 - 1;
-      v11 = v13 == 1;
-      v12 = v5;
-      --v13;
-    }
-    while ( !v11 );
-  }
-  return result;
+	for ( i = 0; i < width; ++i )
+	{
+		unsigned int *top    = pixels + i;
+		unsigned int *bottom = top + lastRow;
+
+		for ( j = 0; j < height / 2; ++j )
+		{
+			unsigned int tmp = top[j * width];
+			top[j * width]     = bottom[-j * width];
+			bottom[-j * width] = tmp;
+		}
+	}
 }
 
 /* ---- R_LoadImage  0x004EDF20 ----  VERIFIED */
-char __cdecl R_LoadImage(const char *name, int *a1, unsigned __int16 *a2, unsigned __int16 *a3, int *a4, _DWORD *a5, int a6)
+/* Tries <name>.dds, then <name>.tga, then <name>.jpg (each loader sets the
+ * format out-param on success and stops the chain).  readFlag is passed
+ * through to the loaders (0 = header scan only, 1 = full load, 2 = sheet load).
+ * Returns the low byte of the resulting format (dead EAX). */
+void __cdecl R_LoadImage( const char *name, int *data, unsigned __int16 *width,
+                          unsigned __int16 *height, int *format,
+                          unsigned int *hasMipmaps, int readFlag )
 {
-  const char *v8;
-  int v9;
-  signed int v10;
-  char *v11;
-  char *v12;
-  char *v13;
-  char *v15;
-  char v16[68]; // [esp+18h] [ebp-4Ch] BYREF
-  unsigned int v17;
-  unsigned int retaddr;
-  char *v19;
+	char filename[64];
+	int  len;
+	int  result = 0;
 
-  v17 = retaddr ^ _security_cookie;
-  v8 = name;
-  *a1 = 0;
-  *a2 = 0;
-  *a3 = 0;
-  *a4 = 0;
-  *a5 = 0;
-  v10 = strlen(name);
-  if ( v10 >= 5 )
-  {
-    if ( v10 >= 64 )
-      ri_Error(1, "\x15" "image name '%s' is longer than %i characters\n", v8, 63);
-    if ( v8[v10 - 4] == 46 )
-      v10 -= 4;
-    if ( v10 >= 60 )
-      ri_Error(1, "\x15" "image name '%s' with its extension is longer than %i characters\n", v8, 63);
-    qmemcpy(v16, v8, v10);
-    v15 = &v16[v10 + 2];
-    *v15 = 100;
-    v16[v10] = 46;
-    v16[v10 + 4] = 0;
-    v11 = &v16[v10 + 1];
-    v12 = &v16[v10 + 3];
-    *v12 = 115;
-    v19 = v12;
-    *v11 = 100;
-    LoadDDS(a4, v16, a1, a2, a3, a5, a6);
-    v9 = *a4;
-    if ( *a4 )
-      goto LABEL_16;
-    v13 = v15;
-    *a5 = 1;
-    *v19 = 97;
-    *v11 = 116;
-    *v13 = 103;
-    LoadTGA((int)v16, a1, a2, a3, a4, a6);
-    v9 = *a4;
-    if ( *a4 || (*v19 = 103, *v11 = 106, *v13 = 112, LoadJPG(v16, a1, a2, a3, a4, a6), (v9 = *a4) != 0) )
-    {
-LABEL_16:
-      if ( !*a1 )
-        ++tr_delayedImageCount;
-    }
-  }
-  return v9;
+	*data       = 0;
+	*width      = 0;
+	*height     = 0;
+	*format     = 0;
+	*hasMipmaps = 0;
+
+	len = strlen( name );
+	if ( len < 5 )
+		return;
+
+	if ( len >= 64 )
+		ri.Error( 1, "\x15" "image name '%s' is longer than %i characters\n", name, 63 );
+	if ( name[len - 4] == '.' )
+		len -= 4;                                 
+	if ( len >= 60 )
+		ri.Error( 1, "\x15" "image name '%s' with its extension is longer than %i characters\n", name, 63 );
+
+	memcpy( filename, name, len );
+	filename[len]     = '.';
+	
+	*( filename + len + 4 ) = 0;
+
+	
+	filename[len + 1] = 'd';
+	filename[len + 2] = 'd';
+	filename[len + 3] = 's';
+	LoadDDS( filename, data, width, height, format, hasMipmaps, readFlag );
+	result = *format;
+
+	if ( !*format )
+	{
+		
+		*hasMipmaps = 1;
+		filename[len + 1] = 't';
+		filename[len + 2] = 'g';
+		filename[len + 3] = 'a';
+		LoadTGA( filename, data, width, height, format, readFlag );
+		result = *format;
+
+		if ( !*format )
+		{
+			
+			filename[len + 1] = 'j';
+			filename[len + 2] = 'p';
+			filename[len + 3] = 'g';
+			LoadJPG( filename, data, width, height, format, readFlag );
+			result = *format;
+		}
+	}
+
+	if ( *format && !*data )    
+		++tr_delayedImageCount;
+
+	return;
 }
 
 /* ---- R_LoadCubeMapImage  0x004EE0C0 ----  VERIFIED */
@@ -2793,7 +2352,7 @@ int __cdecl R_LoadCubeMapImage( const char *name, int flags, int imageTrack,
 {
   const char    *suffix[6];
   unsigned char *faces[6];
-  char           filename[68];
+  char           filename[64];
   image_t       *image;
   unsigned __int16 loadedWidth, loadedHeight;
   int   loadedFormat, loadedSpare;
@@ -2814,7 +2373,7 @@ int __cdecl R_LoadCubeMapImage( const char *name, int flags, int imageTrack,
 
   if ( name && Q_stricmpn( name, "$renormalize", 99999 ) == 0 )
   {
-    /* ---- the procedural normalisation cube map (0x004EE137) ---- */
+    
     int   axis[6][3];
     float sign[6][3];
     float dir[3];
@@ -2835,15 +2394,15 @@ int __cdecl R_LoadCubeMapImage( const char *name, int flags, int imageTrack,
     sign[4][0] =  1.0f; sign[4][1] =  1.0f; sign[4][2] = -1.0f;
     sign[5][0] = -1.0f; sign[5][1] = -1.0f; sign[5][2] = -1.0f;
 
-    flags &= 0xFFFFFFF8;                          /* 0x004EE16D */
+    flags &= 0xFFFFFFF8;                          
     width  = 64;
     height = 64;
 
     for ( face = 0; face < 6; face++ )
     {
-      out = (unsigned char *)ri_Hunk_AllocateTempMemory( 0x4000 );
+      out = (unsigned char *)( (void *)( (*(int (__cdecl **)(int))&ri.Hunk_AllocateTempMemory)( (int)(0x4000) ) ) );
       if ( out )
-        R_RememberImageAllocation( out, R_IMAGE_ALLOCATION_TEMP_MEMORY );
+        R_RememberImageAllocation( out, 1 );
       faces[face] = out;
 
       dir[ axis[face][0] ] = sign[face][0];
@@ -2858,12 +2417,11 @@ int __cdecl R_LoadCubeMapImage( const char *name, int flags, int imageTrack,
 
           VectorNormalize2( dir, normalized );
 
-          out[0] = (unsigned char)(int)( ( normalized[0] + 1.0 ) * 127.5
-                                         + 9.3132257461547852e-10 );
-          out[1] = (unsigned char)(int)( ( normalized[1] + 1.0 ) * 127.5
-                                         + 9.3132257461547852e-10 );
-          out[2] = (unsigned char)(int)( ( normalized[2] + 1.0 ) * 127.5
-                                         + 9.3132257461547852e-10 );
+          
+
+          out[0] = (unsigned char)R_ImageFistpBias( (float)( ( normalized[0] + 1.0f ) * 127.5f ) );
+          out[1] = (unsigned char)R_ImageFistpBias( (float)( ( normalized[1] + 1.0f ) * 127.5f ) );
+          out[2] = (unsigned char)R_ImageFistpBias( (float)( ( normalized[2] + 1.0f ) * 127.5f ) );
           out[3] = 0xFF;
           out += 4;
         }
@@ -2872,23 +2430,23 @@ int __cdecl R_LoadCubeMapImage( const char *name, int flags, int imageTrack,
   }
   else
   {
-    /* ---- six face files (0x004EE4A3) ---- */
+    
     len = strlen( name );
     if ( len + 7 >= 64 )
     {
-      ri_Printf( 2, "Cube map name will exceed max qpath\n" );
+      ri.Printf( 2, "Cube map name will exceed max qpath\n" );
       return 0;
     }
 
     strcpy( filename, name );
-    strcat( filename, "_**.tga" );                /* 0x0054BAE8, 8 bytes */
+    strcat( filename, "_**.tga" );                
 
     for ( face = 0; face < 6; face++ )
     {
       strcpy( filename + len + 1, suffix[face] );
 
       R_LoadImage( filename, (int *)&faces[face], &loadedWidth, &loadedHeight,
-                   &loadedFormat, (_DWORD *)&loadedSpare, 1 );
+                   &loadedFormat, (unsigned int *)&loadedSpare, 1 );
 
       if ( !faces[face] )
         return 0;
@@ -2900,7 +2458,7 @@ int __cdecl R_LoadCubeMapImage( const char *name, int flags, int imageTrack,
         format = loadedFormat;
         if ( loadedWidth != loadedHeight )
         {
-          ri_Printf( 2, "Cube map face images should be square ('%s')\n", filename );
+          ri.Printf( 2, "Cube map face images should be square ('%s')\n", filename );
           return 0;
         }
       }
@@ -2908,26 +2466,26 @@ int __cdecl R_LoadCubeMapImage( const char *name, int flags, int imageTrack,
       {
         if ( width != loadedWidth || height != loadedHeight )
         {
-          ri_Printf( 2, "Cube map face images are not all the same size ('%s')\n", filename );
+          ri.Printf( 2, "Cube map face images are not all the same size ('%s')\n", filename );
           return 0;
         }
         if ( format != loadedFormat )
         {
-          ri_Printf( 2, "Cube map face images are not all the same format ('%s')\n", filename );
+          ri.Printf( 2, "Cube map face images are not all the same format ('%s')\n", filename );
           return 0;
         }
       }
     }
 
-    /* 0x004EE5C7.  Asymmetric on purpose -- face 1 takes three. */
-    R_FlipImageDiagonally( (int)faces[0], height, width );
-    R_FlipImageDiagonally( (int)faces[1], height, width );
-    R_FlipImageHorizontally( width, height, (int)faces[1] );
-    R_FlipImageVertically( height, (_DWORD *)faces[1], width );
-    R_FlipImageVertically( height, (_DWORD *)faces[2], width );
-    R_FlipImageHorizontally( width, height, (int)faces[3] );
-    R_FlipImageDiagonally( (int)faces[4], height, width );
-    R_FlipImageDiagonally( (int)faces[5], height, width );
+    
+    R_FlipImageDiagonally( (unsigned int *)faces[0], height, width );
+    R_FlipImageDiagonally( (unsigned int *)faces[1], height, width );
+    R_FlipImageHorizontally( width, height, (unsigned int *)faces[1] );
+    R_FlipImageVertically( height, (unsigned int *)faces[1], width );
+    R_FlipImageVertically( height, (unsigned int *)faces[2], width );
+    R_FlipImageHorizontally( width, height, (unsigned int *)faces[3] );
+    R_FlipImageDiagonally( (unsigned int *)faces[4], height, width );
+    R_FlipImageDiagonally( (unsigned int *)faces[5], height, width );
   }
 
   image = R_AllocImage( name, 0x8513u, width, height, flags | 0x30, imageTrack );
@@ -2937,7 +2495,7 @@ int __cdecl R_LoadCubeMapImage( const char *name, int flags, int imageTrack,
     if ( !R_CreateImageInternal( image, colorScale, faces[i],
                                  0x8515u + i, 0x1908u ) )
     {
-      R_FreeImage( image );                       /* inlined at 0x004EE70F */
+      R_FreeImage( image );                       
       return 0;
     }
   }
@@ -2948,382 +2506,323 @@ int __cdecl R_LoadCubeMapImage( const char *name, int flags, int imageTrack,
 /* ---- R_FindExistingImage  0x004EE770 ----  VERIFIED */
 int __cdecl R_FindExistingImage( char *name, int target, int flags, int trackType )
 {
-    int  image;
-    int  diff;
+	image_t *image = imageHashTable[ tr_image_generateHashValue( name ) ];
+	int      diff;
 
-    image = hashtable[ tr_image_generateHashValue( name ) ];
-    while ( image )
-    {
-        if ( name && image && !Q_stricmpn( name, (const char *)image, 99999 ) )
-            break;
-        image = *(_DWORD *)( image + 116 );   /* +0x74, next in bucket */
-    }
-    if ( !image )
-        return 0;
+	while ( image )
+	{
+		if ( name && image && !Q_stricmpn( name, image->imgName, 99999 ) )
+			break;
+		image = image->hashNext;
+	}
+	if ( !image )
+		return 0;
 
-    diff = *(_DWORD *)( image + 100 ) ^ flags;   /* +0x64 */
-    if ( diff
-      && strcmp( name, "*white" )
-      && strcmp( name, "*gray" ) )
-    {
-        if ( diff & 1 )
-            ri_Printf( 1, "WARNING: reused image %s with mixed mipmap allowance\n", name );
-        if ( diff & 2 )
-            ri_Printf( 1, "WARNING: reused image %s with mixed picmip allowance\n", name );
-        if ( diff & 4 )
-            ri_Printf( 1, "WARNING: reused image %s with mixed picmip type (model / world)\n", name );
-        if ( diff & 0x30 )
-            ri_Printf( 0, "WARNING: reused image %s with mixed clamp modes\n", name );
-    }
+	diff = (int)image->flags ^ flags;
+	if ( diff
+	  && strcmp( name, "*white" )
+	  && strcmp( name, "*gray" ) )
+	{
+		if ( diff & IMAGE_FLAG_MIPMAP )
+			ri.Printf( 1, "WARNING: reused image %s with mixed mipmap allowance\n", name );
+		if ( diff & IMAGE_FLAG_ALLOW_PICMIP )
+			ri.Printf( 1, "WARNING: reused image %s with mixed picmip allowance\n", name );
+		if ( diff & IMAGE_FLAG_USE_PICMIP2 )
+			ri.Printf( 1, "WARNING: reused image %s with mixed picmip type (model / world)\n", name );
+		if ( diff & ( IMAGE_FLAG_CLAMP_S | IMAGE_FLAG_CLAMP_T ) )
+			ri.Printf( 0, "WARNING: reused image %s with mixed clamp modes\n", name );
+	}
 
-    if ( *(_DWORD *)( image + 84 ) != target )   /* +0x54, GL target */
-        ri_Printf( 2, "ERROR: image '%s' cannot be used in a cube map and in a normal texture", name );
+	if ( image->target != (unsigned int)target )
+		ri.Printf( 2, "ERROR: image '%s' cannot be used in a cube map and in a normal texture", name );
 
-    if ( *(_DWORD *)( image + 80 ) != trackType )   /* +0x50 */
-        ri_Printf( 0, "WARNING: image '%s' changed type from %s to %s.\n", name,
-                   r_imageTrackNames[ *(_DWORD *)( image + 80 ) ],
-                   r_imageTrackNames[ trackType ] );
-    *(_DWORD *)( image + 80 ) = trackType;
+	if ( image->imageTrack != trackType )
+		ri.Printf( 0, "WARNING: image '%s' changed type from %s to %s.\n", name,
+		           r_imageTrackNames[ image->imageTrack ],
+		           r_imageTrackNames[ trackType ] );
+	image->imageTrack = trackType;
 
-    return image;
+	return (int)image;
 }
 
 /* ---- R_LoadSingleDelayedImage  0x004EE8A0 ----  VERIFIED */
-int __cdecl R_LoadSingleDelayedImage(int a1)
+/* Reloads a delayed image now, verifies it still matches the record's cached
+ * dimensions/format/mipmap state, then uploads it.  If the upload fails the
+ * record is replaced with a copy of the default image (keeping its name and
+ * hash link).  The error-message argument order is kept exactly as retail. */
+void __cdecl R_LoadSingleDelayedImage( int imageAddr )
 {
-  int v1;
-  int v2;
-  unsigned __int16 v3;
-  int v4;
-  int v5;
-  const char *v6;
-  const char *v7;
-  int v8;
-  int v10; // [esp+10h] [ebp-54h] BYREF
-  int v11; // [esp+14h] [ebp-50h] BYREF
-  int v12; // [esp+18h] [ebp-4Ch] BYREF
-  int v13; // [esp+1Ch] [ebp-48h] BYREF
-  char v14[64]; // [esp+20h] [ebp-44h] BYREF
-  unsigned int v15;
-  unsigned int retaddr;
+	image_t        *image = (image_t *)imageAddr;
+	int             loadedData;
+	unsigned short  loadedWidth;
+	unsigned short  loadedHeight;
+	int             loadedFormat;
+	int             hasMipmaps;
+	char            savedName[64];
+	image_t        *savedHashNext;
 
-  v1 = a1;
-  v2 = *(_DWORD *)(a1 + 100);
-  v15 = retaddr ^ _security_cookie;
-  *(_DWORD *)(a1 + 100) = v2 & 0xFFFFFF7F;
-  *(_DWORD *)(v1 + 104) = 0;
-  *(_WORD *)(v1 + 108) = 0;
-  *(_WORD *)(v1 + 110) = 0;
-  *(_BYTE *)(v1 + 112) = 0;
-  --tr_delayedImageCount;
-  v12 = 0;
-  v11 = 0;
-  v10 = 0;
-  a1 = 0;
-  R_LoadImage((const char *)v1, &v12, (unsigned __int16 *)&v11, (unsigned __int16 *)&v10, &a1, &v13, 1);
-  v3 = v11;
-  v4 = v13;
-  if ( (_WORD)v11 != *(_WORD *)(v1 + 64)
-    || (_WORD)v10 != *(_WORD *)(v1 + 66)
-    || (v5 = a1, a1 != *(_DWORD *)(v1 + 96))
-    || a1 != 6408 && !v13 && (*(_BYTE *)(v1 + 100) & 1) != 0 )
-  {
-    R_FreeImageAllocations();
-    v6 = "with";
-    if ( !v4 )
-      v6 = "without";
-    v7 = "with";
-    if ( (*(_BYTE *)(v1 + 100) & 1) == 0 )
-      v7 = "without";
-    ri_Error(
-      1,
-      "\x15" "delayed-load image '%s' changed from %ix%i type 0x%04x %s mipmaps to %ix%i type 0x%04x %s mipmaps\n",
-      v1,
-      v3,
-      (unsigned __int16)v10,
-      a1,
-      v7,
-      *(unsigned __int16 *)(v1 + 64),
-      *(unsigned __int16 *)(v1 + 66),
-      *(_DWORD *)(v1 + 96),
-      v6);
-    v5 = a1;
-  }
-  if ( !R_CreateImageInternal(v1, 0, (unsigned __int8 *)v12, 0xDE1u, v5) )
-  {
-    strcpy(v14, (const char *)v1);
-    v8 = glState_currentTextures[glState_currentTmu];
-    a1 = *(_DWORD *)(v1 + 116);
-    if ( v8 == *(_DWORD *)(v1 + 88) )
-    {
-      glBindTexture(*(_DWORD *)(v1 + 84), 0);
-      glState_currentTextures[glState_currentTmu] = 0;
-    }
-    qglDeleteTextures(1, v1 + 88);
-    qmemcpy((void *)v1, (const void *)tr_defaultImage, 0x78u);
-    strcpy((char *)v1, v14);
-    *(_DWORD *)(v1 + 116) = a1;
-  }
-  R_FreeImageAllocations();
-  return 0;
+	image->flags &= ~0x0080;
+	image->link.textureSheet   = 0;
+	image->state.sheet.x       = 0;
+	image->state.sheet.y       = 0;
+	image->state.sheet.rotated = 0;
+	--tr_delayedImageCount;
+	loadedData = 0;
+	loadedWidth  = 0;
+	loadedHeight = 0;
+	loadedFormat = 0;
+
+	R_LoadImage( image->imgName, &loadedData, &loadedWidth, &loadedHeight,
+	             &loadedFormat, (unsigned int *)&hasMipmaps, 1 );
+
+	if ( loadedWidth  != image->width
+	  || loadedHeight != image->height
+	  || loadedFormat != (int)image->internalFormat
+	  || ( loadedFormat != 6408 && !hasMipmaps && ( image->flags & 0x0001 ) ) )
+	{
+		R_FreeImageAllocations();
+		ri.Error(
+			1,
+			"\x15" "delayed-load image '%s' changed from %ix%i type 0x%04x %s mipmaps to %ix%i type 0x%04x %s mipmaps\n",
+			image->imgName,
+			loadedWidth,
+			loadedHeight,
+			loadedFormat,
+			( image->flags & 0x0001 ) ? "with" : "without",
+			image->width,
+			image->height,
+			image->internalFormat,
+			hasMipmaps ? "with" : "without" );
+	}
+
+	if ( !R_CreateImageInternal( image, 0, (unsigned char *)loadedData, 0xDE1u, loadedFormat ) )
+	{
+		strcpy( savedName, image->imgName );
+		savedHashNext = image->hashNext;
+		R_DeleteImage( image );
+		memcpy( image, (const void *)tr_defaultImage, 0x78u );
+		strcpy( image->imgName, savedName );
+		image->hashNext = savedHashNext;
+	}
+	R_FreeImageAllocations();
 }
 
 /* ---- R_UpdateDelayLoadImage  0x004EEA60 ----  VERIFIED */
-char __cdecl R_UpdateDelayLoadImage(int a1, int a2, int a3)
+/* For a still-delayed image: force-load it now, or record the requesting
+ * shader as its merge target (loading immediately if a second, non-mergable
+ * shader wants it), then fold its delay group into the current one. */
+void __cdecl R_UpdateDelayLoadImage( int imageAddr, int shader, int forceLoad )
 {
-  int v3;
-  int v4;
-  int v5;
-  int i;
-  int v7;
+	image_t         *image  = (image_t *)imageAddr;
+	struct shader_s *existingShader;
+	int              group;
+	int              i;
 
-  v3 = a1;
-  LOBYTE(a1) = *(_BYTE *)(a1 + 100);
-  if ( (char)a1 < 0 )
-  {
-    LOBYTE(a1) = a3;
-    if ( a3 )
-    {
-LABEL_3:
-      LOBYTE(a1) = R_LoadSingleDelayedImage(v3);
-      return a1;
-    }
-    v4 = *(_DWORD *)(v3 + 104);
-    if ( a2 == v4 )
-      return a1;
-    if ( v4 )
-    {
-      a1 = CompareMergableShaders(a2, v4, v3, v3);
-      if ( a1 )
-        goto LABEL_3;
-    }
-    else
-    {
-      *(_DWORD *)(v3 + 104) = a2;
-    }
-    v5 = *(_DWORD *)(v3 + 108);
-    if ( v5 != tr_delayedImageGroup )
-    {
-      LOBYTE(a1) = tr_numImages;
-      for ( i = 0; i < tr_numImages; ++i )
-      {
-        v7 = dword_16C9840[i];
-        if ( v7 )
-        {
-          if ( *(char *)(v7 + 100) < 0 && *(_DWORD *)(v7 + 108) == v5 )
-            *(_DWORD *)(v7 + 108) = tr_delayedImageGroup;
-        }
-        LOBYTE(a1) = tr_numImages;
-      }
-    }
-  }
-  return a1;
+	if ( !( image->flags & 0x80 ) )             /* not delay-loaded */
+		return;
+
+	if ( forceLoad )
+	{
+		R_LoadSingleDelayedImage( imageAddr );
+		return;
+	}
+
+	existingShader = image->link.delayedShader;
+	if ( shader == (int)existingShader )
+		return;
+
+	if ( !existingShader )
+		image->link.delayedShader = (struct shader_s *)shader;
+	else if ( CompareMergableShaders( shader, (int)existingShader, imageAddr, imageAddr ) )
+	{
+		R_LoadSingleDelayedImage( imageAddr );
+		return;
+	}
+
+	group = image->state.delay.group;
+	if ( group != (*(int *)(((char *)(void *)&tr_registered) + 0x0128)) )
+	{
+		for ( i = 0; i < tr_numImages; ++i )
+		{
+			image_t *other = ( (image_t **)(void *)tr_imageSlots )[i];
+
+			if ( other
+			  && ( other->flags & 0x80 )
+			  && other->state.delay.group == group )
+				other->state.delay.group = (*(int *)(((char *)(void *)&tr_registered) + 0x0128));
+		}
+	}
 }
 
 /* ---- R_FindImageFile  0x004EEAE0 ----  VERIFIED */
-int __cdecl R_FindImageFile(char *a1, int a2, int a3, int a4, int a5, float a6)
+int __cdecl R_FindImageFile( char *name, int target, int flags, int trackType,
+                             const float *colorScale, float heightScale )
 {
-  char *v6;
-  cvar_t *integer;
-  int ExistingImage;
-  int v9;
-  int v11;
-  int v12;  /* flags; int, not char */
-  unsigned __int8 *v13;
-  int v15;
-  int v17;
-  int CubeMapImage;
-  unsigned __int16 v19; // [esp+14h] [ebp-14h] BYREF
-  unsigned __int16 v20; // [esp+18h] [ebp-10h] BYREF
-  unsigned __int8 *v21; // [esp+1Ch] [ebp-Ch] BYREF
-  int v22; // [esp+20h] [ebp-8h] BYREF
-  unsigned int v23; // [esp+24h] [ebp-4h] BYREF
+	int             image;
+	unsigned short  width;
+	unsigned short  height;
+	unsigned char  *pic;
+	unsigned int    format;
+	int             hasMipmaps;
 
-  v6 = a1;
-  if ( !a1 )
-    return 0;
-  integer = (cvar_t *)r_optimize->integer;
-  if ( !integer || (integer = r_optimizeTextures, !r_optimizeTextures->integer) )
-    a3 &= ~0x80u;
-  if ( a4 == 10 )
-  {
-    v6 = R_MangleTextureName(a2, a3, (float *)a5, a1, a6);
-    if ( !v6 )
-      return 0;
-  }
-  ExistingImage = R_FindExistingImage(v6, a2, a3, a4);
-  v9 = ExistingImage;
-  if ( ExistingImage )
-  {
-    if ( *(char *)(ExistingImage + 100) < 0 )
-    {
-      R_UpdateDelayLoadImage(ExistingImage, 0, (a3 & 0x80) == 0);
-      if ( *(char *)(v9 + 100) < 0 )
-      {
-        *(_DWORD *)(v9 + 112) += tr_delayedImageGroupTriCount;
-        return v9;
-      }
-      return v9;
-    }
-    if ( *(_DWORD *)(ExistingImage + 104) )
-    {
-      ri_Error(1, "\x15" "tried to load image '%s', which has been merged with other textures, after the map finished loading\n", v6);
-      return 0;
-    }
-    return v9;
-  }
-  if ( a4 == 10 )
-  {
-    v11 = R_AllocImage(v6, a2, 0, 0, a3, 10);
-    R_FreeImageAllocations();
-    return v11;
-  }
-  if ( a2 != 3553 )
-  {
-    if ( a2 == 34067 )
-    {
-      CubeMapImage = R_LoadCubeMapImage(v6, a3, a4, (float *)a5);
-      R_FreeImageAllocations();
-      return CubeMapImage;
-    }
-    ri_Printf(2, "Unknown texture target 0x%04x\n", a2);
-    goto LABEL_41;
-  }
-  v12 = a3;
-  if ( (char)a3 < 0
-    && ((a3 & 0x40) != 0
-     || a5
-     && (*(_DWORD *)a5 != 1065353216
-      || *(_DWORD *)(a5 + 4) != 1065353216
-      || *(_DWORD *)(a5 + 8) != 1065353216
-      || *(_DWORD *)(a5 + 12) != 1065353216)) )
-  {
-    v12 = a3 & ~0x80;
-  }
-  R_LoadImage(v6, (int *)&v21, &v20, &v19, (int *)&v23, &v22, (v12 & 0x80) == 0);
-  if ( !v22 && (v12 & 1) != 0 )
-  {
-    ri_Printf(2, "image '%s' requested mipmaps, but they aren't available\n", v6);
-LABEL_41:
-    v9 = 0;
-    R_FreeImageAllocations();
-    return v9;
-  }
-  if ( !v23 )
-    goto LABEL_41;
-  if ( (v12 & 0x40) == 0 )
-  {
-    v17 = R_CreateImage(v6, v12, a4, v21, v20, v19, v23, (float *)a5);
-    R_FreeImageAllocations();
-    return v17;
-  }
-  if ( v23 != 6408 )
-  {
-    if ( v23 > 0x83EF && v23 <= 0x83F3 )
-      ri_Printf(2, "image '%s': heightToNormal not valid for DDS textures\n", v6);
-    goto LABEL_41;
-  }
-  v13 = v21;
-  if ( ( v12 & 0x80 ) == 0 )            /* 0x004EECA5 `test bl, bl / js`  */
-    R_HeightmapImage((int)v21, v20, v19, a6);
-  v15 = R_CreateImage(v6, v12, a4, v13, v20, v19, 6408, (float *)a5);
-  R_FreeImageAllocations();
-  return v15;
+	if ( !name )
+		return 0;
+
+	if ( !r_optimize->integer || !r_optimizeTextures->integer )
+		flags &= ~0x0080;
+
+	if ( trackType == 10 )
+	{
+		name = R_MangleTextureName( target, flags, (float *)colorScale, name, heightScale );
+		if ( !name )
+			return 0;
+	}
+
+	image = R_FindExistingImage( name, target, flags, trackType );
+	if ( image )
+	{
+		/* flag 0x80 (delay-loaded) is bit 7 of the low byte: retail tests its sign */
+		if ( (signed char)( (image_t *)image )->flags >> 7 )
+		{
+			R_UpdateDelayLoadImage( image, 0, ( flags & 0x0080 ) == 0 );
+			if ( (signed char)( (image_t *)image )->flags >> 7 )
+				( (image_t *)image )->state.delay.groupTriCount += (*(int *)(((char *)(void *)&tr_registered) + 0x012C));
+		}
+		else if ( ( (image_t *)image )->link.delayedShader )
+		{
+			ri.Error( 1, "\x15" "tried to load image '%s', which has been merged with other textures, after the map finished loading\n", name );
+			return 0;
+		}
+		return image;
+	}
+
+	if ( trackType == 10 )
+	{
+		image = (int)R_AllocImage( name, target, 0, 0, flags, 10 );
+	}
+	else if ( target == 3553 )
+	{
+		if ( ( flags & 0x0080 )
+		  && ( ( flags & 0x0040 )
+		    || ( colorScale
+		      && ( colorScale[0] != 1.0f || colorScale[1] != 1.0f
+		        || colorScale[2] != 1.0f || colorScale[3] != 1.0f ) ) ) )
+		{
+			flags &= ~0x0080;
+		}
+
+		R_LoadImage( name, (int *)&pic, &width, &height, (int *)&format, (unsigned int *)&hasMipmaps,
+		             ( flags & 0x0080 ) == 0 );
+
+		if ( !hasMipmaps && ( flags & 0x0001 ) )
+		{
+			ri.Printf( 2, "image '%s' requested mipmaps, but they aren't available\n", name );
+			image = 0;
+		}
+		else if ( !format )
+		{
+			image = 0;
+		}
+		else if ( flags & 0x0040 )
+		{
+			switch ( format )
+			{
+			case 0x83F0:
+			case 0x83F1:
+			case 0x83F2:
+			case 0x83F3:
+				ri.Printf( 2, "image '%s': heightToNormal not valid for DDS textures\n", name );
+				image = 0;
+				break;
+			case 6408:
+				if ( !( flags & 0x0080 ) )
+					R_HeightmapImage( pic, width, height, heightScale );
+				image = R_CreateImage( name, flags, trackType, pic, width, height, 6408, (float *)colorScale );
+				break;
+			default:
+				image = 0;
+				break;
+			}
+		}
+		else
+		{
+			image = R_CreateImage( name, flags, trackType, pic, width, height, format, (float *)colorScale );
+		}
+	}
+	else if ( target == 34067 )
+	{
+		image = R_LoadCubeMapImage( name, flags, trackType, colorScale );
+	}
+	else
+	{
+		ri.Printf( 2, "Unknown texture target 0x%04x\n", target );
+		image = 0;
+	}
+	R_FreeImageAllocations();
+	return image;
 }
 
 /* ---- R_FindImageInstance  0x004EED80 ----  VERIFIED */
-int __cdecl R_FindImageInstance(int a1, char *a2, int a3, char *Str1, int a5)
+/* Decodes a mangled "$tex_"/"$h2n_" instance name back into a base name plus
+ * target/flags/colour-scale/height-scale, decides whether the upload may be
+ * deferred, then resolves it through R_FindImageFile.  (The retail 1.0f tests
+ * are exact bit compares; only NaN colour scales would diverge.) */
+int __cdecl R_FindImageInstance( int disableDelay, char *baseName, int trackType, char *mangledName, int shader )
 {
-  float *v5;
-  int v6;
-  int result;
-  int v8;
-  int v9; // [esp+4h] [ebp-68h] BYREF
-  float v10; // [esp+8h] [ebp-64h] BYREF
-  int v11; // [esp+Ch] [ebp-60h] BYREF
-  float v12[4]; // [esp+10h] [ebp-5Ch] BYREF -- var_5C..var_50, stride 4
-  char v16[68]; // [esp+20h] [ebp-4Ch] BYREF
-  unsigned int v17;
-  unsigned int retaddr;
+	float  colorScale[4];
+	float  heightScale;
+	int    target;
+	int    flags;
+	char   name[64];
+	float *colorScalePtr;
+	int    result;
 
-  v17 = retaddr ^ _security_cookie;
-  R_UnmangleTextureName(v16, (int *)v12, a2, Str1, (int)&v11, (int)&v9, &v10);
-  if ( (v12[0] == 1.0) | __UNORDERED__(v12[0], 1.0)
-    && (v12[1] == 1.0) | __UNORDERED__(v12[1], 1.0)
-    && (v12[2] == 1.0) | __UNORDERED__(v12[2], 1.0)
-    && (v12[3] == 1.0) | __UNORDERED__(v12[3], 1.0) )
-  {
-    v5 = 0;
-  }
-  else
-  {
-    v5 = v12;
-  }
-  if ( a1 || !r_optimizeTextures->integer || !r_optimize->integer || (v9 & 0x100) != 0 )
-    v6 = v9 & 0xFFFFFF7F;
-  else
-    v6 = v9 | 0x80;
-  v9 = v6;
-  result = R_FindImageFile(v16, v11, v6, a3, (int)v5, v10);
-  v8 = result;
-  if ( result )
-  {
-    R_UpdateDelayLoadImage(result, a5, a1);
-    return v8;
-  }
-  return result;
+	R_UnmangleTextureName( name, colorScale, baseName, mangledName,
+	                       &target, &flags, &heightScale );
+
+	if ( colorScale[0] == 1.0f && colorScale[1] == 1.0f
+	  && colorScale[2] == 1.0f && colorScale[3] == 1.0f )
+		colorScalePtr = 0;
+	else
+		colorScalePtr = colorScale;
+
+	if ( disableDelay || !r_optimizeTextures->integer || !r_optimize->integer
+	  || ( flags & IMAGE_FLAG_NO_TEXTURE_SHEET ) )
+		flags &= ~IMAGE_FLAG_DELAYED_UPLOAD;
+	else
+		flags |= IMAGE_FLAG_DELAYED_UPLOAD;
+
+	result = R_FindImageFile( name, target, flags, trackType, colorScalePtr, heightScale );
+	if ( result )
+		R_UpdateDelayLoadImage( result, shader, disableDelay );
+	return result;
 }
 
 /* ---- R_BeginDelayedImageGroup  0x004EEE80 ----  [HIGH] */
-cvar_t *__cdecl R_BeginDelayedImageGroup(int a1)
+void __cdecl R_BeginDelayedImageGroup(const char *modelName)
 {
-  cvar_t *result;
-
-  if ( tr_modelsFinishedLoading )
+  if ( !tr_modelsFinishedLoading )
   {
-    result = r_errorOnConflicts;
-    if ( r_errorOnConflicts->integer )
-    {
-      result = (cvar_t *)tr_ignorePrecacheErrorCount;
-      if ( !tr_ignorePrecacheErrorCount )
-        return (cvar_t *)ri_Error(1, "\x15" "model '%s' not precached\n", a1);
-    }
+    tr_delayedImageGroup = ++tr_delayedImageGroupSequence;
   }
-  else
+  else if ( r_errorOnConflicts->integer && !tr_ignorePrecacheErrorCount )
   {
-    result = (cvar_t *)(tr_delayedImageGroupSequence + 1);
-    tr_delayedImageGroupSequence = (int)result;
-    tr_delayedImageGroup = (int)result;
+    ri.Error(1, "\x15" "model '%s' not precached\n", modelName);
   }
-  return result;
 }
 
 /* ---- R_SetImageGroupTriCount  0x004EEED0 ----  [HIGH] */
-int __cdecl R_SetImageGroupTriCount(int a1)
+void __cdecl R_SetImageGroupTriCount(int triCount)
 {
-  int result;
-
-  result = tr_delayedImageGroup;
   if ( tr_delayedImageGroup )
-  {
-    result = a1;
-    tr_delayedImageGroupTriCount = a1;
-  }
-  return result;
+    tr_delayedImageGroupTriCount = triCount;
 }
 
 /* ---- R_SetImageGroupTileMode  0x004EEEF0 ----  [HIGH] */
-int __cdecl R_SetImageGroupTileMode(int a1)
+void __cdecl R_SetImageGroupTileMode(int tileMode)
 {
-  int result;
-
-  result = tr_delayedImageGroup;
   if ( tr_delayedImageGroup )
-  {
-    result = a1;
-    tr_delayedImageGroupTileMode = a1;
-  }
-  return result;
+    tr_delayedImageGroupTileMode = tileMode;
 }
 
 /* ---- R_EndDelayedImageGroup  0x004EEF10 ----  [HIGH] */
@@ -3338,743 +2837,488 @@ int R_EndDelayedImageGroup()
 }
 
 /* ---- CopyImageTileLevel_DXT1  0x004EEF20 ----  VERIFIED */
-void __cdecl CopyImageTileLevel_DXT1(
-        unsigned __int16 a1,
-        unsigned __int16 a2,
-        unsigned __int16 a3,
-        int a4,
-        int *a5,
-        unsigned __int16 a6,
-        unsigned __int16 a7)
+void __cdecl CopyImageTileLevel_DXT1( unsigned short imageWidth, unsigned char *dst, const unsigned char *src,
+                                      unsigned short x, unsigned short y, unsigned short width, unsigned short height )
 {
-  int *v7;
-  int v9; // kr00_4
-  unsigned __int16 v10;
-  int v11;
-  int v12;
-  int v13;
-  int *v14;
-  int v15;
-  bool v16; // zf
-  int v18;
-  int v19;
-  int v20;
-  int v21;
+  unsigned char       *out;
+  const unsigned char *in;
+  const unsigned char *cursor;
+  unsigned short       i;
+  unsigned short       j;
 
-  v7 = a5;
-  v9 = a3 * a1;
-  v10 = a7;
-  v11 = v9 / 2 + a4 + 2 * a6;
-  if ( a7 < a2 )
+  cursor = src;
+  out = dst + y * imageWidth / 2 + 2 * x;
+  if ( width >= height )
   {
-    if ( a7 )
+    for ( j = 0; j < height; j += 4 )
     {
-      v18 = 2 * (a3 - a2);
-      v14 = a5;
-      v19 = (unsigned __int16)(((unsigned __int16)(a7 - 1) >> 2) + 1);
-      do
-      {
-        if ( a2 )
-        {
-          v15 = 2 * v10;
-          v20 = (unsigned __int16)(((unsigned __int16)(a2 - 1) >> 2) + 1);
-          do
-          {
-            TransposeDDSBlockDXT1((int)v14, v11);
-            v14 = (int *)((char *)v14 + v15);
-            v11 += 8;
-            --v20;
-          }
-          while ( v20 );
-          v10 = a7;
-        }
-        v11 += v18;
-        v14 = a5 + 2;
-        v16 = v19 == 1;
-        a5 += 2;
-        --v19;
-      }
-      while ( !v16 );
+      Com_Memcpy( out, cursor, 2 * width );
+      cursor += 2 * width;
+      out += 2 * imageWidth;
     }
   }
-  else if ( a2 )
+  else
   {
-    v12 = 2 * a7;
-    v21 = 2 * a3;
-    v13 = (unsigned __int16)(((unsigned __int16)(a2 - 1) >> 2) + 1);
-    do
+    for ( i = 0; i < width; i += 4 )
     {
-      Com_Memcpy((void *)v11, v7, v12);
-      v7 = (int *)((char *)v7 + v12);
-      v11 += v21;
-      --v13;
+      in = src + 2 * i;
+      for ( j = 0; j < height; j += 4 )
+      {
+        TransposeDDSBlockDXT1( in, out );
+        in += 2 * width;
+        out += 8;
+      }
+      out += 2 * ( imageWidth - height );
     }
-    while ( v13 );
   }
 }
 
 /* ---- CopyImageTile_DXT1  0x004EF020 ----  VERIFIED */
-char __cdecl CopyImageTile_DXT1(
-        int a1,
-        int a2,
-        int *a3,
-        int a4,
-        unsigned __int16 a5,
-        unsigned __int16 a6,
-        unsigned __int16 a7,
-        unsigned __int16 a8)
+void __cdecl CopyImageTile_DXT1( int sheetPtr, unsigned char *dst, const unsigned char *src, int bufferEnd,
+                                 unsigned short x, unsigned short y, unsigned short width, unsigned short height )
 {
-  unsigned __int16 v8;
-  unsigned __int16 v9;
-  int v10;
-  char result;
-  int v12;
-  int CardMemoryAmount;
-  int *v14;
-  unsigned __int16 v15;
-  unsigned __int16 v16;
+  unsigned short levelWidth;
+  unsigned short levelHeight;
 
-  v8 = a8;
-  v9 = a7;
-  v10 = a1;
-  CopyImageTileLevel_DXT1(a6, a8, *(_WORD *)(a1 + 64), a2, a3, a5, a7);
-  result = *(_BYTE *)(a1 + 100);
-  if ( (result & 1) != 0 )
+  (void)bufferEnd;
+  CopyImageTileLevel_DXT1( ((image_t *)sheetPtr)->width, dst, src, x, y, width, height );
+  if ( ((image_t *)sheetPtr)->flags & IMAGE_FLAG_MIPMAP )
   {
-    v15 = *(_WORD *)(a1 + 64);
-    v16 = *(_WORD *)(a1 + 66);
-    while ( 1 )
+    levelWidth  = ((image_t *)sheetPtr)->width;
+    levelHeight = ((image_t *)sheetPtr)->height;
+    do
     {
-      v12 = *(_DWORD *)(v10 + 96);
-      CardMemoryAmount = GetCardMemoryAmount(v15, v12, v16);
-      v15 >>= 1;
-      v16 >>= 1;
-      a2 += CardMemoryAmount;
-      a5 >>= 1;
-      a6 >>= 1;
-      v14 = (int *)((char *)a3 + GetCardMemoryAmount(v9, v12, v8));
-      result = a5;
-      v9 >>= 1;
-      v8 >>= 1;
-      a3 = v14;
-      if ( (a5 & 3) != 0 )
+      dst += GetCardMemoryAmount( (int)((image_t *)sheetPtr)->internalFormat, levelWidth, levelHeight );
+      levelWidth >>= 1;
+      levelHeight >>= 1;
+      src += GetCardMemoryAmount( (int)((image_t *)sheetPtr)->internalFormat, width, height );
+      x >>= 1;
+      width >>= 1;
+      height >>= 1;
+      y >>= 1;
+      if ( x & 3 )
         break;
-      if ( (a6 & 3) != 0 )
+      if ( y & 3 )
         break;
-      CopyImageTileLevel_DXT1(a6, v8, v15, a2, v14, a5, v9);
-      if ( v9 <= 1u && v8 <= 1u )
-        break;
-      v10 = a1;
+      CopyImageTileLevel_DXT1( levelWidth, dst, src, x, y, width, height );
     }
+    while ( width > 1 || height > 1 );
   }
-  return result;
 }
 
 /* ---- CopyImageTileLevel_DXT3  0x004EF130 ----  VERIFIED */
-void __cdecl CopyImageTileLevel_DXT3(
-        unsigned __int16 a1,
-        unsigned __int16 a2,
-        unsigned __int16 a3,
-        int a4,
-        int a5,
-        unsigned __int16 a6,
-        unsigned __int16 a7)
+void __cdecl CopyImageTileLevel_DXT3( unsigned short imageWidth, unsigned char *dst, const unsigned char *src,
+                                      unsigned short x, unsigned short y, unsigned short width, unsigned short height )
 {
-  int *v7;
-  int v8;
-  unsigned __int16 v9;
-  _BYTE *v11;
-  int v12;
-  int v13;
-  _BYTE *v14;
-  int v15;
-  bool v16; // zf
-  int v18;
-  int v19;
-  int v20;
-  int v21;
+  unsigned char       *out;
+  const unsigned char *in;
+  const unsigned char *cursor;
+  unsigned short       i;
+  unsigned short       j;
 
-  v7 = (int *)a5;
-  v8 = a1 * a3 + a4;
-  v9 = a6;
-  v11 = (_BYTE *)(v8 + 4 * a2);
-  if ( a6 < a7 )
+  cursor = src;
+  out = dst + y * imageWidth + 4 * x;
+  if ( width >= height )
   {
-    if ( a6 )
+    for ( j = 0; j < height; j += 4 )
     {
-      v18 = 4 * (a1 - a7);
-      v14 = (_BYTE *)a5;
-      v19 = (unsigned __int16)(((unsigned __int16)(a6 - 1) >> 2) + 1);
-      do
-      {
-        if ( a7 )
-        {
-          v15 = 4 * v9;
-          v21 = (unsigned __int16)(((unsigned __int16)(a7 - 1) >> 2) + 1);
-          do
-          {
-            TransposeDDSBlockDXT3(v11, v14);
-            v14 += v15;
-            v11 += 16;
-            --v21;
-          }
-          while ( v21 );
-          v9 = a6;
-        }
-        v11 += v18;
-        v14 = (_BYTE *)(a5 + 16);
-        LOBYTE(a1) = v19 - 1;
-        v16 = v19 == 1;
-        a5 += 16;
-        --v19;
-      }
-      while ( !v16 );
+      Com_Memcpy( out, cursor, 4 * width );
+      cursor += 4 * width;
+      out += 4 * imageWidth;
     }
   }
-  else if ( a7 )
+  else
   {
-    v12 = 4 * a6;
-    v20 = 4 * a1;
-    v13 = (unsigned __int16)(((unsigned __int16)(a7 - 1) >> 2) + 1);
-    do
+    for ( i = 0; i < width; i += 4 )
     {
-      Com_Memcpy((void *)v11, v7, v12);
-      v7 = (int *)((char *)v7 + v12);
-      v11 += v20;
-      --v13;
+      in = src + 4 * i;
+      for ( j = 0; j < height; j += 4 )
+      {
+        TransposeDDSBlockDXT3( out, in );
+        in += 4 * width;
+        out += 16;
+      }
+      out += 4 * ( imageWidth - height );
     }
-    while ( v13 );
   }
 }
 
 /* ---- CopyImageTile_DXT3  0x004EF220 ----  VERIFIED */
-char __cdecl CopyImageTile_DXT3(
-        int a1,
-        int a2,
-        int a3,
-        int a4,
-        unsigned __int16 a5,
-        unsigned __int16 a6,
-        unsigned __int16 a7,
-        unsigned __int16 a8)
+void __cdecl CopyImageTile_DXT3( int sheetPtr, unsigned char *dst, const unsigned char *src, int bufferEnd,
+                                 unsigned short x, unsigned short y, unsigned short width, unsigned short height )
 {
-  unsigned __int16 v8;
-  unsigned __int16 v9;
-  int v10;
-  char result;
-  int v12;
-  int CardMemoryAmount;
-  int v14;
-  unsigned __int16 v15;
-  unsigned __int16 v16;
+  unsigned short levelWidth;
+  unsigned short levelHeight;
 
-  v8 = a8;
-  v9 = a7;
-  v10 = a1;
-  CopyImageTileLevel_DXT3(*(_WORD *)(a1 + 64), a5, a6, a2, a3, a7, a8);
-  result = *(_BYTE *)(a1 + 100);
-  if ( (result & 1) != 0 )
+  (void)bufferEnd;
+  CopyImageTileLevel_DXT3( ((image_t *)sheetPtr)->width, dst, src, x, y, width, height );
+  if ( ((image_t *)sheetPtr)->flags & IMAGE_FLAG_MIPMAP )
   {
-    v15 = *(_WORD *)(a1 + 64);
-    v16 = *(_WORD *)(a1 + 66);
-    while ( 1 )
+    levelWidth  = ((image_t *)sheetPtr)->width;
+    levelHeight = ((image_t *)sheetPtr)->height;
+    do
     {
-      v12 = *(_DWORD *)(v10 + 96);
-      CardMemoryAmount = GetCardMemoryAmount(v15, v12, v16);
-      v15 >>= 1;
-      v16 >>= 1;
-      a2 += CardMemoryAmount;
-      a5 >>= 1;
-      a6 >>= 1;
-      v14 = GetCardMemoryAmount(v9, v12, v8) + a3;
-      result = a5;
-      v9 >>= 1;
-      v8 >>= 1;
-      a3 = v14;
-      if ( (a5 & 3) != 0 )
+      dst += GetCardMemoryAmount( (int)((image_t *)sheetPtr)->internalFormat, levelWidth, levelHeight );
+      levelWidth >>= 1;
+      levelHeight >>= 1;
+      src += GetCardMemoryAmount( (int)((image_t *)sheetPtr)->internalFormat, width, height );
+      x >>= 1;
+      width >>= 1;
+      height >>= 1;
+      y >>= 1;
+      if ( x & 3 )
         break;
-      if ( (a6 & 3) != 0 )
+      if ( y & 3 )
         break;
-      CopyImageTileLevel_DXT3(v15, a5, a6, a2, v14, v9, v8);
-      if ( v9 <= 1u && v8 <= 1u )
-        break;
-      v10 = a1;
+      CopyImageTileLevel_DXT3( levelWidth, dst, src, x, y, width, height );
     }
+    while ( width > 1 || height > 1 );
   }
-  return result;
 }
 
 /* ---- CopyImageTileLevel_DXT5  0x004EF330 ----  VERIFIED */
-void __cdecl CopyImageTileLevel_DXT5(
-        unsigned __int16 a1,
-        unsigned __int16 a2,
-        unsigned __int16 a3,
-        int a4,
-        int a5,
-        unsigned __int16 a6,
-        unsigned __int16 a7)
+void __cdecl CopyImageTileLevel_DXT5( unsigned short imageWidth, unsigned char *dst, const unsigned char *src,
+                                      unsigned short x, unsigned short y, unsigned short width, unsigned short height )
 {
-  int *v7;
-  int v9;
-  unsigned __int16 v10;
-  int v11;
-  int v12;
-  int v13;
-  _BYTE *v14;
-  int v15;
-  bool v16; // zf
-  int v18;
-  int v19;
-  int v20;
-  int v21;
+  unsigned char       *out;
+  const unsigned char *in;
+  const unsigned char *cursor;
+  unsigned short       i;
+  unsigned short       j;
 
-  v7 = (int *)a5;
-  v9 = a1 * a3 + a4;
-  v10 = a6;
-  v11 = v9 + 4 * a2;
-  if ( a6 < a7 )
+  cursor = src;
+  out = dst + y * imageWidth + 4 * x;
+  if ( width >= height )
   {
-    if ( a6 )
+    for ( j = 0; j < height; j += 4 )
     {
-      v18 = 4 * (a1 - a7);
-      v14 = (_BYTE *)a5;
-      v19 = (unsigned __int16)(((unsigned __int16)(a6 - 1) >> 2) + 1);
-      do
-      {
-        if ( a7 )
-        {
-          v15 = 4 * v10;
-          v21 = (unsigned __int16)(((unsigned __int16)(a7 - 1) >> 2) + 1);
-          do
-          {
-            TransposeDDSBlockDXT5(v14, v11);
-            v14 += v15;
-            v11 += 16;
-            --v21;
-          }
-          while ( v21 );
-          v10 = a6;
-        }
-        v11 += v18;
-        v14 = (_BYTE *)(a5 + 16);
-        LOBYTE(a1) = v19 - 1;
-        v16 = v19 == 1;
-        a5 += 16;
-        --v19;
-      }
-      while ( !v16 );
+      Com_Memcpy( out, cursor, 4 * width );
+      cursor += 4 * width;
+      out += 4 * imageWidth;
     }
   }
-  else if ( a7 )
+  else
   {
-    v12 = 4 * a6;
-    v20 = 4 * a1;
-    v13 = (unsigned __int16)(((unsigned __int16)(a7 - 1) >> 2) + 1);
-    do
+    for ( i = 0; i < width; i += 4 )
     {
-      Com_Memcpy((void *)v11, v7, v12);
-      v7 = (int *)((char *)v7 + v12);
-      v11 += v20;
-      --v13;
+      in = src + 4 * i;
+      for ( j = 0; j < height; j += 4 )
+      {
+        TransposeDDSBlockDXT5( in, out );
+        in += 4 * width;
+        out += 16;
+      }
+      out += 4 * ( imageWidth - height );
     }
-    while ( v13 );
   }
 }
 
 /* ---- CopyImageTile_DXT5  0x004EF420 ----  VERIFIED */
-char __cdecl CopyImageTile_DXT5(
-        int a1,
-        int a2,
-        int a3,
-        int a4,
-        unsigned __int16 a5,
-        unsigned __int16 a6,
-        unsigned __int16 a7,
-        unsigned __int16 a8)
+void __cdecl CopyImageTile_DXT5( int sheetPtr, unsigned char *dst, const unsigned char *src, int bufferEnd,
+                                 unsigned short x, unsigned short y, unsigned short width, unsigned short height )
 {
-  unsigned __int16 v8;
-  unsigned __int16 v9;
-  int v10;
-  char result;
-  int v12;
-  int CardMemoryAmount;
-  int v14;
-  unsigned __int16 v15;
-  unsigned __int16 v16;
+  unsigned short levelWidth;
+  unsigned short levelHeight;
 
-  v8 = a8;
-  v9 = a7;
-  v10 = a1;
-  CopyImageTileLevel_DXT5(*(_WORD *)(a1 + 64), a5, a6, a2, a3, a7, a8);
-  result = *(_BYTE *)(a1 + 100);
-  if ( (result & 1) != 0 )
+  (void)bufferEnd;
+  CopyImageTileLevel_DXT5( ((image_t *)sheetPtr)->width, dst, src, x, y, width, height );
+  if ( ((image_t *)sheetPtr)->flags & IMAGE_FLAG_MIPMAP )
   {
-    v15 = *(_WORD *)(a1 + 64);
-    v16 = *(_WORD *)(a1 + 66);
-    while ( 1 )
+    levelWidth  = ((image_t *)sheetPtr)->width;
+    levelHeight = ((image_t *)sheetPtr)->height;
+    do
     {
-      v12 = *(_DWORD *)(v10 + 96);
-      CardMemoryAmount = GetCardMemoryAmount(v15, v12, v16);
-      v15 >>= 1;
-      v16 >>= 1;
-      a2 += CardMemoryAmount;
-      a5 >>= 1;
-      a6 >>= 1;
-      v14 = GetCardMemoryAmount(v9, v12, v8) + a3;
-      result = a5;
-      v9 >>= 1;
-      v8 >>= 1;
-      a3 = v14;
-      if ( (a5 & 3) != 0 )
+      dst += GetCardMemoryAmount( (int)((image_t *)sheetPtr)->internalFormat, levelWidth, levelHeight );
+      levelWidth >>= 1;
+      levelHeight >>= 1;
+      src += GetCardMemoryAmount( (int)((image_t *)sheetPtr)->internalFormat, width, height );
+      x >>= 1;
+      width >>= 1;
+      height >>= 1;
+      y >>= 1;
+      if ( x & 3 )
         break;
-      if ( (a6 & 3) != 0 )
+      if ( y & 3 )
         break;
-      CopyImageTileLevel_DXT5(v15, a5, a6, a2, v14, v9, v8);
-      if ( v9 <= 1u && v8 <= 1u )
-        break;
-      v10 = a1;
+      CopyImageTileLevel_DXT5( levelWidth, dst, src, x, y, width, height );
     }
+    while ( width > 1 || height > 1 );
   }
-  return result;
 }
 
 /* ---- CopyImageTile_RGBA  0x004EF530 ----  VERIFIED */
-int __cdecl CopyImageTile_RGBA(
-        int result,
-        int *a2,
-        unsigned __int16 a3,
-        int a4,
-        int a5,
-        unsigned __int16 a6,
-        unsigned __int16 a7)
+void __cdecl CopyImageTile_RGBA(
+        unsigned short height,
+        const unsigned char *src,
+        unsigned short tileY,
+        image_t *sheet,
+        unsigned char *dst,
+        unsigned short tileX,
+        unsigned short width)
 {
-  int v8;
-  int v9;
-  bool v10; // zf
-  int v11;
+  unsigned short y;
 
-  v8 = a5 + 4 * (a6 + *(unsigned __int16 *)(a4 + 64) * a3);
-  if ( (_WORD)result )
+  dst += 4 * (tileX + sheet->width * tileY);
+  for ( y = 0; y < height; y++ )
   {
-    v9 = 4 * a7;
-    v11 = (unsigned __int16)result;
-    do
-    {
-      Com_Memcpy(v8, a2, v9);
-      a2 = (int *)((char *)a2 + v9);
-      result = v11 - 1;
-      v10 = v11 == 1;
-      v8 += 4 * *(unsigned __int16 *)(a4 + 64);
-      --v11;
-    }
-    while ( !v10 );
+    Com_Memcpy(dst, src, 4 * width);
+    src += 4 * width;
+    dst += 4 * sheet->width;
   }
-  return result;
 }
 
 /* ---- LoadImageTile  0x004EF590 ----  VERIFIED */
-int __cdecl LoadImageTile(int a1, int a2, int a3, int a4, unsigned __int16 a5, unsigned __int16 a6)
+/* Reloads a delayed image, verifies it still matches its scan, picmip-reduces
+ * it, then blits it into its slot (slotX,slotY) on the sheet, dispatched by the
+ * sheet's compressed/uncompressed format. */
+void __cdecl LoadImageTile( int imagePtr, int sheetPtr, int buffer, int bufferEnd,
+                           unsigned __int16 slotX, unsigned __int16 slotY )
 {
-  bool v6; // cf
-  unsigned __int8 *v7;
-  unsigned __int16 v9;
-  unsigned __int16 v10;
-  int v11;
-  int v12; // [esp+8h] [ebp-14h] BYREF
-  int v13; // [esp+Ch] [ebp-10h] BYREF
-  unsigned int v14; // [esp+10h] [ebp-Ch] BYREF
-  unsigned __int8 *v15; // [esp+14h] [ebp-8h] BYREF
-  int v16; // [esp+18h] [ebp-4h] BYREF
+	image_t        *image = (image_t *)imagePtr;
+	image_t        *sheet = (image_t *)sheetPtr;
+	unsigned char  *loadedPixels;
+	unsigned short  loadedWidth;
+	unsigned short  loadedHeight;
+	unsigned int    loadedFormat;
+	int             hasMipmaps;
+	int             picmip;
 
-  *(_DWORD *)(a1 + 100) &= ~0x80u;
-  *(_DWORD *)(a1 + 88) = *(_DWORD *)(a2 + 88);
-  v6 = *(_WORD *)(a1 + 64) < *(_WORD *)(a1 + 66);
-  *(_DWORD *)(a1 + 104) = a2;
-  *(_WORD *)(a1 + 110) = a6;
-  *(_WORD *)(a1 + 108) = a5;
-  *(_BYTE *)(a1 + 112) = v6;
-  --tr_delayedImageCount;
-  R_LoadImage((const char *)a1, (int *)&v15, (unsigned __int16 *)&v13, (unsigned __int16 *)&v12, (int *)&v14, &v16, 2);
-  v7 = v15;
-  if ( !v15 )
-    return ri_Error(1, "\x15" "image '%s' got deleted between initial scan and actual load\n", a1);
-  v9 = v12;
-  v10 = v13;
-  if ( (unsigned __int16)v12 + (unsigned __int16)v13 != *(unsigned __int16 *)(a1 + 64) + *(unsigned __int16 *)(a1 + 66)
-    || (_WORD)v13 != *(_WORD *)(a1 + 64) && (_WORD)v13 != *(_WORD *)(a1 + 66)
-    || v14 != *(_DWORD *)(a1 + 96)
-    || v14 != 6408 && !v16 && (*(_BYTE *)(a1 + 100) & 1) != 0 )
-  {
-    return ri_Error(1, "\x15" "image '%s' changed between initial scan and actual load\n", a1);
-  }
-  v15 = (unsigned __int8 *)R_PicmipForImageFlags(*(_DWORD *)(a1 + 100));
-  if ( v15 )
-  {
-    do
-    {
-      if ( v10 <= 4u )
-        break;
-      if ( v9 <= 4u )
-        break;
-      v7 = R_MipMap(v14, v7, (char *)a1, v10, v9, 2);
-      if ( !v7 )
-        ri_Error(1, "\x15" "tried to put image '%s' on a texture sheet, but it has an invalid custom mipmap\n", a1);
-      v10 >>= 1;
-      v9 >>= 1;
-      --v15;
-    }
-    while ( v15 );
-    LOWORD(v12) = v9;
-    LOWORD(v13) = v10;
-  }
-  v11 = *(_DWORD *)(a2 + 96);
-  if ( v11 > 33778 )
-  {
-    if ( v11 == 33779 )
-      CopyImageTile_DXT5(a2, a3, (int)v7, a4, a5, a6, v13, v12);
-  }
-  else if ( v11 == 33778 )
-  {
-    CopyImageTile_DXT3(a2, a3, (int)v7, a4, a5, a6, v13, v12);
-  }
-  else if ( v11 == 6408 )
-  {
-    CopyImageTile_RGBA(v12, (int *)v7, a6, a2, a3, a5, v13);
-  }
-  else if ( v11 > 33775 )
-  {
-    CopyImageTile_DXT1(a2, a3, (int *)v7, a4, a5, a6, v13, v12);
-  }
-  R_FreeImageAllocations();
-  return 0;
+	image->flags &= ~0x0080;
+	image->texnum              = sheet->texnum;
+	image->link.textureSheet   = sheet;
+	image->state.sheet.x       = slotX;
+	image->state.sheet.y       = slotY;
+	image->state.sheet.rotated = (unsigned char)( image->width < image->height );
+	--tr_delayedImageCount;
+
+	R_LoadImage( image->imgName, (int *)&loadedPixels, &loadedWidth, &loadedHeight,
+	             (int *)&loadedFormat, (unsigned int *)&hasMipmaps, 2 );
+	if ( !loadedPixels )
+		{ ri.Error( 1, "\x15" "image '%s' got deleted between initial scan and actual load\n", image->imgName ); return; }
+
+	if ( loadedWidth + loadedHeight != image->width + image->height
+	  || ( loadedWidth != image->width && loadedWidth != image->height )
+	  || loadedFormat != image->internalFormat
+	  || ( loadedFormat != 6408 && !hasMipmaps && ( image->flags & 0x0001 ) ) )
+	{
+		{ ri.Error( 1, "\x15" "image '%s' changed between initial scan and actual load\n", image->imgName ); return; }
+	}
+
+	picmip = R_PicmipForImageFlags( image->flags );
+	if ( picmip )
+	{
+		do
+		{
+			if ( loadedWidth <= 4u || loadedHeight <= 4u )
+				break;
+			loadedPixels = R_MipMap( loadedFormat, loadedPixels, image->imgName,
+			                         loadedWidth, loadedHeight, 2 );
+			if ( !loadedPixels )
+				ri.Error( 1, "\x15" "tried to put image '%s' on a texture sheet, but it has an invalid custom mipmap\n", image->imgName );
+			loadedWidth  >>= 1;
+			loadedHeight >>= 1;
+			--picmip;
+		}
+		while ( picmip );
+	}
+
+	switch ( (int)sheet->internalFormat )   /* signed compares in retail: an int-typed format there */
+	{
+		case 33779:   
+			CopyImageTile_DXT5( sheetPtr, (unsigned char *)buffer, (const unsigned char *)loadedPixels, bufferEnd, slotX, slotY, loadedWidth, loadedHeight );
+			break;
+		case 33778:   
+			CopyImageTile_DXT3( sheetPtr, (unsigned char *)buffer, (const unsigned char *)loadedPixels, bufferEnd, slotX, slotY, loadedWidth, loadedHeight );
+			break;
+		case 6408:    
+			CopyImageTile_RGBA( loadedHeight, loadedPixels, slotY, sheet, (unsigned char *)buffer, slotX, loadedWidth );
+			break;
+		case 33776:   
+		case 33777:   
+			CopyImageTile_DXT1( sheetPtr, (unsigned char *)buffer, (const unsigned char *)loadedPixels, bufferEnd, slotX, slotY, loadedWidth, loadedHeight );
+			break;
+	}
+
+	R_FreeImageAllocations();
 }
 
 /* ---- UploadImageGroup_r  0x004EF800 ----  VERIFIED */
-int __cdecl UploadImageGroup_r(int *a1, int a2, int a3, int a4, int a5, int a6)
+/* Walks the packing tree, accumulating the (x,y) offset of each leaf, then
+ * blits each leaf image into the sheet via LoadImageTile.  Siblings sharing
+ * the group width stack vertically (advance y); otherwise they advance x. */
+void __cdecl UploadImageGroup_r( imageGroupNode_t *node, int sheet, int buffer, int bufferEnd,
+                                 unsigned short x, unsigned short y )
 {
-  int v6;
-  int *v7;
-  int i;
-  int *v9;
-
-  v6 = a6;
-  v7 = a1;
-  for ( i = a5; v7[1]; v7 = (int *)v7[1] )
-  {
-    v9 = (int *)*v7;
-    if ( v7[4] == *(_DWORD *)(*v7 + 16) )
-    {
-      UploadImageGroup_r(v9, a2, a3, a4, i, v6);
-      LOWORD(a6) = *(_WORD *)(*v7 + 20) + a6;
-      v6 = a6;
-    }
-    else
-    {
-      UploadImageGroup_r(v9, a2, a3, a4, i, v6);
-      LOWORD(a5) = *(_WORD *)(*v7 + 16) + a5;
-      i = a5;
-    }
-  }
-  if ( r_debugOptTex->integer )
-    ri_Printf(
-      0,
-      "  %-36s(%4i,%4i)%4i x %4i from %4i x %4i\n",
-      (const char *)*v7,
-      (unsigned __int16)a5,
-      (unsigned __int16)a6,
-      v7[4],
-      v7[5],
-      *(unsigned __int16 *)(*v7 + 64),
-      *(unsigned __int16 *)(*v7 + 66));
-  return LoadImageTile(*v7, a2, a3, a4, i, v6);
+	if ( node->next )
+	{
+		if ( node->width == node->u.child->width )
+		{
+			UploadImageGroup_r( node->u.child, sheet, buffer, bufferEnd, x, y );
+			UploadImageGroup_r( node->next, sheet, buffer, bufferEnd, x, y + node->u.child->height );
+		}
+		else
+		{
+			UploadImageGroup_r( node->u.child, sheet, buffer, bufferEnd, x, y );
+			UploadImageGroup_r( node->next, sheet, buffer, bufferEnd, x + node->u.child->width, y );
+		}
+	}
+	else
+	{
+		if ( r_debugOptTex->integer )
+			ri.Printf(
+				0,
+				"  %-36s(%4i,%4i)%4i x %4i from %4i x %4i\n",
+				node->u.image->imgName,
+				x,
+				y,
+				node->width,
+				node->height,
+				node->u.image->width,
+				node->u.image->height );
+		LoadImageTile( (int)node->u.image, sheet, buffer, bufferEnd, x, y );
+	}
 }
 
 /* ---- UploadImageGroup  0x004EF8E0 ----  VERIFIED */
-int __cdecl UploadImageGroup(int a1, int *a2, int a3, int a4)
+/* A single node uploads directly; a multi-node group allocates a "*sheetNNN"
+ * atlas, sizes it (mip chain included for compressed formats), packs every
+ * member into it, and uploads the atlas. */
+void __cdecl UploadImageGroup( int *nodePtr, int groupIndex, int format, int flags )
 {
-  bool v6; // zf
-  int integer;
-  char *v9;
-  int v10;
-  int v11;
-  int v12;
-  unsigned __int8 *v13;
-  char *v14;
-  int v15;
-  int v16;
-  unsigned int v17;
-  int CardMemoryAmount;
-  int v19;
+	imageGroupNode_t *node = (imageGroupNode_t *)nodePtr;
+	image_t          *sheet;
+	int               cardMemory;
+	int               w, h;
+	unsigned char    *buffer;
 
-  v6 = a2[1] == 0;
-  integer = r_debugOptTex->integer;
-  if ( v6 )
-  {
-    if ( integer )
-      ri_Printf(
-        0,
-        "image %2i: %4i x %4i from %4i x %4i -- %s\n",
-        a1,
-        a2[4],
-        a2[5],
-        *(unsigned __int16 *)(*a2 + 64),
-        *(unsigned __int16 *)(*a2 + 66),
-        (const char *)*a2);
-    return R_LoadSingleDelayedImage(*a2);
-  }
-  else
-  {
-    if ( integer )
-      ri_Printf(0, "sheet %2i: %4i x %4i\n", a1, a2[4], a2[5]);
-    v16 = a2[5];
-    v15 = a2[4];
-    v9 = va("*sheet%03i", a1);
-    v10 = R_AllocImage(v9, 3553, v15, v16, a4, 7);
-    *(_DWORD *)(v10 + 96) = a3;
-    v11 = a2[5];
-    v19 = v10;
-    CardMemoryAmount = GetCardMemoryAmount(a2[4], a3, v11);
-    if ( a3 != 6408 && (*(_BYTE *)(v10 + 100) & 1) != 0 )
-    {
-      v12 = a2[4];
-      do
-      {
-        do
-        {
-          v12 = (v12 + 1) >> 1;
-          v11 = (v11 + 1) >> 1;
-          CardMemoryAmount += GetCardMemoryAmount(v12, a3, v11);
-        }
-        while ( v12 != 1 );
-      }
-      while ( v11 != 1 );
-      v10 = v19;
-    }
-    v13 = (unsigned __int8 *)ri_Malloc(CardMemoryAmount);
-    UploadImageGroup_r(a2, v10, (int)v13, (int)&v13[CardMemoryAmount], 0, 0);
-    if ( a3 == 6408 )
-    {
-      if ( r_debugOptTex->integer )
-      {
-        v17 = *(unsigned __int16 *)(v10 + 66);
-        v14 = va("%s.jpg", (const char *)(v10 + 1));
-        SaveJPG((int)v14, 100, *(unsigned __int16 *)(v10 + 64), v17, 0, (int)v13);
-      }
-    }
-    R_CreateImageInternal(v10, 0, v13, 0xDE1u, a3);
-    return ri_Free(v13);
-  }
+	if ( !node->next )
+	{
+		if ( r_debugOptTex->integer )
+			ri.Printf(
+				0,
+				"image %2i: %4i x %4i from %4i x %4i -- %s\n",
+				groupIndex,
+				node->width,
+				node->height,
+				node->u.image->width,
+				node->u.image->height,
+				node->u.image->imgName );
+		R_LoadSingleDelayedImage( (int)node->u.image );
+		return;
+	}
+
+	if ( r_debugOptTex->integer )
+		ri.Printf( 0, "sheet %2i: %4i x %4i\n", groupIndex, node->width, node->height );
+	sheet = R_AllocImage( va( "*sheet%03i", groupIndex ), 3553, node->width, node->height, flags, 7 );
+	sheet->internalFormat = format;
+	cardMemory = GetCardMemoryAmount( format, node->width, node->height );
+	if ( format != 6408 && ( sheet->flags & 0x0001 ) )
+	{
+		w = node->width;
+		h = node->height;
+		do
+		{
+			do
+			{
+				w = ( w + 1 ) >> 1;
+				h = ( h + 1 ) >> 1;
+				cardMemory += GetCardMemoryAmount( format, w, h );
+			}
+			while ( w != 1 );
+		}
+		while ( h != 1 );
+	}
+	buffer = (unsigned char *)ri.Malloc( cardMemory );
+	UploadImageGroup_r( node, (int)sheet, (int)buffer, (int)&buffer[cardMemory], 0, 0 );
+	if ( format == 6408 && r_debugOptTex->integer )
+		SaveJPG( (int)va( "%s.jpg", sheet->imgName + 1 ), 100, sheet->width, sheet->height, 0, (int)buffer );
+	R_CreateImageInternal( sheet, 0, buffer, 0xDE1u, format );
+	ri.Free( buffer );
 }
 
 /* ---- compare_mergable_common  0x004EFA60 ----  [HIGH] */
-int __cdecl compare_mergable_common(_DWORD *a1, _DWORD *a2)
+/* Orders two packing nodes by min(width,height), then by width+height, then by
+ * triangleCount -- the packer's "which is harder to place" ordering. */
+int __cdecl compare_mergable_common(unsigned int *nodeA, unsigned int *nodeB)
 {
-  int v2;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
+  imageGroupNode_t *n1 = (imageGroupNode_t *)nodeA;
+  imageGroupNode_t *n2 = (imageGroupNode_t *)nodeB;
+  int min1 = ( n1->width < n1->height ) ? n1->width : n1->height;
+  int min2 = ( n2->width < n2->height ) ? n2->width : n2->height;
   int result;
 
-  v2 = a1[5];
-  v3 = a1[4];
-  v4 = v3;
-  if ( v3 >= v2 )
-    v4 = a1[5];
-  v5 = a2[4];
-  v6 = a2[5];
-  v7 = v5;
-  if ( v5 >= v6 )
-    v7 = a2[5];
-  result = v4 - v7;
+  result = min1 - min2;
   if ( !result )
   {
-    result = v3 + v2 - v6 - v5;
+    result = ( n1->width + n1->height ) - ( n2->width + n2->height );
     if ( !result )
-      return a1[2] - a2[2];
+      return n1->triangleCount - n2->triangleCount;
   }
   return result;
 }
 
 /* ---- compare_mergable_xxxxx  0x004EFAB0 ----  [HIGH] */
-int __cdecl compare_mergable_xxxxx(_DWORD **a1, _DWORD **a2)
+/* qsort comparator over node pointers: group first, then compare_mergable_common. */
+int __cdecl compare_mergable_xxxxx(unsigned int **slotA, unsigned int **slotB)
 {
-  int result;
+  imageGroupNode_t *n1 = (imageGroupNode_t *)*slotA;
+  imageGroupNode_t *n2 = (imageGroupNode_t *)*slotB;
+  int result = n1->group - n2->group;
 
-  result = (*a1)[3] - (*a2)[3];
   if ( !result )
-    return compare_mergable_common(*a1, *a2);
+    return compare_mergable_common( (unsigned int *)n1, (unsigned int *)n2 );
   return result;
 }
 
 /* ---- compare_mergable_xxxx  0x004EFAE0 ----  [HIGH] */
-int __cdecl compare_mergable_xxxx(_DWORD **a1, _DWORD **a2)
+/* qsort comparator over node pointers that sinks NULL entries to the end,
+ * otherwise ordering by compare_mergable_common. */
+int __cdecl compare_mergable_xxxx(unsigned int **slotA, unsigned int **slotB)
 {
-  int v2;
+  imageGroupNode_t *n1 = (imageGroupNode_t *)*slotA;
+  imageGroupNode_t *n2 = (imageGroupNode_t *)*slotB;
 
-  v2 = (int)*a2;
-  if ( !*a1 )
-    return v2 != 0;
-  if ( v2 )
-    return compare_mergable_common(*a1, *a2);
-  return -1;
+  if ( !n1 )
+    return n2 != 0;
+  if ( !n2 )
+    return -1;
+  return compare_mergable_common( (unsigned int *)n1, (unsigned int *)n2 );
 }
 
 /* ---- PickMergeDirection  0x004EFB10 ----  VERIFIED */
-int __cdecl PickMergeDirection(int a1, int a2, int a3)
+int __cdecl PickMergeDirection(int nodes, int count, int startIndex)
 {
-  int v3;
-  int v4;
-  int v5;
+  imageGroupNode_t **list = (imageGroupNode_t **)nodes;
+  int width;
+  int height;
   int i;
-  int v7;
-  int v8;
-  int v10;
-  int v11;
 
-  v3 = *(_DWORD *)(a2 + 4 * a1);
-  v4 = *(_DWORD *)(v3 + 20);
-  v5 = *(_DWORD *)(v3 + 16);
-  if ( v5 == v4 )
+  height = list[startIndex]->height;
+  width  = list[startIndex]->width;
+  if ( width == height )
     return 0;
-  if ( v5 != glConfig_maxTextureSize )
+  if ( width != glConfig_maxTextureSize )
   {
-    for ( i = a1 + 1; i < a3; ++i )
+    for ( i = startIndex + 1; i < count; ++i )
     {
-      v7 = *(_DWORD *)(a2 + 4 * i);
-      if ( *(_DWORD *)(v7 + 20) != v4 )
+      if ( list[i]->height != height )
         break;
-      v8 = *(_DWORD *)(v7 + 16);
-      if ( v8 > 2 * v5 )
+      if ( list[i]->width > 2 * width )
         break;
-      if ( v8 == 2 * v5 )
+      if ( list[i]->width == 2 * width )
       {
-        if ( i < a3 )
+        for ( ; i < count; ++i )
         {
-          while ( *(_DWORD *)(*(_DWORD *)(a2 + 4 * i) + 20) == v4 )
-          {
-            if ( ++i >= a3 )
-              return 0;
-          }
-          if ( i < a3 )
-          {
-            while ( 1 )
-            {
-              v10 = *(_DWORD *)(a2 + 4 * i);
-              if ( *(_DWORD *)(v10 + 16) >= v5 || *(_DWORD *)(v10 + 20) != 2 * v4 )
-                break;
-              if ( ++i >= a3 )
-                return 0;
-            }
-            if ( i < a3 )
-            {
-              v11 = *(_DWORD *)(a2 + 4 * i);
-              if ( *(_DWORD *)(v11 + 16) == v5 && *(_DWORD *)(v11 + 20) == 2 * v4 )
-                return 1;
-            }
-          }
+          if ( list[i]->height != height )
+            break;
         }
+        for ( ; i < count; ++i )
+        {
+          if ( list[i]->width >= width || list[i]->height != 2 * height )
+            break;
+        }
+        if ( i < count && list[i]->width == width && list[i]->height == 2 * height )
+          return 1;
         return 0;
       }
     }
@@ -4083,766 +3327,498 @@ int __cdecl PickMergeDirection(int a1, int a2, int a3)
 }
 
 /* ---- MergeImageList  0x004EFBB0 ----  VERIFIED */
-int __cdecl MergeImageList(int a1, int a2, int a3, int a4)
+int __cdecl MergeImageList(int pool, int nodes, int count, int outIndex)
 {
-  int v4;
-  int v5;
-  _DWORD *v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  int i;
-  int v12;
-  int v13;
-  int v14;
-  int v16;
+  imageGroupNode_t **list = (imageGroupNode_t **)nodes;
+  int                i;
+  int                j;
 
-  v4 = a3;
-  if ( a3 != 1 )
+  if ( count == 1 )
+    return outIndex;
+  for ( i = 1; i < count; )
   {
-    v5 = 1;
-    v16 = 1;
-    if ( a3 > 1 )
+    if ( list[i]->height == glConfig.maxTextureSize )
+      return outIndex;
+    if ( list[i]->width == list[i - 1]->width && list[i]->height == list[i - 1]->height )
     {
-      v6 = (_DWORD *)(a1 + 24 * a4 + 12);
-      do
+      ((imageGroupNode_t *)pool)[outIndex].u.child       = list[i - 1];
+      ((imageGroupNode_t *)pool)[outIndex].next          = list[i];
+      ((imageGroupNode_t *)pool)[outIndex].group         = list[i]->group;
+      ((imageGroupNode_t *)pool)[outIndex].triangleCount = list[i]->triangleCount + list[i - 1]->triangleCount;
+      switch ( PickMergeDirection( nodes, count, i ) )
       {
-        v7 = *(_DWORD *)(a2 + 4 * v5);
-        v8 = *(_DWORD *)(v7 + 20);
-        if ( v8 == glConfig_maxTextureSize )
+        case 0:
+          ((imageGroupNode_t *)pool)[outIndex].width  = 2 * list[i]->width;
+          ((imageGroupNode_t *)pool)[outIndex].height = list[i]->height;
           break;
-        v9 = *(_DWORD *)(a2 + 4 * v5 - 4);
-        if ( *(_DWORD *)(v7 + 16) == *(_DWORD *)(v9 + 16) && v8 == *(_DWORD *)(v9 + 20) )
-        {
-          *(v6 - 3) = v9;
-          *(v6 - 2) = *(_DWORD *)(a2 + 4 * v5);
-          *v6 = *(_DWORD *)(*(_DWORD *)(a2 + 4 * v5) + 12);
-          *(v6 - 1) = *(_DWORD *)(*(_DWORD *)(a2 + 4 * v5 - 4) + 8) + *(_DWORD *)(*(_DWORD *)(a2 + 4 * v5) + 8);
-          v10 = PickMergeDirection(v5, a2, v4);
-          if ( v10 )
-          {
-            if ( v10 == 1 )
-            {
-              v6[1] = *(_DWORD *)(*(_DWORD *)(a2 + 4 * v5) + 16);
-              v6[2] = 2 * *(_DWORD *)(*(_DWORD *)(a2 + 4 * v5) + 20);
-            }
-          }
-          else
-          {
-            v6[1] = 2 * *(_DWORD *)(*(_DWORD *)(a2 + 4 * v5) + 16);
-            v6[2] = *(_DWORD *)(*(_DWORD *)(a2 + 4 * v5) + 20);
-          }
-          for ( i = v5 + 1; i < a3; *(_DWORD *)(a2 + 4 * i++ - 8) = v12 )
-          {
-            v12 = *(_DWORD *)(a2 + 4 * i);
-            v13 = *(_DWORD *)(v12 + 20);
-            v14 = v6[2];
-            if ( v13 > v14 )
-              break;
-            if ( v13 == v14 && *(_DWORD *)(v12 + 16) >= v6[1] )
-              break;
-          }
-          *(_DWORD *)(a2 + 4 * i - 8) = v6 - 3;
-          if ( i < a3 )
-          {
-            qmemcpy((void *)(a2 + 4 * i - 4), (const void *)(a2 + 4 * i), 4 * (a3 - i));
-            v5 = v16;
-            i = a3;
-          }
-          *(_DWORD *)(a2 + 4 * i - 4) = 0;
-          --a3;
-          ++a4;
-          v6 += 6;
-          v4 = a3;
-        }
-        else
-        {
-          v16 = ++v5;
-        }
+        case 1:
+          ((imageGroupNode_t *)pool)[outIndex].width  = list[i]->width;
+          ((imageGroupNode_t *)pool)[outIndex].height = 2 * list[i]->height;
+          break;
       }
-      while ( v5 < v4 );
+      for ( j = i + 1; j < count; j++ )
+      {
+        if ( list[j]->height > ((imageGroupNode_t *)pool)[outIndex].height
+          || ( list[j]->height == ((imageGroupNode_t *)pool)[outIndex].height && list[j]->width >= ((imageGroupNode_t *)pool)[outIndex].width ) )
+          break;
+        list[j - 2] = list[j];
+      }
+      list[j - 2] = &((imageGroupNode_t *)pool)[outIndex];
+      for ( ; j < count; j++ )
+        list[j - 1] = list[j];
+      list[j - 1] = 0;
+      count--;
+      outIndex++;
+    }
+    else
+    {
+      i++;
     }
   }
-  return a4;
+  return outIndex;
 }
 
 /* ---- CombineImageGroups  0x004EFD00 ----  VERIFIED */
-int __cdecl CombineImageGroups(unsigned int *a1, unsigned int a2)
+int __cdecl CombineImageGroups(unsigned int *countPtr, unsigned int nodes)
 {
-  unsigned int v2;
-  signed int i;
-  int v4;
-  int v5;
-  int v6;
-  int v8;
-  int v9;
-  signed int j;
-  int v11;
+  imageGroupNode_t **list = (imageGroupNode_t **)nodes;
+  int                i;
+  int                j;
+  int                keepGroup;
+  int                mergeGroup;
 
-  qsort_m(a2, *a1, 4u, (int (__cdecl *)(unsigned int, _BYTE *))compare_mergable_xxxx);
-  if ( *a1 )
+  qsort_m(nodes, *countPtr, 4u, (int (__cdecl *)(unsigned int, byte *))compare_mergable_xxxx);
+  while ( *countPtr && !list[*countPtr - 1] )
+    --*countPtr;
+  for ( i = 1; i < (int)*countPtr; i++ )
   {
-    do
-    {
-      if ( *(_DWORD *)(a2 + 4 * *a1 - 4) )
-        break;
-      v2 = *a1 - 1;
-      *a1 = v2;
-    }
-    while ( v2 );
-  }
-  for ( i = 1; i < (int)*a1; ++i )
-  {
-    v4 = *(_DWORD *)(a2 + 4 * i);
-    v5 = *(_DWORD *)(v4 + 20);
-    if ( v5 == glConfig_maxTextureSize )
+    if ( list[i]->height == glConfig_maxTextureSize )
       break;
-    v6 = *(_DWORD *)(a2 + 4 * i - 4);
-    if ( *(_DWORD *)(v4 + 16) == *(_DWORD *)(v6 + 16) && v5 == *(_DWORD *)(v6 + 20) )
+    if ( list[i]->width == list[i - 1]->width && list[i]->height == list[i - 1]->height )
     {
-      v8 = *(_DWORD *)(*(_DWORD *)(a2 + 4 * i - 4) + 12);
-      v9 = *(_DWORD *)(*(_DWORD *)(a2 + 4 * i) + 12);
-      for ( j = 0; j < (int)*a1; ++j )
+      mergeGroup = list[i]->group;
+      keepGroup  = list[i - 1]->group;
+      for ( j = 0; j < (int)*countPtr; j++ )
       {
-        v11 = *(_DWORD *)(a2 + 4 * j);
-        if ( *(_DWORD *)(v11 + 12) == v9 )
-          *(_DWORD *)(v11 + 12) = v8;
+        if ( list[j]->group == mergeGroup )
+          list[j]->group = keepGroup;
       }
-      qsort_m(a2, *a1, 4u, (int (__cdecl *)(unsigned int, _BYTE *))compare_mergable_xxxxx);
-      return v8;
+      qsort_m(nodes, *countPtr, 4u, (int (__cdecl *)(unsigned int, byte *))compare_mergable_xxxxx);
+      return keepGroup;
     }
   }
   return 0;
 }
 
 /* ---- MergeAndLoadDelayedImages  0x004EFDC0 ----  VERIFIED */
-void __cdecl MergeAndLoadDelayedImages(int a1, signed int a2, int a3, int a4)
+void __cdecl MergeAndLoadDelayedImages( image_t **images, int count, int format, int flags )
 {
-  signed int v4;
-  int v7;
-  int *v8;
-  int v9;
-  unsigned __int16 v10;
-  int v11;
-  cvar_t *v12;
-  int integer;
-  int v14;
-  int i;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  signed int v20;
-  signed int j;
-  int k;
-  int v23;
-  int v24;
-  signed int m;
-  signed int v26;
-  int n;
-  _DWORD *v28;  /* pointer index array */
-  char *v29;
-  _DWORD *v30;  /* group record array */
-  int v31;
+  imageGroupNode_t  *records;
+  imageGroupNode_t **list;
+  int                i;
+  int                picmip;
+  int                outIndex;
+  int                group;
+  int                start;
+  int                end;
 
-  v4 = a2;
   if ( r_debugOptTex->integer )
-    ri_Printf(0, "%i groups -> ", a2);
-  v30 = (_DWORD *)alloca((48 * v4 - 21) & 0xFFFFFFFC);
-  v28 = (_DWORD *)alloca((8 * v4 - 4 + 3) & 0xFFFFFFFC);
-  if ( v4 > 0 )
+    ri.Printf( 0, "%i groups -> ", count );
+  /* n leaves merge into at most n - 1 interior records */
+  records = (imageGroupNode_t *)_alloca( ( 2 * count - 1 ) * sizeof( imageGroupNode_t ) );
+  list    = (imageGroupNode_t **)_alloca( ( 2 * count - 1 ) * sizeof( imageGroupNode_t * ) );
+  for ( i = 0; i < count; i++ )
   {
-    v7 = a1;
-    /* retail 0x004EFE22 `lea eax, [edi+14h]` -- record 0's sixth dword */
-    v8 = (int *)(v30 + 5);
-    v29 = (char *)v28 - a1;
-    v31 = v4;
-    do
+    records[i].u.image       = images[i];
+    records[i].next          = 0;
+    records[i].group         = images[i]->state.delay.group;
+    records[i].triangleCount = images[i]->state.delay.groupTriCount;
+    records[i].width  = images[i]->width > images[i]->height ? images[i]->width : images[i]->height;
+    records[i].height = images[i]->width + images[i]->height - records[i].width;
+    if ( images[i]->flags & IMAGE_FLAG_ALLOW_PICMIP )
     {
-      *(v8 - 5) = *(_DWORD *)v7;
-      *(v8 - 4) = 0;
-      *(v8 - 2) = *(_DWORD *)(*(_DWORD *)v7 + 108);
-      *(v8 - 3) = *(_DWORD *)(*(_DWORD *)v7 + 112);
-      LOWORD(v9) = *(_WORD *)(*(_DWORD *)v7 + 66);
-      v10 = *(_WORD *)(*(_DWORD *)v7 + 64);
-      if ( v10 <= (unsigned __int16)v9 )
-        v9 = (unsigned __int16)v9;
-      else
-        v9 = v10;
-      *(v8 - 1) = v9;
-      *v8 = *(unsigned __int16 *)(*(_DWORD *)v7 + 64) + *(unsigned __int16 *)(*(_DWORD *)v7 + 66) - v9;
-      v11 = *(_DWORD *)(*(_DWORD *)v7 + 100);
-      if ( (v11 & 2) != 0 )
+      for ( picmip = R_PicmipForImageFlags( images[i]->flags ); picmip && records[i].width > 4 && records[i].height > 4; picmip-- )
       {
-        v12 = r_picmip2;
-        if ( (v11 & 4) == 0 )
-          v12 = r_picmip;
-        integer = v12->integer;
-        if ( (v11 & 2) != 0 )
-        {
-          v14 = 3;
-          if ( integer <= 3 )
-            v14 = integer;
-          for ( i = v14 & ~(v14 >> 31); i; *v8 = v17 >> 1 )
-          {
-            v16 = *(v8 - 1);
-            if ( v16 <= 4 )
-              break;
-            v17 = *v8;
-            if ( *v8 <= 4 )
-              break;
-            --i;
-            *(v8 - 1) = v16 >> 1;
-          }
-        }
+        records[i].width  >>= 1;
+        records[i].height >>= 1;
       }
-      if ( *(v8 - 1) > glConfig_maxTextureSize )
-      {
-        do
-        {
-          v18 = *(v8 - 1) >> 1;
-          v19 = *v8 >> 1;
-          *(v8 - 1) = v18;
-          *v8 = v19;
-        }
-        while ( v18 > glConfig_maxTextureSize );
-      }
-      *(_DWORD *)&v29[v7] = v8 - 5;
-      v8 += 6;
-      v7 += 4;
-      --v31;
     }
-    while ( v31 );
-    v4 = a2;
+    while ( records[i].width > glConfig.maxTextureSize )
+    {
+      records[i].width  >>= 1;
+      records[i].height >>= 1;
+    }
+    list[i] = &records[i];
   }
-  v31 = v4;
-  qsort_m((unsigned int)v28, v4, 4u, (int (__cdecl *)(unsigned int, _BYTE *))compare_mergable_xxxxx);
-  v20 = 0;
-  if ( v4 > 0 )
+  outIndex = count;
+  qsort_m( (unsigned int)list, count, 4u, (int (__cdecl *)(unsigned int, byte *))compare_mergable_xxxxx );
+  for ( start = 0; start < count; start = end )
   {
-    while ( 1 )
+    for ( end = start + 1; end < count; end++ )
     {
-      for ( j = v20 + 1; j < v4; ++j )
-      {
-        if ( *(_DWORD *)(v28[v20] + 12) != *(_DWORD *)(v28[j] + 12) )
-          break;
-      }
-      v31 = MergeImageList((int)v30, (int)&v28[v20], j - v20, v31);
-      v20 = j;
-      if ( j >= a2 )
-        break;
-      v4 = a2;
-    }
-  }
-  for ( k = CombineImageGroups((unsigned int *)&a2, (unsigned int)v28);
-        k;
-        k = CombineImageGroups((unsigned int *)&a2, (unsigned int)v28) )
-  {
-    v23 = 0;
-    if ( *(_DWORD *)(v28[0] + 12) != k )
-    {
-      do
-        v24 = *(_DWORD *)(v28[++v23] + 12);
-      while ( v24 != k );
-    }
-    for ( m = v23 + 1; m < a2; ++m )
-    {
-      if ( *(_DWORD *)(v28[v23] + 12) != *(_DWORD *)(v28[m] + 12) )
+      if ( list[start]->group != list[end]->group )
         break;
     }
-    v31 = MergeImageList((int)v30, (int)&v28[v23], m - v23, v31);
+    outIndex = MergeImageList( (int)records, (int)&list[start], end - start, outIndex );
   }
-  v26 = a2;
+  while ( ( group = CombineImageGroups( (unsigned int *)&count, (unsigned int)list ) ) != 0 )
+  {
+    for ( start = 0; list[start]->group != group; start++ )
+      ;
+    for ( end = start + 1; end < count; end++ )
+    {
+      if ( list[start]->group != list[end]->group )
+        break;
+    }
+    outIndex = MergeImageList( (int)records, (int)&list[start], end - start, outIndex );
+  }
   if ( r_debugOptTex->integer )
-    ri_Printf(0, "%i groups\n", a2);
-  for ( n = 0; n < v26; ++n )
-    UploadImageGroup(n, (int *)v28[n], a3, a4);
+    ri.Printf( 0, "%i groups\n", count );
+  for ( i = 0; i < count; i++ )
+    UploadImageGroup( (int *)list[i], i, format, flags );
 }
 
 /* ---- compare_image_types  0x004F0030 ----  [HIGH] */
-int __cdecl compare_image_types(int a1, int a2)
+/* qsort comparator over image-pointer slots: internalFormat then mipmap flag. */
+int __cdecl compare_image_types(int slotA, int slotB)
 {
-  int result;
+  image_t *imageA = *(image_t **)slotA;
+  image_t *imageB = *(image_t **)slotB;
+  int result = (int)imageA->internalFormat - (int)imageB->internalFormat;
 
-  result = *(_DWORD *)(*(_DWORD *)a1 + 96) - *(_DWORD *)(*(_DWORD *)a2 + 96);
   if ( !result )
-    return (*(_DWORD *)(*(_DWORD *)a1 + 100) & 1) - (*(_DWORD *)(*(_DWORD *)a2 + 100) & 1);
+    return ( imageA->flags & IMAGE_FLAG_MIPMAP ) - ( imageB->flags & IMAGE_FLAG_MIPMAP );
   return result;
 }
 
 /* ---- R_LoadDelayedImages  0x004F0060 ----  VERIFIED */
+/* Gathers every delayed image, sorts by (format, mipmap), then hands each run
+ * of same-format/same-mipmap images to MergeAndLoadDelayedImages (which packs
+ * them into sheets and uploads). */
 void R_LoadDelayedImages()
 {
-  signed int v1;
-  int v2;
-  int v3;
-  signed int v4;
-  signed int v5;
-  int v6;
-  _DWORD *v7;
-  int v8;
-  signed int v9;
+	image_t **delayed;
+	int       count;
+	int       i;
+	int       start;
+	int       end;
 
-  tr_delayedImageGroup = 0;
-  if ( tr_delayedImageCount )
-  {
-    v7 = (_DWORD *)alloca((4 * tr_delayedImageCount + 3) & 0xFFFFFFFC);
-    v1 = 0;
-    v2 = 0;
-    v9 = 0;
-    if ( tr_numImages > 0 )
-    {
-      do
-      {
-        v3 = dword_16C9840[v2];
-        if ( v3 )
-        {
-          if ( (*(_BYTE *)(v3 + 100) & 0x80) != 0 )
-            v7[v1++] = v3;
-        }
-        ++v2;
-      }
-      while ( v2 < tr_numImages );
-      v9 = v1;
-    }
-    qsort_m((unsigned int)v7, v1, 4u, (int (__cdecl *)(unsigned int, _BYTE *))compare_image_types);
-    v4 = 0;
-    if ( v1 > 0 )
-    {
-      do
-      {
-        v5 = v4 + 1;
-        if ( v4 + 1 < v1 )
-        {
-          v8 = *(_DWORD *)(v7[v4] + 96);
-          do
-          {
-            v6 = v7[v5];
-            if ( v8 != *(_DWORD *)(v6 + 96) )
-              break;
-            if ( ((*(_BYTE *)(v6 + 100) ^ *(_BYTE *)(v7[v4] + 100)) & 1) != 0 )
-              break;
-            ++v5;
-          }
-          while ( v5 < v1 );
-        }
-        MergeAndLoadDelayedImages((int)&v7[v4], v5 - v4, *(_DWORD *)(v7[v4] + 96), *(_DWORD *)(v7[v4] + 100) & 1);
-        v1 = v9;
-        v4 = v5;
-      }
-      while ( v5 < v9 );
-    }
-    tr_delayedImageCount = 0;
-  }
+	(*(int *)(((char *)(void *)&tr_registered) + 0x0128)) = 0;
+	if ( !tr_delayedImageCount )
+		return;
+
+	delayed = (image_t **)_alloca( tr_delayedImageCount * sizeof( image_t * ) );
+	count = 0;
+	for ( i = 0; i < tr_numImages; i++ )
+	{
+		if ( tr_images[i] && ( tr_images[i]->flags & IMAGE_FLAG_DELAYED_UPLOAD ) )
+			delayed[count++] = tr_images[i];
+	}
+
+	qsort_m( (unsigned int)delayed, count, 4u, (int (__cdecl *)(unsigned int, byte *))compare_image_types );
+
+	for ( start = 0; start < count; start = end )
+	{
+		for ( end = start + 1; end < count; end++ )
+		{
+			if ( delayed[start]->internalFormat != delayed[end]->internalFormat )
+				break;
+			if ( ( delayed[start]->flags ^ delayed[end]->flags ) & IMAGE_FLAG_MIPMAP )
+				break;
+		}
+		MergeAndLoadDelayedImages( &delayed[start], end - start, delayed[start]->internalFormat,
+		                           delayed[start]->flags & IMAGE_FLAG_MIPMAP );
+	}
+
+	tr_delayedImageCount = 0;
 }
 
 /* ---- R_CreateDlightImage  0x004F0150 ----  VERIFIED */
-int R_CreateDlightImage()
+void R_CreateDlightImage()
 {
-  double v0;
-  double v1;
-  unsigned __int8 *v2;
-  int v3;
-  unsigned __int64 v4; // rax
-  bool v5; // cc
-  int v6;
-  int result;
-  int v8;
-  unsigned __int8 *v9;
-  int v10;
-  float v11;
-  cvar_t *v12;
-  cvar_t *v13;
-  unsigned __int8 v14[16384]; // [esp+28h] [ebp-8020h] BYREF
-  _DWORD v15[4]; // [esp+4028h] [ebp-4020h] BYREF
-  __int16 v16;
-  _BYTE v17[16384]; // [esp+403Ah] [ebp-400Eh] BYREF
-  unsigned int v18;
-  unsigned int retaddr;
+	int            x, y;
+	int            b;
+	unsigned char  data[64][64][4];
+	unsigned char  tga[18 + sizeof( data )];   /* one block: 18-byte header, pixels at +18 */
+	cvar_t        *radiusCvar;
+	cvar_t        *shiftCvar;
+	rfloat         shiftSq;
+	float          scale;
+	image_t       *image;
 
-  v18 = retaddr ^ _security_cookie;
-  v13 = ri_Cvar_Get("r_dlightRadius", "0.1124278", 0);
-  v12 = ri_Cvar_Get("r_dlightShift", "0.3162278", 0);
-  v0 = v12->value * v12->value;
-  v8 = 0;
-  v9 = &v14[1];
-  v1 = 1.0 / (v0 + 1.0);
-  v11 = 255.0 / (1.0 / (v13->value * v13->value + v0) - v1);
-  do
-  {
-    v2 = v9;
-    v3 = 0;
-    v10 = 0;
-    do
-    {
-      v4 = (unsigned __int64)(v11
-                            / (((31.5 - (double)v10) * (31.5 - (double)v10) + (31.5 - (double)v8) * (31.5 - (double)v8))
-                             * 0.0010078106
-                             + v0)
-                            - v1 * v11);
-      if ( (int)v4 <= 255 )
-      {
-        if ( (int)v4 < 0 )
-          LOBYTE(v4) = 0;
-      }
-      else
-      {
-        LOBYTE(v4) = -1;
-      }
-      ++v3;
-      v2[1] = v4;
-      *v2 = v4;
-      *(v2 - 1) = v4;
-      v2[2] = -1;
-      v2 += 256;
-      v10 = v3;
-    }
-    while ( v3 < 64 );
-    v5 = ++v8 < 64;
-    v9 += 4;
-  }
-  while ( v5 );
-  v6 = R_AllocImage("*dlight", 3553, 64, 64, 48, 0);
-  if ( !R_CreateImageInternal(v6, 0, v14, 0xDE1u, 6408) )
-  {
-    R_FreeImage(v6);
-    v6 = 0;
-  }
-  tr_dlightImage = v6;
-  result = 1;
-  if ( v13->modificationCount > 1 || v12->modificationCount > 1 )
-  {
-    v15[0] = 0x20000;
-    v15[1] = 0;
-    v15[2] = 0;
-    v15[3] = 4194368;
-    v16 = 32;
-    qmemcpy(v17, v14, sizeof(v17));
-    return ri_FS_WriteFile("dlight.tga", v15, 16402);
-  }
-  return result;
+	radiusCvar = ri.Cvar_Get( "r_dlightRadius", "0.1124278", 0 );
+	shiftCvar  = ri.Cvar_Get( "r_dlightShift", "0.3162278", 0 );
+	shiftSq = (rfloat)shiftCvar->value * shiftCvar->value;
+	scale   = 255.0f / ( 1.0f / ( (rfloat)radiusCvar->value * radiusCvar->value + shiftSq )
+	                     - 1.0f / ( shiftSq + 1.0f ) );
+
+	for ( x = 0; x < 64; ++x )
+	{
+		for ( y = 0; y < 64; ++y )
+		{
+			/* signed __ftol2 at 0x004F022E (out-of-range / NaN -> 0x80000000 -> 0);
+			 * flt_569188 = 0x3A841883 = (float)(1 / 31.5^2) */
+			b = (int)( scale / ( (rfloat)( ( 31.5f - x ) * ( 31.5f - x ) + ( 31.5f - y ) * ( 31.5f - y ) )
+			                     * 0.0010078106f + shiftSq )
+			           - 1.0f / ( shiftSq + 1.0f ) * scale );
+			if ( b > 255 )
+				b = 255;
+			else if ( b < 0 )
+				b = 0;
+			data[y][x][0] =
+			data[y][x][1] =
+			data[y][x][2] = (unsigned char)b;
+			data[y][x][3] = 255;
+		}
+	}
+
+	image = R_AllocImage( "*dlight", 3553, 64, 64, 48, 0 );
+	if ( !R_CreateImageInternal( image, 0, (unsigned char *)data, 0xDE1u, 6408 ) )
+	{
+		R_FreeImage( image );
+		image = 0;
+	}
+	tr_dlightImage = (int)image;
+
+	if ( radiusCvar->modificationCount > 1 || shiftCvar->modificationCount > 1 )
+	{
+		memset( tga, 0, 18 );
+		tga[2]  = 2;    /* uncompressed true-colour */
+		tga[12] = 64;   /* width */
+		tga[13] = 0;
+		tga[14] = 64;   /* height */
+		tga[15] = 0;
+		tga[16] = 32;   /* bits per pixel */
+		memcpy( tga + 18, data, sizeof( data ) );
+		ri.FS_WriteFile( "dlight.tga", tga, sizeof( tga ) );
+	}
 }
 
 /* ---- R_CreateDefaultImage  0x004F0380 ----  VERIFIED */
-int R_CreateDefaultImage()
+/* 16x16 dark-grey (0x20202020) square with an opaque black one-pixel border. */
+void R_CreateDefaultImage()
 {
-  int v0;
-  char *v1;
-  int v2;
-  int result;
-  int v4[258]; // [esp+10h] [ebp-408h] BYREF
-  unsigned int retaddr;
+	int           x;
+	unsigned char data[16][16][4];
+	image_t      *image;
 
-  v4[257] = retaddr ^ _security_cookie;
-  memset(v4, 0x20u, 0x400u);
-  v0 = 0;
-  v1 = (char *)v4 + 1;
-  do
-  {
-    BYTE2(v4[v0]) = 0;
-    BYTE1(v4[v0]) = 0;
-    LOBYTE(v4[v0]) = 0;
-    BYTE3(v4[v0]) = -1;
-    BYTE2(v4[v0 + 240]) = 0;
-    BYTE1(v4[v0 + 240]) = 0;
-    LOBYTE(v4[v0 + 240]) = 0;
-    BYTE3(v4[v0 + 240]) = -1;
-    v1[1] = 0;
-    *v1 = 0;
-    *(v1 - 1) = 0;
-    v1[2] = -1;
-    v1[61] = 0;
-    v1[60] = 0;
-    v1[59] = 0;
-    v1[62] = -1;
-    ++v0;
-    v1 += 64;
-  }
-  while ( v0 < 16 );
-  v2 = R_AllocImage("*default", 3553, 16, 16, 1, 0);
-  result = R_CreateImageInternal(v2, 0, (unsigned __int8 *)v4, 0xDE1u, 6408);
-  if ( result )
-  {
-    tr_defaultImage = v2;
-  }
-  else
-  {
-    R_FreeImage(v2);
-    tr_defaultImage = 0;
-  }
-  return result;
+	memset( data, 32, sizeof( data ) );
+	for ( x = 0; x < 16; ++x )
+	{
+		data[0][x][0] =
+		data[0][x][1] =
+		data[0][x][2] = 0;
+		data[0][x][3] = 255;
+
+		data[15][x][0] =
+		data[15][x][1] =
+		data[15][x][2] = 0;
+		data[15][x][3] = 255;
+
+		data[x][0][0] =
+		data[x][0][1] =
+		data[x][0][2] = 0;
+		data[x][0][3] = 255;
+
+		data[x][15][0] =
+		data[x][15][1] =
+		data[x][15][2] = 0;
+		data[x][15][3] = 255;
+	}
+
+	image = R_AllocImage( "*default", 3553, 16, 16, 1, 0 );
+	if ( !R_CreateImageInternal( image, 0, (unsigned char *)data, 0xDE1u, 6408 ) )
+	{
+		R_FreeImage( image );
+		image = 0;
+	}
+	tr_defaultImage = (int)image;
 }
 
 /* ---- SmallestTextureSizeFitting  0x004F0480 ----  [HIGH] */
-int __cdecl SmallestTextureSizeFitting(char *this)
+/* Rounds `size` up to the next power of two (>= 1). */
+int __cdecl SmallestTextureSizeFitting( int size )
 {
-  int v1;
-  int result;
+	int result = 1;
 
-  v1 = (int)(this - 1);
-  for ( result = 1; v1; result *= 2 )
-    v1 >>= 1;
-  return result;
+	for ( --size; size; size >>= 1 )
+		result <<= 1;
+	return result;
 }
 
 /* ---- R_CreateScreenImage  0x004F04A0 ----  VERIFIED */
-int R_CreateScreenImage()
+/* Full-white capture image sized to the next power of two on each axis.
+ * (glConfig_vidWidth / glConfig_vidHeight hold the screen width / height.) */
+void R_CreateScreenImage()
 {
-  int v0;
-  int v1;
-  int v2;
-  int v3;
-  int *v4;
-  int v5;
-  int v7;
+	int      width  = SmallestTextureSizeFitting( glConfig_vidWidth );
+	int      height = SmallestTextureSizeFitting( glConfig_vidHeight );
+	int     *pixels;
+	image_t *image;
 
-  v0 = dwStyle - 1;
-  v1 = 1;
-  v7 = 1;
-  if ( dwStyle != 1 )
-  {
-    do
-    {
-      v0 >>= 1;
-      v1 *= 2;
-    }
-    while ( v0 );
-    v7 = v1;
-  }
-  v2 = dwExStyle - 1;
-  v3 = 1;
-  if ( dwExStyle != 1 )
-  {
-    do
-    {
-      v2 >>= 1;
-      v3 *= 2;
-    }
-    while ( v2 );
-  }
-  v4 = (int *)ri_Hunk_AllocateTempMemory(4 * v1 * v3);
-  Com_Memset(v4, 255, 4 * v1 * v3);
-  v5 = R_AllocImage("*screen", 3553, v1, v3, 560, 0);
-  if ( !R_CreateImageInternal(v5, 0, (unsigned __int8 *)v4, 0xDE1u, 6408) )
-  {
-    R_FreeImage(v5);
-    v5 = 0;
-  }
-  tr_screenImage = v5;
-  tr_screenImageWidth = v7;
-  tr_screenImageHeight = v3;
-  ri_Hunk_FreeTempMemory(v4);
-  return 0;
+	pixels = (int *)ri_Hunk_AllocateTempMemory( 4 * width * height );
+	Com_Memset( pixels, 255, 4 * width * height );
+
+	image = R_AllocImage( "*screen", 3553, width, height, 560, 0 );
+	if ( !R_CreateImageInternal( image, 0, (unsigned char *)pixels, 0xDE1u, 6408 ) )
+	{
+		R_FreeImage( image );
+		image = 0;
+	}
+	tr_screenImage       = (int)image;
+	tr_screenImageWidth  = width;
+	tr_screenImageHeight = height;
+	ri_Hunk_FreeTempMemory( pixels );
 }
 
 /* ---- R_CreateBuiltinImages  0x004F0560 ----  VERIFIED */
-int R_CreateBuiltinImages()
+/* Creates the *default / *white / *identityLight / *gray images, 32 *scratch
+ * images, the *dlight image and the *screen image. */
+void R_CreateBuiltinImages()
 {
-  int v0;
-  char v1;
-  char *v2;
-  int v3;
-  _BYTE *v4;
-  int v5;
-  int v6;
-  int v7;
-  int *v8;
-  int v9;
-  int HashValue;
-  int v11;
-  int v12;
-  int v14[258]; // [esp+10h] [ebp-408h] BYREF
-  unsigned int retaddr;
+	int           x, y;
+	unsigned char data[16][16][4];
+	image_t      *image;
 
-  v14[257] = retaddr ^ _security_cookie;
-  R_CreateDefaultImage();
-  memset(v14, 0xFFu, 0x400u);
-  v0 = R_AllocImage("*white", 3553, 8, 8, 0, 0);
-  if ( !R_CreateImageInternal(v0, 0, (unsigned __int8 *)v14, 0xDE1u, 6408) )
-  {
-    R_FreeImage(v0);
-    v0 = 0;
-  }
-  v1 = tr_identityLightByte;
-  tr_whiteImage = v0;
-  v2 = (char *)v14 + 1;
-  v3 = 16;
-  do
-  {
-    v4 = v2;
-    v5 = 16;
-    do
-    {
-      v4[1] = v1;
-      *v4 = v1;
-      *(v4 - 1) = v1;
-      v4[2] = -1;
-      v4 += 64;
-      --v5;
-    }
-    while ( v5 );
-    v2 += 4;
-    --v3;
-  }
-  while ( v3 );
-  v6 = R_AllocImage("*identityLight", 3553, 8, 8, 0, 0);
-  if ( !R_CreateImageInternal(v6, 0, (unsigned __int8 *)v14, 0xDE1u, 6408) )
-  {
-    R_FreeImage(v6);
-    v6 = 0;
-  }
-  memset(v14, 0xC0u, 0x400u);
-  tr_identityLightImage = v6;
-  v7 = R_AllocImage("*gray", 3553, 8, 8, 0, 0);
-  if ( !R_CreateImageInternal(v7, 0, (unsigned __int8 *)v14, 0xDE1u, 6408) )
-  {
-    R_FreeImage(v7);
-    v7 = 0;
-  }
-  tr_grayImage = v7;
-  v8 = tr_scratchImages;
-  do
-  {
-    v9 = R_AllocImage("*scratch", 3553, 16, 16, 50, 0);
-    if ( !R_CreateImageInternal(v9, 0, (unsigned __int8 *)v14, 0xDE1u, 6408) )
-    {
-      HashValue = tr_image_generateHashValue((char *)v9);
-      v11 = *(_DWORD *)(v9 + 116);
-      --tr_numImages;
-      v12 = glState_currentTmu;
-      hashtable[HashValue] = v11;
-      if ( glState_currentTextures[v12] == *(_DWORD *)(v9 + 88) )
-      {
-        glBindTexture(*(_DWORD *)(v9 + 84), 0);
-        glState_currentTextures[glState_currentTmu] = 0;
-      }
-      qglDeleteTextures(1, v9 + 88);
-      v9 = 0;
-    }
-    *v8++ = v9;
-  }
-  while ( v8 < &tr_scratchImages[32] );
-  R_CreateDlightImage();
-  return R_CreateScreenImage();
+	R_CreateDefaultImage();
+
+	/* *white -- solid 0xFF */
+	memset( data, 255, sizeof( data ) );
+	image = R_AllocImage( "*white", 3553, 8, 8, 0, 0 );
+	if ( !R_CreateImageInternal( image, 0, (unsigned char *)data, 0xDE1u, 6408 ) )
+	{
+		R_FreeImage( image );
+		image = 0;
+	}
+	tr_whiteImage = (int)image;
+
+	/* *identityLight -- RGB = tr_identityLightByte, A = 255 */
+	for ( x = 0; x < 16; ++x )
+	{
+		for ( y = 0; y < 16; ++y )
+		{
+			data[y][x][0] =
+			data[y][x][1] =
+			data[y][x][2] = (unsigned char)tr_identityLightByte;
+			data[y][x][3] = 255;
+		}
+	}
+	image = R_AllocImage( "*identityLight", 3553, 8, 8, 0, 0 );
+	if ( !R_CreateImageInternal( image, 0, (unsigned char *)data, 0xDE1u, 6408 ) )
+	{
+		R_FreeImage( image );
+		image = 0;
+	}
+	tr_identityLightImage = (int)image;
+
+	/* *gray -- solid 0xC0 */
+	memset( data, 0xC0, sizeof( data ) );
+	image = R_AllocImage( "*gray", 3553, 8, 8, 0, 0 );
+	if ( !R_CreateImageInternal( image, 0, (unsigned char *)data, 0xDE1u, 6408 ) )
+	{
+		R_FreeImage( image );
+		image = 0;
+	}
+	tr_grayImage = (int)image;
+
+	/* 32 *scratch images (reuse the *gray pixels) */
+	for ( x = 0; x < 32; ++x )
+	{
+		image = R_AllocImage( "*scratch", 3553, 16, 16, 50, 0 );
+		if ( !R_CreateImageInternal( image, 0, (unsigned char *)data, 0xDE1u, 6408 ) )
+		{
+			R_FreeImage( image );
+			image = 0;
+		}
+		tr_scratchImages[x] = (int)image;
+	}
+
+	R_CreateDlightImage();
+	R_CreateScreenImage();
 }
 
 /* ---- R_SetColorMappings  0x004F0780 ----  VERIFIED */
+/* Builds the gamma and intensity lookup tables from r_overBrightBits /
+ * r_gamma / r_intensity (clamping each), then pushes the gamma ramp to the
+ * device if it supports hardware gamma.  (The retail 1.0/0.5/3.0 tests are the
+ * same ordered comparisons once the NaN-only __UNORDERED__ terms are dropped.) */
 void R_SetColorMappings()
 {
-  int integer;
-  double v1;
-  int v2;
-  unsigned __int64 v3; // rax
-  int v4;
-  cvar_t *v5;
-  int v6;
-  unsigned __int64 v7; // rax
-  const char *v8;
-  int v9;
-  int v10;
-  float value;
+	int   i, j;
+	float g;
+	int   inf;
+	int   shift;
 
-  integer = r_overBrightBits->integer;
-  tr_overbrightBits = integer;
-  if ( !glConfig_deviceSupportsGamma )
-  {
-    integer = 0;
-    tr_overbrightBits = 0;
-  }
-  if ( !glConfig_isFullscreen )
-  {
-    integer = 0;
-    tr_overbrightBits = 0;
-  }
-  if ( glConfig_colorBits <= 16 )
-  {
-    if ( integer > 1 )
-    {
-      integer = 1;
-      goto LABEL_12;
-    }
-  }
-  else if ( integer > 2 )
-  {
-    integer = 2;
-    goto LABEL_12;
-  }
-  if ( integer >= 0 )
-    goto LABEL_13;
-  integer = 0;
-LABEL_12:
-  tr_overbrightBits = integer;
-LABEL_13:
-  v1 = 1.0 / (double)(1 << integer);
-  tr_identityLight = v1;
-  tr_identityLightByte = (unsigned __int8)(unsigned __int64)(v1 * 255.0);
-  if ( r_intensity->value <= 1.0 )
-  {
-    ri_Cvar_Set("r_intensity", "1");
-    LOBYTE(integer) = tr_overbrightBits;
-  }
-  if ( (r_gamma->value < 0.5) | __UNORDERED__(r_gamma->value, 0.5) )
-  {
-    v8 = "0.5";
-LABEL_19:
-    ri_Cvar_Set("r_gamma", v8);
-    LOBYTE(integer) = tr_overbrightBits;
-    goto LABEL_20;
-  }
-  if ( r_gamma->value > 3.0 )
-  {
-    v8 = "3.0";
-    goto LABEL_19;
-  }
-LABEL_20:
-  v2 = 0;
-  value = r_gamma->value;
-  v9 = 0;
-  do
-  {
-    if ( (value == 1.0) | __UNORDERED__(value, 1.0) )
-      LODWORD(v3) = v2;
-    else
-      v3 = (unsigned __int64)(pow((double)v9 * 0.0039215689, 1.0 / value) * 255.0 + 0.5);
-    v4 = (_DWORD)v3 << integer;
-    if ( v4 >= 0 )
-    {
-      if ( v4 > 255 )
-        LOBYTE(v4) = -1;
-    }
-    else
-    {
-      LOBYTE(v4) = 0;
-    }
-    s_gammatable[v2++] = v4;
-    v9 = v2;
-  }
-  while ( v2 < 256 );
-  v5 = r_intensity;
-  v6 = 0;
-  v10 = 0;
-  do
-  {
-    v7 = (unsigned __int64)((double)v10 * v5->value);
-    if ( (int)v7 > 255 )
-      LOBYTE(v7) = -1;
-    s_intensitytable[v6++] = v7;
-    v10 = v6;
-  }
-  while ( v6 < 256 );
-  if ( glConfig_deviceSupportsGamma )
-    GLimp_SetGamma( (unsigned char *)s_gammatable,
-                    (unsigned char *)s_gammatable,
-                    (unsigned char *)s_gammatable );
+	tr_overbrightBits = r_overBrightBits->integer;
+	if ( !glConfig_deviceSupportsGamma )
+		tr_overbrightBits = 0;
+	if ( !glConfig_isFullscreen )
+		tr_overbrightBits = 0;
+
+	if ( glConfig_colorBits > 16 )
+	{
+		if ( tr_overbrightBits > 2 )
+			tr_overbrightBits = 2;
+	}
+	else
+	{
+		if ( tr_overbrightBits > 1 )
+			tr_overbrightBits = 1;
+	}
+	if ( tr_overbrightBits < 0 )
+		tr_overbrightBits = 0;
+
+	tr_identityLight     = 1.0f / ( 1 << tr_overbrightBits );
+	tr_identityLightByte = (unsigned char)(int)( 255 * tr_identityLight );   /* __ftol2 at 0x004F0805, movzx al */
+
+	if ( r_intensity->value <= 1 )
+		ri.Cvar_Set( "r_intensity", "1" );
+
+	if ( r_gamma->value < 0.5f )
+		ri.Cvar_Set( "r_gamma", "0.5" );
+	else if ( r_gamma->value > 3.0f )
+		ri.Cvar_Set( "r_gamma", "3.0" );
+
+	g = r_gamma->value;
+
+	shift = tr_overbrightBits;
+
+	for ( i = 0; i < 256; ++i )
+	{
+		if ( g == 1 )
+			inf = i;
+		else
+			inf = (int)( 255 * pow( (rfloat)i * 0.0039215689f, 1.0f / (rfloat)g ) + 0.5f );   /* __ftol2 at 0x004F08DA; flt_568EC4 = (float)(1/255) = 0x3B808081 */
+		inf <<= shift;
+		if ( inf < 0 )
+			inf = 0;
+		if ( inf > 255 )
+			inf = 255;
+		s_gammatable[i] = (unsigned char)inf;
+	}
+
+	for ( i = 0; i < 256; ++i )
+	{
+		/* signed __ftol2 at 0x004F0927: a product >= 2^31 gives 0x80000000,
+		 * which the signed > 255 test lets through as byte 0 */
+		j = (int)( (rfloat)i * r_intensity->value );
+		if ( j > 255 )
+			j = 255;
+		s_intensitytable[i] = (unsigned char)j;
+	}
+
+	if ( glConfig_deviceSupportsGamma )
+		GLimp_SetGamma( (unsigned char *)s_gammatable,
+		                (unsigned char *)s_gammatable,
+		                (unsigned char *)s_gammatable );
 }
 
 /* ---- R_InitImages  0x004F0980 ----  [HIGH] */
-int R_InitImages()
+void R_InitImages()
 {
   memset(hashtable, 0, sizeof(hashtable));
   R_SetColorMappings();
-  return R_CreateBuiltinImages();
+  R_CreateBuiltinImages();
 }
 
 /* ---- R_DeleteTextures  0x004F09A0 ----  VERIFIED */
@@ -4851,90 +3827,70 @@ void R_DeleteTextures()
   int i;
 
   for ( i = 0; i < tr_numImages; ++i )
-    qglDeleteTextures(1, dword_16C9840[i] + 88);
-  memset(dword_16C9840, 0, sizeof(dword_16C9840));
+    qglDeleteTextures( 1, &tr_images[i]->texnum );
+  memset(tr_imageSlots, 0, R_MAX_IMAGES * sizeof(image_t *));   /* rep stosd 0x800 dwords at 0x004F09D1 */
   memset(glState_currentTextures, 0, 0x20u);
   if ( glBindTexture )
   {
     if ( qglActiveTextureARB )
     {
-      if ( glState_currentTmu != 1 )
-      {
-        qglActiveTextureARB(33985);
-        glState_currentTmu = 1;
-      }
-      if ( glState_currentClientTmu != 1 )
-      {
-        qglClientActiveTextureARB(33985);
-        glState_currentClientTmu = 1;
-      }
-      glBindTexture(0xDE1u, 0);
-      if ( glState_currentTmu )
-      {
-        qglActiveTextureARB(33984);
-        glState_currentTmu = 0;
-      }
-      if ( glState_currentClientTmu )
-      {
-        qglClientActiveTextureARB(33984);
-        glState_currentClientTmu = 0;
-      }
+      GL_SelectTexture( 1 );
+      glBindTexture( 0xDE1u, 0 );
+      GL_SelectTexture( 0 );
+      glBindTexture( 0xDE1u, 0 );
     }
-    glBindTexture(0xDE1u, 0);
+    else
+    {
+      glBindTexture( 0xDE1u, 0 );
+    }
   }
 }
 
-/* ---- RE_GetShaderFromModel  0x004F0AA0 ----  VERIFIED */
-int __cdecl RE_GetShaderFromModel(int a1, int a2)
-{
-  int v2;
-  int v3;
-  int v4;
-  int v5;
-  int v6;
-  char *Shader;
-  int v8;
-  int v9;
-  const char *v10;
-  int v12;
+int __cdecl R_GetModelByHandle( int a1 );   /* tr_model.c */
 
-  v2 = a2;
-  if ( a2 < 0 )
-    v2 = 0;
-  v3 = tr_models[a1];
-  if ( !v3 )
-    return 0;
-  v4 = *(_DWORD *)(v3 + 76);
-  if ( !v4 )
-    return 0;
-  v5 = *(_DWORD *)(v4 + 24);
-  if ( !v5 )
-    return 0;
-  if ( v2 >= *(_DWORD *)(v4 + 28) )
-    v2 = 0;
-  v6 = v5 + 12 * v2;
-  Shader = *(char **)(v6 + 4);
-  v12 = v6;
-  if ( *((int *)Shader + 16) > -1 )
-  {
-    v8 = 1;
-    v9 = hashtable[tr_image_generateHashValue(Shader)];
-    if ( v9 )
-    {
-      v10 = *(const char **)(v6 + 4);
-      while ( strcmp(v10, (const char *)v9) )
-      {
-        v9 = *(_DWORD *)(v9 + 116);
-        if ( !v9 )
-          goto LABEL_15;
-      }
-      v8 = *(_DWORD *)(v9 + 100) & 1;
-LABEL_15:
-      v6 = v12;
-    }
-    Shader = R_FindShader(*(char **)(v6 + 4), -1, v8, (const char *)8);
-    *(_DWORD *)(*((_DWORD *)Shader + 85) + 1636) = 10;
-    *(_DWORD *)(*((_DWORD *)Shader + 85) + 1668) = 1048832;
-  }
-  return *((_DWORD *)Shader + 17);
+/* ---- RE_GetShaderFromModel  0x004F0AA0 ----  VERIFIED */
+/* Resolves the material for one brush-model surface.  If the surface's shader
+ * is lightmapped, an existing image of the same name decides whether mipmaps
+ * are allowed, then R_FindShader is (re)invoked and two of its stage words are
+ * patched.  The material-internal offsets (+85 dwords, +1636, +1668, +17) are
+ * left raw -- they index a stage record beyond this file's shader_t view. */
+int __cdecl RE_GetShaderFromModel( int modelIndex, int surfaceNum )
+{
+	model_t     *model;
+	bmodel_t    *bmodel;
+	msurface_t  *surfaces;
+	msurface_t  *surf;
+	shader_t    *shader;
+	image_t     *image;
+	int          mipmapAllowed;
+	int          hash;
+
+	if ( surfaceNum < 0 )
+		surfaceNum = 0;
+	model = (model_t *)R_GetModelByHandle( modelIndex );
+	if ( !model || !( bmodel = model->bmodel ) || !( surfaces = bmodel->firstSurface ) )
+		return 0;
+	if ( surfaceNum >= bmodel->numSurfaces )
+		surfaceNum = 0;
+	surf = &surfaces[ surfaceNum ];
+
+	shader = (shader_t *)surf->shader;
+	if ( shader->lightmapIndex > -1 )
+	{
+		mipmapAllowed = 1;
+		hash = tr_image_generateHashValue( (char *)surf->shader );
+		for ( image = ( (image_t **)(void *)hashtable )[ hash ]; image; image = image->hashNext )
+		{
+			if ( !strcmp( (char *)surf->shader, image->imgName ) )
+			{
+				mipmapAllowed = image->flags & 0x0001;
+				break;
+			}
+		}
+
+		shader = (shader_t *)R_FindShader( (char *)surf->shader, -1, mipmapAllowed, (const char *)8 );
+		*(unsigned int *)( *( (unsigned int *)shader + 85 ) + 1636 ) = 10;
+		*(unsigned int *)( *( (unsigned int *)shader + 85 ) + 1668 ) = 1048832;
+	}
+	return shader->index;
 }

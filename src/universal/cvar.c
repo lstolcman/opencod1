@@ -28,7 +28,7 @@ static cvar_t  *cvar_hashTable[FILE_HASH_SIZE];
 static long generateHashValue_Cvar( const char *fname ) {
 	int i;
 	long hash;
-	char letter;
+	int letter;
 
 	if ( !fname ) {
 		Com_Error( ERR_DROP, "\x15" "null name in generateHashValue" );
@@ -82,7 +82,8 @@ void Cvar_Shutdown( void ) {
 	int i;
 	cvar_t  *var;
 
-	for ( i = 0 ; i < FILE_HASH_SIZE ; i++ ) {
+	/* size_t bound: retail's loop compare is unsigned */
+	for ( i = 0 ; i < sizeof( cvar_hashTable ) / sizeof( cvar_hashTable[0] ) ; i++ ) {
 		for ( var = cvar_hashTable[i] ; var ; var = var->hashNext ) {
 			if ( var->latchedString ) {
 				free( var->latchedString );
@@ -107,13 +108,13 @@ cvar_t *Cvar_Get( const char *var_name, const char *var_value, int flags ) {
 	cvar_t  *var;
 	long hash;
 	cvar_t  **prev;
-	int len;
+	char *str;
 
 	if ( !var_name || !var_value ) {
 		Com_Error( ERR_FATAL, "\x15" "Cvar_Get: NULL parameter" );
 	}
 
-	if ( strchr( var_name, '\\' ) || strchr( var_name, '\"' ) || strchr( var_name, ';' ) ) {
+	if ( !Cvar_ValidateString( var_name ) ) {
 		Com_Error( ERR_FATAL, va( "invalid cvar name string: %s", var_name ) );
 	}
 
@@ -156,38 +157,27 @@ cvar_t *Cvar_Get( const char *var_name, const char *var_value, int flags ) {
 	var = &cvar_indexes[cvar_numIndexes];
 	cvar_numIndexes++;
 
-	len = strlen( var_name ) + 1;
-	var->name = malloc( len );
-	if ( !var->name ) {
-		Sys_OutOfMemoryError();
-	}
-	Com_Memset( var->name, 0, len );
-	strcpy( var->name, var_name );
-
-	len = strlen( var_value ) + 1;
-	var->string = malloc( len );
-	if ( !var->string ) {
-		Sys_OutOfMemoryError();
-	}
-	Com_Memset( var->string, 0, len );
-	strcpy( var->string, var_value );
-
+	/* CopyStringInternal written out: a temp keeps retail's strcpy loop shape */
+	str = Z_MallocInternal( strlen( var_name ) + 1 );
+	strcpy( str, var_name );
+	var->name = str;
+	str = Z_MallocInternal( strlen( var_value ) + 1 );
+	strcpy( str, var_value );
+	var->string = str;
 	var->modified = qtrue;
 	var->modificationCount = 1;
 	var->value = atof( var->string );
 	var->integer = atoi( var->string );
+	str = Z_MallocInternal( strlen( var_value ) + 1 );
+	strcpy( str, var_value );
+	var->resetString = str;
 
-	len = strlen( var_value ) + 1;
-	var->resetString = malloc( len );
-	if ( !var->resetString ) {
-		Sys_OutOfMemoryError();
-	}
-	Com_Memset( var->resetString, 0, len );
-	strcpy( var->resetString, var_value );
-
+	/* retail sorts with the CRT _stricmp (0x0053549F, folds to lower case),
+	   not Q_stricmp (folds to upper case); the two order '_' etc. differently
+	   against letters. */
 	prev = &cvar_vars;
 	while ( *prev ) {
-		if ( Q_stricmp( var->name, ( *prev )->name ) < 0 ) {
+		if ( _stricmp( var->name, ( *prev )->name ) < 0 ) {
 			break;
 		}
 		prev = &( *prev )->next;
@@ -302,7 +292,7 @@ void Cvar_Set( const char *var_name, const char *value ) {
 }
 
 /* ---- Cvar_VMSet  0x00439920 ---- */
-void Cvar_VMSet( const char *value, vmCvar_t *vmCvar ) {
+void Cvar_VMSet( vmCvar_t *vmCvar, const char *value ) {
 	Cvar_Set2( cvar_indexes[vmCvar->handle].name, value, qtrue );
 	Cvar_Update( vmCvar );
 }
@@ -362,7 +352,8 @@ void    Cvar_Update( vmCvar_t *vmCvar ) {
 	if ( strlen( cv->string ) + 1 > MAX_CVAR_VALUE_STRING ) {
 		Com_Error( ERR_DROP, "\x15" "Cvar_Update: src %s length %d exceeds MAX_CVAR_VALUE_STRING",
 				   cv->string,
-				   strlen( cv->string ) );
+				   strlen( cv->string ),
+				   sizeof( vmCvar->string ) );
 	}
 	Q_strncpyz( vmCvar->string, cv->string, MAX_CVAR_VALUE_STRING );
 

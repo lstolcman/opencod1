@@ -1,44 +1,6 @@
-/*
- * cg_weapons_mp.c -- events and effects dealing with weapons.
- *
- * cgame/cg_weapons.c of cgame_mp_x86.dll (CoD 1.1 multiplayer, imagebase
- * 0x30000000).  49 functions, 0x300341B0 .. 0x30039750, in address order.
- *
- * RTCW's cgame/cg_weapons.c is the ancestor of CG_RegisterItemVisuals,
- * CG_RegisterItems, CG_RailTrail, CG_CalculateWeaponPosition, CG_AddViewWeapon,
- * CG_AddPlayerWeapon, CG_DrawWeaponSelect, CG_WeaponSelectable,
- * CG_FinishWeaponChange, CG_NextWeapon_f / CG_PrevWeapon_f / CG_Weapon_f,
- * CG_FireWeapon and the tracer family.  Everything else is CoD's own:
- *
- *   - the viewmodel is DObj + XAnim, not a frame/oldframe model, so
- *     CG_RegisterWeapon builds an anim tree of twenty animations and a
- *     two-part DObj, and CG_StartWeaponAnim / CG_PlayADSAnim /
- *     CG_WeaponRunXModelAnims drive it by goal weight instead of by frame;
- *   - weapon selection is CoD's six-slot model (CG_CycleWeap,
- *     CG_SelectFirstWeaponInSlot / NotInSlot, CG_WeaponSlot_f,
- *     CG_AltWeapon_f), not Q3's thirteen-bit weapon mask;
- *   - ADS, sway and recoil have no RTCW ancestor at all.  The heavy lifting
- *     lives in the shared game/bg_weapon.c -- this unit only assembles the
- *     pmWeaponAngleState_t, calls BG_CalculateWeaponAngles /
- *     BG_CalculateWeaponPosition_Sway and writes the results back into cg.
- *
- * TWO WEAPON RECORDS, DO NOT CONFLATE THEM.
- *   weaponInfo_t   1052 bytes, bg_public.h, the parsed weapon file.  cgame
- *                  reaches it through bg_weaponInfo[weapon], the pointer
- *                  table at 0x300EEF3C (recovered symbol misnamed
- *                  `cg_weapons`), with bg_numWeapons beside it at 0x300EEF38
- *                  (CG_RegisterWeapon 0x30034D19/0x30034D2E).
- *   cgWeaponInfo_t 408 bytes, cg_local.h, cgame's own per-weapon record.  That
- *                  is cg_weapons[64] at 0x301A6940, and it is this unit that
- *                  fills it in (CG_RegisterWeapon `imul ebp, 198h` 0x30034D21).
- *
- * THE HOLES.  cgWeaponInfo_t, cg_t, cgs_t and refEntity_t are all declared
- * with unnamed ranges in the headers.  Fields inside those ranges are reached
- * through the overlays and macros below, each carrying the offset and a
- * reference address.
- *
- * @fidelity: partial
- */
+// cg_weapons_mp.c -- events and effects dealing with weapons
+// The viewmodel is a DObj driven by XAnim goal weights, weapon selection uses
+// the slot bar, and the sway / ADS / recoil maths live in bg_weapon.c.
 
 #include "cg_local.h"
 
@@ -47,214 +9,94 @@
 #include <string.h>
 #include <math.h>
 
-/* Declarations no header carries. */
-
-/* universal/com_math.c and universal/q_shared.c */
+// com_math.c / q_shared.c
 vec_t           VectorNormalize( vec3_t v );
-/* DObjSkel2MatrixMultiply43's register mapping is eax = mat43, ecx = boneMatrix,
-   edx = out (CG_AddPlayerWeapon 0x30037137). */
+float           GetLeanFraction( float f );
 
-/* game/bg_misc.c and game/bg_weapon.c.  bg_public.h declares neither the two
-   angle solvers nor the two name lookups. */
+// bg_misc.c / bg_weapon.c
 void            BG_EvaluateTrajectory( const trajectory_t *tr, int atTime, vec3_t result );
 void            BG_CalculateWeaponAngles( pmWeaponAngleState_t *state, vec3_t angles );
-void            BG_CalculateWeaponPosition_Sway( vec3_t swayOffsets, vec3_t swayAngles,
-												 const playerState_t *ps,
-												 vec3_t previousViewAngles, float scale, int msec );
+void            BG_CalculateWeaponPosition_Sway( const playerState_t *ps, vec3_t swayOffsets,
+										 vec3_t swayAngles, vec3_t previousViewAngles, float scale, int msec );
 int             BG_GetWeaponIndexForName( const char *name );
 int             BG_GetWeaponSlotForName( const char *name );
 
-/* Com_Error level 7, the one the localization failures below use
-   (CG_RegisterWeapon 0x30035D1B).  q_shared.h's errorParm_t stops at 5. */
+// Com_Error level for localization failures; errorParm_t stops short of it
 #define ERR_LOCALIZATION    7
 
-/* cg_main_mp.c -- see the note in cg_local.h; the binary returns the length. */
+// cg_main_mp.c
 int             CG_PlaySoundAliasByName( const char *name, int entnum, const vec3_t origin );
 
-/* cg_localents_mp.c */
+// cg_localents_mp.c
 localEntity_t  *CG_AllocLocalEntity( void );
 
-/* cg_draw_mp.c */
+// cg_draw_mp.c
 qboolean        CG_GetWeapReticleZoom( float *zoom );
 
-/* cg_newDraw_mp.c / ui_shared.c */
+// cg_newDraw_mp.c / ui_shared.c
 void            Controls_GetConfig( void );
 const char     *BindingFromName( const char *name );
 
 /*
 =============================================================================
 
-	THE HOLES
+	LOCAL TYPES
 
 =============================================================================
 */
 
-
-/*
- * cg_items[] -- this unit's per-item record, 36 bytes (0x301DC3E0,
- * `lea ebp,[eax+eax*8]` in CG_RegisterItemVisuals at 0x30036082).  cg_ent_mp.c
- * already carries an extern for it under this name.
- */
 typedef struct cgItemInfo_t {
-	qboolean        registered;             /* +0x00 CG_RegisterItemVisuals 0x30036085 */
-	qhandle_t       models[MAX_ITEM_MODELS];/* +0x04 0x300360E2 */
-	qhandle_t       icon;                   /* +0x0C 0x30036103 */
-	byte            unknown_0x10[12];
-	const char     *pickupSound;            /* +0x1C 0x3003611F */
-	const char     *ammoPickupSound;        /* +0x20 CG_RegisterWeapon 0x30035B4B */
+	qboolean        registered;
+	qhandle_t       models[MAX_ITEM_MODELS];
+	qhandle_t       icons[MAX_ITEM_ICONS];  // only [0] is used
+	const char     *pickupSound;
+	const char     *ammoPickupSound;
 } cgItemInfo_t;
 CG_ASSERT_SIZE( cgItemInfo_t, 36 );
+CG_ASSERT_OFFSET( cgItemInfo_t, pickupSound, 0x1C );
 
-/*
- * The three DObjModel_t records CG_RegisterWeapon and CG_ChangeViewmodelDobj
- * hand to Com_ClientDObjCreate (trap 164).  12 bytes: the XModel pointer
- * trap_R_GetXModelByHandle returns, the tag the part hangs off, and the
- * qhandle_t the part was registered under (stored as a word, 0x30035181).
- */
+// one part of a viewmodel DObj: the model, the tag it hangs off, and the
+// handle it was registered under
 typedef struct cgDObjModel_t {
-	void           *xmodel;                 /* +0x00 */
-	const char     *tagName;                /* +0x04 */
-	short           hModel;                 /* +0x08 */
-	short           pad;                    /* +0x0A */
+	void           *xmodel;
+	const char     *tagName;
+	short           hModel;
+	short           pad;
 } cgDObjModel_t;
 CG_ASSERT_SIZE( cgDObjModel_t, 12 );
 
-/*
- * refEntity_t.  Five offsets this unit stores into that land in cg_public.h's
- * unknown_ ranges.
- */
-#define RE_LIGHTINGORIGIN( e )  ( (float *)&( e )->unknown_0x08[4] )        /* +0x0C CG_AddPlayerWeapon 0x30036D96 */
-#define RE_UNKNOWN_0x18( e )    ( *(int *)&( e )->unknown_0x08[0x10] )      /* +0x18 CG_AddPlayerWeapon 0x30036DB3 */
-#define RE_CUSTOMSHADER( e )    ( *(qhandle_t *)&( e )->unknown_0x60[8] )    /* +0x68 CG_RailTrail2 0x3003482D */
-#define RE_SHADERTIME( e )      ( *(float *)&( e )->unknown_0x70[8] )        /* +0x78 CG_RailTrail2 0x30034821 */
-#define RE_RADIUS( e )          ( *(float *)&( e )->unknown_0x70[0x0C] )     /* +0x7C CG_WaterRipple 0x30038DA7 */
-#define RE_DOBJ( e )            ( *(int *)&( e )->unknown_0x70[0x20] )       /* +0x90 CG_AddPlayerWeapon 0x30036DE7 */
+#define RT_DOBJ                 1
+#define RT_SPRITE_LOCAL         5
+#define RT_RAIL_CORE            7
 
-#define RT_DOBJ                 1       /* CG_AddPlayerWeapon 0x30036E27 */
-#define RT_SPRITE_LOCAL         5       /* CG_WaterRipple 0x30038D72 */
-#define RT_RAIL_CORE            7       /* CG_RailTrail2 0x3003480C */
+#define RF_VIEWMODEL            0x0C
+#define RF_PLAYERMODEL          0x8C
 
-#define RF_VIEWMODEL            0x0C    /* CG_AddViewWeapon 0x300375A2 */
-#define RF_PLAYERMODEL          0x8C    /* CG_AddPlayerWeapon 0x30036E2F */
+#define LE_FADE_RGB             0
+#define LE_SCALE_FADE           1
+#define LE_MOVING_TRACER        2
 
-/*
- * localEntity_t.  cg_local.h carries the record from leType through lifeRate
- * and then one 212-byte hole; the hole is a vec4 of RGBA at +0x3C and a whole
- * refEntity_t at +0x50 (0x50 + 156 == 236, the record size exactly).
- */
-#define LE_COLOR( le )          ( (float *)&( le )->unknown_0x018[0x24] )        /* +0x3C CG_RailTrail2 0x30034867 */
-#define LE_REFENTITY( le )      ( (refEntity_t *)&( le )->unknown_0x018[0x38] )  /* +0x50 CG_RailTrail2 0x3003480C */
-
-#define LE_FADE_RGB             0       /* CG_RailTrail2 0x300347DB */
-#define LE_SCALE_FADE           1       /* CG_WaterRipple 0x30038D2E */
-#define LE_MOVING_TRACER        2       /* CG_SpawnTracer 0x30039022 */
-
-/*
- * localEntity_t's moving-tracer payload, the fields CG_SpawnTracer fills in
- * (0x3003906C..0x300390A9) that sit inside the same hole.
- */
-#define LE_TRACERFLAGS( le )    ( *(int *)&( le )->unknown_0x018[0x00] )     /* +0x18 0x30039075 */
-#define LE_TRACERTIME( le )     ( *(int *)&( le )->unknown_0x018[0x04] )     /* +0x1C 0x3003906C */
-#define LE_TRACERORIGIN( le )   ( (float *)&( le )->unknown_0x018[0x0C] )    /* +0x24 0x3003906F */
-#define LE_TRACERVELOCITY( le ) ( (float *)&( le )->unknown_0x018[0x18] )    /* +0x30 0x3003908F */
-
-/*
- * cg_t.  Everything this unit touches that cg_local.h spells as a hole.
- *
- * cg.unknown_0x27314[48] is the ADS / weapon-position lerp block CG_Respawn
- * clears (0x30028B2C).
- */
-#define CG_ADSLASTFRAC()        ( *(float *)&cg.unknown_0x27314[0x00] )      /* cg+0x27314 0x30036C6D */
-#define CG_ADSGOINGUP()         ( *(int *)&cg.unknown_0x27314[0x04] )        /* cg+0x27318 0x30036C63 */
-#define CG_WEAPONPOSBASE()      ( (float *)&cg.unknown_0x27314[0x08] )       /* cg+0x2731C 0x30036805 */
-#define CG_IDLESCALE()          ( *(float *)&cg.unknown_0x27314[0x14] )      /* cg+0x27328 0x30037552 */
-#define CG_POSTRACK()           ( (float *)&cg.unknown_0x27314[0x18] )       /* cg+0x2732C 0x30036497 */
-#define CG_MOVEOFFSET()         ( (float *)&cg.unknown_0x27314[0x24] )       /* cg+0x27338 0x30037535 */
-
-/* cg.unknown_0x27498[36] is exactly BG_CalculateWeaponPosition_Sway's three
-   out-parameters, in the order it takes them (0x30036276..0x30036290). */
-#define CG_PREVVIEWANGLES()     ( (float *)&cg.unknown_0x27498[0x00] )       /* cg+0x27498 */
-#define CG_SWAYANGLES()         ( (float *)&cg.unknown_0x27498[0x0C] )       /* cg+0x274A4 */
-#define CG_SWAYOFFSETS()        ( (float *)&cg.unknown_0x27498[0x18] )       /* cg+0x274B0 */
-
-/* cg.unknown_0x2A7EC[24] is six per-slot fade fractions, indexed by weapon slot
-   (CG_DrawWeaponSelect walks 0x3020C940 down to 0x3020C92C, 0x30037ED6). */
-#define CG_SLOTFADE()           ( (float *)cg.unknown_0x2A7EC )              /* cg+0x2A7EC */
-/* cg+0x2A804 is the cg.time of the previous CG_DrawWeaponSelect (0x300377A0). */
-#define CG_WEAPONSELECTDRAWTIME()   ( cg.unknown_0x2A804 )
-
-/* cg.unknown_0x2A8AC[8] -- RTCW's bobfracsin / xyspeed pair. */
-#define CG_XYSPEED()            ( *(float *)&cg.unknown_0x2A8AC[4] )         /* cg+0x2A8B0 0x300362F8 */
-
-/* cg.unknown_0x2A994 gates the whole of CG_AddViewWeapon (0x3003725E). */
-#define CG_NOVIEWWEAPON()       ( cg.unknown_0x2A994 )
-
-/*
- * cg.unknown_0x2AA40[96] -- the view-model placement block.  The first two are
- * the angles CG_CalcCrosshairPosition reads back (0x30015D73); then the ADS
- * world offset, the recoil state BG_CalculateWeaponAngles owns, and the tag
- * origin/axis CG_DObjGetViewModelTagMatrix reads (0x3001C40A).
- */
-#define CG_GUNPITCH()           ( *(float *)&cg.unknown_0x2AA40[0x00] )      /* cg+0x2AA40 0x300374F8 */
-#define CG_GUNYAW()             ( *(float *)&cg.unknown_0x2AA40[0x04] )      /* cg+0x2AA44 0x30037508 */
-#define CG_ADSWORLDOFFSET()     ( (float *)&cg.unknown_0x2AA40[0x08] )       /* cg+0x2AA48 0x30036935 */
-#define CG_RECOILPITCH()        ( *(float *)&cg.unknown_0x2AA40[0x14] )      /* cg+0x2AA54 0x3003755C */
-#define CG_RECOILYAW()          ( *(float *)&cg.unknown_0x2AA40[0x18] )      /* cg+0x2AA58 */
-#define CG_RECOILROLL()         ( *(float *)&cg.unknown_0x2AA40[0x1C] )      /* cg+0x2AA5C */
-#define CG_RECOILPITCHSPEED()   ( *(float *)&cg.unknown_0x2AA40[0x20] )      /* cg+0x2AA60 0x30038A05 */
-#define CG_RECOILYAWSPEED()     ( *(float *)&cg.unknown_0x2AA40[0x24] )      /* cg+0x2AA64 0x30038A16 */
-#define CG_RECOILSTATE()        ( *(int *)&cg.unknown_0x2AA40[0x28] )        /* cg+0x2AA68 */
-#define CG_VIEWMODELORIGIN()    ( (float *)&cg.unknown_0x2AA40[0x2C] )       /* cg+0x2AA6C 0x30037014 */
-#define CG_VIEWMODELAXIS()      ( (vec3_t *)&cg.unknown_0x2AA40[0x38] )      /* cg+0x2AA78 0x30037031 */
-#define CG_NOVIEWMODELTAG()     ( *(int *)&cg.unknown_0x2AA40[0x5C] )        /* cg+0x2AA9C 0x30036D57 */
-
-/* Two of cgMedia_t's ten 23-entry surface-sound tables (media+0x2F8, 92-byte
-   stride) and four of its nine impact-effect tables (media+0x70C), indexed by
-   the surfaceType the bullet trace returned. */
-#define CGS_BULLETSOUND_A()     ( (sfxHandle_t *)&cgs.media.unknown_0x2F8[0x170] )   /* cgs+0x9E4C */
-#define CGS_BULLETSOUND_B()     ( (sfxHandle_t *)&cgs.media.unknown_0x2F8[0x1CC] )   /* cgs+0x9EA8 */
-#define CGS_BULLETIMPACT_A()    ( (int *)&cgs.media.unknown_0x70C[0x000] )           /* cgs+0xA0F0 */
-#define CGS_BULLETMARK_A()      ( (int *)&cgs.media.unknown_0x70C[0x05C] )           /* cgs+0xA14C */
-#define CGS_BULLETIMPACT_B()    ( (int *)&cgs.media.unknown_0x70C[0x0B8] )           /* cgs+0xA1A8 */
-#define CGS_BULLETMARK_B()      ( (int *)&cgs.media.unknown_0x70C[0x114] )           /* cgs+0xA204 */
-#define CGS_FLESHHITNOBLOOD()   ( *(int *)&cgs.media.unknown_0x70C[0x33C] )          /* cgs+0xA42C */
-
-/* The surfaceType of flesh; CG_BulletHitEvent special-cases it when cg_blood
-   is off (0x30039683). */
 #define SURF_TYPE_FLESH         7
 
-/* The world-sound entity number CG_WhizbySound, CG_BulletHitEvent and
-   CG_BulletHitClientEvent hand CG_PlaySoundAliasByName (0x30038EE3,
-   0x30039691, 0x3003970C push 0x3FE); Q3's ENTITYNUM_WORLD, MAX_GENTITIES - 2. */
 #define ENTITYNUM_WORLD         ( MAX_GENTITIES - 2 )
 
-/* centity_t: the muzzle-flash latch CG_FireWeapon sets and CG_AddPlayerWeapon
-   consumes (0x30038BAD / 0x30037165). */
-#define CENT_MUZZLEFLASH( c )   ( *(int *)( c )->unknown_0x1E4 )             /* +0x1E4 */
+#define PMF_FIRSTPERSON         0x50000     // the local client is viewing through this entity
+#define PMF_WEAPONSELECTABLE    0x40000
+#define EF_WEAPONLOCKED         0x00C000    // ps.eFlags
+#define EF_NOVIEWWEAPON         0x00C000
+#define PMF_ADS                 0x20
 
-/* playerState_t pm_flags bit that says the local client owns this entity, and
-   the eFlags pair that suppresses the view weapon. */
-#define PMF_FIRSTPERSON         0x50000     /* CG_AddPlayerWeapon 0x30036D14 */
-#define PMF_WEAPONSELECTABLE    0x40000     /* CG_NextWeapon_f 0x3003807E */
-#define EF_WEAPONLOCKED         0x00C000    /* CG_AltWeapon_f 0x30037FB6, ps.eFlags */
-#define EF_NOVIEWWEAPON         0x00C000    /* CG_AddViewWeapon 0x30037271, `test ah, 0C0h` */
-#define PMF_ADS                 0x20        /* CG_WeaponRunXModelAnims 0x30034464 */
+#define ET_PLAYER               1
+#define ET_TURRET               0x0B
+#define ET_EVENTS               0x0C
+#define EV_FIRE_WEAPON_LASTSHOT 0xA1
+#define EV_BULLET_HIT_SMALL     0xAD
+#define EV_BULLET_HIT_CLIENT_SMALL 0xAF
 
-/* Entity and event numbers this unit tests against. */
-#define ET_PLAYER               1           /* CG_FireWeapon's flash entity check */
-#define ET_TURRET               0x0B        /* CG_FireWeapon 0x30038BDD */
-#define ET_EVENTS               0x0C        /* CG_EjectWeaponBrass 0x30038A40 */
-#define EV_FIRE_WEAPON_LASTSHOT 0xA1        /* CG_FireWeapon 0x30038C1E */
-#define EV_BULLET_HIT_SMALL     0xAD        /* CG_BulletHitEvent 0x30039641 */
-#define EV_BULLET_HIT_CLIENT_SMALL 0xAF     /* CG_BulletHitClientEvent 0x300396F1 */
+#define WEAPON_RELOADING        5           // ps.weaponstate
 
-#define WEAPON_RELOADING        5           /* ps.weaponstate, 0x30034452 */
-
-/*
- * The twenty viewmodel animations, in the order CG_RegisterWeapon registers
- * them: weaponInfo_t's idleAnim (+0x1C) through adsDownAnim (+0x68), one anim
- * index per field (0x30034E10).  Slot 0 of the tree is the additive root.
- */
+// the viewmodel animations, in weaponInfo_t order (idleAnim .. adsDownAnim);
+// slot 0 of the tree is the root
 #define WEAPANIM_IDLE           1
 #define WEAPANIM_EMPTY_IDLE     2
 #define WEAPANIM_FIRE           3
@@ -277,14 +119,14 @@ CG_ASSERT_SIZE( cgDObjModel_t, 12 );
 #define WEAPANIM_ADS_DOWN       20
 #define WEAPANIM_NUM            21
 
-/* bg_itemlist is 70 rows; CG_RegisterItems walks 1..69 (0x300361C5). */
+// rows in bg_itemlist
 #ifndef MAX_ITEMS
 #define MAX_ITEMS               70
 #endif
 
-#define CS_ITEMS                8           /* CG_RegisterItems 0x3003616D */
+#define CS_ITEMS                8
 
-/* CG_FadeColor's total for the weapon-select overlay (0x300377C0). */
+// how long the weapon select overlay stays up
 #define WEAPON_SELECT_TIME      1800
 
 /*
@@ -295,29 +137,25 @@ CG_ASSERT_SIZE( cgDObjModel_t, 12 );
 =============================================================================
 */
 
-cgWeaponInfo_t  cg_weapons[MAX_WEAPONS_CG];             /* 0x301A6940 */
-cgItemInfo_t    cg_items[MAX_ITEMS];                    /* 0x301DC3E0 */
+cgWeaponInfo_t  cg_weapons[MAX_WEAPONS_CG];
+cgItemInfo_t    cg_items[MAX_ITEMS];
 
-/* The world-space tag_brass origin CG_AddPlayerWeapon leaves behind for
-   CG_EjectWeaponBrass to play the shell effect at (0x305430C0). */
+// world position of the view weapon's tag_brass, for the shell eject effect
 static vec3_t   cg_brassOrigin;
 
-/* CG_DrawWeaponSelect's alt-weapon carousel state: the slot and weapon the
-   spin was last armed for, and the spin fraction in [-1,1] that decays to zero
-   (0x300EEF10, 0x300EEF14, 0x30096C20). */
+// weapon select alt-weapon carousel: the slot and weapon the spin was last
+// armed for, and the spin fraction in [-1,1] that decays to zero
 static int      cg_weaponSelectSpinSlot;
 static int      cg_weaponSelectSpinWeapon;
 static float    cg_weaponSelectSpin;
 
-/* 0x30094720.  Shared with cg_consolecmds_mp.c (CG_Fade_f, CG_ConsoleCommand);
-   not static in the binary. */
-char            cg_cmdArgBuffer[1024];
-
-/* The tag every muzzle flash and bullet trajectory is bolted to, 0x3007486C.
-   The binary indexes it (CG_FireWeapon 0x30038BE7), so it is a table; 1.1 only
-   ever reaches element 0. */
+// the tags muzzle flashes and bullet trajectories come from; turrets index
+// it by tagIndex, everything else uses [0]
 static const char *cg_flashTags[] = {
-	"tag_flash"
+	"tag_flash",
+	"tag_flash_11",
+	"tag_flash_2",
+	"tag_flash_22"
 };
 
 /*
@@ -336,16 +174,16 @@ Drive the viewmodel anim tree to `anim`: full goal weight on the one animation
 asked for, zero on the other seventeen, all at this weapon's own rate.
 ==============
 */
-static void CG_StartWeaponAnim( int weapon, int obj, int anim ) {
+static void CG_StartWeaponAnim( int weapon, void *tree, int anim ) {
 	const cgWeaponInfo_t    *cgWeapon;
-	int i;
+	unsigned short i;   // keep: matches original codegen
 
 	cgWeapon = &cg_weapons[ weapon ];
 	for ( i = 1; i < 19; i++ ) {
 		if ( anim == i ) {
-			trap_syscall_0x8C( obj, i, 1.0f, 0.0f, cgWeapon->animRate[i], 1, 1 );
+			trap_XAnimSetGoalWeight( tree, i, 1.0f, 0.0f, cgWeapon->animRate[i], 1, 1 );
 		} else {
-			trap_syscall_0x8C( obj, i, 0.0f, 0.0f, cgWeapon->animRate[i], 0, 0 );
+			trap_XAnimSetGoalWeight( tree, i, 0.0f, 0.0f, cgWeapon->animRate[i], 0, 0 );
 		}
 	}
 }
@@ -355,30 +193,28 @@ static void CG_StartWeaponAnim( int weapon, int obj, int anim ) {
 CG_PlayADSAnim
 
 Cross-fade the two aim-down-sight animations and scrub both to the transition
-fraction Pmove keeps in ps.fWeaponPosFrac.  `weapon` is passed in and never
-read -- the compiler proved it dead but the caller still pushes it
-(0x3003447B / 0x30034240, which has no arg slot for it).
+fraction Pmove keeps in ps.fWeaponPosFrac.  `weapon` is unused.
 ==============
 */
-static void CG_PlayADSAnim( int weapon, int anim, int obj ) {
+static void CG_PlayADSAnim( int weapon, int anim, void *tree ) {
 	if ( anim == WEAPANIM_ADS_UP ) {
-		trap_syscall_0x8C( obj, WEAPANIM_ADS_UP, 1.0f, 0.5f, 0.0f, 1, 0 );
-		trap_syscall_0x8C( obj, WEAPANIM_ADS_DOWN, 0.0f, 0.5f, 0.0f, 0, 0 );
+		trap_XAnimSetGoalWeight( tree, WEAPANIM_ADS_UP, 1.0f, 0.5f, 0.0f, 1, 0 );
+		trap_XAnimSetGoalWeight( tree, WEAPANIM_ADS_DOWN, 0.0f, 0.5f, 0.0f, 0, 0 );
 	} else {
-		trap_syscall_0x8C( obj, WEAPANIM_ADS_UP, 0.0f, 0.5f, 0.0f, 0, 0 );
-		trap_syscall_0x8C( obj, WEAPANIM_ADS_DOWN, 1.0f, 0.5f, 0.0f, 1, 0 );
+		trap_XAnimSetGoalWeight( tree, WEAPANIM_ADS_UP, 0.0f, 0.5f, 0.0f, 0, 0 );
+		trap_XAnimSetGoalWeight( tree, WEAPANIM_ADS_DOWN, 1.0f, 0.5f, 0.0f, 1, 0 );
 	}
 
-	trap_XAnimSetTime( obj, WEAPANIM_ADS_UP, cg.predictedPlayerState.fWeaponPosFrac );
-	trap_XAnimSetTime( obj, WEAPANIM_ADS_DOWN, 1.0f - cg.predictedPlayerState.fWeaponPosFrac );
+	trap_XAnimSetTime( tree, WEAPANIM_ADS_UP, cg.predictedPlayerState.fWeaponPosFrac );
+	trap_XAnimSetTime( tree, WEAPANIM_ADS_DOWN, 1.0f - cg.predictedPlayerState.fWeaponPosFrac );
 }
 
 /*
 ==============
 CG_ProcessWeaponNoteTracks
 
-Play the sound alias any note track the viewmodel anim tree fired this frame
-names.  The engine hands back its deferred-notify array through trap 150.
+Play the sound alias named by any note track the viewmodel anim tree hit this
+frame.
 ==============
 */
 static void CG_ProcessWeaponNoteTracks( void ) {
@@ -395,7 +231,7 @@ static void CG_ProcessWeaponNoteTracks( void ) {
 	}
 
 	cgWeapon = &cg_weapons[ cg.predictedPlayerState.weapon ];
-	numNotes = trap_syscall_0x96( (int)&notes );
+	numNotes = trap_XAnimGetDeferredNotifies( &notes );
 	for ( i = 0; i < numNotes; i++ ) {
 
 		if ( !_stricmp( notes[i * 3], "noteTrackSoundA" ) ) {
@@ -425,21 +261,26 @@ the cached value, so re-firing the same animation restarts it.
 static void CG_WeaponRunXModelAnims( playerState_t *ps, cgWeaponInfo_t *cgWeapon ) {
 	const weaponInfo_t  *weaponInfo;
 	qboolean ads;
-	int tree;
+	void *tree;
 	int i;
 
-	tree = trap_syscall_0xB1( cgWeapon->dobj );
+	tree = trap_DObjGetTree( cgWeapon->dobj );
 	weaponInfo = bg_weaponInfo[ps->weapon];
 
+	// keep: the redundant store matches original codegen
 	ads = qfalse;
-	if ( ps->weaponstate != WEAPON_RELOADING
-		 || ps->weaponTime - weaponInfo->adsReloadTransTime <= 0 ) {
-		if ( ps->pm_flags & PMF_ADS ) {
-			ads = qtrue;
-		}
+	if ( ps->weaponstate == WEAPON_RELOADING
+		 && ps->weaponTime - weaponInfo->adsReloadTransTime > 0 ) {
+		ads = qfalse;
+	} else if ( ps->pm_flags & PMF_ADS ) {
+		ads = qtrue;
 	}
 	if ( weaponInfo->aimDownSight ) {
-		CG_PlayADSAnim( ps->weapon, ads ? WEAPANIM_ADS_UP : WEAPANIM_ADS_DOWN, tree );
+		if ( ads ) {
+			CG_PlayADSAnim( ps->weapon, WEAPANIM_ADS_UP, tree );
+		} else {
+			CG_PlayADSAnim( ps->weapon, WEAPANIM_ADS_DOWN, tree );
+		}
 	}
 
 	if ( ps->weapAnim == cgWeapon->lastWeapAnim ) {
@@ -448,18 +289,18 @@ static void CG_WeaponRunXModelAnims( playerState_t *ps, cgWeaponInfo_t *cgWeapon
 
 	switch ( ps->weapAnim & ~0x200 ) {
 	case 0:
-		/* Idle.  Hold off until every animation in the tree has a time --
-		   until then the tree is not ready and the cache is invalidated. */
+		// idle: hold off until every animation in the tree has finished,
+		// invalidating the cache until then
 		for ( i = 1; i < 19; i++ ) {
-			if ( !trap_syscall_0xB4( tree, i ) ) {
+			if ( !trap_XAnimHasFinished( tree, i ) ) {
 				cgWeapon->lastWeapAnim = -1;
 				return;
 			}
 		}
-		if ( ps->ammoclip[bg_weaponInfo[ps->weapon]->clipIndex] ) {
-			CG_StartWeaponAnim( ps->weapon, tree, WEAPANIM_IDLE );
-		} else {
+		if ( !ps->ammoclip[bg_weaponInfo[ps->weapon]->clipIndex] ) {
 			CG_StartWeaponAnim( ps->weapon, tree, WEAPANIM_EMPTY_IDLE );
+		} else {
+			CG_StartWeaponAnim( ps->weapon, tree, WEAPANIM_IDLE );
 		}
 		break;
 	case 2:
@@ -532,11 +373,11 @@ static void CG_WeaponRunXModelAnims( playerState_t *ps, cgWeaponInfo_t *cgWeapon
 ==============
 CG_RailTrail2
 
-One coloured line, as a fade-RGB local entity that lives for
-cg_railTrailTime msec.  RTCW's CG_RailTrail core.
+re-inserted this as a debug mechanism for bullets
+One coloured line that fades over cg_railTrailTime msec.
 ==============
 */
-static void CG_RailTrail2( const vec3_t start, const vec3_t end, const vec3_t color ) {
+static void CG_RailTrail2( const vec3_t color, const vec3_t start, const vec3_t end ) {
 	localEntity_t   *le;
 	refEntity_t     *re;
 
@@ -545,23 +386,23 @@ static void CG_RailTrail2( const vec3_t start, const vec3_t end, const vec3_t co
 	}
 
 	le = CG_AllocLocalEntity();
-	re = LE_REFENTITY( le );
+	re = &le->refEntity;
 
 	le->leType = LE_FADE_RGB;
 	le->endTime = cg.time + cg_railTrailTime.integer;
 	le->lifeRate = 1.0f / (float)cg_railTrailTime.integer;
 
+	re->shaderTime = (float)cg.time / 1000.0f;
 	re->reType = RT_RAIL_CORE;
-	RE_SHADERTIME( re ) = (float)cg.time / 1000.0f;
-	RE_CUSTOMSHADER( re ) = cgs.media.railCoreShader;
+	re->customShader = cgs.media.railCoreShader;
 
 	VectorCopy( start, re->origin );
 	VectorCopy( end, re->oldorigin );
 
-	LE_COLOR( le )[0] = color[0];
-	LE_COLOR( le )[1] = color[1];
-	LE_COLOR( le )[2] = color[2];
-	LE_COLOR( le )[3] = 1.0f;
+	le->color[0] = color[0];
+	le->color[1] = color[1];
+	le->color[2] = color[2];
+	le->color[3] = 1.0f;
 
 	AxisClear( re->axis );
 }
@@ -570,12 +411,13 @@ static void CG_RailTrail2( const vec3_t start, const vec3_t end, const vec3_t co
 ==============
 CG_RailTrail
 
+modified so we could draw boxes for debugging as well
 The EV_RAILTRAIL debug primitive.  `type` picks both the colour and the shape:
 0-1 and 'E'-'H' are a single line, 2 and 3 are a wireframe box between the two
 points, 5 is a sixteen-segment circle of radius end[0] about start.
 ==============
 */
-void CG_RailTrail( int type, const vec3_t start, const vec3_t end ) {
+void CG_RailTrail( int type, const vec3_t end, const vec3_t start ) {
 	vec3_t color;
 	vec3_t up, perp, cross;
 	vec3_t size;
@@ -586,99 +428,121 @@ void CG_RailTrail( int type, const vec3_t start, const vec3_t end ) {
 	int i;
 
 	color[0] = 0.0f;
-	color[1] = 1.0f;
-	color[2] = 1.0f;
+	color[1] = color[2] = 1.0f;
 
-	switch ( type ) {
-	case 0:
-		CG_RailTrail2( end, start, color );
+	// keep: an if chain, not a switch (matches original codegen)
+	if ( type == 0 ) {
+		color[0] = 0.0f;
+		color[1] = color[2] = 1.0f;
+		CG_RailTrail2( color, end, start );
 		return;
-	case 1:
+	} else if ( type == 1 ) {
 		color[0] = 1.0f;
 		color[1] = 0.0f;
 		color[2] = 0.0f;
-		CG_RailTrail2( end, start, color );
+		CG_RailTrail2( color, end, start );
 		return;
-	case 'E':
+	} else if ( type == 'E' ) {
 		color[0] = 1.0f;
 		color[1] = 1.0f;
 		color[2] = 0.0f;
-		CG_RailTrail2( end, start, color );
+		CG_RailTrail2( color, end, start );
 		return;
-	case 'F':
+	} else if ( type == 'F' ) {
 		color[0] = 0.0f;
 		color[1] = 1.0f;
 		color[2] = 0.0f;
-		CG_RailTrail2( end, start, color );
+		CG_RailTrail2( color, end, start );
 		return;
-	case 'G':
+	} else if ( type == 'G' ) {
 		color[0] = 0.0f;
 		color[1] = 0.0f;
 		color[2] = 1.0f;
-		CG_RailTrail2( end, start, color );
+		CG_RailTrail2( color, end, start );
 		return;
-	case 'H':
+	} else if ( type == 'H' ) {
 		color[0] = 1.0f;
 		color[1] = 1.0f;
 		color[2] = 1.0f;
-		CG_RailTrail2( end, start, color );
+		CG_RailTrail2( color, end, start );
 		return;
-	case 3:
+	} else if ( type == 2 ) {
+		// the box in the default colour
+	} else if ( type == 3 ) {
 		color[0] = 1.0f;
-		color[1] = 0.0f;
-		color[2] = 0.0f;
-		break;
-	case 5:
+		color[1] = color[2] = 0.0f;
+	} else if ( type == 5 ) {
 		radius = end[0];
 		up[0] = 0.0f;
 		up[1] = 0.0f;
 		up[2] = 1.0f;
 		PerpendicularVector( perp, up );
 		CrossProduct( up, perp, cross );
-		for ( i = 0; i < 16; i++ ) {
-			angle = (float)i * 0.39269909f;         /* 2*PI / 16 */
-			s = (float)sin( angle ) * radius;
-			c = (float)cos( angle ) * radius;
-			points[i][0] = perp[0] * c + cross[0] * s + start[0];
-			points[i][1] = perp[1] * c + cross[1] * s + start[1];
-			points[i][2] = perp[2] * c + cross[2] * s + start[2];
+		for ( i = 0; i < sizeof( points ) / sizeof( points[0] ); i++ ) {
+			angle = i * 0.39269909f;                // 2*PI / 16
+			{
+				// keep: inline fsincos, matches original codegen
+				float *sinPtr = &s;
+				float *sinOut, *cosOut;
+
+				cosOut = &c;
+				sinOut = sinPtr;
+				__asm {
+					push    eax
+					push    ecx
+					fld     angle
+					fsincos
+					mov     ecx, cosOut
+					mov     eax, sinOut
+					fstp    dword ptr [ecx]
+					fstp    dword ptr [eax]
+					pop     ecx
+					pop     eax
+				}
+			}
+			s *= radius;
+			c *= radius;
+			VectorScale( cross, s, points[i] );
+			VectorMA( points[i], c, perp, points[i] );
+			VectorAdd( points[i], start, points[i] );
 		}
-		for ( i = 0; i < 16; i++ ) {
-			CG_RailTrail2( points[i], points[( i + 1 ) & 15], color );
+		for ( i = 0; i < sizeof( points ) / sizeof( points[0] ); i++ ) {
+			CG_RailTrail2( color, points[i], points[( i + 1 ) & 15] );
 		}
 		return;
-	default:
-		break;
 	}
 
-	/* The box.  Six corners are built off `end` and `start` and the twelve
-	   edges are drawn one CG_RailTrail2 at a time. */
-	size[0] = end[0] - start[0];
-	size[1] = end[1] - start[1];
-	size[2] = end[2] - start[2];
+	// the box: six corners off end and start, twelve edges
+	VectorSubtract( end, start, size );
 
-	c1[0] = end[0] - size[0];   c1[1] = end[1];             c1[2] = end[2];
-	c2[0] = end[0];             c2[1] = end[1] - size[1];   c2[2] = end[2];
-	c3[0] = end[0];             c3[1] = end[1];             c3[2] = end[2] - size[2];
+	VectorCopy( end, c1 );
+	VectorCopy( end, c2 );
+	VectorCopy( end, c3 );
+	c1[0] -= size[0];
+	c2[1] -= size[1];
+	c3[2] -= size[2];
 
-	CG_RailTrail2( end, c1, color );
-	CG_RailTrail2( end, c2, color );
-	CG_RailTrail2( end, c3, color );
+	CG_RailTrail2( color, end, c1 );
+	CG_RailTrail2( color, end, c2 );
+	CG_RailTrail2( color, end, c3 );
 
-	c4[0] = start[0] + size[0]; c4[1] = start[1];           c4[2] = start[2];
-	c5[0] = start[0];           c5[1] = start[1] + size[1]; c5[2] = start[2];
-	c6[0] = start[0];           c6[1] = start[1];           c6[2] = start[2] + size[2];
+	VectorCopy( start, c4 );
+	VectorCopy( start, c5 );
+	VectorCopy( start, c6 );
+	c4[0] += size[0];
+	c5[1] += size[1];
+	c6[2] += size[2];
 
-	CG_RailTrail2( start, c4, color );
-	CG_RailTrail2( start, c5, color );
-	CG_RailTrail2( start, c6, color );
+	CG_RailTrail2( color, start, c4 );
+	CG_RailTrail2( color, start, c5 );
+	CG_RailTrail2( color, start, c6 );
 
-	CG_RailTrail2( c2, c6, color );
-	CG_RailTrail2( c6, c1, color );
-	CG_RailTrail2( c1, c5, color );
-	CG_RailTrail2( c2, c4, color );
-	CG_RailTrail2( c4, c3, color );
-	CG_RailTrail2( c3, c5, color );
+	CG_RailTrail2( color, c2, c6 );
+	CG_RailTrail2( color, c6, c1 );
+	CG_RailTrail2( color, c1, c5 );
+	CG_RailTrail2( color, c2, c4 );
+	CG_RailTrail2( color, c4, c3 );
+	CG_RailTrail2( color, c3, c5 );
 }
 
 /*
@@ -693,8 +557,7 @@ void CG_RailTrail( int type, const vec3_t start, const vec3_t end ) {
 ==============
 CG_WeaponDObjHandle
 
-The DObj slot a weapon's viewmodel lives in.  1024 is where the client DObj
-range for viewmodels starts; uncalled in 1.1, every call site inlines it.
+The DObj slot a weapon's viewmodel lives in; viewmodel DObjs start at 1024.
 ==============
 */
 static int CG_WeaponDObjHandle( int weapon ) {
@@ -705,6 +568,7 @@ static int CG_WeaponDObjHandle( int weapon ) {
 ==============
 CG_RegisterWeapon
 
+The server says this item is used on this level
 The one-time load of everything cgame needs for a weapon: the viewmodel DObj
 and its anim tree, the world model, the icons, the sound aliases and the
 effects.  Idempotent -- `registered` gates the whole body.
@@ -717,16 +581,16 @@ void CG_RegisterWeapon( int weaponNum ) {
 	gitem_t             *item;
 	cgDObjModel_t dobjModels[2];
 	char filename[64];
-	int anims, tree;
-	qhandle_t hModel;
+	void *anims, *tree;
+	rfloat rate;
 	int i;
 
 	if ( !weaponNum ) {
 		return;
 	}
 
-	weaponInfo = bg_weaponInfo[weaponNum];
 	cgWeapon = &cg_weapons[ weaponNum ];
+	weaponInfo = bg_weaponInfo[weaponNum];
 	if ( cgWeapon->registered ) {
 		return;
 	}
@@ -734,15 +598,16 @@ void CG_RegisterWeapon( int weaponNum ) {
 	memset( cgWeapon, 0, sizeof( *cgWeapon ) );
 	cgWeapon->registered = qtrue;
 
-	item = &bg_itemlist[weaponNum];
+	// keep: read back through cgWeapon (matches original codegen)
+	cgWeapon->item = &bg_itemlist[weaponNum];
+	item = cgWeapon->item;
 	itemInfo = &cg_items[weaponNum];
-	cgWeapon->item = item;
 	CG_RegisterItemVisuals( weaponNum );
 	cgWeapon->lastWeapAnim = -1;
 
 	if ( weaponInfo->gunModel[0] ) {
 		if ( !weaponInfo->handModel || !weaponInfo->handModel[0] ) {
-			/* "\x15" spliced: a following hex digit would extend the escape */
+			// "\x15" spliced: a following hex digit would extend the escape
 			Com_Error( ERR_DROP, "\x15" "CG_RegisterWeapon: No hand model specified for [%s]",
 					   weaponInfo->displayName );
 		}
@@ -751,134 +616,111 @@ void CG_RegisterWeapon( int weaponNum ) {
 					   weaponInfo->displayName );
 		}
 
-		/* The anim tree.  Twenty animations, all children of "root", indexed
-		   1..20 in the order weaponInfo_t declares them; a weapon that leaves
-		   one blank gets its idle animation in that slot instead. */
-		anims = trap_XAnimCreateAnims( (int)"VIEWMODEL", WEAPANIM_NUM );
-		trap_XAnimBlend( anims, 0, (int)"root", 1, 20, 0 );
+		// the anim tree: twenty animations, all children of "root", indexed
+		// 1..20 in the order weaponInfo_t declares them; a weapon that leaves
+		// one blank gets its idle animation in that slot instead
+		anims = trap_XAnimCreateAnims( "VIEWMODEL", WEAPANIM_NUM );
+		trap_XAnimBlend( anims, 0, "root", 1, 20, 0 );
+		// the animation names are consecutive fields starting at idleAnim
 		for ( i = 1; i < 21; i++ ) {
-			/* weaponInfo_t's twenty animation names are twenty consecutive
-			   const char * at +0x1C; the binary walks them with a pointer
-			   (0x30034E10). */
-			const char *animName = ( &weaponInfo->idleAnim )[i - 1];
-
-			if ( animName[0] ) {
-				trap_XAnimPrecache( (int)animName );
+			if ( ( &weaponInfo->idleAnim )[i - 1][0] ) {
+				trap_XAnimPrecache( ( &weaponInfo->idleAnim )[i - 1] );
+				trap_XAnimCreate( anims, i, ( &weaponInfo->idleAnim )[i - 1] );
 			} else {
-				trap_XAnimPrecache( (int)weaponInfo->idleAnim );
-				animName = weaponInfo->idleAnim;
+				trap_XAnimPrecache( weaponInfo->idleAnim );
+				trap_XAnimCreate( anims, i, weaponInfo->idleAnim );
 			}
-			trap_XAnimCreate( anims, i, (int)animName );
 		}
 		tree = trap_XAnimCreateTree( anims );
 
-		/* Play the animations that have a fixed duration in the weapon file at
-		   the rate that makes them last exactly that long. */
+		// play the animations that have a fixed duration in the weapon file at
+		// the rate that makes them last exactly that long
 		for ( i = 0; i < WEAPANIM_NUM; i++ ) {
 			cgWeapon->animRate[i] = 1.0f;
 		}
+		// keep: each rate's 0 default set before its test (original codegen)
+		rate = 0.0f;
 		if ( weaponInfo->holdFireTime > 0 ) {
-			cgWeapon->animRate[WEAPANIM_HOLDFIRE] =
-				(float)trap_XAnimGetLength( anims, WEAPANIM_HOLDFIRE ) / (float)weaponInfo->holdFireTime;
-		} else {
-			cgWeapon->animRate[WEAPANIM_HOLDFIRE] = 0.0f;
+			rate = (float)trap_XAnimGetLength( anims, WEAPANIM_HOLDFIRE ) / (float)weaponInfo->holdFireTime;
 		}
+		cgWeapon->animRate[WEAPANIM_HOLDFIRE] = rate;
+		rate = 0.0f;
 		if ( weaponInfo->meleeTime > 0 ) {
-			cgWeapon->animRate[WEAPANIM_MELEE] =
-				(float)trap_XAnimGetLength( anims, WEAPANIM_MELEE ) / (float)weaponInfo->meleeTime;
-		} else {
-			cgWeapon->animRate[WEAPANIM_MELEE] = 0.0f;
+			rate = (float)trap_XAnimGetLength( anims, WEAPANIM_MELEE ) / (float)weaponInfo->meleeTime;
 		}
+		cgWeapon->animRate[WEAPANIM_MELEE] = rate;
+		rate = 0.0f;
 		if ( weaponInfo->reloadTime > 0 ) {
-			cgWeapon->animRate[WEAPANIM_RELOAD] =
-				(float)trap_XAnimGetLength( anims, WEAPANIM_RELOAD ) / (float)weaponInfo->reloadTime;
-		} else {
-			cgWeapon->animRate[WEAPANIM_RELOAD] = 0.0f;
+			rate = (float)trap_XAnimGetLength( anims, WEAPANIM_RELOAD ) / (float)weaponInfo->reloadTime;
 		}
+		cgWeapon->animRate[WEAPANIM_RELOAD] = rate;
+		rate = 0.0f;
 		if ( weaponInfo->reloadEmptyTime > 0 ) {
-			cgWeapon->animRate[WEAPANIM_RELOAD_EMPTY] =
-				(float)trap_XAnimGetLength( anims, WEAPANIM_RELOAD_EMPTY ) / (float)weaponInfo->reloadEmptyTime;
-		} else {
-			cgWeapon->animRate[WEAPANIM_RELOAD_EMPTY] = 0.0f;
+			rate = (float)trap_XAnimGetLength( anims, WEAPANIM_RELOAD_EMPTY ) / (float)weaponInfo->reloadEmptyTime;
 		}
+		cgWeapon->animRate[WEAPANIM_RELOAD_EMPTY] = rate;
+		rate = 0.0f;
 		if ( weaponInfo->reloadStartTime > 0 ) {
-			cgWeapon->animRate[WEAPANIM_RELOAD_START] =
-				(float)trap_XAnimGetLength( anims, WEAPANIM_RELOAD_START ) / (float)weaponInfo->reloadStartTime;
-		} else {
-			cgWeapon->animRate[WEAPANIM_RELOAD_START] = 0.0f;
+			rate = (float)trap_XAnimGetLength( anims, WEAPANIM_RELOAD_START ) / (float)weaponInfo->reloadStartTime;
 		}
-		/* reloadEnd divides by reloadTime, not reloadEndTime -- the binary
-		   reloads [esi+1E8h] here, the same field the reload rate above uses
-		   (0x30034F8C).  Retail quirk. */
+		cgWeapon->animRate[WEAPANIM_RELOAD_START] = rate;
+		// original quirk: reloadEnd divides by reloadTime, not reloadEndTime
+		rate = 0.0f;
 		if ( weaponInfo->reloadTime > 0 ) {
-			cgWeapon->animRate[WEAPANIM_RELOAD_END] =
-				(float)trap_XAnimGetLength( anims, WEAPANIM_RELOAD_END ) / (float)weaponInfo->reloadTime;
-		} else {
-			cgWeapon->animRate[WEAPANIM_RELOAD_END] = 0.0f;
+			rate = (float)trap_XAnimGetLength( anims, WEAPANIM_RELOAD_END ) / (float)weaponInfo->reloadTime;
 		}
+		cgWeapon->animRate[WEAPANIM_RELOAD_END] = rate;
+		rate = 0.0f;
 		if ( weaponInfo->raiseTime > 0 ) {
-			cgWeapon->animRate[WEAPANIM_RAISE] =
-				(float)trap_XAnimGetLength( anims, WEAPANIM_RAISE ) / (float)weaponInfo->raiseTime;
-		} else {
-			cgWeapon->animRate[WEAPANIM_RAISE] = 0.0f;
+			rate = (float)trap_XAnimGetLength( anims, WEAPANIM_RAISE ) / (float)weaponInfo->raiseTime;
 		}
+		cgWeapon->animRate[WEAPANIM_RAISE] = rate;
+		rate = 0.0f;
 		if ( weaponInfo->dropTime > 0 ) {
-			cgWeapon->animRate[WEAPANIM_DROP] =
-				(float)trap_XAnimGetLength( anims, WEAPANIM_DROP ) / (float)weaponInfo->dropTime;
-		} else {
-			cgWeapon->animRate[WEAPANIM_DROP] = 0.0f;
+			rate = (float)trap_XAnimGetLength( anims, WEAPANIM_DROP ) / (float)weaponInfo->dropTime;
 		}
+		cgWeapon->animRate[WEAPANIM_DROP] = rate;
+		rate = 0.0f;
 		if ( weaponInfo->altRaiseTime > 0 ) {
-			cgWeapon->animRate[WEAPANIM_ALTRAISE] =
-				(float)trap_XAnimGetLength( anims, WEAPANIM_ALTRAISE ) / (float)weaponInfo->altRaiseTime;
-		} else {
-			cgWeapon->animRate[WEAPANIM_ALTRAISE] = 0.0f;
+			rate = (float)trap_XAnimGetLength( anims, WEAPANIM_ALTRAISE ) / (float)weaponInfo->altRaiseTime;
 		}
+		cgWeapon->animRate[WEAPANIM_ALTRAISE] = rate;
+		rate = 0.0f;
 		if ( weaponInfo->altDropTime > 0 ) {
-			cgWeapon->animRate[WEAPANIM_ALTDROP] =
-				(float)trap_XAnimGetLength( anims, WEAPANIM_ALTDROP ) / (float)weaponInfo->altDropTime;
-		} else {
-			cgWeapon->animRate[WEAPANIM_ALTDROP] = 0.0f;
+			rate = (float)trap_XAnimGetLength( anims, WEAPANIM_ALTDROP ) / (float)weaponInfo->altDropTime;
 		}
+		cgWeapon->animRate[WEAPANIM_ALTDROP] = rate;
 
 		trap_XAnimClearTreeGoalWeights( tree, 0, 0.0f );
-		trap_syscall_0x8C( tree, 0, 1.0f, 0.0f, cgWeapon->animRate[0], 1, 0 );
+		trap_XAnimSetGoalWeight( tree, 0, 1.0f, 0.0f, cgWeapon->animRate[0], 1, 0 );
 
-		if ( weaponInfo->adsUpAnim[0] && trap_syscall_0x90( anims, WEAPANIM_ADS_UP ) ) {
+		if ( weaponInfo->adsUpAnim[0] && trap_XAnimIsLoopedIndex( anims, WEAPANIM_ADS_UP ) ) {
 			Com_Error( ERR_DROP, "\x15" "CG_RegisterWeapon: ADS anim [%s] cannot be looping",
 					   weaponInfo->adsUpAnim );
 		}
-		if ( weaponInfo->adsDownAnim[0] && trap_syscall_0x90( anims, WEAPANIM_ADS_DOWN ) ) {
+		if ( weaponInfo->adsDownAnim[0] && trap_XAnimIsLoopedIndex( anims, WEAPANIM_ADS_DOWN ) ) {
 			Com_Error( ERR_DROP, "\x15" "CG_RegisterWeapon: ADS anim [%s] cannot be looping",
 					   weaponInfo->adsDownAnim );
 		}
 
-		/* The viewmodel DObj: part 0 is the hands, part 1 is the gun, bolted
-		   to the hands' tag_weapon. */
+		// the viewmodel DObj: part 0 is the hands, part 1 is the gun, bolted
+		// to the hands' tag_weapon
 		sprintf( filename, "%s%s", "xmodel/", weaponInfo->handModel );
-		dobjModels[0].xmodel = NULL;
-		dobjModels[0].tagName = NULL;
-		dobjModels[0].hModel = 0;
-		hModel = trap_R_RegisterModel( filename, 6 );
-		dobjModels[0].hModel = (short)hModel;
-		dobjModels[0].xmodel = (void *)trap_R_GetXModelByHandle( (short)hModel );
+		memset( &dobjModels[0], 0, sizeof( dobjModels[0] ) );
+		dobjModels[0].hModel = (short)trap_R_RegisterModel( filename, 6 );
+		dobjModels[0].xmodel = trap_R_GetXModelByHandle( dobjModels[0].hModel );
 		dobjModels[0].tagName = NULL;
 
 		sprintf( filename, "%s%s", "xmodel/", weaponInfo->gunModel );
-		dobjModels[1].xmodel = NULL;
-		dobjModels[1].tagName = NULL;
-		dobjModels[1].hModel = 0;
-		hModel = trap_R_RegisterModel( filename, 6 );
-		dobjModels[1].hModel = (short)hModel;
-		dobjModels[1].xmodel = (void *)trap_R_GetXModelByHandle( (short)hModel );
+		memset( &dobjModels[1], 0, sizeof( dobjModels[1] ) );
+		dobjModels[1].hModel = (short)trap_R_RegisterModel( filename, 6 );
+		dobjModels[1].xmodel = trap_R_GetXModelByHandle( dobjModels[1].hModel );
 		dobjModels[1].tagName = "tag_weapon";
 
-		trap_DObjCreate( dobjModels, 2, (void *)tree, CG_WeaponDObjHandle( weaponNum ) );
-		cgWeapon->dobj = trap_syscall_0xA2( CG_WeaponDObjHandle( weaponNum ) );
+		trap_DObjCreate( dobjModels, 2, tree, CG_WeaponDObjHandle( weaponNum ) );
+		cgWeapon->dobj = trap_GetClientDObj( CG_WeaponDObjHandle( weaponNum ) );
 
-		strncpy( cgWeapon->handModelName, weaponInfo->handModel,
-				 sizeof( cgWeapon->handModelName ) - 1 );
-		cgWeapon->handModelName[sizeof( cgWeapon->handModelName ) - 1] = 0;
+		Q_strncpyz( cgWeapon->handModelName, weaponInfo->handModel, sizeof( cgWeapon->handModelName ) );
 	}
 
 	if ( weaponInfo->worldModel[0] ) {
@@ -903,10 +745,10 @@ void CG_RegisterWeapon( int weaponNum ) {
 	}
 
 	if ( weaponInfo->viewFlashEffect[0] ) {
-		cgWeapon->viewFlashEffect = trap_syscall_0xDE( weaponInfo->viewFlashEffect );
+		cgWeapon->viewFlashEffect = trap_FX_RegisterEffect( weaponInfo->viewFlashEffect );
 	}
 	if ( weaponInfo->worldFlashEffect[0] ) {
-		cgWeapon->worldFlashEffect = trap_syscall_0xDE( weaponInfo->worldFlashEffect );
+		cgWeapon->worldFlashEffect = trap_FX_RegisterEffect( weaponInfo->worldFlashEffect );
 	}
 
 	cgWeapon->projectileSound = (const char *)trap_Com_SoundAliasString( weaponInfo->projectileSound );
@@ -942,10 +784,10 @@ void CG_RegisterWeapon( int weaponNum ) {
 	}
 
 	if ( weaponInfo->shellEjectEffect[0] ) {
-		cgWeapon->shellEjectEffect = trap_syscall_0xDE( weaponInfo->shellEjectEffect );
+		cgWeapon->shellEjectEffect = trap_FX_RegisterEffect( weaponInfo->shellEjectEffect );
 	}
 	if ( weaponInfo->lastShotEjectEffect[0] ) {
-		cgWeapon->lastShotEjectEffect = trap_syscall_0xDE( weaponInfo->lastShotEjectEffect );
+		cgWeapon->lastShotEjectEffect = trap_FX_RegisterEffect( weaponInfo->lastShotEjectEffect );
 	} else {
 		cgWeapon->lastShotEjectEffect = cgWeapon->shellEjectEffect;
 	}
@@ -954,16 +796,16 @@ void CG_RegisterWeapon( int weaponNum ) {
 		cgWeapon->missileModel = trap_R_RegisterModel( weaponInfo->projectileModel, 7 );
 		if ( !cgWeapon->missileModel ) {
 			CG_Error( "Weapon %s does not specify a valid projectile model (%s)\n",
-					  weaponInfo->worldModel, weaponInfo->projectileModel );
+					  weaponInfo->szInternalName, weaponInfo->worldModel );
 		}
 	}
 	if ( weaponInfo->projExplosionEffect[0] ) {
-		cgWeapon->projExplosionEffect = trap_syscall_0xDE( weaponInfo->projExplosionEffect );
+		cgWeapon->projExplosionEffect = trap_FX_RegisterEffect( weaponInfo->projExplosionEffect );
 	}
 	cgWeapon->projExplosionSound =
 		(const char *)trap_Com_SoundAliasString( weaponInfo->projExplosionSound );
 	if ( weaponInfo->projTrailEffect[0] ) {
-		cgWeapon->missileTrailEffect = trap_syscall_0xDE( weaponInfo->projTrailEffect );
+		cgWeapon->missileTrailEffect = trap_FX_RegisterEffect( weaponInfo->projTrailEffect );
 	}
 	cgWeapon->missileDlight = (float)weaponInfo->projectileDLight;
 
@@ -1043,8 +885,7 @@ static void CG_ChangeViewmodelDobj( int weapon, const char *handModel ) {
 	cgDObjModel_t dobjModels[2];
 	char handFile[64];
 	char gunFile[64];
-	int tree;
-	qhandle_t hModel;
+	void *tree;
 
 	if ( !weapon ) {
 		return;
@@ -1059,12 +900,10 @@ static void CG_ChangeViewmodelDobj( int weapon, const char *handModel ) {
 		return;
 	}
 
-	tree = trap_syscall_0xB1( cgWeapon->dobj );
+	tree = trap_DObjGetTree( cgWeapon->dobj );
 	trap_SafeDObjFree( CG_WeaponDObjHandle( weapon ), 0 );
 
-	dobjModels[0].xmodel = NULL;
-	dobjModels[0].tagName = NULL;
-	dobjModels[0].hModel = 0;
+	memset( &dobjModels[0], 0, sizeof( dobjModels[0] ) );
 
 	sprintf( handFile, "%s%s", "xmodel/", weaponInfo->handModel );
 	if ( handModel[0] ) {
@@ -1072,22 +911,19 @@ static void CG_ChangeViewmodelDobj( int weapon, const char *handModel ) {
 	} else {
 		dobjModels[0].hModel = (short)trap_R_RegisterModel( handFile, 6 );
 	}
-	hModel = trap_R_RegisterModel( handFile, 6 );
-	dobjModels[0].xmodel = (void *)trap_R_GetXModelByHandle( (short)hModel );
+	dobjModels[0].xmodel = trap_R_GetXModelByHandle( (short)trap_R_RegisterModel( handFile, 6 ) );
 	dobjModels[0].tagName = NULL;
-	dobjModels[1].tagName = NULL;
-	dobjModels[1].hModel = 0;
+	memset( &dobjModels[1], 0, sizeof( dobjModels[1] ) );
 
 	sprintf( gunFile, "%s%s", "xmodel/", weaponInfo->gunModel );
 	dobjModels[1].hModel = (short)trap_R_RegisterModel( gunFile, 6 );
-	dobjModels[1].xmodel = (void *)trap_R_GetXModelByHandle( dobjModels[1].hModel );
+	dobjModels[1].xmodel = trap_R_GetXModelByHandle( dobjModels[1].hModel );
 	dobjModels[1].tagName = "tag_weapon";
 
-	trap_DObjCreate( dobjModels, 2, (void *)tree, CG_WeaponDObjHandle( weapon ) );
-	cgWeapon->dobj = trap_syscall_0xA2( CG_WeaponDObjHandle( weapon ) );
+	trap_DObjCreate( dobjModels, 2, tree, CG_WeaponDObjHandle( weapon ) );
+	cgWeapon->dobj = trap_GetClientDObj( CG_WeaponDObjHandle( weapon ) );
 
-	strncpy( cgWeapon->handModelName, handModel, sizeof( cgWeapon->handModelName ) - 1 );
-	cgWeapon->handModelName[sizeof( cgWeapon->handModelName ) - 1] = 0;
+	Q_strncpyz( cgWeapon->handModelName, handModel, sizeof( cgWeapon->handModelName ) );
 }
 
 /*
@@ -1119,7 +955,7 @@ void CG_FreeWeapons( void ) {
 	int i;
 
 	for ( i = 1; i <= bg_numWeapons; i++ ) {
-		trap_SafeDObjFree( CG_WeaponDObjHandle( i ), 0 );
+		trap_SafeDObjFree( CG_WeaponDObjHandle( i ), 1 );
 	}
 }
 
@@ -1127,9 +963,8 @@ void CG_FreeWeapons( void ) {
 ==============
 CG_RegisterItemVisuals
 
-The models, icon and pickup sound one bg_itemlist row needs.  RTCW's, including
-its `sizeof( &itemInfo )` -- the memset really does clear four bytes, which is
-exactly the `registered` flag the function goes on to set.
+The server says this item is used on this level
+RTCW's sizeof( &itemInfo ) is kept: the memset clears only `registered`.
 ==============
 */
 void CG_RegisterItemVisuals( int itemNum ) {
@@ -1151,7 +986,7 @@ void CG_RegisterItemVisuals( int itemNum ) {
 		}
 	}
 
-	itemInfo->icon = trap_R_RegisterShader( item->icon, 5 );
+	itemInfo->icons[0] = trap_R_RegisterShader( item->icon, 5 );
 
 	if ( item->pickup_sound ) {
 		itemInfo->pickupSound = (const char *)trap_Com_SoundAliasString( item->pickup_sound );
@@ -1174,18 +1009,19 @@ visuals of every item the server says is in the level.
 ==============
 */
 void CG_RegisterItems( void ) {
-	char items[256 + 1];    /* RTCW's MAX_ITEMS + 1; frame is 0x108 (0x30036150) */
+	char items[256 + 1];    // RTCW's MAX_ITEMS + 1
 	int value;
 	int i;
 
+	// only register the items that the server says we need
 	strcpy( items, CG_ConfigString( CS_ITEMS ) );
 
 	for ( i = 1; i < MAX_ITEMS; i++ ) {
 		value = items[i / 4];
-		if ( value > '9' ) {
-			value -= 'W';
-		} else {
+		if ( value <= '9' ) {
 			value -= '0';
+		} else {
+			value -= 'W';
 		}
 		if ( value & ( 1 << ( i & 3 ) ) ) {
 			CG_RegisterItemVisuals( i );
@@ -1214,16 +1050,16 @@ shellshock is running.
 static void CG_CalculateWeaponPosition_Sway( void ) {
 	const weaponInfo_t  *weaponInfo;
 	float scale;
-	float frac;
+	rfloat frac;
 	int remaining;
 
-	weaponInfo = bg_weaponInfo[cg.predictedPlayerState.weapon];
+	weaponInfo = BG_GetInfoForWeapon( cg.predictedPlayerState.weapon );
 
-	remaining = cg.shellshock.duration - cg.time + cg.shellshock.startTime;
+	remaining = cg.shellshock.startTime - cg.time + cg.shellshock.duration;
 	if ( remaining > 0 ) {
 		frac = 1.0f;
-		if ( (float)remaining < cg.shellshock.parms->lerpTime ) {
-			frac = (float)remaining / cg.shellshock.parms->lerpTime;
+		if ( remaining < cg.shellshock.parms->lerpTime ) {
+			frac = (rfloat)remaining / cg.shellshock.parms->lerpTime;
 		}
 		scale = ( weaponInfo->swayShellShockScale - 1.0f )
 				* ( ( 3.0f - ( frac + frac ) ) * frac * frac ) + 1.0f;
@@ -1231,9 +1067,8 @@ static void CG_CalculateWeaponPosition_Sway( void ) {
 		scale = 1.0f;
 	}
 
-	BG_CalculateWeaponPosition_Sway( CG_SWAYOFFSETS(), CG_SWAYANGLES(),
-									 &cg.predictedPlayerState, CG_PREVVIEWANGLES(),
-									 scale, cg.frametime );
+	BG_CalculateWeaponPosition_Sway( &cg.predictedPlayerState, cg.swayOffsets, cg.swayAngles,
+									 cg.previousViewAngles, scale, cg.frametime );
 }
 
 /*
@@ -1242,9 +1077,58 @@ CG_CalculateWeaponPosition_SwayMovement
 ==============
 */
 static void CG_CalculateWeaponPosition_SwayMovement( vec3_t offset ) {
-	offset[1] = offset[1] - CG_SWAYOFFSETS()[1];
-	offset[2] = CG_SWAYOFFSETS()[2] + offset[2];
+	offset[1] = offset[1] - cg.swayOffsets[1];
+	offset[2] = cg.swayOffsets[2] + offset[2];
 }
+
+/*
+==============
+CG_TRACKMOVEMENT
+
+Move one component of the tracked weapon offset towards its target at the
+weapon's position rate, by at least a minimum step a frame.
+keep: a macro, frametime set in both arms, and the sum stored rounded but
+compared unrounded -- all to match the original codegen.
+==============
+*/
+#define CG_TRACKMOVEMENT( p, t, wi ) do { \
+	float *pos_ = ( p ); \
+	rfloat target_ = ( t ); \
+	rfloat rate_, step_, sum_; \
+	float frametime_, limit_; \
+	if ( *pos_ == target_ ) { \
+		break; \
+	} \
+	if ( (float)cg.predictedPlayerState.proneViewHeight == cg.predictedPlayerState.viewHeightCurrent ) { \
+		frametime_ = (float)cg.frametime; \
+		rate_ = (rfloat)cg_gun_move_rate.value + ( wi )->posProneMoveRate; \
+	} else { \
+		frametime_ = (float)cg.frametime; \
+		rate_ = (rfloat)cg_gun_move_rate.value + ( wi )->posMoveRate; \
+	} \
+	step_ = rate_ * ( target_ - *pos_ ) * frametime_ * 0.001f; \
+	if ( *pos_ < target_ ) { \
+		limit_ = frametime_ * 0.00010000000474974513f; \
+		if ( step_ < limit_ ) { \
+			step_ = limit_; \
+		} \
+		sum_ = step_ + *pos_; \
+		*pos_ = (float)sum_; \
+		if ( sum_ > target_ ) { \
+			*pos_ = (float)target_; \
+		} \
+	} else { \
+		limit_ = frametime_ * -0.00010000000474974513f; \
+		if ( step_ > limit_ ) { \
+			step_ = limit_; \
+		} \
+		sum_ = step_ + *pos_; \
+		*pos_ = (float)sum_; \
+		if ( sum_ < target_ ) { \
+			*pos_ = (float)target_; \
+		} \
+	} \
+} while ( 0 )
 
 /*
 ==============
@@ -1258,121 +1142,86 @@ position rate and folded out again as the sights come up.
 static void CG_CalculateWeaponPosition_BasePosition_movement( vec3_t offset ) {
 	const weaponInfo_t  *weaponInfo;
 	const playerState_t *ps;
-	float move[3];
-	float minSpeed;
+	// keep: rfloat and the (rfloat) / (float) casts reproduce the original
+	// rounding points
+	rfloat move[3];
+	rfloat minSpeed;
 	float frac;
-	float rate;
-	float step;
-	float limit;
-	float ads;
-	int eFlags;
-	int i;
+	rfloat adsScale;
 
 	weaponInfo = cg.weaponInfo;
 	ps = &cg.predictedPlayerState;
-	eFlags = cg.predictedPlayerEntity.currentState.eFlags;
 
-	if ( eFlags & 0x40 ) {
-		minSpeed = cg_gun_move_minspeed.value + weaponInfo->proneMoveMinSpeed;
-	} else if ( eFlags & 0x20 ) {
-		minSpeed = cg_gun_move_minspeed.value + weaponInfo->duckedMoveMinSpeed;
+	if ( cg.predictedPlayerEntity.currentState.eFlags & 0x40 ) {
+		minSpeed = (rfloat)cg_gun_move_minspeed.value + weaponInfo->proneMoveMinSpeed;
+	} else if ( cg.predictedPlayerEntity.currentState.eFlags & 0x20 ) {
+		minSpeed = (rfloat)cg_gun_move_minspeed.value + weaponInfo->duckedMoveMinSpeed;
 	} else {
-		minSpeed = cg_gun_move_minspeed.value + weaponInfo->standMoveMinSpeed;
+		minSpeed = (rfloat)cg_gun_move_minspeed.value + weaponInfo->standMoveMinSpeed;
 	}
 
-	if ( CG_XYSPEED() > minSpeed && ps->weaponstate != WEAPON_RELOADING ) {
-		frac = ( CG_XYSPEED() - minSpeed ) / ( (float)ps->speed - minSpeed );
-		if ( 0.0f > frac ) {
+	if ( cg.xyspeed > minSpeed && ps->weaponstate != WEAPON_RELOADING ) {
+		frac = ( cg.xyspeed - minSpeed ) / ( (rfloat)ps->speed - minSpeed );
+		// keep: inverted test, matches original codegen
+		if ( !( 0.0f > frac ) ) {
+			if ( 1.0f < frac ) {
+				frac = 1.0f;
+			}
+		} else {
 			frac = 0.0f;
-		} else if ( frac > 1.0f ) {
-			frac = 1.0f;
 		}
 
-		if ( eFlags & 0x40 ) {
-			move[0] = frac * weaponInfo->proneMoveF;
-			move[1] = frac * weaponInfo->proneMoveR;
-			move[2] = frac * weaponInfo->proneMoveU;
-		} else if ( eFlags & 0x20 ) {
-			move[0] = frac * weaponInfo->duckedMoveF;
-			move[1] = frac * weaponInfo->duckedMoveR;
-			move[2] = frac * weaponInfo->duckedMoveU;
+		if ( cg.predictedPlayerEntity.currentState.eFlags & 0x40 ) {
+			move[0] = (rfloat)frac * weaponInfo->proneMoveF;
+			move[1] = (float)( frac * weaponInfo->proneMoveR );
+			move[2] = (float)( frac * weaponInfo->proneMoveU );
+		} else if ( cg.predictedPlayerEntity.currentState.eFlags & 0x20 ) {
+			move[0] = (rfloat)frac * weaponInfo->duckedMoveF;
+			move[1] = (float)( frac * weaponInfo->duckedMoveR );
+			move[2] = (float)( frac * weaponInfo->duckedMoveU );
 		} else {
-			move[0] = frac * weaponInfo->standMoveF;
-			move[1] = frac * weaponInfo->standMoveR;
-			move[2] = frac * weaponInfo->standMoveU;
+			move[0] = (rfloat)frac * weaponInfo->standMoveF;
+			move[1] = (float)( frac * weaponInfo->standMoveR );
+			move[2] = (float)( frac * weaponInfo->standMoveU );
 		}
-		move[0] = cg_gun_move_f.value * frac + move[0];
-		move[1] = cg_gun_move_r.value * frac + move[1];
-		move[2] = cg_gun_move_u.value * frac + move[2];
+		move[0] = (rfloat)cg_gun_move_f.value * frac + move[0];
+		move[1] = (float)( (rfloat)cg_gun_move_r.value * frac + move[1] );
+		move[2] = (float)( (rfloat)cg_gun_move_u.value * frac + move[2] );
 	} else {
-		move[0] = 0.0f;
-		move[1] = 0.0f;
-		move[2] = 0.0f;
+		VectorClear( move );
 	}
 
 	if ( ps->viewHeightTarget == ps->crouchViewHeight ) {
 		move[0] += weaponInfo->duckedOfsF;
-		move[1] += weaponInfo->duckedOfsR;
-		move[2] += weaponInfo->duckedOfsU;
+		move[1] = (float)( move[1] + weaponInfo->duckedOfsR );
+		move[2] = (float)( move[2] + weaponInfo->duckedOfsU );
 		move[0] += cg_gun_ofs_f.value;
-		move[1] += cg_gun_ofs_r.value;
-		move[2] += cg_gun_ofs_u.value;
+		move[1] = (float)( move[1] + cg_gun_ofs_r.value );
+		move[2] = (float)( move[2] + cg_gun_ofs_u.value );
 	} else if ( ps->viewHeightTarget == ps->proneViewHeight ) {
 		move[0] += weaponInfo->proneOfsF;
-		move[1] += weaponInfo->proneOfsR;
-		move[2] += weaponInfo->proneOfsU;
+		move[1] = (float)( move[1] + weaponInfo->proneOfsR );
+		move[2] = (float)( move[2] + weaponInfo->proneOfsU );
 		move[0] += cg_gun_ofs_f.value;
-		move[1] += cg_gun_ofs_r.value;
-		move[2] += cg_gun_ofs_u.value;
+		move[1] = (float)( move[1] + cg_gun_ofs_r.value );
+		move[2] = (float)( move[2] + cg_gun_ofs_u.value );
 	}
 
-	/* Track the three components towards their targets.  Not a function in the
-	   binary -- the compiler inlined it three times at 0x30036497, 0x30037574
-	   and 0x3003665E -- so it is written out once here. */
-	for ( i = 0; i < 3; i++ ) {
-		if ( CG_POSTRACK()[i] == move[i] ) {
-			continue;
-		}
-		if ( (float)ps->proneViewHeight == ps->viewHeightCurrent ) {
-			rate = cg_gun_move_rate.value + weaponInfo->posProneMoveRate;
-		} else {
-			rate = cg_gun_move_rate.value + weaponInfo->posMoveRate;
-		}
-		step = rate * ( move[i] - CG_POSTRACK()[i] ) * (float)cg.frametime * 0.001f;
-		if ( CG_POSTRACK()[i] < move[i] ) {
-			limit = (float)cg.frametime * 0.0001f;
-			if ( step < limit ) {
-				step = limit;
-			}
-			CG_POSTRACK()[i] = step + CG_POSTRACK()[i];
-			if ( CG_POSTRACK()[i] > move[i] ) {
-				CG_POSTRACK()[i] = move[i];
-			}
-		} else {
-			limit = (float)cg.frametime * -0.0001f;
-			if ( step > limit ) {
-				step = limit;
-			}
-			CG_POSTRACK()[i] = step + CG_POSTRACK()[i];
-			if ( CG_POSTRACK()[i] < move[i] ) {
-				CG_POSTRACK()[i] = move[i];
-			}
-		}
-	}
+	CG_TRACKMOVEMENT( &cg.playerEntity.vLastMoveOrg[0], move[0], weaponInfo );
+	CG_TRACKMOVEMENT( &cg.playerEntity.vLastMoveOrg[1], move[1], weaponInfo );
+	CG_TRACKMOVEMENT( &cg.playerEntity.vLastMoveOrg[2], move[2], weaponInfo );
 
-	ads = cg.predictedPlayerState.fWeaponPosFrac;
-	if ( ads != 0.0f ) {
-		if ( ads >= 0.5f ) {
-			return;
+	if ( cg.predictedPlayerState.fWeaponPosFrac != 0.0f ) {
+		if ( cg.predictedPlayerState.fWeaponPosFrac < 0.5f ) {
+			adsScale = 1.0f - ( (rfloat)cg.predictedPlayerState.fWeaponPosFrac + cg.predictedPlayerState.fWeaponPosFrac );
+			offset[0] += cg.playerEntity.vLastMoveOrg[0] * adsScale;
+			offset[1] += cg.playerEntity.vLastMoveOrg[1] * adsScale;
+			offset[2] += cg.playerEntity.vLastMoveOrg[2] * adsScale;
 		}
-		frac = 1.0f - ( ads + ads );
-		offset[0] += CG_POSTRACK()[0] * frac;
-		offset[1] += CG_POSTRACK()[1] * frac;
-		offset[2] += CG_POSTRACK()[2] * frac;
 	} else {
-		offset[0] += CG_POSTRACK()[0];
-		offset[1] += CG_POSTRACK()[1];
-		offset[2] += CG_POSTRACK()[2];
+		offset[0] += cg.playerEntity.vLastMoveOrg[0];
+		offset[1] += cg.playerEntity.vLastMoveOrg[1];
+		offset[2] += cg.playerEntity.vLastMoveOrg[2];
 	}
 }
 
@@ -1384,12 +1233,10 @@ CG_CalculateWeaponPosition_BasePosition
 static void CG_CalculateWeaponPosition_BasePosition( vec3_t offset ) {
 	vec3_t move;
 
-	move[0] = 0.0f;
-	move[1] = 0.0f;
-	move[2] = 0.0f;
+	VectorClear( move );
 	CG_CalculateWeaponPosition_BasePosition_movement( move );
 
-	VectorCopy( move, CG_WEAPONPOSBASE() );
+	VectorCopy( move, cg.playerEntity.vPositionLastOrg );
 
 	offset[0] += move[0];
 	offset[1] += move[1];
@@ -1405,15 +1252,15 @@ Turn a forward/right/up offset into a world point off the view origin.
 */
 static void CG_CalculateWeaponPosition_ToWorldPosition( vec3_t pos ) {
 	vec3_t offset;
-	vec3_t forward, right, up;
+	vec3_t axis[3];     // forward, right, up
 
 	VectorCopy( pos, offset );
-	AngleVectors( cg.refdefViewAngles, forward, right, up );
+	AngleVectors( cg.refdefViewAngles, axis[0], axis[1], axis[2] );
 
 	VectorCopy( cg.refdef.vieworg, pos );
-	pos[0] += right[0] * -offset[1] + up[0] * offset[2] + forward[0] * offset[0];
-	pos[1] += right[1] * -offset[1] + up[1] * offset[2] + forward[1] * offset[0];
-	pos[2] += right[2] * -offset[1] + up[2] * offset[2] + forward[2] * offset[0];
+	VectorMA( pos, offset[0], axis[0], pos );
+	VectorMA( pos, -offset[1], axis[1], pos );
+	VectorMA( pos, offset[2], axis[2], pos );
 }
 
 /*
@@ -1426,19 +1273,21 @@ crosshair.
 ==============
 */
 static void CG_CalculateWeaponPosition_SaveOffsetMovement( const vec3_t origin ) {
-	float frac;
+	rfloat frac;
 
-	frac = cg.predictedPlayerState.fWeaponPosFrac;
-	if ( bg_weaponInfo[cg.predictedPlayerState.weapon]->aimDownSight && frac != 0.0f ) {
-		CG_ADSWORLDOFFSET()[0] = ( origin[0] - cg.refdef.vieworg[0] ) * frac;
-		CG_ADSWORLDOFFSET()[1] = ( origin[1] - cg.refdef.vieworg[1] ) * frac;
-		CG_ADSWORLDOFFSET()[2] = ( origin[2] - cg.refdef.vieworg[2] ) * frac;
-		return;
+	if ( BG_IsAimDownSightWeapon( cg.predictedPlayerState.weapon ) ) {
+		frac = cg.predictedPlayerState.fWeaponPosFrac;
+		if ( frac != 0.0f ) {
+			cg.gunXOfs = ( origin[0] - cg.refdef.vieworg[0] ) * frac;
+			cg.gunYOfs = ( origin[1] - cg.refdef.vieworg[1] ) * frac;
+			cg.gunZOfs = ( origin[2] - cg.refdef.vieworg[2] ) * frac;
+			return;
+		}
 	}
 
-	CG_ADSWORLDOFFSET()[0] = 0.0f;
-	CG_ADSWORLDOFFSET()[1] = 0.0f;
-	CG_ADSWORLDOFFSET()[2] = 0.0f;
+	cg.gunXOfs = 0.0f;
+	cg.gunYOfs = 0.0f;
+	cg.gunZOfs = 0.0f;
 }
 
 /*
@@ -1451,25 +1300,33 @@ RTCW's landing drop.
 */
 static void CG_CalculateWeaponPosition( vec3_t origin ) {
 	int delta;
+	float frac;
+	float scale;
+	vec3_t angles;
+	vec3_t right;
 
-	origin[0] = 0.0f;
-	origin[1] = 0.0f;
-	origin[2] = 0.0f;
+	VectorClear( origin );
 
 	if ( cg.predictedPlayerState.leanf != 0.0f
 		 && cg.predictedPlayerState.fWeaponPosFrac < 1.0f ) {
-		/* Not the eye's 16/20: retail inlines AddLeanToPosition here with the
-		   angle at frac * -2.0 (0x30036A0E) and the offset at
-		   frac * 1.6 * (1 - adsFrac) (0x30036A28). */
-		AddLeanToPosition( origin, 0.0f, cg.predictedPlayerState.leanf, -2.0f,
-						   1.6f * ( 1.0f - cg.predictedPlayerState.fWeaponPosFrac ) );
+		// adjust 'lean' into weapon
+		// keep: AddLeanToPosition written out, for the original rounding
+		frac = GetLeanFraction( cg.predictedPlayerState.leanf );
+		angles[0] = 0.0f;
+		angles[1] = 0.0f;
+		angles[2] = frac * -2.0f;
+		scale = ( 1.0f - cg.predictedPlayerState.fWeaponPosFrac ) * frac * 1.6f;
+		AngleVectors( angles, NULL, right, NULL );
+		origin[0] += right[0] * scale;
+		origin[1] += right[1] * scale;
+		origin[2] += right[2] * scale;
 	}
 
 	CG_CalculateWeaponPosition_BasePosition( origin );
 	CG_CalculateWeaponPosition_SwayMovement( origin );
 	CG_CalculateWeaponPosition_ToWorldPosition( origin );
 
-	/* drop the weapon when landing */
+	// drop the weapon when landing
 	delta = cg.time - cg.landTime;
 	if ( delta < 150 ) {
 		origin[2] += cg.landChange * 0.25f * (float)delta / 150.0f;
@@ -1489,20 +1346,25 @@ from a settled position -- once the fraction is moving, the direction is kept.
 ==============
 */
 static void CG_CalculateWeaponPostion_PositionToADS( void ) {
-	float frac;
+	qboolean goingUp;
 
-	if ( !bg_weaponInfo[cg.predictedPlayerState.weapon]->aimDownSight ) {
+	if ( !BG_IsAimDownSightWeapon( cg.predictedPlayerState.weapon ) ) {
 		return;
 	}
 
-	frac = cg.predictedPlayerState.fWeaponPosFrac;
-	if ( frac != 1.0f && frac != 0.0f
-		 && ( CG_ADSLASTFRAC() == 1.0f || CG_ADSLASTFRAC() == 0.0f )
-		 && frac != CG_ADSLASTFRAC() ) {
-		CG_ADSGOINGUP() = ( frac > CG_ADSLASTFRAC() );
+	if ( cg.predictedPlayerState.fWeaponPosFrac != 1.0f && cg.predictedPlayerState.fWeaponPosFrac != 0.0f
+		 && ( cg.playerEntity.fLastWeaponPosFrac == 1.0f || cg.playerEntity.fLastWeaponPosFrac == 0.0f )
+		 && cg.predictedPlayerState.fWeaponPosFrac != cg.playerEntity.fLastWeaponPosFrac ) {
+		// keep: through a local, matches original codegen
+		if ( cg.predictedPlayerState.fWeaponPosFrac >= cg.playerEntity.fLastWeaponPosFrac ) {
+			goingUp = qtrue;
+		} else {
+			goingUp = qfalse;
+		}
+		cg.playerEntity.bPositionToADS = goingUp;
 	}
 
-	CG_ADSLASTFRAC() = frac;
+	cg.playerEntity.fLastWeaponPosFrac = cg.predictedPlayerState.fWeaponPosFrac;
 }
 
 /*
@@ -1518,9 +1380,11 @@ static void CG_CalculateWeaponPostion_PositionToADS( void ) {
 CG_WeaponFlash
 
 Play a weapon's flash effect off a bone of the DObj it is attached to.
+`handle` is that DObj's Com_GetClientDObj slot: the entity number, or
+CG_WeaponDObjHandle for the viewmodel.
 ==============
 */
-static void CG_WeaponFlash( int weapon, qboolean viewmodel, int obj, const vec3_t origin,
+static void CG_WeaponFlash( int handle, int weapon, const vec3_t origin, qboolean viewmodel,
 							const char *tagName ) {
 	int effect;
 	int bolt[2];
@@ -1534,22 +1398,24 @@ static void CG_WeaponFlash( int weapon, qboolean viewmodel, int obj, const vec3_
 		return;
 	}
 
-	bolt[0] = obj;
-	bolt[1] = trap_syscall_0xDF( obj, tagName );
+	bolt[0] = handle;
+	bolt[1] = trap_FX_GetBoneIndex( handle, tagName );
 	if ( bolt[1] < 0 ) {
 		return;
 	}
 
-	trap_syscall_0xE5( effect, (int)origin, 0, (int)bolt );
+	trap_FX_PlayOrientedEffectID( effect, origin, NULL, bolt );
 }
 
 /*
 ==============
 CG_AddPlayerWeapon
 
-Add the weapon model to the scene, either as the local client's viewmodel
-(ps != NULL) or as another player's held weapon.  Also caches the tag_brass
-world position for the shell effect and fires any pending muzzle flash.
+Used for both the view weapon (ps is valid) and the world modelother character models (ps is NULL)
+The main player will have this called for BOTH cases, so effects like light and
+sound should only be done on the world model case.
+Also caches the tag_brass position for the shell effect and fires any pending
+muzzle flash.
 ==============
 */
 void CG_AddPlayerWeapon( refEntity_t *parent, playerState_t *ps, centity_t *cent, int drawGun ) {
@@ -1560,20 +1426,21 @@ void CG_AddPlayerWeapon( refEntity_t *parent, playerState_t *ps, centity_t *cent
 	int partBits[4];
 	int weaponNum;
 	int boneIndex;
-	int boneBase;
+	const float *boneMatrix;
 	float gunMatrix[12];
 	float tagMatrix[16];
 
-	firstPersonOwner = qfalse;
 	if ( ( cg.snap->ps.pm_flags & PMF_FIRSTPERSON )
 		 && cent->currentState.number == cg.snap->ps.clientNum ) {
 		firstPersonOwner = qtrue;
+	} else {
+		firstPersonOwner = qfalse;
 	}
 
 	weaponNum = cent->currentState.weapon;
 	isViewWeapon = ( ps != NULL );
 
-	if ( isViewWeapon && CG_NOVIEWMODELTAG() ) {
+	if ( isViewWeapon && cg.cameraMode ) {
 		return;
 	}
 	if ( cent->currentState.eFlags & EF_NOVIEWWEAPON ) {
@@ -1584,9 +1451,9 @@ void CG_AddPlayerWeapon( refEntity_t *parent, playerState_t *ps, centity_t *cent
 	cgWeapon = &cg_weapons[ weaponNum ];
 
 	memset( &gun, 0, sizeof( gun ) );
+	VectorCopy( parent->lightingOrigin, gun.lightingOrigin );
+	gun.shadowPlane = parent->shadowPlane;
 	gun.renderfx = parent->renderfx;
-	VectorCopy( RE_LIGHTINGORIGIN( parent ), RE_LIGHTINGORIGIN( &gun ) );
-	RE_UNKNOWN_0x18( &gun ) = RE_UNKNOWN_0x18( parent );
 
 	if ( isViewWeapon ) {
 		gun.shaderRGBA[0] = 255;
@@ -1594,43 +1461,31 @@ void CG_AddPlayerWeapon( refEntity_t *parent, playerState_t *ps, centity_t *cent
 		gun.shaderRGBA[2] = 255;
 		gun.shaderRGBA[3] = 255;
 
-		RE_DOBJ( &gun ) = cgWeapon->dobj;
-		RE_LIGHTINGORIGIN( &gun )[0] = ps->origin[0];
-		RE_LIGHTINGORIGIN( &gun )[1] = ps->origin[1];
-		RE_LIGHTINGORIGIN( &gun )[2] = ps->origin[2] + ps->viewHeightCurrent;
+		gun.dobj = cgWeapon->dobj;
+		VectorCopy( ps->origin, gun.lightingOrigin );
+		gun.lightingOrigin[2] += ps->viewHeightCurrent;
 		gun.reType = RT_DOBJ;
 		gun.renderfx = RF_PLAYERMODEL;
-		AddLeanToPosition( RE_LIGHTINGORIGIN( &gun ), ps->viewangles[1], ps->leanf,
+		AddLeanToPosition( gun.lightingOrigin, ps->viewangles[1], ps->leanf,
 						   16.0f, 20.0f );
 
-		trap_syscall_0x95( cgWeapon->dobj, (float)cg.frametime * 0.001f );
+		trap_DObjUpdateClientInfo( cgWeapon->dobj, (float)cg.frametime * 0.001f );
 
-		partBits[0] = -1;
-		partBits[1] = -1;
-		partBits[2] = -1;
-		partBits[3] = -1;
-		if ( !trap_syscall_0xA9( cgWeapon->dobj, (int)partBits ) ) {
-			trap_syscall_0x97( cgWeapon->dobj, (int)partBits );
-			trap_syscall_0xAB( cgWeapon->dobj, (int)partBits );
+		memset( partBits, 0xFF, sizeof( partBits ) );
+		if ( !trap_DObjCreateSkelForBones( cgWeapon->dobj, partBits ) ) {
+			trap_DObjCalcAnim( cgWeapon->dobj, partBits );
+			trap_DObjCalcSkel( cgWeapon->dobj, partBits );
 		}
 
 		CG_ProcessWeaponNoteTracks();
 
-		/* THE isViewWeapon BLOCK RUNS TO HERE, not to CG_ProcessWeaponNoteTracks.
-		   0x30036DAD is `test edi, edi` with edi = isViewWeapon and 0x30036DBB is
-		   `jz loc_30037162`, which skips everything below in one jump: the gun
-		   matrix, the viewmodel origin/axis stores and the tag_brass lookup. */
-		/* The pose goes into the gun's OWN origin and axis -- 0x30036EE6..0x30036FE0
-		   write the refEntity being built -- and cg's viewmodel origin/axis are
-		   copied out of it afterwards. */
-		VectorCopy( parent->axis[0], gun.axis[0] );
-		VectorCopy( parent->axis[1], gun.axis[1] );
-		VectorCopy( parent->axis[2], gun.axis[2] );
 		VectorCopy( parent->origin, gun.origin );
+		AxisCopy( parent->axis, gun.axis );
 
-		gun.origin[0] += cg.refdef.viewaxis[0][0] * cg_gunX.value;
-		gun.origin[0] += cg.refdef.viewaxis[1][0] * cg_gunY.value;
-		gun.origin[0] += cg.refdef.viewaxis[2][0] * cg_gunZ.value;
+		// keep: the x row's operand order matches original codegen
+		gun.origin[0] += cg_gunX.value * cg.refdef.viewaxis[0][0];
+		gun.origin[0] += cg_gunY.value * cg.refdef.viewaxis[1][0];
+		gun.origin[0] += cg_gunZ.value * cg.refdef.viewaxis[2][0];
 		gun.origin[1] += cg.refdef.viewaxis[0][1] * cg_gunX.value;
 		gun.origin[1] += cg.refdef.viewaxis[1][1] * cg_gunY.value;
 		gun.origin[1] += cg.refdef.viewaxis[2][1] * cg_gunZ.value;
@@ -1642,15 +1497,15 @@ void CG_AddPlayerWeapon( refEntity_t *parent, playerState_t *ps, centity_t *cent
 			trap_R_AddRefEntityToScene( &gun );
 		}
 
-		VectorCopy( gun.origin, CG_VIEWMODELORIGIN() );
-		VectorCopy( gun.axis[0], CG_VIEWMODELAXIS()[0] );
-		VectorCopy( gun.axis[1], CG_VIEWMODELAXIS()[1] );
-		VectorCopy( gun.axis[2], CG_VIEWMODELAXIS()[2] );
+		VectorCopy( gun.origin, cg.viewModelOrigin );
+		VectorCopy( gun.axis[0], cg.viewModelAxis[0] );
+		VectorCopy( gun.axis[1], cg.viewModelAxis[1] );
+		VectorCopy( gun.axis[2], cg.viewModelAxis[2] );
 
-		boneIndex = trap_syscall_0xAE( cgWeapon->dobj, (int)"tag_brass" );
+		boneIndex = trap_DObjGetBoneIndex( cgWeapon->dobj, "tag_brass" );
 		if ( boneIndex > -1 ) {
-			boneBase = trap_syscall_0x9D( cgWeapon->dobj, 0 );
-			/* the gun pose as nine axis floats followed by the origin (0x300370A5) */
+			boneMatrix = DOBJ_BONEMATRIX( trap_DObjGetMatrixArray( cgWeapon->dobj ), boneIndex );
+			// the gun pose as nine axis floats followed by the origin
 			gunMatrix[0] = gun.axis[0][0];
 			gunMatrix[1] = gun.axis[0][1];
 			gunMatrix[2] = gun.axis[0][2];
@@ -1663,31 +1518,30 @@ void CG_AddPlayerWeapon( refEntity_t *parent, playerState_t *ps, centity_t *cent
 			gunMatrix[9] = gun.origin[0];
 			gunMatrix[10] = gun.origin[1];
 			gunMatrix[11] = gun.origin[2];
-			DObjSkel2MatrixMultiply43( gunMatrix, tagMatrix,
-									   (const float *)( (byte *)boneBase + ( boneIndex << 6 ) ) );
+			DObjSkel2MatrixMultiply43( boneMatrix, gunMatrix, tagMatrix );
 			cg_brassOrigin[0] = tagMatrix[12];
 			cg_brassOrigin[1] = tagMatrix[13];
 			cg_brassOrigin[2] = tagMatrix[14];
 		}
 	}
 
-	if ( !CENT_MUZZLEFLASH( cent ) ) {
+	if ( !cent->bMuzzleFlash ) {
 		return;
 	}
 	if ( firstPersonOwner && !isViewWeapon ) {
 		return;
 	}
-	CENT_MUZZLEFLASH( cent ) = 0;
+	cent->bMuzzleFlash = 0;
 	if ( !drawGun ) {
 		return;
 	}
 
 	if ( isViewWeapon ) {
-		CG_WeaponFlash( weaponNum, qtrue, CG_WeaponDObjHandle( weaponNum ),
-						CG_VIEWMODELORIGIN(), cg_flashTags[0] );
+		CG_WeaponFlash( CG_WeaponDObjHandle( weaponNum ), weaponNum,
+						cg.viewModelOrigin, qtrue, cg_flashTags[0] );
 	} else {
-		CG_WeaponFlash( weaponNum, qfalse, cent->currentState.number,
-						cent->lerpOrigin, cg_flashTags[0] );
+		CG_WeaponFlash( cent->currentState.number, weaponNum,
+						cent->lerpOrigin, qfalse, cg_flashTags[0] );
 	}
 }
 
@@ -1695,8 +1549,7 @@ void CG_AddPlayerWeapon( refEntity_t *parent, playerState_t *ps, centity_t *cent
 ==============
 CG_AddViewWeapon
 
-Add the local client's weapon to the scene: place it, run the sway and recoil
-solvers over it, drive its animations, and hand it to CG_AddPlayerWeapon.
+Add the weapon, and flash for the player's view
 ==============
 */
 void CG_AddViewWeapon( playerState_t *ps ) {
@@ -1707,11 +1560,12 @@ void CG_AddViewWeapon( playerState_t *ps ) {
 	vec3_t viewAxis[3];
 	vec3_t weaponAxis[3];
 	float zoom;
+	vec3_t gunOffset;
 	qboolean drawGun;
 
 	drawGun = qtrue;
 
-	/* no gun if in third person view or dead */
+	// no gun if in third person view or dead
 	if ( ps->pm_type == 4 || ps->pm_type == 5 ) {
 		return;
 	}
@@ -1719,102 +1573,105 @@ void CG_AddViewWeapon( playerState_t *ps ) {
 		return;
 	}
 
+	// allow the gun to be completely removed
 	if ( cg_drawGun.integer != 2
 		 && ( cg_drawGun.integer == 0 || CG_GetWeapReticleZoom( &zoom ) ) ) {
 		drawGun = qfalse;
 	}
 
-	if ( CG_NOVIEWWEAPON() ) {
+	// don't draw if testing a gun model
+	if ( cg.testGun ) {
 		return;
 	}
 	if ( ps->eFlags & EF_NOVIEWWEAPON ) {
 		return;
 	}
 
-	if ( ps->weapon <= 0 ) {
-		CG_GUNPITCH() = cg.refdefViewAngles[0];
-		CG_GUNYAW() = cg.refdefViewAngles[1];
-		CG_ADSWORLDOFFSET()[0] = 0.0f;
-		CG_ADSWORLDOFFSET()[1] = 0.0f;
-		CG_ADSWORLDOFFSET()[2] = 0.0f;
-		return;
-	}
+	// keep: signed test, matches original codegen
+	if ( (int)ps->weapon > 0 ) {
+		CG_RegisterWeapon( ps->weapon );
+		cgWeapon = &cg_weapons[ ps->weapon ];
 
-	CG_RegisterWeapon( ps->weapon );
-	cgWeapon = &cg_weapons[ ps->weapon ];
+		CG_CalculateWeaponPosition_Sway();
+		CG_CalculateWeaponPostion_PositionToADS();
 
-	CG_CalculateWeaponPosition_Sway();
-	CG_CalculateWeaponPostion_PositionToADS();
+		memset( &hand, 0, sizeof( hand ) );
 
-	memset( &hand, 0, sizeof( hand ) );
-	CG_CalculateWeaponPosition( hand.origin );
+		// set up gun position
+		CG_CalculateWeaponPosition( hand.origin );
 
-	VectorMA( hand.origin, cg_gunX.value, cg.refdef.viewaxis[0], hand.origin );
-	VectorMA( hand.origin, cg_gunY.value, cg.refdef.viewaxis[1], hand.origin );
-	VectorMA( hand.origin, cg_gunZ.value, cg.refdef.viewaxis[2], hand.origin );
+		gunOffset[0] = cg_gunX.value;
+		gunOffset[1] = cg_gunY.value;
+		gunOffset[2] = cg_gunZ.value;
+		VectorMA( hand.origin, gunOffset[0], cg.refdef.viewaxis[0], hand.origin );
+		VectorMA( hand.origin, gunOffset[1], cg.refdef.viewaxis[1], hand.origin );
+		VectorMA( hand.origin, gunOffset[2], cg.refdef.viewaxis[2], hand.origin );
 
-	AnglesToAxis( cg.refdefViewAngles, viewAxis );
+		AnglesToAxis( cg.refdefViewAngles, viewAxis );
 
-	state.ps = ps;
-	state.speed = CG_XYSPEED();
-	state.frametime = (float)cg.frametime * 0.001f;
-	state.moveOffset[0] = CG_MOVEOFFSET()[0];
-	state.moveOffset[1] = CG_MOVEOFFSET()[1];
-	state.moveOffset[2] = CG_MOVEOFFSET()[2];
-	state.idleScale = CG_IDLESCALE();
-	state.time = cg.time - ps->deltaTime;
-	if ( cg.damageTime ) {
-		state.viewKickStartTime = cg.damageTime - ps->deltaTime;
+		state.ps = ps;
+		state.speed = cg.xyspeed;
+		state.frametime = (float)cg.frametime * 0.001f;
+		state.moveOffset[0] = cg.playerEntity.vLastMoveAng[0];
+		state.moveOffset[1] = cg.playerEntity.vLastMoveAng[1];
+		state.moveOffset[2] = cg.playerEntity.vLastMoveAng[2];
+		state.idleScale = cg.playerEntity.fLastIdleFactor;
+		state.time = cg.time - ps->deltaTime;
+		if ( cg.damageTime ) {
+			state.viewKickStartTime = cg.damageTime - ps->deltaTime;
+		} else {
+			state.viewKickStartTime = 0;
+		}
+		state.viewKickPitch = cg.v_dmg_pitch;
+		state.viewKickYaw = cg.v_dmg_roll;
+		state.recoilPitch = cg.recoilPitch;
+		state.recoilYaw = cg.recoilYaw;
+		state.recoilRoll = cg.recoilRoll;
+		state.recoilPitchSpeed = cg.recoilPitchSpeed;
+		state.recoilYawSpeed = cg.recoilYawSpeed;
+		state.recoilState = cg.recoilState;
+		state.baseAngles[0] = cg.swayAngles[0];
+		state.baseAngles[1] = cg.swayAngles[1];
+		state.baseAngles[2] = cg.swayAngles[2];
+
+		BG_CalculateWeaponAngles( &state, angles );
+
+		AnglesToAxis( angles, weaponAxis );
+		MatrixMultiply( weaponAxis, viewAxis, hand.axis );
+
+		if ( bg_weaponInfo[ps->weapon]->aimDownSight && ps->fWeaponPosFrac != 0.0f ) {
+			AxisToAngles( hand.axis, angles );
+			cg.gunPitch = AngleNormalize360( angles[0] );
+			cg.gunYaw = AngleNormalize360( angles[1] );
+		} else {
+			cg.gunPitch = cg.refdefViewAngles[0];
+			cg.gunYaw = cg.refdefViewAngles[1];
+		}
+
+		cg.playerEntity.vLastMoveAng[0] = state.moveOffset[0];
+		cg.playerEntity.vLastMoveAng[1] = state.moveOffset[1];
+		cg.playerEntity.vLastMoveAng[2] = state.moveOffset[2];
+		cg.playerEntity.fLastIdleFactor = state.idleScale;
+		cg.recoilPitch = state.recoilPitch;
+		cg.recoilYaw = state.recoilYaw;
+		cg.recoilRoll = state.recoilRoll;
+		cg.recoilPitchSpeed = state.recoilPitchSpeed;
+		cg.recoilYawSpeed = state.recoilYawSpeed;
+		cg.recoilState = state.recoilState;
+
+		CG_WeaponRunXModelAnims( ps, cgWeapon );
+
+		hand.renderfx = RF_VIEWMODEL;
+
+		// add everything onto the hand
+		CG_AddPlayerWeapon( &hand, ps, &cg.predictedPlayerEntity, drawGun );
 	} else {
-		state.viewKickStartTime = 0;
+		cg.gunPitch = cg.refdefViewAngles[0];
+		cg.gunYaw = cg.refdefViewAngles[1];
+		cg.gunXOfs = 0.0f;
+		cg.gunYOfs = 0.0f;
+		cg.gunZOfs = 0.0f;
 	}
-	state.viewKickPitch = cg.damageY;
-	state.viewKickYaw = cg.damageX;
-	state.recoilPitch = CG_RECOILPITCH();
-	state.recoilYaw = CG_RECOILYAW();
-	state.recoilRoll = CG_RECOILROLL();
-	state.recoilPitchSpeed = CG_RECOILPITCHSPEED();
-	state.recoilYawSpeed = CG_RECOILYAWSPEED();
-	state.recoilState = CG_RECOILSTATE();
-	state.baseAngles[0] = CG_SWAYANGLES()[0];
-	state.baseAngles[1] = CG_SWAYANGLES()[1];
-	state.baseAngles[2] = CG_SWAYANGLES()[2];
-
-	BG_CalculateWeaponAngles( &state, angles );
-
-	AnglesToAxis( angles, weaponAxis );
-	MatrixMultiply( weaponAxis, viewAxis, hand.axis );
-
-	if ( bg_weaponInfo[ps->weapon]->aimDownSight && ps->fWeaponPosFrac != 0.0f ) {
-		/* angles is the OUT parameter and arrives in eax, the axis in ecx
-		   (AxisToAngles 0x3003C815).  That is the register mapping, not the
-		   source order -- the axis is written first, matching the single
-		   __cdecl definition in universal/com_math_raw.c.  0x300374EE reads
-		   angles[0] and [1] back out after the call, so angles is the
-		   destination and hand.axis must survive. */
-		AxisToAngles( hand.axis, angles );
-		CG_GUNPITCH() = AngleNormalize360( angles[0] );
-		CG_GUNYAW() = AngleNormalize360( angles[1] );
-	} else {
-		CG_GUNPITCH() = cg.refdefViewAngles[0];
-		CG_GUNYAW() = cg.refdefViewAngles[1];
-	}
-
-	CG_MOVEOFFSET()[0] = state.moveOffset[0];
-	CG_MOVEOFFSET()[1] = state.moveOffset[1];
-	CG_MOVEOFFSET()[2] = state.moveOffset[2];
-	CG_IDLESCALE() = state.idleScale;
-	CG_RECOILPITCH() = state.recoilPitch;
-	CG_RECOILYAW() = state.recoilYaw;
-	CG_RECOILROLL() = state.recoilRoll;
-	CG_RECOILPITCHSPEED() = state.recoilPitchSpeed;
-	CG_RECOILYAWSPEED() = state.recoilYawSpeed;
-	CG_RECOILSTATE() = state.recoilState;
-
-	CG_WeaponRunXModelAnims( ps, cgWeapon );
-
-	hand.renderfx = RF_VIEWMODEL;
-	CG_AddPlayerWeapon( &hand, ps, &cg.predictedPlayerEntity, drawGun );
 }
 
 /*
@@ -1837,20 +1694,20 @@ static void CG_DrawWeapSlotBinding( int slot, const float *color, float x, float
 	const char *binding;
 	vec4_t textColor;
 
+	textColor[3] = color[3];
 	binding = BindingFromName( va( "weaponslot %s", BG_GetWeaponSlotNameForIndex( slot ) ) );
 
 	textColor[0] = 0.0f;
 	textColor[1] = 0.0f;
 	textColor[2] = 0.0f;
-	textColor[3] = color[3];
-	trap_R_Text_Paint( x + 1.0f, y + 1.0f - 4.0f + 9.6f, 5, 0.25f, textColor,
-					   binding, 6.0f, 0, 0 );
+	CG_DrawStringExt( x + 1.0f, y + 1.0f - 4.0f, binding, textColor, qfalse, qfalse,
+					  6.0f, 12.0f, 0, qtrue );
 
 	textColor[0] = 1.0f;
 	textColor[1] = 1.0f;
 	textColor[2] = 1.0f;
-	trap_R_Text_Paint( x, y - 4.0f + 9.6f, 5, 0.25f, textColor,
-					   binding, 6.0f, 0, 0 );
+	CG_DrawStringExt( x, y - 4.0f, binding, textColor, qfalse, qfalse,
+					  6.0f, 12.0f, 0, qtrue );
 
 	trap_R_SetColor( color );
 }
@@ -1866,21 +1723,29 @@ back to the selected one.
 */
 void CG_DrawWeaponSelect( void ) {
 	const weaponInfo_t  *weaponInfo;
+	const weaponInfo_t  *selectedInfo;
 	const cgWeaponInfo_t    *cgWeapon;
 	float       *color;
-	vec4_t drawColor;
-	float positions[8];
+	struct {
+		vec4_t  drawColor;
+		float   positions[6];   // original size; a 7-weapon alt chain overruns it
+	} hud;
 	float x, width, height, size, pos;
+	float halfWidth;
 	float spinAbs;
+	float spinSign, spinSign2;
+	float iconSize, spinFrac, iconY;
+	float scale;
 	int msec;
 	int selectedSlot;
-	int weapon, alt;
+	int alt;
+	signed char slotWeapon;
 	int numAlts;
 	int slot;
 	int index;
 
-	msec = cg.time - CG_WEAPONSELECTDRAWTIME();
-	CG_WEAPONSELECTDRAWTIME() = cg.time;
+	msec = cg.time - cg.lastWeaponSelectDrawTime;
+	cg.lastWeaponSelectDrawTime = cg.time;
 
 	if ( cg.predictedPlayerState.pm_type >= 6 ) {
 		return;
@@ -1893,205 +1758,209 @@ void CG_DrawWeaponSelect( void ) {
 
 	Controls_GetConfig();
 
-	drawColor[0] = 0.5f;
-	drawColor[1] = 0.5f;
-	drawColor[2] = 0.5f;
-	drawColor[3] = color[3];
-	trap_R_SetColor( drawColor );
+	hud.drawColor[0] = 0.5f;
+	hud.drawColor[1] = 0.5f;
+	hud.drawColor[2] = 0.5f;
+	hud.drawColor[3] = color[3];
+	trap_R_SetColor( hud.drawColor );
 
-	weapon = cg_weaponSelect.integer;
-	selectedSlot = BG_IsPlayerWeaponInSlot( &cg.predictedPlayerState, weapon, qtrue );
+	selectedSlot = BG_IsPlayerWeaponInSlot( &cg.predictedPlayerState, cg_weaponSelect.integer, qtrue );
 
 	x = 632.0f;
-	for ( slot = 5; slot >= 1; slot-- ) {
-		int slotWeapon = (signed char)cg.predictedPlayerState.weaponslots[slot];
+	for ( slot = 5; slot > 0; slot-- ) {
+		slotWeapon = cg.predictedPlayerState.weaponslots[slot];
 
 		if ( !slotWeapon
 			 || !( cg.predictedPlayerState.weapons[slotWeapon >> 5] & ( 1 << ( slotWeapon & 31 ) ) ) ) {
 			x -= 32.0f;
-			CG_SLOTFADE()[slot] = 0.0f;
+			cg.weaponSlotFade[slot] = 0.0f;
 			x -= 2.0f;
-			continue;
-		}
-
-		weaponInfo = bg_weaponInfo[slotWeapon];
-		cgWeapon = &cg_weapons[ slotWeapon ];
-
-		if ( !cgWeapon->hudIcon ) {
-			x -= 32.0f;
-			CG_DrawPic( x, 8.0f, 32.0f, 32.0f, cgs.media.hudNoWeaponIcon );
-			CG_SLOTFADE()[slot] = 0.0f;
-			x -= 2.0f;
-			continue;
-		}
-
-		if ( selectedSlot != slot ) {
-			if ( CG_SLOTFADE()[slot] > 0.0f && msec ) {
-				CG_SLOTFADE()[slot] -= (float)msec * 0.01f;
-				if ( CG_SLOTFADE()[slot] < 0.0f ) {
-					CG_SLOTFADE()[slot] = 0.0f;
-				}
-			}
-			height = ( CG_SLOTFADE()[slot] + 1.0f ) * 32.0f;
-			width = height;
-			if ( weaponInfo->wideListIcon ) {
-				width = height + height;
-			}
-			x -= width;
-			CG_DrawPic( x, 8.0f, width, height, cgWeapon->hudIcon );
-			CG_DrawWeapSlotBinding( slot, drawColor, x, 8.0f );
-			x -= 2.0f;
-			continue;
-		}
-
-		/* the selected slot */
-		if ( CG_SLOTFADE()[slot] < 1.0f && msec ) {
-			CG_SLOTFADE()[slot] += (float)msec * 0.01f;
-			if ( CG_SLOTFADE()[slot] > 1.0f ) {
-				CG_SLOTFADE()[slot] = 1.0f;
-			}
-		}
-
-		numAlts = 1;
-		alt = bg_weaponInfo[weapon]->altWeaponIndex;
-		while ( alt && alt != weapon ) {
-			alt = bg_weaponInfo[alt]->altWeaponIndex;
-			numAlts++;
-		}
-
-		if ( numAlts == 1 ) {
-			cg_weaponSelectSpin = 0.0f;
-			cg_weaponSelectSpinSlot = selectedSlot;
-			cg_weaponSelectSpinWeapon = weapon;
-
-			drawColor[0] = 1.0f;
-			drawColor[1] = 1.0f;
-			drawColor[2] = 1.0f;
-			trap_R_SetColor( drawColor );
-
-			height = ( CG_SLOTFADE()[slot] + 1.0f ) * 32.0f;
-			width = height;
-			if ( weaponInfo->wideListIcon ) {
-				width = height + height;
-			}
-			x -= width;
-			CG_DrawPic( x, 8.0f, width, height, cgWeapon->hudIcon );
-
-			drawColor[0] = 0.5f;
-			drawColor[1] = 0.5f;
-			drawColor[2] = 0.5f;
-			trap_R_SetColor( drawColor );
-			CG_DrawWeapSlotBinding( slot, drawColor, x, 8.0f );
-			x -= 2.0f;
-			continue;
-		}
-
-		/* more than one weapon on the alt chain: arm and decay the spin */
-		if ( cg_weaponSelectSpinSlot != selectedSlot ) {
-			cg_weaponSelectSpinSlot = selectedSlot;
-			cg_weaponSelectSpinWeapon = weapon;
-			cg_weaponSelectSpin = 0.0f;
 		} else {
-			if ( cg_weaponSelectSpinWeapon != weapon ) {
-				if ( bg_weaponInfo[cg_weaponSelectSpinWeapon]->altWeaponIndex == weapon ) {
-					cg_weaponSelectSpin = 1.0f;
-				} else {
-					cg_weaponSelectSpin = -1.0f;
-				}
-				cg_weaponSelectSpinWeapon = weapon;
-			}
-			if ( cg_weaponSelectSpin != 0.0f ) {
-				if ( cg_weaponSelectSpin < 0.0f ) {
-					cg_weaponSelectSpin += (float)msec * 0.0066666668f;
-					if ( cg_weaponSelectSpin > 0.0f ) {
-						cg_weaponSelectSpin = 0.0f;
-					}
-				} else {
-					cg_weaponSelectSpin -= (float)msec * 0.0066666668f;
-					if ( cg_weaponSelectSpin < 0.0f ) {
-						cg_weaponSelectSpin = 0.0f;
-					}
-				}
-			}
-		}
+			weaponInfo = bg_weaponInfo[slotWeapon];
+			cgWeapon = &cg_weapons[ slotWeapon ];
 
-		size = ( CG_SLOTFADE()[slot] + 1.0f ) * 32.0f;
-		width = size;
-		if ( weaponInfo->wideListIcon ) {
-			width = size + size;
-		}
-
-		positions[1] = 8.0f;
-		positions[2] = size + 10.0f;
-		for ( index = 2; index < numAlts; index++ ) {
-			positions[index + 1] = positions[index] + 34.0f;
-		}
-
-		x -= width * 0.5f;
-
-		/* the alternates, walking the chain forwards from the selected one */
-		alt = bg_weaponInfo[weapon]->altWeaponIndex;
-		while ( alt && alt != weapon ) {
-			const weaponInfo_t  *altInfo = bg_weaponInfo[alt];
-			const cgWeaponInfo_t    *altWeapon = &cg_weapons[ alt ];
-			float iconWidth = 32.0f;
-
-			height = 32.0f;
-			if ( altInfo->wideListIcon ) {
-				iconWidth = 64.0f;
-			}
-
-			if ( cg_weaponSelectSpin != 0.0f ) {
-				spinAbs = (float)fabs( cg_weaponSelectSpin );
-				index = ( cg_weaponSelectSpin < 0.0f ? 0 : 2 ) % numAlts;
-				pos = positions[2] - ( positions[2] - positions[1 + index] ) * spinAbs;
-				if ( cg_weaponSelectSpin > 0.0f
-					 || ( numAlts - 1 == 1 && cg_weaponSelectSpin < 0.0f ) ) {
-					height = ( spinAbs * CG_SLOTFADE()[slot] + 1.0f ) * 32.0f;
-					iconWidth = iconWidth * ( spinAbs * CG_SLOTFADE()[slot] + 1.0f );
-				}
+			if ( !cgWeapon->hudIcon ) {
+				x -= 32.0f;
+				CG_DrawPic( x, 8.0f, 32.0f, 32.0f, cgs.media.hudNoWeaponIcon );
+				cg.weaponSlotFade[slot] = 0.0f;
+				x -= 2.0f;
 			} else {
-				pos = positions[2];
+				if ( selectedSlot != slot ) {
+					if ( cg.weaponSlotFade[slot] > 0.0f && msec ) {
+						cg.weaponSlotFade[slot] -= (float)msec * 0.01f;
+						if ( cg.weaponSlotFade[slot] < 0.0f ) {
+							cg.weaponSlotFade[slot] = 0.0f;
+						}
+					}
+					height = ( cg.weaponSlotFade[slot] + 1.0f ) * 32.0f;
+					width = height;
+					if ( weaponInfo->wideListIcon ) {
+						width = height + height;
+					}
+					x -= width;
+					CG_DrawPic( x, 8.0f, width, height, cgWeapon->hudIcon );
+				} else {
+					// the selected slot
+					if ( cg.weaponSlotFade[slot] < 1.0f && msec ) {
+						cg.weaponSlotFade[slot] += (float)msec * 0.01f;
+						if ( cg.weaponSlotFade[slot] > 1.0f ) {
+							cg.weaponSlotFade[slot] = 1.0f;
+						}
+					}
+
+					numAlts = 1;
+					selectedInfo = bg_weaponInfo[cg_weaponSelect.integer];
+					alt = selectedInfo->altWeaponIndex;
+					while ( alt && alt != cg_weaponSelect.integer ) {
+						alt = bg_weaponInfo[alt]->altWeaponIndex;
+						numAlts++;
+					}
+
+					if ( numAlts == 1 ) {
+						cg_weaponSelectSpin = 0.0f;
+						cg_weaponSelectSpinSlot = selectedSlot;
+						cg_weaponSelectSpinWeapon = cg_weaponSelect.integer;
+
+						hud.drawColor[0] = 1.0f;
+						hud.drawColor[1] = 1.0f;
+						hud.drawColor[2] = 1.0f;
+						trap_R_SetColor( hud.drawColor );
+
+						iconSize = ( cg.weaponSlotFade[slot] + 1.0f ) * 32.0f;
+						width = iconSize;
+						if ( weaponInfo->wideListIcon ) {
+							width = iconSize + iconSize;
+						}
+						CG_DrawPic( x - width, 8.0f, width, iconSize, cgWeapon->hudIcon );
+						x -= width;
+
+						hud.drawColor[0] = 0.5f;
+						hud.drawColor[1] = 0.5f;
+						hud.drawColor[2] = 0.5f;
+						trap_R_SetColor( hud.drawColor );
+					} else {
+						// more than one weapon on the alt chain: arm and decay the spin
+						if ( cg_weaponSelectSpinSlot != selectedSlot ) {
+							cg_weaponSelectSpinSlot = selectedSlot;
+							cg_weaponSelectSpinWeapon = cg_weaponSelect.integer;
+							cg_weaponSelectSpin = 0.0f;
+						} else {
+							if ( cg_weaponSelectSpinWeapon != cg_weaponSelect.integer ) {
+								if ( bg_weaponInfo[cg_weaponSelectSpinWeapon]->altWeaponIndex == cg_weaponSelect.integer ) {
+									cg_weaponSelectSpin = 1.0f;
+								} else {
+									cg_weaponSelectSpin = -1.0f;
+								}
+								cg_weaponSelectSpinWeapon = cg_weaponSelect.integer;
+							}
+							if ( cg_weaponSelectSpin != 0.0f ) {
+								if ( cg_weaponSelectSpin < 0.0f ) {
+									cg_weaponSelectSpin += (float)msec * 0.0066666668f;
+									if ( cg_weaponSelectSpin > 0.0f ) {
+										cg_weaponSelectSpin = 0.0f;
+									}
+								} else {
+									cg_weaponSelectSpin -= (float)msec * 0.0066666668f;
+									if ( cg_weaponSelectSpin < 0.0f ) {
+										cg_weaponSelectSpin = 0.0f;
+									}
+								}
+							}
+						}
+
+						// original bug, kept: with a negative spin the selected-icon
+						// lookup below reads positions[-1], which the struct pins to
+						// drawColor[3]
+						height = ( cg.weaponSlotFade[slot] + 1.0f ) * 32.0f;
+						halfWidth = height;
+						// keep: positions[0] set in both arms (original codegen)
+						if ( weaponInfo->wideListIcon ) {
+							hud.positions[0] = 8.0f;
+							halfWidth = height + height;
+						} else {
+							hud.positions[0] = 8.0f;
+						}
+						// the slot's full width, kept for the end
+						size = halfWidth;
+						hud.positions[1] = height + 10.0f;
+						for ( index = 2; index < numAlts; index++ ) {
+							hud.positions[index] = hud.positions[index - 1] + 34.0f;
+						}
+
+						halfWidth *= -0.5f;
+
+						// the alternates, walking the chain forwards from the selected one
+						alt = selectedInfo->altWeaponIndex;
+						while ( alt && alt != cg_weaponSelect.integer ) {
+							const weaponInfo_t  *altInfo = bg_weaponInfo[alt];
+							const cgWeaponInfo_t    *altWeapon = &cg_weapons[ alt ];
+							float iconWidth;
+
+							height = 32.0f;
+							iconWidth = height;
+							if ( altInfo->wideListIcon ) {
+								iconWidth = height * 2.0f;
+							}
+
+							if ( cg_weaponSelectSpin != 0.0f ) {
+								spinAbs = (float)fabs( cg_weaponSelectSpin );
+								// keep: sign bit read through a stored copy (original codegen)
+								spinSign = cg_weaponSelectSpin;
+								index = ( 2 - ( *(int *)&spinSign < 0 ) * 2 ) % numAlts;
+								pos = hud.positions[1] - ( hud.positions[1] - hud.positions[index] ) * spinAbs;
+								if ( cg_weaponSelectSpin > 0.0f
+									 || ( numAlts - 1 == 1 && cg_weaponSelectSpin < 0.0f ) ) {
+									scale = cg.weaponSlotFade[slot] * spinAbs + 1.0f;
+									iconWidth *= scale;
+									height *= scale;
+								}
+							} else {
+								pos = hud.positions[1];
+							}
+
+							CG_DrawPic( halfWidth + x - iconWidth * 0.5f, pos, iconWidth, height, altWeapon->hudIcon );
+
+							alt = altInfo->altWeaponIndex;
+						}
+
+						// and the selected weapon itself, on top
+						hud.drawColor[0] = 1.0f;
+						hud.drawColor[1] = 1.0f;
+						hud.drawColor[2] = 1.0f;
+						trap_R_SetColor( hud.drawColor );
+
+						height = 32.0f;
+						width = height;
+						if ( weaponInfo->wideListIcon ) {
+							width = height * 2.0f;
+						}
+						if ( cg_weaponSelectSpin != 0.0f ) {
+							spinFrac = (float)fabs( cg_weaponSelectSpin );
+							spinSign2 = cg_weaponSelectSpin;
+							index = ( 1 - ( *(int *)&spinSign2 < 0 ) * 2 ) % numAlts;
+							iconY = hud.positions[0] - ( hud.positions[0] - hud.positions[index] ) * spinFrac;
+							scale = ( 1.0f - spinFrac ) * cg.weaponSlotFade[slot] + 1.0f;
+							width *= scale;
+							height *= scale;
+						} else {
+							iconY = hud.positions[0];
+							scale = cg.weaponSlotFade[slot] + 1.0f;
+							width *= scale;
+							height *= scale;
+						}
+						CG_DrawPic( halfWidth + x - width * 0.5f, iconY, width, height, cgWeapon->hudIcon );
+						x -= size;
+
+						hud.drawColor[0] = 0.5f;
+						hud.drawColor[1] = 0.5f;
+						hud.drawColor[2] = 0.5f;
+						trap_R_SetColor( hud.drawColor );
+					}
+				}
+				CG_DrawWeapSlotBinding( slot, hud.drawColor, x, 8.0f );
+				x -= 2.0f;
 			}
-
-			trap_R_DrawStretchPic( ( x - iconWidth * 0.5f ) * cgs.screenXScale,
-								   pos * cgs.screenYScale,
-								   iconWidth * cgs.screenXScale,
-								   height * cgs.screenYScale,
-								   0.0f, 0.0f, 1.0f, 1.0f, altWeapon->hudIcon );
-
-			alt = altInfo->altWeaponIndex;
 		}
-
-		/* and the selected weapon itself, on top */
-		drawColor[0] = 1.0f;
-		drawColor[1] = 1.0f;
-		drawColor[2] = 1.0f;
-		trap_R_SetColor( drawColor );
-
-		size = 32.0f;
-		if ( weaponInfo->wideListIcon ) {
-			size = 64.0f;
-		}
-		if ( cg_weaponSelectSpin != 0.0f ) {
-			spinAbs = (float)fabs( cg_weaponSelectSpin );
-			index = ( 1 - ( cg_weaponSelectSpin < 0.0f ? 2 : 0 ) ) % numAlts;
-			pos = positions[1] - ( positions[1] - positions[1 + index] ) * spinAbs;
-			height = ( 1.0f - spinAbs ) * CG_SLOTFADE()[slot] + 1.0f;
-		} else {
-			pos = positions[1];
-			height = CG_SLOTFADE()[slot] + 1.0f;
-		}
-		CG_DrawPic( x - size * height * 0.5f, pos, size * height, height * 32.0f,
-					cgWeapon->hudIcon );
-		x -= width * 0.5f;   /* net advance is one width; the other 0.5 was applied above (retail 0x30037e68) */
-
-		drawColor[0] = 0.5f;
-		drawColor[1] = 0.5f;
-		drawColor[2] = 0.5f;
-		trap_R_SetColor( drawColor );
-		CG_DrawWeapSlotBinding( slot, drawColor, x, 8.0f );
-		x -= 2.0f;
 	}
 }
 
@@ -2101,7 +1970,11 @@ CG_WeaponSelectable
 ==============
 */
 static qboolean CG_WeaponSelectable( int weapon ) {
-	return ( cg.predictedPlayerState.weapons[weapon >> 5] & ( 1 << ( weapon & 31 ) ) ) != 0;
+	// keep: if/return form matches original codegen
+	if ( !( cg.predictedPlayerState.weapons[weapon >> 5] & ( 1 << ( weapon & 31 ) ) ) ) {
+		return qfalse;
+	}
+	return qtrue;
 }
 
 /*
@@ -2112,18 +1985,18 @@ Hand the choice to the engine through cg_weaponSelect, and drop out of walk
 mode unless this is a switch to the same weapon's alternate.
 ==============
 */
-/* NOT static: cg_servercmds_mp.c's CG_ServerCommand calls it too (0x3002E139). */
 void CG_FinishWeaponChange( int oldWeapon, int newWeapon ) {
 	qboolean isAlt;
 
-	cg.weaponSelectTime = cg.time;
-	if ( oldWeapon == newWeapon ) {
+	cg.weaponSelectTime = cg.time;  // flash the weapon icon
+	if ( oldWeapon == newWeapon ) {   // no need to do any more than flash the icon
 		return;
 	}
 
-	isAlt = qfalse;
-	if ( newWeapon && bg_weaponInfo[oldWeapon]->altWeaponIndex == newWeapon ) {
+	if ( newWeapon && newWeapon == bg_weaponInfo[oldWeapon]->altWeaponIndex ) {
 		isAlt = qtrue;
+	} else {
+		isAlt = qfalse;
 	}
 
 	trap_Cvar_Set( "cg_weaponSelect", va( "%i", newWeapon ) );
@@ -2136,6 +2009,8 @@ void CG_FinishWeaponChange( int oldWeapon, int newWeapon ) {
 /*
 ==============
 CG_AltWeapon_f
+
+Switch to the selected weapon's alternate.
 ==============
 */
 void CG_AltWeapon_f( void ) {
@@ -2154,7 +2029,7 @@ void CG_AltWeapon_f( void ) {
 		return;
 	}
 	if ( cg.time - cg.weaponSelectTime < cg_weaponCycleDelay.integer ) {
-		return;
+		return; // force pause so holding it down won't go too fast
 	}
 
 	alt = bg_weaponInfo[cg_weaponSelect.integer]->altWeaponIndex;
@@ -2172,9 +2047,11 @@ void CG_AltWeapon_f( void ) {
 /*
 ==============
 CG_SelectWeaponIndex
+
+Select a weapon by index.  Unreferenced.
 ==============
 */
-static void CG_SelectWeaponIndex( int weapon ) {
+void CG_SelectWeaponIndex( int weapon ) {
 	CG_FinishWeaponChange( cg_weaponSelect.integer, weapon );
 }
 
@@ -2207,10 +2084,10 @@ void CG_NextWeapon_f( void ) {
 		return;
 	}
 	if ( cg.time - cg.weaponSelectTime < cg_weaponCycleDelay.integer ) {
-		return;
+		return; // force pause so holding it down won't go too fast
 	}
 
-	cg.weaponSelectTime = cg.time;
+	cg.weaponSelectTime = cg.time;  // flash the current weapon icon
 	CG_CycleWeap( qtrue, qfalse );
 }
 
@@ -2241,10 +2118,10 @@ void CG_PrevWeapon_f( void ) {
 		return;
 	}
 	if ( cg.time - cg.weaponSelectTime < cg_weaponCycleDelay.integer ) {
-		return;
+		return; // force pause so holding it down won't go too fast
 	}
 
-	cg.weaponSelectTime = cg.time;
+	cg.weaponSelectTime = cg.time;  // flash the current weapon icon
 	CG_CycleWeap( qfalse, qfalse );
 }
 
@@ -2268,11 +2145,9 @@ void CG_Weapon_f( void ) {
 		return;
 	}
 
-	trap_Argv( 1, cg_cmdArgBuffer, sizeof( cg_cmdArgBuffer ) );
-	weapon = (unsigned char)BG_GetWeaponIndexForName( cg_cmdArgBuffer );
+	weapon = (unsigned char)BG_GetWeaponIndexForName( CG_Argv( 1 ) );
 	if ( !weapon ) {
-		trap_Argv( 1, cg_cmdArgBuffer, sizeof( cg_cmdArgBuffer ) );
-		weapon = atoi( cg_cmdArgBuffer );
+		weapon = atoi( CG_Argv( 1 ) );
 		if ( !weapon ) {
 			return;
 		}
@@ -2283,32 +2158,26 @@ void CG_Weapon_f( void ) {
 
 /*
 ==============
-CG_OutOfAmmoChange            0x300381B0..0x300382E6
+CG_OutOfAmmoChange
 
-The weapon just ran dry.  Prefer another weapon of the same slot when the slot
-stacks; otherwise walk the five stackable slots for anything with ammo; failing
-both, hand it to CG_CycleWeap.
-
-Two tail chunks of CG_EntityEvent in retail (0x300381B0..0x30038278 and
-0x30038280..0x300382E6): EV_NOAMMO and EV_DROPWEAPON tail-jump into it at
-0x3001E241, so it has no function entry of its own.
-
-CG_WeaponSelectable is inlined at 0x300381E5 and the ammo test is inlined
-twice.  The five slot numbers really are a local array: MSVC materialises
-{1,2,3,4,5} on the stack (0x3003824C..0x30038274) and indexes it, then reloads
-slots[i] at the hit (0x300382C9) rather than keeping the weapon in a register.
+The current weapon has just run out of ammo
+Prefer another weapon of the same slot when the slot stacks; otherwise walk the
+five slots for anything with ammo; failing both, hand it to CG_CycleWeap.
 ==============
 */
 void CG_OutOfAmmoChange( void ) {
 	const weaponInfo_t  *weaponInfo;
 	int slots[5];
 	int i;
-	int weapon;
+	weaponInfo_t **weaponTable;
+	signed char weapon;
+	int weaponIndex;
 
 	if ( !cg.snap ) {
 		return;
 	}
 
+	weaponTable = bg_weaponInfo;
 	weaponInfo = cg.weaponInfo;
 
 	if ( weaponInfo->slotStackable ) {
@@ -2316,14 +2185,14 @@ void CG_OutOfAmmoChange( void ) {
 			if ( !CG_WeaponSelectable( i ) ) {
 				continue;
 			}
-			if ( !bg_weaponInfo[i]->slotStackable ) {
+			if ( !weaponTable[i]->slotStackable ) {
 				continue;
 			}
-			if ( bg_weaponInfo[i]->weaponSlot != weaponInfo->weaponSlot ) {
+			if ( weaponTable[i]->weaponSlot != weaponInfo->weaponSlot ) {
 				continue;
 			}
-			if ( cg.predictedPlayerState.ammoclip[bg_weaponInfo[i]->clipIndex]
-				 + cg.predictedPlayerState.ammo[bg_weaponInfo[i]->ammoIndex] ) {
+			if ( cg.predictedPlayerState.ammoclip[weaponTable[i]->clipIndex]
+				 + cg.predictedPlayerState.ammo[weaponTable[i]->ammoIndex] ) {
 				CG_FinishWeaponChange( cg_weaponSelect.integer, i );
 				return;
 			}
@@ -2331,19 +2200,21 @@ void CG_OutOfAmmoChange( void ) {
 	}
 
 	if ( BG_IsPlayerWeaponInSlot( &cg.predictedPlayerState, weaponInfo->weapIndex, qtrue ) ) {
+		// keep: a local array of slot numbers, matches original codegen
 		slots[0] = 1;
 		slots[1] = 2;
 		slots[2] = 3;
 		slots[3] = 4;
 		slots[4] = 5;
 
-		for ( i = 0; i < 5; i++ ) {
+		for ( i = 0; i < sizeof( slots ) / sizeof( slots[0] ); i++ ) {
 			weapon = (signed char)cg.predictedPlayerState.weaponslots[slots[i]];
 			if ( !weapon ) {
 				continue;
 			}
-			if ( cg.predictedPlayerState.ammoclip[bg_weaponInfo[weapon]->clipIndex]
-				 + cg.predictedPlayerState.ammo[bg_weaponInfo[weapon]->ammoIndex] ) {
+			weaponIndex = weapon;
+			if ( cg.predictedPlayerState.ammoclip[weaponTable[weaponIndex]->clipIndex]
+				 + cg.predictedPlayerState.ammo[weaponTable[weaponIndex]->ammoIndex] ) {
 				CG_FinishWeaponChange( cg_weaponSelect.integer,
 									   (signed char)cg.predictedPlayerState.weaponslots[slots[i]] );
 				return;
@@ -2375,12 +2246,11 @@ void CG_WeaponSlot_f( void ) {
 		return;
 	}
 	if ( cg.time - cg.weaponSelectTime < cg_weaponCycleDelay.integer ) {
-		return;
+		return; // force pause so holding it down won't go too fast
 	}
-	cg.weaponSelectTime = cg.time;
+	cg.weaponSelectTime = cg.time;  // flash the current weapon icon
 
-	trap_Argv( 1, cg_cmdArgBuffer, sizeof( cg_cmdArgBuffer ) );
-	slot = BG_GetWeaponSlotForName( cg_cmdArgBuffer );
+	slot = BG_GetWeaponSlotForName( CG_Argv( 1 ) );
 	if ( !slot ) {
 		slot = atoi( CG_Argv( 1 ) );
 	}
@@ -2408,10 +2278,11 @@ weapon; with checkAmmo set, one that still has ammunition.
 ==============
 */
 static qboolean CG_SelectFirstWeaponInSlot( qboolean next, qboolean checkAmmo ) {
-	const weaponInfo_t  *weaponInfo;
-	int slot;
 	int step;
-	int weapon;
+	weaponInfo_t **weaponTable;
+	int slot;
+	signed char weapon;
+	int index;
 
 	if ( next ) {
 		step = 1;
@@ -2421,23 +2292,24 @@ static qboolean CG_SelectFirstWeaponInSlot( qboolean next, qboolean checkAmmo ) 
 		slot = 5;
 	}
 
-	do {
-		weapon = (signed char)cg.predictedPlayerState.weaponslots[slot];
+	weaponTable = bg_weaponInfo;
+
+	for ( ;; ) {
+		weapon = cg.predictedPlayerState.weaponslots[slot];
 		if ( weapon ) {
 			if ( !checkAmmo ) {
 				break;
 			}
-			weaponInfo = bg_weaponInfo[weapon];
-			if ( cg.predictedPlayerState.ammoclip[weaponInfo->clipIndex]
-				 + cg.predictedPlayerState.ammo[weaponInfo->ammoIndex] ) {
+			index = weapon;   // keep: matches original codegen
+			if ( cg.predictedPlayerState.ammoclip[weaponTable[index]->clipIndex]
+				 + cg.predictedPlayerState.ammo[weaponTable[index]->ammoIndex] ) {
 				break;
 			}
 		}
 		slot += step;
-	} while ( slot && slot != WEAPSLOT_NUM );
-
-	if ( !slot || slot == WEAPSLOT_NUM ) {
-		return qfalse;
+		if ( !slot || slot == WEAPSLOT_NUM ) {
+			return qfalse;
+		}
 	}
 
 	CG_FinishWeaponChange( cg_weaponSelect.integer,
@@ -2450,78 +2322,104 @@ static qboolean CG_SelectFirstWeaponInSlot( qboolean next, qboolean checkAmmo ) 
 CG_SelectFirstWeaponNotInSlot
 
 The fallback when nothing in the slot bar will do: walk every weapon the player
-owns and take the first one that is not already occupying a slot -- unless the
-slot its class would use is filled by a non-stackable weapon.
+owns and take the first one that is not already occupying a slot -- unless it
+is slot-stackable and a stack slot is still open for it (its class's slot, or
+either primary slot, is empty or holds a stackable weapon).
 ==============
 */
 static qboolean CG_SelectFirstWeaponNotInSlot( qboolean next, qboolean checkAmmo ) {
-	const weaponInfo_t  *weaponInfo;
 	int weapon;
 	int step;
-	int occupant;
+	int first;
+	int stackSlot;
+	signed char primaryB;
+	signed char occupant;
 
 	if ( next ) {
-		weapon = 1;
+		first = 1;
 		step = 1;
 	} else {
-		weapon = bg_numWeapons;
+		first = bg_numWeapons;
 		step = -1;
 	}
 
-	do {
-		if ( !( cg.predictedPlayerState.weapons[weapon >> 5] & ( 1 << ( weapon & 31 ) ) ) ) {
-			weapon += step;
-			continue;
-		}
-		if ( BG_IsPlayerWeaponInSlot( &cg.predictedPlayerState, weapon, qtrue ) ) {
-			weapon += step;
-			continue;
-		}
+	primaryB = cg.predictedPlayerState.weaponslots[WEAPSLOT_PRIMARYB];
 
-		weaponInfo = bg_weaponInfo[weapon];
-		if ( weaponInfo->slotStackable ) {
-			switch ( weaponInfo->weaponSlot ) {
-			case WEAPSLOT_PRIMARY:
-			case WEAPSLOT_PRIMARYB:
-				occupant = (signed char)cg.predictedPlayerState.weaponslots[WEAPSLOT_PRIMARY];
-				if ( !occupant || bg_weaponInfo[occupant]->slotStackable ) {
-					weapon += step;
-					continue;
+	weapon = first;
+
+	// keep: the gotos, the separate pistol case and the never-taken jump back
+	// to inslot all match original codegen
+	for ( ;; ) {
+		if ( !( cg.predictedPlayerState.weapons[weapon >> 5] & ( 1 << ( weapon & 31 ) ) ) ) {
+			goto advance;
+		}
+		{
+		inslot:
+			if ( BG_IsPlayerWeaponInSlot( &cg.predictedPlayerState, weapon, qtrue ) ) {
+				goto advance;
+			}
+
+			// BG_GetStackSlotForWeapon, expanded
+			stackSlot = WEAPSLOT_NONE;
+			if ( bg_weaponInfo[weapon]->slotStackable ) {
+				switch ( bg_weaponInfo[weapon]->weaponSlot ) {
+				case WEAPSLOT_PRIMARY:
+				case WEAPSLOT_PRIMARYB:
+					occupant = cg.predictedPlayerState.weaponslots[WEAPSLOT_PRIMARY];
+					if ( !occupant || bg_weaponInfo[occupant]->slotStackable ) {
+						goto advance;
+					}
+					occupant = primaryB;
+					if ( !occupant || bg_weaponInfo[occupant]->slotStackable ) {
+						goto advance;
+					}
+					break;
+				case WEAPSLOT_PISTOL:
+					occupant = cg.predictedPlayerState.weaponslots[bg_weaponInfo[weapon]->weaponSlot];
+					if ( !occupant || bg_weaponInfo[occupant]->slotStackable ) {
+						stackSlot = bg_weaponInfo[weapon]->weaponSlot;
+					}
+					break;
+				case WEAPSLOT_GRENADE:
+				case WEAPSLOT_SMOKEGRENADE:
+					occupant = cg.predictedPlayerState.weaponslots[bg_weaponInfo[weapon]->weaponSlot];
+					if ( !occupant || bg_weaponInfo[occupant]->slotStackable ) {
+						stackSlot = bg_weaponInfo[weapon]->weaponSlot;
+					}
+					break;
+				default:
+					break;
 				}
-				occupant = (signed char)cg.predictedPlayerState.weaponslots[WEAPSLOT_PRIMARYB];
-				if ( !occupant || bg_weaponInfo[occupant]->slotStackable ) {
-					weapon += step;
-					continue;
-				}
-				weapon += step;
-				continue;
-			case WEAPSLOT_PISTOL:
-			case WEAPSLOT_GRENADE:
-			case WEAPSLOT_SMOKEGRENADE:
-				occupant = (signed char)cg.predictedPlayerState.weaponslots[weaponInfo->weaponSlot];
-				if ( !occupant || bg_weaponInfo[occupant]->slotStackable ) {
-					weapon += step;
-					continue;
-				}
-				break;
-			default:
-				break;
+			}
+			if ( stackSlot ) {
+				goto advance;
 			}
 		}
 
 		if ( checkAmmo
-			 && !( cg.predictedPlayerState.ammoclip[weaponInfo->clipIndex]
-				   + cg.predictedPlayerState.ammo[weaponInfo->ammoIndex] ) ) {
-			weapon += step;
+			 && !( cg.predictedPlayerState.ammoclip[bg_weaponInfo[weapon]->clipIndex]
+				   + cg.predictedPlayerState.ammo[bg_weaponInfo[weapon]->ammoIndex] ) ) {
+			if ( stackSlot ) {
+				goto inslot;    // never taken: stackSlot is WEAPSLOT_NONE here
+			}
+			// original bug, kept: no advance, so an owned, unslotted, empty
+			// candidate is re-tested forever and the client hangs
 			continue;
 		}
 
 		CG_FinishWeaponChange( cg_weaponSelect.integer, weapon );
 		return qtrue;
-	} while ( weapon && weapon != bg_numWeapons );
 
-	return qfalse;
+	advance:
+		weapon += step;
+		if ( !weapon || weapon == bg_numWeapons ) {
+			return qfalse;
+		}
+	}
 }
+
+// the weapon in a slot; weaponslots[] holds signed bytes
+#define CG_SLOTWEAPON( slot )   ( (signed char)cg.predictedPlayerState.weaponslots[slot] )
 
 /*
 ==============
@@ -2537,7 +2435,8 @@ void CG_CycleWeap( qboolean next, qboolean checkAmmo ) {
 	int slot, endSlot, step, endWeapon;
 	int weapon;
 	int alt;
-	int occupant;
+	qboolean isAlt;
+	int stackSlot;
 
 	if ( !cg.snap ) {
 		return;
@@ -2556,26 +2455,19 @@ void CG_CycleWeap( qboolean next, qboolean checkAmmo ) {
 		endWeapon = bg_numWeapons;
 	}
 
-	weapon = cg_weaponSelect.integer;
-	slot = BG_IsPlayerWeaponInSlot( &cg.predictedPlayerState, weapon, qtrue );
+	slot = BG_IsPlayerWeaponInSlot( &cg.predictedPlayerState, cg_weaponSelect.integer, qtrue );
 	if ( !slot ) {
-		slot = BG_GetStackSlotForWeapon( &cg.predictedPlayerState, weapon, WEAPSLOT_NONE );
+		slot = BG_GetStackSlotForWeapon( &cg.predictedPlayerState, cg_weaponSelect.integer, WEAPSLOT_NONE );
 	}
 
 	if ( slot ) {
 		slot = ( slot + step + 4 ) % 5 + 1;
 		while ( slot != endSlot ) {
-			int slotWeapon = (signed char)cg.predictedPlayerState.weaponslots[slot];
-
-			if ( slotWeapon ) {
-				if ( !checkAmmo ) {
-					CG_FinishWeaponChange( weapon, slotWeapon );
-					return;
-				}
-				weaponInfo = bg_weaponInfo[slotWeapon];
-				if ( cg.predictedPlayerState.ammoclip[weaponInfo->clipIndex]
-					 + cg.predictedPlayerState.ammo[weaponInfo->ammoIndex] ) {
-					CG_FinishWeaponChange( weapon, slotWeapon );
+			if ( CG_SLOTWEAPON( slot ) ) {
+				if ( !checkAmmo
+					 || cg.predictedPlayerState.ammoclip[bg_weaponInfo[CG_SLOTWEAPON( slot )]->clipIndex]
+						+ cg.predictedPlayerState.ammo[bg_weaponInfo[CG_SLOTWEAPON( slot )]->ammoIndex] ) {
+					CG_FinishWeaponChange( cg_weaponSelect.integer, CG_SLOTWEAPON( slot ) );
 					return;
 				}
 			}
@@ -2587,6 +2479,7 @@ void CG_CycleWeap( qboolean next, qboolean checkAmmo ) {
 		}
 		CG_SelectFirstWeaponInSlot( next, checkAmmo );
 	} else {
+		weapon = cg_weaponSelect.integer;
 		while ( 1 ) {
 			weapon = ( bg_numWeapons + step - 1 + weapon ) % bg_numWeapons + 1;
 			if ( weapon == endWeapon ) {
@@ -2598,18 +2491,18 @@ void CG_CycleWeap( qboolean next, qboolean checkAmmo ) {
 
 			weaponInfo = bg_weaponInfo[weapon];
 
-			/* skip a weapon that is only an alternate of the one selected */
-			alt = weaponInfo->altWeaponIndex;
-			while ( alt ) {
+			// skip a weapon that is only an alternate of the one selected
+			isAlt = qfalse;
+			for ( alt = weaponInfo->altWeaponIndex; alt; alt = bg_weaponInfo[alt]->altWeaponIndex ) {
 				if ( alt == cg_weaponSelect.integer ) {
+					isAlt = qtrue;
 					break;
 				}
 				if ( alt == weapon ) {
 					break;
 				}
-				alt = bg_weaponInfo[alt]->altWeaponIndex;
 			}
-			if ( alt && alt == cg_weaponSelect.integer ) {
+			if ( isAlt ) {
 				continue;
 			}
 
@@ -2617,30 +2510,34 @@ void CG_CycleWeap( qboolean next, qboolean checkAmmo ) {
 				continue;
 			}
 
+			// BG_GetStackSlotForWeapon( ps, weapon, WEAPSLOT_NONE ), expanded
+			stackSlot = WEAPSLOT_NONE;
 			if ( weaponInfo->slotStackable ) {
 				switch ( weaponInfo->weaponSlot ) {
 				case WEAPSLOT_PRIMARY:
 				case WEAPSLOT_PRIMARYB:
-					occupant = (signed char)cg.predictedPlayerState.weaponslots[WEAPSLOT_PRIMARY];
-					if ( !occupant || bg_weaponInfo[occupant]->slotStackable ) {
-						continue;
+					if ( !CG_SLOTWEAPON( WEAPSLOT_PRIMARY )
+						 || bg_weaponInfo[CG_SLOTWEAPON( WEAPSLOT_PRIMARY )]->slotStackable ) {
+						stackSlot = WEAPSLOT_PRIMARY;
+					} else if ( !CG_SLOTWEAPON( WEAPSLOT_PRIMARYB )
+								|| bg_weaponInfo[CG_SLOTWEAPON( WEAPSLOT_PRIMARYB )]->slotStackable ) {
+						stackSlot = WEAPSLOT_PRIMARYB;
 					}
-					occupant = (signed char)cg.predictedPlayerState.weaponslots[WEAPSLOT_PRIMARYB];
-					if ( !occupant || bg_weaponInfo[occupant]->slotStackable ) {
-						continue;
-					}
-					continue;
+					break;
 				case WEAPSLOT_PISTOL:
 				case WEAPSLOT_GRENADE:
 				case WEAPSLOT_SMOKEGRENADE:
-					occupant = (signed char)cg.predictedPlayerState.weaponslots[weaponInfo->weaponSlot];
-					if ( !occupant || bg_weaponInfo[occupant]->slotStackable ) {
-						continue;
+					if ( !CG_SLOTWEAPON( weaponInfo->weaponSlot )
+						 || bg_weaponInfo[CG_SLOTWEAPON( weaponInfo->weaponSlot )]->slotStackable ) {
+						stackSlot = weaponInfo->weaponSlot;
 					}
-					continue;
+					break;
 				default:
-					continue;
+					break;
 				}
+			}
+			if ( stackSlot ) {
+				continue;
 			}
 
 			if ( checkAmmo
@@ -2659,7 +2556,7 @@ void CG_CycleWeap( qboolean next, qboolean checkAmmo ) {
 		CG_SelectFirstWeaponNotInSlot( next, checkAmmo );
 	}
 
-	/* Nothing selectable is left: clear the selection outright. */
+	// nothing selectable is left: clear the selection outright
 	weapon = cg_weaponSelect.integer;
 	if ( cg.predictedPlayerState.weapons[weapon >> 5] & ( 1 << ( weapon & 31 ) ) ) {
 		return;
@@ -2675,7 +2572,7 @@ void CG_CycleWeap( qboolean next, qboolean checkAmmo ) {
 /*
 =============================================================================
 
-	FIRING
+	WEAPON EVENTS
 
 =============================================================================
 */
@@ -2689,63 +2586,68 @@ weapon's min and max for the stance the sights are in.
 ==============
 */
 static void CG_WeaponFireRecoil( void ) {
-	const weaponInfo_t  *weaponInfo;
+	vec3_t kick;
+	float pitch;
+	rfloat yaw;
 	float frac;
-	float pitch, yaw;
 
-	weaponInfo = cg.weaponInfo;
 	frac = cg.predictedPlayerState.fWeaponPosFrac;
 
 	if ( frac == 1.0f ) {
 		pitch = ( (float)rand() * ( 1.0f / 32768.0f ) )
-				* ( weaponInfo->adsViewKickPitchMax - weaponInfo->adsViewKickPitchMin )
-				+ weaponInfo->adsViewKickPitchMin;
+				* ( cg.weaponInfo->adsViewKickPitchMax - cg.weaponInfo->adsViewKickPitchMin )
+				+ cg.weaponInfo->adsViewKickPitchMin;
 		yaw = ( (float)rand() * ( 1.0f / 32768.0f ) )
-			  * ( weaponInfo->adsViewKickYawMax - weaponInfo->adsViewKickYawMin )
-			  + weaponInfo->adsViewKickYawMin;
+			  * ( cg.weaponInfo->adsViewKickYawMax - cg.weaponInfo->adsViewKickYawMin )
+			  + cg.weaponInfo->adsViewKickYawMin;
 	} else {
 		pitch = ( (float)rand() * ( 1.0f / 32768.0f ) )
-				* ( weaponInfo->hipViewKickPitchMax - weaponInfo->hipViewKickPitchMin )
-				+ weaponInfo->hipViewKickPitchMin;
+				* ( cg.weaponInfo->hipViewKickPitchMax - cg.weaponInfo->hipViewKickPitchMin )
+				+ cg.weaponInfo->hipViewKickPitchMin;
 		yaw = ( (float)rand() * ( 1.0f / 32768.0f ) )
-			  * ( weaponInfo->hipViewKickYawMax - weaponInfo->hipViewKickYawMin )
-			  + weaponInfo->hipViewKickYawMin;
+			  * ( cg.weaponInfo->hipViewKickYawMax - cg.weaponInfo->hipViewKickYawMin )
+			  + cg.weaponInfo->hipViewKickYawMin;
 	}
 
-	cg.kick_angles[0] = -pitch;
-	cg.kick_angles[1] = yaw;
-	cg.kick_angles[2] = yaw * -0.5f;
+	// keep: built in a local, matches original codegen
+	kick[0] = -pitch;
+	kick[1] = yaw;
+	kick[2] = yaw * -0.5f;
+	VectorCopy( kick, cg.kick_angles );
 
 	if ( frac > 0.0f ) {
 		pitch = ( (float)rand() * ( 1.0f / 32768.0f ) )
-				* ( weaponInfo->adsGunKickPitchMax - weaponInfo->adsGunKickPitchMin )
-				+ weaponInfo->adsGunKickPitchMin;
-		yaw = ( (float)rand() * ( 1.0f / 32768.0f ) )
-			  * ( weaponInfo->adsGunKickYawMax - weaponInfo->adsGunKickYawMin )
-			  + weaponInfo->adsGunKickYawMin;
+				* ( cg.weaponInfo->adsGunKickPitchMax - cg.weaponInfo->adsGunKickPitchMin )
+				+ cg.weaponInfo->adsGunKickPitchMin;
+		yaw = ( (rfloat)( (float)rand() * ( 1.0f / 32768.0f ) )
+				* ( (rfloat)cg.weaponInfo->adsGunKickYawMax - (rfloat)cg.weaponInfo->adsGunKickYawMin ) )
+			  + (rfloat)cg.weaponInfo->adsGunKickYawMin;
 	} else {
 		pitch = ( (float)rand() * ( 1.0f / 32768.0f ) )
-				* ( weaponInfo->hipGunKickPitchMax - weaponInfo->hipGunKickPitchMin )
-				+ weaponInfo->hipGunKickPitchMin;
-		yaw = ( (float)rand() * ( 1.0f / 32768.0f ) )
-			  * ( weaponInfo->hipGunKickYawMax - weaponInfo->hipGunKickYawMin )
-			  + weaponInfo->hipGunKickYawMin;
+				* ( cg.weaponInfo->hipGunKickPitchMax - cg.weaponInfo->hipGunKickPitchMin )
+				+ cg.weaponInfo->hipGunKickPitchMin;
+		yaw = ( (rfloat)( (float)rand() * ( 1.0f / 32768.0f ) )
+				* ( (rfloat)cg.weaponInfo->hipGunKickYawMax - (rfloat)cg.weaponInfo->hipGunKickYawMin ) )
+			  + (rfloat)cg.weaponInfo->hipGunKickYawMin;
 	}
 
-	CG_RECOILPITCHSPEED() = CG_RECOILPITCHSPEED() + pitch;
-	CG_RECOILYAWSPEED() = CG_RECOILYAWSPEED() + yaw;
+	// keep: the gun yaw kick is rounded only after the sum, and the
+	// parenthesised products above match original codegen
+	cg.recoilPitchSpeed = cg.recoilPitchSpeed + pitch;
+	cg.recoilYawSpeed = cg.recoilYawSpeed + yaw;
 }
 
 /*
 ==============
 CG_EjectWeaponBrass
+
+Play the weapon's shell eject effect off tag_brass.
 ==============
 */
 void CG_EjectWeaponBrass( entityState_t *es, int event ) {
 	const cgWeaponInfo_t    *cgWeapon;
 	int bolt[2];
 	int weapon;
-	int effect;
 
 	if ( !cg_brass.integer ) {
 		return;
@@ -2766,26 +2668,30 @@ void CG_EjectWeaponBrass( entityState_t *es, int event ) {
 	cgWeapon = &cg_weapons[ weapon ];
 
 	if ( cgWeapon->lastShotEjectEffect && event == EV_FIRE_WEAPON_LASTSHOT ) {
-		effect = cgWeapon->lastShotEjectEffect;
+		if ( ( cg.snap->ps.pm_flags & PMF_FIRSTPERSON )
+			 && es->number == cg.snap->ps.clientNum ) {
+			bolt[0] = CG_WeaponDObjHandle( weapon );
+		} else {
+			bolt[0] = es->number;
+		}
+		bolt[1] = trap_FX_GetBoneIndex( bolt[0], "tag_brass" );
+		if ( bolt[1] < 0 ) {
+			return;
+		}
+		trap_FX_PlayOrientedEffectID( cgWeapon->lastShotEjectEffect, cg_brassOrigin, NULL, bolt );
 	} else if ( cgWeapon->shellEjectEffect ) {
-		effect = cgWeapon->shellEjectEffect;
-	} else {
-		return;
+		if ( ( cg.snap->ps.pm_flags & PMF_FIRSTPERSON )
+			 && es->number == cg.snap->ps.clientNum ) {
+			bolt[0] = CG_WeaponDObjHandle( weapon );
+		} else {
+			bolt[0] = es->number;
+		}
+		bolt[1] = trap_FX_GetBoneIndex( bolt[0], "tag_brass" );
+		if ( bolt[1] < 0 ) {
+			return;
+		}
+		trap_FX_PlayOrientedEffectID( cgWeapon->shellEjectEffect, cg_brassOrigin, NULL, bolt );
 	}
-
-	if ( ( cg.snap->ps.pm_flags & PMF_FIRSTPERSON )
-		 && es->number == cg.snap->ps.clientNum ) {
-		bolt[0] = CG_WeaponDObjHandle( weapon );
-	} else {
-		bolt[0] = es->number;
-	}
-
-	bolt[1] = trap_syscall_0xDF( bolt[0], "tag_brass" );
-	if ( bolt[1] < 0 ) {
-		return;
-	}
-
-	trap_syscall_0xE5( effect, (int)cg_brassOrigin, 0, (int)bolt );
 }
 
 /*
@@ -2800,7 +2706,7 @@ void CG_FireWeapon( centity_t *cent, entityState_t *es, int event, int tagIndex 
 	const char *sound;
 	vec3_t origin;
 	float tagMatrix[16];
-	int obj;
+	DObj *obj;
 
 	if ( !es->weapon ) {
 		return;
@@ -2812,9 +2718,9 @@ void CG_FireWeapon( centity_t *cent, entityState_t *es, int event, int tagIndex 
 
 	cgWeapon = &cg_weapons[ es->weapon ];
 
-	/* mark the entity as muzzle flashing, so when it is added it will
-	   append the flash to the weapon model */
-	CENT_MUZZLEFLASH( cent ) = 1;
+	// mark the entity as muzzle flashing, so when it is added it will
+	// append the flash to the weapon model
+	cent->bMuzzleFlash = 1;
 
 	if ( ( cg.snap->ps.pm_flags & PMF_FIRSTPERSON )
 		 && es->number == cg.snap->ps.clientNum ) {
@@ -2822,7 +2728,7 @@ void CG_FireWeapon( centity_t *cent, entityState_t *es, int event, int tagIndex 
 	}
 
 	if ( es->eType == ET_TURRET ) {
-		CG_WeaponFlash( es->weapon, qfalse, es->number, cent->lerpOrigin,
+		CG_WeaponFlash( es->number, es->weapon, cent->lerpOrigin, qfalse,
 						cg_flashTags[tagIndex] );
 	}
 
@@ -2842,7 +2748,7 @@ void CG_FireWeapon( centity_t *cent, entityState_t *es, int event, int tagIndex 
 			} else {
 				BG_EvaluateTrajectory( &es->pos, cg.time, origin );
 			}
-		} else if ( ( obj = trap_syscall_0xA2( es->number ) ) != 0
+		} else if ( ( obj = trap_GetClientDObj( es->number ) ) != 0
 					&& CG_DObjGetWorldTagMatrix( obj, "tag_flash", cent, tagMatrix ) ) {
 			origin[0] = tagMatrix[12];
 			origin[1] = tagMatrix[13];
@@ -2861,7 +2767,7 @@ void CG_FireWeapon( centity_t *cent, entityState_t *es, int event, int tagIndex 
 /*
 =============================================================================
 
-	BULLET EFFECTS
+	BULLETS
 
 =============================================================================
 */
@@ -2870,15 +2776,15 @@ void CG_FireWeapon( centity_t *cent, entityState_t *es, int event, int tagIndex 
 ==============
 CG_WaterRipple
 
-Uncalled in 1.1 -- kept because the linker kept it.
+Unreferenced; dir is unused.
 ==============
 */
-static void CG_WaterRipple( qhandle_t shader, const vec3_t origin, int radius, int duration ) {
+void CG_WaterRipple( qhandle_t shader, const vec3_t origin, const vec3_t dir, int radius, int duration ) {
 	localEntity_t   *le;
 	refEntity_t     *re;
 
 	le = CG_AllocLocalEntity();
-	re = LE_REFENTITY( le );
+	re = &le->refEntity;
 
 	le->leType = LE_SCALE_FADE;
 	le->leFlags = 1;
@@ -2886,15 +2792,15 @@ static void CG_WaterRipple( qhandle_t shader, const vec3_t origin, int radius, i
 	le->lifeRate = 1.0f / (float)duration;
 
 	VectorCopy( origin, re->origin );
+	re->shaderTime = (float)cg.time * 0.001f;
 	re->reType = RT_SPRITE_LOCAL;
-	RE_CUSTOMSHADER( re ) = shader;
+	re->radius = (float)radius;
+	re->customShader = shader;
 	re->shaderRGBA[0] = 255;
 	re->shaderRGBA[1] = 255;
 	re->shaderRGBA[2] = 255;
 	re->shaderRGBA[3] = 255;
-	RE_SHADERTIME( re ) = (float)cg.time * 0.001f;
-	RE_RADIUS( re ) = (float)radius;
-	LE_COLOR( le )[3] = 1.0f;
+	le->color[3] = 1.0f;
 }
 
 /*
@@ -2905,27 +2811,28 @@ A bullet that passes close to the listener gets a whizby, played 16 units back
 along its path from the point of closest approach.
 ==============
 */
-static void CG_WhizbySound( const vec3_t start, const vec3_t end ) {
+static void CG_WhizbySound( const vec3_t end, const vec3_t start ) {
 	vec3_t delta;
+	vec3_t normal;
 	vec3_t dir;
-	vec3_t toEar;
+	vec3_t toView;
 	vec3_t point;
+	vec3_t diff;
 	float along;
-	float length;
 	float dist;
 
 	VectorSubtract( end, start, delta );
-	VectorNormalize2( delta, dir );
-
-	VectorSubtract( cg.refdef.vieworg, start, toEar );
-	along = DotProduct( toEar, dir );
+	VectorNormalize2( delta, normal );
+	VectorCopy( normal, dir );  // keep: matches original codegen
+	VectorSubtract( cg.refdef.vieworg, start, toView );
+	along = DotProduct( toView, dir );
 	if ( along < 64.0f ) {
 		return;
 	}
 
-	/* the point of closest approach has to be far enough inside the trace */
-	length = DotProduct( dir, delta );
-	if ( length < along + 64.0f ) {
+	// the point of closest approach has to be far enough inside the trace
+	// (keep: subtracting -64, as the original does)
+	if ( along - -64.0f > DotProduct( dir, delta ) ) {
 		return;
 	}
 
@@ -2933,9 +2840,8 @@ static void CG_WhizbySound( const vec3_t start, const vec3_t end ) {
 	point[1] = along * dir[1] + start[1];
 	point[2] = along * dir[2] + start[2];
 
-	dist = (float)sqrt( ( point[0] - cg.refdef.vieworg[0] ) * ( point[0] - cg.refdef.vieworg[0] )
-						+ ( point[1] - cg.refdef.vieworg[1] ) * ( point[1] - cg.refdef.vieworg[1] )
-						+ ( point[2] - cg.refdef.vieworg[2] ) * ( point[2] - cg.refdef.vieworg[2] ) );
+	VectorSubtract( point, cg.refdef.vieworg, diff );
+	dist = (float)sqrt( DotProduct( diff, diff ) );
 	if ( dist > 140.0f ) {
 		return;
 	}
@@ -2957,28 +2863,31 @@ cg_tracerlength behind the impact and reaches it at cg_tracerSpeed.
 */
 static void CG_SpawnTracer( const vec3_t start, const vec3_t end ) {
 	localEntity_t   *le;
+	vec3_t origin;
 	vec3_t tail;
 	vec3_t dir;
-	vec3_t delta;
+	float len;
 	float dist;
 	int offset;
 	int spawnTime;
 
-	VectorSubtract( end, start, dir );
+	VectorCopy( start, origin );
+	VectorCopy( end, tail );
+	VectorSubtract( tail, origin, dir );
 	VectorNormalize( dir );
 
-	/* the tracer stops cg_tracerlength short of the impact */
-	tail[0] = -cg_tracerlength.value * dir[0] + end[0];
-	tail[1] = -cg_tracerlength.value * dir[1] + end[1];
-	tail[2] = -cg_tracerlength.value * dir[2] + end[2];
+	// subtract the length of the tracer from the end point, so we dont go through the end point
+	len = -cg_tracerlength.value;
+	tail[0] = len * dir[0] + tail[0];
+	tail[1] = len * dir[1] + tail[1];
+	tail[2] = len * dir[2] + tail[2];
 
-	VectorSubtract( tail, start, delta );
-	dist = (float)sqrt( delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2] );
+	dist = Distance( origin, tail );
 
 	le = CG_AllocLocalEntity();
 	le->leType = LE_MOVING_TRACER;
 
-	/* spread the spawn back over the frame so a burst does not arrive at once */
+	// spread the spawn back over the frame so a burst does not arrive at once
 	if ( cg.frametime ) {
 		offset = ( rand() % cg.frametime ) / 2;
 	} else {
@@ -2986,15 +2895,15 @@ static void CG_SpawnTracer( const vec3_t start, const vec3_t end ) {
 	}
 	spawnTime = cg.time - offset;
 
-	LE_TRACERTIME( le ) = spawnTime;
-	LE_TRACERORIGIN( le )[0] = start[0];
-	LE_TRACERORIGIN( le )[1] = start[1];
-	LE_TRACERORIGIN( le )[2] = start[2];
-	LE_TRACERFLAGS( le ) = 2;
 	le->endTime = spawnTime - (int)( dist * -1000.0f / cg_tracerSpeed.value );
-	LE_TRACERVELOCITY( le )[0] = cg_tracerSpeed.value * dir[0];
-	LE_TRACERVELOCITY( le )[1] = cg_tracerSpeed.value * dir[1];
-	LE_TRACERVELOCITY( le )[2] = cg_tracerSpeed.value * dir[2];
+	le->pos.trTime = spawnTime;
+	le->pos.trType = 2;    // TR_LINEAR
+	le->pos.trBase[0] = origin[0];
+	le->pos.trBase[1] = origin[1];
+	le->pos.trBase[2] = origin[2];
+	le->pos.trDelta[0] = cg_tracerSpeed.value * dir[0];
+	le->pos.trDelta[1] = cg_tracerSpeed.value * dir[1];
+	le->pos.trDelta[2] = cg_tracerSpeed.value * dir[2];
 }
 
 /*
@@ -3007,22 +2916,18 @@ One camera-facing quad between two points, cg_tracerwidth wide.
 void CG_DrawTracer( const vec3_t start, const vec3_t end ) {
 	polyVert_t verts[4];
 	vec3_t dir;
+	vec3_t line;
 	vec3_t right;
-	float dot1, dot2;
-	float width;
 
 	VectorSubtract( end, start, dir );
-	dot1 = DotProduct( dir, cg.refdef.viewaxis[1] );
-	dot2 = DotProduct( dir, cg.refdef.viewaxis[2] );
+	line[0] = DotProduct( dir, cg.refdef.viewaxis[1] );
+	line[1] = DotProduct( dir, cg.refdef.viewaxis[2] );
 
-	right[0] = cg.refdef.viewaxis[1][0] * dot2 - cg.refdef.viewaxis[2][0] * dot1;
-	right[1] = cg.refdef.viewaxis[1][1] * dot2 - cg.refdef.viewaxis[2][1] * dot1;
-	right[2] = cg.refdef.viewaxis[1][2] * dot2 - cg.refdef.viewaxis[2][2] * dot1;
+	VectorScale( cg.refdef.viewaxis[1], line[1], right );
+	VectorMA( right, -line[0], cg.refdef.viewaxis[2], right );
 	VectorNormalize( right );
 
-	width = cg_tracerwidth.value;
-
-	VectorMA( end, width, right, verts[0].xyz );
+	VectorMA( end, cg_tracerwidth.value, right, verts[0].xyz );
 	verts[0].st[0] = 1.0f;
 	verts[0].st[1] = 1.0f;
 	verts[0].st2[0] = 1.0f;
@@ -3032,7 +2937,7 @@ void CG_DrawTracer( const vec3_t start, const vec3_t end ) {
 	verts[0].modulate[2] = 255;
 	verts[0].modulate[3] = 255;
 
-	VectorMA( end, -width, right, verts[1].xyz );
+	VectorMA( end, -cg_tracerwidth.value, right, verts[1].xyz );
 	verts[1].st[0] = 1.0f;
 	verts[1].st[1] = 0.0f;
 	verts[1].st2[0] = 1.0f;
@@ -3042,7 +2947,7 @@ void CG_DrawTracer( const vec3_t start, const vec3_t end ) {
 	verts[1].modulate[2] = 255;
 	verts[1].modulate[3] = 255;
 
-	VectorMA( start, -width, right, verts[2].xyz );
+	VectorMA( start, -cg_tracerwidth.value, right, verts[2].xyz );
 	verts[2].st[0] = 0.0f;
 	verts[2].st[1] = 0.0f;
 	verts[2].st2[0] = 0.0f;
@@ -3052,7 +2957,7 @@ void CG_DrawTracer( const vec3_t start, const vec3_t end ) {
 	verts[2].modulate[2] = 255;
 	verts[2].modulate[3] = 255;
 
-	VectorMA( start, width, right, verts[3].xyz );
+	VectorMA( start, cg_tracerwidth.value, right, verts[3].xyz );
 	verts[3].st[0] = 0.0f;
 	verts[3].st[1] = 1.0f;
 	verts[3].st2[0] = 0.0f;
@@ -3077,20 +2982,21 @@ static void CG_Tracer( const vec3_t start, const vec3_t end, int forceDraw ) {
 	vec3_t dir;
 	vec3_t head, tail;
 	float length;
-	/* not `near`/`far`: MSVC reserves both (C4226, then C2143 on every use). */
-	float nearDist;
+	float nearDist;     // not near/far: MSVC reserves both
 	float farDist;
 
+	// tracer
 	VectorSubtract( end, start, dir );
 	length = VectorNormalize( dir );
 
+	// start at least a little ways from the muzzle
 	if ( length < 100.0f && !forceDraw ) {
 		return;
 	}
 
 	nearDist = ( (float)rand() * ( 1.0f / 32768.0f ) ) * ( length - 60.0f ) + 50.0f;
 	farDist = cg_tracerlength.value + nearDist;
-	if ( farDist >= length ) {
+	if ( farDist > length ) {
 		farDist = length;
 	}
 
@@ -3116,19 +3022,18 @@ come out of the eye, everything else off the firing model's tag.
 static qboolean CG_CalcMuzzlePoint( int entityNum, vec3_t muzzle, const char *tagName ) {
 	centity_t   *cent;
 	float tagMatrix[16];
-	int obj;
+	DObj *obj;
 
 	if ( ( cg.snap->ps.pm_flags & PMF_FIRSTPERSON )
 		 && entityNum == cg.snap->ps.clientNum ) {
-		muzzle[0] = cg.snap->ps.origin[0];
-		muzzle[1] = cg.snap->ps.origin[1];
-		muzzle[2] = cg.snap->ps.origin[2] + cg.snap->ps.viewHeightCurrent;
+		VectorCopy( cg.snap->ps.origin, muzzle );
+		muzzle[2] += cg.snap->ps.viewHeightCurrent;
 		AddLeanToPosition( muzzle, cg.refdefViewAngles[1], cg.snap->ps.leanf, 16.0f, 20.0f );
 		return qtrue;
 	}
 
 	cent = &cg_entities[entityNum];
-	obj = trap_syscall_0xA2( cent->currentState.number );
+	obj = trap_GetClientDObj( cent->currentState.number );
 	if ( !obj ) {
 		return qfalse;
 	}
@@ -3173,25 +3078,18 @@ static void CG_BulletTrajectoryEffects( int entityNum, const vec3_t end, int sur
 		return;
 	}
 
-	if ( ( cg.snap->ps.pm_flags & PMF_FIRSTPERSON )
-		 && entityNum == cg.snap->ps.clientNum ) {
-		CG_WhizbySound( muzzle, end );
-		return;
+	if ( !( ( cg.snap->ps.pm_flags & PMF_FIRSTPERSON )
+			&& entityNum == cg.snap->ps.clientNum )
+		 && (float)rand() < cg_tracerchance.value * 32768.0f ) {
+		if ( surfaceType == SURF_TYPE_FLESH ) {
+			CG_Tracer( muzzle, end, 0 );
+			CG_WhizbySound( end, muzzle );
+			return;
+		}
+		CG_SpawnTracer( muzzle, end );
 	}
 
-	if ( cg_tracerchance.value * 32768.0f <= (float)rand() ) {
-		CG_WhizbySound( muzzle, end );
-		return;
-	}
-
-	if ( surfaceType == SURF_TYPE_FLESH ) {
-		CG_Tracer( muzzle, end, 0 );
-		CG_WhizbySound( muzzle, end );
-		return;
-	}
-
-	CG_SpawnTracer( muzzle, end );
-	CG_WhizbySound( muzzle, end );
+	CG_WhizbySound( end, muzzle );
 }
 
 /*
@@ -3202,34 +3100,34 @@ A bullet that hit the world: the impact sound, the surface's impact and mark
 effects, and the trajectory effects behind it.
 ==============
 */
-void CG_BulletHitEvent( int event, const vec3_t origin, int surfaceType, int entityNum,
+void CG_BulletHitEvent( int entityNum, const vec3_t origin, int surfaceType, int event,
 						const vec3_t dir, const vec3_t dir2 ) {
 	const char *sound;
 	int impact;
 	int mark;
 
 	if ( event == EV_BULLET_HIT_SMALL ) {
-		sound = (const char *)CGS_BULLETSOUND_A()[surfaceType];
-		impact = CGS_BULLETIMPACT_A()[surfaceType];
-		mark = CGS_BULLETMARK_A()[surfaceType];
+		sound = (const char *)cgs.media.bulletSmallSounds[surfaceType];
+		impact = cgs.media.bulletSmallNormalEffects[surfaceType];
+		mark = cgs.media.bulletSmallReflectEffects[surfaceType];
 	} else {
-		sound = (const char *)CGS_BULLETSOUND_B()[surfaceType];
-		impact = CGS_BULLETIMPACT_B()[surfaceType];
-		mark = CGS_BULLETMARK_B()[surfaceType];
+		sound = (const char *)cgs.media.bulletLargeSounds[surfaceType];
+		impact = cgs.media.bulletLargeNormalEffects[surfaceType];
+		mark = cgs.media.bulletLargeReflectEffects[surfaceType];
 	}
 
 	if ( !cg_blood.integer && surfaceType == SURF_TYPE_FLESH ) {
-		impact = CGS_FLESHHITNOBLOOD();
+		impact = cgs.media.fleshHitNoBloodEffect;
 		mark = 0;
 	}
 
 	CG_PlaySoundAliasByName( sound, ENTITYNUM_WORLD, origin );
 
 	if ( impact ) {
-		trap_syscall_0xE4( impact, (int)origin, (int)dir );
+		trap_FX_PlayEffectID( impact, origin, dir );
 	}
 	if ( mark ) {
-		trap_syscall_0xE4( mark, (int)origin, (int)dir2 );
+		trap_FX_PlayEffectID( mark, origin, dir2 );
 	}
 
 	CG_BulletTrajectoryEffects( entityNum, origin, surfaceType, cg_flashTags[0] );
@@ -3243,13 +3141,13 @@ A bullet that hit a player: only the sound and the trajectory effects; the
 impact effects come from the hit player's own event.
 ==============
 */
-void CG_BulletHitClientEvent( int event, const vec3_t origin, int surfaceType, int entityNum ) {
+void CG_BulletHitClientEvent( int entityNum, const vec3_t origin, int surfaceType, int event ) {
 	const char *sound;
 
 	if ( event == EV_BULLET_HIT_CLIENT_SMALL ) {
-		sound = (const char *)CGS_BULLETSOUND_A()[surfaceType];
+		sound = (const char *)cgs.media.bulletSmallSounds[surfaceType];
 	} else {
-		sound = (const char *)CGS_BULLETSOUND_B()[surfaceType];
+		sound = (const char *)cgs.media.bulletLargeSounds[surfaceType];
 	}
 
 	CG_PlaySoundAliasByName( sound, ENTITYNUM_WORLD, origin );

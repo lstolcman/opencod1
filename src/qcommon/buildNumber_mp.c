@@ -11,11 +11,13 @@
 
 #define PRODUCT_BUILD_NUMBER    1412
 
+/* Retail hardcodes the original build stamp (0x568e00 "Oct  8 2003", note
+   the two spaces, and 0x568e0c "17:17:54"), not the tree compiler's clock. */
 #ifndef PRODUCT_BUILD_DATE
-#define PRODUCT_BUILD_DATE      __DATE__
+#define PRODUCT_BUILD_DATE      "Oct  8 2003"
 #endif
 #ifndef PRODUCT_BUILD_TIME
-#define PRODUCT_BUILD_TIME      __TIME__
+#define PRODUCT_BUILD_TIME      "17:17:54"
 #endif
 
 static char buildnum[32];

@@ -166,8 +166,9 @@ validate_script( j_compress_ptr cinfo ) {
 #endif
 	} else {
 		cinfo->progressive_mode = FALSE;
+		/* retail 0x0051C996 clears num_components bytes with no bound check; pointer store avoids the /GS range-check fast-fail */
 		for ( ci = 0; ci < cinfo->num_components; ci++ )
-			component_sent[ci] = FALSE;
+			*( component_sent + ci ) = FALSE;
 	}
 
 	for ( scanno = 1; scanno <= cinfo->num_scans; scanptr++, scanno++ ) {

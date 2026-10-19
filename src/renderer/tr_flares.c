@@ -4,23 +4,31 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "tr_records.h"
 #include "tr_gl_types.h"
 #include "tr_orientation.h"   /* backEnd.or 0x016D8DA8 -- one object, not 16 shards */
 #include "tr_tess.h"
+#include "tr_local.h"
+/* ---- renderer-owned globals ---- */
+float rendererSunFlareVisibility;   /* 0x014072FC */
+int rendererActiveFlares;   /* 0x016DA40C */
+int rendererFreeFlares;   /* 0x016DCA20 */
+unsigned char rendererFlarePool[9740];   /* 0x016DA420 */
+
 
 extern int GL_Bind();
 extern int GL_State();
 extern int RB_BeginImmediateMode();
 void __cdecl RB_BeginSurface( void *shader, int vertexComponentCount );
-extern void __cdecl RB_CalcSunBlind( float *a1, float *a2, float a3 );
+extern void __cdecl RB_CalcSunBlind( float *outBlind, float *outGlare, float visibility );
 void __cdecl RB_EndSurface( void );
 extern int RB_SelectStorageATI();
 extern int RB_SelectStorageNV();
 unsigned __int64 __cdecl RB_glColor4f( float r, float g, float b, float a );
-char *__cdecl RB_glVertex3f( int xbits, int ybits, int zbits );
+void __cdecl RB_glVertex3f( float x, float y, float z );
+GLenum __cdecl RB_glBegin( GLenum result );
+void RB_glEnd( void );
+void RB_EndImmediateMode( void );
 extern int R_FogOn();
 extern int R_TransformClipToWindow();
 extern int R_TransformHomogenousModelToClip();
@@ -30,251 +38,318 @@ extern int R_TransformHomogenousModelToClip();
 void VectorNormalizeFast( float *v );
 
 
-#define FLARE_BYTES   0x2600
+/* -------------------------------------------------------------------------
+ *  flare_t (0x4c) -- one persistent light-flare record.  A light flare is an
+ *  eye effect drawn for a bright, visible light source; its screen size is
+ *  roughly constant while its intensity is faded up/down as the source becomes
+ *  visible/occluded, which requires state that survives across scenes.
+ *
+ *  128 records live in the global pool (rendererFlarePool).  RB_AddFlare threads
+ *  them onto an active chain (rendererActiveFlares, tr's r_activeFlares) and a free
+ *  chain (rendererFreeFlares, r_inactiveFlares); `next` at +0x00 is the chain link.
+ *  Descends from RTCW's flare_t; the CoD-specific fields (screenRadius, and
+ *  the NDC depth stored in eyeZ) are proven by the decompiled reads and match
+ *  the CoDUO renderer_flare_t reconstruction.
+ * ------------------------------------------------------------------------- */
+typedef struct flare_s {
+	struct flare_s *next;          /* +0x00  active / free chain link */
+	int             addedFrame;    /* +0x04  backEnd.viewParms.frameCount when last added (-1 => fresh) */
+	int             portalView;    /* +0x08  view discriminator (backEnd wireframe/portal state) */
+	int             frameSceneNum; /* +0x0c */
+	int             fadeInMsec;    /* +0x10 */
+	int             fadeOutMsec;   /* +0x14 */
+	shader_t       *shader;        /* +0x18  flare / spotlight material */
+	int             active;        /* +0x1c  qboolean -- visible this scene */
+	int             fadeTime;      /* +0x20  time of the last visibility update */
+	float           drawIntensity; /* +0x24  faded intensity (0 => not drawn) */
+	int             windowX;       /* +0x28 */
+	int             windowY;       /* +0x2c */
+	float           eyeZ;          /* +0x30  NDC depth used for the occlusion readback */
+	vec3_t          color;         /* +0x34 */
+	float           size;          /* +0x40 */
+	int             screenRadius;  /* +0x44  screen-space test half-size, pixels */
+	int             id;            /* +0x48  matches the source; -1 for the sun flare */
+} flare_t;
+COD1_ASSERT_SIZE(flare_t, 0x4c);
+ASSERT_OFF(flare_t, portalView, 0x08);
+ASSERT_OFF(flare_t, shader, 0x18);
+ASSERT_OFF(flare_t, active, 0x1c);
+ASSERT_OFF(flare_t, fadeTime, 0x20);
+ASSERT_OFF(flare_t, eyeZ, 0x30);
+ASSERT_OFF(flare_t, color, 0x34);
+ASSERT_OFF(flare_t, screenRadius, 0x44);
+ASSERT_OFF(flare_t, id, 0x48);
 
-/* ---- RE_ClearFlares  0x004D8C50 ----  VERIFIED */
-int *RE_ClearFlares()
+/* -------------------------------------------------------------------------
+ *  flareSource_t (0x3c) -- the descriptor that RB_AddDlightFlares,
+ *  RB_AddCoronaFlares and RB_UpdateSunFlare fill and hand to RB_AddFlare
+ *  (CoDUO renderer_flare_source_t).  `color` is a vec4_t but only rgb reaches
+ *  the flare: color[3] is copied into flare.size and then immediately
+ *  overwritten by size -- the retail bug reproduced in RB_AddFlare.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+	int        id;           /* +0x00 */
+	shader_t  *shader;       /* +0x04 */
+	vec3_t     origin;       /* +0x08 */
+	float      depthOffset;  /* +0x14  pulls the flare toward the eye; also the homogeneous w */
+	vec4_t     color;        /* +0x18  color[3] unused by the flare */
+	float      size;         /* +0x28 */
+	int        screenRadius; /* +0x2c */
+	int        fadeInMsec;   /* +0x30 */
+	int        fadeOutMsec;  /* +0x34 */
+	int        active;       /* +0x38  qboolean */
+} flareSource_t;
+COD1_ASSERT_SIZE(flareSource_t, 0x3c);
+ASSERT_OFF(flareSource_t, origin, 0x08);
+ASSERT_OFF(flareSource_t, depthOffset, 0x14);
+ASSERT_OFF(flareSource_t, color, 0x18);
+ASSERT_OFF(flareSource_t, size, 0x28);
+ASSERT_OFF(flareSource_t, screenRadius, 0x2c);
+ASSERT_OFF(flareSource_t, fadeInMsec, 0x30);
+ASSERT_OFF(flareSource_t, active, 0x38);
+
+/* -------------------------------------------------------------------------
+ *  corona_t (0x30) -- a light corona submitted by the client for the frame
+ *  (CoDUO renderer_corona_t; RTCW corona_t).  RB_AddCoronaFlares reads these
+ *  out of backEnd.refdef.coronas at a 0x30 stride.  `transformed` is an
+ *  RTCW-lineage local-space slot that CoD leaves unused.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+	vec3_t origin;       /* +0x00 */
+	vec3_t color;        /* +0x0c */
+	vec3_t transformed;  /* +0x18  unused */
+	float  scale;        /* +0x24 */
+	int    id;           /* +0x28 */
+	int    flags;        /* +0x2c  bit 0x2 => use the spotlight material */
+} corona_t;
+COD1_ASSERT_SIZE(corona_t, 0x30);
+ASSERT_OFF(corona_t, color, 0x0c);
+ASSERT_OFF(corona_t, scale, 0x24);
+ASSERT_OFF(corona_t, id, 0x28);
+ASSERT_OFF(corona_t, flags, 0x2c);
+
+void __cdecl RB_AddFlare( flareSource_t *src, float *normal );
+
+#define MAX_FLARES    128
+#define FLARE_BYTES   0x2600          /* == MAX_FLARES * sizeof(flare_t) */
+COD1_STATIC_ASSERT(FLARE_BYTES == MAX_FLARES * sizeof(flare_t),
+                   "flare pool byte size must equal MAX_FLARES * sizeof(flare_t)");
+
+/* retail's inlined float->int idiom (0x004D92C0-0x004D92D8 and the fade
+ * conversions at 0x004D9028-0x004D9076 / 0x004D914F-0x004D91A1): fld float /
+ * fadd qword 2^-30 / fistp -- round-to-nearest under the default control word,
+ * not the truncating __ftol2 an (int) cast compiles to.  The operand is a float,
+ * so callers' products are rounded to float first, as retail's fstp does. */
+static int R_FlareFistp( float f )
 {
-  int *v0;
-  int *result;
+  double bias = 9.313225746154785e-10;
+  int    i;
 
-  memset(&unk_16DA420, 0, FLARE_BYTES);
-  v0 = 0;
-  dword_16DA40C = 0;
-  flt_14072FC = 0.0;
+  __asm fld   f
+  __asm fadd  bias
+  __asm fistp i
+  return i;
+}
+
+/* ---- RE_ClearFlares  0x004D8C50 ----  VERIFIED
+ * Zero the flare pool and rebuild the free list (each record links back to the
+ * previous one, so the free head is the last record).  The return value is
+ * dead EAX -- the past-the-end cursor -- preserved exactly. */
+flare_t *RE_ClearFlares()
+{
+  flare_t *pool = (flare_t *)&rendererFlarePool;
+  flare_t *prev;
+  flare_t *f;
+
+  memset(pool, 0, FLARE_BYTES);
+  prev = 0;
+  rendererActiveFlares = 0;                              /* r_activeFlares = NULL */
+  rendererSunFlareVisibility = 0.0;                              /* sun-flare visibility */
   rendererSunState_currentBlindFraction = 0.0;
   rendererSunState_currentGlareFraction = 0.0;
   rendererSunState_lastUpdateTime = 0;
-  result = (int *)&unk_16DA420;
+
+  f = pool;
   do
   {
-    *result = (int)v0;
-    v0 = result;
-    result += 19;
+    f->next = prev;
+    prev = f;
+    ++f;
   }
-  while ( (int)result < (int)&unk_16DA420[FLARE_BYTES] );
-  dword_16DCA20 = (int)v0;
-  return result;
+  while ( (int)f < (int)&pool[MAX_FLARES] );
+  rendererFreeFlares = (int)prev;                      /* r_inactiveFlares = last record */
+  return f;
 }
 
-/* ---- RB_AddFlare  0x004D8CA0 ----  VERIFIED */
-void __cdecl RB_AddFlare(int a1, float *a2)
+/* ---- RB_AddFlare  0x004D8CA0 ----  VERIFIED
+ * Called at surface tessellation time.  Finds (or allocates) the flare that
+ * matches this source id / scene / view, transforms the source point to the
+ * screen and stores the test info.  Retail deliberately writes flare.size
+ * twice (from color[3] then from size), discarding the color[3] word -- that
+ * dead store is reproduced faithfully. */
+void __cdecl RB_AddFlare(flareSource_t *src, float *normal)
 {
-  float *v2;
-  float v4;
-  float v5;
-  double v6;
-  double v7;
-  int v8;
-  double v9;
-  int v10;
-  double v11;
-  double v12;
-  float eye[4];  /* [ebp-30h] BYREF -- retail vec4_t */
-  float src[4];  /* [ebp-20h] BYREF -- retail vec4_t */
-  float clip[4]; /* [ebp-10h] BYREF -- retail vec4_t */
-  float v22;  /* retail reuses the arg_0 slot as scratch */
+  flare_t *f;
+  float    dot;
+  float    margin;
+  float    eye[4];    /* [ebp-30h] BYREF -- retail vec4_t */
+  float    point[4];  /* [ebp-20h] BYREF -- the source point, then window coords */
+  float    clip[4];   /* [ebp-10h] BYREF */
+  float    local[3];  /* Q3's `local`: shares eye's slot, and its references put eye at the frame bottom */
+  int      i;
 
-  v2 = (float *)dword_16DA40C;
+  f = (flare_t *)rendererActiveFlares;
   ++backEnd_pc_flareAddCount;
-  if ( dword_16DA40C )
+  if ( rendererActiveFlares )
   {
     do
     {
-      if ( *((_DWORD *)v2 + 18) == *(_DWORD *)a1
-        && *((_DWORD *)v2 + 3) == backEnd_viewParms_frameSceneNum
-        && *((_DWORD *)v2 + 2) == backEnd_wireframeOverride )
+      if ( f->id == src->id
+        && f->frameSceneNum == backEnd_viewParms_frameSceneNum
+        && f->portalView == backEnd_wireframeOverride )
       {
         break;
       }
-      v2 = *(float **)v2;
+      f = f->next;
     }
-    while ( v2 );
+    while ( f );
   }
-  v4 = *(float *)(a1 + 12);
-  v5 = *(float *)(a1 + 16);
-  src[0] = *(float *)(a1 + 8);
-  src[3] = *(float *)(a1 + 20);
-  src[1] = v4;
-  src[2] = v5;
-  if ( !((src[3] == 0.0) | __UNORDERED__(src[3], 0.0)) )
+
+  point[0] = src->origin[0];
+  point[1] = src->origin[1];
+  point[2] = src->origin[2];
+  point[3] = src->depthOffset;
+  if ( point[3] != 0.0f )
   {
-    v6 = -src[3];
-    eye[0] = backEnd_viewParms_originX[0] * v6 + src[0];
-    eye[1] = backEnd_viewParms_originY * v6 + src[1];
-    eye[2] = v6 * backEnd_viewParms_originZ + src[2];
+    VectorMA(point, -point[3], backEnd_viewParms_originX, eye);
     VectorNormalizeFast(eye);
-    v7 = src[3] * -12.0;                 /* flt_569084 = 0xC1400000 */
-    src[0] = eye[0] * v7 + src[0];
-    src[1] = eye[1] * v7 + src[1];
-    src[2] = v7 * eye[2] + src[2];
+    VectorMA(point, point[3] * -12.0f, eye, point); /* -12.0f (0xC1400000), pooled .rdata literal in retail */
   }
-  R_TransformHomogenousModelToClip(eye, flt_16D8DE4, backEnd_viewParms_projectionMatrix, clip, src);
-  if ( v2 || *(_DWORD *)(a1 + 44) )
+
+  R_TransformHomogenousModelToClip(point, backEnd_or_modelMatrix, backEnd_viewParms_projectionMatrix, eye, clip);
+
+  /* A new point flare (no existing record, no explicit screen radius) is
+   * rejected here if it falls outside the clip volume. */
+  if ( !f && !src->screenRadius )
   {
-LABEL_14:
-    R_TransformClipToWindow(clip, (int)backEnd_viewParms_originX, eye, src);
-    if ( !v2 )
+    for ( i = 0; i < 3; ++i )
     {
-      v2 = (float *)dword_16DCA20;
-      if ( !dword_16DCA20 )
+      if ( clip[i] >= clip[3] || clip[i] <= -clip[3] )
         return;
-      v9 = (double)*(int *)(a1 + 44);
-      v22 = v9;
-      if ( (v9 + src[0] < 0.0) | __UNORDERED__(v9 + src[0], 0.0)
-        || (double)backEnd_viewParms_viewportWidth <= src[0] - v22
-        || (v22 + src[1] < 0.0) | __UNORDERED__(v22 + src[1], 0.0)
-        || (double)backEnd_viewParms_viewportHeight <= src[1] - v22 )
-      {
-        return;
-      }
-      v10 = *(_DWORD *)dword_16DCA20;
-      *(_DWORD *)dword_16DCA20 = dword_16DA40C;
-      dword_16DA40C = (int)v2;
-      *((_DWORD *)v2 + 3) = backEnd_viewParms_frameSceneNum;
-      dword_16DCA20 = v10;
-      *((_DWORD *)v2 + 2) = backEnd_wireframeOverride;
-      *((_DWORD *)v2 + 1) = -1;
-      v2[18] = *(float *)a1;
-      v2[9] = 0.0;
-      *((_DWORD *)v2 + 8) = backEnd_refdef_time - 10;
     }
-    v2[6] = *(float *)(a1 + 4);
-    v2[7] = *(float *)(a1 + 56);
-    v2[4] = *(float *)(a1 + 48);
-    v2[5] = *(float *)(a1 + 52);
-    *((_DWORD *)v2 + 1) = backEnd_viewParms_frameCount;
-    v2[13] = *(float *)(a1 + 24);
-    v2[14] = *(float *)(a1 + 28);
-    v2[15] = *(float *)(a1 + 32);
-    v2[16] = *(float *)(a1 + 36);
-    v2[16] = *(float *)(a1 + 40);
-    v2[17] = *(float *)(a1 + 44);
-    if ( a2 )
-    {
-      eye[0] = backEnd_viewParms_originX[0] - *(float *)(a1 + 8);
-      eye[1] = backEnd_viewParms_originY - *(float *)(a1 + 12);
-      eye[2] = backEnd_viewParms_originZ - *(float *)(a1 + 16);
-      VectorNormalizeFast(eye);
-      v11 = eye[2] * a2[2] + eye[1] * a2[1] + eye[0] * *a2;
-      v2[13] = v11 * v2[13];
-      v2[14] = v11 * v2[14];
-      v2[15] = v11 * v2[15];
-    }
-    v12 = src[1];
-    *((_DWORD *)v2 + 10) = (int)src[0] + backEnd_viewParms_viewportX;
-    *((_DWORD *)v2 + 11) = (int)v12 + backEnd_viewParms_viewportY;
-    if ( (*(float *)(a1 + 20) == 0.0) | __UNORDERED__(*(float *)(a1 + 20), 0.0) )
-      v2[12] = 1.0;
-    else
-      v2[12] = (clip[2] / clip[3] + 1.0) * 0.5;
-    return;
   }
-  v8 = 0;
-  while ( clip[v8] < (double)clip[3] && -clip[3] < clip[v8] )
+
+  R_TransformClipToWindow(clip, (int)backEnd_viewParms_originX, eye, point);
+  if ( !f )
   {
-    if ( ++v8 >= 3 )
-      goto LABEL_14;
+    f = (flare_t *)rendererFreeFlares;
+    if ( !rendererFreeFlares )
+      return;                                      /* free list empty */
+
+    margin = (float)src->screenRadius;
+    if ( point[0] + margin < 0.0f
+      || point[0] - margin >= backEnd_viewParms_viewportWidth
+      || point[1] + margin < 0.0f
+      || point[1] - margin >= backEnd_viewParms_viewportHeight )
+    {
+      return;
+    }
+
+    /* pop from the free list, push onto the active list */
+    rendererFreeFlares = (int)((flare_t *)rendererFreeFlares)->next;
+    f->next = (flare_t *)rendererActiveFlares;
+    rendererActiveFlares = (int)f;
+    f->frameSceneNum = backEnd_viewParms_frameSceneNum;
+    f->portalView = backEnd_wireframeOverride;
+    f->addedFrame = -1;
+    f->id = src->id;
+    f->drawIntensity = 0.0;
+    f->fadeTime = backEnd_refdef_time - 10;
   }
+
+  f->shader = src->shader;
+  f->active = src->active;
+  f->fadeInMsec = src->fadeInMsec;
+  f->fadeOutMsec = src->fadeOutMsec;
+  f->addedFrame = backEnd_viewParms_frameCount;
+  f->color[0] = src->color[0];
+  f->color[1] = src->color[1];
+  f->color[2] = src->color[2];
+  f->size = src->color[3];                         /* retail bug: this store is discarded... */
+  f->size = src->size;                             /* ...by this one (source color[3] is unused) */
+  f->screenRadius = src->screenRadius;
+
+  if ( normal )
+  {
+    /* fade the flare down as its surface turns away from the viewer */
+    local[0] = backEnd_viewParms_originX[0] - src->origin[0];
+    local[1] = backEnd_viewParms_originY - src->origin[1];
+    local[2] = backEnd_viewParms_originZ - src->origin[2];
+    VectorNormalizeFast(local);
+    dot = local[2] * normal[2] + local[1] * normal[1] + local[0] * normal[0];
+    f->color[0] = dot * f->color[0];
+    f->color[1] = dot * f->color[1];
+    f->color[2] = dot * f->color[2];
+  }
+
+  f->windowX = (int)point[0] + backEnd_viewParms_viewportX;
+  f->windowY = (int)point[1] + backEnd_viewParms_viewportY;
+#ifdef COD1_VC7
+  if ( src->depthOffset != 0.0f )
+    f->eyeZ = (clip[2] / clip[3] + 1.0f) * 0.5f;
+  else
+    f->eyeZ = 1.0f;
+#else
+  if ( src->depthOffset != 0.0f )
+    f->eyeZ = (clip[2] / clip[3] + 1.0) * 0.5;
+  else
+    f->eyeZ = 1.0f;
+#endif
 }
 
-/* ---- RB_AddDlightFlares  0x004D8FD0 ----  VERIFIED */
-cvar_t *RB_AddDlightFlares()
+/* ---- RB_AddDlightFlares  0x004D8FD0 ----  VERIFIED
+ * Adds a flare for each dynamic light (only when r_flares >= 2).  Retail is
+ * void: the old Hex-Rays "return value" was only whatever EAX held. */
+void RB_AddDlightFlares()
 {
-  cvar_t *result;
-  float value;
-  double v2;
-  double v3;
-  int v4;
-  _DWORD *v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  int v11;
-  float v12;
-  float v13;
-  _DWORD v14[15]; // [esp+20h] [ebp-3Ch] BYREF
+  dlight_t *light;
+  flareSource_t src;
+  int       i;
 
-  result = r_flares;
   if ( r_flares->integer >= 2 )
   {
-    value = r_flareSize->value;
-    v14[1] = tr_flareShader;
-    v2 = r_flareFadeIn->value;
-    v14[0] = 1024;
-    v14[9] = 1065353216;
-    *(float *)&v14[10] = value;
-    v14[11] = 0;
-    v12 = v2 * 1000.0;
-    v3 = r_flareFadeOut->value * 1000.0;
-    v14[12] = (int)(v12 + 9.313225746154785e-10);
-    v13 = v3;
-    result = (cvar_t *)backEnd_refdef_dlights;
-    v14[13] = (int)(v13 + 9.313225746154785e-10);
-    v4 = 0;
-    v14[14] = 1;
-    if ( backEnd_refdef_num_dlights > 0 )
+    src.shader = (shader_t *)tr_flareShader;
+    src.id = 1024;
+    src.color[3] = 1.0f;
+    src.size = r_flareSize->value;
+    src.screenRadius = 0;
+    src.fadeInMsec = R_FlareFistp(r_flareFadeIn->value * 1000.0f);   /* 0x004D8FFF-0x004D9040 */
+    src.fadeOutMsec = R_FlareFistp(r_flareFadeOut->value * 1000.0f); /* 0x004D9049-0x004D9076 */
+    src.active = 1;
+    light = (dlight_t *)backEnd_refdef_dlights;
+    for ( i = 0; i < backEnd_refdef_num_dlights; ++i, ++light )
     {
-      v5 = (_DWORD *)(backEnd_refdef_dlights + 72);
-      do
-      {
-        v6 = *(v5 - 1);
-        v7 = v5[1];
-        v14[3] = *v5;
-        v8 = *(v5 - 17);
-        v14[2] = v6;
-        v9 = v5[2];
-        v14[6] = v8;
-        v14[4] = v7;
-        v10 = *(v5 - 16);
-        v14[5] = v9;
-        v11 = *(v5 - 15);
-        v14[7] = v10;
-        v14[8] = v11;
-        RB_AddFlare((int)v14, 0);
-        ++v14[0];
-        result = (cvar_t *)backEnd_refdef_num_dlights;
-        ++v4;
-        v5 += 34;
-      }
-      while ( v4 < backEnd_refdef_num_dlights );
+      src.origin[0] = light->position[0];
+      src.origin[1] = light->position[1];
+      src.origin[2] = light->position[2];
+      src.depthOffset = light->position[3];
+      src.color[0] = light->color[0];
+      src.color[1] = light->color[1];
+      src.color[2] = light->color[2];
+      RB_AddFlare(&src, 0);
+      ++src.id;
     }
   }
-  return result;
 }
 
-/* ---- RB_AddCoronaFlares  0x004D9100 ----  VERIFIED */
+/* ---- RB_AddCoronaFlares  0x004D9100 ----  VERIFIED
+ * Adds a flare for each corona (only when r_flares == 1 or 3, and a world is
+ * loaded).  The return value is dead EAX, preserved exactly. */
 int RB_AddCoronaFlares()
 {
   int result;
-  double value;
-  double v2;
-  int v3;
-  int v4;
-  bool v5; // zf
-  int v6;
-  int v7;
-  double v8;
-  double v9;
-  int v10;
-  float v11;
-  float v12;
-  int v13; // [esp+20h] [ebp-3Ch] BYREF
-  int v14;
-  int v15;
-  int v16;
-  int v17;
-  int v18;
-  int v19;
-  int v20;
-  int v21;
-  int v22;
-  float v23;
-  int v24;
-  int v25;
-  int v26;
+  corona_t *corona;
+  flareSource_t src;
   int i;
 
   result = r_flares->integer;
@@ -283,239 +358,222 @@ int RB_AddCoronaFlares()
     result = tr_world;
     if ( tr_world )
     {
-      value = r_flareFadeIn->value;
-      v18 = 1065353216;
-      v22 = 1065353216;
-      v24 = 0;
-      v11 = value * 1000.0;
-      v2 = r_flareFadeOut->value * 1000.0;
-      v25 = (int)(v11 + 9.313225746154785e-10);
-      v12 = v2;
+      src.depthOffset = 1.0f;
+      src.color[3] = 1.0f;
+      src.screenRadius = 0;
+      src.fadeInMsec = R_FlareFistp(r_flareFadeIn->value * 1000.0f);   /* 0x004D912E-0x004D916B */
+      src.fadeOutMsec = R_FlareFistp(r_flareFadeOut->value * 1000.0f); /* 0x004D9174-0x004D91A1 */
+      src.active = 1;
       result = backEnd_refdef_coronaCount;
-      v3 = backEnd_refdef_coronas;
-      v4 = 0;
-      v26 = (int)(v12 + 9.313225746154785e-10);
-      for ( i = 1; v4 < backEnd_refdef_coronaCount; v3 += 48 )
+      corona = (corona_t *)backEnd_refdef_coronas;
+      for ( i = 0; i < backEnd_refdef_coronaCount; ++i, ++corona )
       {
-        v5 = (*(_BYTE *)(v3 + 44) & 2) == 0;
-        v13 = *(_DWORD *)(v3 + 40);
-        if ( v5 )
-          v14 = tr_flareShader;
+        src.id = corona->id;
+        if ( corona->flags & 2 )
+          src.shader = (shader_t *)tr_spotLightShader;
         else
-          v14 = tr_spotLightShader;
-        v6 = *(_DWORD *)(v3 + 4);
-        v7 = *(_DWORD *)(v3 + 8);
-        v15 = *(_DWORD *)v3;
-        v19 = *(_DWORD *)(v3 + 12);
-        v8 = r_flareSize->value;
-        v16 = v6;
-        v9 = v8 * *(float *)(v3 + 36);
-        v20 = *(_DWORD *)(v3 + 16);
-        v17 = v7;
-        v10 = *(_DWORD *)(v3 + 20);
-        v23 = v9;
-        v21 = v10;
-        RB_AddFlare((int)&v13, 0);
+          src.shader = (shader_t *)tr_flareShader;
+        src.origin[0] = corona->origin[0];
+        src.origin[1] = corona->origin[1];
+        src.origin[2] = corona->origin[2];
+        src.color[0] = corona->color[0];
+        src.color[1] = corona->color[1];
+        src.color[2] = corona->color[2];
+        src.size = r_flareSize->value * corona->scale;
+        RB_AddFlare(&src, 0);
         result = backEnd_refdef_coronaCount;
-        ++v4;
       }
     }
   }
   return result;
 }
 
-/* ---- RB_UpdateSunFlare  0x004D9250 ----  VERIFIED */
-void __cdecl RB_UpdateSunFlare(int a1, int a2, int a3, float a4, int a5, int a6)
+/* ---- RB_UpdateSunFlare  0x004D9250 ----  VERIFIED
+ * Builds the sun's flare (id -1) from the world sun light and the caller's
+ * shader/color/size/fade parameters.  brightness and size carry float bit patterns in
+ * int slots, so they are reinterpreted rather than converted.  Parameter order
+ * and types are kept exactly as decompiled. */
+void __cdecl RB_UpdateSunFlare(int shader,float brightness,float size,float spriteSize,int fadeInMsec,int fadeOutMsec)
 {
-  _DWORD *v6;
-  int v7;
-  int v8;
-  _DWORD v10[15]; // [esp+8h] [ebp-3Ch] BYREF
-  float v11;
+  flareSource_t src;
+  dlight_t     *sun;
+  float         screenRadius;
 
-  v10[1] = a1;
-  v6 = *(_DWORD **)(tr_world + 276);
-  v7 = v6[18];
-  v10[2] = v6[17];
-  v8 = v6[19];
-  v10[3] = v7;
-  v10[4] = v8;
-  v11 = (double)backEnd_viewParms_viewportWidth * a4 * 0.0015625;
-  v10[6] = a2;
-  v10[0] = -1;
-  v10[5] = 0;
-  v10[7] = a2;
-  v10[8] = a2;
-  v10[9] = 1065353216;
-  v10[10] = a3;
-  v10[11] = (int)(v11 + 9.313225746154785e-10);
-  v10[12] = a5;
-  v10[13] = a6;
-  v10[14] = 1;
-  RB_AddFlare((int)v10, 0);
+  src.shader = (shader_t *)shader;
+  sun = *(dlight_t **)(tr_world + 276);           /* tr.world->sunLight */
+  src.id = -1;
+  src.origin[0] = sun->position[0];
+  src.origin[1] = sun->position[1];
+  src.origin[2] = sun->position[2];
+  src.depthOffset = 0.0f;
+  src.color[0] = brightness;
+  src.color[1] = brightness;
+  src.color[2] = brightness;
+  src.color[3] = 1.0f;
+  src.size = size;
+  /* 1/640 is the .rdata float 0x3ACCCCCD (flt_568FE4), and the product is
+   * stored as a float (0x004D928C) before the rounding fistp (0x004D92D8). */
+#ifdef COD1_VC7
+  screenRadius = backEnd_viewParms_viewportWidth * spriteSize * 0.0015625f;
+#else
+  screenRadius = (double)backEnd_viewParms_viewportWidth * spriteSize * (double)0.0015625f;
+#endif
+  src.screenRadius = R_FlareFistp(screenRadius);
+  src.fadeInMsec = fadeInMsec;
+  src.fadeOutMsec = fadeOutMsec;
+  src.active = 1;
+  RB_AddFlare(&src, 0);
 }
 
-/* ---- RB_TestFlare  0x004D9310 ----  VERIFIED */
-void __cdecl RB_TestFlare(int a1)
+/* ---- RB_TestFlare  0x004D9310 ----  VERIFIED
+ * Reads back the depth buffer around the flare and fades its draw intensity
+ * toward the fraction of samples that are not occluded. */
+void __cdecl RB_TestFlare(flare_t *f)
 {
-  int v1;
-  int v2;
-  int v3;
-  int v4;
-  GLint v5;
-  GLint v6;
-  GLsizei v7;
-  GLsizei v8;
-  int i;
-  int v10;
-  int v12;
-  float v13;
-  int v14;
-  float pixels[4225]; // [esp+10h] [ebp-4204h] BYREF
+  int     size;
+  GLint   readX;
+  GLint   readY;
+  GLsizei readW;
+  GLsizei readH;
+  int     sampleArea;
+  int     visibleCount;
+  int     i;
+  float   fade;
+  float   pixels[4225]; /* [ebp-4204h] BYREF -- 65 * 65 depth samples */
+  int    *finish;
 
-  ++*(int *)&backEnd_pc_flareTests;
-  v1 = *(_DWORD *)(a1 + 68);
-  v2 = *(_DWORD *)(a1 + 40);
-  if ( v2 + v1 < 0 || v2 - v1 >= backEnd_viewParms_viewportWidth || (v3 = *(_DWORD *)(a1 + 44), v3 + v1 < 0) || v3 - v1 >= backEnd_viewParms_viewportHeight )
+  ++*(int *)&backEnd_pc_flareTests;               /* backEnd.pc.flareTestCount */
+
+  if ( f->windowX + f->screenRadius >= 0
+    && f->windowX - f->screenRadius < backEnd_viewParms_viewportWidth
+    && f->windowY + f->screenRadius >= 0
+    && f->windowY - f->screenRadius < backEnd_viewParms_viewportHeight )
   {
-    v13 = 1.0;
-    if ( (*(_BYTE *)(a1 + 28) & 1) == 0 )
-      v13 = 0.0;
+    /* via a pointer: retail's glState is address-taken, so this store may alias *f */
+    finish = &glState_finishCalled;
+    *finish = 0;                                   /* readpixels acts as a sync */
+    size = 2 * f->screenRadius + 1;
+    if ( size > 65 )
+      size = 65;
+    else if ( size < 1 )
+      size = 1;
+    readX = f->windowX - size / 2;
+    readY = f->windowY - size / 2;
+    readW = size;
+    readH = size;
+    sampleArea = size * size;
+    if ( readX < 0 )
+    {
+      readW = readX + size;
+      readX = 0;
+    }
+    else if ( size > backEnd_viewParms_viewportWidth - readX )
+    {
+      readW = backEnd_viewParms_viewportWidth - readX;
+    }
+    if ( readY < 0 )
+    {
+      readH = readY + size;
+      readY = 0;
+    }
+    else if ( size > backEnd_viewParms_viewportHeight - readY )
+    {
+      readH = backEnd_viewParms_viewportHeight - readY;
+    }
+    visibleCount = 0;
+    if ( readW > 0 && readH > 0 )
+    {
+      glReadPixels(readX, readY, readW, readH, 0x1902u, 0x1406u, pixels); /* GL_DEPTH_COMPONENT, GL_FLOAT */
+      for ( i = 0; i < readW * readH; ++i )
+        visibleCount += (f->eyeZ <= pixels[i]);
+    }
+    fade = (double)visibleCount / (double)sampleArea;
   }
   else
   {
-    glState_finishCalled = 0;
-    v4 = 2 * *(_DWORD *)(a1 + 68) + 1;
-    if ( v4 <= 65 )
-    {
-      if ( v4 < 1 )
-        v4 = 1;
-    }
-    else
-    {
-      v4 = 65;
-    }
-    v5 = *(_DWORD *)(a1 + 40) - v4 / 2;
-    v6 = *(_DWORD *)(a1 + 44) - v4 / 2;
-    v7 = v4;
-    v8 = v4;
-    v14 = v4 * v4;
-    if ( v5 >= 0 )
-    {
-      if ( v4 > backEnd_viewParms_viewportWidth - v5 )
-        v7 = backEnd_viewParms_viewportWidth - v5;
-    }
-    else
-    {
-      v7 = v5 + v4;
-      v5 = 0;
-    }
-    if ( v6 >= 0 )
-    {
-      if ( v4 > backEnd_viewParms_viewportHeight - v6 )
-        v8 = backEnd_viewParms_viewportHeight - v6;
-    }
-    else
-    {
-      v8 = v6 + v4;
-      v6 = 0;
-    }
-    v12 = 0;
-    if ( v7 > 0 && v8 > 0 )
-    {
-      glReadPixels(v5, v6, v7, v8, 0x1902u, 0x1406u, pixels);
-      for ( i = 0; i < v7 * v8; v12 += v10 )
-        v10 = *(float *)(a1 + 48) <= (double)pixels[i++];
-    }
-    v13 = (double)v12 / (double)v14;
+    fade = 1.0;
+    if ( (f->active & 1) == 0 )
+      fade = 0.0;
   }
-  if ( *(_DWORD *)(a1 + 72) == -1 )
-    flt_14072FC = v13;
-  *(float *)(a1 + 36) = R_UpdateOverTime(
-                          *(float *)(a1 + 36),
-                          v13,
-                          *(_DWORD *)(a1 + 16),
-                          *(_DWORD *)(a1 + 20),
-                          backEnd_refdef_time - *(_DWORD *)(a1 + 32));
-  *(_DWORD *)(a1 + 32) = backEnd_refdef_time;
+
+  if ( f->id == -1 )
+    rendererSunFlareVisibility = fade;                            /* sun-flare visibility */
+  f->drawIntensity = R_UpdateOverTime(
+                       f->drawIntensity,
+                       fade,
+                       f->fadeInMsec,
+                       f->fadeOutMsec,
+                       backEnd_refdef_time - f->fadeTime);
+  f->fadeTime = backEnd_refdef_time;
 }
 
-/* ---- RB_RenderFlare  0x004D94B0 ----  VERIFIED */
-void __cdecl RB_RenderFlare(int a1)
+/* ---- RB_RenderFlare  0x004D94B0 ----  VERIFIED
+ * Emits one screen-aligned quad for the flare into the tess buffers.  The
+ * four vertex colors are a packed RGBA8888 word (rgb scaled by identityLight,
+ * alpha from drawIntensity). */
+void __cdecl RB_RenderFlare(flare_t *f)
 {
-  double v1;
-  int v2;
-  int v3;
-  int v4;
-  cvar_t *v5;
-  float *v6;
-  _DWORD *v7;
-  _DWORD *v8;
-  int *v9;
-  float v10;
-  int v11;
-  float v12;
-  float v13;
+  float  size;
+  vec3_t color;
+  int    packedColor;
+  int    storage;
+  float *xyz;
+  float *st;
+  int   *rgba;
 
-  ++HIDWORD(backEnd_pc_flareTests);
-  v12 = tr_identityLight * *(float *)(a1 + 56);
-  v13 = tr_identityLight * *(float *)(a1 + 60);
-  LOBYTE(v11) = (unsigned __int64)(tr_identityLight * *(float *)(a1 + 52) * 255.0);
-  BYTE1(v11) = (unsigned __int64)(v12 * 255.0);
-  BYTE2(v11) = (unsigned __int64)(v13 * 255.0);
-  v1 = *(float *)(a1 + 64) * 0.0015625 * (double)backEnd_viewParms_viewportWidth;
-  BYTE3(v11) = (unsigned __int64)(*(float *)(a1 + 36) * 255.0);
+  ++*((int *)&backEnd_pc_flareTests + 1);          /* backEnd.pc.flareRenderCount */
+
+  VectorScale( f->color, tr_identityLight, color );
+  ((unsigned char *)&packedColor)[0] = (unsigned __int64)(color[0] * 255.0f);
+  ((unsigned char *)&packedColor)[1] = (unsigned __int64)(color[1] * 255.0f);
+  ((unsigned char *)&packedColor)[2] = (unsigned __int64)(color[2] * 255.0f);
+  ((unsigned char *)&packedColor)[3] = (unsigned __int64)((rfloat)f->drawIntensity * 255.0f);
+  size = ( (rfloat)f->size * 0.0015625f ) * (double)backEnd_viewParms_viewportWidth;   /* parens: VC7 scheduling weight */ /* flt_568FE4 0x3ACCCCCD */
+
   backEnd_currentEntity = (int)&tr_worldEntity;
-  v2 = storageClass;
-  v10 = v1;
+  storage = storageClass;
   if ( storageClass != glState_currentStorageMode )
   {
     if ( glConfig_NVVertexArrayRange )
-    {
       RB_SelectStorageNV(storageClass);
-    }
     else if ( glConfig_ATIVertexArrayObject )
-    {
       RB_SelectStorageATI(storageClass);
-    }
-    glState_currentStorageMode = v2;
+    glState_currentStorageMode = storage;
   }
-  RB_BeginSurface(*(void **)(a1 + 24), 3);   /* 0x004D9588: mov ecx,[edi+18h] / push 3 */
-  v3 = tess_numVertexes;
-  v4 = tess_numVertexes * tess_vertexComponentCount;
-  *(float *)&tess_xyz[v4] = (double)*(int *)(a1 + 40) - v10;
-  v5 = r_znear;
-  v6 = (float *)(4 * v4 + ((int)(char *)tess_xyz + 8));
-  v7 = (_DWORD *)(8 * v3 + ((int)(char *)tess_texCoords0));
-  *(v6 - 1) = (double)*(int *)(a1 + 44) - v10;
-  *v6 = v5->value;
-  *v7 = 0;
-  v7[1] = 0;
-  dword_181FF60[v3] = v11;
-  v6 += 3;
-  *(v6 - 2) = (double)*(int *)(a1 + 40) - v10;
-  v6 += 3;
-  v8 = (_DWORD *)(8 * v3 + ((int)(char *)tess_texCoords0 + 20));
-  v9 = (int *)(4 * v3 + ((int)(char *)tess_vertexColors + 8));
-  *(v6 - 4) = (double)*(int *)(a1 + 44) + v10;
-  *(v6 - 3) = v5->value;
-  *(v8 - 3) = 0;
-  *(v8 - 2) = 1065353216;
-  *(v9 - 1) = v11;
-  v6 += 2;
-  ++v8;
-  *(v6 - 4) = (double)*(int *)(a1 + 40) + v10;
-  *(v6 - 3) = (double)*(int *)(a1 + 44) + v10;
-  *(v6 - 2) = v5->value;
-  *(v8 - 2) = 1065353216;
-  *(v8 - 1) = 1065353216;
-  *v9 = v11;
-  *(v6 - 1) = (double)*(int *)(a1 + 40) + v10;
-  *v6 = (double)*(int *)(a1 + 44) - v10;
-  v6[1] = v5->value;
-  *v8 = 1065353216;
-  v8[1] = 0;
-  v9[1] = v11;
+
+  RB_BeginSurface(f->shader, 3);                   /* 3 = vertex component count */
+  xyz  = &tess_xyz[tess_numVertexes * tess_vertexComponentCount];
+  st   = &tess_texCoords0[2 * tess_numVertexes];
+  rgba = &tess_vertexColorsPacked[tess_numVertexes];
+
+  *xyz++ = f->windowX - size;
+  *xyz++ = f->windowY - size;
+  *xyz++ = r_znear->value;
+  *st++ = 0.0f;
+  *st++ = 0.0f;
+  *rgba++ = packedColor;
+
+  *xyz++ = f->windowX - size;
+  *xyz++ = f->windowY + size;
+  *xyz++ = r_znear->value;
+  *st++ = 0.0f;
+  *st++ = 1.0f;
+  *rgba++ = packedColor;
+
+  *xyz++ = f->windowX + size;
+  *xyz++ = f->windowY + size;
+  *xyz++ = r_znear->value;
+  *st++ = 1.0f;
+  *st++ = 1.0f;
+  *rgba++ = packedColor;
+
+  *xyz++ = f->windowX + size;
+  *xyz++ = f->windowY - size;
+  *xyz++ = r_znear->value;
+  *st++ = 1.0f;
+  *st++ = 0.0f;
+  *rgba++ = packedColor;
+
   tess_indexes[tess_numIndexes++] = tess_numVertexes;
   tess_indexes[tess_numIndexes++] = tess_numVertexes + 1;
   tess_indexes[tess_numIndexes++] = tess_numVertexes + 2;
@@ -526,133 +584,121 @@ void __cdecl RB_RenderFlare(int a1)
   RB_EndSurface();
 }
 
-/* ---- RB_RenderFlares  0x004D9770 ----  VERIFIED */
+/* ---- RB_RenderFlares  0x004D9770 ----  VERIFIED
+ * Once per view: reclaim/age active flares, run the occlusion test, then draw
+ * the sun blind/glare overlay and every visible flare in an ortho pass. */
 void RB_RenderFlares()
 {
-  int v0;
-  int v1;  /* "some flare in this view is visible" */
-  int *v2;  /* trailing pointer for the unlink */
-  int v3;
-  int i;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  float v14; // [esp+60h] [ebp-Ch] BYREF -- RB_CalcSunBlind out, via ESI
-  float v15; // [esp+64h] [ebp-8h] BYREF -- RB_CalcSunBlind out, via EDI
+  flare_t  *f;
+  flare_t **prev;
+  flare_t  *rf;
+  int       draw;
+  float     glareFraction; /* RB_CalcSunBlind out A -- rgb white level */
+  float     blindFraction; /* RB_CalcSunBlind out B -- overlay alpha */
 
-  if ( r_flares->integer )
+  if ( !r_flares->integer )
+    return;
+
+  RB_AddDlightFlares();
+  RB_AddCoronaFlares();
+
+  rendererSunFlareVisibility = 0.0f;                              /* recomputed by RB_TestFlare for the sun */
+  draw = 0;
+  prev = (flare_t **)&rendererActiveFlares;               /* &r_activeFlares */
+  while ( (f = *prev) != 0 )
   {
-    RB_AddDlightFlares();
-    RB_AddCoronaFlares();
-    v0 = dword_16DA40C;
-    v1 = 0;
-    flt_14072FC = 0.0;
-    v2 = &dword_16DA40C;
-    if ( dword_16DA40C )
+    /* drop any flare that was not added last frame */
+    if ( f->addedFrame < backEnd_viewParms_frameCount )
     {
-      do
+      if ( f->drawIntensity <= 0.0f )
       {
-        if ( *(_DWORD *)(v0 + 4) < backEnd_viewParms_frameCount )
-        {
-          if ( *(float *)(v0 + 36) <= 0.0 )
-          {
-            v3 = dword_16DCA20;
-            *v2 = *(_DWORD *)v0;
-            *(_DWORD *)v0 = v3;
-            dword_16DCA20 = v0;
-            goto LABEL_12;
-          }
-          *(_DWORD *)(v0 + 28) = 0;
-          *(_DWORD *)(v0 + 48) = 0x40000000;
-        }
-        if ( *(_DWORD *)(v0 + 12) == backEnd_viewParms_frameSceneNum && *(_DWORD *)(v0 + 8) == backEnd_wireframeOverride )
-        {
-          RB_TestFlare(v0);
-          if ( (*(float *)(v0 + 36) == 0.0) | __UNORDERED__(*(float *)(v0 + 36), 0.0) )
-          {
-            v5 = dword_16DCA20;
-            *v2 = *(_DWORD *)v0;
-            *(_DWORD *)v0 = v5;
-            dword_16DCA20 = v0;
-            goto LABEL_12;
-          }
-          v1 = 1;
-        }
-        v2 = (int *)v0;
-LABEL_12:
-        v0 = *v2;
+        *prev = f->next;
+        f->next = (flare_t *)rendererFreeFlares;
+        rendererFreeFlares = (int)f;
+        continue;
       }
-      while ( *v2 );
+      f->active = 0;
+      f->eyeZ = 2.0;                               /* 0x40000000 */
     }
-    RB_CalcSunBlind(&v15, &v14, flt_14072FC);
-    if ( v1 || v14 > 0.0 || v15 > 0.0 )
+
+    /* only test flares from this scene / view */
+    if ( f->frameSceneNum == backEnd_viewParms_frameSceneNum
+      && f->portalView == backEnd_wireframeOverride )
     {
-      if ( backEnd_wireframeOverride )
-        glDisable(0x3000u);
-      qglPushMatrix();
-      qglLoadIdentity();
-      glMatrixMode(0x1701u);
-      qglPushMatrix();
-      qglLoadIdentity();
-      qglOrtho(
-        (double)backEnd_viewParms_viewportX,
-        (double)(backEnd_viewParms_viewportX + backEnd_viewParms_viewportWidth),
-        (double)backEnd_viewParms_viewportY,
-        (double)(backEnd_viewParms_viewportY + backEnd_viewParms_viewportHeight),
-        -99999.0,
-        99999.0);
-      if ( !((v14 == 0.0) | __UNORDERED__(v14, 0.0)) || !((v15 == 0.0) | __UNORDERED__(v15, 0.0)) )
+      RB_TestFlare(f);
+      if ( f->drawIntensity != 0.0f )
       {
-        RB_BeginImmediateMode();
-        GL_Bind((GLenum *)tr_whiteImage);
-        GL_State(65634);                       /* 0x10062 */
-        if ( glState_texEnv[glState_currentTmu] != 8448 )
-        {
-          glState_texEnv[glState_currentTmu] = 8448;
-          glTexEnvi(0x2300u, 0x2200u, 8448);
-        }
-        RB_glColor4f(v15, v15, v15, v14);
-        *(float *)&v10 = (float)backEnd_viewParms_viewportY;
-        mode = 7;
-        *(float *)&v6 = (float)backEnd_viewParms_viewportX;
-        RB_glVertex3f(v6, v10, 0);
-        *(float *)&v11 = (float)(backEnd_viewParms_viewportY + backEnd_viewParms_viewportHeight);
-        *(float *)&v7 = (float)backEnd_viewParms_viewportX;
-        RB_glVertex3f(v7, v11, 0);
-        *(float *)&v12 = (float)(backEnd_viewParms_viewportY + backEnd_viewParms_viewportHeight);
-        *(float *)&v8 = (float)(backEnd_viewParms_viewportX + backEnd_viewParms_viewportWidth);
-        RB_glVertex3f(v8, v12, 0);
-        *(float *)&v13 = (float)backEnd_viewParms_viewportY;
-        *(float *)&v9 = (float)(backEnd_viewParms_viewportX + backEnd_viewParms_viewportWidth);
-        RB_glVertex3f(v9, v13, 0);
-        glDrawArrays(mode, 0, rbDebug_immediateVertexCount);
-        rbDebug_immediateVertexCount = 0;
-        mode = 0;
-        rbDebug_immediateModeActive = 0;
-        R_FogOn();
-        glVertexPointer(3, 0x1406u, 0, tess_xyz);
+        draw = 1;
       }
-      if ( v1 )
+      else
       {
-        for ( i = dword_16DA40C; i; i = *(_DWORD *)i )
-        {
-          if ( *(_DWORD *)(i + 12) == backEnd_viewParms_frameSceneNum
-            && *(_DWORD *)(i + 8) == backEnd_wireframeOverride
-            && !((*(float *)(i + 36) == 0.0) | __UNORDERED__(*(float *)(i + 36), 0.0)) )
-          {
-            RB_RenderFlare(i);
-          }
-        }
+        /* fully faded out -- return it to the free list */
+        *prev = f->next;
+        f->next = (flare_t *)rendererFreeFlares;
+        rendererFreeFlares = (int)f;
+        continue;
       }
-      qglPopMatrix();
-      glMatrixMode(0x1700u);
-      qglPopMatrix();
+    }
+    prev = &f->next;
+  }
+
+  RB_CalcSunBlind(&blindFraction, &glareFraction, rendererSunFlareVisibility);
+  if ( !draw && blindFraction <= 0.0f && glareFraction <= 0.0f )   /* retail jp/jnp: a NaN fraction draws */
+    return;
+
+  if ( backEnd_wireframeOverride )
+    glDisable(0x3000u);                          /* GL_CLIP_PLANE0 */
+  qglPushMatrix();
+  qglLoadIdentity();
+  glMatrixMode(0x1701u);                          /* GL_PROJECTION */
+  qglPushMatrix();
+  qglLoadIdentity();
+  qglOrtho(
+    (double)backEnd_viewParms_viewportX,
+    (double)(backEnd_viewParms_viewportX + backEnd_viewParms_viewportWidth),
+    (double)backEnd_viewParms_viewportY,
+    (double)(backEnd_viewParms_viewportY + backEnd_viewParms_viewportHeight),
+    -99999.0,
+    99999.0);
+
+  /* full-screen sun blind / glare overlay */
+  if ( blindFraction != 0.0f || glareFraction != 0.0f )
+  {
+    RB_BeginImmediateMode();
+    GL_Bind((GLenum *)tr_whiteImage);
+    GL_State(65634);                              /* 0x10062 */
+    if ( glState_texEnv[glState_currentTmu] != 8448 )
+    {
+      glState_texEnv[glState_currentTmu] = 8448;  /* GL_MODULATE */
+      glTexEnvi(0x2300u, 0x2200u, 8448);          /* GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE */
+    }
+    RB_glColor4f(glareFraction, glareFraction, glareFraction, blindFraction);
+    RB_glBegin(7);                                /* GL_QUADS */
+    RB_glVertex3f((float)backEnd_viewParms_viewportX, (float)backEnd_viewParms_viewportY, 0.0f);
+    RB_glVertex3f((float)backEnd_viewParms_viewportX,
+                  (float)(backEnd_viewParms_viewportY + backEnd_viewParms_viewportHeight), 0.0f);
+    RB_glVertex3f((float)(backEnd_viewParms_viewportX + backEnd_viewParms_viewportWidth),
+                  (float)(backEnd_viewParms_viewportY + backEnd_viewParms_viewportHeight), 0.0f);
+    RB_glVertex3f((float)(backEnd_viewParms_viewportX + backEnd_viewParms_viewportWidth),
+                  (float)backEnd_viewParms_viewportY, 0.0f);
+    RB_glEnd();
+    RB_EndImmediateMode();
+  }
+
+  if ( draw )
+  {
+    for ( rf = (flare_t *)rendererActiveFlares; rf; rf = rf->next )
+    {
+      if ( rf->frameSceneNum == backEnd_viewParms_frameSceneNum
+        && rf->portalView == backEnd_wireframeOverride
+        && rf->drawIntensity != 0.0f )
+      {
+        RB_RenderFlare(rf);
+      }
     }
   }
+
+  qglPopMatrix();
+  glMatrixMode(0x1700u);                          /* GL_MODELVIEW */
+  qglPopMatrix();
 }

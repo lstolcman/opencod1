@@ -4,463 +4,515 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "tr_records.h"
 #include "tr_shaderregistry.h"
 #include "tr_gl_types.h"
 #include "tr_tess.h"
+#include "tr_local.h"
+/* ---- renderer-owned globals ---- */
+int rendererVisibleModelWarningView;
+int r_firstSceneCorona;
+int r_firstSceneDlight;
+int r_firstSceneDrawSurf;
+int r_firstSceneEntity;
+int r_firstScenePoly;
+int r_numcoronas;
+int r_numdlights;
+int r_numentities;
+int r_numpolys;
+int r_numpolyverts;
+/* RTCW tr_scene.c skyboxportal */
+int rendererSkyboxPortalActive;   /* 0x016DCA28 */
+int rendererSkyboxPortal;   /* 0x016DCA54 */
 
 
-#define r_dynamiclight             ((cvar_t *)(r_dynamiclight))
+
 #define r_lodbias                  ((cvar_t *)(r_lodbias))
-#define r_lodscale                 ((cvar_t *)(r_lodscale))
-#define r_norefresh                ((cvar_t *)(r_norefresh))
+
+
+/* ------------------------------------------------------------------------- *
+ *  File-local typed views over the per-frame scene block (backEndData).
+ *
+ *  RE_ClearScene/RE_Add*ToScene/RE_RenderScene fill fixed-offset sub-arrays
+ *  inside the big backEndData allocation; the record types below are proven by
+ *  the decompiled writes and cross-checked with CoDUO, and pinned with offset
+ *  asserts so a wrong offset fails the build.  msurface/dlight/drawSurf/entity
+ *  types come from tr_local.h; only the poly, corona and incoming-refdef
+ *  layouts are defined here.  All three are candidates for tr_local.h.
+ * ------------------------------------------------------------------------- */
+
+/* polyVert_t (0x20) -- xyz/st/color vertex; only ever block-copied here, so
+ * its interior stays opaque.  RTCW's polyVert_t is 0x18; CoD widened it. */
+typedef struct {
+	byte bytes[0x20];
+} polyVert_t;
+COD1_ASSERT_SIZE(polyVert_t, 0x20);
+
+/* srfPoly_t (0x10) -- SF_POLY draw surface.  CoD drops RTCW's fogIndex, so
+ * this is 16 bytes with verts at +0x0c (RTCW is 20 with verts at +0x10). */
+typedef struct {
+	int         surfaceType;      /* +0x00  == 2 (SF_POLY) */
+	qhandle_t   hShader;          /* +0x04 */
+	int         numVerts;         /* +0x08 */
+	polyVert_t *verts;            /* +0x0c */
+} srfPoly_t;
+COD1_ASSERT_SIZE(srfPoly_t, 0x10);
+ASSERT_OFF(srfPoly_t, hShader, 0x04);
+ASSERT_OFF(srfPoly_t, numVerts, 0x08);
+ASSERT_OFF(srfPoly_t, verts, 0x0c);
+
+/* corona_t (0x30) -- CoDUO renderer_corona_t */
+typedef struct {
+	vec3_t origin;                /* +0x00 */
+	vec3_t color;                 /* +0x0c */
+	vec3_t transformed;           /* +0x18  RTCW-lineage local origin; unused */
+	float  scale;                 /* +0x24 */
+	int    id;                    /* +0x28 */
+	int    flags;                 /* +0x2c */
+} corona_t;
+COD1_ASSERT_SIZE(corona_t, 0x30);
+ASSERT_OFF(corona_t, color, 0x0c);
+ASSERT_OFF(corona_t, scale, 0x24);
+ASSERT_OFF(corona_t, id, 0x28);
+
+/* Incoming public refdef_t -- only the header prefix RE_RenderScene reads is
+ * named; the tail (areamask/text/glfog/...) is not touched here.  The prefix
+ * is the standard Q3/RTCW refdef head and matches trRefdef_t (tr_records.h). */
+typedef struct {
+	int    x, y, width, height;   /* +0x00 +0x04 +0x08 +0x0c */
+	float  fov_x, fov_y;          /* +0x10 +0x14 */
+	vec3_t vieworg;               /* +0x18 */
+	vec3_t viewaxis[3];           /* +0x24 */
+	int    time;                  /* +0x48 */
+	int    rdflags;               /* +0x4c */
+} refdef_t;
+ASSERT_OFF(refdef_t, fov_x, 0x10);
+ASSERT_OFF(refdef_t, vieworg, 0x18);
+ASSERT_OFF(refdef_t, viewaxis, 0x24);
+ASSERT_OFF(refdef_t, time, 0x48);
+ASSERT_OFF(refdef_t, rdflags, 0x4c);
+
+/* backEndData sub-array bases (fixed byte offsets into the frame block) */
+#define SCENE_DRAWSURFS       0             /* drawSurf_t[]      */
+#define SCENE_DLIGHTS         0x80000       /* dlight_t[]        (524288) */
+#define SCENE_CORONAS         528640        /* corona_t[]        */
+#define SCENE_ENTITIES        530176        /* trRefEntity_t[]   */
+#define SCENE_ENTITYSURFACES  1242880       /* entity surface[]  */
+#define SCENE_POLYS           1308416       /* srfPoly_t[]       (16 * 81776) */
+#define SCENE_POLYVERTS       1373952       /* polyVert_t[]      (32 * 42936) */
+#define SCENE_CMD_USED        1898240       /* renderCommandList.used */
+
 
 
 extern int R_RenderView();
+double Distance( const vec3_t p1, const vec3_t p2 );  /* com_math.c (vec_t, /Op); double here: R_GetLodDist re-stores it (0x004EA113) */
 
-/* ---- R_ToggleSmpFrame  0x004E96F0 ----  VERIFIED */
-void R_ToggleSmpFrame( void ) {
-  *(_DWORD *)(backEndData + 1898240) = 0; //backEndData[tr.smpFrame]->commands.used = 0;
+/* ---- R_ToggleSmpFrame  0x004E96F0 ----  VERIFIED
+ * Reset the per-frame scene counters.  CoD dropped RTCW's r_smp double buffer
+ * (no tr.smpFrame swap), so this always touches frame 0.  The int return is
+ * dead EAX (always 0); every caller ignores it. */
+int R_ToggleSmpFrame( void )
+{
+  *(int *)(backEndData + SCENE_CMD_USED) = 0;    /* renderCommandList.used = 0 */
 
   r_firstSceneDrawSurf = 0;
 
-  r_numdlights = 0;
+  r_numdlights       = 0;
   r_firstSceneDlight = 0;
 
-  r_numcoronas = 0;
+  r_numcoronas       = 0;
   r_firstSceneCorona = 0;
 
-  r_numentities = 0;
+  r_numentities      = 0;
   r_firstSceneEntity = 0;
 
-  r_numpolys = 0;
+  r_numpolys       = 0;
   r_firstScenePoly = 0;
 
   r_numpolyverts = 0;
 
+  return 0;
 }
 
-/* ---- RE_ClearScene  0x004E9740 ----  VERIFIED */
-int RE_ClearScene()
+/* ---- RE_ClearScene  0x004E9740 ----  VERIFIED
+ * Mark the current scene contents as the new baseline for the next scene.
+ * Returns r_numpolys (dead EAX). */
+int RE_ClearScene( void )
 {
-  int result;
+  int result = r_numpolys;
 
   r_firstSceneDlight = r_numdlights;
-  result = r_numpolys;
   r_firstSceneCorona = r_numcoronas;
   r_firstSceneEntity = r_numentities;
-  r_firstScenePoly = r_numpolys;
+  r_firstScenePoly   = r_numpolys;
   return result;
 }
 
-/* ---- R_AddPolygonSurfaces  0x004E9770 ----  VERIFIED */
-int R_AddPolygonSurfaces()
+/* R_GetShaderByHandle (tr_shader.c), which retail inlines here. */
+static __inline shader_t *R_SceneShaderByHandle( int hShader )
 {
-  int result;
-  int v1;
-  int i;
-  int v3;
-  char *v4;
-
-  result = tr_refdef_numPolys;
-  v1 = tr_refdef_polys;
-  for ( i = 0; i < tr_refdef_numPolys; v1 += 16 )
+  if ( hShader < 0 )
   {
-    tr_currentEntityNumber = i & 0x3FF;
-    tr_shiftedEntityNumber = tr_currentEntityNumber << 8;
-    v3 = *(_DWORD *)(v1 + 4);
-    if ( v3 >= 0 && v3 < tr_numShaders[0] )
-    {
-      v4 = (char *)tr_shaders[v3];
-    }
-    else
-    {
-      ri_Printf(2, "R_GetShaderByHandle: out of range hShader '%d'\n", *(_DWORD *)(v1 + 4));
-      v4 = tr_defaultShader;
-    }
+    ri.Printf( 2, "R_GetShaderByHandle: out of range hShader '%d'\n", hShader );
+    return (shader_t *)tr_defaultShader;
+  }
+  if ( hShader >= tr_numShaders[0] )
+  {
+    ri.Printf( 2, "R_GetShaderByHandle: out of range hShader '%d'\n", hShader );
+    return (shader_t *)tr_defaultShader;
+  }
+  return (shader_t *)tr_shaders[hShader];
+}
+
+/* ---- R_AddPolygonSurfaces  0x004E9770 ----  VERIFIED
+ * Queue the scene's polygons as draw surfaces.  Returns tr.refdef.numPolys
+ * (dead EAX). */
+int R_AddPolygonSurfaces( void )
+{
+  srfPoly_t *poly = (srfPoly_t *)tr_refdef_polys;
+  shader_t  *shader;
+  int        i;
+
+  for ( i = 0; i < tr_refdef_numPolys; ++i, ++poly )
+  {
+    tr_currentEntityNumber = i & QSORT_ENTITYNUM_MASK;
+    tr_shiftedEntityNumber = tr_currentEntityNumber << QSORT_ENTITYNUM_SHIFT;
+
+    shader = R_SceneShaderByHandle( poly->hShader );
+
     if ( tr_refdef_numDrawSurfs < 0x10000 )
     {
-      *(_DWORD *)(tr_refdef_drawSurfs + 8 * tr_refdef_numDrawSurfs) = tr_shiftedEntityNumber
-                                                     | ((*((_DWORD *)v4 + 18) | (storageClass << 12)) << 18)
-                                                     | 2;
-      *(_DWORD *)(tr_refdef_drawSurfs + 8 * tr_refdef_numDrawSurfs++ + 4) = v1;
-    }
-    result = tr_refdef_numPolys;
-    ++i;
-  }
-  return result;
-}
-
-/* ---- RE_AddPolyToScene  0x004E9830 ----  VERIFIED */
-int __cdecl RE_AddPolyToScene(int a1, int a2, const void *a3)
-{
-  int result;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  _DWORD *v9;
-  void *v10;
-
-  result = tr_registered;
-  if ( tr_registered )
-  {
-    v4 = a1;
-    if ( !a1 )
-      v4 = *((_DWORD *)tr_defaultShader + 17);
-    v5 = r_numpolyverts;
-    result = max_polyverts;
-    v6 = r_numpolyverts + a2;
-    if ( r_numpolyverts + a2 <= max_polyverts )
-    {
-      v7 = r_numpolys;
-      if ( r_numpolys < max_polys )
-      {
-        v8 = backEndData;
-        v9 = (_DWORD *)(backEndData + 16 * (r_numpolys + 81776));
-        v9[2] = a2;
-        v10 = (void *)(v8 + 32 * (v5 + 42936));
-        *v9 = 2;
-        v9[1] = v4;
-        v9[3] = v10;
-        result = 32 * a2;
-        qmemcpy(v10, a3, 32 * a2);
-        r_numpolys = v7 + 1;
-        r_numpolyverts = v6;
-      }
+      ( (drawSurf_t *)tr_refdef_drawSurfs )[ tr_refdef_numDrawSurfs ].sort =
+          ( ( ( storageClass << 12 ) | shader->sortedIndex ) << QSORT_SHADERNUM_SHIFT )
+          | tr_shiftedEntityNumber | 2;
+      ( (drawSurf_t *)tr_refdef_drawSurfs )[ tr_refdef_numDrawSurfs ].surface = poly;
+      ++tr_refdef_numDrawSurfs;
     }
   }
-  return result;
+
+  return tr_refdef_numPolys;
 }
 
-/* ---- RE_AddPolysToScene  0x004E98D0 ----  VERIFIED */
-void __cdecl RE_AddPolysToScene(int a1, int a2, char *a3, int a4)
+/* ---- RE_AddPolyToScene  0x004E9830 ----  VERIFIED
+ * Add one polygon (numVerts verts) to the scene. */
+void __cdecl RE_AddPolyToScene( int hShader, int numVerts, const void *verts )
 {
-  int v4;
-  char *v5;
-  unsigned int v6;
-  int *v7;
-  bool v8; // cc
-  int v9;
-  int v11;
+  srfPoly_t  *poly;
+  polyVert_t *polyVerts;
 
-  if ( tr_registered )
+  if ( !tr_registered[0] )
+    return;
+
+  if ( !hShader )
+    hShader = ( (shader_t *)tr_defaultShader )->index;
+
+  if ( r_numpolyverts + numVerts > max_polyverts )
+    return;
+  if ( r_numpolys >= max_polys )
+    return;
+
+  poly      = &( (srfPoly_t  *)( backEndData + SCENE_POLYS ) )[ r_numpolys ];
+  polyVerts = &( (polyVert_t *)( backEndData + SCENE_POLYVERTS ) )[ r_numpolyverts ];
+
+  poly->surfaceType = 2;                         /* SF_POLY */
+  poly->hShader     = hShader;
+  poly->numVerts    = numVerts;
+  poly->verts       = polyVerts;
+
+  memcpy( polyVerts, verts, 32 * numVerts );
+  ++r_numpolys;
+  r_numpolyverts += numVerts;
+}
+
+/* ---- RE_AddPolysToScene  0x004E98D0 ----  VERIFIED
+ * Add numPolys polygons of numVerts verts each, sharing one shader; their
+ * vertex data is packed contiguously in `verts`. */
+void __cdecl RE_AddPolysToScene( int hShader, int numVerts, char *verts, int numPolys )
+{
+  srfPoly_t  *poly;
+  int         i;
+
+  if ( !tr_registered[0] )
+    return;
+
+  if ( !hShader )
   {
-    if ( a1 )
-    {
-      v11 = 0;
-      if ( a4 > 0 )
-      {
-        v4 = a2;
-        v9 = r_numpolyverts + a2;
-        v5 = (char *)(backEndData + 32 * (r_numpolyverts + 42936));
-        v6 = 32 * a2;
-        v7 = (int *)(16 * r_numpolys + backEndData + 1308424);
-        do
-        {
-          if ( v9 > max_polyverts )
-            break;
-          if ( r_numpolys >= max_polys )
-            break;
-          *v7 = v4;
-          *(v7 - 1) = a1;
-          v7[1] = (int)v5;
-          *(v7 - 2) = 2;
-          qmemcpy(v5, a3, v6);
-          ++r_numpolys;
-          v4 = a2;
-          v9 += a2;
-          v7 += 4;
-          v5 += v6;
-          r_numpolyverts += a2;
-          v8 = ++v11 < a4;
-          a3 += v6;
-        }
-        while ( v8 );
-      }
-    }
-    else
-    {
-      ri_Printf(2, "WARNING: RE_AddPolysToScene: NULL poly shader\n");
-    }
+    ri.Printf( 2, "WARNING: RE_AddPolysToScene: NULL poly shader\n" );
+    return;
+  }
+
+  for ( i = 0; i < numPolys; ++i )
+  {
+    if ( r_numpolyverts + numVerts > max_polyverts || r_numpolys >= max_polys )
+      return;
+
+    poly = &( (srfPoly_t *)( backEndData + SCENE_POLYS ) )[ r_numpolys ];
+    poly->surfaceType = 2;                       /* SF_POLY */
+    poly->hShader     = hShader;
+    poly->numVerts    = numVerts;
+    poly->verts       = &( (polyVert_t *)( backEndData + SCENE_POLYVERTS ) )[ r_numpolyverts ];
+
+    memcpy( poly->verts, &( (polyVert_t *)verts )[ numVerts * i ], 32 * numVerts );
+    ++r_numpolys;
+    r_numpolyverts += numVerts;
   }
 }
 
 /* ---- RE_AddRefEntityToScene  0x004E9A00 ----  VERIFIED */
-void __cdecl RE_AddRefEntityToScene(int *a1, int a2)
+void __cdecl RE_AddRefEntityToScene( refEntity_t *ent, int staticModelLighting )
 {
-  int v2;
-  int v3;
-  int v4;
+  int            reType;
 
-  if ( tr_registered )
+  if ( !tr_registered[0] )
+    return;
+
+  if ( com_statmon->integer && r_numentities >= 919 )
+    StatMon_Warning( 9, 3000, "gfx/2d/warning@models.jpg" );
+
+  if ( r_numentities >= 1022 )
   {
-    if ( com_statmon->integer )
-    {
-      if ( r_numentities >= 919 )
-        StatMon_Warning(9, 3000, "gfx/2d/warning@models.jpg");
-    }
-    if ( r_numentities < 1022 )
-    {
-      v2 = *a1;
-      if ( *a1 < 0 || v2 >= 16 )
-        ri_Error(1, "\x15" "RE_AddRefEntityToScene: bad reType %i", v2);
-      v3 = r_numentities;
-      v4 = 696 * r_numentities + backEndData;
-      qmemcpy((void *)(v4 + 530176), a1, 0x9Cu);
-      *(_BYTE *)(v4 + 530337) = 0;
-      *(_DWORD *)(v4 + 530868) = 0;
-      *(_DWORD *)(v4 + 530864) = a2;
-      *(_DWORD *)(v4 + 530380) = 0;
-      r_numentities = v3 + 1;
-      ++tr_refdef_num_entities;
-    }
-    else if ( rendererVisibleModelWarningView != tr_viewCount )
+    if ( rendererVisibleModelWarningView != tr_viewCount )
     {
       rendererVisibleModelWarningView = tr_viewCount;
-      ri_Printf(2, "too many visible models (more than %i)\n", 1021);
+      ri.Printf( 2, "too many visible models (more than %i)\n", 1021 );
     }
+    return;
   }
+
+  reType = ent->reType;
+  if ( reType < 0 || reType >= 16 )
+    ri.Error( 1, "\x15" "RE_AddRefEntityToScene: bad reType %i", reType );
+
+  /* retail indexes the entity per field (no pointer local) */
+#define SCENE_ENT  ( (trRefEntity_t *)( backEndData + SCENE_ENTITIES ) )[ r_numentities ]
+  memcpy( &SCENE_ENT.e, ent, sizeof( refEntity_t ) );
+
+  SCENE_ENT.lightingCalculated                   = 0;
+  SCENE_ENT.cullState                            = 0;
+  SCENE_ENT.staticModelLighting                  = (void *)staticModelLighting;
+  SCENE_ENT.lightCount                           = 0;
+#undef SCENE_ENT
+
+  ++r_numentities;
+  ++tr_refdef_num_entities;
 }
 
-/* ---- RE_AddLightToScene  0x004E9B00 ----  VERIFIED */
-void __cdecl RE_AddLightToScene(_DWORD *a1, float a2, float a3, float a4, float a5)
+/* ---- RE_AddLightToScene  0x004E9B00 ----  VERIFIED
+ * Register a point light.  radius drives the intensity (radius^2 / 32); the
+ * ambient/specular/attenuation defaults reproduce the retail bit patterns. */
+void __cdecl RE_AddLightToScene( float *origin, float radius, float r, float g, float b )
 {
-  double v5;
-  int v6;
-  double v7;
-  int v8;
+  dlight_t *light;
+  rfloat    intensity;
 
-  if ( tr_registered )
-  {
-    if ( r_numdlights < 32 && a2 > 0.0 )
-    {
-      v5 = a2 * a2 * 0.03125;
-      v6 = 136 * r_numdlights++ + backEndData + 0x80000;
-      *(float *)(v6 + 116) = a2;
-      *(float *)(v6 + 16) = v5;
-      *(float *)(v6 + 4) = a3;
-      *(float *)(v6 + 8) = a4;
-      *(float *)(v6 + 12) = a5;
-      *(_DWORD *)(v6 + 32) = 1065353216;
-      *(_DWORD *)v6 = 2;
-      *(_DWORD *)(v6 + 20) = 0;
-      *(_DWORD *)(v6 + 24) = 0;
-      *(_DWORD *)(v6 + 28) = 0;
-      *(float *)(v6 + 36) = tr_identityLight * v5 * a3;
-      *(float *)(v6 + 40) = tr_identityLight * v5 * a4;
-      v7 = tr_identityLight;
-      *(_DWORD *)(v6 + 48) = 1065353216;
-      *(_DWORD *)(v6 + 64) = 1065353216;
-      *(_DWORD *)(v6 + 52) = 0;
-      *(_DWORD *)(v6 + 56) = 0;
-      *(_DWORD *)(v6 + 60) = 0;
-      *(float *)(v6 + 44) = v7 * v5 * a5;
-      *(_DWORD *)(v6 + 68) = *a1;
-      *(_DWORD *)(v6 + 72) = a1[1];
-      v8 = a1[2];
-      *(_DWORD *)(v6 + 80) = 1065353216;
-      *(_DWORD *)(v6 + 104) = 1065353216;
-      *(_DWORD *)(v6 + 76) = v8;
-      *(_DWORD *)(v6 + 96) = 981668463;
-      *(_DWORD *)(v6 + 100) = 0;
-      *(_DWORD *)(v6 + 108) = 0;
-      *(_DWORD *)(v6 + 112) = 1127481344;
-    }
-  }
+  if ( !tr_registered[0] || r_numdlights >= 32 || radius <= 0.0f )
+    return;
+
+  intensity = radius * radius * 0.03125f;
+  light = &( (dlight_t *)( backEndData + SCENE_DLIGHTS ) )[ r_numdlights++ ];
+
+  light->radius    = radius;
+  light->type      = 2;                          /* R_LIGHT_TYPE_POINT */
+  light->color[0]  = r;
+  light->color[1]  = g;
+  light->color[2]  = b;
+  light->intensity = intensity;
+
+  light->ambient[0] = 0.0f;
+  light->ambient[1] = 0.0f;
+  light->ambient[2] = 0.0f;
+  light->ambient[3] = 1.0f;
+
+  light->diffuse[0] = tr_identityLight * intensity * r;
+  light->diffuse[1] = tr_identityLight * intensity * g;
+  light->diffuse[2] = tr_identityLight * intensity * b;
+  light->diffuse[3] = 1.0f;
+
+  light->specular[0] = 0.0f;
+  light->specular[1] = 0.0f;
+  light->specular[2] = 0.0f;
+  light->specular[3] = 1.0f;
+
+  light->position[0] = origin[0];
+  light->position[1] = origin[1];
+  light->position[2] = origin[2];
+  light->position[3] = 1.0f;
+
+  light->constantAttenuation  = 0.001f;
+  light->linearAttenuation    = 0.0f;
+  light->quadraticAttenuation = 1.0f;
+  light->spotExponent         = 0.0f;
+  light->spotCutoff           = 180.0f;
 }
 
 /* ---- RE_AddCoronaToScene  0x004E9C10 ----  VERIFIED */
-void __cdecl RE_AddCoronaToScene(_DWORD *a1, int a2, int a3, int a4, int a5, unsigned int a6, int a7)
+void __cdecl RE_AddCoronaToScene( float *origin, float r, float g, float b,
+                                  float scale, int id, int flags )
 {
-  _DWORD *v7;
+  corona_t *corona;
 
-  if ( tr_registered )
+  if ( !tr_registered[0] || r_numcoronas >= 32 )
+    return;
+
+  if ( id < 0 || id >= 1024 )
   {
-    if ( r_numcoronas < 32 )
-    {
-      if ( a6 >= 0x400 )
-      {
-        ri_Printf(1, "^3added corona with invalid id %i (should be >= 0 and < %i)\n", a6, 1024);
-      }
-      else
-      {
-        v7 = (_DWORD *)(48 * r_numcoronas++ + backEndData + 528640);
-        *v7 = *a1;
-        v7[1] = a1[1];
-        v7[2] = a1[2];
-        v7[3] = a2;
-        v7[4] = a3;
-        v7[5] = a4;
-        v7[10] = a6;
-        v7[9] = a5;
-        v7[11] = a7;
-      }
-    }
+    ri.Printf( 1, "^3added corona with invalid id %i (should be >= 0 and < %i)\n", id, 1024 );
+    return;
   }
+
+  corona = &( (corona_t *)( backEndData + SCENE_CORONAS ) )[ r_numcoronas++ ];
+  corona->origin[0] = origin[0];
+  corona->origin[1] = origin[1];
+  corona->origin[2] = origin[2];
+  corona->color[0]  = r;
+  corona->color[1]  = g;
+  corona->color[2]  = b;
+  corona->scale     = scale;
+  corona->id        = id;
+  corona->flags     = flags;
 }
 
-/* ---- RE_RenderScene  0x004E9CB0 ----  VERIFIED */
-cvar_t *__cdecl RE_RenderScene(int a1)
+/* ---- RE_RenderScene  0x004E9CB0 ----  VERIFIED
+ * Copy the caller's refdef into tr.refdef, build a primary viewParms_t on the
+ * stack and hand it to R_RenderView.  void: the EAX values retail leaves
+ * (tr_registered / r_norefresh / elapsed ms) are never read. */
+void __cdecl RE_RenderScene( refdef_t *fd )
 {
-  cvar_t *result;
-  int v2;
-  int v3;
-  int v4;
-  double v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
-  int v15;
-  long double v16;
-  int v17;
-  int v18;
-  _DWORD v19[154]; // [esp+10h] [ebp-268h] BYREF
-  unsigned int retaddr;
+  viewParms_t parms;
+  int         startTime;
+  int         rdflags;
+  rfloat      fov;
 
-  v19[153] = retaddr ^ _security_cookie;
-  result = (cvar_t *)tr_registered;
-  if ( tr_registered )
-  {
-    if ( Stream )
-      fprintf(Stream, "%s", (int)"====== RE_RenderScene =====\n");
-    result = r_norefresh;
-    if ( !r_norefresh->integer )
-    {
-      v18 = ri_Milliseconds();
-      if ( !tr_world && (*(_BYTE *)(a1 + 76) & 1) == 0 )
-        ri_Error(1, "\x15" "R_RenderScene: NULL worldmodel");
-      tr_refdef_x = *(_DWORD *)a1;
-      tr_refdef_y = *(_DWORD *)(a1 + 4);
-      tr_refdef_width = *(_DWORD *)(a1 + 8);
-      v2 = *(_DWORD *)(a1 + 12);
-      tr_refdef_height = v2;
-      tr_refdef_fov_x = *(float *)(a1 + 16);
-      tr_refdef_fov_y = *(float *)(a1 + 20);
-      tr_refdef_vieworgX = *(float *)(a1 + 24);
-      tr_refdef_vieworgY = *(float *)(a1 + 28);
-      tr_refdef_vieworgZ = *(float *)(a1 + 32);
-      tr_refdef_viewaxis00 = *(_DWORD *)(a1 + 36);
-      tr_refdef_viewaxis01 = *(_DWORD *)(a1 + 40);
-      tr_refdef_viewaxis02 = *(_DWORD *)(a1 + 44);
-      tr_refdef_viewaxis10 = *(float *)(a1 + 48);
-      tr_refdef_viewaxis11 = *(float *)(a1 + 52);
-      tr_refdef_viewaxis12 = *(float *)(a1 + 56);
-      tr_refdef_viewaxis20 = *(_DWORD *)(a1 + 60);
-      tr_refdef_viewaxis21 = *(_DWORD *)(a1 + 64);
-      tr_refdef_viewaxis22 = *(_DWORD *)(a1 + 68);
-      tr_refdef_time = *(_DWORD *)(a1 + 72);
-      tr_refdef_rdflags = *(_DWORD *)(a1 + 76);
-      v3 = *(_DWORD *)(a1 + 76);
-      if ( (v3 & 8) != 0 )
-        dword_16DCA54 = 1;
-      dword_16DCA28 = (unsigned __int8)(v3 & 0x10) >> 4;
-      tr_refdef_floatTime = (double)tr_refdef_time * 0.001;
-      tr_refdef_num_entities = r_numentities - r_firstSceneEntity;
-      tr_refdef_numDrawSurfs = r_firstSceneDrawSurf;
-      tr_refdef_entitySurfaces = backEndData + 1242880;
-      tr_refdef_entities = 696 * r_firstSceneEntity + backEndData + 530176;
-      v4 = r_numdlights - r_firstSceneDlight;
-      tr_refdef_dlights = 136 * r_firstSceneDlight + backEndData + 0x80000;
-      tr_refdef_coronas = 48 * r_firstSceneCorona + backEndData + 528640;
-      tr_refdef_coronaCount = r_numcoronas - r_firstSceneCorona;
-      tr_refdef_drawSurfs = backEndData;
-      tr_refdef_entitySurfaceCount = 0;
-      tr_refdef_num_dlights = r_numdlights - r_firstSceneDlight;
-      tr_refdef_entityDlightCount = r_numdlights - r_firstSceneDlight;
-      tr_refdef_numPolys = r_numpolys - r_firstScenePoly;
-      tr_refdef_polys = backEndData + 16 * (r_firstScenePoly + 81776);
-      if ( !r_dynamiclight->integer )
-        tr_refdef_entityDlightCount = 0;
-      if ( r_dynamiclight->integer != 1 )
-      {
-        v4 = 0;
-        tr_refdef_num_dlights = 0;
-      }
-      if ( r_dynamiclight->integer == 3 )
-      {
-        ri_Printf(0, "%i dynamic lights in scene\n", v4);
-        v2 = tr_refdef_height;
-      }
-      memset(v19, 0, 0x260u);
-      v19[74] = tr_refdef_x;
-      v19[75] = dwExStyle - v2 - tr_refdef_y;
-      *(float *)&v19[78] = tr_refdef_fov_x;
-      *(float *)&v19[79] = tr_refdef_fov_y;
-      v19[76] = tr_refdef_width;
-      v19[77] = v2;
-      v19[65] = 0;
-      if ( tr_refdef_fov_x > (double)tr_refdef_fov_y )
-        v5 = *(float *)&v19[79];
-      else
-        v5 = *(float *)&v19[78];
-      v6 = *(_DWORD *)(a1 + 28);
-      v19[80] = LODWORD(r_lodbias->value);
-      v7 = *(_DWORD *)(a1 + 32);
-      v19[1] = v6;
-      v8 = *(_DWORD *)(a1 + 40);
-      v19[2] = v7;
-      v9 = *(_DWORD *)(a1 + 44);
-      v19[4] = v8;
-      v10 = *(_DWORD *)(a1 + 52);
-      v19[5] = v9;
-      v11 = *(_DWORD *)(a1 + 56);
-      v19[7] = v10;
-      v12 = *(_DWORD *)(a1 + 64);
-      v19[8] = v11;
-      v13 = *(_DWORD *)(a1 + 68);
-      v19[10] = v12;
-      v14 = *(_DWORD *)(a1 + 28);
-      v19[11] = v13;
-      v15 = *(_DWORD *)(a1 + 32);
-      v19[63] = v14;
-      v19[64] = v15;
-      v16 = tan(v5 * 0.0087266462) / tan(0.6981317400932312) * r_lodscale->value;
-      v19[0] = *(_DWORD *)(a1 + 24);
-      v17 = *(_DWORD *)(a1 + 36);
-      *(float *)&v19[81] = v16;
-      v19[3] = v17;
-      v19[6] = *(_DWORD *)(a1 + 48);
-      v19[9] = *(_DWORD *)(a1 + 60);
-      v19[62] = *(_DWORD *)(a1 + 24);
-      R_RenderView(v19);
-      r_firstSceneDrawSurf = tr_refdef_numDrawSurfs;
-      r_firstSceneEntity = r_numentities;
-      r_firstSceneDlight = r_numdlights;
-      r_firstScenePoly = r_numpolys;
-      result = (cvar_t *)(ri_Milliseconds() - v18);
-      tr_frontEndMsec += (int)result;
-    }
-  }
-  return result;
+  if ( !tr_registered[0] )
+    return;
+
+  if ( Stream )
+    fprintf( Stream, "%s", "====== RE_RenderScene =====\n" );
+
+  if ( r_norefresh->integer )
+    return;
+
+  startTime = ri.Milliseconds();
+
+  if ( !tr_world && ( fd->rdflags & 1 ) == 0 )
+    ri.Error( 1, "\x15" "R_RenderScene: NULL worldmodel" );
+
+  /* ---- copy the incoming refdef into tr.refdef ----
+   * viewaxis rows 0 and 2 are int-typed macros in tr_records.h; copy their
+   * float bits verbatim so no float->int narrowing occurs. */
+  tr_refdef_x          = fd->x;
+  tr_refdef_y          = fd->y;
+  tr_refdef_width      = fd->width;
+  tr_refdef_height     = fd->height;
+  tr_refdef_fov_x      = fd->fov_x;
+  tr_refdef_fov_y      = fd->fov_y;
+  tr_refdef_vieworgX   = fd->vieworg[0];
+  tr_refdef_vieworgY   = fd->vieworg[1];
+  tr_refdef_vieworgZ   = fd->vieworg[2];
+  tr_refdef_viewaxis00 = *(int *)&fd->viewaxis[0][0];
+  tr_refdef_viewaxis01 = *(int *)&fd->viewaxis[0][1];
+  tr_refdef_viewaxis02 = *(int *)&fd->viewaxis[0][2];
+  tr_refdef_viewaxis10 = fd->viewaxis[1][0];
+  tr_refdef_viewaxis11 = fd->viewaxis[1][1];
+  tr_refdef_viewaxis12 = fd->viewaxis[1][2];
+  tr_refdef_viewaxis20 = *(int *)&fd->viewaxis[2][0];
+  tr_refdef_viewaxis21 = *(int *)&fd->viewaxis[2][1];
+  tr_refdef_viewaxis22 = *(int *)&fd->viewaxis[2][2];
+  tr_refdef_time       = fd->time;
+  tr_refdef_rdflags    = fd->rdflags;
+
+  rdflags = fd->rdflags;
+  if ( ( rdflags & 8 ) != 0 )
+    rendererSkyboxPortal = 1;
+  if ( ( rdflags & 0x10 ) != 0 )                 /* VC7: movsx al; and 10h; shr 4 */
+    rendererSkyboxPortalActive = 1;
+  else
+    rendererSkyboxPortalActive = 0;
+
+#ifdef COD1_VC7
+  tr_refdef_floatTime          = tr_refdef_time * 0.001f;           /* flt_568E6C = 0x3A83126F */
+#else
+  tr_refdef_floatTime          = (double)tr_refdef_time * 0.001f;
+#endif
+  tr_refdef_numDrawSurfs       = r_firstSceneDrawSurf;
+  tr_refdef_drawSurfs          = backEndData + SCENE_DRAWSURFS;
+  tr_refdef_num_entities       = r_numentities - r_firstSceneEntity;
+  tr_refdef_entities           = 696 * r_firstSceneEntity + backEndData + SCENE_ENTITIES;
+  tr_refdef_entitySurfaces     = backEndData + SCENE_ENTITYSURFACES;
+  tr_refdef_entitySurfaceCount = 0;
+  tr_refdef_num_dlights        = r_numdlights - r_firstSceneDlight;
+  tr_refdef_entityDlightCount  = tr_refdef_num_dlights;
+  tr_refdef_dlights            = 136 * r_firstSceneDlight + backEndData + SCENE_DLIGHTS;
+  tr_refdef_coronaCount        = r_numcoronas - r_firstSceneCorona;
+  tr_refdef_coronas            = 48 * r_firstSceneCorona + backEndData + SCENE_CORONAS;
+  tr_refdef_numPolys           = r_numpolys - r_firstScenePoly;
+  tr_refdef_polys              = 16 * r_firstScenePoly + backEndData + SCENE_POLYS;
+
+  if ( !r_dynamiclight->integer )
+    tr_refdef_entityDlightCount = 0;
+  if ( r_dynamiclight->integer != 1 )
+    tr_refdef_num_dlights = 0;
+  if ( r_dynamiclight->integer == 3 )
+    ri.Printf( 0, "%i dynamic lights in scene\n", tr_refdef_num_dlights );
+
+  /* ---- build the primary view ---- */
+  memset( &parms, 0, sizeof( parms ) );
+
+  parms.viewportX      = tr_refdef_x;
+  parms.viewportY      = glConfig_vidHeight - tr_refdef_height - tr_refdef_y;
+  parms.viewportWidth  = tr_refdef_width;
+  parms.viewportHeight = tr_refdef_height;
+  parms.fovX           = tr_refdef_fov_x;
+  parms.fovY           = tr_refdef_fov_y;
+  parms.isPortal       = 0;
+
+  /* lodScale is scaled by tan(narrower-fov/2) relative to a 40-degree base.
+   * Retail tests !(fovX <= fovY) (fcomp; test ah,41h; jp), so an unordered
+   * (NaN) compare selects fovY. The half-angle factor flt_56904C is the float
+   * 0x3C0EFA35 (0.0087266462f); the divisor dbl_569190 is a double. */
+  if ( parms.fovX <= parms.fovY )
+    fov = parms.fovX;
+  else
+    fov = parms.fovY;
+#ifdef COD1_VC7
+  parms.lodScale = tan( fov * 0.0087266462f ) / tan( 0.6981317400932312 );
+  parms.lodScale *= r_lodscale->value;          /* split: retail's fstp lands after the axis[0][0] load */
+#else
+  parms.lodScale = tan( fov * 0.0087266462f ) / tan( 0.6981317400932312 ) * r_lodscale->value;
+#endif
+  parms.lodBias  = r_lodbias->value;
+
+  VectorCopy( fd->vieworg, parms.orientation.origin );
+  VectorCopy( fd->viewaxis[0], parms.orientation.axis[0] );
+  VectorCopy( fd->viewaxis[1], parms.orientation.axis[1] );
+  VectorCopy( fd->viewaxis[2], parms.orientation.axis[2] );
+
+  VectorCopy( fd->vieworg, parms.pvsOrigin );
+
+  R_RenderView( &parms );
+
+  r_firstSceneDrawSurf = tr_refdef_numDrawSurfs;
+  r_firstSceneEntity   = r_numentities;
+  r_firstSceneDlight   = r_numdlights;
+  r_firstScenePoly     = r_numpolys;
+
+  tr_frontEndMsec += ri.Milliseconds() - startTime;
 }
 
 
-/* ---- R_GetLodDist  0x004EA0C0 ----  VERIFIED */
-double __cdecl R_GetLodDist(float *a1)
+/* ---- R_GetLodDist  0x004EA0C0 ----  VERIFIED
+ * Distance from the view origin to the entity, scaled by lodScale/lodBias and
+ * an optional per-entity divisor (refEnt[16]).  Cross-file callers declare this
+ * `extern double __cdecl R_GetLodDist(float *)`, so the signature is fixed. */
+double __cdecl R_GetLodDist( float *refEnt )
 {
-  float v2;
-  float v3;
-  float v4;
-  float v5;
-  float v6;
+  float dist;
+  float lodDist;
 
-  v4 = tr_viewParms_originX - a1[17];
-  v5 = tr_viewParms_originY - a1[18];
-  v6 = tr_viewParms_originZ - a1[19];
-  v2 = sqrt(v6 * v6 + v5 * v5 + v4 * v4);
-  v3 = tr_viewParms_lodScale * v2 + tr_viewParms_lodBias;
-  if ( !((a1[16] == 0.0) | __UNORDERED__(a1[16], 0.0)) )
-    return (float)(v3 / a1[16]);
-  return v3;
+  dist = Distance( &refEnt[17], &tr_viewParms_originX );
+
+  lodDist = tr_viewParms_lodScale * dist + tr_viewParms_lodBias;
+  if ( refEnt[16] != 0.0f )
+    lodDist = lodDist / refEnt[16];
+  return lodDist;
 }
-

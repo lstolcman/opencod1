@@ -13,7 +13,7 @@
 
 void CL_Netchan_PrintProfileStats( qboolean bPrintToConsole );
 void SV_Netchan_PrintProfileStats( qboolean bPrintToConsole );
-void Sys_SendPacket( const void *data, int length, netadr_t to );
+void Sys_SendPacket( int length, const void *data, netadr_t to );
 qboolean Sys_StringToAdr( const char *s, netadr_t *a );
 
 const char *NET_AdrToString( netadr_t a );
@@ -57,7 +57,6 @@ loopback_t loopbacks[2];
 /* 0x008CC888.  NET_AdrToString's single static result buffer. */
 char net_string[64];
 
-netProfileInfo_t *pProf;
 
 extern byte svs[];
 #define SV_OOB_PROF_OFFSET  45184
@@ -73,7 +72,23 @@ extern byte svs[];
 void NetProf_PrepProfiling( netProfileInfo_t **pProfile ) {
 	int mode;
 
-	if ( !net_profile->integer ) {
+	if ( net_profile->integer ) {
+		if ( !net_iProfilingOn ) {
+			if ( !com_sv_running->integer
+				 || ( com_cl_running->integer && net_profile->integer == 2 ) ) {
+				mode = 1;
+			} else {
+				mode = 2;
+			}
+			net_iProfilingOn = mode;
+			Com_Printf( "Net Profiling turned on: %s\n", netsrcString[mode - 1] );
+		}
+
+		if ( !*pProfile ) {
+			*pProfile = (netProfileInfo_t *)malloc( sizeof( netProfileInfo_t ) );
+			memset( *pProfile, 0, sizeof( netProfileInfo_t ) );
+		}
+	} else {
 		if ( net_iProfilingOn ) {
 			net_iProfilingOn = 0;
 			Com_Printf( "Net Profiling turned off\n" );
@@ -82,23 +97,6 @@ void NetProf_PrepProfiling( netProfileInfo_t **pProfile ) {
 			free( *pProfile );
 			*pProfile = NULL;
 		}
-		return;
-	}
-
-	if ( !net_iProfilingOn ) {
-		if ( !com_sv_running->integer
-			 || ( com_cl_running->integer && net_profile->integer == 2 ) ) {
-			mode = 1;
-		} else {
-			mode = 2;
-		}
-		net_iProfilingOn = mode;
-		Com_Printf( "Net Profiling turned on: %s\n", netsrcString[mode - 1] );
-	}
-
-	if ( !*pProfile ) {
-		*pProfile = (netProfileInfo_t *)malloc( sizeof( netProfileInfo_t ) );
-		memset( *pProfile, 0, sizeof( netProfileInfo_t ) );
 	}
 }
 
@@ -140,7 +138,7 @@ void NetProf_NewRecievePacket( netchan_t *chan, int iSize, int bFragment ) {
 /* NetProf_UpdateStatistics  0x004485C0  VERIFIED */
 void NetProf_UpdateStatistics( netProfileStream_t *pStream ) {
 	int i, now;
-	int iNumPackets, iNumFragments, iCountedPackets;
+	int iNumPackets, iNumFragments;
 	int iTotalBytes, iSmallestSize, iLargestSize;
 	int iOldestPacket, iOldestPacketTime, iTimeSpan;
 
@@ -188,31 +186,41 @@ void NetProf_UpdateStatistics( netProfileStream_t *pStream ) {
 		return;
 	}
 
-	iCountedPackets = iNumPackets;
-	pStream->iFragmentPercentage = iNumFragments ? 100 * iNumFragments / iNumPackets : 0;
+	if ( iNumFragments ) {
+		pStream->iFragmentPercentage = 100 * iNumFragments / iNumPackets;
+	} else {
+		pStream->iFragmentPercentage = 0;
+	}
 	pStream->iLargestPacket = iLargestSize;
 	pStream->iSmallestPacket = iSmallestSize;
 
 	if ( pStream->iLastBPSCalcTime + NET_PROFILE_RECALC_MS < Sys_Milliseconds() ) {
 		iTimeSpan = Sys_Milliseconds() - iOldestPacketTime;
 		if ( iOldestPacket != -1 ) {
-			iCountedPackets = iNumPackets - 1;
+			iNumPackets--;
 			iTotalBytes -= pStream->packets[iOldestPacket].iSize;
 			if ( pStream->packets[iOldestPacket].bFragment ) {
 				iNumFragments--;
 			}
 		}
-		if ( iTimeSpan >= 1 && iCountedPackets ) {
-			pStream->iBytesPerSecond = iTotalBytes
-				? (int)( (double)iTotalBytes / ( (double)iTimeSpan * 0.001 ) )
-				: 0;
+		if ( iTimeSpan >= 1 && iNumPackets ) {
+			if ( !iTotalBytes ) {
+				pStream->iBytesPerSecond = 0;
+			} else {
+				/* float-typed in retail (fmul by 0.001f) but kept at 53 bits by x87; the modern build widens it */
+#ifdef COD1_VC7
+				pStream->iBytesPerSecond = (int)( iTotalBytes / ( iTimeSpan * 0.001f ) );
+#else
+				pStream->iBytesPerSecond = (int)( (double)iTotalBytes / ( (double)iTimeSpan * 0.001f ) );
+#endif
+			}
 			pStream->iLastBPSCalcTime = Sys_Milliseconds();
 		} else {
 			pStream->iBytesPerSecond = 0;
 		}
 	}
 
-	pStream->iCountedPackets = iCountedPackets;
+	pStream->iCountedPackets = iNumPackets;
 	pStream->iCountedFragments = iNumFragments;
 }
 
@@ -362,10 +370,11 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 	MSG_BeginReading( msg );
 	sequence = MSG_ReadLong( msg );
 
-	fragmented = qfalse;
 	if ( sequence & FRAGMENT_BIT ) {
 		sequence &= ~FRAGMENT_BIT;
 		fragmented = qtrue;
+	} else {
+		fragmented = qfalse;
 	}
 
 	if ( chan->sock == NS_SERVER ) {
@@ -409,55 +418,56 @@ qboolean Netchan_Process( netchan_t *chan, msg_t *msg ) {
 					sequence );
 	}
 
-	if ( !fragmented ) {
-		chan->incomingSequence = sequence;
+	if ( fragmented ) {
+		if ( sequence != chan->fragmentSequence ) {
+			chan->fragmentSequence = sequence;
+			chan->fragmentLength = 0;
+		}
+
+		if ( fragmentStart != chan->fragmentLength ) {
+			if ( showdrop->integer || showpackets->integer ) {
+				Com_Printf( "%s:Dropped a message fragment\n",
+							NET_AdrToString( chan->remoteAddress ), sequence );
+			}
+			return qfalse;
+		}
+
+		if ( fragmentLength < 0
+			 || msg->readcount + fragmentLength > msg->cursize
+			 || (unsigned int)( chan->fragmentLength + fragmentLength ) > MAX_MSGLEN ) {
+			if ( showdrop->integer || showpackets->integer ) {
+				Com_Printf( "%s:illegal fragment length\n",
+							NET_AdrToString( chan->remoteAddress ) );
+			}
+			return qfalse;
+		}
+
+		memcpy( &chan->fragmentBuffer[chan->fragmentLength],
+				&msg->data[msg->readcount], (size_t)fragmentLength );
+		chan->fragmentLength += fragmentLength;
+
+		if ( fragmentLength == FRAGMENT_SIZE ) {
+			return qfalse;
+		}
+
+		if ( chan->fragmentLength > msg->maxsize ) {
+			Com_Printf( "%s:fragmentLength %i > msg->maxsize\n",
+						NET_AdrToString( chan->remoteAddress ), chan->fragmentLength );
+			return qfalse;
+		}
+
+		*(int *)msg->data = sequence;
+		memcpy( msg->data + 4, chan->fragmentBuffer, (size_t)chan->fragmentLength );
+		msg->cursize = chan->fragmentLength + 4;
+		chan->fragmentLength = 0;
+
+		MSG_BeginReading( msg );
+		MSG_ReadLong( msg );
+
 		return qtrue;
 	}
 
-	if ( sequence != chan->fragmentSequence ) {
-		chan->fragmentSequence = sequence;
-		chan->fragmentLength = 0;
-	}
-
-	if ( fragmentStart != chan->fragmentLength ) {
-		if ( showdrop->integer || showpackets->integer ) {
-			Com_Printf( "%s:Dropped a message fragment\n",
-						NET_AdrToString( chan->remoteAddress ) );
-		}
-		return qfalse;
-	}
-
-	if ( fragmentLength < 0
-		 || msg->readcount + fragmentLength > msg->cursize
-		 || (unsigned int)( chan->fragmentLength + fragmentLength ) > MAX_MSGLEN ) {
-		if ( showdrop->integer || showpackets->integer ) {
-			Com_Printf( "%s:illegal fragment length\n",
-						NET_AdrToString( chan->remoteAddress ) );
-		}
-		return qfalse;
-	}
-
-	memcpy( &chan->fragmentBuffer[chan->fragmentLength],
-			&msg->data[msg->readcount], (size_t)fragmentLength );
-	chan->fragmentLength += fragmentLength;
-
-	if ( fragmentLength == FRAGMENT_SIZE ) {
-		return qfalse;
-	}
-
-	if ( chan->fragmentLength > msg->maxsize ) {
-		Com_Printf( "%s:fragmentLength %i > msg->maxsize\n",
-					NET_AdrToString( chan->remoteAddress ), chan->fragmentLength );
-		return qfalse;
-	}
-
-	*(int *)msg->data = sequence;
-	memcpy( msg->data + 4, chan->fragmentBuffer, (size_t)chan->fragmentLength );
-	msg->cursize = chan->fragmentLength + 4;
-	chan->fragmentLength = 0;
-
-	MSG_BeginReading( msg );
-	MSG_ReadLong( msg );
+	chan->incomingSequence = sequence;
 
 	return qtrue;
 }
@@ -582,47 +592,43 @@ void NET_SendPacket( netsrc_t sock, int length, const void *data, netadr_t to ) 
 		return;
 	}
 
-	if ( to.type != NA_BOT && to.type != NA_BAD ) {
-		Sys_SendPacket( data, length, to );
-	}
-}
-
-static void NET_ProfileOOBPacket( netsrc_t sock, int length ) {
-	netProfileInfo_t **block;
-
-	if ( !net_profile->integer ) {
-		return;
-	}
-	block = ( sock == NS_SERVER ) ? SV_OOB_PROF() : &pProf;
-	NetProf_PrepProfiling( block );
-	if ( *block ) {
-		NetProf_AddPacket( &( *block )->send, length, qfalse );
+	if ( to.type != NA_BAD && to.type != NA_BOT ) {
+		Sys_SendPacket( length, data, to );
 	}
 }
 
 /* NET_OutOfBandPrint  0x00449490  VERIFIED */
 void NET_OutOfBandPrint( netsrc_t sock, netadr_t adr, const char *format, ... ) {
-	byte string[MAX_MSGLEN + 4];    /* retail: 0x4004 */
+	char string[MAX_MSGLEN];    /* retail 0x449490: 0x4000 buffer, cookie at +0x4000 (0x4004 frame) */
 	va_list argptr;
 	int length;
 
-	string[0] = 0xFF;
-	string[1] = 0xFF;
-	string[2] = 0xFF;
-	string[3] = 0xFF;
+	string[0] = -1;
+	string[1] = -1;
+	string[2] = -1;
+	string[3] = -1;
 
 	va_start( argptr, format );
-	vsprintf( (char *)string + 4, format, argptr );
+	vsprintf( string + 4, format, argptr );
 	va_end( argptr );
 
-	length = strlen( (char *)string );
+	length = strlen( string );
 	NET_SendPacket( sock, length, string, adr );
-	NET_ProfileOOBPacket( sock, length );
+
+	if ( sock == NS_SERVER ) {
+		if ( net_profile->integer ) {
+			NetProf_PrepProfiling( SV_OOB_PROF() );
+			NetProf_AddPacket( &( *SV_OOB_PROF() )->send, length, qfalse );
+		}
+	} else if ( net_profile->integer ) {
+		NetProf_PrepProfiling( &clc.pProf );
+		NetProf_AddPacket( &clc.pProf->send, length, qfalse );
+	}
 }
 
 /* NET_OutOfBandData  0x00449590  VERIFIED */
 void NET_OutOfBandData( netsrc_t sock, netadr_t adr, int len, const void *data ) {
-	byte string[MAX_MSGLEN * 2 + 4];
+	byte string[MAX_MSGLEN * 2];
 	msg_t mbuf;
 	int i;
 
@@ -640,7 +646,16 @@ void NET_OutOfBandData( netsrc_t sock, netadr_t adr, int len, const void *data )
 	Huff_Compress( &mbuf, 12 );
 
 	NET_SendPacket( sock, mbuf.cursize, mbuf.data, adr );
-	NET_ProfileOOBPacket( sock, mbuf.cursize );
+
+	if ( sock == NS_SERVER ) {
+		if ( net_profile->integer ) {
+			NetProf_PrepProfiling( SV_OOB_PROF() );
+			NetProf_AddPacket( &( *SV_OOB_PROF() )->send, mbuf.cursize, qfalse );
+		}
+	} else if ( net_profile->integer ) {
+		NetProf_PrepProfiling( &clc.pProf );
+		NetProf_AddPacket( &clc.pProf->send, mbuf.cursize, qfalse );
+	}
 }
 
 /* NET_StringToAdr  0x00449690  VERIFIED */
@@ -663,9 +678,12 @@ qboolean NET_StringToAdr( const char *s, netadr_t *a ) {
 		port++;
 	}
 
-	if ( !Sys_StringToAdr( base, a )
-		 || ( a->ip[0] == 0xFF && a->ip[1] == 0xFF
-			  && a->ip[2] == 0xFF && a->ip[3] == 0xFF ) ) {
+	if ( !Sys_StringToAdr( base, a ) ) {
+		a->type = NA_BAD;
+		return qfalse;
+	}
+
+	if ( a->ip[0] == 0xFF && a->ip[1] == 0xFF && a->ip[2] == 0xFF && a->ip[3] == 0xFF ) {
 		a->type = NA_BAD;
 		return qfalse;
 	}

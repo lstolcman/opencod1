@@ -15,13 +15,40 @@
 #include <malloc.h>
 #include <io.h>
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
+#include "scr_local.h"
+/* ---- module-owned globals ---- */
+FILE *yyout;   /* 0x01407350 */
+int yy_last_accepting_cpos;   /* 0x00A7A5F0 */
+int g_parseTreeRoot;   /* 0x00A7A5FC */
+int g_sourceCharPos;   /* 0x00A7A600 */
+int g_scriptText;   /* 0x00A7A604 */
+int yy_last_accepting_state;   /* 0x00A7A60C */
+int g_sourcePos;
+int yy_c_buf_p;
+int yy_current_buffer;
+int yy_did_buffer_switch_on_eof;
+int yy_n_chars;
+int yychar;
+int yyin;
+int yytext_ptr;
+unsigned char yy_hold_char;
+int yy_start;   /* 0x01407348 */
+int yy_init;   /* 0x005745D8 */
+int yyleng;   /* 0x016C36A8 */
+int yynerrs;   /* 0x016C36B0 */
+
 
 typedef unsigned int sval_t;
 
-typedef struct {
+typedef union sval_u {
+	int				type;
 	sval_t			val;
+	unsigned int	sourcePosValue;
+	union sval_u	*node;
+} sval_u;
+
+typedef struct {
+	sval_u			val;
 	unsigned int	sourcePos;
 } yystype;
 
@@ -29,7 +56,7 @@ typedef struct yy_buffer_state {
 	FILE	*yy_input_file;
 	char	*yy_ch_buf;
 	char	*yy_buf_pos;
-	int		yy_buf_size;
+	unsigned int	yy_buf_size;	/* yy_size_t: the grow path divides unsigned */
 	int		yy_n_chars;
 	int		yy_is_our_buffer;
 	int		yy_is_interactive;
@@ -38,17 +65,19 @@ typedef struct yy_buffer_state {
 	int		yy_buffer_status;
 } *YY_BUFFER_STATE;
 
-extern sval_t node0( int type );
-extern sval_t node1( int type, sval_t a );
-extern sval_t node2( int type, sval_t a, sval_t b );
-extern sval_t node2_( sval_t a, sval_t b );
-extern sval_t node3( int type, sval_t a, sval_t b, sval_t c );
-extern sval_t node4( int type, sval_t a, sval_t b, sval_t c, sval_t d );
-extern sval_t node5( int type, sval_t a, sval_t b, sval_t c, sval_t d, sval_t e );
-extern sval_t node6( int type, sval_t a, sval_t b, sval_t c, sval_t d, sval_t e, sval_t f );
-extern sval_t linked_list_end( sval_t a );
-extern sval_t prepend_node( sval_t a, sval_t list );
-extern sval_t append_node( sval_t list, sval_t a );
+extern sval_u node1_( int type );
+extern sval_u node_pos( unsigned int sourcePos );
+extern sval_u node0( int type );
+extern sval_u node1( int type, sval_u a );
+extern sval_u node2( int type, sval_u a, sval_u b );
+extern sval_u node2_( sval_u a, sval_u b );
+extern sval_u node3( int type, sval_u a, sval_u b, sval_u c );
+extern sval_u node4( int type, sval_u a, sval_u b, sval_u c, sval_u d );
+extern sval_u node5( int type, sval_u a, sval_u b, sval_u c, sval_u d, sval_u e );
+extern sval_u node6( int type, sval_u a, sval_u b, sval_u c, sval_u d, sval_u e, sval_u f );
+extern sval_u linked_list_end( sval_u a );
+extern sval_u prepend_node( sval_u a, sval_u list );
+extern sval_u append_node( sval_u list, sval_u a );
 
 void QDECL CompileError( unsigned int sourcePos, const char *format, ... );
 unsigned short SL_GetLowercaseStringOfLen( const char *text, unsigned char user,
@@ -59,13 +88,13 @@ unsigned short SL_GetStringOfLen( const char *text, unsigned char user,
 #define yyleng					yyleng	/* 0x016C36A8 */
 #define yynerrs					yynerrs	/* 0x016C36B0 */
 #define yy_start				yy_start	/* 0x01407348 */
-#define yyout					dword_1407350	/* 0x01407350 */
+#define yyout					yyout	/* 0x01407350 */
 #define yy_init					yy_init	/* 0x005745D8 */
-#define yy_last_accepting_cpos	dword_A7A5F0	/* 0x00A7A5F0 */
-#define yy_last_accepting_state	dword_A7A60C	/* 0x00A7A60C */
-#define g_parseTreeRoot			dword_A7A5FC	/* 0x00A7A5FC -- ScriptParse's out value */
-#define g_sourceCharPos			dword_A7A600	/* 0x00A7A600 -- running offset into the script text */
-#define g_scriptText			dword_A7A604	/* 0x00A7A604 -- YY_INPUT read cursor */
+#define yy_last_accepting_cpos	yy_last_accepting_cpos	/* 0x00A7A5F0 */
+#define yy_last_accepting_state	yy_last_accepting_state	/* 0x00A7A60C */
+#define g_parseTreeRoot			g_parseTreeRoot	/* 0x00A7A5FC -- ScriptParse's out value */
+#define g_sourceCharPos			g_sourceCharPos	/* 0x00A7A600 -- running offset into the script text */
+#define g_scriptText			g_scriptText	/* 0x00A7A604 -- YY_INPUT read cursor */
 #define g_scrStatementCount		scrCompilePub_scriptCount	/* 0x008E60B8 -- bumped per statement by rules 31 and 33 */
 
 #define YY_CURRENT_BUFFER	((YY_BUFFER_STATE)(unsigned int)yy_current_buffer)
@@ -95,7 +124,7 @@ yystype yylval;
 #define YYMAXDEPTH		10000
 #define YYERRTOKEN		257
 
-static YY_BUFFER_STATE	yy_create_buffer( int size, FILE *file );
+static YY_BUFFER_STATE	yy_create_buffer( FILE *file, int size );
 static void				yy_load_buffer_state( void );
 static int				yy_get_next_buffer( void );
 static int				yy_get_previous_state( void );
@@ -112,15 +141,19 @@ YY_BUFFER_STATE			yy_scan_string( const char *str );
 YY_BUFFER_STATE			yy_scan_bytes( int len, const char *bytes );
 
 short					TextValue( int length, const char *text );
-short					StringValue( int length, const char *text );
+void					StringValue( const char *str, int len );
 int						IntegerValue( const char *text );
 int						FloatValue( const char *text );
 
+void					*yy_flex_alloc( size_t size );
+void					*yy_flex_realloc( void *ptr, size_t size );
+void					yy_flex_free( void *ptr );
+
 int						yylex( void );
 int						yywrap( void );
-int						yyerror( void );
+int						yyerror( const char *msg );
 
-static const unsigned char yytranslate[344] = {   /* 0x00572D70  VERIFIED md5 6fb4c39204f2129294590fc037b30706 */
+static const char yytranslate[344] = {   /* 0x00572D70  VERIFIED md5 6fb4c39204f2129294590fc037b30706 */
 	0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
 	2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
 	2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
@@ -607,20 +640,15 @@ static const short yy_chk[452] = {   /* 0x00575440  VERIFIED md5 2c681c79528641d
 };
 
 /* ---- __yy_memcpy  0x0047E420 ---- */
-char *__yy_memcpy( char *from, int count, char *to )
+static void __yy_memcpy( char *to, char *from, unsigned int count )
 {
-	int		offset;
-	int		n = count;
+	register char	*f = from;
+	register char	*t = to;
+	register int	i = count;
 
-	if ( n > 0 ) {
-		offset = (int)( to - from );
-		do {
-			from[offset] = *from;
-			++from;
-			--n;
-		} while ( n );
+	while ( i-- > 0 ) {
+		*t++ = *f++;
 	}
-	return from;
 }
 
 /* ---- yy_get_previous_state  0x004806D0 ---- */
@@ -676,45 +704,47 @@ static int yy_try_NUL_trans( int yy_current_state )
 /* ---- yy_get_next_buffer  0x00480500 ---- */
 static int yy_get_next_buffer( void )
 {
-	YY_BUFFER_STATE	b = YY_CURRENT_BUFFER;
-	char			*dest = b->yy_ch_buf;
-	char			*source = YY_TEXT;
-	int				number_to_move, i;
-	int				ret_val;
-	int				num_to_read;
+	char	*dest = YY_CURRENT_BUFFER->yy_ch_buf;
+	char	*source = YY_TEXT;
+	int		number_to_move, i;
+	int		ret_val;
 
-	if ( YY_CBUF_P > &b->yy_ch_buf[yy_n_chars + 1] ) {
+	if ( YY_CBUF_P > &YY_CURRENT_BUFFER->yy_ch_buf[yy_n_chars + 1] ) {
 		yy_fatal_error( "fatal flex scanner internal error--end of buffer missed" );
 	}
 
-	if ( !b->yy_fill_buffer ) {
-		return ( YY_CBUF_P - YY_TEXT - 1 == 0 ) ? EOB_ACT_END_OF_FILE : EOB_ACT_LAST_MATCH;
+	if ( YY_CURRENT_BUFFER->yy_fill_buffer == 0 ) {
+		if ( YY_CBUF_P - YY_TEXT == 1 ) {
+			return EOB_ACT_END_OF_FILE;
+		} else {
+			return EOB_ACT_LAST_MATCH;
+		}
 	}
 
 	number_to_move = (int)( YY_CBUF_P - YY_TEXT ) - 1;
+
 	for ( i = 0; i < number_to_move; ++i ) {
 		*( dest++ ) = *( source++ );
 	}
 
-	if ( b->yy_buffer_status == 2  ) {
-		yy_n_chars = 0;
-		b->yy_n_chars = 0;
+	if ( YY_CURRENT_BUFFER->yy_buffer_status == 2 ) {
+		YY_CURRENT_BUFFER->yy_n_chars = yy_n_chars = 0;
 	} else {
-		num_to_read = b->yy_buf_size - number_to_move - 1;
+		int	num_to_read = YY_CURRENT_BUFFER->yy_buf_size - number_to_move - 1;
 
 		while ( num_to_read <= 0 ) {
-			char	*old_base = b->yy_ch_buf;
-			int		offset = (int)( YY_CBUF_P - old_base );
+			YY_BUFFER_STATE	b = YY_CURRENT_BUFFER;
+			int				yy_c_buf_p_offset = (int)( YY_CBUF_P - b->yy_ch_buf );
 
 			if ( b->yy_is_our_buffer ) {
 				int	new_size = b->yy_buf_size * 2;
 
 				if ( new_size <= 0 ) {
-					new_size = b->yy_buf_size + ( b->yy_buf_size / 8 );
+					b->yy_buf_size += b->yy_buf_size / 8;
+				} else {
+					b->yy_buf_size *= 2;
 				}
-				b->yy_buf_size = new_size;
-				b->yy_ch_buf = (char *)realloc( old_base, new_size + 2 );
-				b = YY_CURRENT_BUFFER;
+				b->yy_ch_buf = (char *)yy_flex_realloc( (void *)b->yy_ch_buf, b->yy_buf_size + 2 );
 			} else {
 				b->yy_ch_buf = NULL;
 			}
@@ -723,61 +753,51 @@ static int yy_get_next_buffer( void )
 				yy_fatal_error( "fatal error - scanner input buffer overflow" );
 			}
 
-			yy_c_buf_p = (int)( b->yy_ch_buf + offset );
-			num_to_read = b->yy_buf_size - number_to_move - 1;
+			yy_c_buf_p = (int)&b->yy_ch_buf[yy_c_buf_p_offset];
+
+			num_to_read = YY_CURRENT_BUFFER->yy_buf_size - number_to_move - 1;
 		}
 
 		if ( num_to_read > 8192 ) {
 			num_to_read = 8192;
 		}
 
-		i = 0;
-		if ( num_to_read > 0 ) {
-			char	*p = (char *)(unsigned int)g_scriptText;
-			char	c;
+		/* YY_INPUT: read one line from the script text */
+		{
+			char	c = '*';
+			int		n;
 
-			for ( ;; ) {
-				c = *p++;
-				if ( !c ) {
-					g_scriptText = (int)( p - 1 );
-					break;
-				}
-				if ( c == '\n' ) {
-					g_scriptText = (int)p;
-					b->yy_ch_buf[number_to_move + i] = '\n';
-					++i;
-					break;
-				}
-				b->yy_ch_buf[number_to_move + i] = c;
-				++i;
-				if ( i >= num_to_read ) {
-					g_scriptText = (int)p;
-					break;
-				}
+			for ( n = 0; n < num_to_read && ( c = *(char *)(unsigned int)( g_scriptText++ ) ) && c != '\n'; ++n ) {
+				( &YY_CURRENT_BUFFER->yy_ch_buf[number_to_move] )[n] = c;
 			}
+			if ( c == '\n' ) {
+				( &YY_CURRENT_BUFFER->yy_ch_buf[number_to_move] )[n++] = c;
+			} else if ( !c ) {
+				--g_scriptText;
+			}
+			yy_n_chars = n;
 		}
 
-		yy_n_chars = i;
-		b->yy_n_chars = i;
+		YY_CURRENT_BUFFER->yy_n_chars = yy_n_chars;
 	}
 
 	if ( yy_n_chars == 0 ) {
 		if ( number_to_move == 0 ) {
 			ret_val = EOB_ACT_END_OF_FILE;
 			yyrestart( (FILE *)(unsigned int)yyin );
-			b = YY_CURRENT_BUFFER;
 		} else {
 			ret_val = EOB_ACT_LAST_MATCH;
-			b->yy_buffer_status = 2 ;
+			YY_CURRENT_BUFFER->yy_buffer_status = 2;
 		}
 	} else {
 		ret_val = EOB_ACT_CONTINUE_SCAN;
 	}
 
 	yy_n_chars += number_to_move;
-	b->yy_ch_buf[yy_n_chars] = 0;
-	b->yy_ch_buf[yy_n_chars + 1] = 0;
-	yytext_ptr = (int)b->yy_ch_buf;
+	YY_CURRENT_BUFFER->yy_ch_buf[yy_n_chars] = 0;
+	YY_CURRENT_BUFFER->yy_ch_buf[yy_n_chars + 1] = 0;
+
+	yytext_ptr = (int)&YY_CURRENT_BUFFER->yy_ch_buf[0];
 
 	return ret_val;
 }
@@ -810,7 +830,7 @@ int yylex( void )
 			yyout = (int)stdout;
 		}
 		if ( !yy_current_buffer ) {
-			yy_current_buffer = (int)yy_create_buffer( YY_BUF_SIZE, (FILE *)(unsigned int)yyin );
+			yy_current_buffer = (int)yy_create_buffer( (FILE *)(unsigned int)yyin, YY_BUF_SIZE );
 		}
 		yy_load_buffer_state();
 	}
@@ -818,9 +838,10 @@ int yylex( void )
 	for ( ;; ) {
 		yy_cp = YY_CBUF_P;
 
-		*yy_cp = (char)yy_hold_char;
+		/* through yy_c_buf_p, not yy_cp: gives retail's esi/edi split */
+		*YY_CBUF_P = (char)yy_hold_char;
 
-		yy_bp = yy_cp;
+		yy_bp = YY_CBUF_P;
 		yy_current_state = yy_start;
 
 yy_match:
@@ -871,8 +892,8 @@ do_action:
 		case 5:  YY_USER_ACTION; break;
 		case 6:  YY_USER_ACTION; yy_start = 5; break;
 
-		case 7:  YY_USER_ACTION; StringValue( yyleng - 2, YY_TEXT + 1 ); return 259;
-		case 8:  YY_USER_ACTION; StringValue( yyleng - 3, YY_TEXT + 2 ); return 260;
+		case 7:  YY_USER_ACTION; StringValue( YY_TEXT + 1, yyleng - 2 ); return 259;
+		case 8:  YY_USER_ACTION; StringValue( YY_TEXT + 2, yyleng - 3 ); return 260;
 
 		case 9:  YY_USER_ACTION; return 261;
 		case 10: YY_USER_ACTION; return 262;
@@ -964,6 +985,7 @@ do_action:
 		case 92:
 			YY_USER_ACTION;
 			CompileError( g_sourcePos, "bad token '%s'", YY_TEXT );
+			return 257;		/* retail 0x0048033E: returns 0x101 (not reached; CompileError longjmps) */
 
 		case 93:
 			YY_USER_ACTION;
@@ -1049,40 +1071,36 @@ short TextValue( int length, const char *text )
 }
 
 /* ---- StringValue  0x0047F390 ---- VERIFIED */
-short StringValue( int length, const char *text )
+void StringValue( const char *str, int len )
 {
-	char			*buf = (char *)_alloca( length + 1 );
-	char			*out = buf;
-	int				remaining = length;
-	char			c;
-	short			id;
+	char	*buf;
+	char	*s;
 
-	while ( remaining ) {
-		if ( *text == '\\' ) {
-			if ( remaining - 1 == 0 ) {
+	buf = (char *)_alloca( len + 1 );
+	s = buf;
+	while ( len ) {
+		if ( *str != '\\' ) {
+			--len;
+			*s++ = *str;
+		} else {
+			--len;
+			if ( !len ) {
 				break;
 			}
-			++text;
-			c = *text;
-			switch ( c ) {
-			case 'n':	*out = '\n'; break;
-			case 'r':	*out = '\r'; break;
-			case 't':	*out = '\t'; break;
-			default:	*out = c;    break;
+			++str;
+			switch ( *str ) {
+			case 'n':	*s++ = '\n'; break;
+			case 'r':	*s++ = '\r'; break;
+			case 't':	*s++ = '\t'; break;
+			default:	*s++ = *str; break;
 			}
-			++out;
-			remaining -= 2;
-		} else {
-			--remaining;
-			*out++ = *text;
+			--len;
 		}
-		++text;
+		++str;
 	}
-	*out = '\0';
+	*s = '\0';
 
-	id = (short)SL_GetStringOfLen( buf, 0, strlen( buf ) + 1, 13 );
-	*(unsigned short *)&yylval.val = (unsigned short)id;
-	return id;
+	*(unsigned short *)&yylval.val = SL_GetStringOfLen( buf, 0, strlen( buf ) + 1, 13 );
 }
 
 /* ---- IntegerValue  0x0047F420 ---- */
@@ -1101,7 +1119,7 @@ int FloatValue( const char *text )
 void yyrestart( FILE *input_file )
 {
 	if ( !yy_current_buffer ) {
-		yy_current_buffer = (int)yy_create_buffer( YY_BUF_SIZE, (FILE *)(unsigned int)yyin );
+		yy_current_buffer = (int)yy_create_buffer( (FILE *)(unsigned int)yyin, YY_BUF_SIZE );
 	}
 	yy_init_buffer( YY_CURRENT_BUFFER, input_file );
 	yy_load_buffer_state();
@@ -1130,14 +1148,13 @@ void yy_switch_to_buffer( YY_BUFFER_STATE new_buffer )
 static void yy_load_buffer_state( void )
 {
 	yy_n_chars = YY_CURRENT_BUFFER->yy_n_chars;
-	yytext_ptr = (int)YY_CURRENT_BUFFER->yy_buf_pos;
-	yy_c_buf_p = yytext_ptr;
+	yytext_ptr = yy_c_buf_p = (int)YY_CURRENT_BUFFER->yy_buf_pos;
 	yyin = (int)YY_CURRENT_BUFFER->yy_input_file;
 	yy_hold_char = (unsigned char)*YY_CBUF_P;
 }
 
 /* ---- yy_create_buffer  0x00480970 ---- */
-static YY_BUFFER_STATE yy_create_buffer( int size, FILE *file )
+static YY_BUFFER_STATE yy_create_buffer( FILE *file, int size )
 {
 	YY_BUFFER_STATE	b;
 
@@ -1148,7 +1165,7 @@ static YY_BUFFER_STATE yy_create_buffer( int size, FILE *file )
 
 	b->yy_buf_size = size;
 
-	b->yy_ch_buf = (char *)malloc( size + 2 );
+	b->yy_ch_buf = (char *)yy_flex_alloc( b->yy_buf_size + 2 );
 	if ( !b->yy_ch_buf ) {
 		yy_fatal_error( "out of dynamic memory in yy_create_buffer()" );
 	}
@@ -1183,7 +1200,7 @@ void yy_init_buffer( YY_BUFFER_STATE b, FILE *file )
 
 	b->yy_input_file = file;
 	b->yy_fill_buffer = 1;
-	b->yy_is_interactive = file ? ( _isatty( _fileno( file ) ) > 0 ) : 0;
+	b->yy_is_interactive = file ? ( _isatty( (_fileno)( file ) ) > 0 ) : 0;
 }
 
 /* ---- yy_flush_buffer  0x00480AA0 ---- */
@@ -1265,8 +1282,7 @@ YY_BUFFER_STATE yy_scan_bytes( int len, const char *bytes )
 	for ( i = 0; i < len; ++i ) {
 		buf[i] = bytes[i];
 	}
-	buf[len] = 0;
-	buf[len + 1] = 0;
+	buf[len] = buf[len + 1] = 0;
 
 	b = yy_scan_buffer( buf, len + 2 );
 	if ( !b ) {
@@ -1303,54 +1319,89 @@ void yy_flex_free( void *ptr )
 	free( ptr );
 }
 
-/* ---- yyerror  0x00480CA0 ---- */
-int yyerror( void )
+/* ---- yyerror  0x00480CA0 ---- msg unused; yyparse passes bison's strings (both in retail .rdata) */
+int yyerror( const char *msg )
 {
 	if ( !yychar ) {
 		CompileError( g_sourcePos, "unexpected end of file found" );
-	}
-	if ( yychar != YYERRTOKEN ) {
+	} else if ( yychar != YYERRTOKEN ) {
 		CompileError( g_sourcePos, "bad syntax" );
 	}
 	return 0;
 }
 
-static short	yyss[YYMAXDEPTH];
-static yystype	yyvs[YYMAXDEPTH];
+#define YYINITDEPTH		200
 
 #define V( k )	( yyvsp[( k )].val )
 #define P( k )	( yyvsp[( k )].sourcePos )
 
-/* ---- yyparse  0x0047E440 ---- */
+/* ---- yyparse  0x0047E440 ---- bison 1.28 skeleton: local stacks grown with alloca */
 int yyparse( void )
 {
-	register int	yystate;
-	register int	yyn;
-	short			*yyssp;
-	yystype			*yyvsp;
-	int				yychar1;
-	int				yylen;
-	int				yyerrstatus;
-	yystype			yyval;
+	register int		yystate;
+	register int		yyn;
+	register short		*yyssp;
+	register yystype	*yyvsp;
+	int					yyerrstatus;
+	int					yychar1 = 0;
 
+	short				yyssa[YYINITDEPTH];
+	yystype				yyvsa[YYINITDEPTH];
+
+	short				*yyss = yyssa;
+	yystype				*yyvs = yyvsa;
+
+	int					yystacksize = YYINITDEPTH;
+	int					yyfree_stacks = 0;
+
+	yystype				yyval;
+	int					yylen;
+
+	yystate = 0;
+	yyerrstatus = 0;
 	yynerrs = 0;
 	yychar = YYEMPTY;
-	yyerrstatus = 0;
-	yychar1 = 0;
 
 	yyssp = yyss - 1;
 	yyvsp = yyvs;
-	yystate = 0;
-	yyval.val = 0;
-	yyval.sourcePos = 0;
 
 yynewstate:
+
 	*++yyssp = (short)yystate;
 
-	if ( yyssp >= yyss + YYMAXDEPTH - 1 ) {
-		yyerror();
-		return 2;
+	if ( yyssp >= yyss + yystacksize - 1 ) {
+		yystype	*yyvs1 = yyvs;
+		short	*yyss1 = yyss;
+
+		int		size = yyssp - yyss + 1;
+
+		if ( yystacksize >= YYMAXDEPTH ) {
+			yyerror( "parser stack overflow" );
+			if ( yyfree_stacks ) {
+				free( yyss );
+				free( yyvs );
+			}
+			return 2;
+		}
+		yystacksize *= 2;
+		if ( yystacksize > YYMAXDEPTH ) {
+			yystacksize = YYMAXDEPTH;
+		}
+		yyss = (short *)_alloca( yystacksize * sizeof( *yyssp ) );
+		__yy_memcpy( (char *)yyss, (char *)yyss1, size * (unsigned int)sizeof( *yyssp ) );
+		yyvs = (yystype *)_alloca( yystacksize * sizeof( *yyvsp ) );
+		__yy_memcpy( (char *)yyvs, (char *)yyvs1, size * (unsigned int)sizeof( *yyvsp ) );
+
+		yyssp = yyss + size - 1;
+		yyvsp = yyvs + size - 1;
+
+		if ( yyssp >= yyss + yystacksize - 1 ) {
+			goto yyabortlab;
+		}
 	}
+
+	goto yybackup;
+yybackup:
 
 	yyn = yypact[yystate];
 	if ( yyn == YYFLAG ) {
@@ -1362,10 +1413,10 @@ yynewstate:
 	}
 
 	if ( yychar <= 0 ) {
-		yychar = 0;
 		yychar1 = 0;
+		yychar = 0;
 	} else {
-		yychar1 = ( (unsigned int)yychar > YYMAXUTOK ) ? YYUNDEFTOK : yytranslate[yychar];
+		yychar1 = ( (unsigned int)yychar <= YYMAXUTOK ) ? yytranslate[yychar] : YYUNDEFTOK;
 	}
 
 	yyn += yychar1;
@@ -1374,31 +1425,36 @@ yynewstate:
 	}
 
 	yyn = yytable[yyn];
+
 	if ( yyn < 0 ) {
 		if ( yyn == YYFLAG ) {
 			goto yyerrlab;
 		}
 		yyn = -yyn;
 		goto yyreduce;
-	}
-	if ( yyn == 0 ) {
+	} else if ( yyn == 0 ) {
 		goto yyerrlab;
 	}
+
 	if ( yyn == YYFINAL ) {
-		return 0;
+		goto yyacceptlab;
 	}
 
-	if ( yychar ) {
+	if ( yychar != 0 ) {
 		yychar = YYEMPTY;
 	}
+
 	*++yyvsp = yylval;
+
 	if ( yyerrstatus ) {
-		--yyerrstatus;
+		yyerrstatus--;
 	}
+
 	yystate = yyn;
 	goto yynewstate;
 
 yydefault:
+
 	yyn = yydefact[yystate];
 	if ( yyn == 0 ) {
 		goto yyerrlab;
@@ -1413,228 +1469,267 @@ yyreduce:
 	switch ( yyn ) {
 
 	case 1:
-		g_parseTreeRoot = (int)node2_( yyval.val, V( 0 ) );
+		g_parseTreeRoot = (int)node2_( yyval.val, V( 0 ) ).node;
 		break;
 
 	case 2:
-		yyval.val = node2( 4, yyval.val, yyval.sourcePos );
+		yyval.val = node2( 4, yyval.val, node_pos( yyval.sourcePos ) );
 		break;
 
 	case 3:
-		yyval.val = node5( 43, yyval.val, yyval.sourcePos, V( 0 ), P( 0 ), P( -1 ) );
+		yyval.val = node5( 43, yyval.val, node_pos( yyval.sourcePos ), V( 0 ), node_pos( P( 0 ) ), node_pos( P( -1 ) ) );
 		yyval.sourcePos = P( -1 );
 		break;
 
 	case 4:
-		yyval.val = node5( 44, yyval.val, yyval.sourcePos, V( 0 ), P( 0 ), P( -1 ) );
+		yyval.val = node5( 44, yyval.val, node_pos( yyval.sourcePos ), V( 0 ), node_pos( P( 0 ) ), node_pos( P( -1 ) ) );
 		yyval.sourcePos = P( -1 );
 		break;
-
-	case 5:		yyval.val = node4( 45, yyval.val, V( 0 ), 62, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 6:		yyval.val = node4( 45, yyval.val, V( 0 ), 63, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 7:		yyval.val = node4( 45, yyval.val, V( 0 ), 64, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 8:		yyval.val = node4( 45, yyval.val, V( 0 ), 65, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 9:		yyval.val = node4( 45, yyval.val, V( 0 ), 66, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 10:	yyval.val = node4( 45, yyval.val, V( 0 ), 67, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 11:	yyval.val = node4( 45, yyval.val, V( 0 ), 68, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 12:	yyval.val = node4( 45, yyval.val, V( 0 ), 69, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 13:	yyval.val = node4( 45, yyval.val, V( 0 ), 70, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 14:	yyval.val = node4( 45, yyval.val, V( 0 ), 71, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 15:	yyval.val = node4( 45, yyval.val, V( 0 ), 72, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 16:	yyval.val = node4( 45, yyval.val, V( 0 ), 73, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 17:	yyval.val = node4( 45, yyval.val, V( 0 ), 74, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 18:	yyval.val = node4( 45, yyval.val, V( 0 ), 75, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 19:	yyval.val = node4( 45, yyval.val, V( 0 ), 76, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-	case 20:	yyval.val = node4( 45, yyval.val, V( 0 ), 77, P( -1 ) ); yyval.sourcePos = P( -1 ); break;
-
-	case 21:	yyval.val = node2( 46, V( 0 ), P( 0 ) ); break;
-	case 22:	yyval.val = node2( 47, V( 0 ), P( 0 ) ); break;
-	case 23:	yyval.val = node2( 48, V( 0 ), P( 0 ) ); break;
-	case 24:	yyval.val = node2( 49, V( 0 ), P( 0 ) ); break;
-	case 25:	yyval.val = node2( 50, V( 0 ), P( 0 ) ); break;
-	case 26:	yyval.val = node2( 51, V( 0 ), P( 0 ) ); break;
-
+	case 5:		yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 62 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 6:		yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 63 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 7:		yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 64 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 8:		yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 65 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 9:		yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 66 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 10:	yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 67 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 11:	yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 68 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 12:	yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 69 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 13:	yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 70 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 14:	yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 71 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 15:	yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 72 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 16:	yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 73 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 17:	yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 74 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 18:	yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 75 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 19:	yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 76 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 20:	yyval.val = node4( 45, yyval.val, V( 0 ), node1_( 77 ), node_pos( P( -1 ) ) ); yyval.sourcePos = P( -1 ); break;
+	case 21:	yyval.val = node2( 46, V( 0 ), node_pos( P( 0 ) ) ); break;
+	case 22:	yyval.val = node2( 47, V( 0 ), node_pos( P( 0 ) ) ); break;
+	case 23:	yyval.val = node2( 48, V( 0 ), node_pos( P( 0 ) ) ); break;
+	case 24:	yyval.val = node2( 49, V( 0 ), node_pos( P( 0 ) ) ); break;
+	case 25:	yyval.val = node2( 50, V( 0 ), node_pos( P( 0 ) ) ); break;
+	case 26:	yyval.val = node2( 51, V( 0 ), node_pos( P( 0 ) ) ); break;
 	case 27:
 		yyval.val = node1( 63, yyval.val );
 		break;
 
 	case 28:
-	case 89:
-	case 99:
-	case 107:
-	case 122:
 		yyval.val = node0( 0 );
 		break;
 
 	case 31:
-		yyval.val = node3( 17, yyval.val, V( 0 ), yyval.sourcePos );
+		yyval.val = node3( 17, yyval.val, V( 0 ), node_pos( yyval.sourcePos ) );
 		++g_scrStatementCount;
 		break;
 
 	case 32:
-		yyval.val = node2( 16, yyval.val, yyval.sourcePos );
+		yyval.val = node2( 16, yyval.val, node_pos( yyval.sourcePos ) );
 		break;
 
 	case 33:
-		yyval.val = node3( 17, yyval.val, V( 0 ), yyval.sourcePos );
+		yyval.val = node3( 17, yyval.val, V( 0 ), node_pos( yyval.sourcePos ) );
 		yyval.sourcePos = P( -1 );
 		++g_scrStatementCount;
 		break;
 
 	case 34:
-		yyval.val = node2( 16, V( 0 ), yyval.sourcePos );
+		yyval.val = node2( 16, V( 0 ), node_pos( yyval.sourcePos ) );
 		break;
 
 	case 35:
 	case 56:
-		yyval.val = node2( 14, yyval.val, yyval.sourcePos );
+		yyval.val = node2( 14, yyval.val, node_pos( yyval.sourcePos ) );
 		break;
 
 	case 36:
-		yyval.val = node2( 18, V( -2 ), P( -2 ) );
+		yyval.val = node2( 18, V( -2 ), node_pos( P( -2 ) ) );
 		break;
 
 	case 37:
-		yyval.val = node2( 22, yyval.val, yyval.sourcePos );
+		yyval.val = node2( 22, yyval.val, node_pos( yyval.sourcePos ) );
 		break;
 
 	case 38:
-		yyval.val = node3( 26, V( 0 ), yyval.sourcePos, P( 0 ) );
+		yyval.val = node3( 26, V( 0 ), node_pos( yyval.sourcePos ), node_pos( P( 0 ) ) );
 		yyval.sourcePos = P( 0 );
 		break;
 
 	case 39:
-		yyval.val = node3( 19, yyval.val, V( -1 ), P( -2 ) );
+		yyval.val = node3( 19, yyval.val, V( -1 ), node_pos( P( -2 ) ) );
 		yyval.sourcePos = P( -2 );
 		break;
 
 	case 40:
-		yyval.val = node5( 20, yyval.val, V( -3 ), V( -1 ), yyval.sourcePos, P( -2 ) );
+		yyval.val = node5( 20, yyval.val, V( -3 ), V( -1 ), node_pos( yyval.sourcePos ), node_pos( P( -2 ) ) );
 		yyval.sourcePos = P( -2 );
 		break;
-
-	case 41:	yyval.val = node2( 42, V( -1 ), yyval.sourcePos ); break;
-	case 42:	yyval.val = node2( 5, yyval.val, yyval.sourcePos ); break;
-	case 43:	yyval.val = node2( 6, yyval.val, yyval.sourcePos ); break;
-	case 44:	yyval.val = node2( 7, V( 0 ), yyval.sourcePos ); break;
-	case 45:	yyval.val = node2( 8, V( 0 ), yyval.sourcePos ); break;
-	case 46:	yyval.val = node2( 9, yyval.val, yyval.sourcePos ); break;
-	case 47:	yyval.val = node2( 10, yyval.val, yyval.sourcePos ); break;
+	case 41:	yyval.val = node2( 42, V( -1 ), node_pos( yyval.sourcePos ) ); break;
+	case 42:	yyval.val = node2( 5, yyval.val, node_pos( yyval.sourcePos ) ); break;
+	case 43:	yyval.val = node2( 6, yyval.val, node_pos( yyval.sourcePos ) ); break;
+	case 44:	yyval.val = node2( 7, V( 0 ), node_pos( yyval.sourcePos ) ); break;
+	case 45:	yyval.val = node2( 8, V( 0 ), node_pos( yyval.sourcePos ) ); break;
+	case 46:	yyval.val = node2( 9, yyval.val, node_pos( yyval.sourcePos ) ); break;
+	case 47:	yyval.val = node2( 10, yyval.val, node_pos( yyval.sourcePos ) ); break;
 	case 48:	yyval.val = node1( 15, yyval.val ); break;
-	case 49:	yyval.val = node2( 13, yyval.val, yyval.sourcePos ); break;
-	case 50:	yyval.val = node1( 27, yyval.sourcePos ); break;
-	case 51:	yyval.val = node1( 28, yyval.sourcePos ); break;
-	case 52:	yyval.val = node1( 29, yyval.sourcePos ); break;
-	case 53:	yyval.val = node1( 30, yyval.sourcePos ); break;
-	case 54:	yyval.val = node1( 31, yyval.sourcePos ); break;
-
+	case 49:	yyval.val = node2( 13, yyval.val, node_pos( yyval.sourcePos ) ); break;
+	case 50:	yyval.val = node1( 27, node_pos( yyval.sourcePos ) ); break;
+	case 51:	yyval.val = node1( 28, node_pos( yyval.sourcePos ) ); break;
+	case 52:	yyval.val = node1( 29, node_pos( yyval.sourcePos ) ); break;
+	case 53:	yyval.val = node1( 30, node_pos( yyval.sourcePos ) ); break;
+	case 54:	yyval.val = node1( 31, node_pos( yyval.sourcePos ) ); break;
 	case 55:
-		yyval.val = node2( 52, yyval.val, yyval.sourcePos );
+		yyval.val = node2( 52, yyval.val, node_pos( yyval.sourcePos ) );
 		yyval.sourcePos = P( 0 );
 		break;
-
 	case 57:	yyval.val = node0( 64 ); break;
-	case 58:	yyval.val = node2( 65, V( 0 ), P( 0 ) ); break;
-	case 59:	yyval.val = node2( 69, yyval.val, yyval.sourcePos ); break;
-	case 60:	yyval.val = node2( 70, yyval.val, yyval.sourcePos ); break;
-	case 61:	yyval.val = node1( 71, yyval.sourcePos ); break;
-
+	case 58:	yyval.val = node2( 65, V( 0 ), node_pos( P( 0 ) ) ); break;
+	case 59:	yyval.val = node2( 69, yyval.val, node_pos( yyval.sourcePos ) ); break;
+	case 60:	yyval.val = node2( 70, yyval.val, node_pos( yyval.sourcePos ) ); break;
+	case 61:	yyval.val = node1( 71, node_pos( yyval.sourcePos ) ); break;
 	case 62:
-		yyval.val = node4( 12, yyval.val, V( 0 ), yyval.sourcePos, P( 0 ) );
+		yyval.val = node4( 12, yyval.val, V( 0 ), node_pos( yyval.sourcePos ), node_pos( P( 0 ) ) );
 		yyval.sourcePos = P( 0 );
 		break;
 
 	case 63:
-		yyval.val = node4( 11, yyval.val, V( -1 ), yyval.sourcePos, P( -1 ) );
+		yyval.val = node4( 11, yyval.val, V( -1 ), node_pos( yyval.sourcePos ), node_pos( P( -1 ) ) );
 		yyval.sourcePos = P( -2 );
 		break;
-
-	case 64:	yyval.val = node2( 3, yyval.val, yyval.sourcePos ); break;
+	case 64:	yyval.val = node2( 3, yyval.val, node_pos( yyval.sourcePos ) ); break;
 	case 65:	yyval.val = node1( 21, yyval.val ); break;
-	case 66:	yyval.val = node3( 2, yyval.val, V( 0 ), P( -1 ) ); break;
-	case 67:	yyval.val = node2( 23, V( 0 ), yyval.sourcePos ); break;
-	case 68:	yyval.val = node1( 24, yyval.sourcePos ); break;
-	case 69:	yyval.val = node3( 25, V( 0 ), P( 0 ), yyval.sourcePos ); break;
-	case 70:	yyval.val = node2( 37, yyval.val, yyval.sourcePos ); break;
-	case 71:	yyval.val = node2( 38, yyval.val, yyval.sourcePos ); break;
-
-	case 72:	yyval.val = node4( 39, yyval.val, V( 0 ), 62, P( -1 ) ); break;
-	case 73:	yyval.val = node4( 39, yyval.val, V( 0 ), 63, P( -1 ) ); break;
-	case 74:	yyval.val = node4( 39, yyval.val, V( 0 ), 64, P( -1 ) ); break;
-	case 75:	yyval.val = node4( 39, yyval.val, V( 0 ), 71, P( -1 ) ); break;
-	case 76:	yyval.val = node4( 39, yyval.val, V( 0 ), 72, P( -1 ) ); break;
-	case 77:	yyval.val = node4( 39, yyval.val, V( 0 ), 73, P( -1 ) ); break;
-	case 78:	yyval.val = node4( 39, yyval.val, V( 0 ), 74, P( -1 ) ); break;
-	case 79:	yyval.val = node4( 39, yyval.val, V( 0 ), 75, P( -1 ) ); break;
-	case 80:	yyval.val = node4( 39, yyval.val, V( 0 ), 76, P( -1 ) ); break;
-	case 81:	yyval.val = node4( 39, yyval.val, V( 0 ), 77, P( -1 ) ); break;
-
-	case 82:	yyval.val = node4( 54, yyval.val, V( -1 ), yyval.sourcePos, P( -3 ) ); break;
-	case 83:	yyval.val = node4( 55, yyval.val, V( -1 ), yyval.sourcePos, P( -3 ) ); break;
-	case 84:	yyval.val = node4( 56, yyval.val, V( -1 ), yyval.sourcePos, P( -3 ) ); break;
-	case 85:	yyval.val = node4( 57, yyval.val, V( -1 ), yyval.sourcePos, P( -1 ) ); break;
-	case 86:	yyval.val = node1( 61, yyval.sourcePos ); break;
-	case 87:	yyval.val = node1( 62, yyval.sourcePos ); break;
-	case 88:	yyval.val = node4( 35, V( -4 ), V( -1 ), P( -1 ), P( -3 ) ); break;
-
-	case 92:	yyval.val = node2( 40, V( -1 ), yyval.sourcePos ); break;
-	case 93:	yyval.val = node3( 32, V( -2 ), V( 0 ), P( -2 ) ); break;
-	case 94:	yyval.val = node4( 33, V( -4 ), V( -2 ), V( 0 ), P( -4 ) ); break;
-	case 95:	yyval.val = node4( 34, V( -2 ), V( 0 ), P( -2 ), yyval.sourcePos ); break;
-	case 96:	yyval.val = node6( 36, V( -5 ), V( -4 ), V( -2 ), V( 0 ), P( -4 ), yyval.sourcePos ); break;
-	case 97:	yyval.val = node3( 58, V( -2 ), V( 0 ), P( -2 ) ); break;
-	case 98:	yyval.val = node2( 41, V( -1 ), yyval.sourcePos ); break;
-	case 100:	yyval.val = node2( 59, V( -1 ), yyval.sourcePos ); break;
-	case 101:	yyval.val = node1( 60, yyval.sourcePos ); break;
-
+	case 66:	yyval.val = node3( 2, yyval.val, V( 0 ), node_pos( P( -1 ) ) ); break;
+	case 67:	yyval.val = node2( 23, V( 0 ), node_pos( yyval.sourcePos ) ); break;
+	case 68:	yyval.val = node1( 24, node_pos( yyval.sourcePos ) ); break;
+	case 69:	yyval.val = node3( 25, V( 0 ), node_pos( P( 0 ) ), node_pos( yyval.sourcePos ) ); break;
+	case 70:	yyval.val = node2( 37, yyval.val, node_pos( yyval.sourcePos ) ); break;
+	case 71:	yyval.val = node2( 38, yyval.val, node_pos( yyval.sourcePos ) ); break;
+	case 72:	yyval.val = node4( 39, yyval.val, V( 0 ), node1_( 62 ), node_pos( P( -1 ) ) ); break;
+	case 73:	yyval.val = node4( 39, yyval.val, V( 0 ), node1_( 63 ), node_pos( P( -1 ) ) ); break;
+	case 74:	yyval.val = node4( 39, yyval.val, V( 0 ), node1_( 64 ), node_pos( P( -1 ) ) ); break;
+	case 75:	yyval.val = node4( 39, yyval.val, V( 0 ), node1_( 71 ), node_pos( P( -1 ) ) ); break;
+	case 76:	yyval.val = node4( 39, yyval.val, V( 0 ), node1_( 72 ), node_pos( P( -1 ) ) ); break;
+	case 77:	yyval.val = node4( 39, yyval.val, V( 0 ), node1_( 73 ), node_pos( P( -1 ) ) ); break;
+	case 78:	yyval.val = node4( 39, yyval.val, V( 0 ), node1_( 74 ), node_pos( P( -1 ) ) ); break;
+	case 79:	yyval.val = node4( 39, yyval.val, V( 0 ), node1_( 75 ), node_pos( P( -1 ) ) ); break;
+	case 80:	yyval.val = node4( 39, yyval.val, V( 0 ), node1_( 76 ), node_pos( P( -1 ) ) ); break;
+	case 81:	yyval.val = node4( 39, yyval.val, V( 0 ), node1_( 77 ), node_pos( P( -1 ) ) ); break;
+	case 82:	yyval.val = node4( 54, yyval.val, V( -1 ), node_pos( yyval.sourcePos ), node_pos( P( -3 ) ) ); break;
+	case 83:	yyval.val = node4( 55, yyval.val, V( -1 ), node_pos( yyval.sourcePos ), node_pos( P( -3 ) ) ); break;
+	case 84:	yyval.val = node4( 56, yyval.val, V( -1 ), node_pos( yyval.sourcePos ), node_pos( P( -3 ) ) ); break;
+	case 85:	yyval.val = node4( 57, yyval.val, V( -1 ), node_pos( yyval.sourcePos ), node_pos( P( -1 ) ) ); break;
+	case 86:	yyval.val = node1( 61, node_pos( yyval.sourcePos ) ); break;
+	case 87:	yyval.val = node1( 62, node_pos( yyval.sourcePos ) ); break;
+	case 88:	yyval.val = node4( 35, V( -4 ), V( -1 ), node_pos( P( -1 ) ), node_pos( P( -3 ) ) ); break;
+	case 89:
+		yyval.val = node0( 0 );
+		break;
+	case 92:	yyval.val = node2( 40, V( -1 ), node_pos( yyval.sourcePos ) ); break;
+	case 93:	yyval.val = node3( 32, V( -2 ), V( 0 ), node_pos( P( -2 ) ) ); break;
+	case 94:	yyval.val = node4( 33, V( -4 ), V( -2 ), V( 0 ), node_pos( P( -4 ) ) ); break;
+	case 95:	yyval.val = node4( 34, V( -2 ), V( 0 ), node_pos( P( -2 ) ), node_pos( yyval.sourcePos ) ); break;
+	case 96:	yyval.val = node6( 36, V( -5 ), V( -4 ), V( -2 ), V( 0 ), node_pos( P( -4 ) ), node_pos( yyval.sourcePos ) ); break;
+	case 97:	yyval.val = node3( 58, V( -2 ), V( 0 ), node_pos( P( -2 ) ) ); break;
+	case 98:	yyval.val = node2( 41, V( -1 ), node_pos( yyval.sourcePos ) ); break;
+	case 99:
+		yyval.val = node0( 0 );
+		break;
+	case 100:	yyval.val = node2( 59, V( -1 ), node_pos( yyval.sourcePos ) ); break;
+	case 101:	yyval.val = node1( 60, node_pos( yyval.sourcePos ) ); break;
 	case 103:
 		yyval.val = append_node( yyval.val, V( 0 ) );
 		break;
 
 	case 104:
-	case 110:
-	case 121:
-	case 124:
 		yyval.val = linked_list_end( node0( 0 ) );
 		break;
 
 	case 105:
-	case 115:
-		yyval.val = prepend_node( node2_( V( 0 ), P( 0 ) ), yyval.val );
+		yyval.val = prepend_node( node2_( V( 0 ), node_pos( P( 0 ) ) ), yyval.val );
 		break;
 
 	case 106:
-	case 116:
 	{
-		sval_t	tail = node0( 0 );
+		sval_u	tail = node0( 0 );
 
-		yyval.val = prepend_node( node2_( yyval.val, yyval.sourcePos ), tail );
+		yyval.val = prepend_node( node2_( yyval.val, node_pos( yyval.sourcePos ) ), tail );
 		break;
 	}
 
+	case 107:
+		yyval.val = node0( 0 );
+		break;
+
 	case 108:
-	case 111:
-	case 113:
-	case 120:
-		yyval.val = append_node( yyval.val, node2_( V( 0 ), P( 0 ) ) );
+		yyval.val = append_node( yyval.val, node2_( V( 0 ), node_pos( P( 0 ) ) ) );
 		break;
 
 	case 109:
-	case 112:
-	case 114:
 	{
-		sval_t	cell = node2_( yyval.val, yyval.sourcePos );
+		sval_u	cell = node2_( yyval.val, node_pos( yyval.sourcePos ) );
 
 		yyval.val = append_node( linked_list_end( node0( 0 ) ), cell );
 		break;
 	}
 
-	case 117:	yyval.val = node4( 66, yyval.val, V( -4 ), V( -1 ), yyval.sourcePos ); break;
-	case 118:	yyval.val = node4( 67, V( -7 ), V( -5 ), V( -2 ), P( -7 ) ); break;
-	case 119:	yyval.val = node2( 68, V( -2 ), P( -2 ) ); break;
+	case 110:
+		yyval.val = linked_list_end( node0( 0 ) );
+		break;
+
+	case 111:
+		yyval.val = append_node( yyval.val, node2_( V( 0 ), node_pos( P( 0 ) ) ) );
+		break;
+
+	case 112:
+	{
+		sval_u	cell = node2_( yyval.val, node_pos( yyval.sourcePos ) );
+
+		yyval.val = append_node( linked_list_end( node0( 0 ) ), cell );
+		break;
+	}
+
+	case 113:
+		yyval.val = append_node( yyval.val, node2_( V( 0 ), node_pos( P( 0 ) ) ) );
+		break;
+
+	case 114:
+	{
+		sval_u	cell = node2_( yyval.val, node_pos( yyval.sourcePos ) );
+
+		yyval.val = append_node( linked_list_end( node0( 0 ) ), cell );
+		break;
+	}
+
+	case 115:
+		yyval.val = prepend_node( node2_( V( 0 ), node_pos( P( 0 ) ) ), yyval.val );
+		break;
+
+	case 116:
+	{
+		sval_u	tail = node0( 0 );
+
+		yyval.val = prepend_node( node2_( yyval.val, node_pos( yyval.sourcePos ) ), tail );
+		break;
+	}
+
+	case 117:	yyval.val = node4( 66, yyval.val, V( -4 ), V( -1 ), node_pos( yyval.sourcePos ) ); break;
+	case 118:	yyval.val = node4( 67, V( -7 ), V( -5 ), V( -2 ), node_pos( P( -7 ) ) ); break;
+	case 119:	yyval.val = node2( 68, V( -2 ), node_pos( P( -2 ) ) ); break;
+	case 120:
+		yyval.val = append_node( yyval.val, node2_( V( 0 ), node_pos( P( 0 ) ) ) );
+		break;
+
+	case 121:
+		yyval.val = linked_list_end( node0( 0 ) );
+		break;
+
+	case 122:
+		yyval.val = node0( 0 );
+		break;
 
 	case 123:
 		yyval.val = append_node( yyval.val, V( -1 ) );
+		break;
+
+	case 124:
+		yyval.val = linked_list_end( node0( 0 ) );
 		break;
 
 	default:
@@ -1647,61 +1742,92 @@ yyreduce:
 	*++yyvsp = yyval;
 
 	yyn = yyr1[yyn];
+
 	yystate = yypgoto[yyn - YYNTBASE] + *yyssp;
 	if ( yystate >= 0 && yystate <= YYLAST && yycheck[yystate] == *yyssp ) {
 		yystate = yytable[yystate];
 	} else {
 		yystate = yydefgoto[yyn - YYNTBASE];
 	}
+
 	goto yynewstate;
 
 yyerrlab:
-	if ( yyerrstatus == 0 ) {
+
+	if ( !yyerrstatus ) {
 		++yynerrs;
-		yyerror();
+		yyerror( "parse error" );
 	}
+
+	goto yyerrlab1;
+yyerrlab1:
 
 	if ( yyerrstatus == 3 ) {
 		if ( yychar == 0 ) {
-			return 1;
+			goto yyabortlab;
 		}
 		yychar = YYEMPTY;
 	}
 
 	yyerrstatus = 3;
 
-	for ( ;; ) {
-		yyn = yypact[yystate];
-		if ( yyn != YYFLAG ) {
-			yyn += YYTERROR;
-			if ( yyn >= 0 && yyn <= YYLAST && yycheck[yyn] == YYTERROR ) {
-				yyn = yytable[yyn];
-				if ( yyn < 0 ) {
-					if ( yyn != YYFLAG ) {
-						yyn = -yyn;
-						goto yyreduce;
-					}
-				} else if ( yyn != 0 ) {
-					break;
-				}
-			}
-		}
+	goto yyerrhandle;
 
-		if ( yyssp == yyss ) {
-			return 1;
+yyerrdefault:
+
+yyerrpop:
+
+	if ( yyssp == yyss ) {
+		goto yyabortlab;
+	}
+	yyvsp--;
+	yystate = *--yyssp;
+
+yyerrhandle:
+
+	yyn = yypact[yystate];
+	if ( yyn == YYFLAG ) {
+		goto yyerrdefault;
+	}
+
+	yyn += YYTERROR;
+	if ( yyn < 0 || yyn > YYLAST || yycheck[yyn] != YYTERROR ) {
+		goto yyerrdefault;
+	}
+
+	yyn = yytable[yyn];
+	if ( yyn < 0 ) {
+		if ( yyn == YYFLAG ) {
+			goto yyerrpop;
 		}
-		--yyssp;
-		--yyvsp;
-		yystate = *yyssp;
+		yyn = -yyn;
+		goto yyreduce;
+	} else if ( yyn == 0 ) {
+		goto yyerrpop;
 	}
 
 	if ( yyn == YYFINAL ) {
-		return 0;
+		goto yyacceptlab;
 	}
 
 	*++yyvsp = yylval;
+
 	yystate = yyn;
 	goto yynewstate;
+
+yyacceptlab:
+	if ( yyfree_stacks ) {
+		free( yyss );
+		free( yyvs );
+	}
+	return 0;
+
+yyabortlab:
+	if ( yyfree_stacks ) {
+		free( yyss );
+		free( yyvs );
+	}
+	return 1;
 }
 
 /* ---- ScriptParse  0x00480CE0 ---- */

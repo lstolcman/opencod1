@@ -14,28 +14,25 @@
 extern void Sys_OutOfMemoryPrep( void );
 extern char *SEH_GetLocalizedString_m( const char *key );
 extern qboolean FS_MakeReadOnly( const char *path, qboolean readOnly );
-extern void FS_BuildOSPath_Internal( const char *base, const char *qpath,
-									 char *fsPath, int flags );
-extern cvar_t *fs_homepath;
+extern unsigned Sys_LoadingKeepAlive( void );
 
-#define CM_FILE_ATTRIBUTE_READONLY  0x00000001
 #define CM_MB_ICONHAND              0x00000010
-__declspec( dllimport ) unsigned long __stdcall GetFileAttributesA( const char *name );
-__declspec( dllimport ) int __stdcall SetFileAttributesA( const char *name,
-														  unsigned long attributes );
 __declspec( dllimport ) int __stdcall MessageBoxA( void *wnd, const char *text,
 												   const char *caption,
 												   unsigned int type );
 
-char cm_mapName[MAX_QPATH];
-cmodel_t cm_boxModel;
+clipMap_t cm;    /* 0x016174A0 */
+byte *cmod_base;    /* 0x016215FC */
 
-extern float cm_boxModelMinsX, cm_boxModelMinsY, cm_boxModelMinsZ;
-extern float cm_boxModelMaxsX, cm_boxModelMaxsY, cm_boxModelMaxsZ;
+cvar_t *cm_noCurves;    /* 0x01617480 */
+cvar_t *cm_playerCurveClip;    /* 0x01621600 */
 
 static unsigned int cm_lastChecksum;
 
 static void *cm_lumpData;
+
+/* LittleLong is a no-op on x86; retail keeps the emptied header swap loops */
+#define CM_LittleLong( x )  ( x )
 
 /* ---- CMod_LoadShaders  0x00418FF0 ---- VERIFIED */
 static void CMod_LoadShaders( lump_t *l ) {
@@ -66,10 +63,10 @@ static void CMod_LoadSubmodels( lump_t *l ) {
 	int count, i, j, n;
 
 	in = (const float *)( cmod_base + l->fileofs );
-	if ( l->filelen % 48 ) {
+	if ( (unsigned int)l->filelen % 48 ) {
 		Com_Error( ERR_DROP, "\x15" "CMod_LoadSubmodels: funny lump size" );
 	}
-	count = l->filelen / 48;
+	count = (unsigned int)l->filelen / 48;
 	if ( count < 1 ) {
 		Com_Error( ERR_DROP, "\x15" "Map with no models" );
 	}
@@ -109,12 +106,14 @@ static void CMod_LoadSubmodels( lump_t *l ) {
 			indexes[j] = ini[10] + j;
 		}
 
-		out->leaf.numLeafSurfaces = (unsigned short)ini[9];
-		if ( (unsigned short)ini[9] != ini[9] ) {
+		n = ini[9];
+		out->leaf.numLeafSurfaces = (unsigned short)n;
+		if ( (unsigned short)n != n ) {
 			Com_Error( ERR_DROP, "\x15" "CMod_LoadSubmodels: numLeafSurfaces exceeded" );
 		}
-		out->leaf.firstLeafSurface = (unsigned short)ini[8];
-		if ( (unsigned short)ini[8] != ini[8] ) {
+		n = ini[8];
+		out->leaf.firstLeafSurface = (unsigned short)n;
+		if ( (unsigned short)n != n ) {
 			Com_Error( ERR_DROP, "\x15" "CMod_LoadSubmodels: firstLeafSurface exceeded" );
 		}
 	}
@@ -127,10 +126,10 @@ static void CMod_LoadNodes( lump_t *l ) {
 	int count, i, j, child;
 
 	in = (const int *)( cmod_base + l->fileofs );
-	if ( l->filelen % 36 ) {
+	if ( (unsigned int)l->filelen % 36 ) {
 		Com_Error( ERR_DROP, "\x15" "MOD_LoadBmodel: funny lump size" );
 	}
-	count = l->filelen / 36;
+	count = (unsigned int)l->filelen / 36;
 	if ( count < 1 ) {
 		Com_Error( ERR_DROP, "\x15" "Map has no nodes" );
 	}
@@ -152,7 +151,7 @@ static void CMod_LoadNodes( lump_t *l ) {
 }
 
 /* ---- CMod_LoadBrushes  0x00419300 ---- VERIFIED */
-static void CMod_LoadBrushes( lump_t *sidesLump, lump_t *brushLump ) {
+static void CMod_LoadBrushes( lump_t *brushLump, lump_t *sidesLump ) {
 	const short *in;
 	const int *sideIn;
 	cbrush_t *out;
@@ -160,35 +159,31 @@ static void CMod_LoadBrushes( lump_t *sidesLump, lump_t *brushLump ) {
 	int numBrushes, numSides;
 	int i, axis, end, materialNum;
 
-	sideIn = (const int *)( cmod_base + sidesLump->fileofs );
+	in = (const short *)( cmod_base + brushLump->fileofs );
 	if ( brushLump->filelen & 3 ) {
 		Com_Error( ERR_DROP, "\x15" "CMod_LoadBrushes: funny lump size" );
 	}
-	numBrushes = brushLump->filelen >> 2;
+	numBrushes = (unsigned int)brushLump->filelen >> 2;
 
-	in = (const short *)( cmod_base + brushLump->fileofs );
+	sideIn = (const int *)( cmod_base + sidesLump->fileofs );
 	if ( sidesLump->filelen & 7 ) {
 		Com_Error( ERR_DROP, "\x15" "CMod_LoadBrushes: funny lump size" );
 	}
 
-	numSides = ( sidesLump->filelen >> 3 ) - 6 * numBrushes;
+	numSides = ( (unsigned int)sidesLump->filelen >> 3 ) - 6 * numBrushes;
 	if ( numSides < 0 ) {
 		Com_Error( ERR_DROP, "\x15" "CMod_LoadBrushes: bad side count" );
 	}
 
-	if ( numSides ) {
-		cm_brushsides = (cbrushside_t *)Hunk_AllocAlignInternal(
-			numSides * sizeof( cbrushside_t ), 32 );
-	} else {
-		cm_brushsides = NULL;
-	}
+	cm_brushsides = numSides ? (cbrushside_t *)Hunk_AllocAlignInternal(
+		numSides * sizeof( cbrushside_t ), 32 ) : NULL;
+	side = cm_brushsides;
 	cm_numBrushSides = numSides;
 
 	cm_brushes = (cbrush_t *)Hunk_AllocAlignInternal(
 		( numBrushes + 1 ) * sizeof( cbrush_t ), 32 );
 	cm_numBrushes = numBrushes;
 
-	side = cm_brushsides;
 	out = cm_brushes;
 
 	for ( i = 0; i < numBrushes; i++, out++, in += 2 ) {
@@ -239,12 +234,13 @@ static void CMod_LoadLeafs( lump_t *l ) {
 	const int *in;
 	cLeaf_t *out;
 	int count, i;
+	int cellValue, clusterValue, areaValue, brushCountValue, firstSurfaceValue, surfaceCountValue;
 
 	in = (const int *)( cmod_base + l->fileofs );
-	if ( l->filelen % 36 ) {
+	if ( (unsigned int)l->filelen % 36 ) {
 		Com_Error( ERR_DROP, "\x15" "CMod_LoadLeafs: funny lump size" );
 	}
-	count = l->filelen / 36;
+	count = (unsigned int)l->filelen / 36;
 	if ( count < 1 ) {
 		Com_Error( ERR_DROP, "\x15" "Map with no leafs" );
 	}
@@ -253,38 +249,44 @@ static void CMod_LoadLeafs( lump_t *l ) {
 	cm_numLeafs = count;
 
 	out = cm_leafs;
-	for ( i = 0; i < count; i++, out++, in += 9 ) {
-		out->cellnum = (short)in[6];
-		if ( (short)in[6] != in[6] ) {
+	for ( i = 0; i < count; i++, in += 9, out++ ) {
+		cellValue = in[6];
+		out->cellnum = (short)cellValue;
+		if ( (short)cellValue != cellValue ) {
 			Com_Error( ERR_DROP, "\x15" "CMod_LoadLeafs: cellnum exceeded" );
 		}
-		out->cluster = (short)in[0];
-		if ( (short)in[0] != in[0] ) {
+		clusterValue = in[0];
+		out->cluster = (short)clusterValue;
+		if ( (short)clusterValue != clusterValue ) {
 			Com_Error( ERR_DROP, "\x15" "CMod_LoadLeafs: cluster exceeded" );
 		}
-		out->area = (short)in[1];
-		if ( (short)in[1] != in[1] ) {
+		areaValue = in[1];
+		out->area = (short)areaValue;
+		if ( (short)areaValue != areaValue ) {
 			Com_Error( ERR_DROP, "\x15" "CMod_LoadLeafs: area exceeded" );
 		}
 		out->firstLeafBrush = in[4];
-		out->numLeafBrushes = (unsigned short)in[5];
-		if ( (unsigned short)in[5] != in[5] ) {
+		brushCountValue = in[5];
+		out->numLeafBrushes = (unsigned short)brushCountValue;
+		if ( (unsigned short)brushCountValue != brushCountValue ) {
 			Com_Error( ERR_DROP, "\x15" "CMod_LoadLeafs: numLeafBrushes exceeded" );
 		}
-		out->firstLeafSurface = (unsigned short)in[2];
-		if ( (unsigned short)in[2] != in[2] ) {
+		firstSurfaceValue = in[2];
+		out->firstLeafSurface = (unsigned short)firstSurfaceValue;
+		if ( (unsigned short)firstSurfaceValue != firstSurfaceValue ) {
 			Com_Error( ERR_DROP, "\x15" "CMod_LoadLeafs: firstLeafSurface exceeded" );
 		}
-		out->numLeafSurfaces = (unsigned short)in[3];
-		if ( (unsigned short)in[3] != in[3] ) {
+		surfaceCountValue = in[3];
+		out->numLeafSurfaces = (unsigned short)surfaceCountValue;
+		if ( (unsigned short)surfaceCountValue != surfaceCountValue ) {
 			Com_Error( ERR_DROP, "\x15" "CMod_LoadLeafs: numLeafSurfaces exceeded" );
 		}
 
-		if ( in[0] >= cm_numClusters ) {
-			cm_numClusters = in[0] + 1;
+		if ( clusterValue >= cm_numClusters ) {
+			cm_numClusters = clusterValue + 1;
 		}
-		if ( in[1] >= cm_numAreas ) {
-			cm_numAreas = in[1] + 1;
+		if ( areaValue >= cm_numAreas ) {
+			cm_numAreas = areaValue + 1;
 		}
 	}
 
@@ -298,16 +300,17 @@ static void CMod_LoadLeafs( lump_t *l ) {
 static void CMod_LoadPlanes( lump_t *l ) {
 	const float *in;
 	cplane_t *out;
-	unsigned int count;
-	unsigned int i;
-	int bits;
+	int count;
+	int i;
+	byte bits;
+	int j;
 
 	in = (const float *)( cmod_base + l->fileofs );
 	if ( l->filelen & 15 ) {
 		Com_Error( ERR_DROP, "\x15" "MOD_LoadBmodel: funny lump size" );
 	}
 	count = (unsigned int)l->filelen >> 4;
-	if ( !count ) {
+	if ( count < 1 ) {
 		Com_Error( ERR_DROP, "\x15" "Map with no planes" );
 	}
 
@@ -315,33 +318,19 @@ static void CMod_LoadPlanes( lump_t *l ) {
 	cm_numPlanes = count;
 
 	out = cm_planes;
-	for ( i = 0; i < count; i++, out++, in += 4 ) {
+	for ( i = 0; i < count; i++, in += 4, out++ ) {
 		bits = 0;
+		for ( j = 0; j < 3; j++ ) {
+			/* ( in[j] ): retail's LittleFloat is an identity here; its parentheses steer VC7's x87 schedule */
+			out->normal[j] = ( in[j] );
+			if ( out->normal[j] < 0 ) {
+				bits |= 1 << j;
+			}
+		}
 
-		out->normal[0] = in[0];
-		if ( in[0] < 0.0f ) {
-			bits |= 1;
-		}
-		out->normal[1] = in[1];
-		if ( in[1] < 0.0f ) {
-			bits |= 2;
-		}
-		out->normal[2] = in[2];
-		if ( in[2] < 0.0f ) {
-			bits |= 4;
-		}
-		out->dist = in[3];
-
-		if ( out->normal[0] == 1.0f ) {
-			out->type = 0;
-		} else if ( out->normal[1] == 1.0f ) {
-			out->type = 1;
-		} else if ( out->normal[2] == 1.0f ) {
-			out->type = 2;
-		} else {
-			out->type = 3;
-		}
-		out->signbits = (byte)bits;
+		out->dist = ( in[3] );
+		out->type = ( out->normal[0] == 1.0 ? 0 : ( out->normal[1] == 1.0 ? 1 : ( out->normal[2] == 1.0 ? 2 : 3 ) ) );
+		out->signbits = bits;
 	}
 }
 
@@ -357,12 +346,12 @@ static void CMod_LoadLeafBrushes( lump_t *l ) {
 	}
 	count = (unsigned int)l->filelen >> 2;
 
-	out = (int *)Hunk_AllocAlignInternal( count * sizeof( int ) + sizeof( int ), 32 );
-	cm_leafbrushes = out;
+	cm_leafbrushes = (int *)Hunk_AllocAlignInternal( count * sizeof( int ) + sizeof( int ), 32 );
 	cm_numLeafBrushes = count;
 
-	for ( i = 0; i < count; i++ ) {
-		out[i] = in[i];
+	out = cm_leafbrushes;
+	for ( i = 0; i < count; i++, in++, out++ ) {
+		*out = *in;
 	}
 }
 
@@ -378,12 +367,12 @@ static void CMod_LoadLeafSurfaces( lump_t *l ) {
 	}
 	count = (unsigned int)l->filelen >> 2;
 
-	out = (int *)Hunk_AllocAlignInternal( count * sizeof( int ), 32 );
-	cm_leafsurfaces = out;
+	cm_leafsurfaces = (int *)Hunk_AllocAlignInternal( count * sizeof( int ), 32 );
 	cm_numLeafSurfaces = count;
 
-	for ( i = 0; i < count; i++ ) {
-		out[i] = in[i];
+	out = cm_leafsurfaces;
+	for ( i = 0; i < count; i++, in++, out++ ) {
+		*out = *in;
 	}
 }
 
@@ -398,17 +387,20 @@ static void CMod_LoadLeafCurvesAndTerrain( lump_t *surfLump, lump_t *vertLump,
 	const short *indexes;
 	cPatch_t *out;
 	int count, i, j, n;
-	static vec3_t points[MAX_TERRAIN_VERTS];
-	static short heightIndexes[MAX_TERRAIN_INDEXES];
+	/* retail keeps both scratch arrays on the stack (0x30044-byte frame,
+	   points at esp+48h, heightIndexes at esp+18048h), not in .bss */
+	vec3_t points[MAX_TERRAIN_VERTS];
+	short heightIndexes[MAX_TERRAIN_INDEXES];
 
 	in = (const dcollisionsurface_t *)( cmod_base + surfLump->fileofs );
 	if ( surfLump->filelen & 15 ) {
 		Com_Error( ERR_DROP, "\x15" "CMod_LoadLeafpatchesAndTerrain: funny lump size" );
 	}
-	count = surfLump->filelen >> 4;
+	/* retail 0x00419932 shr / 0x0041992E div: lump sizes are treated as unsigned */
+	count = (unsigned int)surfLump->filelen >> 4;
 
 	verts = (const float *)( cmod_base + vertLump->fileofs );
-	if ( vertLump->filelen % 12 ) {
+	if ( (unsigned int)vertLump->filelen % 12 ) {
 		Com_Error( ERR_DROP, "\x15" "CMod_LoadLeafpatchesAndTerrain: funny lump size" );
 	}
 
@@ -421,10 +413,11 @@ static void CMod_LoadLeafCurvesAndTerrain( lump_t *surfLump, lump_t *vertLump,
 	cm_patches = (cPatch_t *)Hunk_AllocAlignInternal( count * sizeof( cPatch_t ), 32 );
 
 	out = cm_patches;
-	for ( i = 0; i < count; i++, out++, in++ ) {
+	for ( i = 0; i < count; i++, in++, out++ ) {
+		n = ( in->materialIndex );
 		out->checkcount = 0;
-		out->materialNum = in->materialIndex;
-		out->contents = cm_materials[in->materialIndex].contentFlags;
+		out->materialNum = n;
+		out->contents = cm_materials[n].contentFlags;
 
 		if ( in->isTerrain ) {
 			const float *src;
@@ -437,21 +430,26 @@ static void CMod_LoadLeafCurvesAndTerrain( lump_t *surfLump, lump_t *vertLump,
 						   MAX_TERRAIN_VERTS );
 			}
 			src = verts + 3 * in->firstIndex;
-			for ( j = 0; j < numVerts; j++ ) {
-				points[j][0] = src[j * 3 + 0];
-				points[j][1] = src[j * 3 + 1];
-				points[j][2] = src[j * 3 + 2];
+			for ( j = 0; j < numVerts; j++, src += 3 ) {
+				points[j][0] = ( src[0] );
+				points[j][1] = ( src[1] );
+				points[j][2] = ( src[2] );
 			}
 
-			n = (unsigned short)in->b;
+			/* Retail sign-extends the 16-bit index count (movsx) before the
+			   unsigned compare, so a raw count of 0x8000 or more goes negative
+			   and fails the check with Com_Error, as a count above 0xC000 does. */
+			n = in->b;
 			if ( (unsigned int)n > MAX_TERRAIN_INDEXES ) {
 				Com_Error( ERR_DROP,
 						   "\x15" "CMod_LoadLeafpatchesAndTerrain: more than %i indexes in terrain\n",
 						   MAX_TERRAIN_INDEXES );
 			}
-			if ( n > 0 ) {
-				Com_Memcpy( heightIndexes, indexes + in->secondIndex,
-							n * sizeof( short ) );
+			{
+				const short *isrc = indexes + in->secondIndex;
+				for ( j = 0; j < n; j++ ) {
+					heightIndexes[j] = ( isrc[j] );
+				}
 			}
 
 			out->pc = NULL;
@@ -461,6 +459,7 @@ static void CMod_LoadLeafCurvesAndTerrain( lump_t *surfLump, lump_t *vertLump,
 		} else {
 			const float *src;
 			int width, height;
+			int maxError;
 
 			width = in->a;
 			height = in->b;
@@ -471,24 +470,34 @@ static void CMod_LoadLeafCurvesAndTerrain( lump_t *surfLump, lump_t *vertLump,
 						   MAX_TERRAIN_VERTS );
 			}
 			src = verts + 3 * in->secondIndex;
-			for ( j = 0; j < n; j++ ) {
-				points[j][0] = src[j * 3 + 0];
-				points[j][1] = src[j * 3 + 1];
-				points[j][2] = src[j * 3 + 2];
+			for ( j = 0; j < n; j++, src += 3 ) {
+				points[j][0] = ( src[0] );
+				points[j][1] = ( src[1] );
+				points[j][2] = ( src[2] );
 			}
 
-			out->pc = CM_GeneratePatchCollide( width, height, in->firstIndex,
+			/* maxError is read into its own local only at the call: that is
+			   what makes retail load height after pushing it (0x00419B07). */
+			maxError = in->firstIndex;
+			out->pc = CM_GeneratePatchCollide( width, height, maxError,
 												   points, &out->mins );
 			out->tc = NULL;
+		}
+
+		/* Retail inlines Sys_LoadingKeepAlive here. The gate tests the total
+		   patch count, not i, so it is loop-invariant: it runs every
+		   iteration or never. */
+		if ( ( count & 3 ) == 3 ) {
+			Sys_LoadingKeepAlive();
 		}
 	}
 }
 
 /* ---- CMod_LoadEntityString  0x00419BC0 ---- VERIFIED */
 static void CMod_LoadEntityString( lump_t *l ) {
-	cm_entityString = (char *)Hunk_AllocAlignInternal( l->filelen, 32 );
+	const byte *entitySource; int entityOffset; cm_entityString = (char *)Hunk_AllocAlignInternal( l->filelen, 32 );
 	cm_entityStringLen = l->filelen;
-	Com_Memcpy( cm_entityString, cmod_base + l->fileofs, l->filelen );
+	entitySource=cmod_base; entityOffset=l->fileofs; Com_Memcpy( cm_entityString, entitySource + entityOffset, l->filelen );
 }
 
 /* ---- CMod_LoadVisibility  0x00419C00 ---- VERIFIED */
@@ -515,6 +524,7 @@ static void CMod_LoadVisibility( lump_t *l ) {
 static void CM_ClearMap( void ) {
 	Com_Memset( cm_mapName, 0, sizeof( cm_mapName ) );
 
+	cm_numStaticModels = 0;     cm_staticModels = NULL;
 	cm_numMaterials = 0;        cm_materials = NULL;
 	cm_numBrushSides = 0;       cm_brushsides = NULL;
 	cm_numPlanes = 0;           cm_planes = NULL;
@@ -544,6 +554,7 @@ void CM_LoadMap( const char *name, qboolean clientload, int *checksum ) {
 	char mapName[MAX_QPATH];
 	void *buf;
 	int length;
+	int i;
 
 	if ( !name || !name[0] ) {
 		Com_Error( ERR_DROP, "\x15" "CM_LoadMap: NULL name" );
@@ -562,7 +573,7 @@ void CM_LoadMap( const char *name, qboolean clientload, int *checksum ) {
 		return;
 	}
 
-	CM_ClearMap();
+	Com_Memset( &cm, 0, sizeof(cm) );
 
 	length = FS_ReadFile( mapName, &buf );
 	if ( !buf ) {
@@ -573,6 +584,9 @@ void CM_LoadMap( const char *name, qboolean clientload, int *checksum ) {
 	*checksum = cm_lastChecksum;
 
 	header = *(dheader_t *)buf;
+	for ( i = 0; i < sizeof( dheader_t ) / 4; i++ ) {
+		( (int *)&header )[i] = CM_LittleLong( ( (int *)&header )[i] );
+	}
 
 	if ( header.version != CM_BSP_VERSION ) {
 		Com_Error( ERR_DROP, va(
@@ -584,7 +598,7 @@ void CM_LoadMap( const char *name, qboolean clientload, int *checksum ) {
 
 	CMod_LoadShaders( &header.lumps[LUMP_MATERIALS] );
 	CMod_LoadPlanes( &header.lumps[LUMP_PLANES] );
-	CMod_LoadBrushes( &header.lumps[LUMP_BRUSHSIDES], &header.lumps[LUMP_BRUSHES] );
+	CMod_LoadBrushes( &header.lumps[LUMP_BRUSHES], &header.lumps[LUMP_BRUSHSIDES] );
 	CMod_LoadNodes( &header.lumps[LUMP_NODES] );
 	CMod_LoadLeafs( &header.lumps[LUMP_LEAFS] );
 	CMod_LoadLeafBrushes( &header.lumps[LUMP_LEAFBRUSHES] );
@@ -614,12 +628,10 @@ void CM_SaveLump( int lump, const void *data, int length, unsigned int *checksum
 	dheader_t header;
 	void *buf;
 	byte *out;
-	char fsPath[MAX_OSPATH];
 	qboolean wasReadOnly;
 	fileHandle_t f;
 	size_t total;
 	int ofs, i;
-	unsigned long attributes;
 
 	FS_ReadFile( cm_mapName, &buf );
 	if ( !buf ) {
@@ -627,6 +639,7 @@ void CM_SaveLump( int lump, const void *data, int length, unsigned int *checksum
 	}
 
 	header = *(dheader_t *)buf;
+	for(i=0;i<sizeof(dheader_t)/4;i++){ ((int *)&header)[i]=CM_LittleLong(((int *)&header)[i]); }
 
 	total = CM_HEADER_SIZE;
 	for ( i = 0; i < CM_LUMPS; i++ ) {
@@ -638,12 +651,9 @@ void CM_SaveLump( int lump, const void *data, int length, unsigned int *checksum
 
 	out = (byte *)malloc( total );
 	if ( !out ) {
-		char *title, *body;
-
 		Sys_OutOfMemoryPrep();
-		title = SEH_GetLocalizedString_m( "WIN_OUT_OF_MEM_TITLE" );
-		body = SEH_GetLocalizedString_m( "WIN_OUT_OF_MEM_BODY" );
-		MessageBoxA( 0, body, title, CM_MB_ICONHAND );
+		MessageBoxA( 0, SEH_GetLocalizedString_m( "WIN_OUT_OF_MEM_BODY" ),
+					 SEH_GetLocalizedString_m( "WIN_OUT_OF_MEM_TITLE" ), CM_MB_ICONHAND );
 		exit( -1 );
 	}
 	Com_Memset( out, 0, total );
@@ -653,10 +663,10 @@ void CM_SaveLump( int lump, const void *data, int length, unsigned int *checksum
 		if ( header.lumps[i].filelen ) {
 			const void *src;
 
-			if ( i == lump ) {
-				src = data;
-			} else {
+			if ( i != lump ) {
 				src = (const byte *)buf + header.lumps[i].fileofs;
+			} else {
+				src = data;
 			}
 			Com_Memcpy( out + ofs, src, header.lumps[i].filelen );
 		}
@@ -664,23 +674,21 @@ void CM_SaveLump( int lump, const void *data, int length, unsigned int *checksum
 		ofs += ( header.lumps[i].filelen + 3 ) & ~3;
 	}
 
+	for(i=0;i<sizeof(dheader_t)/4;i++){ ((int *)&header)[i]=CM_LittleLong(((int *)&header)[i]); }
 	Com_Memcpy( out, &header, CM_HEADER_SIZE );
 
 	wasReadOnly = FS_MakeReadOnly( cm_mapName, qfalse );
 	f = FS_FOpenFileWrite( cm_mapName );
-	if ( f ) {
+	if ( !f ) {
+		Com_Printf( "Failed to open %s\n", cm_mapName );
+	} else {
 		FS_Write( out, ofs, f );
 		FS_FCloseFile( f );
-	} else {
-		Com_Printf( "Failed to open %s\n", cm_mapName );
 	}
 
 	if ( wasReadOnly ) {
-		FS_BuildOSPath_Internal( fs_homepath->string, cm_mapName, fsPath, 0 );
-		attributes = GetFileAttributesA( fsPath );
-		if ( ( attributes | CM_FILE_ATTRIBUTE_READONLY ) != attributes ) {
-			SetFileAttributesA( fsPath, attributes | CM_FILE_ATTRIBUTE_READONLY );
-		}
+		/* inlined at retail 0x0041A09A; the first FS_MakeReadOnly stays a call */
+		FS_MakeReadOnly( cm_mapName, qtrue );
 	}
 
 	if ( checksum ) {
@@ -696,6 +704,7 @@ int CM_LoadLump_m( int lump, void **data ) {
 	dheader_t header;
 	fileHandle_t f;
 	int len;
+	int i;
 
 	fs_loadingMode = 1;
 	FS_FOpenFileRead( cm_mapName, &f, qfalse );
@@ -704,6 +713,9 @@ int CM_LoadLump_m( int lump, void **data ) {
 	}
 
 	FS_Read( &header, CM_HEADER_SIZE, f );
+	for ( i = 0; i < sizeof( dheader_t ) / 4; i++ ) {
+		( (int *)&header )[i] = CM_LittleLong( ( (int *)&header )[i] );
+	}
 
 	len = header.lumps[lump].filelen;
 	if ( !len ) {
@@ -721,12 +733,10 @@ int CM_LoadLump_m( int lump, void **data ) {
 }
 
 /* ---- CM_FreeLump_m  0x0041A250 ---- VERIFIED */
-void CM_FreeLump_m( void ) {
-	Hunk_FreeTempMemoryInternal( cm_lumpData );
-}
+void CM_FreeLump_m( void ) { extern int hunk_low_temp; int *header; int delta; if (!s_hunkData) { free(cm_lumpData); return; } header=(int *)cm_lumpData-4; if(header[0]!=(int)0x89537892) Com_Error(ERR_FATAL,"\x15Hunk_FreeTempMemory: bad magic"); delta=header[1]; header[0]=(int)0x89537893; hunk_low_temp-=delta; }
 
 /* ---- CM_ClipHandleToModel  0x0041A2A0 ---- VERIFIED */
-cmodel_t *CM_ClipHandleToModel( clipHandle_t handle ) {
+__declspec(noinline) cmodel_t *CM_ClipHandleToModel( clipHandle_t handle ) {
 	if ( handle < 0 ) {
 		Com_Error( ERR_DROP, "\x15" "CM_ClipHandleToModel: bad handle %i", handle );
 	}
@@ -787,9 +797,12 @@ void CM_InitBoxHull( void ) {
 	box_brush->numSides = 0;
 	box_brush->sides = NULL;
 	box_brush->contents = -1;
-	for ( i = 0; i < 6; i++ ) {
-		box_brush->axialMaterialNum[i] = -1;
-	}
+	box_brush->axialMaterialNum[0] = -1;
+box_brush->axialMaterialNum[1] = -1;
+box_brush->axialMaterialNum[2] = -1;
+box_brush->axialMaterialNum[3] = -1;
+box_brush->axialMaterialNum[4] = -1;
+box_brush->axialMaterialNum[5] = -1;
 
 	cm_boxModel.leaf.numLeafBrushes = 1;
 	cm_boxModel.leaf.firstLeafBrush = cm_numLeafBrushes;
@@ -802,9 +815,6 @@ clipHandle_t CM_TempBoxModel( const vec3_t mins, const vec3_t maxs,
 	VectorCopy( mins, cm_boxModel.mins );
 	VectorCopy( maxs, cm_boxModel.maxs );
 
-	cm_boxModelMinsX = mins[0];  cm_boxModelMinsY = mins[1];  cm_boxModelMinsZ = mins[2];
-	cm_boxModelMaxsX = maxs[0];  cm_boxModelMaxsY = maxs[1];  cm_boxModelMaxsZ = maxs[2];
-
 	VectorCopy( mins, box_brush->mins );
 	VectorCopy( maxs, box_brush->maxs );
 	box_brush->contents = contents;
@@ -813,8 +823,9 @@ clipHandle_t CM_TempBoxModel( const vec3_t mins, const vec3_t maxs,
 }
 
 /* ---- CM_SetTempBoxModelContents  0x0041A4C0 ---- VERIFIED */
-void CM_SetTempBoxModelContents( int contents ) {
+int CM_SetTempBoxModelContents( int contents ) {
 	( void )contents;
+	return box_brush->contents;
 }
 
 /* ---- CM_ModelBounds  0x0041A4D0 ---- VERIFIED */

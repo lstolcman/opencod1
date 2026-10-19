@@ -1,24 +1,6 @@
-/*
- * cg_public.h -- the client game module / engine interface for cgame_mp_x86.dll.
- *
- * Call of Duty 1.1 multiplayer.  RTCW's cgame/cg_public.h is the structural
- * model: the shared render and snapshot view, the trap numbers the module calls
- * out on (cgameImport_t) and the entry points the engine calls in
- * (cgameExport_t).
- *
- * The two halves of this ABI are the wrapper bodies in cg_syscalls_mp.c
- * (0x30030460..0x300322C0 in cgame_mp_x86.dll) and CL_CgameSystemCalls in
- * client_mp/cl_cgame_mp.c (retail 0x00401DF0), which says what the engine
- * does with every argument.
- *
- * entityState_t is declared here AND in game_mp/g_public.h AND in
- * server_mp/server.h.  That is the retail tree's own arrangement -- each module
- * carries its own copy of the shared ABI and no module's header includes
- * another's.  The layout and the size assertion are the same ones those two
- * assert.
- *
- * @fidelity: likely
- */
+// cg_public.h -- definitions shared by the cgame module and the client
+// each module carries its own copy of the shared types (entityState_t is
+// also declared in g_public.h and server.h)
 
 #ifndef __CG_PUBLIC_H__
 #define __CG_PUBLIC_H__
@@ -29,17 +11,18 @@
 #define QDECL   __cdecl
 #endif
 
-typedef int qhandle_t;
-typedef int sfxHandle_t;        /* the sound-alias handle cgMedia_t stores */
+// compile-time field offset check
+#define CG_ASSERT_OFFSET( type, member, off ) 	COD1_STATIC_ASSERT( offsetof( type, member ) == ( off ), #type "." #member )
 
-/*
- * 0x3E80.  CL_CgameSystemCalls case 79 copies 0x5E84 bytes out of
- * cl.gameState (retail 0x00402EE0); MAX_CONFIGSTRINGS is 0x800, so the string
- * pool is 0x5E84 - 0x800*4 - 4.
- */
+typedef int qhandle_t;
+typedef int sfxHandle_t;        // sound alias handle
+
+// an animated model instance; owned by the engine and opaque to cgame
+typedef struct DObj_s DObj;
+
 #define MAX_GAMESTATE_CHARS     0x3E80
 
-#define MAX_ENTITIES_IN_SNAPSHOT    256     /* CL_GetSnapshot 0x00401120 */
+#define MAX_ENTITIES_IN_SNAPSHOT    256
 #define MAX_CLIENTS_IN_SNAPSHOT     64
 
 /*
@@ -53,66 +36,71 @@ typedef int sfxHandle_t;        /* the sound-alias handle cgMedia_t stores */
 typedef struct trajectory_t {
 	int trType;
 	int trTime;
-	int trDuration;
+	int trDuration;             // if non 0, trTime + trDuration = stop time
 	vec3_t trBase;
-	vec3_t trDelta;
+	vec3_t trDelta;             // velocity, etc
 } trajectory_t;
 COD1_ASSERT_SIZE( trajectory_t, 36 );
 
+// entityState_t is the information conveyed from the server
+// in an update message about entities that the client will
+// need to render in some way
+// Different eTypes may use the information in different ways
+// The messages are delta compressed, so it doesn't really matter if
+// the structure size is fairly large
+//
+// NOTE: all fields in here must be 32 bits (or those within sub-structures)
+
 typedef struct entityState_s {
-	int number;
-	int eType;
+	int number;             // entity index
+	int eType;              // entityType_t
 	int eFlags;
-	trajectory_t pos;
-	trajectory_t apos;
+	trajectory_t pos;       // for calculating position
+	trajectory_t apos;      // for calculating angles
 	int time;
 	int time2;
 	vec3_t origin2;
 	vec3_t angles2;
-	int otherEntityNum;
+	int otherEntityNum;     // shotgun sources, etc
 	int attackerEntityNum;
-	int groundEntityNum;
-	int constantLight;
-	int loopSound;
+	int groundEntityNum;        // -1 = in air
+	int constantLight;      // r + (g<<8) + (b<<16) + (intensity<<24)
+	int loopSound;          // constantly loop this sound
 	int surfType;
 	int index;
-	int clientNum;
+	int clientNum;          // 0 to (MAX_CLIENTS - 1), for players and corpses
 	int iHeadIcon;
 	int iHeadIconTeam;
-	int solid;
+	int solid;              // for client side prediction, trap_linkentity sets this properly
 	int eventParm;
-	int eventSequence;
+	int eventSequence;      // pmove generated events
 	int events[4];
 	unsigned int eventParms[4];
-	int weapon;
-	int legsAnim;
-	int torsoAnim;
+	int weapon;             // determines weapon and flash model, etc
+	int legsAnim;           // mask off ANIM_TOGGLEBIT
+	int torsoAnim;          // mask off ANIM_TOGGLEBIT
 	float leanf;
 	int scale;
-	int dmgFlags;
-	int animMovetype;
+	int dmgFlags;           // to pass along additional information for damage effects for players/ Also used for cursorhints for non-player entities
+	int animMovetype;       // clients can't derive movetype of other clients for anim scripting system
 	float fTorsoHeight;
 	float fTorsoPitch;
 	float fWaistPitch;
 } entityState_t;
 COD1_ASSERT_SIZE( entityState_t, 240 );
 
-/*
- * The per-client record the server broadcasts alongside the entities.  Only
- * the size is known here -- CL_GetSnapshot copies 0x5C bytes per client at
- * 0x004011E9, and server_mp/server.h carries the same record as `byte cs[92]`
- * with the note that its first dword is the client number.  cg_snapshot_mp.c
- * carries the field layout.
- */
+// the per-client information the server sends along with each snapshot
 typedef struct clientState_s {
-	byte unknown_0x00[92];
+	int clientNum;
+	int team;
+	int modelIndex;                 // CS_MODELS index
+	int attachModelIndex[6];        // MAX_ATTACHED_MODELS, CS_MODELS indexes
+	int attachTagIndex[6];          // CS_TAGS indexes
+	char name[32];
 } clientState_t;
 COD1_ASSERT_SIZE( clientState_t, 92 );
+CG_ASSERT_OFFSET( clientState_t, name, 0x3C );
 
-/*
- * trap_GetGameState memcpy target; CL_CgameSystemCalls case 79 copies exactly
- * sizeof( gameState_t ) out of the engine's own copy.
- */
 typedef struct gameState_t {
 	int stringOffsets[MAX_CONFIGSTRINGS];
 	char stringData[MAX_GAMESTATE_CHARS];
@@ -120,22 +108,22 @@ typedef struct gameState_t {
 } gameState_t;
 COD1_ASSERT_SIZE( gameState_t, 0x5E84 );
 
-/*
- * trap_GetSnapshot's output record.  Every offset below is the constant
- * CL_GetSnapshot writes to (client_mp/cl_records.h SNAP_OUT_*); numServerCommands
- * is Q3's field in the one slot CL_GetSnapshot leaves alone.
- */
+// snapshots are a view of the server at a given time
+
+// Snapshots are generated at regular time intervals by the server,
+// but they may not be sent if a client's rate level is exceeded, or
+// they may be dropped by the network.
 typedef struct snapshot_t {
-	/* +0x00000 */ int snapFlags;
-	/* +0x00004 */ int ping;
-	/* +0x00008 */ int serverTime;
-	/* +0x0000C */ playerState_t ps;
-	/* +0x020DC */ int numEntities;
-	/* +0x020E0 */ int numClients;
-	/* +0x020E4 */ entityState_t entities[MAX_ENTITIES_IN_SNAPSHOT];
-	/* +0x110E4 */ clientState_t clients[MAX_CLIENTS_IN_SNAPSHOT];
-	/* +0x127E4 */ int numServerCommands;
-	/* +0x127E8 */ int serverCommandSequence;
+	int snapFlags;                      // SNAPFLAG_RATE_DELAYED, etc
+	int ping;
+	int serverTime;                 // server time the message is valid for (in msec)
+	playerState_t ps;                       // complete information about the current player at this time
+	int numEntities;                        // all of the entities that need to be presented
+	int numClients;
+	entityState_t entities[MAX_ENTITIES_IN_SNAPSHOT];   // at the time of this snapshot
+	clientState_t clients[MAX_CLIENTS_IN_SNAPSHOT];
+	int numServerCommands;                  // text based server commands to execute when this
+	int serverCommandSequence;              // snapshot becomes current
 } snapshot_t;
 COD1_ASSERT_SIZE( snapshot_t, 0x127EC );
 
@@ -148,120 +136,134 @@ COD1_ASSERT_SIZE( snapshot_t, 0x127EC );
 */
 
 /*
- * trap_GetGlconfig's target.  CL_CgameSystemCalls case 78 copies 0xA0 bytes out
- * of cls.glconfig; the layout is client_mp/cl_refapi.h's, which the renderer
- * fills in.
- */
+** glconfig_t
+**
+** Contains variables specific to the OpenGL configuration
+** being run right now.  These are constant once the OpenGL
+** subsystem is initialized.
+*/
 typedef struct glconfig_t {
-	/* +0x00 */ char   *renderer_string;
-	/* +0x04 */ char   *vendor_string;
-	/* +0x08 */ char   *version_string;
-	/* +0x0C */ char   *extensions_string;
-	/* +0x10 */ char   *wextensions_string;    /* CoD1 addition */
-	/* +0x14 */ int     maxTextureSize;
-	/* +0x18 */ int     maxActiveTextures;
-	/* +0x1C */ int     maxLights;             /* CoD1 addition */
-	/* +0x20 */ int     colorBits;
-	/* +0x24 */ int     depthBits;
-	/* +0x28 */ int     stencilBits;
-	/* +0x2C */ int     deviceSupportsGamma;
-	/* +0x30 */ int     unknown_0x30[2];
-	/* +0x38 */ int     textureEnvAddAvailable;
-	/* +0x3C */ int     unknown_0x3C[6];
-	/* +0x54 */ int     NVFogAvailable;
-	/* +0x58 */ int     unknown_0x58[11];
-	/* +0x84 */ int     vidWidth;
-	/* +0x88 */ int     vidHeight;
-	/* +0x8C */ float   windowAspect;
-	/* +0x90 */ int     displayFrequency;
-	/* +0x94 */ int     isFullscreen;
-	/* +0x98 */ int     stereoEnabled;
-	/* +0x9C */ int     unknown_0x9C;
+	char   *renderer_string;
+	char   *vendor_string;
+	char   *version_string;
+	char   *extensions_string;
+	char   *wextensions_string;    // WGL extensions
+	int     maxTextureSize;                             // queried from GL
+	int     maxActiveTextures;                          // multitexture ability
+	int     maxLights;
+	int     colorBits;
+	int     depthBits;
+	int     stencilBits;
+	int     deviceSupportsGamma;
+	int     maxAnisotropy;
+	int     maxTextureFilterAnisotropy;
+	int     textureEnvAddAvailable;
+	int     textureCubeMap;
+	int     textureEnvCombine;
+	int     textureEnvDot3;
+	int     ARBVertexBufferObject;
+	int     ARBVertexProgram;
+	int     rescaleNormal;
+	int     NVFogAvailable;
+	int     NVFogMode;
+	int     NVVertexArrayRange;
+	int     NVFenceAvailable;
+	int     NVRegisterCombiners;
+	int     NVTextureShader;
+	int     maxPNTrianglesTessellationLevel;
+	int     pnTrianglesNormalMode;
+	int     pnTrianglesPointMode;
+	int     ATIVertexArrayObject;
+	int     ATIElementArray;
+	int     ATIFragmentShader;
+	int     vidWidth;
+	int     vidHeight;
+	// aspect is the screen's physical width / height, which may be different
+	// than scrWidth / scrHeight if the pixels are non-square
+	// normal screens should be 4/3, but wide aspect monitors may be 16/9
+	float   windowAspect;
+	int     displayFrequency;
+	// synonymous with "does rendering consume the entire screen?", therefore
+	// a Voodoo or Voodoo2 will have this set to TRUE, as will a Win32 ICD that
+	// used CDS.
+	int     isFullscreen;
+	int     stereoEnabled;
+	qboolean smpActive;                     // dual processor
 } glconfig_t;
 COD1_ASSERT_SIZE( glconfig_t, 160 );
+CG_ASSERT_OFFSET( glconfig_t, NVFogMode, 0x58 );
 
-/*
- * trap_R_AddRefEntityToScene's argument.  156 bytes: CG_Beam (0x3001B89E)
- * clears the whole record with `rep stosd` of 0x27 dwords.  The named offsets
- * are the ones a builder stores; the holes are left as padding:
- *
- *   +0x00 reType          CG_Beam 0x3001B905 stores 6
- *   +0x04 renderfx        CG_Beam 0x3001B90D stores 0x40
- *   +0x1C axis[3]         CG_Beam 0x3001B8E1.. stores the identity basis
- *   +0x44 origin          CG_Beam 0x3001B8AF copies es.pos.trBase
- *   +0x54 oldorigin       CG_Beam 0x3001B8C4 copies es.origin2
- *   +0x6C shaderRGBA      CG_AddFadeRGB 0x3002008D.. stores four bytes
- *
- * Q3 puts shaderRGBA at 0x74, so CoD1's middle is NOT Q3's -- do not fill the
- * holes from Q3 text without checking the binary.
- */
+// CoD drops RTCW's skinNum, customSkin, torso and backlerp members
 typedef struct refEntity_s {
-	/* +0x00 */ int         reType;
-	/* +0x04 */ int         renderfx;
-	/* +0x08 */ byte        unknown_0x08[0x14];
-	/* +0x1C */ vec3_t      axis[3];
-	/* +0x40 */ byte        unknown_0x40[0x04];
-	/* +0x44 */ vec3_t      origin;
-	/* +0x50 */ byte        unknown_0x50[0x04];
-	/* +0x54 */ vec3_t      oldorigin;
-	/* +0x60 */ byte        unknown_0x60[0x0C];
-	/* +0x6C */ byte        shaderRGBA[4];
-	/* +0x70 */ byte        unknown_0x70[0x2C];
+	int         reType;
+	int         renderfx;
+	qhandle_t   hModel;               // opaque type outside refresh
+
+	// most recent data
+	vec3_t      lightingOrigin;          // so multi-part models can be lit identically (RF_LIGHTING_ORIGIN)
+	float       shadowPlane;              // projection shadows go here, stencils go slightly lower
+
+	vec3_t      axis[3];                 // rotation vectors
+	float       nonNormalizedAxes;     // axis are not normalized, i.e. they have scale
+	vec3_t      origin;                // also used as MODEL_BEAM's "from"
+	int         frame;                      // also used as MODEL_BEAM's diameter
+
+	// previous data for frame interpolation
+	vec3_t      oldorigin;             // also used as MODEL_BEAM's "to"
+	int         oldframe;
+	float       spriteSize;     // name inferred
+
+	// texturing
+	qhandle_t   customShader;         // use one image for the entire thing
+
+	// misc
+	byte        shaderRGBA[4];             // colors used by rgbgen entity shaders
+	float       shaderTexCoord[2];        // texture coordinates used by tcMod entity modifiers
+	float       shaderTime;               // subtracted from refdef time to control effect start times
+
+	// extra sprite information
+	float       radius;
+	float       rotation;
+
+	vec3_t      fireRiseDir;
+	DObj       *dobj;
+	void       *owner;          // the centity_t
+	void       *staticModel;
 } refEntity_t;
 COD1_ASSERT_SIZE( refEntity_t, 156 );
+CG_ASSERT_OFFSET( refEntity_t, oldframe, 0x60 );
+CG_ASSERT_OFFSET( refEntity_t, shaderRGBA, 0x6C );
+CG_ASSERT_OFFSET( refEntity_t, shaderTexCoord, 0x70 );
+CG_ASSERT_OFFSET( refEntity_t, fireRiseDir, 0x84 );
+CG_ASSERT_OFFSET( refEntity_t, dobj, 0x90 );
 
-/*
- * trap_R_RenderScene's argument, and cg.refdef.  Q3's head verbatim and
- * nothing after it: cg.refdef.x is 0x3020957C and cg.refdefViewAngles[1]
- * 0x302095D0, which puts the end of the record at
- * 0x302095CC -- 80 bytes.  cg.refdef.vieworg (0x30209594) is +0x18 and the
- * rdflags dword CG_DrawActive masks (0x302095C8) is +0x4C, both Q3's offsets.
- */
 typedef struct refdef_s {
-	/* +0x00 */ int x, y, width, height;
-	/* +0x10 */ float fov_x, fov_y;
-	/* +0x18 */ vec3_t vieworg;
-	/* +0x24 */ vec3_t viewaxis[3];
-	/* +0x48 */ int time;
-	/* +0x4C */ int rdflags;
+	int x, y, width, height;
+	float fov_x, fov_y;
+	vec3_t vieworg;
+	vec3_t viewaxis[3];             // transformation matrix
+	int time;           // time in milliseconds for shader effects and other time dependent rendering issues
+	int rdflags;                    // RDF_NOWORLDMODEL, etc
 } refdef_t;
 COD1_ASSERT_SIZE( refdef_t, 80 );
 
-/*
- * trap_R_AddPolyToScene's vertex.  32 bytes, NOT Q3's 24 -- CoD carries a
- * second texcoord pair.  CG_AddMarks reaches modulate at +28 inside a
- * 32-byte stride (0x300239E2); CG_PlayerSplash and cg_weapons' tracer quad
- * build four-vert quads on the same stride.
- * The second st pair is what trap_R_MarkFragments fills alongside the first;
- * `st2` is an inferred name.
- */
+// CoD carries a second texture coordinate pair
 typedef struct polyVert_t {
-	/* +0x00 */ vec3_t xyz;
-	/* +0x0C */ float st[2];
-	/* +0x14 */ float st2[2];
-	/* +0x1C */ byte modulate[4];
+	vec3_t xyz;
+	float st[2];
+	float st2[2];                   // name inferred
+	byte modulate[4];
 } polyVert_t;
 COD1_ASSERT_SIZE( polyVert_t, 32 );
 
-/*
- * trap_R_MarkFragments' output record.  12 bytes, not Q3's 8: CoD prepended
- * the shader the hit surface resolved to, and CG_ImpactMark puts THAT into the
- * poly rather than its own markShader argument (0x30023837, 0x30023875).  The
- * fragment loop strides 0xC and reads three dwords (0x300238D1).
- */
+// markfragments are returned by CM_MarkFragments()
 typedef struct markFragment_t {
-	/* +0x00 */ qhandle_t   markShader;
-	/* +0x04 */ int         firstPoint;
-	/* +0x08 */ int         numPoints;
+	qhandle_t   markShader;         // shader of the surface the fragment was clipped from
+	int         firstPoint;
+	int         numPoints;
 } markFragment_t;
 COD1_ASSERT_SIZE( markFragment_t, 12 );
 
-/*
- * The script parser token trap_PC_ReadToken fills in.  1040 bytes: in
- * ui_shared.c's PC_Int_Parse (0x300404D0) the local token is 0x410 bytes, its
- * `type` at +0 is compared against 3 (TT_NUMBER) and its `string` at +0x10 is
- * compared against '-'.  That is Q3's botlib layout exactly.
- */
 #define MAX_TOKENLENGTH     1024
 
 typedef struct pc_token_s {
@@ -274,30 +276,11 @@ typedef struct pc_token_s {
 COD1_ASSERT_SIZE( pc_token_t, 1040 );
 
 /*
-=============================================================================
+==================================================================
 
-	THE TRAP NUMBERS
+functions imported from the main executable
 
-	Each constant is the immediate the matching wrapper in cg_syscalls_mp.c
-	pushes before `call syscall`, and the comment is what
-	CL_CgameSystemCalls does with it.  A CG_SYSCALL_0xNN spelling means the
-	Mac symbol table did not name that wrapper.
-
-	Trap 34 is absent on BOTH sides: CL_CgameSystemCalls goes straight from
-	case 33 to case 35, and no wrapper pushes it.
-
-	Traps the engine dispatcher answers but no wrapper issues: 101
-	(Cmd_RemoveCommand), 109-117 and 120 -- the QVM memory/math block (memset,
-	memcpy, strncpy, sin, cos, atan2, sqrt, floor, ceil, acos), unused because
-	a native DLL calls the CRT directly.  The game DLL's gameImport_t has the
-	same hole for the same reason.
-
-	Traps a wrapper issues that the engine has NO case for: 236, 237, 238,
-	239.  Retail falls through to `Com_Error( ERR_DROP, "Bad cgame system
-	trap: %i" )` on all four, and nothing in the DLL calls those four
-	wrappers -- they are dead code the linker kept.
-
-=============================================================================
+==================================================================
 */
 
 typedef enum
@@ -311,8 +294,8 @@ typedef enum
 	CG_MILLISECONDS                        =   6,
 	CG_CVAR_REGISTER                       =   7,
 	CG_CVAR_UPDATE                         =   8,
-	CG_CVAR_SET                            =   9,   /* Cvar_Set2( name, value, qtrue ) */
-	CG_CVAR_SETVAR                         =  10,   /* Cvar_VMSet */
+	CG_CVAR_SET                            =   9,
+	CG_CVAR_SETVAR                         =  10,
 	CG_CVAR_VARIABLESTRINGBUFFER           =  11,
 	CG_ARGC                                =  12,
 	CG_ARGV                                =  13,
@@ -324,63 +307,59 @@ typedef enum
 	CG_FS_GETFILELIST                      =  19,
 	CG_COM_SAVECVARSTOBUFFER               =  20,
 	CG_COM_LOADCVARSFROMBUFFER             =  21,
-	CG_SENDCONSOLECOMMAND                  =  22,   /* Cbuf_AddText */
+	CG_SENDCONSOLECOMMAND                  =  22,
 	CG_ADDCOMMAND                          =  23,
-	CG_SENDCLIENTCOMMAND                   =  24,   /* CL_AddReliableCommand */
+	CG_SENDCLIENTCOMMAND                   =  24,
 	CG_UPDATESCREEN                        =  25,
-	CG_DRAWNOTIFYLINES                     =  26,   /* Con_DrawNotify */
-	CG_DRAWBOLDMESSAGES                    =  27,   /* Con_DrawBoldMessages */
-	CG_DRAWMINICONSOLE                     =  28,   /* Con_DrawMiniConsole */
-	CG_DRAWSUBTITLES                       =  29,   /* Con_DrawSubtitles */
-	CG_DRAWSAY                             =  30,   /* Con_DrawSay */
+	CG_DRAWNOTIFYLINES                     =  26,
+	CG_DRAWBOLDMESSAGES                    =  27,
+	CG_DRAWMINICONSOLE                     =  28,
+	CG_DRAWSUBTITLES                       =  29,
+	CG_DRAWSAY                             =  30,
 	CG_CM_LOADMAP                          =  31,
-	CG_CM_NUMINLINEMODELS                  =  32,   /* cm.numSubModels */
+	CG_CM_NUMINLINEMODELS                  =  32,
 	CG_CM_INLINEMODEL                      =  33,
-	/* 34 is unused: the engine has no case for it and no wrapper issues it. */
-	/* The engine reads a third `contents` slot for 35 and 42 that neither
-	   wrapper pushes; the wrappers are right and the slot is stale.  See
-	   trap_CM_TempBoxModel in cg_syscalls_mp.c for the disassembly. */
-	CG_CM_TEMPBOXMODEL                     =  35,   /* CM_TempBoxModel( mins, maxs, contents, qfalse ) */
+	// 34 is unused
+	CG_CM_TEMPBOXMODEL                     =  35,
 	CG_CM_POINTCONTENTS                    =  36,
 	CG_CM_TRANSFORMEDPOINTCONTENTS         =  37,
-	CG_CM_BOXTRACE                         =  38,   /* CM_BoxTrace( .., qfalse ) */
-	CG_CM_TRANSFORMEDBOXTRACE              =  39,   /* CM_TransformedBoxTraceExternal( .., qfalse ) */
-	CG_CM_CAPSULETRACE                     =  40,   /* CM_BoxTrace( .., qtrue ) */
-	CG_CM_TRANSFORMEDCAPSULETRACE          =  41,   /* CM_TransformedBoxTraceExternal( .., qtrue ) */
-	CG_CM_TEMPCAPSULEMODEL                 =  42,   /* CM_TempBoxModel( mins, maxs, contents, qtrue ) */
-	CG_R_MARKFRAGMENTS                     =  43,   /* re slot +0x98 */
+	CG_CM_BOXTRACE                         =  38,
+	CG_CM_TRANSFORMEDBOXTRACE              =  39,
+	CG_CM_CAPSULETRACE                     =  40,
+	CG_CM_TRANSFORMEDCAPSULETRACE          =  41,
+	CG_CM_TEMPCAPSULEMODEL                 =  42,
+	CG_R_MARKFRAGMENTS                     =  43,
 	CG_R_LOADWORLDMAP                      =  44,
 	CG_R_REGISTERMODEL                     =  45,
 	CG_R_FINISHLOADINGMODELS               =  46,
-	CG_SYSCALL_0X2F                        =  47,   /* re.SetIgnorePrecacheErrors */
+	CG_R_SETIGNOREPRECACHEERRORS           =  47,
 	CG_R_REGISTERSHADER                    =  48,
-	CG_SYSCALL_0X31                        =  49,   /* re.GetShaderFromModel */
+	CG_R_GETSHADERFROMMODEL                =  49,
 	CG_R_GETXMODELBYHANDLE                 =  50,
 	CG_R_REGISTERFONT                      =  51,
 	CG_R_TEXT_WIDTH                        =  52,
 	CG_R_TEXT_HEIGHT                       =  53,
 	CG_R_TEXT_PAINT                        =  54,
 	CG_R_TEXT_PAINTWITHCURSOR              =  55,
-	CG_SE_TRANSLATEREFERENCE               =  56,   /* SEH_StringEd_GetString */
-	CG_SE_LOCALIZEMESSAGE                  =  57,   /* SEH_LocalizeTextMessage */
+	CG_SE_TRANSLATEREFERENCE               =  56,
+	CG_SE_LOCALIZEMESSAGE                  =  57,
 	CG_SE_PRINTSTRLEN                      =  58,
 	CG_SE_READCHARFROMSTRING               =  59,
 	CG_R_CLEARSCENE                        =  60,
 	CG_R_ADDREFENTITYTOSCENE               =  61,
-	CG_SYSCALL_0X3E                        =  62,   /* re.GetEntityToken */
-	CG_HUNKUSED                            =  63,   /* com_hunkMeminfoRunningTotal */
+	CG_R_GETENTITYTOKEN                    =  62,
+	CG_HUNKUSED                            =  63,
 	CG_R_ADDPOLYTOSCENE                    =  64,
-	/* the wrapper's placeholder name is trap_syscall_0x42; it pushes 0x41 (0x30030F88) */
-	CG_SYSCALL_0X41                        =  65,   /* re.AddPolysToScene */
+	CG_R_ADDPOLYSTOSCENE                   =  65,
 	CG_R_ADDLIGHTTOSCENE                   =  66,
-	CG_SYSCALL_0X43                        =  67,   /* re.AddCoronaToScene */
+	CG_R_ADDCORONATOSCENE                  =  67,
 	CG_R_SETFOG                            =  68,
 	CG_R_RENDERSCENE                       =  69,
 	CG_R_SAVESCREEN                        =  70,
 	CG_R_BLENDSAVEDSCREEN                  =  71,
 	CG_R_SETCOLOR                          =  72,
 	CG_R_DRAWSTRETCHPIC                    =  73,
-	CG_SYSCALL_0X4A                        =  74,   /* re.StretchPicGradient */
+	CG_R_DRAWSTRETCHPICGRADIENT            =  74,
 	CG_R_DRAWSTRETCHPICROTATE              =  75,
 	CG_R_DRAWQUADPIC                       =  76,
 	CG_R_MODELBOUNDS                       =  77,
@@ -391,33 +370,33 @@ typedef enum
 	CG_GETSERVERCOMMAND                    =  82,
 	CG_GETCURRENTCMDNUMBER                 =  83,
 	CG_GETUSERCMD                          =  84,
-	CG_SYSCALL_0X55                        =  85,   /* CL_SetUserCmdValue */
+	CG_SETUSERCMDVALUE                     =  85,
 	CG_SETUSERCMDAIMVALUES                 =  86,
 	CG_SETUSERCMDINSHELLSHOCK              =  87,
-	CG_R_REGISTERSHADERNOMIP               =  88,   /* Material_RegisterHandle */
+	CG_R_REGISTERSHADERNOMIP               =  88,
 	CG_MEMORYREMAINING                     =  89,
-	CG_SYSCALL_0X5A                        =  90,   /* Key_IsDown */
-	CG_SYSCALL_0X5B                        =  91,   /* cls.keyCatchers */
-	CG_SYSCALL_0X5C                        =  92,   /* Key_SetCatcher */
-	CG_SYSCALL_0X5D                        =  93,   /* Key_GetKey */
-	CG_CL_LOOKUPCOLOR                      =  94,   /* the engine's case is PC_AddGlobalDefine; unresolved, see cg_syscalls_mp.c */
+	CG_KEY_ISDOWN                          =  90,
+	CG_KEY_GETCATCHER                      =  91,
+	CG_KEY_SETCATCHER                      =  92,
+	CG_KEY_GETKEY                          =  93,
+	CG_PC_ADDGLOBALDEFINE                  =  94,
 	CG_PC_LOADSOURCE                       =  95,
 	CG_PC_FREESOURCE                       =  96,
 	CG_PC_READTOKEN                        =  97,
 	CG_PC_SOURCEFILEANDLINE                =  98,
-	CG_REALTIME                            =  99,   /* Com_RealTime */
-	CG_SNAPVECTOR                          = 100,   /* Sys_SnapVector */
-	/* 101 (Cmd_RemoveCommand) has an engine case but no wrapper. */
+	CG_REALTIME                            =  99,
+	CG_SNAPVECTOR                          = 100,
+	// 101 is Cmd_RemoveCommand, which cgame never issues
 	CG_CIN_PLAYCINEMATIC                   = 102,
 	CG_CIN_STOPCINEMATIC                   = 103,
 	CG_CIN_RUNCINEMATIC                    = 104,
 	CG_CIN_DRAWCINEMATIC                   = 105,
 	CG_CIN_SETEXTENTS                      = 106,
-	CG_SYSCALL_0X6B                        = 107,   /* re slot +0xA0 */
-	CG_R_TRACKSTATISTICS                   = 108,   /* re slot +0xA4 */
-	/* 109-117, 120: the QVM memory/math block.  Engine cases, no wrappers. */
-	CG_SYSCALL_0X76                        = 118,   /* Com_Printf( "%s%i\n", s, i ) */
-	CG_SYSCALL_0X77                        = 119,   /* Com_Printf( "%s%f\n", s, f ) */
+	CG_R_TRACKSTATISTICS                   = 107,
+	CG_R_PICKSHADER                        = 108,
+	// 109-117 and 120 are the qvm memset / memcpy / strncpy / math traps
+	CG_PRINT_INT                           = 118,   // Com_Printf( "%s%i\n", s, i )
+	CG_PRINT_FLOAT                         = 119,   // Com_Printf( "%s%f\n", s, f )
 	CG_UI_LOADMENU                         = 121,
 	CG_UI_POPUP                            = 122,
 	CG_UI_CLOSEPOPUP                       = 123,
@@ -425,166 +404,166 @@ typedef enum
 	CG_UI_GETMAPDISPLAYNAME                = 125,
 	CG_UI_GETGAMETYPEDISPLAYNAME           = 126,
 	CG_CL_GETSERVERIPADDRESS               = 127,
-	CG_XANIMPRECACHE                       = 128,   /* XAnimPrecacheAnimTree_m */
-	CG_XANIMCREATEANIMS                    = 129,   /* XAnimAllocTree */
-	CG_XANIMCREATE                         = 130,   /* XAnimLoadFileData_m */
-	CG_XANIMCREATETREE                     = 131,   /* XAnimAllocRuntimeTree */
-	CG_XANIMBLEND                          = 132,   /* XAnimSetParentNode */
-	CG_SYSCALL_0X85                        = 133,   /* DObjFree */
-	CG_XANIMCLEARGOALWEIGHT                = 134,   /* XAnimClearAnimNode_m */
-	CG_XANIMCLEARTREEGOALWEIGHTS           = 135,   /* XAnimClearAnim_m */
-	CG_XANIMCLEARTREEGOALWEIGHTSSTRICT     = 136,   /* XAnimClearAnimChildSubtrees_m */
-	CG_SYSCALL_0X89                        = 137,   /* XAnimSetAnimKnob_m */
-	CG_XANIMSETCOMPLETEGOALWEIGHTKNOBALL   = 138,   /* XAnimSetAnimKnobAll_m */
-	CG_SYSCALL_0X8B                        = 139,   /* XAnimClearAnimChildren_m */
-	CG_SYSCALL_0X8C                        = 140,   /* XAnimSetAnimInternalLimited_m */
-	CG_XANIMSETCOMPLETEGOALWEIGHT          = 141,   /* XAnimSetAnimKnobInternal_m */
-	CG_XANIMSETANIMRATE                    = 142,   /* XAnimSetAnimRate_m */
-	CG_XANIMISLOOPED                       = 143,   /* XAnimIsLooped_m via scrAnimPub.trees */
-	CG_SYSCALL_0X90                        = 144,   /* XAnimIsLooped_m */
-	CG_XANIMSETTIME                        = 145,   /* XAnimSetTime_m */
-	CG_XANIMGETTIME                        = 146,   /* XAnimGetTime */
+	CG_XANIMPRECACHE                       = 128,
+	CG_XANIMCREATEANIMS                    = 129,
+	CG_XANIMCREATE                         = 130,
+	CG_XANIMCREATETREE                     = 131,
+	CG_XANIMBLEND                          = 132,
+	CG_DOBJFREE                            = 133,
+	CG_XANIMCLEARGOALWEIGHT                = 134,
+	CG_XANIMCLEARTREEGOALWEIGHTS           = 135,
+	CG_XANIMCLEARTREEGOALWEIGHTSSTRICT     = 136,
+	CG_XANIMSETANIMKNOB                    = 137,
+	CG_XANIMSETCOMPLETEGOALWEIGHTKNOBALL   = 138,
+	CG_XANIMCLEARANIMCHILDREN              = 139,
+	CG_XANIMSETANIMLIMITED                 = 140,
+	CG_XANIMSETCOMPLETEGOALWEIGHT          = 141,
+	CG_XANIMSETANIMRATE                    = 142,
+	CG_XANIMISLOOPED                       = 143,
+	CG_XANIMISLOOPEDINDEX                  = 144,
+	CG_XANIMSETTIME                        = 145,
+	CG_XANIMGETTIME                        = 146,
 	CG_XANIMGETWEIGHT                      = 147,
-	CG_SYSCALL_0X94                        = 148,   /* CL_DObjInvalidateSkels */
-	CG_SYSCALL_0X95                        = 149,   /* DObjUpdateClientInfo_m */
-	CG_SYSCALL_0X96                        = 150,   /* xanim.numDeferredNotifies + the notify array */
-	CG_SYSCALL_0X97                        = 151,   /* DObjCalcAnim */
-	CG_SYSCALL_0X98                        = 152,   /* DObjDisplayAnim */
-	CG_SYSCALL_0X99                        = 153,   /* XAnimGetRelDelta_m */
-	CG_SYSCALL_0X9A                        = 154,   /* XAnimGetAbsDelta_m */
-	CG_XANIMGETRELDELTA                    = 155,   /* XAnimGetRelDeltaForTime_m */
-	CG_SYSCALL_0X9C                        = 156,   /* XAnimGetAbsDeltaForTime_m */
-	CG_SYSCALL_0X9D                        = 157,   /* skel bone address out of the DObj */
-	CG_SYSCALL_0X9E                        = 158,   /* skel bone address out of the DObj */
-	CG_SYSCALL_0X9F                        = 159,   /* DObjMarkRotTransIndex */
-	CG_SYSCALL_0XA0                        = 160,   /* DObjMarkControlRotTransIndex */
+	CG_DOBJINVALIDATESKELS                 = 148,
+	CG_DOBJUPDATECLIENTINFO                = 149,
+	CG_XANIMGETDEFERREDNOTIFIES            = 150,
+	CG_DOBJCALCANIM                        = 151,
+	CG_DOBJDISPLAYANIM                     = 152,
+	CG_XANIMCALCRELDELTA                   = 153,
+	CG_XANIMCALCABSDELTA                   = 154,
+	CG_XANIMGETRELDELTA                    = 155,
+	CG_XANIMGETABSDELTA                    = 156,
+	CG_DOBJGETMATRIXARRAY                  = 157,
+	CG_DOBJGETROTTRANSARRAY                = 158,
+	CG_DOBJSETROTTRANSINDEX                = 159,
+	CG_DOBJSETCONTROLROTTRANSINDEX         = 160,
 	CG_XANIMGETANIMNAME                    = 161,
-	CG_SYSCALL_0XA2                        = 162,   /* Com_GetClientDObj */
-	CG_SYSCALL_0XA3                        = 163,   /* DObjCreate */
-	CG_SYSCALL_0XA4                        = 164,   /* Com_ClientDObjCreate */
-	CG_SAFEDOBJFREE                        = 165,   /* Com_SafeClientDObjFree */
-	CG_SYSCALL_0XA6                        = 166,   /* deref dword */
-	CG_SYSCALL_0XA7                        = 167,   /* 96 * dobj[23] + 48 */
-	CG_SYSCALL_0XA8                        = 168,   /* CL_DObjCreateSkelForBone */
-	CG_SYSCALL_0XA9                        = 169,   /* CL_DObjCreateSkelForBones */
-	CG_SYSCALL_0XAA                        = 170,   /* DObjGetHierarchyBits */
-	CG_SYSCALL_0XAB                        = 171,   /* DObjCalcSkel */
-	CG_SYSCALL_0XAC                        = 172,   /* XModelExists */
-	CG_SYSCALL_0XAD                        = 173,   /* dobj part count */
-	CG_SYSCALL_0XAE                        = 174,   /* DObjGetBoneIndex */
-	CG_SYSCALL_0XAF                        = 175,   /* DObjGetBoneName */
-	CG_SYSCALL_0XB0                        = 176,   /* DObjBuildPartCollisionTable */
-	CG_SYSCALL_0XB1                        = 177,   /* deref dword */
-	CG_XANIMISPRIMITIVE                    = 178,   /* anim tree child count == 0 */
-	CG_XANIMGETLENGTH                      = 179,   /* anim length in msec */
-	CG_SYSCALL_0XB4                        = 180,   /* XAnimHasTime */
-	CG_SYSCALL_0XB5                        = 181,   /* anim tree child count */
-	CG_SYSCALL_0XB6                        = 182,   /* anim tree child base */
-	CG_XANIMGETANIMTREESIZE                = 183,   /* the DObj's tree */
-	CG_SYSCALL_0XB8                        = 184,   /* XAnimCopyTree */
-	CG_SYSCALL_0XB9                        = 185,   /* DObjDumpInfo, com_developer only */
-	CG_SYSCALL_0XBA                        = 186,   /* StatMon_Warning */
-	CG_SYSCALL_0XBB                        = 187,   /* StatMon_GetStatsArray */
+	CG_GETCLIENTDOBJ                       = 162,
+	CG_DOBJCREATEDIRECT                    = 163,
+	CG_DOBJCREATE                          = 164,
+	CG_SAFEDOBJFREE                        = 165,
+	CG_DEREF_DWORD                         = 166,
+	CG_DOBJGETSKELSIZE                     = 167,
+	CG_DOBJCREATESKELFORBONE               = 168,
+	CG_DOBJCREATESKELFORBONES              = 169,
+	CG_DOBJGETHIERARCHYBITS                = 170,
+	CG_DOBJCALCSKEL                        = 171,
+	CG_XMODELEXISTS                        = 172,
+	CG_DOBJNUMPARTS                        = 173,
+	CG_DOBJGETBONEINDEX                    = 174,
+	CG_DOBJGETBONENAME                     = 175,
+	CG_DOBJBUILDPARTCOLLISIONTABLE         = 176,
+	CG_DOBJGETTREE                         = 177,
+	CG_XANIMISPRIMITIVE                    = 178,
+	CG_XANIMGETLENGTH                      = 179,
+	CG_XANIMHASTIME                        = 180,
+	CG_XANIMGETNUMCHILDREN                 = 181,
+	CG_XANIMGETCHILDAT                     = 182,
+	CG_XANIMGETANIMTREESIZE                = 183,
+	CG_XANIMCOPYTREE                       = 184,
+	CG_DOBJDUMPINFO                        = 185,   // developer only
+	CG_STATMON_WARNING                     = 186,
+	CG_STATMON_GETSTATSARRAY               = 187,
 	CG_Z_MALLOCINTERNAL                    = 188,
 	CG_Z_FREEINTERNAL                      = 189,
 	CG_COM_LOADSOUNDALIASES                = 190,
-	CG_COM_SOUNDALIASSTRING                = 191,   /* Com_FindSoundAlias */
+	CG_COM_SOUNDALIASSTRING                = 191,
 	CG_COM_PICKSOUNDALIAS                  = 192,
 	CG_COM_GETSOUNDALIAS                   = 193,
 	CG_MSS_PLAYSOUNDALIAS                  = 194,
 	CG_MSS_PLAYBLENDEDSOUNDALIASES         = 195,
 	CG_SURFACETYPEFROMNAME                 = 196,
 	CG_SURFACETYPETONAME                   = 197,
-	CG_ADD_DEBUG_LINE                      = 198,   /* CL_AddDebugLine; spelling from cl_cgame_mp.c */
-	CG_GETWEAPONINFOMEMORY                 = 199,   /* Com_GetWeaponInfoMemory */
-	CG_SYSCALL_0XC8                        = 200,   /* Com_FreeWeaponInfoMemory */
-	CG_SYSCALL_0XC9                        = 201,   /* Hunk_AllocAlignInternal( size, 32 ) */
-	CG_HUNKALLOCLOWINTERNAL                = 202,   /* Hunk_AllocLowAlignInternal( size, 32 ) */
-	CG_SYSCALL_0XCB                        = 203,   /* Hunk_AllocAlignInternal */
-	CG_HUNKALLOCLOWALIGNINTERNAL           = 204,   /* Hunk_AllocLowAlignInternal */
-	CG_SYSCALL_0XCD                        = 205,   /* no-op in retail */
-	CG_SYSCALL_0XCE                        = 206,   /* no-op in retail */
-	CG_SYSCALL_0XCF                        = 207,   /* deref a global dword */
-	CG_SYSCALL_0XD0                        = 208,   /* cgameClientLerpOrigin */
-	CG_SYSCALL_0XD1                        = 209,   /* MSS_SetListener */
-	CG_SYSCALL_0XD2                        = 210,   /* MSS_UpdateLoopingSounds */
-	CG_SYSCALL_0XD3                        = 211,   /* MSS_StopSounds */
-	CG_SYSCALL_0XD4                        = 212,   /* MSS_PlayMusicAlias */
-	CG_SYSCALL_0XD5                        = 213,   /* MSS_StopBackground */
-	CG_SYSCALL_0XD6                        = 214,   /* MSS_PlayAmbientAlias */
-	CG_SYSCALL_0XD7                        = 215,   /* MSS_FadeAllSounds */
-	CG_SYSCALL_0XD8                        = 216,   /* MSS_FadeSelectSounds */
-	CG_SYSCALL_0XD9                        = 217,   /* MSS_SetEnvironmentEffects */
+	CG_ADD_DEBUG_LINE                      = 198,
+	CG_GETWEAPONINFOMEMORY                 = 199,
+	CG_FREEWEAPONINFOMEMORY                = 200,
+	CG_HUNK_ALLOCINTERNAL                  = 201,   // 32 byte aligned
+	CG_HUNKALLOCLOWINTERNAL                = 202,   // 32 byte aligned
+	CG_HUNK_ALLOCALIGNINTERNAL             = 203,
+	CG_HUNKALLOCLOWALIGNINTERNAL           = 204,
+	CG_SCR_GETNUMVARS                      = 205,
+	CG_SCR_GETNUMTHREADS                   = 206,
+	CG_SCR_GETSTRINGUSAGE                  = 207,
+	CG_SETCLIENTLERPORIGIN                 = 208,
+	CG_MSS_SETLISTENER                     = 209,
+	CG_MSS_UPDATELOOPINGSOUNDS             = 210,
+	CG_MSS_STOPSOUNDS                      = 211,
+	CG_MSS_PLAYMUSICALIAS                  = 212,
+	CG_MSS_STOPBACKGROUND                  = 213,
+	CG_MSS_PLAYAMBIENTALIAS                = 214,
+	CG_MSS_FADEALLSOUNDS                   = 215,
+	CG_MSS_FADESELECTSOUNDS                = 216,
+	CG_MSS_SETENVIRONMENTEFFECTS           = 217,
 	CG_MSS_GETSOUNDOVERLAY                 = 218,
 	CG_KEY_GETBINDINGBUF                   = 219,
 	CG_KEY_SETBINDING                      = 220,
 	CG_KEY_KEYNUMTOSTRINGBUF               = 221,
-	CG_SYSCALL_0XDE                        = 222,   /* CFxScheduler::RegisterEffect */
-	CG_SYSCALL_0XDF                        = 223,   /* FX_GetBoneIndex */
-	CG_SYSCALL_0XE0                        = 224,   /* CFxScheduler::PlayEffect( name, simple ) */
-	CG_SYSCALL_0XE1                        = 225,   /* CFxScheduler::PlayEffect( name ) */
-	CG_SYSCALL_0XE2                        = 226,   /* CFxScheduler::PlayEffect( name, bolt ) */
-	CG_SYSCALL_0XE3                        = 227,   /* CFxScheduler::PlayEffect( id, simple ) */
-	CG_SYSCALL_0XE4                        = 228,   /* FX_PlayEffectID */
-	CG_SYSCALL_0XE5                        = 229,   /* CFxScheduler::PlayEffect( id, axis ) */
-	CG_SYSCALL_0XE6                        = 230,   /* CFxScheduler::AddScheduledEffects */
-	CG_SYSCALL_0XE7                        = 231,   /* FX_Init */
-	CG_SYSCALL_0XE8                        = 232,   /* FX_Free( 1 ) */
-	CG_SYSCALL_0XE9                        = 233,   /* FX_Free( 0 ) */
-	CG_SYSCALL_0XEA                        = 234,   /* SFxHelper::AdjustTime */
-	CG_SYSCALL_0XEB                        = 235,   /* SFxHelper::AdjustCamera */
-	CG_SYSCALL_0XEC                        = 236,   /* no engine case -- dead */
-	CG_SYSCALL_0XED                        = 237,   /* no engine case -- dead */
-	CG_SYSCALL_0XEE                        = 238,   /* no engine case -- dead */
-	CG_SYSCALL_0XEF                        = 239,   /* no engine case -- dead */
-	CG_SYSCALL_0XF0                        = 240,   /* two cgame-owned engine dwords */
-	CG_SYSCALL_0XF1                        = 241    /* CL_FirstSnapshot */
+	CG_FX_REGISTEREFFECT                   = 222,
+	CG_FX_GETBONEINDEX                     = 223,
+	CG_FX_PLAYSIMPLEEFFECT                 = 224,
+	CG_FX_PLAYEFFECT                       = 225,
+	CG_FX_PLAYBOLTEDEFFECT                 = 226,
+	CG_FX_PLAYSIMPLEEFFECTID               = 227,
+	CG_FX_PLAYEFFECTID                     = 228,
+	CG_FX_PLAYORIENTEDEFFECTID             = 229,
+	CG_FX_ADDSCHEDULEDEFFECTS              = 230,
+	CG_FX_INIT                             = 231,
+	CG_FX_FREEALL                          = 232,
+	CG_FX_FREEEFFECTS                      = 233,
+	CG_FX_ADJUSTTIME                       = 234,
+	CG_FX_ADJUSTCAMERA                     = 235,
+	CG_UNUSED_236                          = 236,   // no engine case
+	CG_UNUSED_237                          = 237,   // no engine case
+	CG_UNUSED_238                          = 238,   // no engine case
+	CG_UNUSED_239                          = 239,   // no engine case
+	CG_SETMOUSEMAXSPEEDS                   = 240,
+	CG_CL_FIRSTSNAPSHOT                    = 241
 } cgameImport_t;
 
 /*
-=============================================================================
+==================================================================
 
-	THE ENTRY POINTS
+functions exported to the main executable
 
-	Numbering is vmMain's own switch (0x300203B0).  Only the members whose
-	spelling the engine side already uses on a VM_Call site are named:
-	client_mp/cl_vm.h has 1 and 5-8, cl_cgame_mp.c has 0 and 16,
-	cl_net_chan_mp.c has 15, and 2, 3 and 4 keep RTCW's spelling because
-	vmMain dispatches them to CG_ConsoleCommand, CG_DrawActiveFrame and
-	CG_CrosshairPlayer.
-
-	vmMain also answers 9 through 14, 17 and 18.  They have no name on the
-	engine side, so they are left out rather than invented:
-
-		 9  returns an element of the cgame's game-model table
-		    (CG_GetGameModel, retail 0x004118B0)
-		10  CG_DObjCalcPose            (retail 0x004118D0)
-		11  CG_DObjCalcBoneGeneric
-		12  CG_GetDObjOrientation
-		13  CG_GetEntityOrientation
-		14  CG_ImpactMark
-		17  CL_SaveCgameState's tail    (retail returns 0)
-		18  CL_RestoreCgameState's tail (retail returns 0)
-
-	5 and 8 exist only as `return 0` in retail: vmMain shares one exit for
-	both.  The engine still calls them.
-
-=============================================================================
+==================================================================
 */
 
 typedef enum
 {
 	CG_INIT                 = 0,
+//	void CG_Init( int serverMessageNum, int serverCommandSequence, int clientNum )
+	// called when the level loads or when the renderer is restarted
+	// all media should be registered at this time
+	// cgame will display loading status by calling SCR_Update, which
+	// will call CG_DrawInformation during the loading process
+	// reliableCommandSequence will be 0 on fresh loads, but higher for
+	// demos, tourney restarts, or vid_restarts
+
 	CG_SHUTDOWN             = 1,
+//	void (*CG_Shutdown)( void );
+	// oportunity to flush and close any open files
+
 	CG_CONSOLE_COMMAND      = 2,
+//	qboolean (*CG_ConsoleCommand)( void );
+	// a console command has been issued locally that is not recognized by the
+	// main game system.
+	// use Cmd_Argc() / Cmd_Argv() to read the command, return qfalse if the
+	// command is not known to the game
+
 	CG_DRAW_ACTIVE_FRAME    = 3,
+	// Generates and draws a game scene and status information at the given time.
+	// If demoPlayback is set, local movement prediction will not be enabled
+
 	CG_CROSSHAIR_PLAYER     = 4,
+//	int (*CG_CrosshairPlayer)( void );
+
 	CG_KEY_EVENT            = 5,
-	CG_CHECK_EXEC_KEY       = 6,    /* CG_KeyInterceptEvent */
+	CG_CHECK_EXEC_KEY       = 6,    // CG_KeyInterceptEvent
 	CG_MOUSE_EVENT          = 7,
 	CG_EVENT_HANDLING       = 8,
-	CG_PROFILE_DRAW_TRAP    = 15,   /* CG_DrawStringExt */
+	// 9-14, 17 and 18 are game model, DObj and impact mark callbacks
+	CG_PROFILE_DRAW_TRAP    = 15,   // CG_DrawStringExt
 	CG_SCRIPT_HOOK          = 16
 } cgameExport_t;
 
-#endif  /* __CG_PUBLIC_H__ */
+#endif  // __CG_PUBLIC_H__

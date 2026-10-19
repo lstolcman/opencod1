@@ -1,26 +1,6 @@
 /*
- * g_scr_mover_mp.c -- the script-driven mover.
- *
- * script_brushmodel / script_model / script_origin are CoD's own entities;
- * nothing in RTCW or Q3 corresponds to them.  A script mover is not a binary
- * mover: it has no pos1/pos2 state machine and no use function.  Script code
- * calls moveto/movex/rotateto/... on it and the entity walks a three-phase
- * trajectory -- TR_ACCELERATE, then TR_LINEAR_STOP, then TR_DECCELERATE --
- * re-armed a phase at a time by Reached_ScriptMover, which fires the
- * "movedone" / "rotatedone" notifies when the last phase ends.
- *
- * The phase state lives in gentity_t fields the binary mover uses for other
- * things.  Linear side: pos1 is where the accel phase ends, pos2 where the
- * decel phase starts, pos3 the destination; speed / wait / delay hold the
- * cruise speed, the linear-phase duration and the decel duration.  Angular
- * side is the same six roles in movedir / rotate / TargetAngles and
- * closespeed / angle / random.  That overloading is the original's:
- * ScriptMover_Move (0x20035DF0) and ScriptMover_Rotate (0x20035EC0) differ
- * only in which field of each pair they pass.
- *
- * Function order is binary order (0x200354A0 .. 0x200369E0).
- *
- * @fidelity: likely
+ * g_scr_mover_mp.c -- script_brushmodel / script_model / script_origin and the
+ * script methods that move and rotate them
  */
 
 #include "g_local.h"
@@ -30,59 +10,21 @@
 
 /* Declarations that belong in a shared header. */
 
-#define PITCH   0
-#define YAW     1
-#define ROLL    2
-
-/* Reached_ScriptMover 0x20035754..0x20035787: ANGLE2SHORT is one
-   `fmul 182.044` (65536/360 folded) then ftol and `and eax, 0FFFFh`, so the
-   yaw round-trips through an unsigned short. */
-#define ANGLE2SHORT( x )    ( (int)( ( x ) * ( 65536 / 360.0f ) ) & 65535 )
-#define SHORT2ANGLE( x )    ( ( x ) * ( 360.0f / 65536 ) )
-
-/* trajectory_t.trType.  0/1/2/3/4 are g_mover_mp.c's set; 5/9/10 are
-   used by InitScriptMover's siblings below. */
-#define TR_STATIONARY           0
-#define TR_LINEAR_STOP          3
-#define TR_GRAVITY              5
-#define TR_ACCELERATE           9
-#define TR_DECCELERATE          10
-
-/* entityState_t.eType.  InitScriptMover 0x200360D0. */
-#define ET_SCRIPTMOVER          8
-
-/* entityShared_t.svFlags.  4 is only ever set by SP_script_model
-   (0x2003613E); the name is inferred from United Offensive, which calls the
-   same bit SVF_DOBJ_USE_MODEL_BOUNDS --
-   consistent with it riding along with G_DObjUpdate, but nothing in this DLL
-   reads it. */
-#define SVF_NOCLIENT                1
+/* entityShared_t.svFlags; set by SP_script_model only */
 #define SVF_DOBJ_USE_MODEL_BOUNDS   4
-#define SVF_USE_CURRENT_ORIGIN      0x00000080
 
-/* entityState_t.eFlags.  SP_script_origin 0x2003618A is the only site in the
-   module; the name is inferred (United Offensive's EF_NODRAW is
-   0x80 there, so the bit was renumbered or this is a different flag). */
-#define EF_NODRAW               0x00000100
-
-/* gentity_t.flags.  0x2000 is set here and by ClientSpawn (0x2001A174) and
-   read nowhere in this DLL -- the linkto path outside the module consumes it;
-   the name is inferred from United Offensive's. */
-#define FL_TEAMSLAVE            0x00000004
-#define FL_SUPPORTS_LINKTO      0x00002000
-
-/* entityShared_t.contents.  0x2080 has no recovered name. */
-#define CONTENTS_SOLID          0x00000001
-#define SCRIPT_MODEL_CONTENTS   0x00002080
+/* entityShared_t.contents of a script_model: it stops shots and missiles. */
+#define SCRIPT_MODEL_CONTENTS   ( CONTENTS_CLIPSHOT | CONTENTS_MISSILECLIP )
 
 /* forward: q_math.c */
 float   AngleSubtract( float a1, float a2 );
+float   AngleNormalize360( float angle );
 float   AngleNormalize180( float angle );
 
 /*
- * The script method table's entry type.  g_scr_main_mp.c's Scr_GetMethod
- * (0x20034D00) chains Player_GetMethod -> ScriptEnt_GetMethod ->
- * HudElem_GetMethod -> BuiltIn_GetMethod, all with this shape.
+ * The script method table's entry type.  Scr_GetMethod chains
+ * Player_GetMethod -> ScriptEnt_GetMethod -> HudElem_GetMethod ->
+ * BuiltIn_GetMethod, all with this shape.
  */
 typedef void ( *xmethod_t )( int entnum );
 
@@ -99,12 +41,11 @@ ScriptMover_Updatemove
 Advances one trajectory to its next phase.  Returns qtrue when the move is
 finished, which is what makes Reached_ScriptMover fire the notify.
 
-`current` is passed by every call site and read by none; the parameter slot
-at [esp+20h] is never touched (0x200354A0).
+keep: current is unused; it and the parameter order match original codegen
 ================
 */
-static qboolean ScriptMover_Updatemove( const vec3_t decelStart, trajectory_t *tr, const vec3_t accelEnd,
-										vec3_t current, float speed, float linearTime, float decelTime,
+static qboolean ScriptMover_Updatemove( trajectory_t *tr, vec3_t current, float speed, float linearTime,
+										float decelTime, const vec3_t accelEnd, const vec3_t decelStart,
 										const vec3_t target ) {
 	vec3_t delta;
 	float f;
@@ -131,7 +72,8 @@ static qboolean ScriptMover_Updatemove( const vec3_t decelStart, trajectory_t *t
 		VectorSubtract( target, decelStart, delta );
 		VectorNormalize( delta );
 		tr->trType = TR_DECCELERATE;
-		VectorScale( delta, speed, tr->trDelta );
+		VectorScale( delta, speed, delta );     // keep: scaled in place, then copied, to match original codegen
+		VectorCopy( delta, tr->trDelta );
 		return qfalse;
 	}
 
@@ -157,31 +99,31 @@ void Reached_ScriptMover( gentity_t *ent ) {
 	qboolean done;
 
 	if ( ent->s.pos.trType != TR_STATIONARY ) {
-		if ( level.time >= ent->s.pos.trTime + ent->s.pos.trDuration ) {
-			done = ScriptMover_Updatemove( ent->pos2, &ent->s.pos, ent->pos1, ent->r.currentOrigin,
-										   ent->speed, ent->wait, ent->delay, ent->pos3 );
+		if ( ent->s.pos.trTime + ent->s.pos.trDuration <= level.time ) {
+			done = ScriptMover_Updatemove( &ent->s.pos, ent->r.currentOrigin, ent->speed, ent->wait, ent->delay,
+										   ent->pos1, ent->pos2, ent->pos3 );
 			BG_EvaluateTrajectory( &ent->s.pos, level.time, ent->r.currentOrigin );
 			trap_LinkEntity( ent );
 
 			if ( done ) {
-				Scr_NotifyNum( ent->s.number, 0, scr_const.movedone, 0 );
+				Scr_NotifyNum( ent->s.number, SCR_CLASS_ENTITY, scr_const.movedone, 0 );
 			}
 		}
 	}
 
 	if ( ent->s.apos.trType != TR_STATIONARY ) {
-		if ( level.time >= ent->s.apos.trTime + ent->s.apos.trDuration ) {
-			done = ScriptMover_Updatemove( ent->rotate, &ent->s.apos, ent->movedir, ent->r.currentAngles,
-										   ent->closespeed, ent->angle, ent->random, ent->TargetAngles );
+		if ( ent->s.apos.trTime + ent->s.apos.trDuration <= level.time ) {
+			done = ScriptMover_Updatemove( &ent->s.apos, ent->r.currentAngles, ent->closespeed, ent->angle,
+										   ent->random, ent->movedir, ent->rotate, ent->TargetAngles );
 			BG_EvaluateTrajectory( &ent->s.apos, level.time, ent->r.currentAngles );
 			trap_LinkEntity( ent );
 
 			if ( done ) {
 				ent->r.currentAngles[PITCH] = AngleNormalize180( ent->r.currentAngles[PITCH] );
-				ent->r.currentAngles[YAW] = SHORT2ANGLE( ANGLE2SHORT( ent->r.currentAngles[YAW] ) );
+				ent->r.currentAngles[YAW] = AngleNormalize360( ent->r.currentAngles[YAW] );
 				ent->r.currentAngles[ROLL] = AngleNormalize180( ent->r.currentAngles[ROLL] );
 
-				Scr_NotifyNum( ent->s.number, 0, scr_const.rotatedone, 0 );
+				Scr_NotifyNum( ent->s.number, SCR_CLASS_ENTITY, scr_const.rotatedone, 0 );
 			}
 		}
 	}
@@ -192,7 +134,11 @@ void Reached_ScriptMover( gentity_t *ent ) {
 ScriptMover_SetupMove
 
 Arms the first phase of a move to `point` over `time` seconds, and records
-what the later phases need in the caller's six fields.
+what the later phases need in the caller's six fields: the cruise speed, the
+linear-phase duration, the decel duration, where the accel phase ends, where
+the decel phase starts and the destination.  Moves use speed / wait / delay
+and pos1 / pos2 / pos3; rotations use closespeed / angle / random and
+movedir / rotate / TargetAngles.
 ================
 */
 static void ScriptMover_SetupMove( trajectory_t *tr, const vec3_t point, float time, float accelTime,
@@ -200,13 +146,11 @@ static void ScriptMover_SetupMove( trajectory_t *tr, const vec3_t point, float t
 								   float *decelTimeOut, vec3_t accelEnd, vec3_t decelStart, vec3_t target ) {
 	vec3_t delta;
 	vec3_t dir;
-	vec3_t move;
-	float dist;
+	rfloat dist;
 	float f;
 
-	/* the delta is taken against the OLD current position and the trajectory
-	   snap below then moves it -- 0x200357CE..0x200357FA, the loads are all
-	   ahead of the call */
+	// the delta is taken against the old current position, before the
+	// trajectory snap below moves it
 	VectorSubtract( point, current, delta );
 
 	if ( tr->trType != TR_STATIONARY ) {
@@ -231,7 +175,8 @@ static void ScriptMover_SetupMove( trajectory_t *tr, const vec3_t point, float t
 	*decelTimeOut = decelTime;
 
 	// cruise speed: the accel and decel phases each cover half their time's worth
-	dist = VectorLength( delta );
+	// keep: VectorLength written out to match original codegen
+	dist = sqrt( (rfloat)delta[0] * delta[0] + (rfloat)delta[1] * delta[1] + (rfloat)delta[2] * delta[2] );
 	*speed = ( dist + dist ) / ( time + time - accelTime - decelTime );
 
 	VectorNormalize2( delta, dir );
@@ -251,10 +196,10 @@ static void ScriptMover_SetupMove( trajectory_t *tr, const vec3_t point, float t
 			tr->trTime = level.time;
 			tr->trDuration = *linearTime * 1000;
 			VectorCopy( current, tr->trBase );
-			VectorScale( dir, *linearTime, move );
+			VectorScale( dir, *linearTime, delta );     // keep: delta reused to match original codegen
 			tr->trType = TR_LINEAR_STOP;
 			f = 1000.0f / tr->trDuration;
-			VectorScale( move, f, tr->trDelta );
+			VectorScale( delta, f, tr->trDelta );
 		} else {
 			tr->trTime = level.time;
 			tr->trDuration = *decelTimeOut * 1000;
@@ -302,7 +247,8 @@ static void ScriptMover_SetupMoveSpeed( trajectory_t *tr, const vec3_t velocity,
 
 	*linearTime = time - accelTime - decelTime;
 	*decelTimeOut = decelTime;
-	*speed = VectorLength( velocity );
+	// keep: VectorLength written out, with the cast, to match original codegen
+	*speed = ( (float)sqrt( velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2] ) );
 
 	if ( accelTime != 0 ) {
 		tr->trTime = level.time;
@@ -331,15 +277,15 @@ static void ScriptMover_SetupMoveSpeed( trajectory_t *tr, const vec3_t velocity,
 
 	VectorMA( accelEnd, *linearTime, velocity, decelStart );
 
-	if ( *decelTimeOut == 0 ) {
-		VectorCopy( decelStart, target );
-	} else {
+	if ( *decelTimeOut != 0 ) {
 		decel.trType = TR_DECCELERATE;
 		decel.trTime = level.time;
 		decel.trDuration = *decelTimeOut * 1000;
 		VectorCopy( decelStart, decel.trBase );
 		VectorCopy( velocity, decel.trDelta );
 		BG_EvaluateTrajectory( &decel, level.time + decel.trDuration, target );
+	} else {
+		VectorCopy( decelStart, target );
 	}
 
 	BG_EvaluateTrajectory( tr, level.time, current );
@@ -362,13 +308,16 @@ ScriptMover_GravityMove
 ================
 */
 static void ScriptMover_GravityMove( gentity_t *ent, const vec3_t velocity, float time ) {
-	ent->s.pos.trTime = level.time;
-	ent->s.pos.trDuration = time * 1000;
-	VectorCopy( ent->r.currentOrigin, ent->s.pos.trBase );
-	VectorCopy( velocity, ent->s.pos.trDelta );
-	ent->s.pos.trType = TR_GRAVITY;
+	trajectory_t *tr;
 
-	BG_EvaluateTrajectory( &ent->s.pos, level.time, ent->r.currentOrigin );
+	tr = &ent->s.pos;
+	tr->trTime = level.time;
+	tr->trDuration = time * 1000;
+	VectorCopy( ent->r.currentOrigin, tr->trBase );
+	VectorCopy( velocity, tr->trDelta );
+	tr->trType = TR_GRAVITY;
+
+	BG_EvaluateTrajectory( tr, level.time, ent->r.currentOrigin );
 	trap_LinkEntity( ent );
 }
 
@@ -491,31 +440,39 @@ void SP_script_origin( gentity_t *ent ) {
 
 /*
 ================
-ScriptEnt_GetScriptMover
+GET_SCRIPT_MOVER
 
 The entity-number check and the classname check every method below starts
-with.  LTCG inlined it into all eight call sites, so it has no address of its
-own; the name is inferred.
+with.
+
+keep: a macro, with this block order and the separate moverEnt local, to
+match original codegen
 ================
 */
-static gentity_t *ScriptEnt_GetScriptMover( int entnum ) {
-	gentity_t   *ent;
-
-	if ( (unsigned int)entnum >= MAX_GENTITIES ) {
-		Scr_Error( va( "%i is not a valid entity number", entnum ) );
-		return NULL;
-	}
-
-	ent = &g_entities[entnum];
-
-	if ( ent->classname != scr_const.script_brushmodel
-		 && ent->classname != scr_const.script_model
-		 && ent->classname != scr_const.script_origin ) {
-		Scr_Error( va( "entity %i is not a script_brushmodel, script_model, or script_origin", entnum ) );
-	}
-
-	return ent;
-}
+#define GET_SCRIPT_MOVER( ent, entnum ) \
+	do { \
+		gentity_t   *moverEnt; \
+		if ( (unsigned int)( entnum ) < MAX_GENTITIES ) { \
+			moverEnt = &g_entities[( entnum )]; \
+			if ( moverEnt->classname == scr_const.script_brushmodel ) { \
+				( ent ) = moverEnt; \
+				break; \
+			} \
+			if ( moverEnt->classname == scr_const.script_model ) { \
+				( ent ) = moverEnt; \
+				break; \
+			} \
+			if ( moverEnt->classname == scr_const.script_origin ) { \
+				( ent ) = moverEnt; \
+				break; \
+			} \
+			Scr_Error( va( "entity %i is not a script_brushmodel, script_model, or script_origin", ( entnum ) ) ); \
+			( ent ) = moverEnt; \
+			break; \
+		} \
+		Scr_Error( va( "%i is not a valid entity number", ( entnum ) ) ); \
+		( ent ) = NULL; \
+	} while ( 0 )
 
 /*
 ================
@@ -534,23 +491,23 @@ static void ScriptEntCmdGetCommandTimes( float *totalTime, float *accelTime, flo
 	}
 
 	numParam = Scr_GetNumParam();
-	if ( numParam < 3 ) {
-		*accelTime = 0;
-		*decelTime = 0;
-	} else {
+	if ( numParam > 2 ) {
 		*accelTime = Scr_GetFloat( 2 );
 		if ( *accelTime < 0 ) {
 			Scr_ParamError( 2, "accel time must be nonnegative" );
 		}
 
-		if ( numParam < 4 ) {
-			*decelTime = 0;
-		} else {
+		if ( numParam > 3 ) {
 			*decelTime = Scr_GetFloat( 3 );
 			if ( *decelTime < 0 ) {
 				Scr_ParamError( 3, "decel time must be nonnegative" );
 			}
+		} else {
+			*decelTime = 0;
 		}
+	} else {
+		*accelTime = 0;
+		*decelTime = 0;
 	}
 
 	if ( *accelTime + *decelTime > *totalTime ) {
@@ -561,6 +518,8 @@ static void ScriptEntCmdGetCommandTimes( float *totalTime, float *accelTime, flo
 /*
 ================
 ScriptEntCmd_MoveTo
+
+moveto( point, time [, accelTime, decelTime] ): move to point over time seconds.
 ================
 */
 void ScriptEntCmd_MoveTo( int entnum ) {
@@ -568,7 +527,7 @@ void ScriptEntCmd_MoveTo( int entnum ) {
 	vec3_t point;
 	float time, accelTime, decelTime;
 
-	ent = ScriptEnt_GetScriptMover( entnum );
+	GET_SCRIPT_MOVER( ent, entnum );
 
 	if ( ent->flags & FL_TEAMSLAVE ) {
 		return;
@@ -583,6 +542,8 @@ void ScriptEntCmd_MoveTo( int entnum ) {
 /*
 ================
 ScriptEntCmd_GravityMove
+
+movegravity( velocity, time ): launch along a gravity arc for time seconds.
 ================
 */
 void ScriptEntCmd_GravityMove( int entnum ) {
@@ -590,7 +551,7 @@ void ScriptEntCmd_GravityMove( int entnum ) {
 	vec3_t velocity;
 	float time;
 
-	ent = ScriptEnt_GetScriptMover( entnum );
+	GET_SCRIPT_MOVER( ent, entnum );
 
 	if ( ent->flags & FL_TEAMSLAVE ) {
 		return;
@@ -605,6 +566,8 @@ void ScriptEntCmd_GravityMove( int entnum ) {
 /*
 ================
 ScriptEnt_MoveAxis
+
+Shared by movex / movey / movez: move dist units along one world axis.
 ================
 */
 static void ScriptEnt_MoveAxis( int entnum, int axis ) {
@@ -613,7 +576,7 @@ static void ScriptEnt_MoveAxis( int entnum, int axis ) {
 	float dist;
 	float time, accelTime, decelTime;
 
-	ent = ScriptEnt_GetScriptMover( entnum );
+	GET_SCRIPT_MOVER( ent, entnum );
 
 	if ( ent->flags & FL_TEAMSLAVE ) {
 		return;
@@ -631,6 +594,8 @@ static void ScriptEnt_MoveAxis( int entnum, int axis ) {
 /*
 ================
 ScriptEntCmd_MoveX
+
+movex( dist, time [, accelTime, decelTime] )
 ================
 */
 void ScriptEntCmd_MoveX( int entnum ) {
@@ -640,6 +605,8 @@ void ScriptEntCmd_MoveX( int entnum ) {
 /*
 ================
 ScriptEntCmd_MoveY
+
+movey( dist, time [, accelTime, decelTime] )
 ================
 */
 void ScriptEntCmd_MoveY( int entnum ) {
@@ -649,6 +616,8 @@ void ScriptEntCmd_MoveY( int entnum ) {
 /*
 ================
 ScriptEntCmd_MoveZ
+
+movez( dist, time [, accelTime, decelTime] )
 ================
 */
 void ScriptEntCmd_MoveZ( int entnum ) {
@@ -658,6 +627,9 @@ void ScriptEntCmd_MoveZ( int entnum ) {
 /*
 ================
 ScriptEntCmd_RotateTo
+
+rotateto( angles, time [, accelTime, decelTime] ): rotate to angles over time
+seconds, taking the short way round on each axis.
 ================
 */
 void ScriptEntCmd_RotateTo( int entnum ) {
@@ -667,7 +639,7 @@ void ScriptEntCmd_RotateTo( int entnum ) {
 	float time, accelTime, decelTime;
 	int i;
 
-	ent = ScriptEnt_GetScriptMover( entnum );
+	GET_SCRIPT_MOVER( ent, entnum );
 
 	if ( ent->flags & FL_TEAMSLAVE ) {
 		return;
@@ -690,6 +662,8 @@ void ScriptEntCmd_RotateTo( int entnum ) {
 /*
 ================
 ScriptEnt_RotateAxis
+
+Shared by rotatepitch / rotateyaw / rotateroll: rotate by degrees about one axis.
 ================
 */
 static void ScriptEnt_RotateAxis( int entnum, int axis ) {
@@ -698,7 +672,7 @@ static void ScriptEnt_RotateAxis( int entnum, int axis ) {
 	float degrees;
 	float time, accelTime, decelTime;
 
-	ent = ScriptEnt_GetScriptMover( entnum );
+	GET_SCRIPT_MOVER( ent, entnum );
 
 	if ( ent->flags & FL_TEAMSLAVE ) {
 		return;
@@ -716,6 +690,8 @@ static void ScriptEnt_RotateAxis( int entnum, int axis ) {
 /*
 ================
 ScriptEntCmd_RotatePitch
+
+rotatepitch( degrees, time [, accelTime, decelTime] )
 ================
 */
 void ScriptEntCmd_RotatePitch( int entnum ) {
@@ -725,6 +701,8 @@ void ScriptEntCmd_RotatePitch( int entnum ) {
 /*
 ================
 ScriptEntCmd_RotateYaw
+
+rotateyaw( degrees, time [, accelTime, decelTime] )
 ================
 */
 void ScriptEntCmd_RotateYaw( int entnum ) {
@@ -734,6 +712,8 @@ void ScriptEntCmd_RotateYaw( int entnum ) {
 /*
 ================
 ScriptEntCmd_RotateRoll
+
+rotateroll( degrees, time [, accelTime, decelTime] )
 ================
 */
 void ScriptEntCmd_RotateRoll( int entnum ) {
@@ -743,6 +723,9 @@ void ScriptEntCmd_RotateRoll( int entnum ) {
 /*
 ================
 ScriptEntCmd_RotateVelocity
+
+rotatevelocity( velocity, time [, accelTime, decelTime] ): spin at velocity
+degrees per second for time seconds.
 ================
 */
 void ScriptEntCmd_RotateVelocity( int entnum ) {
@@ -750,7 +733,7 @@ void ScriptEntCmd_RotateVelocity( int entnum ) {
 	vec3_t velocity;
 	float time, accelTime, decelTime;
 
-	ent = ScriptEnt_GetScriptMover( entnum );
+	GET_SCRIPT_MOVER( ent, entnum );
 
 	if ( ent->flags & FL_TEAMSLAVE ) {
 		return;
@@ -765,12 +748,14 @@ void ScriptEntCmd_RotateVelocity( int entnum ) {
 /*
 ================
 ScriptEntCmd_Solid
+
+solid(): make a script_brushmodel solid.
 ================
 */
 void ScriptEntCmd_Solid( int entnum ) {
 	gentity_t   *ent;
 
-	ent = ScriptEnt_GetScriptMover( entnum );
+	GET_SCRIPT_MOVER( ent, entnum );
 
 	if ( ent->classname == scr_const.script_origin ) {
 		G_DPrintf( "cannot use the solid/notsolid commands on a script_origin entity" );
@@ -784,12 +769,14 @@ void ScriptEntCmd_Solid( int entnum ) {
 /*
 ================
 ScriptEntCmd_NotSolid
+
+notsolid(): make a script_brushmodel non-solid.
 ================
 */
 void ScriptEntCmd_NotSolid( int entnum ) {
 	gentity_t   *ent;
 
-	ent = ScriptEnt_GetScriptMover( entnum );
+	GET_SCRIPT_MOVER( ent, entnum );
 
 	if ( ent->classname == scr_const.script_origin ) {
 		G_DPrintf( "cannot use the solid/notsolid commands on a script_origin entity" );
@@ -800,7 +787,7 @@ void ScriptEntCmd_NotSolid( int entnum ) {
 	}
 }
 
-static const scr_method_t scriptEntMethods[] = {      /* 0x20055860 */
+static const scr_method_t scriptEntMethods[] = {
 	{ "moveto",         ScriptEntCmd_MoveTo         },
 	{ "movex",          ScriptEntCmd_MoveX          },
 	{ "movey",          ScriptEntCmd_MoveY          },
@@ -819,11 +806,11 @@ static const scr_method_t scriptEntMethods[] = {      /* 0x20055860 */
 ================
 ScriptEnt_GetMethod
 
-pDeveloper is never touched -- none of these methods is developer-only, and
-Scr_GetMethod has already cleared it before entering the chain.
+None of these methods is developer-only.  Scr_GetMethod clears that flag
+before entering the chain, so this lookup receives only the method name.
 ================
 */
-xmethod_t ScriptEnt_GetMethod( const char **pName, int *pDeveloper ) {
+xmethod_t ScriptEnt_GetMethod( const char **pName ) {
 	unsigned int i;
 
 	for ( i = 0; i < sizeof( scriptEntMethods ) / sizeof( scriptEntMethods[0] ); i++ ) {

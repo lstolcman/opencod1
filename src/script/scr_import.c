@@ -10,21 +10,12 @@
  */
 
 #include "scr_local.h"
-#include "../qcommon/hexrays_shim.h"
 
-#define FindNextSibling     cod1_globals_FindNextSibling_data
-#define FindObject          cod1_globals_FindObject_data
-#include "../qcommon/cod1_globals.h"
-#undef FindNextSibling
-#undef FindObject
 
-#define scrImport_GetFunction       scrImport_GetFunction    /* 0x008E5F04 */
-#define scrImport_GetMethod         scrImport_GetMethod    /* 0x008E5F08 */
-#define scrImport_SetObjectField    scrImport_SetObjectField    /* 0x008E5F0C */
-#define scrImport_GetObjectField    scrImport_GetObjectField    /* 0x008E5F10 */
-#define scrImport_LoadRead          scrImport_LoadRead    /* 0x008E5F14 */
+scrImport_t scrImport;          /* 0x008E5F04 */
 
 #define SCR_IMPORT_TABLE_SIZE       0x14
+COD1_ASSERT_SIZE( scrImport_t, SCR_IMPORT_TABLE_SIZE );
 
 enum {
 	SCR_EXP_GetBool = 0,            /* 0x008E5F18 */
@@ -92,12 +83,14 @@ enum {
 	SCR_EXP_Shutdown,               /* 0x008E6010 */
 	SCR_EXP_Abort,                  /* 0x008E6014 */
 	SCR_EXP_SetLoading,             /* 0x008E6018 */
-	/* AllocGameVariable is index 65 and InitSystem index 66: game_mp_x86.dll's
-	 * copy of this table (base 0x200A04F8) has J_Scr_AllocGameVariable
-	 * (0x2003F810) calling slot 0x200A05FC and j_Scr_InitSystem (0x2003F800)
-	 * calling slot 0x200A0600. */
-	SCR_EXP_AllocGameVariable,      /* 0x008E601C */
-	SCR_EXP_InitSystem,             /* 0x008E6020 */
+	/* Retail Scr_NearHook stores 0x47CBF0 (Scr_InitSystem(unused, time)) at
+	 * 0x8E601C and 0x475790 (Scr_AllocGameVariable(void)) at 0x8E6020.  The
+	 * game DLL's G_InitGame calls slot 0x200A05FC with (1, level.time) first,
+	 * then SetLoading(1), then slot 0x200A0600 with no args.  The game-side
+	 * names J_Scr_AllocGameVariable/j_Scr_InitSystem are swapped relative to
+	 * the engine functions these slots hold. */
+	SCR_EXP_InitSystem,             /* 0x008E601C  <- 0x0047CBF0 */
+	SCR_EXP_AllocGameVariable,      /* 0x008E6020  <- 0x00475790 */
 	SCR_EXP_GetChecksum,            /* 0x008E6024 */
 	SCR_EXP_HasSourceFiles,         /* 0x008E6028 */
 	SCR_EXP_SaveSource,             /* 0x008E602C */
@@ -160,7 +153,7 @@ extern int Scr_AddUndefined();
 extern int Scr_AddVector();
 extern int Scr_BeginLoadAnimTrees();
 extern int Scr_BeginLoadScripts();
-extern unsigned short Scr_ConvertThreadFromLoad( unsigned short saveId );
+extern unsigned short Scr_ConvertThreadFromLoad( unsigned int handle );
 extern int Scr_ConvertThreadToSave();
 extern int Scr_CopyEntityNum();
 extern int Scr_EndLoadAnimTrees();
@@ -208,7 +201,7 @@ extern int Scr_PrecacheAnimTrees();
 extern int Scr_ResetTimeout();
 extern int Scr_RunCurrentThreads();
 extern void Scr_SavePost( void );
-extern void Scr_SavePre( void );
+extern void Scr_SavePre( int sys );
 extern int Scr_SaveShutdown();
 extern int Scr_SaveSource();
 extern int Scr_SetDynamicEntityField();
@@ -243,15 +236,10 @@ int Scr_LoadRead( int len ) {
 }
 
 /* ---- Scr_NearHook  0x0046CEF0 ---- */
+/* Export stores follow retail's order, which is not slot order. */
 void *Scr_NearHook( const void *gameCallbacks ) {
 	if ( gameCallbacks ) {
-		int ( **src )() = (int ( ** )()) gameCallbacks;
-
-		scrImport_GetFunction    = src[0];
-		scrImport_GetMethod      = src[1];
-		scrImport_SetObjectField = src[2];
-		scrImport_GetObjectField = src[3];
-		scrImport_LoadRead       = src[4];
+		scrImport = *(const scrImport_t *)gameCallbacks;
 	}
 
 	scrExports[SCR_EXP_GetBool]                 = (scrExportFn_t)Scr_GetBool;
@@ -266,9 +254,9 @@ void *Scr_NearHook( const void *gameCallbacks ) {
 	scrExports[SCR_EXP_GetConstIString]         = (scrExportFn_t)Scr_GetConstIString;
 	scrExports[SCR_EXP_GetVector]               = (scrExportFn_t)Scr_GetVector;
 	scrExports[SCR_EXP_GetFunc]                 = (scrExportFn_t)Scr_GetFunc;
+	scrExports[SCR_EXP_GetEntityNum]            = (scrExportFn_t)Scr_GetEntityNum;
 	scrExports[SCR_EXP_GetType]                 = (scrExportFn_t)Scr_GetType;
 	scrExports[SCR_EXP_GetPointerType]          = (scrExportFn_t)Scr_GetPointerType;
-	scrExports[SCR_EXP_GetEntityNum]            = (scrExportFn_t)Scr_GetEntityNum;
 	scrExports[SCR_EXP_GetNumParam]             = (scrExportFn_t)Scr_GetNumParam;
 
 	scrExports[SCR_EXP_AddBool]                 = (scrExportFn_t)Scr_AddBool;
@@ -283,24 +271,9 @@ void *Scr_NearHook( const void *gameCallbacks ) {
 	scrExports[SCR_EXP_AddConstString]          = (scrExportFn_t)Scr_AddConstString;
 	scrExports[SCR_EXP_AddVector]               = (scrExportFn_t)Scr_AddVector;
 	scrExports[SCR_EXP_AddObject]               = (scrExportFn_t)Scr_AddObject;
+	scrExports[SCR_EXP_MakeArray]               = (scrExportFn_t)Scr_MakeArray;
 	scrExports[SCR_EXP_AddArray]                = (scrExportFn_t)Scr_AddArray;
 	scrExports[SCR_EXP_AddArrayStringIndexed]   = (scrExportFn_t)Scr_AddArrayStringIndexed;
-	scrExports[SCR_EXP_MakeArray]               = (scrExportFn_t)Scr_MakeArray;
-
-	scrExports[SCR_EXP_BeginLoadScripts]        = (scrExportFn_t)Scr_BeginLoadScripts;
-	scrExports[SCR_EXP_BeginLoadAnimTrees]      = (scrExportFn_t)Scr_BeginLoadAnimTrees;
-	scrExports[SCR_EXP_EndLoadScripts]          = (scrExportFn_t)Scr_EndLoadScripts;
-	scrExports[SCR_EXP_EndLoadAnimTrees]        = (scrExportFn_t)Scr_EndLoadAnimTrees;
-	scrExports[SCR_EXP_PrecacheAnimTrees]       = (scrExportFn_t)Scr_PrecacheAnimTrees;
-	scrExports[SCR_EXP_FreeScripts]             = (scrExportFn_t)Scr_FreeScripts;
-	scrExports[SCR_EXP_FreeGameVariable]        = (scrExportFn_t)Scr_FreeGameVariable;
-	scrExports[SCR_EXP_ShutdownSystem]          = (scrExportFn_t)Scr_ShutdownSystem;
-	scrExports[SCR_EXP_IsSystemActive]          = (scrExportFn_t)Scr_IsSystemActive;
-	scrExports[SCR_EXP_AddExecThread]           = (scrExportFn_t)Scr_AddExecThread;
-	scrExports[SCR_EXP_AddExecEntThreadNum]     = (scrExportFn_t)Scr_AddExecEntThreadNum;
-	scrExports[SCR_EXP_ExecThread]              = (scrExportFn_t)Scr_ExecThread;
-	scrExports[SCR_EXP_ExecEntThreadNum]        = (scrExportFn_t)Scr_ExecEntThreadNum;
-	scrExports[SCR_EXP_IsThreadAlive]           = (scrExportFn_t)Scr_IsThreadAlive;
 
 	scrExports[SCR_EXP_Error]                   = (scrExportFn_t)Scr_Error;
 	scrExports[SCR_EXP_ErrorWithDialogMessage]  = (scrExportFn_t)Scr_ErrorWithDialogMessage;
@@ -340,6 +313,22 @@ void *Scr_NearHook( const void *gameCallbacks ) {
 	scrExports[SCR_EXP_FindAnimTree]            = (scrExportFn_t)Scr_FindAnimTree;
 	scrExports[SCR_EXP_FindAnim]                = (scrExportFn_t)Scr_FindAnim;
 	scrExports[SCR_EXP_GetFunctionHandle]       = (scrExportFn_t)Scr_GetFunctionHandle;
+
+	scrExports[SCR_EXP_ExecThread]              = (scrExportFn_t)Scr_ExecThread;
+	scrExports[SCR_EXP_ExecEntThreadNum]        = (scrExportFn_t)Scr_ExecEntThreadNum;
+	scrExports[SCR_EXP_IsThreadAlive]           = (scrExportFn_t)Scr_IsThreadAlive;
+
+	scrExports[SCR_EXP_BeginLoadScripts]        = (scrExportFn_t)Scr_BeginLoadScripts;
+	scrExports[SCR_EXP_BeginLoadAnimTrees]      = (scrExportFn_t)Scr_BeginLoadAnimTrees;
+	scrExports[SCR_EXP_EndLoadScripts]          = (scrExportFn_t)Scr_EndLoadScripts;
+	scrExports[SCR_EXP_EndLoadAnimTrees]        = (scrExportFn_t)Scr_EndLoadAnimTrees;
+	scrExports[SCR_EXP_PrecacheAnimTrees]       = (scrExportFn_t)Scr_PrecacheAnimTrees;
+	scrExports[SCR_EXP_FreeScripts]             = (scrExportFn_t)Scr_FreeScripts;
+	scrExports[SCR_EXP_FreeGameVariable]        = (scrExportFn_t)Scr_FreeGameVariable;
+	scrExports[SCR_EXP_ShutdownSystem]          = (scrExportFn_t)Scr_ShutdownSystem;
+	scrExports[SCR_EXP_IsSystemActive]          = (scrExportFn_t)Scr_IsSystemActive;
+	scrExports[SCR_EXP_AddExecThread]           = (scrExportFn_t)Scr_AddExecThread;
+	scrExports[SCR_EXP_AddExecEntThreadNum]     = (scrExportFn_t)Scr_AddExecEntThreadNum;
 
 	scrExports[SCR_EXP_FreeThread]              = (scrExportFn_t)Scr_FreeThread;
 	scrExports[SCR_EXP_ConvertThreadToSave]     = (scrExportFn_t)Scr_ConvertThreadToSave;

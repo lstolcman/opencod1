@@ -7,31 +7,29 @@
 #include <string.h>
 #include <stdlib.h>
 
+extern void Hunk_FreeTempMemory( void *buf );   /* universal/com_memory.c */
+
 vm_t        *vm;                                /* retail 0x014073D0 */
-cvar_t      *sv_master[MAX_MASTER_SERVERS];
+cvar_t      *sv_master[MAX_MASTER_SERVERS];    /* retail 0x016BDB40 */
+int         sv_rollingServerId;                 /* retail 0x014073DC, rolling sv_serverid */
 
+/* Tree-only global, no longer registered or read: retail CoDMP.exe has no
+ * sv_debugSpawn cvar (SV_Init 0x00459130 ends at sv_mapRotationCurrent). */
 cvar_t      *sv_debugSpawn;
-
-/* Retail 0x004556E0 returns nothing -- see the note at its definition in sv_client_mp.c. Declared here for the NOT-RETAIL console command below. */
-extern void SV_AddTestClient( void );
-extern void SV_TestClientCommand_f( void );
-extern void SV_TestClientMove_f( void );
-extern void SV_TestDumpMissiles_f( void );
 
 extern void FS_ClearMemory( void );
 
-static const char       *sv_emptyString = "";
+/* Retail pushes the pooled "" literal (0x00559228), not a pointer variable. */
+#define sv_emptyString  ""
 
 /* ---- SV_SetConfigstring  0x00457BE0 ---- */
 void SV_SetConfigstring( unsigned int index, const char *val ) {
 	int i;
 	int len;
-	int offset;
-	const char  *cmd;
 	client_t    *client;
-	char chunk[MAX_STRING_CHARS];
 
-	if ( index >= MAX_CONFIGSTRINGS ) {
+	/* Retail 0x00457BFB tests the index signed (jl/jl). */
+	if ( (int)index < 0 || (int)index >= MAX_CONFIGSTRINGS ) {
 		Com_Error( ERR_DROP, "\x15SV_SetConfigstring: bad index %i\n", index );
 	}
 
@@ -46,36 +44,37 @@ void SV_SetConfigstring( unsigned int index, const char *val ) {
 	free( sv.configstrings[index] );
 	sv.configstrings[index] = CopyStringInternal( val );
 
-	if ( sv.state != SS_GAME && !sv.restarting ) {
-		return;
-	}
-
-	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		client = &svs.clients[i];
-		if ( client->state < CS_PRIMED ) {
-			continue;
-		}
-
-		len = strlen( val );
-		if ( len < 1000 ) {
-			SV_SendServerCommand( client, qtrue, "d %i %s", index, val );
-			continue;
-		}
-
-		offset = 0;
-		while ( len > 0 ) {
-			if ( offset == 0 ) {
-				cmd = "x";
-			} else if ( len >= 1000 ) {
-				cmd = "y";
-			} else {
-				cmd = "z";
+	if ( sv.state == SS_GAME || sv.restarting ) {
+		for ( i = 0, client = svs.clients ; i < sv_maxclients->integer ; i++, client++ ) {
+			if ( client->state < CS_PRIMED ) {
+				continue;
 			}
-			strncpy( chunk, val + offset, 999 );
-			chunk[999] = 0;
-			SV_SendServerCommand( client, qtrue, "%s %i %s", cmd, index, chunk );
-			offset += 999;
-			len -= 999;
+
+			len = strlen( val );
+			if ( len >= 1000 ) {
+				int sent = 0;
+				int remaining = len;
+				const char  *cmd;
+				char buf[MAX_STRING_CHARS];
+
+				while ( remaining > 0 ) {
+					if ( sent == 0 ) {
+						cmd = "x";
+					} else if ( remaining < 1000 ) {
+						cmd = "z";
+					} else {
+						cmd = "y";
+					}
+					Q_strncpyz( buf, &val[sent], 1000 );
+
+					SV_SendServerCommand( client, qtrue, "%s %i %s", cmd, index, buf );
+
+					sent += ( 1000 - 1 );
+					remaining -= ( 1000 - 1 );
+				}
+			} else {
+				SV_SendServerCommand( client, qtrue, "d %i %s", index, val );
+			}
 		}
 	}
 }
@@ -85,7 +84,8 @@ void SV_GetConfigstring( unsigned int index, char *buffer, int bufferSize ) {
 	if ( bufferSize < 1 ) {
 		Com_Error( ERR_DROP, "\x15SV_GetConfigstring: bufferSize == %i", bufferSize );
 	}
-	if ( index >= MAX_CONFIGSTRINGS ) {
+	/* Retail 0x00457E25 tests the index signed (jl/jl), like SV_SetConfigstring. */
+	if ( (int)index < 0 || (int)index >= MAX_CONFIGSTRINGS ) {
 		Com_Error( ERR_DROP, "\x15SV_GetConfigstring: bad index %i\n", index );
 	}
 
@@ -98,22 +98,27 @@ void SV_GetConfigstring( unsigned int index, char *buffer, int bufferSize ) {
 	buffer[bufferSize - 1] = 0;
 }
 
-/* ---- SV_GetConfigstringConst  0x00457E90 ---- */
-const char *SV_GetConfigstringConst( int max, int start, const char *key ) {
-	int i;
-	char    **cs;
-
-	if ( max <= 0 ) {
-		return sv_emptyString;
+/* ---- SV_GetConfigstringConstPtr_m  0x00457E70 ----
+ * The G_GET_CONFIGSTRING_CONST trap's worker: retail SV_GameSystemCalls
+ * tail-jumps here with the index in EAX (LTCG register argument). */
+const char *SV_GetConfigstringConstPtr_m( int index ) {
+	if ( sv.configstrings[index] ) {
+		return sv.configstrings[index];
 	}
+	return sv_emptyString;
+}
 
-	i = 0;
-	for ( cs = &sv.configstrings[start] ; **cs ; cs++ ) {
-		if ( !Q_stricmp( key, *cs ) ) {
-			return sv.configstrings[start + max + i];
+/* ---- SV_GetConfigstringConst  0x00457E90 ---- */
+const char *SV_GetConfigstringConst( int start, const char *key, int max ) {
+	int i;
+
+	for ( i = 0 ; i < max ; i++ ) {
+		if ( !sv.configstrings[start + i][0] ) {
+			break;
 		}
-		if ( ++i >= max ) {
-			return sv_emptyString;
+		/* Retail 0x00457EB1 calls the CRT _stricmp, not Q_stricmp. */
+		if ( !_stricmp( key, sv.configstrings[start + i] ) ) {
+			return sv.configstrings[start + max + i];
 		}
 	}
 
@@ -123,23 +128,15 @@ const char *SV_GetConfigstringConst( int max, int start, const char *key ) {
 /* ---- SV_SetConfigValueForKey  0x00457EF0 ---- */
 void SV_SetConfigValueForKey( int start, const char *key, const char *value, int max ) {
 	int i;
-	char    **cs;
 
-	i = 0;
-	if ( max > 0 ) {
-		cs = &sv.configstrings[start];
-		while ( **cs ) {
-			if ( !Q_stricmp( key, *cs ) ) {
-				break;
-			}
-			++i;
-			++cs;
-			if ( i >= max ) {
-				break;
-			}
+	for ( i = 0 ; i < max ; i++ ) {
+		if ( !sv.configstrings[start + i][0] ) {
+			SV_SetConfigstring( start + i, key );
+			break;
 		}
-		if ( i < max && !**cs ) {
-			SV_SetConfigstring( i + start, key );
+		/* Retail 0x00457F11 calls the CRT _stricmp, not Q_stricmp. */
+		if ( !_stricmp( key, sv.configstrings[start + i] ) ) {
+			break;
 		}
 	}
 
@@ -152,8 +149,6 @@ void SV_SetConfigValueForKey( int start, const char *key, const char *value, int
 
 /* ---- SV_SetUserinfo  0x00457F70 ---- */
 void SV_SetUserinfo( int index, const char *userinfo ) {
-	client_t    *cl;
-
 	if ( index < 0 || index >= sv_maxclients->integer ) {
 		Com_Error( ERR_DROP, "\x15SV_SetUserinfo: bad index %i\n", index );
 	}
@@ -162,12 +157,8 @@ void SV_SetUserinfo( int index, const char *userinfo ) {
 		userinfo = sv_emptyString;
 	}
 
-	cl = &svs.clients[index];
-	strncpy( cl->userinfo, userinfo, sizeof( cl->userinfo ) - 1 );
-	cl->userinfo[sizeof( cl->userinfo ) - 1] = 0;
-
-	strncpy( cl->name, Info_ValueForKey( userinfo, "name" ), sizeof( cl->name ) - 1 );
-	cl->name[sizeof( cl->name ) - 1] = 0;
+	Q_strncpyz( svs.clients[index].userinfo, userinfo, sizeof( svs.clients[index].userinfo ) );
+	Q_strncpyz( svs.clients[index].name, Info_ValueForKey( userinfo, "name" ), sizeof( svs.clients[index].name ) );
 }
 
 /* ---- SV_GetUserinfo  0x00458000 ---- */
@@ -188,7 +179,6 @@ void SV_CreateBaseline( void ) {
 	gentity_t   *svent;
 	svEntity_t     *base;
 	int entnum;
-	int i;
 
 	for ( entnum = 1 ; entnum < sv.num_entities ; entnum++ ) {
 		svent = (gentity_t *)( (byte *)sv.gentities + entnum * sv.gentitySize );
@@ -203,10 +193,8 @@ void SV_CreateBaseline( void ) {
 		base->baseline = svent->s;
 		base->baselineSvFlags = svent->r.svFlags;
 		base->baselineSingleClient = svent->r.singleClient;
-		for ( i = 0 ; i < 3 ; i++ ) {
-			base->baselineAbsmin[i] = svent->r.absmin[i];
-			base->baselineAbsmax[i] = svent->r.absmax[i];
-		}
+		VectorCopy( svent->r.absmin, base->baselineAbsmin );
+		VectorCopy( svent->r.absmax, base->baselineAbsmax );
 	}
 }
 
@@ -222,17 +210,6 @@ void SV_BoundMaxClients( int minimum ) {
 	}
 }
 
-/* ---- SV_SetSnapshotCounts  no-address ---- */
-static void SV_SetSnapshotCounts( int clients ) {
-	if ( com_dedicated->integer ) {
-		svs.numSnapshotEntities = clients << 11;
-		svs.numSnapshotClients = clients * clients * 32;
-	} else {
-		svs.numSnapshotEntities = clients << 8;
-		svs.numSnapshotClients = clients * clients * 4;
-	}
-}
-
 /* ---- SV_Startup  0x00458160 ---- */
 void SV_Startup( void ) {
 	if ( svs.initialized ) {
@@ -241,27 +218,36 @@ void SV_Startup( void ) {
 
 	SV_BoundMaxClients( 1 );
 
-	svs.clients = (client_t *)calloc( sv_maxclients->integer, sizeof( client_t ) );
+	svs.clients = (client_t *)calloc( sv_maxclients->integer * sizeof( client_t ), 1 );
 	if ( !svs.clients ) {
 		Com_Error( ERR_FATAL, "\x15SV_Startup: unable to allocate svs.clients" );
 	}
 
-	SV_SetSnapshotCounts( sv_maxclients->integer );
+	if ( com_dedicated->integer ) {
+		svs.numSnapshotEntities = sv_maxclients->integer * PACKET_BACKUP * 64;
+		svs.numSnapshotClients = sv_maxclients->integer * sv_maxclients->integer * PACKET_BACKUP;
+	} else {
+		svs.numSnapshotEntities = sv_maxclients->integer * 4 * 64;
+		svs.numSnapshotClients = sv_maxclients->integer * sv_maxclients->integer * 4;
+	}
 	svs.initialized = qtrue;
 	Cvar_Set2( "sv_running", "1", qtrue );
 }
 
-/* ---- SV_ChangeMaxClients  0x00458270 ---- */
+/* ---- SV_ChangeMaxClients  0x00458220 ---- */
 void SV_ChangeMaxClients( void ) {
 	int i;
 	int count;
+	client_t *current;
 	int oldMaxClients;
 	client_t    *oldClients;
 
 	count = 0;
 	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		if ( svs.clients[i].state >= CS_CONNECTED && count < i ) {
-			count = i;
+		if ( svs.clients[i].state >= CS_CONNECTED ) {
+			if ( i > count ) {
+				count = i;
+			}
 		}
 	}
 	count++;
@@ -274,15 +260,15 @@ void SV_ChangeMaxClients( void ) {
 
 	oldClients = (client_t *)Hunk_AllocateTempMemoryInternal( count * sizeof( client_t ) );
 	for ( i = 0 ; i < count ; i++ ) {
-		if ( svs.clients[i].state < CS_CONNECTED ) {
-			Com_Memset( &oldClients[i], 0, sizeof( client_t ) );
+		if ( svs.clients[i].state >= CS_CONNECTED ) {
+			oldClients[i] = svs.clients[i];
 		} else {
-			Com_Memcpy( &oldClients[i], &svs.clients[i], sizeof( client_t ) );
+			Com_Memset( &oldClients[i], 0, sizeof( client_t ) );
 		}
 	}
 
 	free( svs.clients );
-	svs.clients = (client_t *)calloc( sv_maxclients->integer, sizeof( client_t ) );
+	svs.clients = (client_t *)calloc( sv_maxclients->integer * sizeof( client_t ), 1 );
 	if ( !svs.clients ) {
 		Com_Error( ERR_FATAL, "\x15SV_Startup: unable to allocate svs.clients" );
 	}
@@ -290,12 +276,19 @@ void SV_ChangeMaxClients( void ) {
 
 	for ( i = 0 ; i < count ; i++ ) {
 		if ( oldClients[i].state >= CS_CONNECTED ) {
-			Com_Memcpy( &svs.clients[i], &oldClients[i], sizeof( client_t ) );
+			svs.clients[i] = oldClients[i];
 		}
 	}
 
-	Hunk_FreeTempMemoryInternal( oldClients );
-	SV_SetSnapshotCounts( sv_maxclients->integer );
+	Hunk_FreeTempMemory( oldClients );
+
+	if ( com_dedicated->integer ) {
+		svs.numSnapshotEntities = sv_maxclients->integer * PACKET_BACKUP * 64;
+		svs.numSnapshotClients = sv_maxclients->integer * sv_maxclients->integer * PACKET_BACKUP;
+	} else {
+		svs.numSnapshotEntities = sv_maxclients->integer * 4 * 64;
+		svs.numSnapshotClients = sv_maxclients->integer * sv_maxclients->integer * 4;
+	}
 }
 
 /* ---- SV_SetExpectedHunkUsage  0x00458450 ---- */
@@ -307,36 +300,35 @@ void SV_SetExpectedHunkUsage( const char *mapname ) {
 	char        *token;
 
 	len = FS_FOpenFileByMode( "hunkusage.dat", &f, FS_READ );
-	if ( len < 0 ) {
-		Cvar_Set2( "com_expectedhunkusage", "-1", qtrue );
-		return;
+	if ( len >= 0 ) {
+		buf = (char *)Z_MallocInternal( len + 1 );
+		memset( buf, 0, len + 1 );
+		FS_Read( buf, len, f );
+		FS_FCloseFile( f );
+
+		parse = buf;
+		while ( 1 ) {
+			/* Com_Parse, inlined by retail at 0x004584C0 and 0x00458559: a
+			 * pending parseInfo->ungetReady is honoured before Com_ParseExt. */
+			token = Com_Parse( &parse );
+			if ( !token || !token[0] ) {
+				break;
+			}
+
+			if ( Q_strcasecmp( token, (char *)mapname ) ) {
+				continue;
+			}
+
+			token = Com_Parse( &parse );
+			if ( token && token[0] ) {
+				Cvar_Set2( "com_expectedhunkusage", token, qtrue );
+				free( buf );
+				return;
+			}
+		}
+
+		free( buf );
 	}
-
-	buf = (char *)Z_MallocInternal( len + 1 );
-	memset( buf, 0, len + 1 );
-	FS_Read( buf, len, f );
-	FS_FCloseFile( f );
-
-	parse = buf;
-	while ( 1 ) {
-		token = Com_ParseExt( &parse, qtrue );
-		if ( !token || !token[0] ) {
-			break;
-		}
-
-		if ( Q_stricmp( token, mapname ) ) {
-			continue;
-		}
-
-		token = Com_ParseExt( &parse, qtrue );
-		if ( token && token[0] ) {
-			Cvar_Set2( "com_expectedhunkusage", token, qtrue );
-			free( buf );
-			return;
-		}
-	}
-
-	free( buf );
 	Cvar_Set2( "com_expectedhunkusage", "-1", qtrue );
 }
 
@@ -405,28 +397,24 @@ void SV_FreeArchivedSnapshot( void ) {
 }
 
 /* ---- SV_SpawnServer  0x00458760 ---- */
-void SV_SpawnServer( const char *server, qboolean killBots ) {
+void SV_SpawnServer( const char *server ) {
 	int i;
 	int checksum;
 	int matchState;
 	char systemInfo[MAX_STRING_CHARS];
 	client_t    *client;
-	cvar_t      *var;
-
-	( void )killBots;
 
 	xmodel_enforceExist = Cvar_Get( "cl_xmodelcheck", "0", CVAR_ARCHIVE | CVAR_LATCH )->integer;
 
-	var = Cvar_FindVar( "sv_running" );
-	if ( var && var->value != 0.0f ) {
+	if ( Cvar_VariableValue( "sv_running" ) ) {
 		matchState = VM_Call( vm, GAME_GET_MATCH_STATE );
 
-		for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-			client = &svs.clients[i];
+		for ( i = 0, client = svs.clients ; i < sv_maxclients->integer ; i++, client++ ) {
 			if ( client->state >= CS_PRIMED ) {
+				/* Retail 0x004587F5: the packet is built with va() and passed
+				 * as the FORMAT, with no varargs after it. */
 				NET_OutOfBandPrint( NS_SERVER, client->netchan.remoteAddress,
-									"loadingnewmap\n%s\n%s", server,
-									sv_gametype->string );
+									va( "loadingnewmap\n%s\n%s", server, sv_gametype->string ) );
 			}
 		}
 
@@ -438,8 +426,8 @@ void SV_SpawnServer( const char *server, qboolean killBots ) {
 	CL_MapLoading();
 	CL_ShutdownCGame();
 	CL_ShutdownUI();
-	if ( com_serverEndpoint ) {
-		com_serverEndpoint( 0 );
+	if ( re_ShutdownPtr ) {
+		re_ShutdownPtr( 0 );
 	}
 	cls_loadingPlaque = 0;
 	cls_rendererStarted = 0;
@@ -448,22 +436,14 @@ void SV_SpawnServer( const char *server, qboolean killBots ) {
 	Com_Printf( "------ Server Initialization ------\n" );
 	Com_Printf( "Server: %s\n", server );
 
-	CL_ShutdownCGame();
-	CL_ShutdownUI();
-	SV_ShutdownGameProgs();
-
-	Hunk_ClearToStart();
-	VM_Clear();
+	Hunk_Clear();
 	SV_ClearServer();
 
 	FS_Shutdown( qtrue );
 	FS_ClearPakReferences( 0 );
 
 	srand( Sys_Milliseconds() );
-	checksum = Sys_Milliseconds();
-	checksum ^= rand() << 16;
-	checksum ^= rand();
-	sv.checksumFeed = checksum;
+	sv.checksumFeed = ( ( (int)rand() << 16 ) ^ rand() ) ^ Sys_Milliseconds();
 	FS_Restart( sv.checksumFeed );
 
 	FS_ClearMemory();
@@ -472,16 +452,19 @@ void SV_SpawnServer( const char *server, qboolean killBots ) {
 		sv.configstrings[i] = CopyStringInternal( sv_emptyString );
 	}
 
-	var = Cvar_FindVar( "sv_running" );
-	if ( var && var->value != 0.0f ) {
-		com_dobjPoolInited = 1;
+	if ( !Cvar_VariableValue( "sv_running" ) ) {
+		Com_Restart();
+		SV_Startup();
+	} else {
+		/* Com_InitDObj (0x00438B70), inlined by retail at 0x00458BA4..0x00458CAD. */
+		Com_Memset( com_dobjAllocBits, 0, sizeof( com_dobjAllocBits ) );
+		Com_Memset( com_clientDObjHandles, 0, sizeof( com_clientDObjHandles ) );
+		Com_Memset( com_serverDObjHandles, 0, sizeof( com_serverDObjHandles ) );
+		com_dobjLastIndex = 1;   /* retail 0x00894240, also named com_dobjPoolInited (never read) */
 		com_dobjInited = 1;
 		if ( sv_maxclients->modified ) {
 			SV_ChangeMaxClients();
 		}
-	} else {
-		Com_Restart();
-		SV_Startup();
 	}
 
 	svs.snapshotEntities = (entityState_t *)Hunk_AllocAlignInternal(
@@ -514,12 +497,7 @@ void SV_SpawnServer( const char *server, qboolean killBots ) {
 	Com_LoadSoundAliases( va( "maps/mp/%s.bsp", server ), 2 );
 
 	xanim_activePoolSlot = 1;
-	vm = VM_Create( "game", (int ( * )( int * ))SV_GameSystemCalls );
-	if ( !vm ) {
-		Com_Error( ERR_FATAL, "\x15VM_Create on game failed" );
-	}
-	SV_HUNK_GAME_BASE = SV_HUNK_LOW_PERM;
-	SV_InitGameVM( qfalse, matchState );
+	SV_InitGameProgs( matchState );
 
 	for ( i = 0 ; i < 3 ; i++ ) {
 		svs.time += 100;
@@ -538,18 +516,15 @@ void SV_SpawnServer( const char *server, qboolean killBots ) {
 	SV_CreateBaseline();
 
 	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		const char  *reject;
+		if ( svs.clients[i].state >= CS_CONNECTED ) {
+			const char  *reject;
 
-		client = &svs.clients[i];
-		if ( client->state < CS_CONNECTED ) {
-			continue;
-		}
-
-		reject = (const char *)VM_Call( vm, GAME_CLIENT_CONNECT, i, client->scriptId );
-		if ( reject ) {
-			SV_DropClient( client, reject );
-		} else {
-			client->state = CS_CONNECTED;
+			reject = (const char *)VM_Call( vm, GAME_CLIENT_CONNECT, i, svs.clients[i].scriptId );
+			if ( reject ) {
+				SV_DropClient( &svs.clients[i], reject );
+			} else {
+				svs.clients[i].state = CS_CONNECTED;
+			}
 		}
 	}
 
@@ -557,7 +532,7 @@ void SV_SpawnServer( const char *server, qboolean killBots ) {
 		const char  *sums = FS_LoadedPakChecksums();
 
 		Cvar_Set2( "sv_paks", sums, qtrue );
-		if ( !sums[0] ) {
+		if ( strlen( sums ) == 0 ) {
 			Com_Printf( "WARNING: sv_pure set but no PK3 files loaded\n" );
 		}
 		Cvar_Set2( "sv_pakNames", FS_LoadedPakNames(), qtrue );
@@ -569,8 +544,7 @@ void SV_SpawnServer( const char *server, qboolean killBots ) {
 	Cvar_Set2( "sv_referencedPaks", FS_ReferencedPakChecksums(), qtrue );
 	Cvar_Set2( "sv_referencedPakNames", FS_ReferencedPakNames(), qtrue );
 
-	strncpy( systemInfo, Cvar_InfoString_Big( CVAR_SYSTEMINFO ), sizeof( systemInfo ) - 1 );
-	systemInfo[sizeof( systemInfo ) - 1] = 0;
+	Q_strncpyz( systemInfo, Cvar_InfoString_Big( CVAR_SYSTEMINFO ), sizeof( systemInfo ) );
 	cvar_modifiedFlags &= ~CVAR_SYSTEMINFO;
 	SV_SetConfigstring( CS_SYSTEMINFO, systemInfo );
 
@@ -622,11 +596,11 @@ void SV_Init( void ) {
 
 	sv_allowDownload = Cvar_Get( "sv_allowDownload", "1", CVAR_ARCHIVE );
 
-	sv_master[0] = sv_master_0_ = Cvar_Get( "sv_master1", "codmaster.activision.com", 0 );
-	sv_master[1] = sv_master_1_ = Cvar_Get( "sv_master2", "", CVAR_ARCHIVE );
-	sv_master[2] = sv_master_2_ = Cvar_Get( "sv_master3", "", CVAR_ARCHIVE );
-	sv_master[3] = sv_master_3_ = Cvar_Get( "sv_master4", "", CVAR_ARCHIVE );
-	sv_master[4] = sv_master_4_ = Cvar_Get( "sv_master5", "", CVAR_ARCHIVE );
+	sv_master[0] = Cvar_Get( "sv_master1", "codmaster.activision.com", 0 );
+	sv_master[1] = Cvar_Get( "sv_master2", "", CVAR_ARCHIVE );
+	sv_master[2] = Cvar_Get( "sv_master3", "", CVAR_ARCHIVE );
+	sv_master[3] = Cvar_Get( "sv_master4", "", CVAR_ARCHIVE );
+	sv_master[4] = Cvar_Get( "sv_master5", "", CVAR_ARCHIVE );
 
 	sv_reconnectlimit = Cvar_Get( "sv_reconnectlimit", "3", 0 );
 	sv_showloss = Cvar_Get( "sv_showloss", "0", 0 );
@@ -638,33 +612,22 @@ void SV_Init( void ) {
 	Cvar_Get( "g_complaintlimit", "3", CVAR_ARCHIVE );
 	sv_mapRotation = Cvar_Get( "sv_mapRotation", "", 0 );
 	sv_mapRotationCurrent = Cvar_Get( "sv_mapRotationCurrent", "", 0 );
-
-	sv_debugSpawn = Cvar_Get( "sv_debugSpawn", "0", 0 );
-	if ( sv_debugSpawn->integer ) {
-		Com_Printf( "SPAWNDBG: tracing ON\n" );
-	}
-
-	Cmd_AddCommand( "addtestclient", SV_AddTestClient );
-
-	Cmd_AddCommand( "testclientcmd", SV_TestClientCommand_f );
-	Cmd_AddCommand( "testclientmove", SV_TestClientMove_f );
-	Cmd_AddCommand( "testdumpmissiles", SV_TestDumpMissiles_f );
 }
 
-/* ---- SV_FinalMessage  0x00459550 ---- */
+/* ---- SV_FinalMessage  0x004594D0 ---- */
 void SV_FinalMessage( const char *message ) {
 	int i, j;
 	client_t    *cl;
 
 	for ( j = 0 ; j < 2 ; j++ ) {
-		for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-			cl = &svs.clients[i];
+		for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
 			if ( cl->state < CS_CONNECTED ) {
 				continue;
 			}
 
 			if ( cl->netchan.remoteAddress.type != NA_LOOPBACK ) {
-				SV_SendServerCommand( cl, qtrue, "e \"%s\"", message );
+				/* Retail 0x0045950E: "e" goes unreliable (ebx = 0), only "w" is reliable. */
+				SV_SendServerCommand( cl, qfalse, "e \"%s\"", message );
 				SV_SendServerCommand( cl, qtrue, "w" );
 			}
 
@@ -674,17 +637,15 @@ void SV_FinalMessage( const char *message ) {
 	}
 }
 
-/* ---- SV_FreeClients  0x004595B0 ---- */
+/* ---- SV_FreeClients  0x00459570 ---- */
 void SV_FreeClients( void ) {
 	int i;
 	client_t    *cl;
 
-	for ( i = 0 ; i < sv_maxclients->integer ; i++ ) {
-		cl = &svs.clients[i];
-		if ( cl->state < CS_CONNECTED ) {
-			continue;
+	for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
+		if ( cl->state >= CS_CONNECTED ) {
+			SV_FreeClientScriptId( cl );
 		}
-		SV_FreeClientScriptId( cl );
 	}
 
 	free( svs.clients );
@@ -713,7 +674,7 @@ void SV_Shutdown( const char *finalmsg ) {
 	}
 	SV_FreeArchivedSnapshot();
 
-	Com_Memset( &svs, 0, sizeof( svs ) );
+	memset( &svs, 0, sizeof( svs ) );
 
 	Cvar_Set2( "sv_running", "0", qtrue );
 	Com_Printf( "---------------------------\n" );

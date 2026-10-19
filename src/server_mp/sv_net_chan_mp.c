@@ -2,9 +2,7 @@
  * @fidelity: verified
  */
 
-#define NetProf_AddPacket   netprof_addpacket_stale_decl_unused
 #include "server.h"
-#undef NetProf_AddPacket
 
 #include <string.h>
 
@@ -22,16 +20,17 @@ extern void NetProf_UpdateStatistics( netProfileStream_t *pStream );
 #define CG_PROFILE_DRAW_TRAP        15
 
 /* ---- SV_Netchan_Encode  0x0045B5A0 ---- */
-void SV_Netchan_Encode( byte *data, client_t *client, int length ) {
+void SV_Netchan_Encode( client_t *client, byte *data, int length ) {
 	const char  *string;
 	int i;
 	int index;
 	byte key;
 
-	key = (byte)client->challenge ^ (byte)client->netchan.outgoingSequence;
 	string = client->lastClientCommandString;
+	index = 0;
+	key = (byte)client->challenge ^ (byte)client->netchan.outgoingSequence;
 
-	for ( i = 0, index = 0 ; i < length ; i++, data++ ) {
+	for ( i = 0 ; i < length ; i++, data++ ) {
 		if ( !string[index] ) {
 			index = 0;
 		}
@@ -51,11 +50,12 @@ void SV_Netchan_Decode( client_t *client, byte *data, int length ) {
 	string = client->reliableCommands[client->reliableAcknowledge
 									  & ( MAX_RELIABLE_COMMANDS - 1 )].command;
 
+	index = 0;
 	key = (byte)client->serverId
 		  ^ (byte)client->challenge
 		  ^ (byte)client->messageAcknowledge;
 
-	for ( i = 0, index = 0 ; i < length ; i++, data++ ) {
+	for ( i = 0 ; i < length ; i++, data++ ) {
 		if ( !string[index] ) {
 			index = 0;
 		}
@@ -72,7 +72,7 @@ void SV_Netchan_TransmitNextFragment( netchan_t *chan ) {
 
 /* ---- SV_Netchan_Transmit  0x0045B680 ---- */
 void SV_Netchan_Transmit( client_t *client, byte *data, int length ) {
-	SV_Netchan_Encode( data + 4, client, length - 4 );
+	SV_Netchan_Encode( client, data + 4, length - 4 );
 	Netchan_Transmit( &client->netchan, length, data );
 }
 
@@ -151,42 +151,42 @@ void SV_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 	char name[32];
 	char line[1024];
 
+	sendSmallest = 9999;
+	recvSmallest = 9999;
+	sendFragments = 0;
+	recvBps = 0;
+	sendPackets = 0;
+	sendBps = 0;
+	recvPackets = 0;
+	recvFragments = 0;
+	sendLargest = 0;
+	recvLargest = 0;
+	y = 80;
+
 	if ( !svs.clients ) {
 		return;
 	}
 
 	SV_Netchan_UpdateProfileStats();
 
-	sendBps = 0;
-	sendPackets = 0;
-	sendFragments = 0;
-	recvBps = 0;
-	recvPackets = 0;
-	recvFragments = 0;
-	sendLargest = 0;
-	sendSmallest = 9999;
-	recvLargest = 0;
-	recvSmallest = 9999;
-	y = 80;
-
 	if ( bPrintToConsole ) {
 		Com_Printf( "\n\n" );
-	} else {
-		y = 90;
 	}
 
 	Com_sprintf( line, sizeof( line ), "====================" );
 	if ( bPrintToConsole ) {
 		Com_Printf( "%s\n", line );
 	} else {
-		SV_ProfDraw( y, line );
 		y += 10;
+		SV_ProfDraw( y, line );
 	}
 
 	Com_sprintf( line, sizeof( line ), "Server Network Profile:" );
 	if ( bPrintToConsole ) {
 		Com_Printf( "%s\n\n", line );
 	} else {
+		/* a blank overlay row after the title, as the console's "%s\n\n" */
+		y += 10;
 		SV_ProfDraw( y, line );
 		y += 10;
 	}
@@ -197,8 +197,8 @@ void SV_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 	if ( bPrintToConsole ) {
 		Com_Printf( "%s\n", line );
 	} else {
-		SV_ProfDraw( y, line );
 		y += 10;
+		SV_ProfDraw( y, line );
 	}
 
 	Com_sprintf( line, sizeof( line ),
@@ -207,8 +207,8 @@ void SV_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 	if ( bPrintToConsole ) {
 		Com_Printf( "%s\n", line );
 	} else {
-		SV_ProfDraw( y, line );
 		y += 10;
+		SV_ProfDraw( y, line );
 	}
 
 	oob = (netProfileInfo_t *)svs.pOOBProf;
@@ -286,22 +286,26 @@ void SV_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 	if ( bPrintToConsole ) {
 		Com_Printf( "%s\n", line );
 	} else {
-		SV_ProfDraw( y, line );
 		y += 10;
+		SV_ProfDraw( y, line );
 	}
 
+	/* each branch prints its own line, as retail does (only the draw tails merge) */
+	oob = (netProfileInfo_t *)svs.pOOBProf;
 	if ( oob ) {
-		int oobPackets = oob->receive.iCountedPackets + oob->send.iCountedPackets;
-		int oobFragments = oob->receive.iCountedFragments
-						   + oob->send.iCountedFragments;
 		int oobFragPct;
 		int oobSmallest;
 		int oobLargest;
 
-		if ( oobPackets <= 0 || oobFragments <= 0 ) {
+		if ( oob->receive.iCountedPackets + oob->send.iCountedPackets <= 0
+			 || oob->receive.iCountedFragments
+			 + oob->send.iCountedFragments <= 0 ) {
 			oobFragPct = 0;
 		} else {
-			oobFragPct = 100 * oobFragments / oobPackets;
+			oobFragPct = 100 * ( oob->receive.iCountedFragments
+								 + oob->send.iCountedFragments )
+						 / ( oob->receive.iCountedPackets
+							 + oob->send.iCountedPackets );
 		}
 
 		oobSmallest = ( oob->send.iSmallestPacket < oob->receive.iSmallestPacket )
@@ -319,17 +323,22 @@ void SV_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 					 oob->receive.iFragmentPercentage,
 					 oob->receive.iBytesPerSecond + oob->send.iBytesPerSecond,
 					 oobLargest, oobSmallest, oobFragPct );
+		if ( bPrintToConsole ) {
+			Com_Printf( "%s\n", line );
+		} else {
+			y += 10;
+			SV_ProfDraw( y, line );
+		}
 	} else {
 		Com_sprintf( line, sizeof( line ),
 					 "  OutOfBand Messages:     0|    0|    0|   - "
 					 "|     0|    0|    0|   - |     0|    0|    0|   - |" );
-	}
-
-	if ( bPrintToConsole ) {
-		Com_Printf( "%s\n", line );
-	} else {
-		SV_ProfDraw( y, line );
-		y += 10;
+		if ( bPrintToConsole ) {
+			Com_Printf( "%s\n", line );
+		} else {
+			y += 10;
+			SV_ProfDraw( y, line );
+		}
 	}
 
 	for ( i = 0, cl = svs.clients ; i < sv_maxclients->integer ; i++, cl++ ) {
@@ -342,18 +351,19 @@ void SV_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 
 		prof = cl->netchan.pProf;
 		if ( prof ) {
-			int packets = prof->receive.iCountedPackets
-						  + prof->send.iCountedPackets;
-			int fragments = prof->receive.iCountedFragments
-							+ prof->send.iCountedFragments;
 			int fragPct;
 			int smallest;
 			int largest;
 
-			if ( packets <= 0 || fragments <= 0 ) {
+			if ( prof->receive.iCountedPackets + prof->send.iCountedPackets <= 0
+				 || prof->receive.iCountedFragments
+				 + prof->send.iCountedFragments <= 0 ) {
 				fragPct = 0;
 			} else {
-				fragPct = 100 * fragments / packets;
+				fragPct = 100 * ( prof->receive.iCountedFragments
+								  + prof->send.iCountedFragments )
+						  / ( prof->receive.iCountedPackets
+							  + prof->send.iCountedPackets );
 			}
 
 			smallest = ( prof->send.iSmallestPacket
@@ -377,18 +387,23 @@ void SV_Netchan_PrintProfileStats( qboolean bPrintToConsole ) {
 						 prof->receive.iBytesPerSecond
 						 + prof->send.iBytesPerSecond,
 						 largest, smallest, fragPct );
+			if ( bPrintToConsole ) {
+				Com_Printf( "%s\n", line );
+			} else {
+				y += 10;
+				SV_ProfDraw( y, line );
+			}
 		} else {
 			Com_sprintf( line, sizeof( line ),
 						 "#%2i-%16s:     0|    0|    0|   0%%"
 						 "|     0|    0|    0|   0%%|     0|    0|    0|   0%%|",
 						 i, name );
-		}
-
-		if ( bPrintToConsole ) {
-			Com_Printf( "%s\n", line );
-		} else {
-			SV_ProfDraw( y, line );
-			y += 10;
+			if ( bPrintToConsole ) {
+				Com_Printf( "%s\n", line );
+			} else {
+				y += 10;
+				SV_ProfDraw( y, line );
+			}
 		}
 	}
 }

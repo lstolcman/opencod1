@@ -4,11 +4,17 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "tr_records.h"
 #include "tr_gl_types.h"
 #include "tr_tess.h"
+#include "tr_local.h"
+/* ---- renderer-owned globals ---- */
+int c_begins;
+int c_vertexes;
+int setArraysOnce;
+/* RTCW tr_shade.c tess (renderer/tr_tess.h) */
+shaderCommands_t tess;      /* 0x017A7F60, 0x218068 bytes */
+
 
 extern int GL_Bind();
 extern int __cdecl GL_CheckErrors( const char *location );
@@ -16,25 +22,25 @@ extern int GL_ClientState();
 extern int GL_Cull();
 extern int GL_State();
 extern int GL_TexEnv();
-extern int GlobalPositionToLocal();
+extern float *GlobalPositionToLocal(float *world, float *out);
 extern int RB_BeginImmediateMode();
 void __cdecl RB_CalcAlphaFromEntity( unsigned char *colors );
 void __cdecl RB_CalcAlphaFromOneMinusEntity( unsigned char *colors );
 void __fastcall RB_CalcColorFromEntity( unsigned char *colors );
 int __fastcall RB_CalcColorFromOneMinusEntity( void *colors );
 extern int RB_CalcCubeMapBumpmapFrameTexCoords();
-extern int RB_CalcCubeMapDot3ReflectTexCoords();
-int __fastcall RB_CalcCubeMapEyeToVertexTexCoords( int a1 );
+extern void RB_CalcCubeMapDot3ReflectTexCoords( float *out, int startIndex );
+int __fastcall RB_CalcCubeMapEyeToVertexTexCoords( int st );
 extern int RB_CalcCubeMapLightHalfAngleTexCoords();
-int __fastcall RB_CalcCubeMapLightVectorTexCoords( int a1 );
-float * __fastcall RB_CalcCubeMapReflectionTexCoords( int a1, int a2 );
+int __fastcall RB_CalcCubeMapLightVectorTexCoords( int st );
+void __cdecl RB_CalcCubeMapReflectionTexCoords( float *st );
 extern int RB_CalcCubeMapSunHalfAngleTexCoords();
 extern int RB_CalcCubeMapTbnTexCoords();
-int __fastcall RB_CalcCubeMapVertexToEyeTexCoords( int a1 );
+int __fastcall RB_CalcCubeMapVertexToEyeTexCoords( int st );
 int __cdecl RB_CalcDiffuseColor( void *colors );
 extern int RB_CalcEnvironmentTexCoords();
-extern float *__cdecl RB_CalcRotateTexCoords( float a1, float *a2 );
-void __cdecl RB_CalcScaleTexCoords( float *st, const float *scale );
+extern float *__cdecl RB_CalcRotateTexCoords( float degsPerSecond, float *st );
+void __cdecl RB_CalcScaleTexCoords( const float *scale, float *st );
 void __cdecl RB_CalcScrollTexCoords( const float *scrollSpeed, float *st );
 int __cdecl RB_CalcSpecularAlpha( int colors );
 extern int RB_CalcStretchTexCoords();
@@ -50,6 +56,7 @@ extern int RB_ShadowTessEnd();
 extern int RB_StageIteratorSky();
 extern int RB_UploadWaterTexture();
 extern int RB_glVertex3f();
+void __cdecl RB_glVertex3fv( const float *v );
 extern int R_Fog();
 void VectorNormalizeFast( float *v );
 void VectorRotate( float *in, float *matrix, float *out );
@@ -58,288 +65,376 @@ void __cdecl RB_DisableTMU( int tmu );
 void __cdecl RB_BeginSurface( void *shader, int vertexComponentCount );
 void __cdecl RB_EndSurface( void );
 
-/* ---- RB_ChooseSurfaceCountColor  0x004FDC10 ----  VERIFIED */
-void __cdecl RB_ChooseSurfaceCountColor(int a1, _BYTE *a2)
-{
-  unsigned int v3;
-  double v4;
-  double v5;
-  float v6;
-  float v7;
-  float v8;
-  float v9[3]; // [ebp-0xc] BYREF  -- retail vec3_t
+/* -------------------------------------------------------------------------
+ *  shaderStage_t (0x688) and its per-unit textureBundle_t (0xC8).
+ *
+ *  The stage is the vertex-array flag word (+0x000), eight texture bundles
+ *  (+0x004, stride 0xC8 -- the `50 * unit` dword indexing), the ATI fragment
+ *  shader / NV register combiners / vertex program (+0x644..+0x64c), the
+ *  rgb/alpha waves and generators (+0x650..+0x67c), the constant colour
+ *  (+0x680) and the GL state bits (+0x684).  A bundle starts at its image[0]:
+ *  with that base every backend's reads agree (the ARB view used to start one
+ *  dword later and the NV view at texCoordComponentCount; tr_shader.c's parser
+ *  view still starts one dword earlier).  Field sources: RB_GetAnimatedImage /
+ *  RB_BindAnimatedImage (image, numImageAnimations, imageAnimationSpeed,
+ *  waterMap, textureEnvMode, texEnvCombine, nvTextureShader, videoMapHandle,
+ *  isLightmap, isVideoMap, clampAnimation), RB_ComputeTexCoords (tcGen,
+ *  tcGenVectors, numTexMods) and the array setup (texCoordComponentCount).
+ *  The TMU helpers in this file still read the bundles with raw byte offsets.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+	void  *image[32];               /* +0x00 */
+	int   numImageAnimations;       /* +0x80 */
+	float imageAnimationSpeed;      /* +0x84 */
+	void  *waterMap;                /* +0x88  waterMap_t (tr_shader.c) */
+	int   texCoordComponentCount;   /* +0x8c  texcoord components uploaded for this unit */
+	int   textureEnvMode;           /* +0x90 */
+	void  *texEnvCombine;           /* +0x94  ShaderTexEnvCombine (tr_shader.c) */
+	void  *nvTextureShader;         /* +0x98  ShaderNVTextureOperation (tr_shader.c) */
+	int   tcGen;                    /* +0x9c */
+	float tcGenVectors[2][3];       /* +0xa0  TCGEN_VECTOR (RB_ComputeTexCoords) */
+	int   numTexMods;               /* +0xb8 */
+	void  *texMods;                 /* +0xbc  texModInfo_t[numTexMods] */
+	int   videoMapHandle;           /* +0xc0 */
+	byte  isLightmap;               /* +0xc4  r_lightmap forces this unit to REPLACE */
+	byte  isVideoMap;               /* +0xc5 */
+	byte  clampAnimation;           /* +0xc6 */
+	byte  reserved_0xc7;            /* +0xc7  alignment */
+} textureBundle_t;
+COD1_ASSERT_SIZE(textureBundle_t, 0xC8);
+ASSERT_OFF(textureBundle_t, tcGen, 0x9c);
+ASSERT_OFF(textureBundle_t, tcGenVectors, 0xa0);
+ASSERT_OFF(textureBundle_t, numTexMods, 0xb8);
+ASSERT_OFF(textureBundle_t, texMods, 0xbc);
 
-  if ( r_showtris->integer <= 6 )
-  {
-    if ( a1 > 30 )
+typedef struct shaderStage_s {
+	unsigned int  flags;                     /* +0x000  attributeBits: vertex-array + stage-type bits */
+	textureBundle_t bundles[8];              /* +0x004  stride 0xC8 (the TMU helpers read them by offset) */
+	int           atiFragmentShader;         /* +0x644  (tr_shader.c ParseATIFragmentShader) */
+	void         *registerCombiners;         /* +0x648 */
+	char         *vertexProgram;             /* +0x64c */
+	byte          rgbWave[0x14];             /* +0x650  waveForm_t */
+	int           rgbGen;                    /* +0x664  colour generator */
+	byte          alphaWave[0x14];           /* +0x668  waveForm_t */
+	int           alphaGen;                  /* +0x67c  alpha generator */
+	byte          constantColor[4];          /* +0x680  RGBA constant colour */
+	unsigned int  stateBits;                 /* +0x684  GL_State bits */
+} shaderStage_t;
+COD1_ASSERT_SIZE(shaderStage_t, 0x688);
+ASSERT_OFF(shaderStage_t, flags, 0x000);
+ASSERT_OFF(shaderStage_t, rgbGen, 0x664);
+ASSERT_OFF(shaderStage_t, alphaGen, 0x67c);
+ASSERT_OFF(shaderStage_t, constantColor, 0x680);
+ASSERT_OFF(shaderStage_t, stateBits, 0x684);
+
+
+/* retail's inlined float->int idiom in RB_ChooseSurfaceCountColor
+ * (0x004FDCB1-0x004FDCBD and twice more): fld float / fadd qword 2^-30 /
+ * fistp -- round-to-nearest under the default control word, not the truncating
+ * __ftol2 an (int) cast compiles to.  The operand is a float, so the caller's
+ * product is rounded to float first, as retail's fstp does. */
+static int RB_FtolBiased( float f )
+{
+  double bias = 9.313225746154785e-10;
+  int    i;
+
+  __asm fld   f
+  __asm fadd  bias
+  __asm fistp i
+  return i;
+}
+
+/* ---- RB_ChooseSurfaceCountColor  0x004FDC10 ----  VERIFIED */
+void __cdecl RB_ChooseSurfaceCountColor( int indexCount, byte *color )
+{
+  unsigned int savedSeed;
+  float        normal[3];
+
+  if(r_showtris->integer>6){
+    /* pseudo-random colour keyed on the shader + triangle count (rand() times the
+     * float 1/32768 at retail 0x00568E98) */
+    savedSeed = rand();
+    srand( 31337 * ( indexCount + ((shader_t *)tess_shader)->sortedIndex ) );   /* shader.sortedIndex */
+    normal[0] = rand() * 0.000030517578125f;
+    normal[1] = rand() * 0.000030517578125f;
+    normal[2] = rand() * 0.000030517578125f;
+    VectorNormalize( normal );
+    color[0] = (byte)RB_FtolBiased( normal[0] * 255.0f );
+    color[1] = (byte)RB_FtolBiased( normal[1] * 255.0f );
+    color[2] = (byte)RB_FtolBiased( normal[2] * 255.0f );
+    srand( savedSeed );
+    color[3] = -1;
+  
+  }else{
+    /* fixed colour ramp keyed on the triangle/index count */
+    if ( indexCount <= 30 )
     {
-      if ( a1 > 150 )
-      {
-        if ( a1 > 450 )
-        {
-          if ( a1 > 1200 )
-          {
-            if ( a1 <= 3000 )
-            {
-              *a2 = tr_identityLightByte >> 2;
-              a2[1] = tr_identityLightByte >> 2;
-              a2[2] = tr_identityLightByte;
-            }
-            else
-            {
-              *a2 = 0;
-              a2[1] = tr_identityLightByte;
-              a2[2] = 0;
-            }
-            a2[3] = -1;
-          }
-          else
-          {
-            *a2 = tr_identityLightByte;
-            a2[1] = tr_identityLightByte;
-            a2[2] = 0;
-            a2[3] = -1;
-          }
-        }
-        else
-        {
-          *a2 = tr_identityLightByte;
-          a2[1] = 0;
-          a2[2] = 0;
-          a2[3] = -1;
-        }
-      }
-      else
-      {
-        *a2 = tr_identityLightByte;
-        a2[1] = tr_identityLightByte >> 1;
-        a2[2] = tr_identityLightByte >> 1;
-        a2[3] = -1;
-      }
+      color[0] = tr_identityLightByte;
+      color[1] = tr_identityLightByte;
+      color[2] = tr_identityLightByte;
+      color[3] = -1;
+    }
+    else if ( indexCount <= 150 )
+    {
+      color[0] = tr_identityLightByte;
+      color[1] = tr_identityLightByte >> 1;
+      color[2] = tr_identityLightByte >> 1;
+      color[3] = -1;
+    }
+    else if ( indexCount <= 450 )
+    {
+      color[0] = tr_identityLightByte;
+      color[1] = 0;
+      color[2] = 0;
+      color[3] = -1;
+    }
+    else if ( indexCount <= 1200 )
+    {
+      color[0] = tr_identityLightByte;
+      color[1] = tr_identityLightByte;
+      color[2] = 0;
+      color[3] = -1;
+    }
+    else if ( indexCount > 3000 )
+    {
+      color[0] = 0;
+      color[1] = tr_identityLightByte;
+      color[2] = 0;
+      color[3] = -1;
     }
     else
     {
-      *a2 = tr_identityLightByte;
-      a2[1] = tr_identityLightByte;
-      a2[2] = tr_identityLightByte;
-      a2[3] = -1;
+      color[0] = tr_identityLightByte >> 2;
+      color[1] = tr_identityLightByte >> 2;
+      color[2] = tr_identityLightByte;
+      color[3] = -1;
     }
-  }
-  else
-  {
-    v3 = rand();
-    srand(31337 * (a1 + *(_DWORD *)(tess_shader + 72)));
-    v9[0] = (double)rand() * 0.000030517578;
-    v9[1] = (double)rand() * 0.000030517578;
-    v9[2] = (double)rand() * 0.000030517578;
-    VectorNormalize(v9);
-    v6 = v9[0] * 255.0;
-    v4 = v9[1] * 255.0;
-    *a2 = (int)(v6 + 9.313225746154785e-10);
-    v7 = v4;
-    v5 = v9[2] * 255.0;
-    a2[1] = (int)(v7 + 9.313225746154785e-10);
-    v8 = v5;
-    a2[2] = (int)(v8 + 9.313225746154785e-10);
-    srand(v3);
-    a2[3] = -1;
+  
   }
 }
 
 /* ---- RB_SetSurfaceCountColor  0x004FDE30 ----  VERIFIED */
-void __cdecl RB_SetSurfaceCountColor(int a1)
+void __cdecl RB_SetSurfaceCountColor(int indexCount)
 {
   GLubyte v[4]; // [esp+8h] [ebp-4h] BYREF
 
-  RB_ChooseSurfaceCountColor(a1, v);
+  RB_ChooseSurfaceCountColor(indexCount, v);
   glColor4ubv(v);
 }
 
-/* ---- RB_MakeNormalVectors  0x004FDE50 ----  VERIFIED */
-int __cdecl RB_MakeNormalVectors(float *a1, float *a2, float *a3)
+/* ---- RB_MakeNormalVectors  0x004FDE50 ----  VERIFIED
+ * Given a unit `forward` vector, build an orthonormal `right` / `up` basis.
+ * The basis is returned through the two output vectors.  This parameter order
+ * gives retail's LTCG registers (forward ecx, up esi, right edx) and the
+ * tangent-based loop in RB_BuildDlightArrays. */
+void __cdecl RB_MakeNormalVectors( const float *forward, float *up, float *right )
 {
-  int result;
-  double v4;
-  double v5;
-  double v6;
-  int v7;
-  double v8;
-  double v9;
-  double v10;
-  float v11;
-  float v12;
-  float v13;
 
-  if ( *a2 <= -1.0 )
+  
+
+
+  float  d, zz;
+  float xx, xy, yy, zy;
+
+  if ( forward[0] > -1.0f )
   {
-    v13 = 1.0 / (a2[2] + 1.0);
-    v8 = *a2 * *a2 * v13;
-    v9 = a2[1] * *a2 * v13;
-    v10 = a2[1] * a2[1] * v13;
-    *a3 = -v9;
-    a3[1] = 1.0 - v10;
-    a3[2] = -a2[1];
-    *a1 = v8 - 1.0;
-    a1[1] = v9;
-    result = *(int *)a2;
-    a1[2] = *a2;
+    d  = 1.0f / ( forward[0] + 1.0f );
+    yy = forward[1] * forward[1] * d;
+    zy = forward[2] * forward[1] * d;
+    zz = forward[2] * forward[2] * d;
+    up[0]    = forward[1];
+    up[1]    = yy - 1.0f;
+    up[2]    = zy;
+    right[0] = forward[2];
+    right[1] = zy;
+    right[2] = zz - 1.0f;
   }
   else
   {
-    result = *((int *)a2 + 1);
-    v11 = 1.0 / (*a2 + 1.0);
-    v4 = *(float *)&result * *(float *)&result * v11;
-    v5 = a2[2] * *(float *)&result * v11;
-    v6 = a2[2];
-    *a3 = *(float *)&result;
-    v12 = v6 * v6 * v11;
-    a3[1] = v4 - 1.0;
-    a3[2] = v5;
-    v7 = *((_DWORD *)a2 + 2);
-    a1[1] = v5;
-    *(_DWORD *)a1 = v7;
-    a1[2] = v12 - 1.0;
+    d  = 1.0f / ( forward[2] + 1.0f );
+    xx = forward[0] * forward[0] * d;
+    xy = forward[1] * forward[0] * d;
+    yy = forward[1] * forward[1] * d;
+    up[0]    = -xy;
+    up[1]    = 1.0f - yy;
+    up[2]    = -forward[1];
+    right[0] = xx - 1.0f;
+    right[1] = xy;
+    right[2] = forward[0];
   }
-  return result;
 }
 
-/* ---- R_DrawStripElements  0x004FDF30 ----  VERIFIED */
-int __cdecl R_DrawStripElements(
-        unsigned __int16 *a1,
-        void (__stdcall *a2)(int),
-        signed int a4)
+/* ---- R_DrawStripElements  0x004FDF30 ----  VERIFIED
+ * Feed a triangle-list index buffer to GL as one or more triangle strips,
+ * starting a new strip whenever a triangle cannot extend the current one.
+ * Returns the original index count (dead-EAX). */
+void __cdecl R_DrawStripElements( unsigned short *indexes,
+                                 void (__stdcall *arrayElement)(int),
+                                 signed int numIndexes )
 {
-  int result;
-  int v6;
-  int v7;
-  int v8;
-  unsigned __int16 *v9;
-  int v10;
-  int v11;
-  int v13;
+  int      i;
+  int      last[3] = { -1, -1, -1 };
+  qboolean even;
 
-  result = a4;
-  ++c_begins;
-  if ( a4 > 0 )
+  c_begins++;
+
+  if ( numIndexes <= 0 )
+    return;
+
+  qglBegin( 5 );                      /* GL_TRIANGLE_STRIP */
+
+  /* prime the strip */
+  arrayElement( indexes[0] );
+  arrayElement( indexes[1] );
+  arrayElement( indexes[2] );
+  c_vertexes += 3;
+
+  last[0] = indexes[0];
+  last[1] = indexes[1];
+  last[2] = indexes[2];
+
+  even = qfalse;
+
+  for ( i = 3; i < numIndexes; i += 3 )
   {
-    qglBegin(5);
-    a2(*a1);
-    a2(a1[1]);
-    a2(a1[2]);
-    v6 = *a1;
-    v13 = a1[1];
-    v7 = 0;
-    c_vertexes += 3;
-    v8 = a1[2];
-    if ( a4 > 3 )
+    /* odd numbered triangle in potential strip */
+    if ( !even )
     {
-      v9 = a1 + 5;
-      a4 = (a4 - 4) / 3u + 1;
-      while ( !v7 )
+      /* check previous triangle to see if we're continuing a strip */
+      if ( ( indexes[i + 0] == last[2] ) && ( indexes[i + 1] == last[1] ) )
       {
-        if ( *(v9 - 2) != v8 || *(v9 - 1) != v13 )
-          goto LABEL_11;
-        a2(*v9);
-        v10 = c_vertexes + 1;
-        v7 = 1;
-LABEL_13:
-        v6 = *(v9 - 2);
-        v8 = *v9;
-        c_vertexes = v10;
-        v13 = *(v9 - 1);
-        v9 += 3;
-        if ( !--a4 )
-          qglEnd();
-          return result;
+        arrayElement( indexes[i + 2] );
+        c_vertexes++;
+        even = qtrue;
       }
-      if ( v8 == *(v9 - 1) && v6 == *(v9 - 2) )
-      {
-        a2(*v9);
-        v10 = c_vertexes + 1;
-      }
+      /* otherwise we're done with this strip so finish it and start a new one */
       else
       {
-LABEL_11:
         qglEnd();
-        qglBegin(5);
-        v11 = *(v9 - 2);
-        ++c_begins;
-        a2(v11);
-        a2(*(v9 - 1));
-        a2(*v9);
-        v10 = c_vertexes + 3;
+
+        qglBegin( 5 );
+        c_begins++;
+
+        arrayElement( indexes[i + 0] );
+        arrayElement( indexes[i + 1] );
+        arrayElement( indexes[i + 2] );
+
+        c_vertexes += 3;
+
+        even = qfalse;
       }
-      v7 = 0;
-      goto LABEL_13;
     }
-    qglEnd();
-    return result;
+    else
+    {
+      /* check previous triangle to see if we're continuing a strip */
+      if ( ( last[2] == indexes[i + 1] ) && ( last[0] == indexes[i + 0] ) )
+      {
+        arrayElement( indexes[i + 2] );
+        c_vertexes++;
+
+        even = qfalse;
+      }
+      /* otherwise we're done with this strip so finish it and start a new one */
+      else
+      {
+        qglEnd();
+
+        qglBegin( 5 );
+        c_begins++;
+
+        arrayElement( indexes[i + 0] );
+        arrayElement( indexes[i + 1] );
+        arrayElement( indexes[i + 2] );
+        c_vertexes += 3;
+
+        even = qfalse;
+      }
+    }
+
+    /* cache the last three vertices */
+    last[0] = indexes[i + 0];
+    last[1] = indexes[i + 1];
+    last[2] = indexes[i + 2];
   }
-  return result;
+
+  qglEnd();
 }
 
 /* ---- R_DrawElements  0x004FE070 ----  VERIFIED */
-void __cdecl R_DrawElements(GLvoid *indexes, GLsizei numIndexes)
+void __cdecl R_DrawElements( GLsizei numIndexes, GLvoid *indexes )
 {
-  int integer;
+  int primitives = r_primitives->integer;
 
-  integer = r_primitives->integer;
-  if ( integer )
+  /* r_primitives: 0 = auto, 1 = triangle strips, 2 = glDrawElements */
+  if ( primitives == 0 )
   {
-    if ( integer != 2 )
-    {
-      if ( integer != 1 )
-        return;
-      goto LABEL_7;
-    }
-LABEL_5:
+    if ( qglLockArraysEXT )
+      primitives = 2;
+    else
+      primitives = 1;
+  }
+  if ( primitives == 2 )
+  {
     backEnd_pc_drawnIndexCount += numIndexes;
     ++backEnd_pc_drawCallCount;
-    glDrawElements(4u, numIndexes, 0x1403u, indexes);
+    glDrawElements( 4u, numIndexes, 0x1403u, indexes );   /* GL_TRIANGLES, GL_UNSIGNED_SHORT */
     return;
   }
-  if ( qglLockArraysEXT )
-    goto LABEL_5;
-LABEL_7:
-  R_DrawStripElements((unsigned __int16 *)indexes, (void (__stdcall *)(int))qglArrayElement, numIndexes);
+  if ( primitives == 1 )
+  {
+    R_DrawStripElements( (unsigned short *)indexes,
+                         (void (__stdcall *)(int))qglArrayElement, numIndexes );
+    return;
+  }
+  /* any other r_primitives value draws nothing */
 }
 
-/* ---- RB_GetAnimatedImage  0x004FE0E0 ----  VERIFIED */
-int __cdecl RB_GetAnimatedImage(int a1, int a2, int a3)
+/* ---- RB_GetAnimatedImage  0x004FE0E0 ----  VERIFIED
+ * Resolve the GL image handle for a texture bundle this frame: a cinematic,
+ * a live water render, or the current frame of an animated image list.
+ * (bundle is the bundle pointer; interior offsets are the disputed bundle layout.
+ * a1 is never read: retail has only (bundle, tmu), but tr_xanim.c still
+ * passes three arguments, so callers here pass 0.) */
+int __cdecl RB_GetAnimatedImage( int tmu, int bundle )
 {
-  int v4;
-  int v5;
-  float v6;
+  int   frame;
+  int   frameCount;
+  float t;
 
-  if ( *(_BYTE *)(a2 + 197) )
+  if ( *(byte *)( bundle + 197 ) )                       /* isVideoMap */
   {
-    ri_CIN_RunCinematic(*(_DWORD *)(a2 + 192), a1);
-    ri_CIN_UploadCinematic(*(_DWORD *)(a2 + 192));
-    return tr_scratchImages[*(_DWORD *)(a2 + 192)];
+    ri.CIN_RunCinematic( *(unsigned int *)( bundle + 192 ) );
+    ri.CIN_UploadCinematic( *(unsigned int *)( bundle + 192 ) );
+    return tr_scratchImages[*(unsigned int *)( bundle + 192 )];
   }
-  if ( *(_DWORD *)(a2 + 136) )
+  if ( *(unsigned int *)( bundle + 136 ) )                       /* waterMap */
   {
-    RB_UploadWaterTexture(*(_DWORD *)(a2 + 136), tr_refdef_time, a3);
-    return *(_DWORD *)a2;
+    RB_UploadWaterTexture( *(unsigned int *)( bundle + 136 ), tr_refdef_time, tmu );
+    return *(unsigned int *)bundle;                              /* image[0] */
   }
-  if ( *(int *)(a2 + 128) <= 1 )
-    return *(_DWORD *)a2;
-  v6 = tess_shaderTime * *(float *)(a2 + 132) * 1024.0;
-  ftol_tempSpill = (int)v6;
-  v4 = (int)v6 >> 10;
-  if ( v4 < 0 )
-    v4 = 0;
-  if ( *(_BYTE *)(a2 + 198) )
+  if ( *(int *)( bundle + 128 ) <= 1 )                     /* numAnimationFrames */
+    return *(unsigned int *)bundle;
+
+  t = tess_shaderTime * *(float *)( bundle + 132 ) * 1024.0f;  /* imageAnimationSpeed */
+  /* inlined myftol (0x4FE154-0x4FE167): the float product through a plain
+     round-to-nearest fistp into the static spill, then >> 10 -- no bias and
+     no truncating __ftol2 */
+  __asm fld   t
+  __asm fistp ftol_tempSpill
+  frame = ftol_tempSpill >> 10;
+  if ( frame < 0 )
+    frame = 0;
+  if ( *(byte *)( bundle + 198 ) )                        /* clampAnimation */
   {
-    v5 = *(_DWORD *)(a2 + 128);
-    if ( v4 >= v5 )
-      return *(_DWORD *)(a2 + 4 * (v5 - 1));
+    frameCount = *(unsigned int *)( bundle + 128 );
+    if ( frame >= frameCount )
+      frame = frameCount - 1;
   }
   else
   {
-    v4 %= *(_DWORD *)(a2 + 128);
+    frame %= *(int *)( bundle + 128 );
   }
-  return *(_DWORD *)(a2 + 4 * v4);
+  return *(unsigned int *)( bundle + 4 * frame );
 }
 
 /* ---- RB_BindAnimatedImage  0x004FE1A0 ----  VERIFIED */
@@ -347,131 +442,126 @@ void __cdecl RB_BindAnimatedImage(void *this)
 {
   GLenum *AnimatedImage;
 
-  AnimatedImage = (GLenum *)RB_GetAnimatedImage((int)this, (int)this, glState_currentTmu);
+  AnimatedImage = (GLenum *)RB_GetAnimatedImage( glState_currentTmu, (int)this );
 
   GL_Bind(AnimatedImage);
 }
 
-/* ---- RB_EnableTMU  0x004FE1C0 ----  VERIFIED */
-_DWORD *__cdecl RB_EnableTMU(int a1, cvar_t *a2, int a3)
+/* ---- RB_EnableTMU  0x004FE1C0 ----  VERIFIED
+ * Bind the texture unit `tmu` to the bundle's animated image and texture
+ * environment (plain, ARB combine, or NV texture shader).  `bundle` points at
+ * the bundle interior; its sub-offsets are the disputed layout kept raw. */
+void __cdecl RB_EnableTMU( int tmu, int bundle )
 {
-  _DWORD *AnimatedImage;
-  GLenum v5;
-  GLenum v6;
-  _DWORD *result;
-  int v8;
-  GLuint v9;
-  int param;
+  unsigned int *image;
+  GLenum  target;
+  GLenum  prevTarget;
+  int     texEnvMode;
 
-  param = *(_DWORD *)(a1 + 144);
-  if ( *(_BYTE *)(a1 + 196) )
+  texEnvMode = *(unsigned int *)( bundle + 144 );           /* textureEnvMode */
+  if ( *(byte *)( bundle + 196 ) )                   /* isLightmap */
   {
-    a2 = r_lightmap;
     if ( r_lightmap->integer )
-      param = 7681;
+      texEnvMode = 7681;                              /* GL_REPLACE */
   }
-  AnimatedImage = (_DWORD *)RB_GetAnimatedImage((int)a2, a1, a3);
-  v5 = AnimatedImage[21];
-  if ( cap[a3] != v5 || AnimatedImage[22] != glState_currentTextures[a3] || param != glState_texEnv[a3] )
+  image  = (unsigned int *)RB_GetAnimatedImage( tmu, bundle );
+  target = image[21];                                 /* image->target */
+  if ( glState_cap[tmu] != target
+    || image[22] != glState_currentTextures[tmu]      /* image->texnum */
+    || texEnvMode != glState_texEnv[tmu] )
   {
-    if ( a3 != glState_currentTmu )
+    if ( tmu != glState_currentTmu )
     {
-      qglActiveTextureARB(a3 + 33984);
-      glState_currentTmu = a3;
+      qglActiveTextureARB( tmu + 33984 );
+      glState_currentTmu = tmu;
     }
-    v6 = cap[a3];
-    if ( v6 != v5 )
+    prevTarget = glState_cap[tmu];
+    if ( prevTarget != target )
     {
-      if ( v6 )
-        glDisable(cap[a3]);
-      glEnable(v5);
-      cap[a3] = v5;
+      if ( prevTarget )
+        glDisable( glState_cap[tmu] );
+      glEnable( target );
+      glState_cap[tmu] = target;
     }
-    if ( AnimatedImage[22] != glState_currentTextures[a3] )
+    if ( image[22] != glState_currentTextures[tmu] )
     {
-      v9 = AnimatedImage[22];
-      AnimatedImage[23] = tr_frameCount;
-      glBindTexture(v5, v9);
-      glState_currentTextures[a3] = AnimatedImage[22];
+      image[23] = tr_frameCount;                      /* image->frameUsed */
+      glBindTexture( target, image[22] );
+      glState_currentTextures[tmu] = image[22];
     }
-    if ( param != glState_texEnv[a3] )
+    if ( texEnvMode != glState_texEnv[tmu] )
     {
-      glTexEnvi(0x2300u, 0x2200u, param);
-      glState_texEnv[a3] = param;
+      glTexEnvi( 0x2300u, 0x2200u, texEnvMode );       /* GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE */
+      glState_texEnv[tmu] = texEnvMode;
     }
   }
-  if ( param == 34160 )
+  if ( texEnvMode == 34160 )                           /* GL_COMBINE_ARB */
   {
-    if ( a3 != glState_currentTmu )
+    if ( tmu != glState_currentTmu )
     {
-      qglActiveTextureARB(a3 + 33984);
-      glState_currentTmu = a3;
+      qglActiveTextureARB( tmu + 33984 );
+      glState_currentTmu = tmu;
     }
-    glTexEnvfv(0x2300u, 0x2201u, *(const GLfloat **)(a1 + 148));
-    glTexEnvi(0x2300u, 0x8571u, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 16));
-    glTexEnvf(0x2300u, 0x8573u, *(GLfloat *)(*(_DWORD *)(a1 + 148) + 44));
-    glTexEnvi(0x2300u, 0x8580u, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 20));
-    glTexEnvi(0x2300u, 0x8581u, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 24));
-    glTexEnvi(0x2300u, 0x8582u, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 28));
-    glTexEnvi(0x2300u, 0x8590u, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 32));
-    glTexEnvi(0x2300u, 0x8591u, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 36));
-    glTexEnvi(0x2300u, 0x8592u, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 40));
-    glTexEnvi(0x2300u, 0x8572u, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 48));
-    glTexEnvf(0x2300u, 0xD1Cu, *(GLfloat *)(*(_DWORD *)(a1 + 148) + 76));
-    glTexEnvi(0x2300u, 0x8588u, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 52));
-    glTexEnvi(0x2300u, 0x8589u, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 56));
-    glTexEnvi(0x2300u, 0x858Au, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 60));
-    glTexEnvi(0x2300u, 0x8598u, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 64));
-    glTexEnvi(0x2300u, 0x8599u, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 68));
-    glTexEnvi(0x2300u, 0x859Au, *(_DWORD *)(*(_DWORD *)(a1 + 148) + 72));
+    /* upload the ARB combine environment from the bundle's combiner block (+148) */
+    glTexEnvfv( 0x2300u, 0x2201u, *(const GLfloat **)( bundle + 148 ) );
+    glTexEnvi( 0x2300u, 0x8571u, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 16 ) );
+    glTexEnvf( 0x2300u, 0x8573u, *(GLfloat *)( *(unsigned int *)( bundle + 148 ) + 44 ) );
+    glTexEnvi( 0x2300u, 0x8580u, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 20 ) );
+    glTexEnvi( 0x2300u, 0x8581u, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 24 ) );
+    glTexEnvi( 0x2300u, 0x8582u, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 28 ) );
+    glTexEnvi( 0x2300u, 0x8590u, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 32 ) );
+    glTexEnvi( 0x2300u, 0x8591u, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 36 ) );
+    glTexEnvi( 0x2300u, 0x8592u, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 40 ) );
+    glTexEnvi( 0x2300u, 0x8572u, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 48 ) );
+    glTexEnvf( 0x2300u, 0xD1Cu, *(GLfloat *)( *(unsigned int *)( bundle + 148 ) + 76 ) );
+    glTexEnvi( 0x2300u, 0x8588u, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 52 ) );
+    glTexEnvi( 0x2300u, 0x8589u, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 56 ) );
+    glTexEnvi( 0x2300u, 0x858Au, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 60 ) );
+    glTexEnvi( 0x2300u, 0x8598u, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 64 ) );
+    glTexEnvi( 0x2300u, 0x8599u, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 68 ) );
+    glTexEnvi( 0x2300u, 0x859Au, *(unsigned int *)( *(unsigned int *)( bundle + 148 ) + 72 ) );
   }
-  result = *(_DWORD **)(a1 + 152);
-  if ( result )
+  if ( *(unsigned int **)( bundle + 152 )                     /* textureShader */
+    && ( **(unsigned int **)( bundle + 152 ) || glState_textureShaderEnabled[tmu] ) )
   {
-    if ( *result || (result = (_DWORD *)glState_textureShaderEnabled[a3]) != 0 )
+    if ( tmu != glState_currentTmu )
     {
-      if ( a3 != glState_currentTmu )
-      {
-        qglActiveTextureARB(a3 + 33984);
-        glState_currentTmu = a3;
-      }
-      glTexEnvi(0x86DEu, 0x86DFu, **(_DWORD **)(a1 + 152));
-      v8 = *(_DWORD *)(a1 + 152);
-      switch ( *(_DWORD *)v8 )
-      {
-        case 0x86E7:
-          glTexEnvfv(0x86DEu, 0x86E0u, (const GLfloat *)(v8 + 12));
-          break;
-        case 0x86E9:
-        case 0x86EA:
-          glTexEnvi(0x86DEu, 0x86E4u, *(_DWORD *)(v8 + 4));
-          break;
-        case 0x86EC:
-        case 0x86EE:
-        case 0x86F0:
-        case 0x86F1:
-        case 0x86F2:
-          goto LABEL_30;
-        case 0x86F3:
-          glTexEnvfv(0x86DEu, 0x86E5u, (const GLfloat *)(v8 + 12));
-LABEL_30:
-          glTexEnvi(0x86DEu, 0x86E4u, *(_DWORD *)(*(_DWORD *)(a1 + 152) + 4));
-          glTexEnvi(0x86DEu, 0x86D9u, *(_DWORD *)(*(_DWORD *)(a1 + 152) + 8));
-          break;
-        default:
-          break;
-      }
-      result = **(_DWORD ***)(a1 + 152);
-      glState_textureShaderEnabled[a3] = result != 0;
+      qglActiveTextureARB( tmu + 33984 );
+      glState_currentTmu = tmu;
     }
+    /* GL_TEXTURE_SHADER_NV, GL_SHADER_OPERATION_NV */
+    glTexEnvi( 0x86DEu, 0x86DFu, **(unsigned int **)( bundle + 152 ) );
+    switch ( **(unsigned int **)( bundle + 152 ) )
+    {
+      case 0x86E7:
+        glTexEnvfv( 0x86DEu, 0x86E0u, (const GLfloat *)( *(unsigned int **)( bundle + 152 ) + 3 ) );
+        break;
+      case 0x86E9:
+      case 0x86EA:
+        glTexEnvi( 0x86DEu, 0x86E4u, ( *(unsigned int **)( bundle + 152 ) )[1] );
+        break;
+      case 0x86F3:
+        glTexEnvfv( 0x86DEu, 0x86E5u, (const GLfloat *)( *(unsigned int **)( bundle + 152 ) + 3 ) );
+        /* fall through */
+      case 0x86EC:
+      case 0x86EE:
+      case 0x86F0:
+      case 0x86F1:
+      case 0x86F2:
+        glTexEnvi( 0x86DEu, 0x86E4u, ( *(unsigned int **)( bundle + 152 ) )[1] );
+        glTexEnvi( 0x86DEu, 0x86D9u, ( *(unsigned int **)( bundle + 152 ) )[2] );
+        break;
+      default:
+        break;
+    }
+    glState_textureShaderEnabled[tmu] = **(unsigned int **)( bundle + 152 ) != 0;
   }
-  return result;
 }
 
 /* ---- RB_DisableTMU  0x004FE5C0 ----  VERIFIED */
 void __cdecl RB_DisableTMU( int tmu )
 {
-  if ( !cap[tmu] )
+  if ( !glState_cap[tmu] )
     return;
 
   if ( tmu != glState_currentTmu )
@@ -480,8 +570,8 @@ void __cdecl RB_DisableTMU( int tmu )
     glState_currentTmu = tmu;
   }
 
-  glDisable( cap[tmu] );
-  cap[tmu] = 0;
+  glDisable( glState_cap[tmu] );
+  glState_cap[tmu] = 0;
 
   if ( glState_textureShaderEnabled[tmu] )
   {
@@ -491,695 +581,551 @@ void __cdecl RB_DisableTMU( int tmu )
 }
 
 /* ---- RB_SetupTmu  0x004FE630 ----  VERIFIED */
-void __cdecl RB_SetupTmu(int a1, int a2)
+void __cdecl RB_SetupTmu( int tmu, shaderStage_t *stage )
 {
-  int v3;
-  cvar_t *v4;
-
-  v3 = a2 + 200 * a1;
-  v4 = *(cvar_t **)(v3 + 148);
-  if ( v4 )
-    RB_EnableTMU(v3 + 4, v4, a1);
+  if ( *(unsigned int *)( (byte *)stage + 200 * tmu + 148 ) )
+    RB_EnableTMU( tmu, (int)( (byte *)stage + 200 * tmu + 4 ) );
   else
-    RB_DisableTMU(a1);
+    RB_DisableTMU( tmu );
 }
 
 /* ---- RB_EnableClientTmu  0x004FE660 ----  VERIFIED */
-void __cdecl RB_EnableClientTmu(int a1, int a2, GLvoid *pointer, GLsizei stride)
+void __cdecl RB_EnableClientTmu( int tmu, int bundle, GLvoid *pointer, GLsizei stride )
 {
-  char v4;
-
-  v4 = glState_currentClientTmu;
-  if ( glState_currentClientTmu != a1 )
+  if ( glState_currentClientTmu != tmu )
   {
-    qglClientActiveTextureARB(a1 + 33984);
-    v4 = a1;
-    glState_currentClientTmu = a1;
+    qglClientActiveTextureARB( tmu + 33984 );
+    glState_currentClientTmu = tmu;
   }
-  if ( (glState_clientStateBits & (1 << v4)) == 0 )
+  if ( ( glState_clientStateBits & ( 1 << glState_currentClientTmu ) ) == 0 )
   {
-    glEnableClientState(0x8078u);
+    glEnableClientState( 0x8078u );                   /* GL_TEXTURE_COORD_ARRAY */
     glState_clientStateBits |= 1 << glState_currentClientTmu;
   }
-  glTexCoordPointer(*(_DWORD *)(a2 + 140), 0x1406u, stride, pointer);
+  glTexCoordPointer( *(unsigned int *)( bundle + 140 ), 0x1406u, stride, pointer );   /* texCoordComponentCount, GL_FLOAT */
 }
 
 /* ---- RB_DisableClientTmu  0x004FE6D0 ----  VERIFIED */
-int __cdecl RB_DisableClientTmu(int a1)
+int __cdecl RB_DisableClientTmu( int tmu )
 {
-  int result;
+  int bit;
 
-  result = glState_clientStateBits;
-  if ( (glState_clientStateBits & (1 << a1)) != 0 )
+  bit = 1 << tmu;
+  if ( bit & glState_clientStateBits )
   {
-    if ( glState_currentClientTmu != a1 )
+    if ( glState_currentClientTmu != tmu )
     {
-      qglClientActiveTextureARB(a1 + 33984);
-      glState_currentClientTmu = a1;
+      qglClientActiveTextureARB( tmu + 33984 );
+      glState_currentClientTmu = tmu;
     }
-    glDisableClientState(0x8078u);
-    result = ~(1 << a1) & glState_clientStateBits;
-    glState_clientStateBits = result;
+    glDisableClientState( 0x8078u );
+    glState_clientStateBits &= ~bit;
   }
-  return result;
+  return glState_clientStateBits;
 }
 
 /* ---- RB_SetupClientTmu  0x004FE720 ----  VERIFIED */
-void __cdecl RB_SetupClientTmu(int a1, GLsizei a2, int a3, int a4)
+void __cdecl RB_SetupClientTmu( int tmu, GLsizei stride, shaderStage_t *stage, GLvoid **texCoordPointers )
 {
-  int v5;
-
-  v5 = a3 + 200 * a1;
-  if ( *(_DWORD *)(v5 + 148) )
-    RB_EnableClientTmu(a1, v5 + 4, *(GLvoid **)(a4 + 4 * a1), a2);
+  /* bundle[tmu].image and &bundle[tmu] as two expressions (a shared unit local
+     folds the add into the address and moves stage to another register) */
+  if ( *(unsigned int *)( (byte *)stage + 200 * tmu + 148 ) )
+    RB_EnableClientTmu( tmu, (int)( (byte *)stage + 200 * tmu + 4 ), texCoordPointers[tmu], stride );
   else
-    RB_DisableClientTmu(a1);
+    RB_DisableClientTmu( tmu );
 }
 
 /* ---- RB_EnableClientTmuATI  0x004FE760 ----  VERIFIED */
-int __cdecl RB_EnableClientTmuATI(int a1, int a2, int a3, int a4, int a5)
+void __cdecl RB_EnableClientTmuATI( int tmu, int bundle, int arrayObject, int offset, int stride )
 {
-  char v5;
-
-  v5 = glState_currentClientTmu;
-  if ( glState_currentClientTmu != a1 )
+  if ( glState_currentClientTmu != tmu )
   {
-    qglClientActiveTextureARB(a1 + 33984);
-    v5 = a1;
-    glState_currentClientTmu = a1;
+    qglClientActiveTextureARB( tmu + 33984 );
+    glState_currentClientTmu = tmu;
   }
-  if ( (glState_clientStateBits & (1 << v5)) == 0 )
+  if ( ( glState_clientStateBits & ( 1 << glState_currentClientTmu ) ) == 0 )
   {
-    glEnableClientState(0x8078u);
+    glEnableClientState( 0x8078u );
     glState_clientStateBits |= 1 << glState_currentClientTmu;
   }
-  qglArrayObjectATI(32888, *(_DWORD *)(a2 + 140), 5126, a5, a3, a4);
-  return 0;
+  qglArrayObjectATI( 32888, *(unsigned int *)( bundle + 140 ), 5126, stride, arrayObject, offset );
 }
 
 /* ---- RB_SetupClientTmuATI  0x004FE7E0 ----  VERIFIED */
-int __cdecl RB_SetupClientTmuATI(int a1, int a2, int a3, int a4, int a5)
+void __cdecl RB_SetupClientTmuATI( int tmu, int stride, shaderStage_t *stage, int arrayObject, int *offsets )
 {
-  int v6;
-
-  v6 = a3 + 200 * a1;
-  if ( *(_DWORD *)(v6 + 148) )
-    return RB_EnableClientTmuATI(a1, v6 + 4, a4, *(_DWORD *)(a5 + 4 * a1), a2);
+  if ( *(unsigned int *)( (byte *)stage + 200 * tmu + 148 ) )
+    RB_EnableClientTmuATI( tmu, (int)( (byte *)stage + 200 * tmu + 4 ), arrayObject, offsets[tmu], stride );
   else
-    return RB_DisableClientTmu(a1);
+    RB_DisableClientTmu( tmu );
 }
 
-/* ---- RB_SetupRegisterCombiners  0x004FE820 ----  VERIFIED */
-int __cdecl RB_SetupRegisterCombiners(int a1)
+/* ---- RB_SetupRegisterCombiners  0x004FE820 ----  VERIFIED
+ * Program the NV_register_combiners state machine from an opaque combiner
+ * state block: the two constant colours, each general combiner input mapping
+ * (four RGB and four alpha) and its RGB / alpha output, then the final
+ * combiner. */
+/* NV combiner records mirror the parser's ShaderNV* records in tr_shader.c.
+ * Keep the public integer handle while accessing the verified record fields. */
+typedef struct {
+  int registerName;
+  int inputMapping;
+  int componentUsage;
+} BackendNVRegisterMapping;
+typedef struct {
+  BackendNVRegisterMapping input[4];
+  int output[3];
+  int scale;
+  int bias;
+  unsigned char flags[3];
+} BackendNVGeneralCombiner;
+typedef struct {
+  float constants[2][4];
+  BackendNVGeneralCombiner portion[2];
+} BackendNVGeneralBlock;
+typedef struct {
+  BackendNVRegisterMapping input[7];
+  unsigned char clampColorSum;
+} BackendNVFinalCombiner;
+typedef struct {
+  float constants[2][4];
+  BackendNVGeneralBlock general[8];
+  BackendNVFinalCombiner final;
+  int numCombiners;
+  qboolean perCombinerConstants;
+} BackendNVCombinerState;
+COD1_ASSERT_SIZE(BackendNVRegisterMapping,12);
+COD1_ASSERT_SIZE(BackendNVGeneralCombiner,72);
+COD1_ASSERT_SIZE(BackendNVGeneralBlock,176);
+ASSERT_OFF(BackendNVCombinerState,general,32);
+ASSERT_OFF(BackendNVCombinerState,final,1440);
+ASSERT_OFF(BackendNVCombinerState,numCombiners,1528);
+ASSERT_OFF(BackendNVCombinerState,perCombinerConstants,1532);
+COD1_ASSERT_SIZE(BackendNVCombinerState,1536);
+int __cdecl RB_SetupRegisterCombiners( int combiners )
 {
-  const char *v1;
-  int v2;
-  int v3;
-  _DWORD *v4;
-  _DWORD *v5;
-  bool v6; // zf
-  int v7;
-  int v8;
-  _DWORD *v9;
-  int v11;
-  int v12;
-  int v13;
-
-  v1 = (const char *)a1;
-  glCombinerParameterfvNV(34090, a1);
-  glCombinerParameterfvNV(34091, a1 + 16);
-  glCombinerParameteriNV(34126, *(_DWORD *)(a1 + 1528));
-  if ( glConfig_NVRegisterCombiners >= 2 )
-  {
-    if ( *(_DWORD *)(a1 + 1532) )
-      glEnable(0x8535u);
-    else
-      glDisable(0x8535u);
+  BackendNVCombinerState *state = (BackendNVCombinerState *)combiners;
+  BackendNVGeneralBlock *block;
+  BackendNVGeneralCombiner *rgb, *alpha;
+  BackendNVRegisterMapping *rgbInput, *alphaInput;
+  int i, j;
+  glCombinerParameterfvNV(34090, state->constants[0]);
+  glCombinerParameterfvNV(34091, state->constants[1]);
+  glCombinerParameteriNV(34126, state->numCombiners);
+  if (glConfig_NVRegisterCombiners >= 2) {
+    if (state->perCombinerConstants) glEnable(0x8535u);
+    else glDisable(0x8535u);
   }
-  if ( *(int *)(a1 + 1528) > 0 )
-  {
-    v12 = 34128;
-    v2 = a1 + 136;
-    do
-    {
-      v11 = 34083;
-      v4 = (_DWORD *)v2;
-      v5 = (_DWORD *)(v2 - 72 + 4);
-      v13 = 4;
-      do
-      {
-        glCombinerInputNV(v12, 6407, v11, *(v5 - 1), *v5, v5[1]);
-        glCombinerInputNV(v12, 6406, v11, *v4, v5[18], v4[2]);
-        v5 += 3;
-        v4 += 3;
-        v6 = v13 == 1;
-        ++v11;
-        --v13;
-      }
-      while ( !v6 );
-      v7 = v12;
-      v3 = v2 - 72;
-      glCombinerOutputNV(
-        v12,
-        6407,
-        *(_DWORD *)(v3 + 48),
-        *(_DWORD *)(v3 + 52),
-        *(_DWORD *)(v3 + 56),
-        *(_DWORD *)(v3 + 60),
-        *(_DWORD *)(v3 + 64),
-        *(unsigned __int8 *)(v3 + 68),
-        *(unsigned __int8 *)(v3 + 69),
-        *(unsigned __int8 *)(v3 + 70));
-      glCombinerOutputNV(
-        v12,
-        6406,
-        *(_DWORD *)(v2 + 48),
-        *(_DWORD *)(v2 + 52),
-        *(_DWORD *)(v2 + 56),
-        *(_DWORD *)(v2 + 60),
-        *(_DWORD *)(v2 + 64),
-        *(unsigned __int8 *)(v2 + 68),
-        *(unsigned __int8 *)(v2 + 69),
-        *(unsigned __int8 *)(v2 + 70));
-      if ( *(_DWORD *)(a1 + 1532) )
-      {
-        glCombinerStageParameterfvNV(v12, 34090, v2 - 104);
-        glCombinerStageParameterfvNV(v12, 34091, v2 - 88);
-      }
-      v2 += 176;
-      ++v12;
+  for (i=0; i<state->numCombiners; ++i) {
+    block=&state->general[i];
+    rgb=&block->portion[0];
+    alpha=&block->portion[1];
+    for (j=0; j<4; ++j) {
+      rgbInput=&rgb->input[j];
+      alphaInput=&alpha->input[j];
+      glCombinerInputNV(i+34128,6407,j+34083,rgbInput->registerName,rgbInput->inputMapping,rgbInput->componentUsage);
+      glCombinerInputNV(i+34128,6406,j+34083,alphaInput->registerName,alphaInput->inputMapping,alphaInput->componentUsage);
     }
-    while ( v7 - 34127 < *(_DWORD *)(a1 + 1528) );
-    v1 = (const char *)a1;
+    glCombinerOutputNV(i+34128,6407,
+                       rgb->output[0],rgb->output[1],rgb->output[2],rgb->scale,rgb->bias,
+                       rgb->flags[0],rgb->flags[1],rgb->flags[2]);
+    glCombinerOutputNV(i+34128,6406,
+                       alpha->output[0],alpha->output[1],alpha->output[2],alpha->scale,alpha->bias,
+                       alpha->flags[0],alpha->flags[1],alpha->flags[2]);
+    if (state->perCombinerConstants) {
+      glCombinerStageParameterfvNV(i+34128,34090,state->general[i].constants[0]);
+      glCombinerStageParameterfvNV(i+34128,34091,state->general[i].constants[1]);
+    }
   }
-  v8 = 0;
-  v9 = v1 + 1444;
-  do
-  {
-    glFinalCombinerInputNV(v8 + 34083, *(v9 - 1), *v9, v9[1]);
-    ++v8;
-    v9 += 3;
+  for(i=0;i<7;++i) {
+    glFinalCombinerInputNV(i+34083,state->final.input[i].registerName,state->final.input[i].inputMapping,state->final.input[i].componentUsage);
   }
-  while ( v8 < 7 );
   return GL_CheckErrors("RB_SetupRegisterCombiners");
 }
 
-/* ---- RB_SetupVertexProgram  0x004FEA20 ----  VERIFIED */
-int __cdecl RB_SetupVertexProgram(int a1)
+/* ---- RB_SetupVertexProgram  0x004FEA20 ----  VERIFIED
+ * Bind the ARB vertex program and upload its local parameters: the local view
+ * origin, and (for a dynamic light) the light origin, colour and attenuation. */
+void __cdecl RB_SetupVertexProgram( int program )
 {
-  int result;
-  float v2[4];
+  float local[4];
 
-  if ( a1 != glState_boundVertexProgram )
+  if ( program != glState_boundVertexProgram )
   {
-    glBindProgramARB(34336, *(_DWORD *)(a1 + 64));
-    glState_boundVertexProgram = a1;
+    glBindProgramARB( 34336, *(unsigned int *)( program + 64 ) );
+    glState_boundVertexProgram = program;
   }
-  GlobalPositionToLocal(v2, backEnd_viewParms_originX);
-  v2[3] = 1.0;
-  glProgramLocalParameter4fvARB(34336, 0, v2);
-  result = backEnd_currentDlight;
+  GlobalPositionToLocal( backEnd_viewParms_originX, local );
+  local[3] = 1.0;
+  glProgramLocalParameter4fvARB( 34336, 0, local );
   if ( backEnd_currentDlight )
   {
-    GlobalPositionToLocal(v2, (float *)(backEnd_currentDlight + 68));
-    v2[3] = 1.0;
-    glProgramLocalParameter4fvARB(34336, 1, v2);
-    v2[0] = backEnd_currentLightScale * *(float *)(backEnd_currentDlight + 36);
-    v2[1] = backEnd_currentLightScale * *(float *)(backEnd_currentDlight + 40);
-    v2[2] = backEnd_currentLightScale * *(float *)(backEnd_currentDlight + 44);
-    v2[3] = backEnd_currentLightScale * *(float *)(backEnd_currentDlight + 48);
-    glProgramLocalParameter4fvARB(34336, 2, backEnd_currentDlight + 36);
-    glProgramLocalParameter4fARB(
-             34336,
-             3,
-             *(float *)(backEnd_currentDlight + 96),
-             *(float *)(backEnd_currentDlight + 100),
-             *(float *)(backEnd_currentDlight + 104),
-             1.0f);
-    return result;
+    GlobalPositionToLocal( (float *)( backEnd_currentDlight + 68 ), local );
+    local[3] = 1.0;
+    glProgramLocalParameter4fvARB( 34336, 1, local );
+    /* scaled colour is computed but the GL call below uses the UNSCALED
+       pointer (backEnd_currentDlight + 36) -- retail */
+    local[0] = backEnd_currentLightScale * *(float *)( backEnd_currentDlight + 36 );
+    local[1] = backEnd_currentLightScale * *(float *)( backEnd_currentDlight + 40 );
+    local[2] = backEnd_currentLightScale * *(float *)( backEnd_currentDlight + 44 );
+    local[3] = backEnd_currentLightScale * *(float *)( backEnd_currentDlight + 48 );
+    glProgramLocalParameter4fvARB( 34336, 2, (const GLfloat *)( backEnd_currentDlight + 36 ) );
+    glProgramLocalParameter4fARB( 34336, 3,
+                                  *(float *)( backEnd_currentDlight + 96 ),
+                                  *(float *)( backEnd_currentDlight + 100 ),
+                                  *(float *)( backEnd_currentDlight + 104 ),
+                                  1.0f );
   }
-  return result;
 }
 
 /* ---- GL_BindFragmentShaderATI  0x004FEB10 ----  VERIFIED */
-void __cdecl GL_BindFragmentShaderATI(int a1)
+void __cdecl GL_BindFragmentShaderATI(int shaderId)
 {
-  if ( a1 != glState_boundFragmentShader )
+  if ( shaderId != glState_boundFragmentShader )
   {
-    glBindFragmentShaderATI(a1);
-    glState_boundFragmentShader = a1;
+    glBindFragmentShaderATI(shaderId);
+    glState_boundFragmentShader = shaderId;
   }
 }
 
-/* ---- RB_SetupMultitexture  0x004FEB30 ----  VERIFIED */
-int __cdecl RB_SetupMultitexture(_DWORD *a1, int a2, GLsizei a3)
+/* ---- RB_SetupMultitexture  0x004FEB30 ----  VERIFIED
+ * Configure every texture unit for a shader stage: the current client / server
+ * units first, then the remaining ones, then the register combiners, vertex
+ * program and fragment shader.  The per-unit helpers are inlined (their
+ * out-of-line copies have no callers in retail). */
+void __cdecl RB_SetupMultitexture( unsigned int *stage, GLvoid **texCoordPointers, GLsizei stride )
 {
-  int v4;
-  _DWORD *v5;
-  cvar_t *v6;
-  cvar_t *v7;
-  int v8;
-  _DWORD *v9;
-  int result;
-  int v11;
-  int v12;
-  int v13;
-  int v14;
+  int clientTmu;
+  int serverTmu;
+  int tmu;
 
-  v4 = a1[50 * glState_currentClientTmu + 37];
-  v5 = &a1[50 * glState_currentClientTmu];
-  v14 = glState_currentClientTmu;
-  if ( v4 )
-    RB_EnableClientTmu(glState_currentClientTmu, (int)(v5 + 1), *(GLvoid **)(a2 + 4 * glState_currentClientTmu), a3);
-  else
-    RB_DisableClientTmu(glState_currentClientTmu);
-  v6 = (cvar_t *)a1[50 * glState_currentTmu + 37];
-  v13 = glState_currentTmu;
-  if ( v6 )
-    RB_EnableTMU((int)&a1[50 * glState_currentTmu + 1], v6, glState_currentTmu);
-  else
-    RB_DisableTMU(glState_currentTmu);
-  v8 = 0;
-  if ( Value > 0 )
+  clientTmu = glState_currentClientTmu;
+  RB_SetupClientTmu( glState_currentClientTmu, stride, (shaderStage_t *)stage, texCoordPointers );
+  serverTmu = glState_currentTmu;
+  RB_SetupTmu( glState_currentTmu, (shaderStage_t *)stage );
+  for ( tmu = 0; tmu < glConfig_maxActiveTextures; tmu++ )                      /* glConfig.maxActiveTextures */
   {
-    v9 = a1 + 1;
-    do
+    if ( tmu != clientTmu )
     {
-      if ( v8 != v14 )
+      if ( stage[50 * tmu + 37] )
+        RB_EnableClientTmu( tmu, (int)&stage[50 * tmu + 1], texCoordPointers[tmu], stride );
+      else if ( ( ( 1 << tmu ) & glState_clientStateBits ) != 0 )
       {
-        if ( v9[36] )
+        if ( glState_currentClientTmu != tmu )
         {
-          RB_EnableClientTmu(v8, (int)v9, *(GLvoid **)(a2 + 4 * v8), a3);
+          qglClientActiveTextureARB( tmu + 33984 );
+          glState_currentClientTmu = tmu;
         }
-        else
-        {
-          v7 = (cvar_t *)v8;
-          if ( ((1 << v8) & glState_clientStateBits) != 0 )
-          {
-            if ( glState_currentClientTmu != v8 )
-            {
-              qglClientActiveTextureARB(v8 + 33984);
-              glState_currentClientTmu = v8;
-            }
-            glDisableClientState(0x8078u);
-            glState_clientStateBits &= ~(1 << v8);
-          }
-        }
+        glDisableClientState( 0x8078u );
+        glState_clientStateBits &= ~( 1 << tmu );
       }
-      if ( v8 != v13 )
-      {
-        if ( v9[36] )
-          RB_EnableTMU((int)v9, v7, v8);
-        else
-          RB_DisableTMU(v8);
-      }
-      ++v8;
-      v9 += 50;
     }
-    while ( v8 < Value );
+    if ( tmu != serverTmu )
+      RB_SetupTmu( tmu, (shaderStage_t *)stage );
   }
-  result = a1[402];
-  if ( result )
-    result = RB_SetupRegisterCombiners(a1[402]);
-  v11 = a1[403];
-  if ( v11 )
-    result = RB_SetupVertexProgram(v11);
-  v12 = a1[401];
-  if ( v12 != glState_boundFragmentShader )
-  {
-    glBindFragmentShaderATI(a1[401]);
-    glState_boundFragmentShader = v12;
-  }
-  return result;
+  if ( stage[402] )                                        /* registerCombiners */
+    RB_SetupRegisterCombiners( stage[402] );
+  if ( stage[403] )                                        /* vertexProgram */
+    RB_SetupVertexProgram( stage[403] );
+  GL_BindFragmentShaderATI( stage[401] );                  /* fragmentShaderATI */
 }
 
-/* ---- RB_SetupMultitextureATI  0x004FECB0 ----  VERIFIED */
-int __cdecl RB_SetupMultitextureATI(_DWORD *a1, int a2, int a3, int a4)
+/* ---- RB_SetupMultitextureATI  0x004FECB0 ----  VERIFIED
+ * ATI array-object variant of RB_SetupMultitexture. */
+void __cdecl RB_SetupMultitextureATI( unsigned int *stage, int arrayObject, int *offsets, int stride )
 {
-  _DWORD *v4;
-  cvar_t *v5;
-  cvar_t *v6;
-  int v7;
-  _DWORD *v8;
-  int result;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
+  int clientTmu;
+  int serverTmu;
+  int tmu;
 
-  v4 = a1;
-  v12 = glState_currentClientTmu;
-  if ( a1[50 * glState_currentClientTmu + 37] )
-    RB_EnableClientTmuATI(glState_currentClientTmu, (int)&a1[50 * glState_currentClientTmu + 1], a2, *(_DWORD *)(a3 + 4 * glState_currentClientTmu), a4);
-  else
-    RB_DisableClientTmu(glState_currentClientTmu);
-  v5 = (cvar_t *)a1[50 * glState_currentTmu + 37];
-  v13 = glState_currentTmu;
-  if ( v5 )
-    RB_EnableTMU((int)&a1[50 * glState_currentTmu + 1], v5, glState_currentTmu);
-  else
-    RB_DisableTMU(glState_currentTmu);
-  v7 = 0;
-  if ( Value > 0 )
+  clientTmu = glState_currentClientTmu;
+  RB_SetupClientTmuATI( glState_currentClientTmu, stride, (shaderStage_t *)stage, arrayObject, offsets );
+  serverTmu = glState_currentTmu;
+  RB_SetupTmu( glState_currentTmu, (shaderStage_t *)stage );
+  for ( tmu = 0; tmu < glConfig_maxActiveTextures; tmu++ )
   {
-    v8 = a1 + 1;
-    do
+    if ( tmu != clientTmu )
     {
-      if ( v7 != v12 )
+      if ( stage[50 * tmu + 37] )
+        RB_EnableClientTmuATI( tmu, (int)&stage[50 * tmu + 1], arrayObject, offsets[tmu], stride );
+      else if ( ( ( 1 << tmu ) & glState_clientStateBits ) != 0 )
       {
-        if ( v8[36] )
+        if ( glState_currentClientTmu != tmu )
         {
-          RB_EnableClientTmuATI(v7, (int)v8, a2, *(_DWORD *)(a3 + 4 * v7), a4);
+          qglClientActiveTextureARB( tmu + 33984 );
+          glState_currentClientTmu = tmu;
         }
-        else
-        {
-          v6 = (cvar_t *)v7;
-          if ( ((1 << v7) & glState_clientStateBits) != 0 )
-          {
-            if ( glState_currentClientTmu != v7 )
-            {
-              qglClientActiveTextureARB(v7 + 33984);
-              glState_currentClientTmu = v7;
-            }
-            glDisableClientState(0x8078u);
-            glState_clientStateBits &= ~(1 << v7);
-          }
-        }
+        glDisableClientState( 0x8078u );
+        glState_clientStateBits &= ~( 1 << tmu );
       }
-      if ( v7 != v13 )
-      {
-        if ( v8[36] )
-          RB_EnableTMU((int)v8, v6, v7);
-        else
-          RB_DisableTMU(v7);
-      }
-      ++v7;
-      v8 += 50;
     }
-    while ( v7 < Value );
-    v4 = a1;
+    if ( tmu != serverTmu )
+      RB_SetupTmu( tmu, (shaderStage_t *)stage );
   }
-  result = v4[402];
-  if ( result )
-    result = RB_SetupRegisterCombiners(v4[402]);
-  v10 = v4[403];
-  if ( v10 )
-    result = RB_SetupVertexProgram(v10);
-  v11 = v4[401];
-  if ( v11 != glState_boundFragmentShader )
-  {
-    glBindFragmentShaderATI(v4[401]);
-    glState_boundFragmentShader = v11;
-  }
-  return result;
+  if ( stage[402] )
+    RB_SetupRegisterCombiners( stage[402] );
+  if ( stage[403] )
+    RB_SetupVertexProgram( stage[403] );
+  GL_BindFragmentShaderATI( stage[401] );
 }
 
-/* ---- RB_EndMultitexture  0x004FEE40 ----  VERIFIED */
-void RB_EndMultitexture()
+/* ---- RB_EndMultitexture  0x004FEE40 ----  VERIFIED
+ * Disable every texture unit above 0, return to unit 0 and restore GL_MODULATE. */
+void RB_EndMultitexture( void )
 {
   int i;
-  int v1;
 
-  for ( i = 1; i < Value; ++i )
+  for ( i = 1; i < glConfig_maxActiveTextures; ++i )
   {
-    if ( (glState_clientStateBits & (1 << i)) != 0 )
+    if ( ( glState_clientStateBits & ( 1 << i ) ) != 0 )
     {
       if ( glState_currentClientTmu != i )
       {
-        qglClientActiveTextureARB(i + 33984);
+        qglClientActiveTextureARB( i + 33984 );
         glState_currentClientTmu = i;
       }
-      glDisableClientState(0x8078u);
-      glState_clientStateBits &= ~(1 << i);
+      glDisableClientState( 0x8078u );
+      glState_clientStateBits &= ~( 1 << i );
     }
-    RB_DisableTMU(i);
+    RB_DisableTMU( i );
   }
-  v1 = glState_currentTmu;
   if ( glState_currentTmu )
   {
-    qglActiveTextureARB(33984);
-    v1 = 0;
+    qglActiveTextureARB( 33984 );
     glState_currentTmu = 0;
   }
   if ( glState_currentClientTmu )
   {
-    qglClientActiveTextureARB(33984);
-    v1 = glState_currentTmu;
+    qglClientActiveTextureARB( 33984 );
     glState_currentClientTmu = 0;
   }
-  if ( glState_texEnv[v1] != 8448 )
+  if ( glState_texEnv[glState_currentTmu] != 8448 )         /* GL_MODULATE */
   {
-    glState_texEnv[v1] = 8448;
-    glTexEnvi(0x2300u, 0x2200u, 8448);
+    glState_texEnv[glState_currentTmu] = 8448;
+    glTexEnvi( 0x2300u, 0x2200u, 8448 );
   }
 }
 
 /* ---- RB_SetupStage  0x004FEF20 ----  VERIFIED */
-int __cdecl RB_SetupStage(_DWORD *a1, int a2, GLsizei a3)
+void __cdecl RB_SetupStage( shaderStage_t *stage, int texCoordPointers, GLsizei stride )
 {
-  GL_State(a1[417]);
-  return RB_SetupMultitexture(a1, a2, a3);
+  GL_State( stage->stateBits );
+  RB_SetupMultitexture( (unsigned int *)stage, (GLvoid **)texCoordPointers, stride );
 }
 
 /* ---- RB_SetupStageATI  0x004FEF40 ----  VERIFIED */
-int __cdecl RB_SetupStageATI(_DWORD *a1, int a2, int a3, int a4)
+void __cdecl RB_SetupStageATI( shaderStage_t *stage, int arrayObject, int offsets, int stride )
 {
-  GL_State(a1[417]);
-  return RB_SetupMultitextureATI(a1, a2, a3, a4);
+  GL_State( stage->stateBits );
+  RB_SetupMultitextureATI( (unsigned int *)stage, arrayObject, (int *)offsets, stride );
 }
 
-/* ---- DrawTris  0x004FEF70 ----  VERIFIED */
-void __cdecl DrawTris(int a1)
+/* ---- DrawTris  0x004FEF70 ----  VERIFIED
+ * Re-draw the current surface's triangles with the r_showtris debug shader.
+ * (only input->entity is read through the pointer; the rest are tess_ globals.) */
+void __cdecl DrawTris( shaderCommands_t *input )
 {
-  void *v1;
-  int v2;
-  int v3;
-  int v4;
+  int savedStageCount;
+  int savedShader;
+  int savedStages;
 
-  if ( r_showtris->integer > 2 || (v1 = *(void **)(a1 + 1933372), v1 != &backEnd_entity2D) && v1 != &backEnd_debugEntity )
+  if ( r_showtris->integer > 2
+    || ( (void *)input->entity != (void *)&backEnd_entity2D
+      && (void *)input->entity != (void *)&backEnd_debugEntity ) )
   {
-    v2 = tess_activeStageCount;
-    v3 = tess_shader;
-    v4 = tess_activeStages;
-    tess_shader = tr_showTrisShader;
-    tess_activeStages = tr_showTrisShader + 340;
-    tess_activeStageCount = *(_DWORD *)(tr_showTrisShader + 336);
-    if ( (r_showtris->integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    tr_stageIteratorFunc(0);
-    glDepthRange(0.0, 1.0);
-    tess_activeStages = v4;
-    tess_shader = v3;
-    tess_activeStageCount = v2;
+    savedShader     = tess_shader;
+    savedStages     = tess_activeStages;
+    savedStageCount = tess_activeStageCount;
+    tess_shader           = tr_showTrisShader;
+    tess_activeStages     = tr_showTrisShader + 340;                    /* showTris->stages */
+    tess_activeStageCount = ((shader_t *)tr_showTrisShader)->numUnfoggedPasses;     /* showTris->numStages */
+    if ( ( r_showtris->integer & 1 ) != 0 )
+      glDepthRange( 0.0, 0.10000000149011612 );   /* (double)0.1f = 0x3FB99999A0000000, retail 0x004FEFD8 */
+    tr_stageIteratorFunc( 0 );
+    glDepthRange( 0.0, 1.0 );
+    tess_activeStages     = savedStages;
+    tess_shader           = savedShader;
+    tess_activeStageCount = savedStageCount;
   }
 }
 
-/* ---- DrawNormals  0x004FF020 ----  VERIFIED */
-void __cdecl DrawNormals(_DWORD *a1)
+/* ---- DrawNormals  0x004FF020 ----  VERIFIED
+ * r_shownormals "white": draw the normal (and, when valid, tangent and
+ * bitangent) at each vertex as coloured lines. */
+void __cdecl DrawNormals( shaderCommands_t *input )
 {
-  int v1;
-  int *v2;
-  float *v3;
-  int v4;
-  int v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
-  int v10;
-  int v11;
-  int v12;
-  int v13;
+  int    i;
+  float *xyz;
+  float  end[3];
 
-  v1 = 0;
-  if ( a1[483337] )
-  {
-    RB_BeginImmediateMode();
-    glDepthRange(0.0, 0.9990000128746033);
-    GL_Bind((GLenum *)tr_whiteImage);
-    rbDebug_immediateColorR = -1;
-    rbDebug_immediateColorG = -1;
-    rbDebug_immediateColorB = -1;
-    rbDebug_immediateColorA = -1;
-    if ( !a1[483339] || !a1[483338] )
-      RB_CalcTangentSpace();
-    if ( r_shownormals->integer == 1 )
-      glDepthRange(0.0, 0.0);
-    GL_State(4352);
-    mode = 1;
-    v2 = tess_xyz;
-    if ( (int)a1[483346] > 0 )
-    {
-      v3 = (float *)(a1 + 180225);
-      do
-      {
-        if ( a1[483338] )
-        {
-          if ( a1[483339] )
-          {
-            rbDebug_immediateColorR = -1;
-            rbDebug_immediateColorG = 127;
-            rbDebug_immediateColorB = 127;
-            rbDebug_immediateColorA = -1;
-            RB_glVertex3f(*v2, v2[1], v2[2]);
-            *(float *)&v5 = *(v3 - 1) + *(v3 - 1) + *(float *)v2;
-            *(float *)&v8 = *v3 + *v3 + *((float *)v2 + 1);
-            *(float *)&v11 = v3[1] + v3[1] + *((float *)v2 + 2);
-            RB_glVertex3f(v5, v8, v11);
-            rbDebug_immediateColorR = 127;
-            rbDebug_immediateColorG = -1;
-            rbDebug_immediateColorB = 127;
-            rbDebug_immediateColorA = -1;
-            RB_glVertex3f(*v2, v2[1], v2[2]);
-            *(float *)&v6 = *(v3 - 24577) + *(v3 - 24577) + *(float *)v2;
-            *(float *)&v9 = *(v3 - 24576) + *(v3 - 24576) + *((float *)v2 + 1);
-            *(float *)&v12 = *(v3 - 24575) + *(v3 - 24575) + *((float *)v2 + 2);
-            RB_glVertex3f(v6, v9, v12);
-            rbDebug_immediateColorR = 127;
-            rbDebug_immediateColorG = 127;
-            rbDebug_immediateColorB = -1;
-            rbDebug_immediateColorA = -1;
-          }
-        }
-        RB_glVertex3f(*v2, v2[1], v2[2]);
-        *(float *)&v7 = *(v3 - 49153) + *(v3 - 49153) + *(float *)v2;
-        *(float *)&v10 = *(v3 - 49152) + *(v3 - 49152) + *((float *)v2 + 1);
-        *(float *)&v13 = *(v3 - 49151) + *(v3 - 49151) + *((float *)v2 + 2);
-        RB_glVertex3f(v7, v10, v13);
-        if ( (_BYTE)v1 == 0xFF )
-        {
-          glDrawArrays(mode, 0, rbDebug_immediateVertexCount);
-          rbDebug_immediateVertexCount = 0;
-          mode = 1;
-        }
-        v2 += tess_vertexComponentCount;
-        ++v1;
-        v3 += 3;
-      }
-      while ( v1 < a1[483346] );
-    }
-    glDrawArrays(mode, 0, rbDebug_immediateVertexCount);
-    rbDebug_immediateVertexCount = 0;
-    mode = 0;
-    glDepthRange(0.0, 1.0);
-    rbDebug_immediateModeActive = 0;
-    if ( !backEnd_projection2D && (glState_glStateBits & 0x200000) == 0 )
-    {
-      if ( r_fog->integer )
-      {
-        v4 = dword_16C4BB0;
-        if ( (backEnd_refdef_rdflags & 8) == 0 )
-          v4 = glfogNum;
-        if ( v4 )
-        {
-          glEnable(0xB60u);
-          glState_glStateBits |= 0x200000u;
-        }
-      }
-    }
-    glVertexPointer(3, 0x1406u, 0, tess_xyz);
-  }
-}
-
-/* ---- DrawColoredNormals  0x004FF310 ----  VERIFIED */
-void __cdecl DrawColoredNormals(int a1)
-{
-  int v1;
-  int *v2;
-  float *v3;
-  double v4;
-  double v5;
-  int v6;
-  int v7;
-  int v8;
-  int v9;
+  if ( !input->requiresVertexBasis )
+    return;
 
   RB_BeginImmediateMode();
-  GL_Bind((GLenum *)tr_whiteImage);
-  rbDebug_immediateColorR = -1;
-  rbDebug_immediateColorG = -1;
-  rbDebug_immediateColorB = -1;
-  rbDebug_immediateColorA = -1;
-  GL_State(4352);
-  mode = 1;
-  v1 = 0;
-  v2 = tess_xyz;
-  if ( *(int *)(a1 + 1933384) > 0 )
+  glDepthRange( 0.0, 0.9990000128746033 );
+  GL_Bind( (GLenum *)tr_whiteImage );
+  rendererDebugState.immediateColorR = -1;
+  rendererDebugState.immediateColorG = -1;
+  rendererDebugState.immediateColorB = -1;
+  rendererDebugState.immediateColorA = -1;
+  if ( !input->stageBitangentsValid || !input->stageTangentsValid )
+    RB_CalcTangentSpace();
+  if ( r_shownormals->integer == 1 )
+    glDepthRange( 0.0, 0.0 );
+  GL_State( 4352 );
+  rendererDebugState.immediateMode = 1;
+
+  xyz = tess_xyz;
+  for ( i = 0; i < input->numVertexes; i++ )
   {
-    v3 = (float *)(a1 + 0x80000);
-    do
+    if ( input->stageTangentsValid && input->stageBitangentsValid )
     {
-      v4 = (v3[6] + 1.0) * 0.5;
-      v5 = (v3[3] + 1.0) * 0.5 * 255.0;
-      rbDebug_immediateColorR = (unsigned __int64)((*v3 + 1.0) * 0.5 * 255.0);
-      rbDebug_immediateColorG = (unsigned __int64)v5;
-      rbDebug_immediateColorB = (unsigned __int64)(v4 * 255.0);
-      rbDebug_immediateColorA = -1;
-      RB_glVertex3f(*v2, v2[1], v2[2]);
-      *(float *)&v7 = *v3 + *v3 + *(float *)v2;
-      *(float *)&v8 = v3[1] + v3[1] + *((float *)v2 + 1);
-      *(float *)&v9 = v3[2] + v3[2] + *((float *)v2 + 2);
-      RB_glVertex3f(v7, v8, v9);
-      v2 += tess_vertexComponentCount;
-      ++v1;
-      v3 += 3;
+      rendererDebugState.immediateColorR = -1;
+      rendererDebugState.immediateColorG = 127;
+      rendererDebugState.immediateColorB = 127;
+      rendererDebugState.immediateColorA = -1;
+      RB_glVertex3fv( xyz );
+      VectorMA( xyz, 2, &input->stageTangents[3 * i], end );
+      RB_glVertex3fv( end );
+
+      rendererDebugState.immediateColorR = 127;
+      rendererDebugState.immediateColorG = -1;
+      rendererDebugState.immediateColorB = 127;
+      rendererDebugState.immediateColorA = -1;
+      RB_glVertex3fv( xyz );
+      VectorMA( xyz, 2, &input->stageBitangents[3 * i], end );
+      RB_glVertex3fv( end );
+
+      rendererDebugState.immediateColorR = 127;
+      rendererDebugState.immediateColorG = 127;
+      rendererDebugState.immediateColorB = -1;
+      rendererDebugState.immediateColorA = -1;
     }
-    while ( v1 < *(_DWORD *)(a1 + 1933384) );
+
+    RB_glVertex3fv( xyz );
+    VectorMA( xyz, 2, &input->stageNormals[3 * i], end );
+    RB_glVertex3fv( end );
+
+    if ( (unsigned char)i == 0xFF )                 /* flush the immediate buffer every 256 verts */
+    {
+      glDrawArrays( rendererDebugState.immediateMode, 0, rendererDebugState.immediateVertexCount );
+      rendererDebugState.immediateVertexCount = 0;
+      rendererDebugState.immediateMode = 1;
+    }
+    xyz += tess_vertexComponentCount;
   }
-  glDrawArrays(mode, 0, rbDebug_immediateVertexCount);
-  rbDebug_immediateVertexCount = 0;
-  mode = 0;
-  glDepthRange(0.0, 1.0);
-  rbDebug_immediateModeActive = 0;
-  if ( !backEnd_projection2D && (glState_glStateBits & 0x200000) == 0 )
+
+  glDrawArrays( rendererDebugState.immediateMode, 0, rendererDebugState.immediateVertexCount );
+  rendererDebugState.immediateVertexCount = 0;
+  rendererDebugState.immediateMode = 0;
+  glDepthRange( 0.0, 1.0 );
+  rendererDebugState.immediateModeActive = 0;
+  if ( !backEnd_projection2D && ( glState_glStateBits & 0x200000 ) == 0 && r_fog->integer )
   {
-    if ( r_fog->integer )
+    int fogNum = tr_fogPortalView_registered;
+    if ( ( backEnd_refdef_rdflags & 8 ) == 0 )
+      fogNum = glfogNum;
+    if ( fogNum )
     {
-      v6 = dword_16C4BB0;
-      if ( (backEnd_refdef_rdflags & 8) == 0 )
-        v6 = glfogNum;
-      if ( v6 )
-      {
-        glEnable(0xB60u);
-        glState_glStateBits |= 0x200000u;
-      }
+      glEnable( 0xB60u );                            /* GL_FOG */
+      glState_glStateBits |= 0x200000u;
     }
   }
-  glVertexPointer(3, 0x1406u, 0, tess_xyz);
+  glVertexPointer( 3, 0x1406u, 0, tess_xyz );
+}
+
+/* ---- DrawColoredNormals  0x004FF310 ----  VERIFIED
+ * r_shownormals "color": draw each vertex normal as a line coloured by the
+ * normal direction.  RETAIL BUG: the green / blue channels read normal[3] /
+ * normal[6] (the X of the next two vertices' normals) instead of normal[1] /
+ * normal[2]; reproduced as shipped. */
+void __cdecl DrawColoredNormals( shaderCommands_t *input )
+{
+  int    i;
+  int   *xyz;
+
+  RB_BeginImmediateMode();
+  GL_Bind( (GLenum *)tr_whiteImage );
+  rendererDebugState.immediateColorR = -1;
+  rendererDebugState.immediateColorG = -1;
+  rendererDebugState.immediateColorB = -1;
+  rendererDebugState.immediateColorA = -1;
+  GL_State( 4352 );
+  rendererDebugState.immediateMode = 1;
+
+  xyz = (int *)tess_xyz;
+  for ( i = 0; i < input->numVertexes; i++ )
+  {
+    const float *pos    = (const float *)xyz;
+    rfloat       r, g, b;
+    float        end[3];
+
+    b = ( (rfloat)input->stageNormals[3 * i + 6] + 1.0f ) * 0.5f;   /* retail bug */
+    g = ( (rfloat)input->stageNormals[3 * i + 3] + 1.0f ) * 0.5f;   /* retail bug */
+    r = ( (rfloat)input->stageNormals[3 * i + 0] + 1.0f ) * 0.5f;
+    rendererDebugState.immediateColorR = (unsigned char)( r * 255.0f );
+    rendererDebugState.immediateColorG = (unsigned char)( g * 255.0f );
+    rendererDebugState.immediateColorB = (unsigned char)( b * 255.0f );
+    rendererDebugState.immediateColorA = -1;
+
+    RB_glVertex3fv( pos );
+    VectorMA( pos, 2, &input->stageNormals[3 * i], end );
+    RB_glVertex3fv( end );
+
+    xyz += tess_vertexComponentCount;
+  }
+
+  glDrawArrays( rendererDebugState.immediateMode, 0, rendererDebugState.immediateVertexCount );
+  rendererDebugState.immediateVertexCount = 0;
+  rendererDebugState.immediateMode = 0;
+  glDepthRange( 0.0, 1.0 );
+  rendererDebugState.immediateModeActive = 0;
+  if ( !backEnd_projection2D && ( glState_glStateBits & 0x200000 ) == 0 && r_fog->integer )
+  {
+    int fogNum = tr_fogPortalView_registered;
+    if ( ( backEnd_refdef_rdflags & 8 ) == 0 )
+      fogNum = glfogNum;
+    if ( fogNum )
+    {
+      glEnable( 0xB60u );
+      glState_glStateBits |= 0x200000u;
+    }
+  }
+  glVertexPointer( 3, 0x1406u, 0, tess_xyz );
 }
 
 /* ---- RB_SelectStorageATI  0x004FF4E0 ----  VERIFIED */
-void __cdecl RB_SelectStorageATI(int a1)
+void __cdecl RB_SelectStorageATI(int storageMode)
 {
-  if ( a1 == 3 )
+  if ( storageMode == 3 )
   {
     glVertexPointer(tess_vertexComponentCount, 0x1406u, 0, tess_xyz);
     glNormalPointer(0x1406u, 12, tess_stageNormals);
-    glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords);
+    /* 0x4FF50F `mov ecx, tess_activeTexCoords`: slot 0's pointer, not the table */
+    glTexCoordPointer(2, 0x1406u, 0, tess_activeTexCoords[0]);
   }
 }
 
 /* ---- RB_SelectStorage  0x004FF530 ----  VERIFIED */
-void __cdecl RB_SelectStorage(int a1)
+void __cdecl RB_SelectStorage(int storageMode)
 {
-  if ( a1 != glState_currentStorageMode )
+  if ( storageMode != glState_currentStorageMode )
   {
     if ( glConfig_NVVertexArrayRange )
     {
-      RB_SelectStorageNV(a1);
-      glState_currentStorageMode = a1;
+      RB_SelectStorageNV(storageMode);
+      glState_currentStorageMode = storageMode;
     }
     else
     {
       if ( glConfig_ATIVertexArrayObject )
-        RB_SelectStorageATI(a1);
-      glState_currentStorageMode = a1;
+        RB_SelectStorageATI(storageMode);
+      glState_currentStorageMode = storageMode;
     }
   }
 }
 
 
-int count;
 
 /* ---- RB_BeginSurface  0x004FF570 ----  VERIFIED */
 void __cdecl RB_BeginSurface( void *shader, int vertexComponentCount )
@@ -1197,13 +1143,13 @@ void __cdecl RB_BeginSurface( void *shader, int vertexComponentCount )
   tess_activeStageCount = shd[0x150 / 4];
   tess_stageIterator = *(int (**)())&shd[0x174 / 4];
   tess_entity = backEnd_currentEntity;
-  tess_requiresVertexBasis = ( shd[0x50 / 4] >> 1 ) & 1;
+  tess_requiresVertexBasis = ( (unsigned int)shd[0x50 / 4] >> 1 ) & 1;
+  tess_vertexComponentCount = vertexComponentCount;
 
   tess_stageBitangentsValid = 0;
   tess_stageTangentsValid = 0;
-  count         = 0;
+  tess_renderedIndexCount = 0;
   tess_renderedVertexCount = 0;
-  tess_vertexComponentCount = vertexComponentCount;
 
   tess_shaderTime = backEnd_refdef_floatTime - *(float *)&shd[0x17C / 4];
 
@@ -1215,414 +1161,267 @@ void __cdecl RB_BeginSurface( void *shader, int vertexComponentCount )
 }
 
 /* ---- DrawMultitextured  0x004FF640 ----  VERIFIED */
-void __cdecl DrawMultitextured(_DWORD *a1, int a2, GLsizei a3, GLvoid *a4)
+void __cdecl DrawMultitextured( shaderStage_t *stage, GLsizei numIndexes, GLvoid *indexes )
 {
-  GL_State(a1[417]);
+  GL_State( stage->stateBits );
   if ( backEnd_wireframeOverride )
-    glPolygonMode(0x408u, 0x1B02u);
-  RB_SetupMultitexture(a1, (int)&tess_activeTexCoords, 0);
-  R_DrawElements(a4, a3);
+    glPolygonMode( 0x408u, 0x1B02u );          /* GL_FRONT_AND_BACK, GL_LINE */
+  RB_SetupMultitexture( (unsigned int *)stage, (GLvoid **)&tess_activeTexCoords, 0 );   /* 0x4FF666 `push offset`: the table address */
+  R_DrawElements( numIndexes, indexes );
 }
 
-/* ---- RB_BuildDlightArrays  0x004FF690 ----  VERIFIED */
-int __fastcall RB_BuildDlightArrays(_BYTE *a1, float *a2, float *a3, int a4)
+int __cdecl myftol( float a1 );   /* tr_shade_calc.c 0x00515940; LTCG inlines it */
+
+/* ---- RB_BuildDlightArrays  0x004FF690 ----  VERIFIED
+ * RTCW's ProjectDlightTexture vertex and triangle passes for one light: the
+ * light's texture coordinates, modulated colours (myftol, inlined) and the
+ * list of triangles that are not entirely clipped.  The texCoords, colors
+ * parameter order gives retail's LTCG registers (colors in ecx, texCoords in
+ * edx at every caller). */
+int __cdecl RB_BuildDlightArrays( float *texCoords, byte *colors, float *dlight, unsigned short *hitIndexes )
 {
-  const float  *dl = a3;
-  _BYTE        *colors = a1;
-  float        *texCoords = a2;
-  unsigned short *hitIndexes;
+  const dlight_t *dl;
+  int     i;
+  int     numIndexes;
+  float  *xyz;
+  float  *tangent;
+  float  *bitangent;
+  float  *normal;
+  vec3_t  origin;
+  vec3_t  delta;
+  vec3_t  dist;
+  vec3_t  floatColor;
+  float   radius;
+  float   scale;
+  float   modulate;
+  char    clip;
+  byte   clipBits[8192];             /* SHADER_MAX_VERTEXES */
 
-  float  radius, invRadius;
-  float  originX, originY, originZ;
-  float  scaleR, scaleG, scaleB;
-  float  dx, dy, dz;
-  float  s, t, z, az, modulate;
-  int    i, numIndexes;
-  char   clip;
-  unsigned short i0, i1, i2;
-  _BYTE  clipBits[8192];              /* SHADER_MAX_VERTEXES, [esp+48h] */
+  dl = (const dlight_t *)dlight;
+  VectorCopy( dl->transformedPosition, origin );
+  radius = dl->radius;
+  scale = 1.0f / radius;
+  floatColor[0] = dl->color[0] * 255.0f;
+  floatColor[1] = dl->color[1] * 255.0f;
+  floatColor[2] = dl->color[2] * 255.0f;
 
-  radius    = dl[29];                 /* +0x74 */
-  originX   = dl[30];                 /* +0x78 */
-  originY   = dl[31];                 /* +0x7C */
-  originZ   = dl[32];                 /* +0x80 */
-  invRadius = 1.0f / radius;
-  scaleR    = dl[1] * 255.0f;
-  scaleG    = dl[2] * 255.0f;
-  scaleB    = dl[3] * 255.0f;
-
-  if ( r_dlightQuality->integer && tess_requiresVertexBasis  )
+  if ( r_dlightQuality->integer && tess_requiresVertexBasis )
   {
     if ( !tess_stageBitangentsValid || !tess_stageTangentsValid )
     {
       for ( i = 0; i < tess_numVertexes; i++ )
       {
-        RB_MakeNormalVectors( &tess_stageBitangents[3 * i],
-                              &tess_stageNormals[3 * i],
-                              &tess_stageTangents[3 * i] );
+        RB_MakeNormalVectors( &tess_stageNormals[3 * i], &tess_stageTangents[3 * i], &tess_stageBitangents[3 * i] );
       }
       tess_stageBitangentsValid = 1;
       tess_stageTangentsValid = 1;
     }
   }
 
-  for ( i = 0; i < tess_numVertexes ; i++ )
+  xyz = tess_xyz;
+  for ( i = 0; i < tess_numVertexes; i++, texCoords += 2, colors += 4, xyz += tess_vertexComponentCount )
   {
-    const float *xyz = &tess_xyz[tess_vertexComponentCount * i];
-
     if ( r_dlightQuality->integer && tess_requiresVertexBasis )
     {
-      const float *tangent   = &tess_stageTangents[3 * i];
-      const float *bitangent = &tess_stageBitangents[3 * i];
-      const float *normal    = &tess_stageNormals[3 * i];
-
-      dx = originX - xyz[0];
-      dy = originY - xyz[1];
-      dz = originZ - xyz[2];
-
-      s = dz * tangent[2]   + dx * tangent[0]   + dy * tangent[1];
-      t = dz * bitangent[2] + dy * bitangent[1] + dx * bitangent[0];
-      z = dz * normal[2]    + dy * normal[1]    + dx * normal[0];
+      tangent   = &tess_stageTangents[3 * i];
+      bitangent = &tess_stageBitangents[3 * i];
+      normal    = &tess_stageNormals[3 * i];
+      VectorSubtract( origin, xyz, delta );
+      dist[0] = delta[2] * tangent[2] + delta[0] * tangent[0] + delta[1] * tangent[1];
+      dist[1] = delta[2] * bitangent[2] + delta[1] * bitangent[1] + delta[0] * bitangent[0];
+      dist[2] = delta[2] * normal[2] + delta[1] * normal[1] + delta[0] * normal[0];
     }
     else
     {
-      s = originX - xyz[0];
-      t = originY - xyz[1];
-      z = originZ - xyz[2];
+      VectorSubtract( origin, xyz, dist );
     }
 
-    ++backEnd_pc_dlightVertexCount;
+    backEnd_pc_dlightVertexCount++;
+
+    texCoords[0] = 0.5f + dist[0] * scale;
+    texCoords[1] = 0.5f + dist[1] * scale;
 
     clip = 0;
-    s = s * invRadius + 0.5f;
-    texCoords[0] = s;
-    t = t * invRadius + 0.5f;
-    texCoords[1] = t;
+    if ( texCoords[0] < 0.0f )
+      clip |= 1;
+    else if ( texCoords[0] > 1.0f )
+      clip |= 2;
 
-    if ( s < 0.0f )
-      clip = 1;
-    else if ( s > 1.0f )
-      clip = 2;
-
-    if ( t < 0.0f )
+    if ( texCoords[1] < 0.0f )
       clip |= 4;
-    else if ( t > 1.0f )
+    else if ( texCoords[1] > 1.0f )
       clip |= 8;
 
-    if ( z <= radius )
-    {
-      if ( -radius <= z )
-      {
-        az = (float)fabs( z );
-        if ( radius * 0.5f <= az )
-        {
-          modulate = ( radius - az ) * invRadius;
-          modulate = modulate + modulate;
-        }
-        else
-        {
-          modulate = 1.0f;
-        }
-      }
-      else
-      {
-        clip |= 0x20;
-        modulate = 0.0f;
-      }
-    }
-    else
+    /* modulate the strength based on the height and color */
+    if ( dist[2] > radius )
     {
       clip |= 0x10;
       modulate = 0.0f;
     }
+    else if ( dist[2] < -radius )
+    {
+      clip |= 0x20;
+      modulate = 0.0f;
+    }
+    else
+    {
+      {
+        /* Q_fabs */
+        float f = dist[2];
+        int   tmp = *(int *)&f & 0x7FFFFFFF;
+        dist[2] = *(float *)&tmp;
+      }
+      if ( dist[2] < radius * 0.5f )
+        modulate = 1.0f;
+      else
+      {
+        modulate = ( radius - dist[2] ) * scale;
+        modulate = modulate + modulate;
+      }
+    }
 
     clipBits[i] = clip;
-    colors[0] = (_BYTE)(int)( modulate * scaleR );
-    colors[1] = (_BYTE)(int)( modulate * scaleG );
-    colors[2] = (_BYTE)(int)( modulate * scaleB );
-    colors[3] = (_BYTE)0xFF;
+    colors[0] = (byte)myftol( modulate * floatColor[0] );
+    colors[1] = (byte)myftol( modulate * floatColor[1] );
+    colors[2] = (byte)myftol( modulate * floatColor[2] );
+    colors[3] = 0xFF;
 
-    texCoords += 2;
-    colors    += 4;
   }
 
-  hitIndexes = (unsigned short *)a4;
+  /* build a list of triangles that need light */
   numIndexes = 0;
-  for ( i = 0; i < tess_numIndexes ; i += 3 )
+  for ( i = 0; i < tess_numIndexes; i += 3 )
   {
-    i2 = ((unsigned short *)tess_indexes)[i + 2];
-    i1 = ((unsigned short *)tess_indexes)[i + 1];
-    i0 = ((unsigned short *)tess_indexes)[i];
-    if ( ( clipBits[i1] & clipBits[i2] & clipBits[i0] ) == 0 )
-    {
-      hitIndexes[0] = i0;
-      hitIndexes[1] = i1;
-      hitIndexes[2] = i2;
-      numIndexes += 3;
-      hitIndexes += 3;
-    }
+    unsigned short a, b, c;
+
+    a = tess_indexes[i];
+    b = tess_indexes[i + 1];
+    c = tess_indexes[i + 2];
+    if ( clipBits[a] & clipBits[b] & clipBits[c] )
+      continue;   /* not lighted */
+    hitIndexes[numIndexes] = a;
+    hitIndexes[numIndexes + 1] = b;
+    hitIndexes[numIndexes + 2] = c;
+    numIndexes += 3;
   }
   return numIndexes;
 }
-#if 0
-int __fastcall RB_BuildDlightArrays(_BYTE *a1, float *a2, float *a3, int a4)
-{
-  int v6;
-  float *v7;
-  int v8;
-  float *v9;
-  float *v10;
-  double v11;
-  double v12;
-  double v13;
-  double v14;
-  char v15;
-  double v16;
-  double v17;
-  int result;
-  int v19;
-  unsigned __int16 *v20;
-  unsigned __int16 v21;
-  unsigned __int16 v22;
-  unsigned __int16 v23;
-  float v24;
-  float v25;
-  float v26;
-  float v27;
-  float v28;
-  int v29;
-  float v30;
-  float v31;
-  float v32;
-  float v33;
-  float v34;
-  float v35;
-  float v36;
-  float v37;
-  float v38;
-  float v39;
-  float v40;
-  float v41;
-  float v42;
-  _BYTE v43[8192];
-  unsigned int v44;
-  unsigned int retaddr;
 
-  v44 = retaddr ^ _security_cookie;
-  v36 = a3[31];
-  v31 = a3[29];
-  v35 = a3[30];
-  v37 = a3[32];
-  v28 = 1.0 / v31;
-  v40 = a3[1] * 255.0;
-  v41 = a3[2] * 255.0;
-  v42 = a3[3] * 255.0;
-  if ( r_dlightQuality->integer )
-  {
-    if ( tess_requiresVertexBasis )
-    {
-      if ( !tess_stageBitangentsValid || !tess_stageTangentsValid )
-      {
-        v6 = 0;
-        if ( tess_numVertexes > 0 )
-        {
-          v7 = (float *)tess_stageTangents;
-          do
-          {
-            RB_MakeNormalVectors(v7 - 24576, v7 - 49152, v7);
-            ++v6;
-            v7 += 3;
-          }
-          while ( v6 < tess_numVertexes );
-        }
-        tess_stageBitangentsValid = 1;
-        tess_stageTangentsValid = 1;
-      }
-    }
-  }
-  v8 = 0;
-  v9 = (float *)tess_xyz;
-  if ( tess_numVertexes > 0 )
-  {
-    v10 = (float *)&unk_1857F64;
-    do
-    {
-      if ( r_dlightQuality->integer && tess_requiresVertexBasis )
-      {
-        v32 = v35 - *v9;
-        v33 = v36 - v9[1];
-        v11 = v37 - v9[2];
-        v34 = v11;
-        v12 = v11 * v10[1] + v32 * *(v10 - 1) + v33 * *v10;
-        v13 = v34 * *(v10 - 24575) + v33 * *(v10 - 24576) + v32 * *(v10 - 24577);
-        v14 = v34 * *(v10 - 49151) + v33 * *(v10 - 49152) + v32 * *(v10 - 49153);
-      }
-      else
-      {
-        v12 = v35 - *v9;
-        v13 = v36 - v9[1];
-        v14 = v37 - v9[2];
-      }
-      v38 = v14;
-      ++backEnd_pc_dlightVertexCount;
-      v15 = 0;
-      v24 = v12 * v28 + 0.5;
-      *a2 = v24;
-      v16 = v13 * v28 + 0.5;
-      a2[1] = v16;
-      if ( (v24 < 0.0) | __UNORDERED__(v24, 0.0) )
-      {
-        v15 = 1;
-      }
-      else if ( v24 > 1.0 )
-      {
-        v15 = 2;
-      }
-      if ( (v16 < 0.0) | __UNORDERED__(v16, 0.0) )
-      {
-        v15 |= 4u;
-      }
-      else if ( v16 > 1.0 )
-      {
-        v15 |= 8u;
-      }
-      if ( v38 <= (double)v31 )
-      {
-        if ( -v31 <= v38 )
-        {
-          v39 = fabs(v14);
-          if ( v31 * 0.5 <= v39 )
-          {
-            v17 = (v31 - v39) * v28;
-            v30 = v17 + v17;
-          }
-          else
-          {
-            v30 = 1.0;
-          }
-        }
-        else
-        {
-          v15 |= 0x20u;
-          v30 = 0.0;
-        }
-      }
-      else
-      {
-        v15 |= 0x10u;
-        v30 = 0.0;
-      }
-      v43[v8] = v15;
-      v25 = v30 * v40;
-      *a1 = (int)v25;
-      v26 = v30 * v41;
-      a1[1] = (int)v26;
-      v27 = v30 * v42;
-      ftol_tempSpill = (int)v27;
-      a1[2] = (int)v27;
-      a1[3] = -1;
-      ++v8;
-      v10 += 3;
-      a2 += 2;
-      a1 += 4;
-      v9 += tess_vertexComponentCount;
-    }
-    while ( v8 < tess_numVertexes );
-  }
-  result = 0;
-  v19 = 0;
-  v29 = 0;
-  if ( tess_numIndexes > 0 )
-  {
-    v20 = (unsigned __int16 *)(a4 + 4);
-    do
-    {
-      v21 = word_17A7F64[v19];
-      v22 = word_17A7F62[v19];
-      v23 = tess_indexes[v19];
-      if ( ((unsigned __int8)(v43[v22] & v43[v21]) & v43[v23]) == 0 )
-      {
-        *(v20 - 2) = v23;
-        *(v20 - 1) = v22;
-        *v20 = v21;
-        v29 += 3;
-        v20 += 3;
-      }
-      v19 += 3;
-    }
-    while ( v19 < tess_numIndexes );
-    return v29;
-  }
-  return result;
-}
-#endif
+/* ---- RB_ComputeColors  0x004FFA60 ----  VERIFIED
+ * stage->rgbGen / alphaGen / constantColor are re-read at each use and the
+ * colour arrays are addressed directly, as retail. */
+#define RB_COLORS        ( (unsigned char (*)[4])tess_stageVertexColors )
+#define RB_VERTEXCOLORS  ( (const unsigned char (*)[4])tess_vertexColors )
+#define RB_STAGE_RGBGEN      ( *(int *)( stage + 1636 ) )
+#define RB_STAGE_ALPHAGEN    ( *(int *)( stage + 1660 ) )
+#define RB_STAGE_CONSTCOLOR  ( *(int *)( stage + 1664 ) )
 
-/* ---- RB_ComputeLocalViewOrigin  no-address ----  VERIFIED */
-static void RB_ComputeLocalViewOrigin( float localViewOrigin[3] )
-{
-  float translated[3];
-
-  if ( (void *)backEnd_currentEntity == (void *)tr_worldEntity )
-  {
-    localViewOrigin[0] = backEnd_viewParms_originX[0];
-    localViewOrigin[1] = backEnd_viewParms_originY;
-    localViewOrigin[2] = backEnd_viewParms_originZ;
-  }
-  else
-  {
-    translated[0] = backEnd_viewParms_originX[0] - *(float *)( backEnd_currentEntity + 68 );
-    translated[1] = backEnd_viewParms_originY    - *(float *)( backEnd_currentEntity + 72 );
-    translated[2] = backEnd_viewParms_originZ    - *(float *)( backEnd_currentEntity + 76 );
-    VectorRotate( translated, (float *)( backEnd_currentEntity + 28 ), localViewOrigin );
-  }
+/* alphaGen 10-13 (view-angle alpha): retail expands one specialised copy
+ * per alphaGen in place, each with its own local view origin */
+#define RB_VIEW_ANGLE_ALPHA( alphaGen ) \
+{ \
+  float        direction[3]; \
+  float        localViewOrigin[3]; \
+  const float *xyz; \
+  const float *normal; \
+  int          i; \
+ \
+  /* the local view origin (retail inlines this per copy; VectorRotate stays a call) */ \
+  if ( (void *)backEnd_currentEntity == (void *)tr_worldEntity ) \
+  { \
+    localViewOrigin[0] = backEnd_viewParms_originX[0]; \
+    localViewOrigin[1] = backEnd_viewParms_originY; \
+    localViewOrigin[2] = backEnd_viewParms_originZ; \
+  } \
+  else \
+  { \
+    direction[0] = backEnd_viewParms_originX[0] - ((trRefEntity_t *)backEnd_currentEntity)->e.origin[0]; \
+    direction[1] = backEnd_viewParms_originY    - ((trRefEntity_t *)backEnd_currentEntity)->e.origin[1]; \
+    direction[2] = backEnd_viewParms_originZ    - ((trRefEntity_t *)backEnd_currentEntity)->e.origin[2]; \
+    VectorRotate( direction, (float *)( backEnd_currentEntity + 28 ), localViewOrigin ); \
+  } \
+ \
+  xyz    = tess_xyz; \
+  normal = tess_stageNormals; \
+  for ( i = 0; i < tess_numVertexes; i++, xyz += tess_vertexComponentCount, normal += 3 ) \
+  { \
+    float  alpha; \
+ \
+    direction[0] = localViewOrigin[0] - xyz[0]; \
+    direction[1] = localViewOrigin[1] - xyz[1]; \
+    direction[2] = localViewOrigin[2] - xyz[2]; \
+    VectorNormalizeFast( direction ); \
+ \
+    if ( alphaGen == 12 ) \
+    { \
+      alpha = direction[0] * normal[0] + direction[2] * normal[2] \
+            + direction[1] * normal[1]; \
+    } \
+    else \
+    { \
+      alpha = direction[2] * normal[2] + direction[0] * normal[0] \
+            + direction[1] * normal[1]; \
+      if ( alphaGen == 13 ) \
+        alpha = -alpha; \
+    } \
+ \
+    if ( alphaGen == 12 ) \
+      *(int *)&alpha &= ( *(int *)&alpha >> 31 ); \
+    else \
+      *(int *)&alpha &= ~( *(int *)&alpha >> 31 ); \
+ \
+    if ( alphaGen == 11 ) \
+      RB_COLORS[i][3] = (unsigned char)(int)( ( 1.0f - alpha ) * 255.0f + 0.5f ); \
+    else if ( alphaGen == 12 ) \
+      RB_COLORS[i][3] = (unsigned char)(int)( ( alpha + 1.0f ) * 255.0f + 0.5f ); \
+    else \
+      RB_COLORS[i][3] = (unsigned char)(int)( alpha * 255.0f + 0.5f ); \
+  } \
 }
 
-/* ---- RB_ComputeColors  0x004FFA60 ----  VERIFIED */
 void __cdecl RB_ComputeColors( int stage )
 {
-  unsigned char (*colors)[4] =
-      (unsigned char (*)[4])tess_stageVertexColors;
-  const unsigned char (*vertexColors)[4] =
-      (const unsigned char (*)[4])tess_vertexColors;
-  int   i, c;
-  int   rgbGen   = *(int *)( stage + 1636 );
-  int   alphaGen = *(int *)( stage + 1660 );
-  unsigned char fill;
+  int          i;
+  const float *xyz;
 
-  switch ( rgbGen )
+  switch ( RB_STAGE_RGBGEN )
   {
+    case 9:
+    case 10:
+      if ( *(int *)( tr_world + 280 ) )
+        memset( RB_COLORS, 0xFF, 4 * tess_numVertexes );
+      else
+        RB_CalcDiffuseColor( RB_COLORS );
+      break;
+
     case 2:
+      memset( RB_COLORS, 0xFF, 4 * tess_numVertexes );
+      break;
+
+    case 12:
       for ( i = 0; i < tess_numVertexes; i++ )
-        *(int *)colors[i] = -1;
-      break;
-
-    case 3:
-      RB_CalcColorFromEntity( (unsigned char *)colors );
-      break;
-
-    case 4:
-      RB_CalcColorFromOneMinusEntity( colors );
-      break;
-
-    case 5:
-      memcpy( colors, vertexColors, 4 * tess_numVertexes );
+        *(int *)RB_COLORS[i] = RB_STAGE_CONSTCOLOR;
       break;
 
     case 6:
       if ( !tr_overbrightBits )
       {
-        memcpy( colors, vertexColors, 4 * tess_numVertexes );
+        memcpy( RB_COLORS, RB_VERTEXCOLORS, 4 * tess_numVertexes );
       }
       else
       {
         for ( i = 0; i < tess_numVertexes; i++ )
         {
-          colors[i][0] = (unsigned char)( vertexColors[i][0] >> tr_overbrightBits );
-          colors[i][1] = (unsigned char)( vertexColors[i][1] >> tr_overbrightBits );
-          colors[i][3] = vertexColors[i][3];
-          colors[i][2] = (unsigned char)( vertexColors[i][2] >> tr_overbrightBits );
+          RB_COLORS[i][0] = (unsigned char)( RB_VERTEXCOLORS[i][0] >> tr_overbrightBits );
+          RB_COLORS[i][1] = (unsigned char)( RB_VERTEXCOLORS[i][1] >> tr_overbrightBits );
+          RB_COLORS[i][2] = (unsigned char)( RB_VERTEXCOLORS[i][2] >> tr_overbrightBits );
+          RB_COLORS[i][3] = RB_VERTEXCOLORS[i][3];
         }
       }
+      break;
+
+    case 5:
+      memcpy( RB_COLORS, RB_VERTEXCOLORS, 4 * tess_numVertexes );
       break;
 
     case 7:
@@ -1630,972 +1429,535 @@ void __cdecl RB_ComputeColors( int stage )
       {
         for ( i = 0; i < tess_numVertexes; i++ )
         {
-          colors[i][0] = (unsigned char)( 255 - vertexColors[i][0] );
-          colors[i][1] = (unsigned char)( 255 - vertexColors[i][1] );
-          colors[i][2] = (unsigned char)( 255 - vertexColors[i][2] );
+          RB_COLORS[i][0] = (unsigned char)( 255 - RB_VERTEXCOLORS[i][0] );
+          RB_COLORS[i][1] = (unsigned char)( 255 - RB_VERTEXCOLORS[i][1] );
+          RB_COLORS[i][2] = (unsigned char)( 255 - RB_VERTEXCOLORS[i][2] );
         }
       }
       else
       {
         for ( i = 0; i < tess_numVertexes; i++ )
-          for ( c = 0; c < 3; c++ )
-            colors[i][c] = (unsigned char)(int)
-                ( (float)( 255 - vertexColors[i][c] ) * tr_identityLight );
+        {
+          RB_COLORS[i][0] = (unsigned char)(int)( (float)( 255 - RB_VERTEXCOLORS[i][0] ) * tr_identityLight );
+          RB_COLORS[i][1] = (unsigned char)(int)( (float)( 255 - RB_VERTEXCOLORS[i][1] ) * tr_identityLight );
+          RB_COLORS[i][2] = (unsigned char)(int)( (float)( 255 - RB_VERTEXCOLORS[i][2] ) * tr_identityLight );
+        }
       }
       break;
 
     case 8:
-      RB_CalcWaveColor( colors, (void *)( stage + 1616 ) );
+      RB_CalcWaveColor( RB_COLORS, (void *)( stage + 1616 ) );
       break;
 
-    case 9:
-    case 10:
-      if ( *(int *)( tr_world + 280 ) )
-      {
-        for ( i = 0; i < tess_numVertexes; i++ )
-          *(int *)colors[i] = -1;
-      }
-      else
-      {
-        RB_CalcDiffuseColor( colors );
-      }
+    case 3:
+      RB_CalcColorFromEntity( (unsigned char *)RB_COLORS );
       break;
 
-    case 12:
-      for ( i = 0; i < tess_numVertexes; i++ )
-        *(int *)colors[i] = *(int *)( stage + 1664 );
+    case 4:
+      RB_CalcColorFromOneMinusEntity( RB_COLORS );
       break;
 
     case 13:
       if ( r_showtris->integer >= 5 )
-        RB_ChooseSurfaceCountColor( tess_numIndexes, colors[0] );
+        RB_ChooseSurfaceCountColor( tess_numIndexes, RB_COLORS[0] );
       else
-        *(int *)colors[0] = *(int *)( stage + 1664 );
+        *(int *)RB_COLORS[0] = RB_STAGE_CONSTCOLOR;
       for ( i = 1; i < tess_numVertexes; i++ )
-        *(int *)colors[i] = *(int *)colors[0];
+        *(int *)RB_COLORS[i] = *(int *)RB_COLORS[0];
       break;
 
     default:
-      fill = (unsigned char)tr_identityLightByte;
-      for ( i = 0; i < tess_numVertexes; i++ )
-      {
-        colors[i][0] = fill;
-        colors[i][1] = fill;
-        colors[i][2] = fill;
-        colors[i][3] = fill;
-      }
+      memset( RB_COLORS, tr_identityLightByte, 4 * tess_numVertexes );
       break;
   }
 
-  switch ( alphaGen )
+  switch ( RB_STAGE_ALPHAGEN )
   {
     case 0:
-      if ( rgbGen == 2 )
+      if ( RB_STAGE_RGBGEN == 2 )
         return;
-      if ( rgbGen == 6 && tr_identityLight == 1.0f )
+      if ( RB_STAGE_RGBGEN == 6 && tr_identityLight == 1.0f )
         return;
       for ( i = 0; i < tess_numVertexes; i++ )
-        colors[i][3] = 0xFF;
+        RB_COLORS[i][3] = 0xFF;
+      return;
+
+    case 9:
+      if ( RB_STAGE_RGBGEN != 12 )
+      {
+        for ( i = 0; i < tess_numVertexes; i++ )
+          RB_COLORS[i][3] = *(unsigned char *)( stage + 1667 );
+      }
+      return;
+
+    case 7:
+      RB_CalcWaveAlpha( (void *)( stage + 1640 ), RB_COLORS );
+      return;
+
+    case 6:
+      RB_CalcSpecularAlpha( (int)RB_COLORS );
       return;
 
     case 2:
-      RB_CalcAlphaFromEntity( (unsigned char *)colors );
+      RB_CalcAlphaFromEntity( (unsigned char *)RB_COLORS );
       return;
 
     case 3:
-      RB_CalcAlphaFromOneMinusEntity( (unsigned char *)colors );
+      RB_CalcAlphaFromOneMinusEntity( (unsigned char *)RB_COLORS );
       return;
 
     case 4:
-      if ( rgbGen != 6 )
+      if ( RB_STAGE_RGBGEN != 6 )
       {
         for ( i = 0; i < tess_numVertexes; i++ )
-          colors[i][3] = vertexColors[i][3];
+          RB_COLORS[i][3] = RB_VERTEXCOLORS[i][3];
       }
       return;
 
     case 5:
       for ( i = 0; i < tess_numVertexes; i++ )
-        colors[i][3] = (unsigned char)( 255 - vertexColors[i][3] );
-      return;
-
-    case 6:
-      RB_CalcSpecularAlpha( (int)colors );
-      return;
-
-    case 7:
-      RB_CalcWaveAlpha( (void *)( stage + 1640 ), colors );
+        RB_COLORS[i][3] = (unsigned char)( 255 - RB_VERTEXCOLORS[i][3] );
       return;
 
     case 8:
-      for ( i = 0; i < tess_numVertexes; i++ )
+      xyz = tess_xyz;
+      for ( i = 0; i < tess_numVertexes; i++, xyz += tess_vertexComponentCount )
       {
-        const float *xyz = &tess_xyz[tess_vertexComponentCount * i];
-        float dx = xyz[0] - backEnd_viewParms_originX[0];
-        float dy = xyz[1] - backEnd_viewParms_originY;
-        float dz = xyz[2] - backEnd_viewParms_originZ;
-        float alpha = (float)
-            ( sqrt( (double)( dz * dz + dy * dy ) + (double)( dx * dx ) )
-              / *(float *)( tess_shader + 164 ) );
+        unsigned char value;
+        /* 0x4FFEA0-0x4FFEDE: dx/dy/dz stay on the x87 stack (never rounded
+           to float); only the quotient is stored as a float */
+        double dx = (double)xyz[0] - backEnd_viewParms_originX[0];
+        double dy = (double)xyz[1] - backEnd_viewParms_originY;
+        double dz = (double)xyz[2] - backEnd_viewParms_originZ;
+        float alpha;
+
+        alpha = (float)sqrt( dz * dz + dy * dy + dx * dx );
+        alpha = alpha / ((shader_t *)tess_shader)->portalRange;
 
         if ( alpha < 0.0f )
-          colors[i][3] = 0;
+          value = 0;
         else if ( alpha > 1.0f )
-          colors[i][3] = 0xFF;
+          value = 0xFF;
         else
-          colors[i][3] = (unsigned char)(int)( alpha * 255.0f );
-      }
-      return;
-
-    case 9:
-      if ( rgbGen != 12 )
-      {
-        for ( i = 0; i < tess_numVertexes; i++ )
-          colors[i][3] = *(unsigned char *)( stage + 1667 );
+          value = (unsigned char)(int)( alpha * 255.0f );
+        RB_COLORS[i][3] = value;
       }
       return;
 
     case 10:
+      RB_VIEW_ANGLE_ALPHA( 10 )
+      return;
+
     case 11:
+      RB_VIEW_ANGLE_ALPHA( 11 )
+      return;
+
     case 12:
+      RB_VIEW_ANGLE_ALPHA( 12 )
+      return;
+
     case 13:
-    {
-      float localViewOrigin[3];
-
-      RB_ComputeLocalViewOrigin( localViewOrigin );
-
-      for ( i = 0; i < tess_numVertexes; i++ )
-      {
-        const float *xyz    = &tess_xyz[tess_vertexComponentCount * i];
-        const float *normal = &tess_stageNormals[3 * i];
-        float  direction[3];
-        float  alpha;
-        int    bits;
-
-        direction[0] = localViewOrigin[0] - xyz[0];
-        direction[1] = localViewOrigin[1] - xyz[1];
-        direction[2] = localViewOrigin[2] - xyz[2];
-        VectorNormalizeFast( direction );
-
-        if ( alphaGen == 12 )
-        {
-          alpha = direction[0] * normal[0] + direction[2] * normal[2]
-                + direction[1] * normal[1];
-        }
-        else
-        {
-          alpha = direction[2] * normal[2] + direction[0] * normal[0]
-                + direction[1] * normal[1];
-          if ( alphaGen == 13 )
-            alpha = -alpha;
-        }
-
-        memcpy( &bits, &alpha, 4 );
-        if ( alphaGen == 12 )
-          bits &= ( bits >> 31 );
-        else
-          bits &= ~( bits >> 31 );
-        memcpy( &alpha, &bits, 4 );
-
-        if ( alphaGen == 11 )
-          alpha = 1.0f - alpha;
-        else if ( alphaGen == 12 )
-          alpha = alpha + 1.0f;
-
-        colors[i][3] = (unsigned char)(int)( alpha * 255.0f + 0.5f );
-      }
+      RB_VIEW_ANGLE_ALPHA( 13 )
       return;
-    }
 
     default:
       return;
   }
 }
-#if 0
-double __cdecl RB_ComputeColors(int a1, double result, int a3)
+#undef RB_VIEW_ANGLE_ALPHA
+#undef RB_COLORS
+#undef RB_VERTEXCOLORS
+#undef RB_STAGE_RGBGEN
+#undef RB_STAGE_ALPHAGEN
+#undef RB_STAGE_CONSTCOLOR
+
+/* ---- RB_ComputeTexCoords  0x00500400 ----  VERIFIED
+ * For each of the 8 texture units, generate that unit's texture coordinates
+ * (from a tess array or a tcGen function) into per-unit scratch and point the
+ * active-texcoord slot at them, then apply the unit's texture-coordinate
+ * modifiers. The bundle cursor uses the existing stage layout for tcGen, its
+ * vectors and texture modifiers. `scratch` mirrors a reused register kept for
+ * the (immaterial) case-15 argument. */
+void __cdecl RB_ComputeTexCoords( int stage )
 {
-  int v4;
-  int mm;
-  char v6;
-  int i;
-  char v8;
-  int j;
-  char v10;
-  int k;
-  unsigned __int64 v12; // rax
-  int nn;
-  int v14;
-  int m;
-  int kk;
-  int n;
-  int ii;
-  int v19;
-  float *jj;
-  double v21;
-  double v22;
-  double v23;
-  long double v24;
-  unsigned __int64 v25; // rax
-  int v26;
-  float *v27;
-  float *v28;
-  int v29;
-  float *v30;
-  float *v31;
-  int v32;
-  float *v33;
-  float *v34;
-  int v35;
-  float *v36;
-  float *v37;
-  float v38; // [esp+10h] [ebp-18h] BYREF
-  float v39;
-  float v40;
-  float v41; // [esp+1Ch] [ebp-Ch] BYREF
-  float v42;
-  float v43;
-  int v44;
-  float v45;
-  int v46;
-  int v47;
-  int v48;
-  int v49;
+  int      texUnit;
+  int      tcGen;
+  int      scratch;             /* ecx scratch in retail */
 
-  switch ( *(_DWORD *)(a3 + 1636) )
+  textureBundle_t *bundle;        /* stage + 4 + 200*unit */
+  unsigned int  *generated;      /* per-unit generated-texcoord scratch */
+  GLvoid **active;         /* &tess_activeTexCoords[unit] */
+  int      numMods;
+  int      m;
+  int      b;
+
+  scratch   = 0;
+  bundle = ((shaderStage_t *)stage)->bundles;
+  for ( b = 0; b < 8; b++ )
   {
-    /* Retail biases the selector before the table -- 0x004FFA6F
-     * `add eax, 0FFFFFFFEh` then `cmp eax, 0Bh / ja def_4FFA7D` -- so rgbGen
-     * 2..13 index the jump table and rgbGen 0 (CGEN_BAD) and 1
-     * (CGEN_IDENTITY_LIGHTING) both fall to the DEFAULT.  rgbGen
-     * identityLighting is the common case for UI and 2D shaders.
-     *
-     * Retail's arm, 0x004FFCEC..0x004FFD08: replicate tr.identityLightByte
-     * into all four lanes and `rep stosd` it over numVertexes dwords -- Q3's
-     *     default: case CGEN_IDENTITY_LIGHTING:
-     *         Com_Memset( tess.svars.colors, tr.identityLightByte,
-     *                     tess.numVertexes * 4 );
-     * The byte replication is the `mov dl,al / mov dh,dl / shl eax,10h /
-     * mov ax,dx` sequence, i.e. 0x01010101 * the byte. */
-    default:
-      v4 = 0x01010101 * (unsigned __int8) tr_identityLightByte;
-      goto LABEL_30;
-    case 2:
-      goto LABEL_3;
-    case 3:
-      RB_CalcColorFromEntity(tess_stageVertexColors);
-      goto LABEL_31;
-    case 4:
-      RB_CalcColorFromOneMinusEntity(tess_stageVertexColors);
-      goto LABEL_31;
-    case 5:
-      goto LABEL_9;
-    case 6:
-      v6 = tr_overbrightBits;
-      if ( tr_overbrightBits )
-      {
-        for ( i = 0; i < tess_numVertexes; byte_186FF5E[4 * i] = v8 )
-        {
-          LOBYTE(tess_stageVertexColors[i]) = LOBYTE(tess_vertexColors[i]) >> v6;
-          BYTE1(tess_stageVertexColors[i]) = BYTE1(tess_vertexColors[i]) >> v6;
-          v8 = BYTE2(tess_vertexColors[i]) >> v6;
-          BYTE3(tess_stageVertexColors[i]) = BYTE3(tess_vertexColors[i]);
-          ++i;
-        }
-      }
-      else
-      {
-LABEL_9:
-        qmemcpy(tess_stageVertexColors, tess_vertexColors, 4 * tess_numVertexes);
-      }
-      goto LABEL_31;
-    case 7:
-      if ( (tr_identityLight == 1.0) | __UNORDERED__(tr_identityLight, 1.0) )
-      {
-        for ( j = 0; j < tess_numVertexes; ++j )
-        {
-          v10 = BYTE2(tess_vertexColors[j]);
-          LOBYTE(tess_stageVertexColors[j]) = -1 - LOBYTE(tess_vertexColors[j]);
-          BYTE1(tess_stageVertexColors[j]) = -1 - BYTE1(tess_vertexColors[j]);
-          BYTE2(tess_stageVertexColors[j]) = -1 - v10;
-        }
-      }
-      else
-      {
-        for ( k = 0; k < tess_numVertexes; ++k )
-        {
-          v12 = (unsigned __int64)((double)(255 - LOBYTE(tess_vertexColors[k])) * tr_identityLight);
-          HIDWORD(v12) = BYTE1(tess_vertexColors[k]);
-          LOBYTE(tess_stageVertexColors[k]) = v12;
-          v44 = 255 - BYTE2(tess_vertexColors[k]);
-          BYTE1(tess_stageVertexColors[k]) = (unsigned __int64)((double)(255 - HIDWORD(v12)) * tr_identityLight);
-          BYTE2(tess_stageVertexColors[k]) = (unsigned __int64)((double)v44 * tr_identityLight);
-        }
-      }
-      goto LABEL_31;
-    case 8:
-      RB_CalcWaveColor(tess_stageVertexColors, a3 + 1616, result);
-      goto LABEL_31;
-    case 9:
-    case 0xA:
-      if ( *(_DWORD *)(tr_world + 280) )
-      {
-LABEL_3:
-        v4 = -1;
-LABEL_30:
-        memset32(tess_stageVertexColors, v4, tess_numVertexes);
-      }
-      else
-      {
-        RB_CalcDiffuseColor((int)tess_stageVertexColors);
-      }
-LABEL_31:
-      switch ( *(_DWORD *)(a3 + 1660) )
-      {
-        case 0:
-          v14 = *(_DWORD *)(a3 + 1636);
-          if ( v14 != 2 && (v14 != 6 || !((tr_identityLight == 1.0) | __UNORDERED__(tr_identityLight, 1.0))) )
-          {
-            for ( m = 0; m < tess_numVertexes; ++m )
-              BYTE3(tess_stageVertexColors[m]) = -1;
-          }
-          break;
-        case 2:
-          RB_CalcAlphaFromEntity((char *)tess_stageVertexColors);
-          break;
-        case 3:
-          RB_CalcAlphaFromOneMinusEntity((char *)tess_stageVertexColors);
-          break;
-        case 4:
-          if ( *(_DWORD *)(a3 + 1636) != 6 )
-          {
-            for ( n = 0; n < tess_numVertexes; ++n )
-              BYTE3(tess_stageVertexColors[n]) = BYTE3(tess_vertexColors[n]);
-          }
-          break;
-        case 5:
-          for ( ii = 0; ii < tess_numVertexes; ++ii )
-            BYTE3(tess_stageVertexColors[ii]) = -1 - BYTE3(tess_vertexColors[ii]);
-          break;
-        case 6:
-          RB_CalcSpecularAlpha((int)tess_stageVertexColors);
-          break;
-        case 7:
-          RB_CalcWaveAlpha(a3 + 1640, (int)tess_stageVertexColors);
-          break;
-        case 8:
-          v19 = 0;
-          for ( jj = (float *)tess_xyz; v19 < tess_numVertexes; ++v19 )
-          {
-            v21 = jj[1] - backEnd_viewParms_originY;
-            v22 = jj[2] - backEnd_viewParms_originZ;
-            v23 = *jj - backEnd_viewParms_originX[0];
-            v24 = sqrt(v22 * v22 + v21 * v21 + v23 * v23) / *(float *)(tess_shader + 164);
-            v45 = v24;
-            if ( (v24 < 0.0) | __UNORDERED__(v24, 0.0) )
-            {
-              LOBYTE(v25) = 0;
-            }
-            else if ( v45 <= 1.0 )
-            {
-              v25 = (unsigned __int64)(v45 * 255.0);
-            }
-            else
-            {
-              LOBYTE(v25) = -1;
-            }
-            BYTE3(tess_stageVertexColors[v19]) = v25;
-            jj += tess_vertexComponentCount;
-          }
-          break;
-        case 9:
-          if ( *(_DWORD *)(a3 + 1636) != 12 )
-          {
-            for ( kk = 0; kk < tess_numVertexes; ++kk )
-              BYTE3(tess_stageVertexColors[kk]) = *(_BYTE *)(a3 + 1667);
-          }
-          break;
-        case 0xA:
-          if ( (_UNKNOWN *)backEnd_currentEntity == &tr_worldEntity )
-          {
-            v41 = backEnd_viewParms_originX[0];
-            v42 = backEnd_viewParms_originY;
-            v43 = backEnd_viewParms_originZ;
-          }
-          else
-          {
-            v38 = backEnd_viewParms_originX[0] - *(float *)(backEnd_currentEntity + 68);
-            v39 = backEnd_viewParms_originY - *(float *)(backEnd_currentEntity + 72);
-            v40 = backEnd_viewParms_originZ - *(float *)(backEnd_currentEntity + 76);
-            /* VectorRotate(in, matrix, out): in = &v38 (the vector just
-             * written above), matrix = currentEntity->axis (+28), out = &v41
-             * (read by the loop below). */
-            VectorRotate(&v38, (float *)(backEnd_currentEntity + 28), &v41);
-          }
-          v26 = 0;
-          v27 = (float *)tess_xyz;
-          if ( tess_numVertexes > 0 )
-          {
-            v28 = flt_1827F64;
-            do
-            {
-              v38 = v41 - *v27;
-              v39 = v42 - v27[1];
-              v40 = v43 - v27[2];
-              VectorNormalizeFast(&v38);
-              *(float *)&v46 = v40 * v28[1] + v38 * *(v28 - 1) + v39 * *v28;
-              BYTE3(tess_stageVertexColors[v26++]) = (unsigned __int64)(COERCE_FLOAT(v46 & ~(v46 >> 31)) * 255.0 + 0.5);
-              v28 += 3;
-              v27 += tess_vertexComponentCount;
-            }
-            while ( v26 < tess_numVertexes );
-          }
-          break;
-        case 0xB:
-          if ( (_UNKNOWN *)backEnd_currentEntity == &tr_worldEntity )
-          {
-            v41 = backEnd_viewParms_originX[0];
-            v42 = backEnd_viewParms_originY;
-            v43 = backEnd_viewParms_originZ;
-          }
-          else
-          {
-            v38 = backEnd_viewParms_originX[0] - *(float *)(backEnd_currentEntity + 68);
-            v39 = backEnd_viewParms_originY - *(float *)(backEnd_currentEntity + 72);
-            v40 = backEnd_viewParms_originZ - *(float *)(backEnd_currentEntity + 76);
-            /* VectorRotate(in, matrix, out): in = &v38 (the vector just
-             * written above), matrix = currentEntity->axis (+28), out = &v41
-             * (read by the loop below). */
-            VectorRotate(&v38, (float *)(backEnd_currentEntity + 28), &v41);
-          }
-          v29 = 0;
-          v30 = (float *)tess_xyz;
-          if ( tess_numVertexes > 0 )
-          {
-            v31 = flt_1827F64;
-            do
-            {
-              v38 = v41 - *v30;
-              v39 = v42 - v30[1];
-              v40 = v43 - v30[2];
-              VectorNormalizeFast(&v38);
-              *(float *)&v47 = v40 * v31[1] + v38 * *(v31 - 1) + v39 * *v31;
-              BYTE3(tess_stageVertexColors[v29++]) = (unsigned __int64)((1.0 - COERCE_FLOAT(v47 & ~(v47 >> 31))) * 255.0 + 0.5);
-              v31 += 3;
-              v30 += tess_vertexComponentCount;
-            }
-            while ( v29 < tess_numVertexes );
-          }
-          break;
-        case 0xC:
-          if ( (_UNKNOWN *)backEnd_currentEntity == &tr_worldEntity )
-          {
-            v41 = backEnd_viewParms_originX[0];
-            v42 = backEnd_viewParms_originY;
-            v43 = backEnd_viewParms_originZ;
-          }
-          else
-          {
-            v38 = backEnd_viewParms_originX[0] - *(float *)(backEnd_currentEntity + 68);
-            v39 = backEnd_viewParms_originY - *(float *)(backEnd_currentEntity + 72);
-            v40 = backEnd_viewParms_originZ - *(float *)(backEnd_currentEntity + 76);
-            /* VectorRotate(in, matrix, out): in = &v38 (the vector just
-             * written above), matrix = currentEntity->axis (+28), out = &v41
-             * (read by the loop below). */
-            VectorRotate(&v38, (float *)(backEnd_currentEntity + 28), &v41);
-          }
-          v32 = 0;
-          v33 = (float *)tess_xyz;
-          if ( tess_numVertexes > 0 )
-          {
-            v34 = flt_1827F64;
-            do
-            {
-              v38 = v41 - *v33;
-              v39 = v42 - v33[1];
-              v40 = v43 - v33[2];
-              VectorNormalizeFast(&v38);
-              *(float *)&v48 = v38 * *(v34 - 1) + v40 * v34[1] + v39 * *v34;
-              BYTE3(tess_stageVertexColors[v32++]) = (unsigned __int64)((COERCE_FLOAT(v48 & (v48 >> 31)) + 1.0) * 255.0 + 0.5);
-              v34 += 3;
-              v33 += tess_vertexComponentCount;
-            }
-            while ( v32 < tess_numVertexes );
-          }
-          break;
-        case 0xD:
-          if ( (_UNKNOWN *)backEnd_currentEntity == &tr_worldEntity )
-          {
-            v41 = backEnd_viewParms_originX[0];
-            v42 = backEnd_viewParms_originY;
-            v43 = backEnd_viewParms_originZ;
-          }
-          else
-          {
-            v38 = backEnd_viewParms_originX[0] - *(float *)(backEnd_currentEntity + 68);
-            v39 = backEnd_viewParms_originY - *(float *)(backEnd_currentEntity + 72);
-            v40 = backEnd_viewParms_originZ - *(float *)(backEnd_currentEntity + 76);
-            /* VectorRotate(in, matrix, out): in = &v38 (the vector just
-             * written above), matrix = currentEntity->axis (+28), out = &v41
-             * (read by the loop below). */
-            VectorRotate(&v38, (float *)(backEnd_currentEntity + 28), &v41);
-          }
-          v35 = 0;
-          v36 = (float *)tess_xyz;
-          if ( tess_numVertexes > 0 )
-          {
-            v37 = flt_1827F64;
-            do
-            {
-              v38 = v41 - *v36;
-              v39 = v42 - v36[1];
-              v40 = v43 - v36[2];
-              VectorNormalizeFast(&v38);
-              *(float *)&v49 = -(v40 * v37[1] + v38 * *(v37 - 1) + v39 * *v37);
-              BYTE3(tess_stageVertexColors[v35++]) = (unsigned __int64)(COERCE_FLOAT(v49 & ~(v49 >> 31)) * 255.0 + 0.5);
-              v37 += 3;
-              v36 += tess_vertexComponentCount;
-            }
-            while ( v35 < tess_numVertexes );
-          }
-          break;
-        default:
-          return result;
-      }
-      return result;
-    case 0xC:
-      for ( mm = 0; mm < tess_numVertexes; ++mm )
-        tess_stageVertexColors[mm] = *(_DWORD *)(a3 + 1664);
-      goto LABEL_31;
-    case 0xD:
-      if ( r_showtris->integer < 5 )
-        tess_stageVertexColors[0] = *(_DWORD *)(a3 + 1664);
-      else
-        RB_ChooseSurfaceCountColor(tess_numIndexes, tess_stageVertexColors);
-      for ( nn = 1; nn < tess_numVertexes; ++nn )
-        tess_stageVertexColors[nn] = tess_stageVertexColors[0];
-      goto LABEL_31;
-    default:
-      LOBYTE(a1) = tr_identityLightByte;
-      BYTE1(a1) = tr_identityLightByte;
-      v4 = a1 << 16;
-      LOWORD(v4) = a1;
-      goto LABEL_30;
-  }
-}
-#endif
+    generated = (unsigned int *)&tess_generatedTexCoords[0x20000 * b];
+    active    = &tess_activeTexCoords[b];
+    *active   = generated;
+    tcGen   = bundle->tcGen;
 
-/* ---- RB_ComputeTexCoords  0x00500400 ----  VERIFIED */
-int __cdecl RB_ComputeTexCoords(int a1)
-{
-  int a2;
-  _DWORD *v2;
-  int v3;
-  GLvoid **v4;
-  int result;
-  float *i;
-  int *v7;
-  int *v8;
-  int v9;
-  int j;
-  float *v11;
-  float *v12;
-  double v13;
-  int v14;
-  _DWORD *v15;
-  int texUnit;
-
-  texUnit = 0;
-  v2 = &tess_generatedTexCoords;
-  v3 = a1 + 172;
-  v4 = &tess_activeTexCoords;
-  v15 = &tess_generatedTexCoords;
-  v14 = a1 + 172;
-  while ( 2 )
-  {
-    *v4 = v2;
-    result = *(_DWORD *)(v3 - 12);
-    switch ( result )
+    switch ( tcGen )
     {
-      case 0:
-        return result;
+      case 0:                                     /* stop */
+        return;
       case 1:
-        memset(v2, 0, 8 * tess_numVertexes);
-        a2 = 0;
-        goto LABEL_43;
-      case 2:
-        if ( setArraysOnce || *(_DWORD *)(v3 + 16) )
+        memset( generated, 0, 8 * tess_numVertexes );
+        scratch = 0;
+        break;
+      case 2:                                     /* lightmap coords */
+        if ( setArraysOnce || bundle->numTexMods )
         {
-          qmemcpy(v2, tess_texCoords1, 8 * tess_numVertexes);
-          a2 = 0;
-          v3 = v14;
+          memcpy( generated, tess_texCoords1, 8 * tess_numVertexes );
+          scratch = 0;
         }
         else
         {
-          *v4 = tess_texCoords1;
+          *active = tess_texCoords1;
         }
-        goto LABEL_43;
-      case 3:
-        if ( setArraysOnce || *(_DWORD *)(v3 + 16) )
+        break;
+      case 3:                                     /* base coords */
+        if ( setArraysOnce || bundle->numTexMods )
         {
-          qmemcpy(v2, tess_texCoords0, 8 * tess_numVertexes);
-          a2 = 0;
-          v3 = v14;
+          memcpy( generated, tess_texCoords0, 8 * tess_numVertexes );
+          scratch = 0;
         }
         else
         {
-          *v4 = tess_texCoords0;
+          *active = tess_texCoords0;
         }
-        goto LABEL_43;
+        break;
+      case 6:                                     /* TCGEN_VECTOR */
+      {
+        const float *xyz = (const float *)tess_xyz;
+        for ( scratch = 0; scratch < tess_numVertexes; scratch++, xyz += tess_vertexComponentCount )
+        {
+          /* retail sums (v1*x1 + v0*x0) + x2*v2 and (w0*x0 + x2*w2) + w1*x1 */
+          ((float *)*active)[2 * scratch + 0] = bundle->tcGenVectors[0][1] * xyz[1]
+                                         + bundle->tcGenVectors[0][0] * xyz[0]
+                                         + xyz[2] * bundle->tcGenVectors[0][2];
+          ((float *)*active)[2 * scratch + 1] = bundle->tcGenVectors[1][0] * xyz[0]
+                                         + xyz[2] * bundle->tcGenVectors[1][2]
+                                         + bundle->tcGenVectors[1][1] * xyz[1];
+        }
+        break;
+      }
       case 4:
-        RB_CalcEnvironmentTexCoords((int)v2);
-        goto LABEL_43;
-      case 6:
-        a2 = 0;
-        for ( i = (float *)tess_xyz; a2 < tess_numVertexes; i += tess_vertexComponentCount )
+        RB_CalcEnvironmentTexCoords( (int)generated );
+        break;
+      case 7:                                     /* normals */
+        if ( !bundle->numTexMods )
         {
-          ++a2;
-          *((float *)*v4 + 2 * a2 - 2) = *(float *)(v3 - 4) * i[1] + *(float *)(v3 - 8) * *i + i[2] * *(float *)v3;
-          *((float *)*v4 + 2 * a2 - 1) = *(float *)(v3 + 4) * *i
-                                       + i[2] * *(float *)(v3 + 12)
-                                       + *(float *)(v3 + 8) * i[1];
+          *active = tess_stageNormals;
         }
-        goto LABEL_43;
-      case 7:
-        if ( !*(_DWORD *)(v3 + 16) )
+        else
         {
-          *v4 = tess_stageNormals;
-          goto LABEL_43;
+          memcpy( generated, tess_stageNormals, 12 * tess_numVertexes );
+          scratch = 0;
         }
-        v7 = (int *)tess_stageNormals;
-        v8 = v2;
-        goto LABEL_19;
-      case 8:
+        break;
+      case 8:                                     /* tangents */
         if ( !tess_stageTangentsValid )
           RB_CalcTangentSpace();
-        if ( *(_DWORD *)(v3 + 16) )
+        if ( !bundle->numTexMods )
         {
-          qmemcpy(*v4, tess_stageTangents, 12 * tess_numVertexes);
-          a2 = 0;
-          v3 = v14;
+          *active = tess_stageTangents;
         }
         else
         {
-          *v4 = tess_stageTangents;
+          memcpy( *active, tess_stageTangents, 12 * tess_numVertexes );
+          scratch = 0;
         }
-        goto LABEL_43;
-      case 9:
+        break;
+      case 9:                                     /* bitangents */
         if ( !tess_stageBitangentsValid )
           RB_CalcTangentSpace();
-        if ( *(_DWORD *)(v3 + 16) )
+        if ( !bundle->numTexMods )
         {
-          v8 = (int *)*v4;
-          v7 = tess_stageBitangents;
-LABEL_19:
-          qmemcpy(v8, v7, 12 * tess_numVertexes);
-          a2 = 0;
-          v3 = v14;
+          *active = tess_stageBitangents;
         }
         else
         {
-          *v4 = tess_stageBitangents;
+          memcpy( *active, tess_stageBitangents, 12 * tess_numVertexes );
+          scratch = 0;
         }
-LABEL_43:
-        result = *(_DWORD *)(v3 + 16);
-        for ( j = 0; j < result; ++j )
-        {
-          v11 = (float *)(68 * j + *(_DWORD *)(v3 + 20));
-          a2 = *(_DWORD *)v11;
-          switch ( *(_DWORD *)v11 )
-          {
-            case 0:
-              j = 4;
-              break;
-            case 1:
-              RB_CalcTransformTexCoords(v11, (float *)*v4);
-              break;
-            case 2:
-              RB_CalcTurbulentTexCoords((float *)*v4, v11 + 1);
-              v2 = v15;
-              v3 = v14;
-              break;
-            case 3:
-              RB_CalcScrollTexCoords(v11 + 14, (float *)*v4);
-              break;
-            case 4:
-              RB_CalcScaleTexCoords((float *)*v4, v11 + 12);
-              break;
-            case 5:
-              RB_CalcStretchTexCoords((int)(v11 + 1), (float *)*v4);
-              v3 = v14;
-              break;
-            case 6:
-              RB_CalcRotateTexCoords(v11[16], (float *)*v4);
-              break;
-            case 7:
-              RB_CalcScrollTexCoords((float *)(backEnd_currentEntity + 112), (float *)*v4);
-              break;
-            case 8:
-              RB_CalcSwapTexCoords((float *)*v4);
-              break;
-            case 9:
-              v12 = (float *)*v4;
-              a2 = 3 * tess_numVertexes;
-              if ( 3 * tess_numVertexes > 0 )
-              {
-                do
-                {
-                  v13 = *v12++;
-                  --a2;
-                  *(v12 - 1) = -v13;
-                }
-                while ( a2 );
-              }
-              break;
-            case 0xA:
-              RB_CalcCubeMapBumpmapFrameTexCoords((float *)*v4);
-              break;
-            default:
-              ri_Error(1, "\x15" "ERROR: unknown texmod '%d' in shader '%s'\n", a2, tess_shader);
-              break;
-          }
-          result = *(_DWORD *)(v3 + 16);
-        }
-        v2 += 0x8000;
-        v3 += 200;
-        ++v4;
-        v15 = v2;
-        v14 = v3;
-        ++texUnit;
-        if ( texUnit < 8 )
-          continue;
-        return result;
+        break;
       case 10:
-        RB_CalcCubeMapTbnTexCoords(v2, 0);
-        goto LABEL_43;
+        RB_CalcCubeMapTbnTexCoords( generated, 0 );
+        break;
       case 11:
-        RB_CalcCubeMapTbnTexCoords(v2, 1);
-        goto LABEL_43;
+        RB_CalcCubeMapTbnTexCoords( generated, 1 );
+        break;
       case 12:
-        RB_CalcCubeMapTbnTexCoords(v2, 2);
-        goto LABEL_43;
+        RB_CalcCubeMapTbnTexCoords( generated, 2 );
+        break;
       case 13:
-        RB_CalcCubeMapVertexToEyeTexCoords((int)v2);
-        goto LABEL_43;
+        RB_CalcCubeMapVertexToEyeTexCoords( (int)generated );
+        break;
       case 14:
-        RB_CalcCubeMapEyeToVertexTexCoords((int)v2);
-        goto LABEL_43;
+        RB_CalcCubeMapEyeToVertexTexCoords( (int)generated );
+        break;
       case 15:
-        RB_CalcCubeMapReflectionTexCoords(a2, (int)v2);
-        goto LABEL_43;
+        RB_CalcCubeMapReflectionTexCoords( generated );
+        break;
       case 16:
-        RB_CalcCubeMapLightVectorTexCoords((int)v2);
-        goto LABEL_43;
+        RB_CalcCubeMapLightVectorTexCoords( (int)generated );
+        break;
       case 17:
-        RB_CalcCubeMapLightHalfAngleTexCoords((int)v2);
-        goto LABEL_43;
+        RB_CalcCubeMapLightHalfAngleTexCoords( (int)generated );
+        break;
       case 18:
-        RB_CalcCubeMapSunHalfAngleTexCoords((int)v2);
-        goto LABEL_43;
+        RB_CalcCubeMapSunHalfAngleTexCoords( (int)generated );
+        break;
       case 19:
-        v9 = 0;
-        goto LABEL_42;
+        RB_CalcCubeMapDot3ReflectTexCoords((float *)generated, 0);
+        break;
       case 20:
-        v9 = 1;
-        goto LABEL_42;
+        RB_CalcCubeMapDot3ReflectTexCoords((float *)generated, 1);
+        break;
       case 21:
-        v9 = 2;
-LABEL_42:
-        RB_CalcCubeMapDot3ReflectTexCoords(v9, (float *)v2);
-        goto LABEL_43;
+        RB_CalcCubeMapDot3ReflectTexCoords((float *)generated, 2);
+        break;
       default:
-        goto LABEL_43;
+        break;
     }
+
+    /* apply this unit's texture-coordinate modifiers */
+    numMods = bundle->numTexMods;
+    for(m=0;m<bundle->numTexMods;++m)
+    {
+      float *texMod = (float *)( 68 * m + (int)bundle->texMods );
+      scratch = *(unsigned int *)texMod;
+      switch ( *(unsigned int *)texMod )
+      {
+        case 0:                                   /* TMOD_NONE terminates the list (TR_MAX_TEXMODS) */
+          m = 4;
+          break;
+        case 8:
+          RB_CalcSwapTexCoords( (float *)*active );
+          break;
+        case 2:
+          RB_CalcTurbulentTexCoords( (float *)*active, texMod + 1 );
+          break;
+        case 7:
+          RB_CalcScrollTexCoords( (float *)( backEnd_currentEntity + 112 ), (float *)*active );
+          break;
+        case 3:
+          RB_CalcScrollTexCoords( texMod + 14, (float *)*active );
+          break;
+        case 4:
+          RB_CalcScaleTexCoords( texMod + 12, (float *)*active );
+          break;
+        case 5:
+          RB_CalcStretchTexCoords( (int)( texMod + 1 ), (float *)*active );
+          break;
+        case 1:
+          RB_CalcTransformTexCoords( texMod, (float *)*active );
+          break;
+        case 6:
+          RB_CalcRotateTexCoords( texMod[16], (float *)*active );
+          break;
+        case 9:                                   /* negate all coords */
+        {
+          float *st = (float *)*active;
+          int    n  = 3 * tess_numVertexes;
+          while ( n-- > 0 )
+          {
+            *st = -*st;
+            st++;
+          }
+          break;
+        }
+        case 10:
+          RB_CalcCubeMapBumpmapFrameTexCoords( (float *)*active );
+          break;
+        default:
+          ri.Error( 1, "\x15" "ERROR: unknown texmod '%d' in shader '%s'\n", scratch, tess_shader );
+          break;
+      }
+
+    }
+
+    ++bundle;
   }
+  return;
 }
 
-/* ---- RB_SetIteratorFog  0x00500810 ----  VERIFIED */
-void __cdecl RB_SetIteratorFog(void)
+/* ---- R_FogOff  0x004D2A50 ----  (retail's lives beside R_FogOn in tr_main.c;
+ * RB_SetIteratorFog tail-jumps to it) */
+static void R_FogOff( void )
 {
-  if ( (backEnd_refdef_rdflags & 1) != 0 )
-  {
-LABEL_2:
-    if ( (glState_glStateBits & 0x200000) != 0 )
-    {
-      glDisable(0xB60u);
-      glState_glStateBits &= ~0x200000u;
-    }
+  if ( ( glState_glStateBits & 0x200000 ) == 0 )
     return;
-  }
-  if ( (backEnd_refdef_rdflags & 0x40) != 0 )
-  {
-    if ( dword_16C4B70 )
-    {
-      R_Fog((int)&unk_16C4B40);
-      return;
-    }
-    goto LABEL_2;
-  }
-  if ( dword_16DCA54 && (backEnd_refdef_rdflags & 8) != 0 )
-  {
-    if ( dword_16C4BB0 )
-    {
-      R_Fog((int)&unk_16C4B80);
-      return;
-    }
-  }
-  else if ( glfogNum > 0 )
-  {
-    R_Fog((int)&dword_16C4C40);
-    return;
-  }
-  if ( (glState_glStateBits & 0x200000) != 0 )
-  {
-    glDisable(0xB60u);
-    glState_glStateBits &= ~0x200000u;
-  }
+  glDisable( 0xB60u );                                     /* GL_FOG */
+  glState_glStateBits &= ~0x200000u;
 }
 
-/* ---- RB_SingleStageGeneric  0x005008A0 ----  VERIFIED */
-void __cdecl RB_SingleStageGeneric(_DWORD *stage, GLvoid *indexes, GLsizei numIndexes)
+/* ---- RB_SetIteratorFog  0x00500810 ----  VERIFIED
+ * Set up (or disable) the fixed-function GL fog for the current view / surface. */
+void __cdecl RB_SetIteratorFog( void )
 {
-  cvar_t *v7;
-  GLenum *AnimatedImage;
-  int v9;
-  int v10;
-
-  _DWORD *a1 = stage;
-  GLvoid *a3 = indexes;
-  GLsizei a5 = numIndexes;
-
-  RB_ComputeColors((int)a1);
-  RB_ComputeTexCoords((int)a1);
-  if ( !setArraysOnce )
+  if ( backEnd_refdef_rdflags & 1 )                        /* RDF_NOWORLDMODEL */
   {
-    if ( (glState_clientStateBits & 0x100) == 0 )
-    {
-      glEnableClientState(0x8076u);
-      glState_clientStateBits |= 0x100u;
-    }
-    glColorPointer(4, 0x1401u, 0, tess_stageVertexColors);
+    R_FogOff();
+    return;
   }
-  if ( a1[51] )
+
+  if ( backEnd_refdef_rdflags & 0x40 )                     /* RDF_DRAWINGSKY */
   {
-    GL_State(a1[417]);
-    if ( backEnd_wireframeOverride )
-      glPolygonMode(0x408u, 0x1B02u);
-    RB_SetupMultitexture(a1, (int)&tess_activeTexCoords, 0);
-    R_DrawElements(a3, a5);
+    if ( tr_fogSky_registered )
+      R_Fog( (int)&tr_fogSky );
+    else
+      R_FogOff();
+    return;
+  }
+
+  if ( rendererSkyboxPortal && ( backEnd_refdef_rdflags & 8 ) )
+  {
+    if ( tr_fogPortalView_registered )
+      R_Fog( (int)&tr_fogPortalView );
+    else
+      R_FogOff();
   }
   else
   {
-    if ( !setArraysOnce )
-      glTexCoordPointer(a1[36], 0x1406u, 0, tess_activeTexCoords);
-    if ( (*(_DWORD *)(*(_DWORD *)(tess_shader + 340) + 1668) & 0x100000) != 0
-      && (v7 = r_debugEntLight, r_debugEntLight->integer) )
-    {
-      AnimatedImage = (GLenum *)tr_whiteImage;
-    }
+    if ( glfogNum > 0 )
+      R_Fog( (int)&tr_fogCurrent_mode );
     else
-    {
-      AnimatedImage = (GLenum *)RB_GetAnimatedImage((int)v7, (int)(a1 + 1), glState_currentTmu);
-    }
-    GL_Bind(AnimatedImage);
-    GL_State(a1[417]);
-    if ( a1[402] )
-      RB_SetupRegisterCombiners(a1[402]);
-    v9 = a1[403];
-    if ( v9 )
-      RB_SetupVertexProgram(v9);
-    v10 = a1[401];
-    if ( v10 != glState_boundFragmentShader )
-    {
-      glBindFragmentShaderATI(v10);
-      glState_boundFragmentShader = v10;
-    }
-    R_DrawElements(a3, a5);
+      R_FogOff();
   }
 }
 
-/* ---- ProjectDlightTexture  0x00500A10 ----  VERIFIED */
-int __cdecl ProjectDlightTexture(void)
+/* ---- RB_SingleStageGeneric  0x005008A0 ----  VERIFIED
+ * Compute colours and texcoords for one shader stage and draw it, either
+ * through the multitexture collapse path or as a single textured pass. */
+void __cdecl RB_SingleStageGeneric( unsigned int *stage, GLsizei numIndexes, GLvoid *indexes )
 {
-  int result;
-  char v2;
-  int v3;
-  int v4;
-  int v5;
-  GLsizei v6;
-  int i;
-  char *v8;
-  _DWORD *v9;
-  int v10;
-  _BYTE v11[98308]; // [esp+18h] [ebp-1800Ch] BYREF
-  result = backEnd_refdef_num_dlights;
-  if ( backEnd_refdef_num_dlights )
+  int     program;
+  int     fragmentShader;
+
+  RB_ComputeColors( (int)stage );
+  RB_ComputeTexCoords( (int)stage );
+
+  if ( !setArraysOnce )
   {
-    RB_EndMultitexture();
-    result = backEnd_refdef_num_dlights;
-    v2 = 0;
-    v10 = 0;
-    if ( backEnd_refdef_num_dlights > 0 )
+    if ( ( glState_clientStateBits & 0x100 ) == 0 )
     {
-      v3 = 0;
-      do
+      glEnableClientState( 0x8076u );                      /* GL_COLOR_ARRAY */
+      glState_clientStateBits |= 0x100u;
+    }
+    glColorPointer( 4, 0x1401u, 0, tess_stageVertexColors );
+  }
+
+  if ( stage[51] )                                         /* multitexture collapse */
+  {
+    GL_State( stage[417] );                                /* stateBits */
+    if ( backEnd_wireframeOverride )
+      glPolygonMode( 0x408u, 0x1B02u );
+    RB_SetupMultitexture( stage, (GLvoid **)&tess_activeTexCoords, 0 );
+    R_DrawElements( numIndexes, indexes );
+  }
+  else
+  {
+    if ( !setArraysOnce )   /* 0x50094B loads slot 0's pointer (the multitexture call above pushes the table address) */
+      glTexCoordPointer( stage[36], 0x1406u, 0, tess_activeTexCoords[0] );
+
+    if ( ( *(unsigned int *)( *(unsigned int *)( tess_shader + 340 ) + 1668 ) & 0x100000 ) != 0
+      && r_debugEntLight->integer )
+      GL_Bind( (GLenum *)tr_whiteImage );
+    else
+      GL_Bind( (GLenum *)RB_GetAnimatedImage( glState_currentTmu, (int)( stage + 1 ) ) );
+    GL_State( stage[417] );
+    if ( stage[402] )
+      RB_SetupRegisterCombiners( stage[402] );
+    program = stage[403];
+    if ( program )
+      RB_SetupVertexProgram( program );
+    fragmentShader = stage[401];
+    if ( fragmentShader != glState_boundFragmentShader )
+    {
+      glBindFragmentShaderATI( fragmentShader );
+      glState_boundFragmentShader = fragmentShader;
+    }
+    R_DrawElements( numIndexes, indexes );
+  }
+}
+
+/* ---- ProjectDlightTexture  0x00500A10 ----  VERIFIED
+ * For each dynamic light touching this surface, build its projected index /
+ * colour arrays and draw the shared dlight stage (shader not lit per entity)
+ * or every per-light stage.  Returns backEnd.refdef.num_dlights (dead-EAX). */
+void __cdecl ProjectDlightTexture( void )
+{
+
+  int      dlightIndex;
+  int      dlight;
+  GLsizei  hitCount;
+  int      stageIndex;
+  char    *stage;
+  unsigned int  *dlightStage;
+  unsigned short hitIndexes[49152];       /* projected index scratch [esp+18h] */
+
+
+  if ( !backEnd_refdef_num_dlights )
+    return;
+
+  RB_EndMultitexture();
+
+  for ( dlightIndex = 0; dlightIndex < backEnd_refdef_num_dlights; dlightIndex++ )
+  {
+    if ( ( ( 1 << dlightIndex ) & tess_dlightBits ) != 0 )
+    {
+      dlight   = (int)&( (dlight_t *)backEnd_refdef_dlights )[dlightIndex];
+      hitCount = RB_BuildDlightArrays( tess_texCoords1, tess_vertexColors,
+                                       (float *)&( (dlight_t *)backEnd_refdef_dlights )[dlightIndex],
+                                       hitIndexes );
+      if ( hitCount )
       {
-        if ( ((1 << v2) & tess_dlightBits) != 0 )
+        if ( *(char *)( tess_shader + 84 ) & 0x80 )         /* shader.lightingFlags: lit per entity */
         {
-          v4 = backEnd_refdef_dlights + v3;
-          v6 = RB_BuildDlightArrays(tess_vertexColors, tess_texCoords1, (float *)(backEnd_refdef_dlights + v3), (int)v11);
-          if ( v6 )
+          backEnd_currentDlight = dlight;
+          for ( stageIndex = 0; stageIndex < 8; stageIndex++ )
           {
-            if ( *(char *)(tess_shader + 84) >= 0 )
-            {
-              v9 = *(_DWORD **)(tr_dlightShader + 340);
-              if ( v9 )
-                RB_SingleStageGeneric(v9, v11, v6);
-            }
-            else
-            {
-              backEnd_currentDlight = v4;
-              for ( i = 0; i < 32; i += 4 )
-              {
-                v8 = *(char **)(i + tess_activeStages);
-                if ( !v8 )
-                  break;
-                if ( *v8 < 0 )
-                  RB_SingleStageGeneric(v8, v11, v6);
-              }
-            }
+            stage = ((char **)tess_activeStages)[stageIndex];
+            if ( !stage )
+              break;
+            if ( *stage & 0x80 )                            /* stage.flags: per-light stage */
+              RB_SingleStageGeneric( (unsigned int *)stage, hitCount, hitIndexes );
           }
         }
-        result = backEnd_refdef_num_dlights;
-        v2 = v10 + 1;
-        v3 += 136;
-        ++v10;
+        else
+        {
+          dlightStage = *(unsigned int **)( tr_dlightShader + 340 );
+          if ( dlightStage )
+            RB_SingleStageGeneric( dlightStage, hitCount, hitIndexes );
+        }
       }
-      while ( v10 < backEnd_refdef_num_dlights );
     }
   }
-  return result;
+  return;
 }
 
 /* ---- RB_IterateStagesGeneric  0x00500B30 ----  VERIFIED */
-void __cdecl RB_IterateStagesGeneric( void )
+void __cdecl RB_IterateStagesGeneric( shaderCommands_t *input )
 {
   int   i;
   char *stage;
 
   RB_EndMultitexture();
 
-  for ( i = 0; i < 32; i += 4 )
+  for ( i = 0; i < 8; i++ )
   {
-    stage = *(char **)( i + tess_activeStages  );
+    stage = ( (char **)tess_activeStages )[i];
     if ( !stage )
       break;
 
-    if ( *stage >= 0 )
+    if ( !( *(unsigned int *)stage & 0x80 ) )
     {
-      RB_SingleStageGeneric( (_DWORD *)stage, tess_indexes, tess_numIndexes );
+      RB_SingleStageGeneric( (unsigned int *)stage, tess_numIndexes, tess_indexes );
       if ( r_lightmap->integer )
       {
         if ( *(unsigned char *)( stage + 200 ) )
@@ -2607,981 +1969,936 @@ void __cdecl RB_IterateStagesGeneric( void )
   }
 }
 
-/* ---- RB_StageIteratorGeneric  0x00500BA0 ----  STATEMENT-DIFF CLEAN */
-int (*__cdecl RB_StageIteratorGeneric(int a4))(void)
+/* ---- RB_StageIteratorGeneric  0x00500BA0 ----  VERIFIED
+ * The generic (fixed-function / non-optimized) tess stage iterator: deform,
+ * fog and cull the current surface, set up the vertex arrays, draw the ordinary
+ * stages, then the dynamic-light pass (the projected dlight texture, or each
+ * per-light stage once per entity light).  `portalPass` runs only the dlight
+ * pass.  Returns qglUnlockArraysEXT (dead-EAX). */
+void __cdecl RB_StageIteratorGeneric(int portalPass)
 {
-  int (*result)(void);
-  int v5;
-  char *v6;
-  int v8;
-  int v9;
-  int v10;
-  int v11;
-  char *v12;
-  int v13;
 
-  result = (int (*)(void))tess_activeStageCount;
-  if ( tess_activeStageCount > 0 && (!a4 || (result = (int (*)(void))tess_dlightBits) != 0) )
+  int     needsNormals;
+  char   *logText;
+  int     entity;
+  int     lightCount;
+  int     lightIndex;
+  int     stageIndex;
+  char   *stage;
+
+  if ( tess_activeStageCount <= 0 )
+    return;
+  if ( portalPass )
   {
-    RB_DeformTessGeometry();
-    v5 = (*(_DWORD *)(tess_shader + 80) >> 8) & 1;
-    if ( r_logFile->integer )
+    if ( !tess_dlightBits )
+      return;
+  }
+
+  RB_DeformTessGeometry();
+  needsNormals = ( ((shader_t *)tess_shader)->surfaceFlags >> 8 ) & 1;      /* shader needs normals */
+  if ( r_logFile->integer )
+  {
+    logText = va( "--- RB_StageIteratorGeneric( %s ) ---\n", (const char *)tess_shader );
+    if ( Stream )
+      fprintf( Stream, "%s", (int)logText );
+  }
+  RB_EndMultitexture();
+  RB_SetIteratorFog();
+  GL_Cull( ((shader_t *)tess_shader)->cullType );
+
+  if ( tess_activeStageCount > 1
+    || *(unsigned int *)( *(unsigned int *)( tess_shader + 340 ) + 348 ) )      /* collapsed multitexture */
+  {
+    if ( needsNormals )
+      GL_ClientState( 1536 );
+    else
+      GL_ClientState( 1024 );
+  }
+  else
+  {
+    setArraysOnce = 1;
+    if ( needsNormals )
+      GL_ClientState( 1793 );
+    else
+      GL_ClientState( 1281 );
+    glColorPointer( 4, 0x1401u, 0, tess_stageVertexColors );
+    glTexCoordPointer( *(unsigned int *)( *(unsigned int *)( tess_shader + 340 ) + 144 ), 0x1406u, 0,
+                       &tess_generatedTexCoords );
+  }
+  if ( needsNormals )
+    glNormalPointer( 0x1406u, 12, tess_stageNormals );
+
+  glVertexPointer( tess_vertexComponentCount, 0x1406u, 0, tess_xyz );
+  if ( qglLockArraysEXT )
+    qglLockArraysEXT( 0, tess_numVertexes );
+  if ( !setArraysOnce )
+  {
+    if ( needsNormals )
+      GL_ClientState( 1793 );
+    else
+      GL_ClientState( 1281 );
+  }
+  if ( !portalPass )
+    RB_IterateStagesGeneric( &tess );
+
+  if ( tess_dlightBits
+    && ((shader_t *)tess_shader)->sort <= 5.0f                       /* shader.sort <= SS_OPAQUE */
+    && ( ((shader_t *)tess_shader)->surfaceParmFlags & 0x20004 ) == 0 )        /* SURF_NODLIGHT | SURF_SKY */
+  {
+    ProjectDlightTexture();
+  }
+  else
+  {
+    if(*(unsigned char *)(tess_shader+84)&0x80u)                        /* shader lit per entity */
     {
-      v6 = va("--- RB_StageIteratorGeneric( %s ) ---\n", (const char *)tess_shader);
-      if ( Stream )
-        fprintf(Stream, "%s", (int)v6);
-    }
-    RB_EndMultitexture();
-    RB_SetIteratorFog();                 /* takes no arguments -- 0x00500C1B */
-    GL_Cull(*(_DWORD *)(tess_shader + 168));
-    if ( tess_activeStageCount > 1 || *(_DWORD *)(*(_DWORD *)(tess_shader + 340) + 348) )
-    {
-      if ( !v5 )
+      entity = backEnd_currentEntity;
+      if ( entity )
       {
-        GL_ClientState(1024);
-LABEL_15:
-        glVertexPointer(tess_vertexComponentCount, 0x1406u, 0, tess_xyz);
-        if ( qglLockArraysEXT )
-          qglLockArraysEXT(0, tess_numVertexes);
-        if ( !setArraysOnce )
+        lightCount = *(unsigned int *)( entity + 204 );
+        if ( lightCount )
         {
-          if ( v5 )
-            GL_ClientState(1793);
-          else
-            GL_ClientState(1281);
-        }
-        if ( !a4 )
-          RB_IterateStagesGeneric();
-        if ( !tess_dlightBits || *(float *)(tess_shader + 88) > 5.0 || (*(_DWORD *)(tess_shader + 92) & 0x20004) != 0 )
-        {
-          if ( *(char *)(tess_shader + 84) < 0 )
+          for ( lightIndex = 0; lightIndex < lightCount; lightIndex++ )
           {
-            v8 = backEnd_currentEntity;
-            if ( backEnd_currentEntity )
+            backEnd_currentDlight = *(unsigned int *)( entity + 8 * lightIndex + 208 );
+            if ( *(unsigned int *)backEnd_currentDlight != 8 )            /* light type != null */
             {
-              v9 = *(_DWORD *)(backEnd_currentEntity + 204);
-              if ( v9 )
+              backEnd_currentLightScale = *(float *)( entity + 8 * lightIndex + 212 );
+              for ( stageIndex = 0; stageIndex < 8; stageIndex++ )
               {
-                v10 = 0;
-                if ( v9 > 0 )
+                stage = ((char **)tess_activeStages)[stageIndex];
+                if ( !stage )
+                  break;
+                if((unsigned char)*stage&0x80u)                                   /* per-light stage */
                 {
-                  do
-                  {
-                    backEnd_currentDlight = *(_DWORD *)(v8 + 8 * v10 + 208);
-                    if ( *(_DWORD *)backEnd_currentDlight != 8 )
-                    {
-                      v11 = 0;
-                      backEnd_currentLightScale = *(float *)(v8 + 8 * v10 + 212);
-                      do
-                      {
-                        v12 = *(char **)(v11 + tess_activeStages);
-                        if ( !v12 )
-                          break;
-                        if ( *v12 < 0 )
-                        {
-                          RB_SingleStageGeneric(v12, tess_indexes, tess_numIndexes);
-                          v8 = backEnd_currentEntity;
-                        }
-                        v11 += 4;
-                      }
-                      while ( v11 < 32 );
-                    }
-                    ++v10;
-                  }
-                  while ( v10 < *(_DWORD *)(v8 + 204) );
+                  RB_SingleStageGeneric( (unsigned int *)stage, tess_numIndexes, tess_indexes );
+                  entity = backEnd_currentEntity;
                 }
-                backEnd_currentDlight = 0;
               }
             }
+            lightCount = *(unsigned int *)( entity + 204 );
           }
+          backEnd_currentDlight = 0;
         }
-        else
-        {
-          ProjectDlightTexture();
-        }
-        result = (int)qglUnlockArraysEXT;
-        if ( qglUnlockArraysEXT )
-          qglUnlockArraysEXT();
-        setArraysOnce = 0;
-        return result;
       }
-      GL_ClientState(1536);
     }
-    else
-    {
-      setArraysOnce = 1;
-      if ( v5 )
-        v13 = 1793;
-      else
-        v13 = 1281;
-      GL_ClientState(v13);
-      glColorPointer(4, 0x1401u, 0, tess_stageVertexColors);
-      glTexCoordPointer(*(_DWORD *)(*(_DWORD *)(tess_shader + 340) + 144), 0x1406u, 0, &tess_generatedTexCoords);
-    }
-    if ( v5 )
-      glNormalPointer(0x1406u, 12, tess_stageNormals);
-    goto LABEL_15;
   }
-  return result;
+
+  if ( qglUnlockArraysEXT )
+    qglUnlockArraysEXT();
+  setArraysOnce = 0;
+  return;
 }
 
-/* ---- RB_EndSurface_OptimizedGeneric  0x00500E40 ----  VERIFIED */
+/* ---- RB_EndSurface_OptimizedGeneric  0x00500E40 ----  VERIFIED
+ * Draw an optimized (pre-tessellated) surface from its static vertex buffer
+ * with the generic (client-array) backend, then the r_showtris overlay. */
 void __cdecl RB_EndSurface_OptimizedGeneric( void )
 {
-  int i;
-  char *v2;
-  int integer;
-  _DWORD *v4;
-  GLubyte v[4]; // [esp+4Ch] [ebp-28h] BYREF
-  _DWORD v7[9]; // [esp+50h] [ebp-24h] BYREF
+  int     i;
+  char   *stage;
+  int     showtris;
+  unsigned int *trisStage;
+  unsigned int  vertexArrays[9];
 
   if ( r_lightmap->integer )
   {
-    if ( glState_texEnv[glState_currentTmu] != 7681 )
+    if ( glState_texEnv[glState_currentTmu] != 7681 )       /* GL_REPLACE */
     {
       glState_texEnv[glState_currentTmu] = 7681;
-      glTexEnvi(0x2300u, 0x2200u, 7681);
+      glTexEnvi( 0x2300u, 0x2200u, 7681 );
     }
   }
   else
   {
-    GL_TexEnv(*(_DWORD *)(*(_DWORD *)(tess_shader + 340) + 348));
+    GL_TexEnv( *(unsigned int *)( *(unsigned int *)( tess_shader + 340 ) + 348 ) );
   }
-  if ( (glState_clientStateBits & 0x100) == 0 )
+  if ( ( glState_clientStateBits & 0x100 ) == 0 )
   {
-    glEnableClientState(0x8076u);
+    glEnableClientState( 0x8076u );
     glState_clientStateBits |= 0x100u;
   }
-  if ( (glState_clientStateBits & 0x200) != 0 )
+  if ( ( glState_clientStateBits & 0x200 ) != 0 )
   {
-    glDisableClientState(0x8075u);
+    glDisableClientState( 0x8075u );
     glState_clientStateBits &= ~0x200u;
   }
-  glColorPointer(4, 0x1401u, 32, (const GLvoid *)(*(_DWORD *)(tess_shader + 396) + 16));
-  glVertexPointer(3, 0x1406u, 32, (const GLvoid *)(*(_DWORD *)(tess_shader + 396) + 20));
-  RB_SetIteratorFog();   /* takes NO arguments -- 0x00500810 */
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
-  v7[0] = *(_DWORD *)(tess_shader + 396);
-  v7[1] = v7[0] + 8;
+  glColorPointer( 4, 0x1401u, 32, (const GLvoid *)( ((shader_t *)tess_shader)->optimizedVertexStorage + 16 ) );
+  glVertexPointer( 3, 0x1406u, 32, (const GLvoid *)( ((shader_t *)tess_shader)->optimizedVertexStorage + 20 ) );
+  RB_SetIteratorFog();
+  GL_Cull( ((shader_t *)tess_shader)->cullType );
+  vertexArrays[0] = ((shader_t *)tess_shader)->optimizedVertexStorage;
+  vertexArrays[1] = vertexArrays[0] + 8;
   for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v2 = *(char **)(tess_activeStages + 4 * i);
-    if ( *v2 >= 0 )
+    stage = *(char **)( tess_activeStages + 4 * i );
+    if ( !( *(unsigned int *)stage & 0x80 ) )
     {
-      GL_State(*((_DWORD *)v2 + 417));
-      RB_SetupMultitexture(v2, (int)v7, 32);
+      GL_State( *( (unsigned int *)stage + 417 ) );
+      RB_SetupMultitexture( (unsigned int *)stage, (GLvoid **)vertexArrays, 32 );
       if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+        qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
       }
       else
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+        glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
       }
     }
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  showtris = r_showtris->integer;
+  if ( showtris )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    GL_Cull(*(_DWORD *)(tr_showTrisShader + 168));
-    v4 = *(_DWORD **)(tr_showTrisShader + 340);
-    GL_State(v4[417]);
-    RB_SetupMultitexture(v4, (int)v7, 32);
-    if ( (glState_clientStateBits & 0x100) != 0 )
+    if ( ( showtris & 1 ) != 0 )
+      glDepthRange( 0.0, 0.10000000149011612 );   /* (double)0.1f, retail 0x0050101E */
+    GL_Cull( ((shader_t *)tr_showTrisShader)->cullType );
+    trisStage = *(unsigned int **)( tr_showTrisShader + 340 );
+    GL_State( trisStage[417] );
+    RB_SetupMultitexture( trisStage, (GLvoid **)vertexArrays, 32 );
+    if ( ( glState_clientStateBits & 0x100 ) != 0 )
     {
-      glDisableClientState(0x8076u);
+      glDisableClientState( 0x8076u );
       glState_clientStateBits &= ~0x100u;
     }
-    if ( r_showtris->integer < 5 )
+    if ( r_showtris->integer >= 5 )
     {
-      qglColor3f(0.0f, tr_identityLight, 0.0f);
+      RB_SetSurfaceCountColor( tess_renderedIndexCount );
     }
     else
     {
-      RB_ChooseSurfaceCountColor(count, v);
-      glColor4ubv(v);
+      qglColor3f( 0.0f, tr_identityLight, 0.0f );
     }
     if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+      qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
     }
     else
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+      glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
     }
-    glDepthRange(0.0, 1.0);
+    glDepthRange( 0.0, 1.0 );
   }
   if ( Stream )
-    fprintf(Stream, "%s", (int)"----------\n");
+    fprintf( Stream, "%s", (int)"----------\n" );
 }
 
-/* ---- RB_EndSurface_OptimizedARB  0x00501180 ----  VERIFIED */
+/* ---- RB_EndSurface_OptimizedARB  0x00501180 ----  VERIFIED
+ * ARB vertex-buffer-object variant of RB_EndSurface_OptimizedGeneric. */
 void __cdecl RB_EndSurface_OptimizedARB( void )
 {
-  char *v0;
-  int v2;
-  char *v3;
-  int integer;
-  _DWORD *v5;
-  GLubyte v[4]; // [esp+54h] [ebp-28h] BYREF
-  _DWORD v8[9]; // [esp+58h] [ebp-24h] BYREF
+  char   *logText;
+  int     i;
+  char   *stage;
+  int     showtris;
+  unsigned int *trisStage;
+  unsigned int  vertexArrays[9];
 
   if ( r_logFile->integer )
   {
-    v0 = va("--- RB_SurfaceOptimizedARB( %s ) ---\n", (const char *)tess_shader);
+    logText = va( "--- RB_SurfaceOptimizedARB( %s ) ---\n", (const char *)tess_shader );
     if ( Stream )
-      fprintf(Stream, "%s", (int)v0);
+      fprintf( Stream, "%s", (int)logText );
   }
   if ( r_lightmap->integer )
   {
     if ( glState_texEnv[glState_currentTmu] != 7681 )
     {
       glState_texEnv[glState_currentTmu] = 7681;
-      glTexEnvi(0x2300u, 0x2200u, 7681);
+      glTexEnvi( 0x2300u, 0x2200u, 7681 );
     }
   }
   else
   {
-    GL_TexEnv(*(_DWORD *)(*(_DWORD *)(tess_shader + 340) + 348));
+    GL_TexEnv( *(unsigned int *)( *(unsigned int *)( tess_shader + 340 ) + 348 ) );
   }
-  qglBindBufferARB(34962, *(_DWORD *)(tess_shader + 396));
-  if ( (glState_clientStateBits & 0x100) == 0 )
+  qglBindBufferARB( 34962, ((shader_t *)tess_shader)->optimizedVertexStorage );
+  if ( ( glState_clientStateBits & 0x100 ) == 0 )
   {
-    glEnableClientState(0x8076u);
+    glEnableClientState( 0x8076u );
     glState_clientStateBits |= 0x100u;
   }
-  if ( (glState_clientStateBits & 0x200) != 0 )
+  if ( ( glState_clientStateBits & 0x200 ) != 0 )
   {
-    glDisableClientState(0x8075u);
+    glDisableClientState( 0x8075u );
     glState_clientStateBits &= ~0x200u;
   }
-  glColorPointer(4, 0x1401u, 32, (const GLvoid *)0x10);
-  glVertexPointer(3, 0x1406u, 32, (const GLvoid *)0x14);
-  RB_SetIteratorFog();   /* takes NO arguments -- 0x00500810 */
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
-  v2 = 0;
-  v8[0] = 0;
-  for ( v8[1] = 8; v2 < tess_activeStageCount; ++v2 )
+  glColorPointer( 4, 0x1401u, 32, (const GLvoid *)0x10 );
+  glVertexPointer( 3, 0x1406u, 32, (const GLvoid *)0x14 );
+  RB_SetIteratorFog();
+  GL_Cull( ((shader_t *)tess_shader)->cullType );
+  vertexArrays[0] = 0;
+  vertexArrays[1] = 8;
+  for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v3 = *(char **)(tess_activeStages + 4 * v2);
-    if ( *v3 >= 0 )
+    stage = *(char **)( tess_activeStages + 4 * i );
+    if ( !( *(unsigned int *)stage & 0x80 ) )
     {
-      GL_State(*((_DWORD *)v3 + 417));
-      RB_SetupMultitexture(v3, (int)v8, 32);
+      GL_State( *( (unsigned int *)stage + 417 ) );
+      RB_SetupMultitexture( (unsigned int *)stage, (GLvoid **)vertexArrays, 32 );
       if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+        qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
       }
       else
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+        glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
       }
     }
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  showtris = r_showtris->integer;
+  if ( showtris )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    GL_Cull(*(_DWORD *)(tr_showTrisShader + 168));
-    v5 = *(_DWORD **)(tr_showTrisShader + 340);
-    GL_State(v5[417]);
-    RB_SetupMultitexture(v5, (int)v8, 32);
-    if ( (glState_clientStateBits & 0x100) != 0 )
+    if ( ( showtris & 1 ) != 0 )
+      glDepthRange( 0.0, 0.10000000149011612 );   /* (double)0.1f, retail 0x0050138F */
+    GL_Cull( ((shader_t *)tr_showTrisShader)->cullType );
+    trisStage = *(unsigned int **)( tr_showTrisShader + 340 );
+    GL_State( trisStage[417] );
+    RB_SetupMultitexture( trisStage, (GLvoid **)vertexArrays, 32 );
+    if ( ( glState_clientStateBits & 0x100 ) != 0 )
     {
-      glDisableClientState(0x8076u);
+      glDisableClientState( 0x8076u );
       glState_clientStateBits &= ~0x100u;
     }
-    if ( r_showtris->integer < 5 )
+    if ( r_showtris->integer >= 5 )
     {
-      qglColor3f(0.0f, tr_identityLight, 0.0f);
+      RB_SetSurfaceCountColor( tess_renderedIndexCount );
     }
     else
     {
-      RB_ChooseSurfaceCountColor(count, v);
-      glColor4ubv(v);
+      qglColor3f( 0.0f, tr_identityLight, 0.0f );
     }
     if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+      qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
     }
     else
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+      glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
     }
-    glDepthRange(0.0, 1.0);
+    glDepthRange( 0.0, 1.0 );
   }
-  qglBindBufferARB(34962, 0);
+  qglBindBufferARB( 34962, 0 );
   if ( Stream )
-    fprintf(Stream, "%s", (int)"----------\n");
+    fprintf( Stream, "%s", (int)"----------\n" );
 }
 
-/* ---- RB_EndSurface_OptimizedATI  0x00501500 ----  VERIFIED */
+/* ---- RB_EndSurface_OptimizedATI  0x00501500 ----  VERIFIED
+ * ATI array-object variant of RB_EndSurface_OptimizedGeneric. */
 void __cdecl RB_EndSurface_OptimizedATI( void )
 {
-  int v0;
-  int v1;
-  int i;
-  char *v4;
-  int integer;
-  _DWORD *v6;
-  GLubyte v[4]; // [esp+5Ch] [ebp-28h] BYREF
-  _DWORD v9[9]; // [esp+60h] [ebp-24h] BYREF
+  int     storage;
+  int     base;
+  int     i;
+  char   *stage;
+  int     showtris;
+  unsigned int *trisStage;
+  unsigned int  vertexArrays[9];
 
-  v0 = *(_DWORD *)(tess_shader + 396);
-  v1 = *(_DWORD *)(tess_shader + 400);
+  storage = ((shader_t *)tess_shader)->optimizedVertexStorage;
+  base    = ((shader_t *)tess_shader)->optimizedVertexStorageOffset;
   if ( r_lightmap->integer )
   {
     if ( glState_texEnv[glState_currentTmu] != 7681 )
     {
       glState_texEnv[glState_currentTmu] = 7681;
-      glTexEnvi(0x2300u, 0x2200u, 7681);
+      glTexEnvi( 0x2300u, 0x2200u, 7681 );
     }
   }
   else
   {
-    GL_TexEnv(*(_DWORD *)(*(_DWORD *)(tess_shader + 340) + 348));
+    GL_TexEnv( *(unsigned int *)( *(unsigned int *)( tess_shader + 340 ) + 348 ) );
   }
-  if ( (glState_clientStateBits & 0x100) == 0 )
+  if ( ( glState_clientStateBits & 0x100 ) == 0 )
   {
-    glEnableClientState(0x8076u);
+    glEnableClientState( 0x8076u );
     glState_clientStateBits |= 0x100u;
   }
-  if ( (glState_clientStateBits & 0x200) != 0 )
+  if ( ( glState_clientStateBits & 0x200 ) != 0 )
   {
-    glDisableClientState(0x8075u);
+    glDisableClientState( 0x8075u );
     glState_clientStateBits &= ~0x200u;
   }
-  qglArrayObjectATI(32886, 4, 5121, 32, v0, v1 + 16);
-  qglArrayObjectATI(32884, 3, 5126, 32, v0, v1 + 20);
-  RB_SetIteratorFog();   /* takes NO arguments -- 0x00500810 */
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
-  v9[0] = v1;
-  v9[1] = v1 + 8;
+  qglArrayObjectATI( 32886, 4, 5121, 32, storage, base + 16 );
+  qglArrayObjectATI( 32884, 3, 5126, 32, storage, base + 20 );
+  RB_SetIteratorFog();
+  GL_Cull( ((shader_t *)tess_shader)->cullType );
+  vertexArrays[0] = base;
+  vertexArrays[1] = base + 8;
   for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v4 = *(char **)(tess_activeStages + 4 * i);
-    if ( *v4 >= 0 )
+    stage = *(char **)( tess_activeStages + 4 * i );
+    if ( !( *(unsigned int *)stage & 0x80 ) )
     {
-      GL_State(*((_DWORD *)v4 + 417));
-      RB_SetupMultitextureATI(v4, v0, (int)v9, 32);
+      GL_State( *( (unsigned int *)stage + 417 ) );
+      RB_SetupMultitextureATI( (unsigned int *)stage, storage, (int *)vertexArrays, 32 );
       if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+        qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
       }
       else
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+        glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
       }
     }
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  showtris = r_showtris->integer;
+  if ( showtris )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    GL_Cull(*(_DWORD *)(tr_showTrisShader + 168));
-    v6 = *(_DWORD **)(tr_showTrisShader + 340);
-    GL_State(v6[417]);
-    RB_SetupMultitextureATI(v6, v0, (int)v9, 32);
-    if ( (glState_clientStateBits & 0x100) != 0 )
+    if ( ( showtris & 1 ) != 0 )
+      glDepthRange( 0.0, 0.10000000149011612 );   /* (double)0.1f, retail 0x005016D3 */
+    GL_Cull( ((shader_t *)tr_showTrisShader)->cullType );
+    trisStage = *(unsigned int **)( tr_showTrisShader + 340 );
+    GL_State( trisStage[417] );
+    RB_SetupMultitextureATI( trisStage, storage, (int *)vertexArrays, 32 );
+    if ( ( glState_clientStateBits & 0x100 ) != 0 )
     {
-      glDisableClientState(0x8076u);
+      glDisableClientState( 0x8076u );
       glState_clientStateBits &= ~0x100u;
     }
-    if ( r_showtris->integer < 5 )
+    if ( r_showtris->integer >= 5 )
     {
-      qglColor3f(0.0f, tr_identityLight, 0.0f);
+      RB_SetSurfaceCountColor( tess_renderedIndexCount );
     }
     else
     {
-      RB_ChooseSurfaceCountColor(count, v);
-      glColor4ubv(v);
+      qglColor3f( 0.0f, tr_identityLight, 0.0f );
     }
     if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+      qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
     }
     else
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+      glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
     }
-    glDepthRange(0.0, 1.0);
+    glDepthRange( 0.0, 1.0 );
   }
   if ( Stream )
-    fprintf(Stream, "%s", (int)"----------\n");
+    fprintf( Stream, "%s", (int)"----------\n" );
 }
 
-/* ---- RB_EndSurface_OptimizedNV  0x00501830 ----  VERIFIED */
+/* ---- RB_EndSurface_OptimizedNV  0x00501830 ----  VERIFIED
+ * NV variant of RB_EndSurface_OptimizedGeneric. */
 void __cdecl RB_EndSurface_OptimizedNV( void )
 {
-  char *v0;
-  int i;
-  char *v3;
-  int integer;
-  _DWORD *v5;
-  GLubyte v[4]; // [esp+4Ch] [ebp-28h] BYREF
-  _DWORD v8[9]; // [esp+50h] [ebp-24h] BYREF
+  char   *logText;
+  int     i;
+  char   *stage;
+  int     showtris;
+  unsigned int *trisStage;
+  unsigned int  vertexArrays[9];
 
   if ( r_logFile->integer )
   {
-    v0 = va("--- RB_SurfaceOptimizedNV( %s ) ---\n", (const char *)tess_shader);
+    logText = va( "--- RB_SurfaceOptimizedNV( %s ) ---\n", (const char *)tess_shader );
     if ( Stream )
-      fprintf(Stream, "%s", (int)v0);
+      fprintf( Stream, "%s", (int)logText );
   }
   if ( r_lightmap->integer )
   {
     if ( glState_texEnv[glState_currentTmu] != 7681 )
     {
       glState_texEnv[glState_currentTmu] = 7681;
-      glTexEnvi(0x2300u, 0x2200u, 7681);
+      glTexEnvi( 0x2300u, 0x2200u, 7681 );
     }
   }
   else
   {
-    GL_TexEnv(*(_DWORD *)(*(_DWORD *)(tess_shader + 340) + 348));
+    GL_TexEnv( *(unsigned int *)( *(unsigned int *)( tess_shader + 340 ) + 348 ) );
   }
-  if ( (glState_clientStateBits & 0x100) == 0 )
+  if ( ( glState_clientStateBits & 0x100 ) == 0 )
   {
-    glEnableClientState(0x8076u);
+    glEnableClientState( 0x8076u );
     glState_clientStateBits |= 0x100u;
   }
-  if ( (glState_clientStateBits & 0x200) != 0 )
+  if ( ( glState_clientStateBits & 0x200 ) != 0 )
   {
-    glDisableClientState(0x8075u);
+    glDisableClientState( 0x8075u );
     glState_clientStateBits &= ~0x200u;
   }
-  glColorPointer(4, 0x1401u, 32, (const GLvoid *)(*(_DWORD *)(tess_shader + 396) + 16));
-  glVertexPointer(3, 0x1406u, 32, (const GLvoid *)(*(_DWORD *)(tess_shader + 396) + 20));
-  RB_SetIteratorFog();   /* takes NO arguments -- 0x00500810 */
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
-  v8[0] = *(_DWORD *)(tess_shader + 396);
-  v8[1] = v8[0] + 8;
+  glColorPointer( 4, 0x1401u, 32, (const GLvoid *)( ((shader_t *)tess_shader)->optimizedVertexStorage + 16 ) );
+  glVertexPointer( 3, 0x1406u, 32, (const GLvoid *)( ((shader_t *)tess_shader)->optimizedVertexStorage + 20 ) );
+  RB_SetIteratorFog();
+  GL_Cull( ((shader_t *)tess_shader)->cullType );
+  vertexArrays[0] = ((shader_t *)tess_shader)->optimizedVertexStorage;
+  vertexArrays[1] = vertexArrays[0] + 8;
   for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v3 = *(char **)(tess_activeStages + 4 * i);
-    if ( *v3 >= 0 )
+    stage = *(char **)( tess_activeStages + 4 * i );
+    if ( !( *(unsigned int *)stage & 0x80 ) )
     {
-      GL_State(*((_DWORD *)v3 + 417));
-      RB_SetupMultitexture(v3, (int)v8, 32);
+      GL_State( *( (unsigned int *)stage + 417 ) );
+      RB_SetupMultitexture( (unsigned int *)stage, (GLvoid **)vertexArrays, 32 );
       if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+        qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
       }
       else
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+        glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
       }
     }
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  showtris = r_showtris->integer;
+  if ( showtris )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    GL_Cull(*(_DWORD *)(tr_showTrisShader + 168));
-    v5 = *(_DWORD **)(tr_showTrisShader + 340);
-    GL_State(v5[417]);
-    RB_SetupMultitexture(v5, (int)v8, 32);
-    if ( (glState_clientStateBits & 0x100) != 0 )
+    if ( ( showtris & 1 ) != 0 )
+      glDepthRange( 0.0, 0.10000000149011612 );   /* (double)0.1f, retail 0x00501A4F */
+    GL_Cull( ((shader_t *)tr_showTrisShader)->cullType );
+    trisStage = *(unsigned int **)( tr_showTrisShader + 340 );
+    GL_State( trisStage[417] );
+    RB_SetupMultitexture( trisStage, (GLvoid **)vertexArrays, 32 );
+    if ( ( glState_clientStateBits & 0x100 ) != 0 )
     {
-      glDisableClientState(0x8076u);
+      glDisableClientState( 0x8076u );
       glState_clientStateBits &= ~0x100u;
     }
-    if ( r_showtris->integer < 5 )
+    if ( r_showtris->integer >= 5 )
     {
-      qglColor3f(0.0f, tr_identityLight, 0.0f);
+      RB_SetSurfaceCountColor( tess_renderedIndexCount );
     }
     else
     {
-      RB_ChooseSurfaceCountColor(count, v);
-      glColor4ubv(v);
+      qglColor3f( 0.0f, tr_identityLight, 0.0f );
     }
     if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+      qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
     }
     else
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+      glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
     }
-    glDepthRange(0.0, 1.0);
+    glDepthRange( 0.0, 1.0 );
   }
   if ( Stream )
-    fprintf(Stream, "%s", (int)"----------\n");
+    fprintf( Stream, "%s", (int)"----------\n" );
 }
 
-/* ---- RB_EndSurface_CachedStaticModelGeneric  0x00501BB0 ----  VERIFIED */
+/* ---- RB_EndSurface_CachedStaticModelGeneric  0x00501BB0 ----  VERIFIED
+ * Draw a cached static-model surface (stride 24) with the generic backend. */
 void __cdecl RB_EndSurface_CachedStaticModelGeneric( void )
 {
-  int i;
-  char *v2;
-  int integer;
-  _DWORD *v4;
-  float v6;
-  GLubyte v[4]; // [esp+64h] [ebp-28h] BYREF
-  _DWORD v8[9]; // [esp+68h] [ebp-24h] BYREF
+  int     i;
+  char   *stage;
+  int     showtris;
+  unsigned int *trisStage;
+  float   trisGrey;
+  unsigned int  vertexArrays[9];
 
-  RB_SetIteratorFog();   /* takes NO arguments -- 0x00500810 */
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
-  if ( (glState_clientStateBits & 0x100) == 0 )
+  RB_SetIteratorFog();
+  GL_Cull( ((shader_t *)tess_shader)->cullType );
+  if ( ( glState_clientStateBits & 0x100 ) == 0 )
   {
-    glEnableClientState(0x8076u);
+    glEnableClientState( 0x8076u );
     glState_clientStateBits |= 0x100u;
   }
-  if ( (glState_clientStateBits & 0x200) != 0 )
+  if ( ( glState_clientStateBits & 0x200 ) != 0 )
   {
-    glDisableClientState(0x8075u);
+    glDisableClientState( 0x8075u );
     glState_clientStateBits &= ~0x200u;
   }
-  glColorPointer(4, 0x1401u, 24, (const GLvoid *)(tr_cachedStaticModelStorage + 8));
-  glVertexPointer(3, 0x1406u, 24, (const GLvoid *)(tr_cachedStaticModelStorage + 12));
-  v8[0] = tr_cachedStaticModelStorage;
+  glColorPointer( 4, 0x1401u, 24, (const GLvoid *)( tr_cachedStaticModelStorage + 8 ) );
+  glVertexPointer( 3, 0x1406u, 24, (const GLvoid *)( tr_cachedStaticModelStorage + 12 ) );
+  vertexArrays[0] = tr_cachedStaticModelStorage;
   for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v2 = *(char **)(tess_activeStages + 4 * i);
-    if ( *v2 >= 0 )
+    stage = *(char **)( tess_activeStages + 4 * i );
+    if ( !( *(unsigned int *)stage & 0x80 ) )
     {
-      GL_State(*((_DWORD *)v2 + 417));
-      RB_SetupMultitexture(v2, (int)v8, 24);
+      GL_State( *( (unsigned int *)stage + 417 ) );
+      RB_SetupMultitexture( (unsigned int *)stage, (GLvoid **)vertexArrays, 24 );
       if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+        qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
       }
       else
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+        glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
       }
     }
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  showtris = r_showtris->integer;
+  if ( showtris )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    GL_Cull(*(_DWORD *)(tr_showTrisShader + 168));
-    v4 = *(_DWORD **)(tr_showTrisShader + 340);
-    GL_State(v4[417]);
-    RB_SetupMultitexture(v4, (int)v8, 24);
-    if ( (glState_clientStateBits & 0x100) != 0 )
+    if ( ( showtris & 1 ) != 0 )
+      glDepthRange( 0.0, 0.10000000149011612 );   /* (double)0.1f, retail 0x00501D21 */
+    GL_Cull( ((shader_t *)tr_showTrisShader)->cullType );
+    trisStage = *(unsigned int **)( tr_showTrisShader + 340 );
+    GL_State( trisStage[417] );
+    RB_SetupMultitexture( trisStage, (GLvoid **)vertexArrays, 24 );
+    if ( ( glState_clientStateBits & 0x100 ) != 0 )
     {
-      glDisableClientState(0x8076u);
+      glDisableClientState( 0x8076u );
       glState_clientStateBits &= ~0x100u;
     }
-    if ( r_showtris->integer < 5 )
+    if ( r_showtris->integer >= 5 )
     {
-      v6 = tr_identityLight * 0.5;
-      qglColor3f(v6, tr_identityLight, tr_identityLight);
+      RB_SetSurfaceCountColor( tess_renderedIndexCount );
     }
     else
     {
-      RB_ChooseSurfaceCountColor(count, v);
-      glColor4ubv(v);
+      trisGrey = tr_identityLight * 0.5f;
+      qglColor3f( trisGrey, tr_identityLight, tr_identityLight );
     }
     if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+      qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
     }
     else
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+      glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
     }
-    glDepthRange(0.0, 1.0);
+    glDepthRange( 0.0, 1.0 );
   }
   if ( Stream )
-    fprintf(Stream, "%s", (int)"----------\n");
+    fprintf( Stream, "%s", (int)"----------\n" );
 }
 
-/* ---- RB_EndSurface_CachedStaticModelARB  0x00501E90 ----  VERIFIED */
+/* ---- RB_EndSurface_CachedStaticModelARB  0x00501E90 ----  VERIFIED
+ * ARB VBO variant of RB_EndSurface_CachedStaticModelGeneric. */
 void __cdecl RB_EndSurface_CachedStaticModelARB( void )
 {
-  int v1;
-  char *v2;
-  int integer;
-  _DWORD *v4;
-  float v6;
-  GLubyte v[4]; // [esp+6Ch] [ebp-28h] BYREF
-  _DWORD v8[9]; // [esp+70h] [ebp-24h] BYREF
+  int     i;
+  char   *stage;
+  int     showtris;
+  unsigned int *trisStage;
+  float   trisGrey;
+  unsigned int  vertexArrays[9];
 
-  RB_SetIteratorFog();   /* takes NO arguments -- 0x00500810 */
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
-  qglBindBufferARB(34962, tr_cachedStaticModelStorage);
-  if ( (glState_clientStateBits & 0x100) == 0 )
+  RB_SetIteratorFog();
+  GL_Cull( ((shader_t *)tess_shader)->cullType );
+  qglBindBufferARB( 34962, tr_cachedStaticModelStorage );
+  if ( ( glState_clientStateBits & 0x100 ) == 0 )
   {
-    glEnableClientState(0x8076u);
+    glEnableClientState( 0x8076u );
     glState_clientStateBits |= 0x100u;
   }
-  if ( (glState_clientStateBits & 0x200) != 0 )
+  if ( ( glState_clientStateBits & 0x200 ) != 0 )
   {
-    glDisableClientState(0x8075u);
+    glDisableClientState( 0x8075u );
     glState_clientStateBits &= ~0x200u;
   }
-  glColorPointer(4, 0x1401u, 24, (const GLvoid *)8);
-  glVertexPointer(3, 0x1406u, 24, (const GLvoid *)0xC);
-  v1 = 0;
-  for ( v8[0] = 0; v1 < tess_activeStageCount; ++v1 )
+  glColorPointer( 4, 0x1401u, 24, (const GLvoid *)8 );
+  glVertexPointer( 3, 0x1406u, 24, (const GLvoid *)0xC );
+  vertexArrays[0] = 0;
+  for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v2 = *(char **)(tess_activeStages + 4 * v1);
-    if ( *v2 >= 0 )
+    stage = *(char **)( tess_activeStages + 4 * i );
+    if ( !( *(unsigned int *)stage & 0x80 ) )
     {
-      GL_State(*((_DWORD *)v2 + 417));
-      RB_SetupMultitexture(v2, (int)v8, 24);
+      GL_State( *( (unsigned int *)stage + 417 ) );
+      RB_SetupMultitexture( (unsigned int *)stage, (GLvoid **)vertexArrays, 24 );
       if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+        qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
       }
       else
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+        glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
       }
     }
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  showtris = r_showtris->integer;
+  if ( showtris )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    GL_Cull(*(_DWORD *)(tr_showTrisShader + 168));
-    v4 = *(_DWORD **)(tr_showTrisShader + 340);
-    GL_State(v4[417]);
-    RB_SetupMultitexture(v4, (int)v8, 24);
-    if ( (glState_clientStateBits & 0x100) != 0 )
+    if ( ( showtris & 1 ) != 0 )
+      glDepthRange( 0.0, 0.10000000149011612 );   /* (double)0.1f, retail 0x00502002 */
+    GL_Cull( ((shader_t *)tr_showTrisShader)->cullType );
+    trisStage = *(unsigned int **)( tr_showTrisShader + 340 );
+    GL_State( trisStage[417] );
+    RB_SetupMultitexture( trisStage, (GLvoid **)vertexArrays, 24 );
+    if ( ( glState_clientStateBits & 0x100 ) != 0 )
     {
-      glDisableClientState(0x8076u);
+      glDisableClientState( 0x8076u );
       glState_clientStateBits &= ~0x100u;
     }
-    if ( r_showtris->integer < 5 )
+    if ( r_showtris->integer >= 5 )
     {
-      v6 = tr_identityLight * 0.5;
-      qglColor3f(v6, tr_identityLight, tr_identityLight);
+      RB_SetSurfaceCountColor( tess_renderedIndexCount );
     }
     else
     {
-      RB_ChooseSurfaceCountColor(count, v);
-      glColor4ubv(v);
+      trisGrey = tr_identityLight * 0.5f;
+      qglColor3f( trisGrey, tr_identityLight, tr_identityLight );
     }
     if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+      qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
     }
     else
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+      glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
     }
-    glDepthRange(0.0, 1.0);
+    glDepthRange( 0.0, 1.0 );
   }
-  qglBindBufferARB(34962, 0);
+  qglBindBufferARB( 34962, 0 );
   if ( Stream )
-    fprintf(Stream, "%s", (int)"----------\n");
+    fprintf( Stream, "%s", (int)"----------\n" );
 }
 
-/* ---- RB_EndSurface_CachedStaticModelATI  0x00502170 ----  VERIFIED */
+/* ---- RB_EndSurface_CachedStaticModelATI  0x00502170 ----  VERIFIED
+ * ATI array-object variant of RB_EndSurface_CachedStaticModelGeneric.  (Its
+ * r_showtris overlay omits the GL_Cull, the colour-array disable and the log
+ * line the other variants emit -- reproduced as shipped.) */
 void __cdecl RB_EndSurface_CachedStaticModelATI( void )
 {
-  int v0;
-  int v1;
-  int i;
-  char *v4;
-  int integer;
-  _DWORD *v6;
-  float v7;
-  GLubyte v[4]; // [esp+70h] [ebp-28h] BYREF
-  _DWORD v9[9]; // [esp+74h] [ebp-24h] BYREF
+  int     storage;
+  int     base;
+  int     i;
+  char   *stage;
+  int     showtris;
+  unsigned int *trisStage;
+  float   trisGrey;
+  unsigned int  vertexArrays[9];
 
-  v0 = tr_cachedStaticModelStorage;
-  v1 = tr_cachedStaticModelStorageOffset;
-  if ( (glState_clientStateBits & 0x100) == 0 )
+  storage = tr_cachedStaticModelStorage;
+  base    = tr_cachedStaticModelStorageOffset;
+  if ( ( glState_clientStateBits & 0x100 ) == 0 )
   {
-    glEnableClientState(0x8076u);
+    glEnableClientState( 0x8076u );
     glState_clientStateBits |= 0x100u;
   }
-  if ( (glState_clientStateBits & 0x200) != 0 )
+  if ( ( glState_clientStateBits & 0x200 ) != 0 )
   {
-    glDisableClientState(0x8075u);
+    glDisableClientState( 0x8075u );
     glState_clientStateBits &= ~0x200u;
   }
-  qglArrayObjectATI(32886, 4, 5121, 24, v0, v1 + 8);
-  qglArrayObjectATI(32884, 3, 5126, 24, v0, v1 + 12);
-  RB_SetIteratorFog();   /* takes NO arguments -- 0x00500810 */
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
-  v9[0] = v1;
+  qglArrayObjectATI( 32886, 4, 5121, 24, storage, base + 8 );
+  qglArrayObjectATI( 32884, 3, 5126, 24, storage, base + 12 );
+  RB_SetIteratorFog();
+  GL_Cull( ((shader_t *)tess_shader)->cullType );
+  vertexArrays[0] = base;
   for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v4 = *(char **)(tess_activeStages + 4 * i);
-    if ( *v4 >= 0 )
+    stage = *(char **)( tess_activeStages + 4 * i );
+    if ( !( *(unsigned int *)stage & 0x80 ) )
     {
-      GL_State(*((_DWORD *)v4 + 417));
-      RB_SetupMultitextureATI(v4, v0, (int)v9, 24);
+      GL_State( *( (unsigned int *)stage + 417 ) );
+      RB_SetupMultitextureATI( (unsigned int *)stage, storage, (int *)vertexArrays, 24 );
       if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+        qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
       }
       else
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+        glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
       }
     }
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  showtris = r_showtris->integer;
+  if ( showtris )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    v6 = *(_DWORD **)(tr_showTrisShader + 340);
-    GL_State(v6[417]);
-    RB_SetupMultitextureATI(v6, v0, (int)v9, 24);
-    if ( r_showtris->integer < 5 )
+    if ( ( showtris & 1 ) != 0 )
+      glDepthRange( 0.0, 0.10000000149011612 );   /* (double)0.1f, retail 0x005022EF */
+    trisStage = *(unsigned int **)( tr_showTrisShader + 340 );
+    GL_State( trisStage[417] );
+    RB_SetupMultitextureATI( trisStage, storage, (int *)vertexArrays, 24 );
+    if ( r_showtris->integer >= 5 )
     {
-      v7 = tr_identityLight * 0.5;
-      qglColor3f(v7, tr_identityLight, tr_identityLight);
+      RB_SetSurfaceCountColor( tess_renderedIndexCount );
     }
     else
     {
-      RB_ChooseSurfaceCountColor(count, v);
-      glColor4ubv(v);
+      trisGrey = tr_identityLight * 0.5f;
+      qglColor3f( trisGrey, tr_identityLight, tr_identityLight );
     }
     if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+      qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
     }
     else
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+      glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
     }
-    glDepthRange(0.0, 1.0);
+    glDepthRange( 0.0, 1.0 );
   }
 }
 
-/* ---- RB_EndSurface_CachedStaticModelNV  0x00502410 ----  VERIFIED */
+/* ---- RB_EndSurface_CachedStaticModelNV  0x00502410 ----  VERIFIED
+ * NV variant of RB_EndSurface_CachedStaticModelGeneric. */
 void __cdecl RB_EndSurface_CachedStaticModelNV( void )
 {
-  int i;
-  char *v2;
-  int integer;
-  _DWORD *v4;
-  float v6;
-  GLubyte v[4]; // [esp+64h] [ebp-28h] BYREF
-  _DWORD v8[9]; // [esp+68h] [ebp-24h] BYREF
+  int     i;
+  char   *stage;
+  int     showtris;
+  unsigned int *trisStage;
+  float   trisGrey;
+  unsigned int  vertexArrays[9];
 
-  RB_SetIteratorFog();   /* takes NO arguments -- 0x00500810 */
-  GL_Cull(*(_DWORD *)(tess_shader + 168));
-  if ( (glState_clientStateBits & 0x100) == 0 )
+  RB_SetIteratorFog();
+  GL_Cull( ((shader_t *)tess_shader)->cullType );
+  if ( ( glState_clientStateBits & 0x100 ) == 0 )
   {
-    glEnableClientState(0x8076u);
+    glEnableClientState( 0x8076u );
     glState_clientStateBits |= 0x100u;
   }
-  if ( (glState_clientStateBits & 0x200) != 0 )
+  if ( ( glState_clientStateBits & 0x200 ) != 0 )
   {
-    glDisableClientState(0x8075u);
+    glDisableClientState( 0x8075u );
     glState_clientStateBits &= ~0x200u;
   }
-  glColorPointer(4, 0x1401u, 24, (const GLvoid *)(tr_cachedStaticModelStorage + 8));
-  glVertexPointer(3, 0x1406u, 24, (const GLvoid *)(tr_cachedStaticModelStorage + 12));
-  v8[0] = tr_cachedStaticModelStorage;
+  glColorPointer( 4, 0x1401u, 24, (const GLvoid *)( tr_cachedStaticModelStorage + 8 ) );
+  glVertexPointer( 3, 0x1406u, 24, (const GLvoid *)( tr_cachedStaticModelStorage + 12 ) );
+  vertexArrays[0] = tr_cachedStaticModelStorage;
   for ( i = 0; i < tess_activeStageCount; ++i )
   {
-    v2 = *(char **)(tess_activeStages + 4 * i);
-    if ( *v2 >= 0 )
+    stage = *(char **)( tess_activeStages + 4 * i );
+    if ( !( *(unsigned int *)stage & 0x80 ) )
     {
-      GL_State(*((_DWORD *)v2 + 417));
-      RB_SetupMultitexture(v2, (int)v8, 24);
+      GL_State( *( (unsigned int *)stage + 417 ) );
+      RB_SetupMultitexture( (unsigned int *)stage, (GLvoid **)vertexArrays, 24 );
       if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+        qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
       }
       else
       {
-        backEnd_pc_drawnIndexCount += count;
+        backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
         ++backEnd_pc_drawCallCount;
-        glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+        glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
       }
     }
   }
-  integer = r_showtris->integer;
-  if ( integer )
+  showtris = r_showtris->integer;
+  if ( showtris )
   {
-    if ( (integer & 1) != 0 )
-      glDepthRange(0.0, 0.1000000014901161);
-    GL_Cull(*(_DWORD *)(tr_showTrisShader + 168));
-    v4 = *(_DWORD **)(tr_showTrisShader + 340);
-    GL_State(v4[417]);
-    RB_SetupMultitexture(v4, (int)v8, 24);
-    if ( (glState_clientStateBits & 0x100) != 0 )
+    if ( ( showtris & 1 ) != 0 )
+      glDepthRange( 0.0, 0.10000000149011612 );   /* (double)0.1f, retail 0x00502581 */
+    GL_Cull( ((shader_t *)tr_showTrisShader)->cullType );
+    trisStage = *(unsigned int **)( tr_showTrisShader + 340 );
+    GL_State( trisStage[417] );
+    RB_SetupMultitexture( trisStage, (GLvoid **)vertexArrays, 24 );
+    if ( ( glState_clientStateBits & 0x100 ) != 0 )
     {
-      glDisableClientState(0x8076u);
+      glDisableClientState( 0x8076u );
       glState_clientStateBits &= ~0x100u;
     }
-    if ( r_showtris->integer < 5 )
+    if ( r_showtris->integer >= 5 )
     {
-      v6 = tr_identityLight * 0.5;
-      qglColor3f(v6, tr_identityLight, tr_identityLight);
+      RB_SetSurfaceCountColor( tess_renderedIndexCount );
     }
     else
     {
-      RB_ChooseSurfaceCountColor(count, v);
-      glColor4ubv(v);
+      trisGrey = tr_identityLight * 0.5f;
+      qglColor3f( trisGrey, tr_identityLight, tr_identityLight );
     }
     if ( qglDrawRangeElementsEXT && tess_optimizedVertexEnd )
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      qglDrawRangeElementsEXT(4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, count, 5123, &tess_optimizedIndexes);
+      qglDrawRangeElementsEXT( 4, tess_optimizedFirstVertex, tess_optimizedVertexEnd, tess_renderedIndexCount, 5123, &tess_optimizedIndexes );
     }
     else
     {
-      backEnd_pc_drawnIndexCount += count;
+      backEnd_pc_drawnIndexCount += tess_renderedIndexCount;
       ++backEnd_pc_drawCallCount;
-      glDrawElements(4u, count, 0x1403u, &tess_optimizedIndexes);
+      glDrawElements( 4u, tess_renderedIndexCount, 0x1403u, &tess_optimizedIndexes );
     }
-    glDepthRange(0.0, 1.0);
+    glDepthRange( 0.0, 1.0 );
   }
   if ( Stream )
-    fprintf(Stream, "%s", (int)"----------\n");
+    fprintf( Stream, "%s", (int)"----------\n" );
 }
 
 /* ---- RB_EndSurface_Optimized  0x005026F0 ----  VERIFIED */
 void __cdecl RB_EndSurface_Optimized( void )
 {
-  switch ( *(int *)( tess_shader + 392 ) )
+  switch ( ((shader_t *)tess_shader)->optimizedBackend )
   {
-    case 0xC:  RB_EndSurface_CachedStaticModelGeneric(); break;
-    case 0xD:  RB_EndSurface_CachedStaticModelARB();     break;
-    case 0xE:  RB_EndSurface_CachedStaticModelATI();     break;
-    case 0xF:  RB_EndSurface_CachedStaticModelNV();      break;
     case 0x19: RB_EndSurface_OptimizedGeneric();         break;
     case 0x1A: RB_EndSurface_OptimizedARB();             break;
     case 0x1B: RB_EndSurface_OptimizedATI();             break;
     case 0x1C: RB_EndSurface_OptimizedNV();              break;
+    case 0xC:  RB_EndSurface_CachedStaticModelGeneric(); break;
+    case 0xD:  RB_EndSurface_CachedStaticModelARB();     break;
+    case 0xE:  RB_EndSurface_CachedStaticModelATI();     break;
+    case 0xF:  RB_EndSurface_CachedStaticModelNV();      break;
     default:   break;
   }
-  backEnd_pc_indexCount += count;
+  backEnd_pc_indexCount += tess_renderedIndexCount;
   backEnd_pc_vertexCount += tess_renderedVertexCount;
-  count         = 0;
+  tess_renderedIndexCount = 0;
   tess_renderedVertexCount = 0;
 }
-#if 0
-int __cdecl RB_EndSurface_Optimized(void *this)
-{
-  int result;
-
-  switch ( *(_DWORD *)(tess_shader + 392) )
-  {
-    case 0xC:
-      RB_EndSurface_CachedStaticModelGeneric(this);
-      break;
-    case 0xD:
-      RB_EndSurface_CachedStaticModelARB(this);
-      break;
-    case 0xE:
-      RB_EndSurface_CachedStaticModelATI();
-      break;
-    case 0xF:
-      RB_EndSurface_CachedStaticModelNV(this);
-      break;
-    case 0x19:
-      RB_EndSurface_OptimizedGeneric();
-      break;
-    case 0x1A:
-      RB_EndSurface_OptimizedARB();
-      break;
-    case 0x1B:
-      RB_EndSurface_OptimizedATI();
-      break;
-    case 0x1C:
-      RB_EndSurface_OptimizedNV();
-      break;
-    default:
-      break;
-  }
-  backEnd_pc_indexCount += count;
-  result = 0;
-  backEnd_pc_vertexCount += tess_renderedVertexCount;
-  count = 0;
-  tess_renderedVertexCount = 0;
-  return result;
-}
-#endif
 
 /* ---- RB_EndSurface  0x005027C0 ----  VERIFIED */
 void __cdecl RB_EndSurface( void )
 {
-  int   v1;
+  int   optimizedDrawn;
   char *string;
 
-  v1 = 0;
-  if ( count )
+  optimizedDrawn = 0;
+  if ( tess_renderedIndexCount )
   {
     RB_EndSurface_Optimized();
-    v1 = 1;
+    optimizedDrawn = 1;
   }
 
   if ( !tess_numIndexes )
     return;
 
-  if ( word_17BFF5E )
-    ri_Error( 1, "\x15" "RB_EndSurface() - SHADER_MAX_INDEXES hit" );
-  if ( *(float *)&tess_xyz[0x1FFF * tess_vertexComponentCount] != 0.0 )
-    ri_Error( 1, "\x15" "RB_EndSurface() - SHADER_MAX_VERTEXES hit" );
+  if ( tess_indexes_last )
+    ri.Error( 1, "\x15" "RB_EndSurface() - SHADER_MAX_INDEXES hit" );
+  if ( *(float *)&tess_xyz[0x1FFF * tess_vertexComponentCount] != 0.0f )
+    ri.Error( 1, "\x15" "RB_EndSurface() - SHADER_MAX_VERTEXES hit" );
 
   if ( tess_shader == tr_stencilShadowShader )
   {
@@ -3591,23 +2908,23 @@ void __cdecl RB_EndSurface( void )
   }
 
   if ( r_debugSort->integer
-    && (double)r_debugSort->integer < *(float *)(tess_shader + 88) )
+    && FCAST( r_debugSort->integer ) < ((shader_t *)tess_shader)->sort )
   {
     tess_numIndexes = 0;
     return;
   }
 
-  if ( dword_16DCA54 )
+  if ( rendererSkyboxPortal )
   {
-    if ( (backEnd_refdef_rdflags & 8) != 0 )
+    if ( !( backEnd_refdef_rdflags & 8 ) )
     {
-      if ( !dword_16DCA28 && (char *)tess_stageIterator != (char *)RB_StageIteratorSky )
+      if ( (char *)tess_stageIterator == (char *)RB_StageIteratorSky )
       {
         tess_numIndexes = 0;
         return;
       }
     }
-    else if ( (char *)tess_stageIterator == (char *)RB_StageIteratorSky )
+    else if ( !rendererSkyboxPortalActive && (char *)tess_stageIterator != (char *)RB_StageIteratorSky )
     {
       tess_numIndexes = 0;
       return;
@@ -3621,12 +2938,12 @@ void __cdecl RB_EndSurface( void )
     backEnd_pc_indexCount += tess_numIndexes;
   }
 
-  tess_stageIterator( v1 );
+  tess_stageIterator( optimizedDrawn );
 
   if ( r_showtris->integer )
   {
     if ( tess_numIndexes )
-      DrawTris( (int)tess_indexes );
+      DrawTris( &tess );
   }
 
   string = r_shownormals->string;
@@ -3634,15 +2951,15 @@ void __cdecl RB_EndSurface( void )
   {
     if ( !_stricmp( string, "white" ) )
     {
-      DrawNormals( tess_indexes );
+      DrawNormals( &tess );
     }
     else if ( !_stricmp( r_shownormals->string, "color" ) )
     {
-      DrawColoredNormals( (int)tess_indexes );
+      DrawColoredNormals( &tess );
     }
     else
     {
-      Cvar_Set2( "r_shownormals", &empty_string, qtrue );
+      Cvar_Set2( "r_shownormals", "", qtrue );
       Com_Printf( "Proper Usage: r_shownormals white | color\n" );
     }
   }

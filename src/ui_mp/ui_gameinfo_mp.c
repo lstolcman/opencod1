@@ -1,25 +1,6 @@
-/*
- * ui_gameinfo_mp.c -- arena (.arena) info loading.
- *
- * ui_mp_x86.dll (CoD 1.1, imagebase 0x40000000), unit
- * ui/ui_gameinfo.c: 0x40007170 .. 0x40007695, three functions.  RTCW's
- * ui/ui_gameinfo.c is the ancestor; CoD keeps only its arena half (the bot
- * loaders and lookups are gone) and changes three things:
- *
- *   - .arena files come from "mp/", not "scripts/", and the path is built with
- *     one sprintf( "%s/%s" ) (0x40007475) rather than strcpy/strcat.
- *   - The per-map type is the "gametype" key: a whitespace list of gametype
- *     script names parsed inside a Com_BeginParseSession and matched against
- *     uiInfo.gameTypes[] by name, each hit setting bit j of typeBits
- *     (0x400075C1 .. 0x4000763F).  No key at all gives typeBits -1, where
- *     RTCW defaulted to ffa.  RTCW's Timelimit/AxisRespawnTime/
- *     AlliedRespawnTime keys are gone.
- *   - UI_ParseInfos reads keys with Com_Parse and values with Com_ParseOnLine
- *     (CoD's names for COM_ParseExt( .., qtrue/qfalse )) and substitutes the
- *     literal "<NULL>" rather than strcpy'ing it over the token (0x40007216).
- *
- * @fidelity: likely
- */
+//
+// gameinfo.c
+//
 
 #include <string.h>
 #include <stdio.h>
@@ -31,12 +12,12 @@
 // arena and bot info
 //
 
-static int ui_numArenas;                    /* 0x40050D58 */
-static char     *ui_arenaInfos[MAX_ARENAS]; /* 0x40050C58 */
+static int ui_numArenas;
+static char     *ui_arenaInfos[MAX_ARENAS];
 
 /*
 ===============
-UI_ParseInfos  0x40007170
+UI_ParseInfos
 ===============
 */
 int UI_ParseInfos( char *buf, int max, char *infos[] ) {
@@ -92,7 +73,7 @@ int UI_ParseInfos( char *buf, int max, char *infos[] ) {
 
 /*
 ===============
-UI_LoadArenasFromFile  0x400072F0
+UI_LoadArenasFromFile
 ===============
 */
 static void UI_LoadArenasFromFile( char *filename ) {
@@ -112,7 +93,8 @@ static void UI_LoadArenasFromFile( char *filename ) {
 	}
 
 	trap_FS_Read( buf, len, f );
-	buf[len] = 0;
+	// keep: pointer store, not buf[len]
+	*( buf + len ) = 0;
 	trap_FS_FCloseFile( f );
 
 	ui_numArenas += UI_ParseInfos( buf, MAX_ARENAS - ui_numArenas, &ui_arenaInfos[ui_numArenas] );
@@ -120,10 +102,13 @@ static void UI_LoadArenasFromFile( char *filename ) {
 
 /*
 ===============
-UI_LoadArenas  0x40007400
+UI_LoadArenas
 ===============
 */
 void UI_LoadArenas( void ) {
+	// keep: declaration order matches original codegen
+	const char *directory = "mp";
+	const char *extension = ".arena";
 	int numdirs;
 	char filename[128];
 	char dirlist[1024];
@@ -136,11 +121,11 @@ void UI_LoadArenas( void ) {
 	uiInfo.mapCount = 0;
 
 	// get all arenas from .arena files
-	numdirs = trap_FS_GetFileList( "mp", ".arena", dirlist, 1024 );
+	numdirs = trap_FS_GetFileList( directory, extension, dirlist, 1024 );
 	dirptr  = dirlist;
 	for ( i = 0; i < numdirs; i++, dirptr += dirlen + 1 ) {
 		dirlen = strlen( dirptr );
-		sprintf( filename, "%s/%s", "mp", dirptr );
+		sprintf( filename, "%s/%s", directory, dirptr );
 		UI_LoadArenasFromFile( filename );
 	}
 	if ( UI_OutOfMemory() ) {
@@ -156,6 +141,7 @@ void UI_LoadArenas( void ) {
 		uiInfo.mapList[uiInfo.mapCount].levelShot = -1;
 		uiInfo.mapList[uiInfo.mapCount].imageName = String_Alloc( va( "levelshots/%s", uiInfo.mapList[uiInfo.mapCount].mapLoadName ) );
 
+		// gametype is a list of gametype names; no key means every gametype
 		type = Info_ValueForKey( ui_arenaInfos[n], "gametype" );
 		if ( type && *type ) {
 			uiInfo.mapList[uiInfo.mapCount].typeBits = 0;
@@ -168,7 +154,7 @@ void UI_LoadArenas( void ) {
 					break;
 				}
 				for ( j = 0; j < uiInfo.numGameTypes; j++ ) {
-					if ( !Q_stricmp( uiInfo.gameTypes[j].gameType, token ) ) {
+					if ( !Q_stricmp( token, uiInfo.gameTypes[j].gameType ) ) {
 						uiInfo.mapList[uiInfo.mapCount].typeBits |= ( 1 << j );
 					}
 				}

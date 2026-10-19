@@ -1,3 +1,8 @@
+/* Tree-only dedicated-build extension (no retail counterpart): the stdout TTY
+ * mirror / reader behind win_syscon.c's #ifdef DEDICATED hooks.  Compiled
+ * empty in the CodMP client, which has no such layer in retail. */
+#ifdef DEDICATED
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
@@ -10,7 +15,7 @@ static int      s_consoleActive;
 static char     s_inputLine[1024];
 static int      s_inputLen;
 
-static char     s_returnedLine[1024];
+static char     s_returnedLine[1024 + 1];	/* + the trailing '\n' */
 
 /* ---- Sys_TtyConsole_Init  no-address ---- */
 void Sys_TtyConsole_Init( void ) {
@@ -96,6 +101,9 @@ char *Sys_TtyConsole_Input( void ) {
 			fputs( "\n", stdout );
 			s_inputLine[s_inputLen] = 0;
 			strcpy( s_returnedLine, s_inputLine );
+			/* '\n'-terminated like the window console's consoleText:
+			 * Sys_GetEvent (0x004636A0) chops the last char. */
+			strcat( s_returnedLine, "\n" );
 			s_inputLen = 0;
 			s_inputLine[0] = 0;
 			return s_returnedLine;
@@ -117,3 +125,5 @@ char *Sys_TtyConsole_Input( void ) {
 		}
 	}
 }
+
+#endif /* DEDICATED */

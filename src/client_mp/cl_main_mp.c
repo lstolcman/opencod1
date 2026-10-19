@@ -3,25 +3,168 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
 #include "cl_records.h"
+#include "cl_local.h"
 #include "cl_vm.h"
+
+/* cl.timeoutcount, the first int of the clientActive_t block (0x01432960; storage in
+ * cl_refstorage.c, which sizes it as the whole block) */
+extern int cl_active;
+
+/* cls.autoupdateFilename (0x0155F260, char[64]; cls_autoupdateFilename below) */
+unsigned char cls_autoupdateFilenameStorage[64];   /* 0x0155F260 */
+unsigned char cls_autoupdateFilenameTerminator;   /* 0x0155F29F, its last byte; unreferenced */
+
+/* cvars (RTCW cl_main.c; registered in CL_Init) */
+cvar_t *cl_conXOffset;              /* 0x01432840 */
+cvar_t *cl_maxpackets;              /* 0x015F7064 */
+cvar_t *cl_motdString;              /* 0x015F7070 */
+cvar_t *cl_packetdup;               /* 0x015CE844 */
+cvar_t *cl_serverStatusResendTime;  /* 0x01617328 */
+cvar_t *cl_serverloadgametype;      /* 0x01617300 */
+cvar_t *cl_serverloadmap;           /* 0x01432948 */
+cvar_t *cl_serverloadwaiting;       /* 0x01617304 */
+cvar_t *cl_updateversion;           /* 0x01617330 */
+cvar_t *cl_waitForFire;             /* 0x015CE82C */
+cvar_t *m_pitch;                    /* 0x0155F248 */
+cvar_t *cl_language;                /* 0x0161734C */
+cvar_t *cl_languagetranslate;       /* 0x01432954 */
+cvar_t *cl_languagewarnings;        /* 0x01617350 */
+cvar_t *cl_languagewarningsaserrors; /* 0x01432844 */
+cvar_t *cl_shownet;                 /* 0x01407444 */
+cvar_t *fx_count;                   /* 0x015CE83C */
+cvar_t *fx_cull;                    /* 0x0161733C */
+cvar_t *fx_debug;                   /* 0x01617310 */
+cvar_t *fx_debugBolt;               /* 0x015CE824 */
+cvar_t *fx_draw;                    /* 0x0161730C */
+cvar_t *fx_enable;                  /* 0x01432854 */
+cvar_t *fx_freeze;                  /* 0x015CE820 */
+cvar_t *r_inGameVideo;              /* 0x01617318, the client's (the renderer registers its own) */
+cvar_t *rconPassword;               /* 0x01617358 */
+cvar_t *activeAction;
+cvar_t *cl_allowDownload;
+cvar_t *cl_avidemo;
+cvar_t *cl_forceavidemo;
+cvar_t *cl_freelook;
+cvar_t *cl_freezeDemo;
+cvar_t *cl_goStandJumpTime;
+cvar_t *cl_ingame;
+cvar_t *cl_motd;
+cvar_t *cl_mouseAccel;
+cvar_t *cl_noprint;
+cvar_t *cl_sensitivity;
+cvar_t *cl_showSend;
+cvar_t *cl_showServerCommands;
+cvar_t *cl_showTimeDelta;
+cvar_t *cl_showmouserate;
+cvar_t *cl_shownuments;
+cvar_t *cl_timeNudge;
+cvar_t *cl_timeout;
+cvar_t *cl_updateavailable;
+cvar_t *cl_updatefiles;
+cvar_t *cl_updateoldversion;
+cvar_t *cl_viewPitchCompensate;
+cvar_t *cl_viewYawCompensate;
+cvar_t *cl_visibleClients;
+cvar_t *m_filter;
+cvar_t *m_forward;
+cvar_t *m_side;
+cvar_t *m_yaw;
+cvar_t *rconAddress;
+cvar_t *timedemo;
+
+clientConnection_t clc;             /* 0x015CE860, cl_static.h */
+clientStatic_t cls;                 /* 0x0155F2C0, cl_static.h */
+
+/* the client's copy of the renderer exports, 0x01432860 (cl_refapi.h names its slots) */
+refexport_t re;
+
+/* the cubemapShot command's face-name suffixes (CL_CubeMapShot_f, cl_scrn_mp.c; registered in CL_Init) */
+const char *cl_cubemapFaceSuffixes[6] = { "_up", "_dn", "_lf", "_rt", "_ft", "_bk" };   /* 0x0057B4B4 */
+
+/* clientActive_t cl fields kept as standalone globals (the 0x01432960 block; tools/vc7
+ * exe_layout turns the ones in its client_active_fields table into typed views of `cl`) */
+char cl_snap_messageNum[4];
+float cgameClientLerpOrigin_x;
+float cgameClientLerpOrigin_y;
+float cgameClientLerpOrigin_z;
+float cgameSensitivity;
+float cl_viewanglesRoll;
+float cl_snap_ps_viewHeightCurrent;   /* 0x01432A50 */
+int cgameUserAim_x;
+int cgameUserAim_y;
+int cgameUserAim_z;
+int cl_cmdNumber;
+int cl_extrapolatedSnapshot;
+int cl_gameState_stringOffsets_CS_SYSTEMINFO_;
+int cl_newSnapshots;
+int cl_oldFrameServerTime;
+int cl_oldServerTime;
+int cl_parseClientsNum;
+int cl_parseEntitiesNum;
+int cl_snap_deltaNum;
+int cl_snap_ping;
+int cl_snap_ps_commandTime;
+int cl_snap_serverTime;
+int cl_snapshots[67584];
+int cl_viewanglesPitch;
+int cl_viewanglesYaw;
+int cl_snap_ps_pm_type;   /* 0x01432984 */
+int cl_snap_ps_pm_flags;   /* 0x0143298C */
+int cl_snap_ps_deltaPitch;   /* 0x014329C8 */
+int cl_snap_ps_eFlags;   /* 0x01432A00 */
+int cl_snap_ps_clientNum;   /* 0x01432A2C */
+int cl_snap_numClients;   /* 0x01434A54 */
+int cl_snap_parseClientsNum;   /* 0x01434A5C */
+int cl_mouseDx_1_;   /* 0x0143A94C */
+int cl_mouseDy_1_;   /* 0x0143A954 */
+int cl_joystickAxis_1_;   /* 0x0143A960 */
+int cl_joystickAxis_2_;   /* 0x0143A964 */
+int cgameMaxPitchSpeedStorage;   /* 0x0143A980 */
+int cgameMaxYawSpeedStorage;   /* 0x0143A984 */
+int cl_outPackets_p_cmdNumber[96];   /* 0x0143AFB4 */
+int cl_outPackets_p_serverTime[95];   /* 0x0143AFB8 */
+int cl_outPackets_p_realtime[94];   /* 0x0143AFBC */
+signed __int32 cgameUserCmdInShellshock;
+signed __int32 cgameUserCmdValue;
+signed __int32 cl_serverTime;
+signed __int32 cl_serverTimeDelta;
+unsigned char cl_entityBaselinesStorage[245760];   /* 0x0147D134 */
+unsigned char cl_parseEntitiesStorage[491520];   /* 0x014B9134 */
+unsigned char cl_parseClientsStorage[188676];   /* 0x01531134 */
+unsigned char cl_mapname[64];
+unsigned char cl_snap_snapFlags[4];
+unsigned char cl_cmdsStorage[1536];   /* 0x0143A9B0 */
+int cl_snap_valid[2112];             /* 0x01432964, cl.snap */
+int cl_gameState_stringOffsets[6049];   /* 0x5E84 bytes, 0x01434A7C */
+float yaw;          /* 0x01432A44 cl.snap.ps.viewangles[YAW]; unreferenced */
+float leanFrac;     /* 0x014329C0 cl.snap.ps.leanFraction; unreferenced */
+
+/* RTCW cl_main.c client state */
+char demoName[8260];
+int autoupdateChecked;
+int autoupdateStarted;
+int serverStatusCount;
+unsigned char cl_pinglistStorage[16832];   /* 0x015CA660, cl_pinglist[] */
+unsigned char cl_serverIPAddress[8388];   /* 0x0087A710 */
+unsigned char cl_serverStatusListStorage[131712];   /* 0x015F7080, cl_serverStatusList[] */
+char cl_cdkeychecksum[10] = "    ";
 
 extern void CL_ParseServerMessage( msg_t *msg );
 extern void MSS_StopSounds( int flags );        /* 0x0044FA40 */
+extern void MSS_FadeAllSounds( float target, int msec );   /* 0x0044E0F0 */
 
 extern int CIN_PlayCinematic();
 extern int CIN_StopCinematic();
 extern int CIN_UploadCinematic();
-extern int CL_CubeMapShot_f();
+void CL_CubeMapShot_f( void );
 void CL_InitCGame( void );          /* 0x004049C0 */
 extern int CL_InitInput();
 int CL_InitUI( void );              /* 0x00418F10, cl_ui_mp.c */
 extern int CL_Netchan_Decode();
 void CL_Netchan_SendOOBPacket( int length, const void *data, netadr_t to );
 extern int CL_PlayCinematic_f();
-extern int CL_RestoreCgameState();
+extern int CL_RestoreCgameState( void *buffer, int size );
 extern int CL_ShutdownInput();
 extern void CL_UpdateLevelHunkUsage( void );
 extern int CL_WritePacket();
@@ -35,6 +178,7 @@ qboolean Com_SaveCvarsToBuffer( const char **cvarNames, int cvarCount,
 extern int Com_WriteLocalizedSoundAliasFiles();
 extern int Con_Close();
 extern int Con_Init();
+extern int FastRound( float f );
 extern int FS_ComparePaks();
 extern int FS_FOpenFileRead_Internal();
 extern int FS_FileExists();
@@ -43,19 +187,16 @@ extern int FS_LoadedPakNames();
 extern int FS_ReferencedPakNames();
 extern int FS_ReferencedPakPureChecksums();
 extern int FS_ShiftStr();
-extern int GetRefAPI();
 extern void CL_InitRef( void );
 extern void CL_ShutdownRef( void );
 extern int Hunk_AllocInternal();
-extern int Hunk_Clear();
 extern int Hunk_FreeTempMemory();
 extern char *MSG_ReadBigString( msg_t *msg );
 extern int   MSG_ReadLong( msg_t *msg );
 extern char *MSG_ReadString( msg_t *msg );
 extern char *MSG_ReadStringLine( msg_t *msg );
-void MSG_WriteBigString( const char *s, msg_t *sb );
+void MSG_WriteBigString( msg_t *sb, const char *s );
 int  MSG_WriteBitsCompress( const byte *datasrc, int bytecount, byte *buffdest );
-extern int MSG_WriteDeltaStruct();
 void MSG_WriteByte( msg_t *msg, int c );
 void MSG_WriteShort( msg_t *msg, int c );
 void MSG_WriteLong( msg_t *msg, int c );
@@ -73,7 +214,7 @@ void MSG_WriteDeltaEntity( msg_t *msg, const byte *from, const byte *to, qboolea
 #define svc_EOF             8
 void MSG_WriteReliableCommandToBuffer( const char *pszCommand, int iBufferSize,
                                        char *pszBuffer );
-extern int MSS_Init();
+extern void MSS_Init();
 extern int MSS_Restore();
 extern int MSS_Save();
 extern int MSS_Shutdown();
@@ -88,7 +229,6 @@ extern void        NetProf_AddPacket( void *pStream, int iSize, int bFragment );
 extern void        NetProf_PrepProfiling( void *ppProfile );
 extern qboolean    Netchan_Process( netchan_t *chan, msg_t *msg );
 extern void        Netchan_Setup( netchan_t *chan, netsrc_t sock, netadr_t adr, int qport );
-extern netProfileInfo_t *pProf;     /* qcommon/net_chan_mp.c, 0x008D8B44-ish */
 /* Defined below at 0x00413430; called from CL_ConnectionlessPacket above it. */
 void __cdecl CL_ServerStatusResponse( netadr_t from, void *msg );
 /* Same shape: CL_DemoCompleted (0x0040E920) tail-jumps to CL_NextDemo (0x0040ED80), and CL_MapLoading (0x0040EE60) calls CL_CheckForResend (0x004103D0); retail places both callees after their callers. */
@@ -129,14 +269,12 @@ extern int putenv_m();
  * `static char demoName[MAX_QPATH]`.  It is a different object from clc.demoName
  * below; RTCW carries the same pair of names. */
 
-/* clc.demoName @ 0x015EEFC0, char[64]. `byte_15EEFFF` is base+0x3F, the terminator strncpy does not write, not a second object. */
-#define clc_demoName        clc_demoName
+/* clc.demoName @ 0x015EEFC0, char[64]. `clc_demoNameTerminator` is base+0x3F, the terminator strncpy does not write, not a second object. */
 
 /* cls.updateInfoString @ 0x015CA028, char[MAX_INFO_STRING]. The declaration is char[1044] because the 20-byte cls.authorizeServer (cls_authorizeServer) follows it inside the same gap. */
-#define cls_updateInfoString    cls_updateInfoString
 
-/* cls.autoupdateFilename @ 0x0155F260, char[64] -- the terminator at byte_155F29F is base+0x3F. TODO: cod1_globals.c gives it one byte. */
-#define cls_autoupdateFilename  ( (char *)&byte_155F260 )
+/* cls.autoupdateFilename @ 0x0155F260, char[64] -- the terminator at cls_autoupdateFilenameTerminator is base+0x3F. */
+#define cls_autoupdateFilename  ( (char *)&cls_autoupdateFilenameStorage )
 
 #define MAX_PINGREQUESTS    16
 
@@ -149,7 +287,7 @@ typedef struct ping_s
 } ping_t;
 COD1_ASSERT_SIZE( ping_t, 1052 );
 
-#define cl_pinglist     ( (ping_t *)unk_15CA660 )
+#define cl_pinglist     ( (ping_t *)cl_pinglistStorage )
 
 typedef struct serverInfo_s
 {
@@ -186,8 +324,7 @@ typedef struct serverAddress_s
 } serverAddress_t;
 COD1_ASSERT_SIZE( serverAddress_t, 6 );
 
-#define cls_globalServerAddresses       ( (serverAddress_t *)unk_15C100C )
-#define cls_numfavoriteservers          cls_numfavoriteservers           /* 0x015C400C */
+#define cls_globalServerAddresses       ( (serverAddress_t *)cls_globalServerAddressesStorage )
 
 #define NUM_SERVER_PORTS    4
 
@@ -208,19 +345,11 @@ typedef struct serverStatus_s
 } serverStatus_t;
 COD1_ASSERT_SIZE( serverStatus_t, 8232 );
 
-#define cl_serverStatusList     ( (serverStatus_t *)&unk_15F7080 )
+#define cl_serverStatusList     ( (serverStatus_t *)&cl_serverStatusListStorage )
 
-#define CL_SERVERSTATUS_BASE    ( (char *)&unk_15F7080 )
-#define unk_15F9080             ( *(unsigned char *)( CL_SERVERSTATUS_BASE + 0x2000 ) )
-#define unk_15F90A4             ( *(unsigned char *)( CL_SERVERSTATUS_BASE + 0x2024 ) )
-#define unk_15FB0C0             ( *(unsigned char *)( CL_SERVERSTATUS_BASE + 0x4040 ) )
-#define byte_1619300            ( (char *)( CL_SERVERSTATUS_BASE + 0x22280 ) )
-#define dword_1619324           ( (unsigned int *)( CL_SERVERSTATUS_BASE + 0x222A4 ) )
-
-#define cls_numlocalservers     cls_numlocalservers           /* 0x0155F400 */
-#define cls_localServers        ( (serverInfo_t *)unk_155F404 )
-#define cls_globalServers       ( (serverInfo_t *)&unk_1565008 )
-#define cls_favoriteServers     ( (serverInfo_t *)unk_15C4010 )
+#define cls_localServers        ( (serverInfo_t *)cls_localServersStorage )
+#define cls_globalServers       ( (serverInfo_t *)&cls_globalServersStorage )
+#define cls_favoriteServers     ( (serverInfo_t *)cls_favoriteServersStorage )
 
 /* ---- CL_CDDialog  0x0040E2E0 ----  [CONFIRMED] */
 void __cdecl CL_CDDialog()
@@ -252,37 +381,32 @@ void CL_ChangeReliableCommand( void ) {
 		l = MAX_STRING_CHARS - 2;
 	}
 	clc_reliableCommands[ MAX_STRING_CHARS * index + l ] = '\n';
-	clc_reliableCommands[ MAX_STRING_CHARS * index + l + 1 ] = '\0';
+	/* retail 0x0040E37E stores with no bound check; pointer store avoids the modern /GS range-check fast-fail */
+	*( clc_reliableCommands + MAX_STRING_CHARS * index + l + 1 ) = '\0';
 }
 
 /* ---- CL_MakeMonkeyDoLaundry  0x0040E390 ----  VERIFIED */
-void __cdecl CL_MakeMonkeyDoLaundry()
+void __cdecl CL_MakeMonkeyDoLaundry( void )
 {
-  int v0;
-
-  if ( dword_8E3C48 )
-  {
-    if ( !(_BYTE)cls_framecount )
-    {
-      v0 = rand();
-      if ( ((double)v0 * 0.000030517578 < 0.1) | __UNORDERED__((double)v0 * 0.000030517578, 0.1) )
-        CL_ChangeReliableCommand();
-    }
-  }
+	if ( sys_monkeySpank && ( cls_framecount & 0xFF ) == 0 ) {
+		if ( rand() * ( 1.0f / 32768.0f ) < 0.1 ) {
+			CL_ChangeReliableCommand();
+		}
+	}
 }
 
 /* ---- CL_WriteDemoMessage  0x0040E3D0 ----  VERIFIED */
 void CL_WriteDemoMessage( msg_t *msg, int headerBytes )
 {
-	int Buffer;
-	int len;
+	int len, swlen;
 
-	Buffer = clc_serverMessageSequence;
-	FS_Write( &Buffer, 4, clc_demofile );
+	len = clc_serverMessageSequence;
+	swlen = len;
+	FS_Write( &swlen, 4, clc_demofile );
 
-	Buffer = msg->cursize - headerBytes;
-	len = Buffer;
-	FS_Write( &Buffer, 4, clc_demofile );
+	len = msg->cursize - headerBytes;
+	swlen = len;
+	FS_Write( &swlen, 4, clc_demofile );
 
 	FS_Write( msg->data + headerBytes, len, clc_demofile );
 }
@@ -290,51 +414,51 @@ void CL_WriteDemoMessage( msg_t *msg, int headerBytes )
 /* ---- CL_StopRecord_f  0x0040E430 ----  VERIFIED */
 void CL_StopRecord_f( void )
 {
-  int Buffer;
+  int len;
 
-  if ( clc_demorecording )
-  {
-    Buffer = -1;
-    FS_Write(&Buffer, 4, clc_demofile);
-    FS_Write(&Buffer, 4, clc_demofile);
-    FS_FCloseFile(clc_demofile);
-    clc_demofile = 0;
-    clc_demorecording = 0;
-    Com_Printf("Stopped demo.\n");
-  }
-  else
+  if ( !clc_demorecording )
   {
     Com_Printf("Not recording a demo.\n");
+    return;
   }
+  len = -1;
+  FS_Write(&len, 4, clc_demofile);
+  FS_Write(&len, 4, clc_demofile);
+  FS_FCloseFile(clc_demofile);
+  clc_demofile = 0;
+  clc_demorecording = 0;
+  Com_Printf("Stopped demo.\n");
 }
 
 /* ---- CL_DemoFilename  0x0040E4B0 ----  VERIFIED */
-void CL_DemoFilename( char *fileName, int number )
+void CL_DemoFilename( int number, char *fileName )
 {
+	int a, b, c, d;
 	if ( number < 0 || number > 9999 ) {
 		Com_sprintf( fileName, 256, "demo9999.tga" );
 		return;
 	}
 
-	Com_sprintf( fileName, 256, "demo%i%i%i%i",
-				 number / 1000,
-				 number % 1000 / 100,
-				 number % 100 / 10,
-				 number % 10 );
+	a = number / 1000;
+	number -= a * 1000;
+	b = number / 100;
+	number -= b * 100;
+	c = number / 10;
+	d = number - c * 10;
+	Com_sprintf( fileName, 256, "demo%i%i%i%i", a, b, c, d );
 }
 
 /* ---- CL_Record_f  0x0040E540 ----  VERIFIED */
 void CL_Record_f( void ) {
 	char name[MAX_OSPATH];
 	byte bufData[MAX_MSGLEN];
-	byte packet[4 + MAX_MSGLEN];
+	byte packet[MAX_MSGLEN];
 	msg_t buf;
 	int i;
 	int len;
 	byte *ent;
 	byte nullstate[ES_SIZE];
 	char *s;
-	int Buffer;
 
 	if ( Cmd_Argc() > 2 ) {
 		Com_Printf( "record <demoname>\n" );
@@ -352,15 +476,14 @@ void CL_Record_f( void ) {
 	}
 
 	if ( Cmd_Argc() == 2 ) {
-		s = Cmd_Argv( 1 );
-		Q_strncpyz( demoName, s, 64 );
+		Q_strncpyz( demoName, Cmd_Argv( 1 ), 64 );
 		Com_sprintf( name, sizeof( name ), "demos/%s.dm_%d", demoName,
 					 PROTOCOL_VERSION );
 	} else {
 		int number;
 
 		for ( number = 0; number <= 9999; number++ ) {
-			CL_DemoFilename( demoName, number );
+			CL_DemoFilename( number, demoName );
 			Com_sprintf( name, sizeof( name ), "demos/%s.dm_%d", demoName,
 						 PROTOCOL_VERSION );
 
@@ -396,12 +519,12 @@ void CL_Record_f( void ) {
 		s = cl_gameState_stringData + cl_gameState_stringOffsets[i];
 		MSG_WriteByte( &buf, svc_configstring );
 		MSG_WriteShort( &buf, i );
-		MSG_WriteBigString( s, &buf );
+		MSG_WriteBigString( &buf, s );
 	}
 
-	Com_Memset( nullstate, 0, sizeof( nullstate ) );
+	memset( nullstate, 0, sizeof( nullstate ) );
 	for ( i = 0; i < MAX_GENTITIES; i++ ) {
-		ent = &byte_147D134[ES_SIZE * i];
+		ent = &cl_entityBaselinesStorage[ES_SIZE * i];
 		if ( !*(int *)( ent + ES_NUMBER ) ) {
 			continue;
 		}
@@ -417,15 +540,15 @@ void CL_Record_f( void ) {
 	MSG_WriteByte( &buf, svc_EOF );
 
 	*(int *)packet = *(int *)buf.data;
-	len = MSG_WriteBitsCompress( buf.data + 4, buf.cursize - 4, packet + 4 ) + 4;
+	i = MSG_WriteBitsCompress( buf.data + 4, buf.cursize - 4, packet + 4 ) + 4;
 
-	Buffer = clc_serverMessageSequence;
-	FS_Write( &Buffer, 4, clc_demofile );
+	len = clc_serverMessageSequence;
+	FS_Write( &len, 4, clc_demofile );
 
-	Buffer = len;
-	FS_Write( &Buffer, 4, clc_demofile );
+	len = i;
+	FS_Write( &len, 4, clc_demofile );
 
-	FS_Write( packet, len, clc_demofile );
+	FS_Write( packet, i, clc_demofile );
 
 }
 
@@ -437,9 +560,9 @@ void CL_DemoCompleted( void ) {
 		time = Sys_Milliseconds() - clc_timeDemoStart;
 		if ( time > 0 ) {
 			Com_Printf( "%i frames, %3.1f seconds: %3.1f fps\n",
-						*(int *)clc_timeDemoFrames,
-						time / 1000.0,
-						*(int *)clc_timeDemoFrames * 1000.0 / time );
+						clc_timeDemoFrames,
+						time * 0.001,   /* 0x0040E98B fmul dbl_568EA8 (0.001), not a divide */
+						clc_timeDemoFrames * 1000.0 / time );
 		}
 	}
 
@@ -448,45 +571,53 @@ void CL_DemoCompleted( void ) {
 }
 
 /* ---- CL_ReadDemoMessage  0x0040E9C0 ----  [CONFIRMED] */
-void __cdecl CL_ReadDemoMessage()
+void __cdecl CL_ReadDemoMessage( void )
 {
-  int v0;
-  msg_t msg;
-  int Buffer;
-  char v3[0x4000];
-  unsigned int v4;
-  unsigned int retaddr;
+	msg_t msg;
+	byte  msgData[MAX_MSGLEN];
+	int   sequence;
 
-  v4 = retaddr ^ _security_cookie;
-  if ( !clc_demofile )
-    goto LABEL_11;
-  if ( FS_Read(&Buffer, 4, clc_demofile) != 4 )
-    goto LABEL_11;
-  clc_serverMessageSequence = Buffer;
-  if ( msgInit == qfalse )
-    MSG_initHuffman();
-  memset(&msg, 0, sizeof(msg));
-  msg.data = (unsigned __int8 *)&v3;
-  msg.maxsize = 0x4000;
-  if ( FS_Read(&msg.cursize, 4, clc_demofile) != 4 || msg.cursize == -1 )
-    goto LABEL_11;
-  if ( msg.cursize > msg.maxsize )
-    Com_Error(ERR_DROP, &byte_5676E8);
-  v0 = FS_Read(msg.data, msg.cursize, clc_demofile);
-  if ( v0 != msg.cursize )
-  {
-    Com_Printf("Demo file was truncated.\n");
-LABEL_11:
-    CL_DemoCompleted();
-    return;
-  }
-  clc_lastPacketTime = cls_realtime;
-  msg.readcount = 0;
-  clc_reliableAcknowledge = MSG_ReadLong(&msg);
-  if ( clc_reliableAcknowledge >= clc_reliableSequence - 64 )
-    CL_ParseServerMessage((int)&msg);
-  else
-    clc_reliableAcknowledge = clc_reliableSequence;
+	if ( !clc_demofile ) {
+		CL_DemoCompleted();
+		return;
+	}
+
+	if ( FS_Read( &sequence, 4, clc_demofile ) != 4 ) {
+		CL_DemoCompleted();
+		return;
+	}
+	clc_serverMessageSequence = sequence;
+
+	if ( msgInit == qfalse ) {
+		MSG_initHuffman();
+	}
+
+	memset( &msg, 0, sizeof( msg ) );
+	msg.data = msgData;
+	msg.maxsize = sizeof( msgData );
+
+	if ( FS_Read( &msg.cursize, 4, clc_demofile ) != 4 || msg.cursize == -1 ) {
+		CL_DemoCompleted();
+		return;
+	}
+	if ( msg.cursize > msg.maxsize ) {
+		Com_Error( ERR_DROP, "\x15" "CL_ReadDemoMessage: demoMsglen > MAX_MSGLEN" );   /* 0x005676E8 */
+	}
+
+	if ( FS_Read( msg.data, msg.cursize, clc_demofile ) != msg.cursize ) {
+		Com_Printf( "Demo file was truncated.\n" );
+		CL_DemoCompleted();
+		return;
+	}
+
+	clc_lastPacketTime = cls_realtime;
+	msg.readcount = 0;
+	clc_reliableAcknowledge = MSG_ReadLong( &msg );
+	if ( clc_reliableAcknowledge < clc_reliableSequence - 64 ) {
+		clc_reliableAcknowledge = clc_reliableSequence;
+	} else {
+		CL_ParseServerMessage( &msg );
+	}
 }
 
 /* ---- CL_PlayDemo_f  0x0040EB40 ----  VERIFIED */
@@ -518,7 +649,6 @@ void CL_PlayDemo_f( void ) {
 	FS_FOpenFileRead_Internal( name, &clc_demofile, qtrue, 0 );
 	if ( !clc_demofile ) {
 		Com_Error( ERR_DROP, va( "EXE_ERR_CANT_WRITE" "\x15" "%s", name ) );
-		return;
 	}
 	Q_strncpyz( clc_demoName, Cmd_Argv( 1 ), sizeof( clc_demoName ) );
 
@@ -562,8 +692,8 @@ void __cdecl CL_ShutdownAll()
 {
   CL_ShutdownCGame();
   CL_ShutdownUI();
-  if ( com_serverEndpoint )
-    com_serverEndpoint(0);
+  if ( re_ShutdownPtr )
+    re_ShutdownPtr(0);
   cls_loadingPlaque = 0;
   cls_rendererStarted = 0;
 }
@@ -579,9 +709,9 @@ void CL_MapLoading( void ) {
 
 	if ( cls_state >= CA_CONNECTED && !Q_stricmp( cls_servername, "localhost" ) ) {
 		cls_state = CA_CONNECTED;
-		Com_Memset( cls_updateInfoString, 0, MAX_INFO_STRING );
-		Com_Memset( clc_serverMessage, 0, 256 );
-		Com_Memset( cl_gameState_stringOffsets, 0, GS_SIZE );  /* 0x01434A7C */
+		memset( cls_updateInfoString, 0, MAX_INFO_STRING );
+		memset( clc_serverMessage, 0, 256 );
+		memset( cl_gameState_stringOffsets, 0, GS_SIZE );  /* 0x01434A7C */
 		clc_lastPacketSentTime = -9999;
 		SCR_UpdateScreen();
 	} else {
@@ -597,37 +727,35 @@ void CL_MapLoading( void ) {
 		CL_CheckForResend();
 	}
 
-	mss_globalFadeTarget = 0;
-	mss_globalFadeRate = -mss_globalFadeCur;
-	MSS_StopSounds( 0 );
+	MSS_FadeAllSounds( 0.0f, 0 );
 }
 
 /* ---- CL_ClearState  0x0040EF70 ---- */
 void CL_ClearState( void )
 {
 	Com_Memset( &cl_active, 0, 1231064 );                     /* 0x01432960 <- real extent, cl_refstorage.c */
-	Com_Memset( &cl_snap_valid, 0, 8448 );                    /* 0x01432964 <- real extent, cl_refstorage.c */
+	Com_Memset( &cl_snap_valid, 0, 8448 );                    /* 0x01432964 <- real extent, defined above */
 	Com_Memset( cl_snap_snapFlags, 0, 4 );                    /* 0x01432968 */
 	Com_Memset( &cl_snap_serverTime, 0, 4 );                  /* 0x0143296C */
 	Com_Memset( cl_snap_messageNum, 0, 4 );                   /* 0x01432970 */
 	Com_Memset( &cl_snap_deltaNum, 0, 4 );                    /* 0x01432974 */
 	Com_Memset( &cl_snap_ping, 0, 4 );                        /* 0x01432978 */
 	Com_Memset( &cl_snap_ps_commandTime, 0, 4 );              /* 0x01432980 */
-	Com_Memset( &dword_1432984, 0, 4 );                       /* 0x01432984 */
-	Com_Memset( &dword_143298C, 0, 4 );                       /* 0x0143298C */
-	Com_Memset( &dword_14329C8, 0, 4 );                       /* 0x014329C8 */
-	Com_Memset( &dword_1432A00, 0, 4 );                       /* 0x01432A00 */
-	Com_Memset( &dword_1432A2C, 0, 4 );                       /* 0x01432A2C */
-	Com_Memset( &flt_1432A50, 0, 4 );                         /* 0x01432A50 */
-	Com_Memset( &dword_1434A54, 0, 4 );                       /* 0x01434A54 */
-	Com_Memset( &dword_1434A5C, 0, 4 );                       /* 0x01434A5C */
+	Com_Memset( &cl_snap_ps_pm_type, 0, 4 );                       /* 0x01432984 */
+	Com_Memset( &cl_snap_ps_pm_flags, 0, 4 );                       /* 0x0143298C */
+	Com_Memset( &cl_snap_ps_deltaPitch, 0, 4 );                       /* 0x014329C8 */
+	Com_Memset( &cl_snap_ps_eFlags, 0, 4 );                       /* 0x01432A00 */
+	Com_Memset( &cl_snap_ps_clientNum, 0, 4 );                       /* 0x01432A2C */
+	Com_Memset( &cl_snap_ps_viewHeightCurrent, 0, 4 );                         /* 0x01432A50 */
+	Com_Memset( &cl_snap_numClients, 0, 4 );                       /* 0x01434A54 */
+	Com_Memset( &cl_snap_parseClientsNum, 0, 4 );                       /* 0x01434A5C */
 	Com_Memset( &cl_serverTime, 0, 4 );                       /* 0x01434A64 */
 	Com_Memset( &cl_oldServerTime, 0, 4 );                    /* 0x01434A68 */
 	Com_Memset( &cl_oldFrameServerTime, 0, 4 );                       /* 0x01434A6C */
 	Com_Memset( &cl_serverTimeDelta, 0, 4 );                  /* 0x01434A70 */
 	Com_Memset( &cl_extrapolatedSnapshot, 0, 4 );             /* 0x01434A74 */
 	Com_Memset( &cl_newSnapshots, 0, 4 );                     /* 0x01434A78 */
-	Com_Memset( cl_gameState_stringOffsets, 0, 24196 );       /* 0x01434A7C <- real extent, cl_refstorage.c */
+	Com_Memset( cl_gameState_stringOffsets, 0, 24196 );       /* 0x01434A7C <- real extent, defined above */
 	Com_Memset( &cl_gameState_stringOffsets_CS_SYSTEMINFO_, 0, 4 ); /* 0x01434A80 */
 	Com_Memset( cl_gameState_stringData, 0, 16000 );          /* 0x01436A7C */
 	Com_Memset( &cl_gameState_dataCount, 0, 4 );              /* 0x0143A8FC */
@@ -635,18 +763,18 @@ void CL_ClearState( void )
 	Com_Memset( &cl_parseEntitiesNum, 0, 4 );                 /* 0x0143A940 */
 	Com_Memset( &cl_parseClientsNum, 0, 4 );                  /* 0x0143A944 */
 	Com_Memset( cl_mouseDx, 0, 44 );                       /* 0x0143A948 */
-	Com_Memset( &dword_143A94C, 0, 4 );                       /* 0x0143A94C */
+	Com_Memset( &cl_mouseDx_1_, 0, 4 );                       /* 0x0143A94C */
 	Com_Memset( cl_mouseDy, 0, 36 );                       /* 0x0143A950 */
-	Com_Memset( &dword_143A954, 0, 4 );                       /* 0x0143A954 */
+	Com_Memset( &cl_mouseDy_1_, 0, 4 );                       /* 0x0143A954 */
 	Com_Memset( &cl_mouseIndex, 0, 4 );                       /* 0x0143A958 */
 	Com_Memset( cl_joystickAxis, 0, 24 );                       /* 0x0143A95C */
-	Com_Memset( &dword_143A960, 0, 4 );                       /* 0x0143A960 */
-	Com_Memset( &dword_143A964, 0, 4 );                       /* 0x0143A964 */
+	Com_Memset( &cl_joystickAxis_1_, 0, 4 );                       /* 0x0143A960 */
+	Com_Memset( &cl_joystickAxis_2_, 0, 4 );                       /* 0x0143A964 */
 	Com_Memset( &cgameUserCmdValue, 0, 4 );                   /* 0x0143A974 */
 	Com_Memset( &cgameUserCmdInShellshock, 0, 4 );            /* 0x0143A978 */
 	Com_Memset( &cgameSensitivity, 0, 4 );                    /* 0x0143A97C */
-	Com_Memset( &dword_143A980, 0, 4 );                       /* 0x0143A980 */
-	Com_Memset( &dword_143A984, 0, 4 );                       /* 0x0143A984 */
+	Com_Memset( &cgameMaxPitchSpeedStorage, 0, 4 );                       /* 0x0143A980 */
+	Com_Memset( &cgameMaxYawSpeedStorage, 0, 4 );                       /* 0x0143A984 */
 	Com_Memset( &cgameClientLerpOrigin_x, 0, 4 );             /* 0x0143A988 */
 	Com_Memset( &cgameClientLerpOrigin_y, 0, 4 );             /* 0x0143A98C */
 	Com_Memset( &cgameClientLerpOrigin_z, 0, 4 );             /* 0x0143A990 */
@@ -657,22 +785,20 @@ void CL_ClearState( void )
 	Com_Memset( &cl_viewanglesYaw, 0, 4 );                       /* 0x0143A9A4 */
 	Com_Memset( &cl_viewanglesRoll, 0, 4 );                         /* 0x0143A9A8 */
 	Com_Memset( &cl_serverId, 0, 4 );                       /* 0x0143A9AC */
-	Com_Memset( stru_143A9B0, 0, 1536 );                      /* 0x0143A9B0 */
+	Com_Memset( cl_cmdsStorage, 0, 1536 );                      /* 0x0143A9B0 */
 	Com_Memset( &cl_cmdNumber, 0, 4 );                        /* 0x0143AFB0 */
-	Com_Memset( dword_143AFB4, 0, 384 );                      /* 0x0143AFB4 */
-	Com_Memset( dword_143AFB8, 0, 380 );                      /* 0x0143AFB8 */
-	Com_Memset( dword_143AFBC, 0, 376 );                      /* 0x0143AFBC */
+	Com_Memset( cl_outPackets_p_cmdNumber, 0, 384 );                      /* 0x0143AFB4 */
+	Com_Memset( cl_outPackets_p_serverTime, 0, 380 );                      /* 0x0143AFB8 */
+	Com_Memset( cl_outPackets_p_realtime, 0, 376 );                      /* 0x0143AFBC */
 	Com_Memset( cl_snapshots, 0, 270336 );                    /* 0x0143B134 */
-	Com_Memset( byte_147D134, 0, 245760 );                    /* 0x0147D134 */
-	Com_Memset( byte_14B9134, 0, 491520 );                    /* 0x014B9134 */
-	Com_Memset( byte_1531134, 0, 188676 );                    /* 0x01531134 */
+	Com_Memset( cl_entityBaselinesStorage, 0, 245760 );                    /* 0x0147D134 */
+	Com_Memset( cl_parseEntitiesStorage, 0, 491520 );                    /* 0x014B9134 */
+	Com_Memset( cl_parseClientsStorage, 0, 188676 );                    /* 0x01531134 */
 }
 
 /* ---- CL_Disconnect  0x0040EF90 ----  [HIGH] */
-void __cdecl CL_Disconnect(qboolean showMainMenu)
+void __cdecl CL_Disconnect( qboolean showMainMenu )
 {
-  int v1;
-
   if ( com_cl_running )
   {
     if ( com_cl_running->integer )
@@ -687,9 +813,9 @@ void __cdecl CL_Disconnect(qboolean showMainMenu)
       }
       cls_downloadName[0] = 0;
       cls_downloadTempName[0] = 0;
-      Cvar_Set2("cl_downloadName", &empty_string, qtrue);
+      Cvar_Set2("cl_downloadName", "", qtrue);
       autoupdateStarted = 0;
-      byte_155F260 = 0;
+      cls_autoupdateFilename[0] = 0;
       if ( clc_demofile )
       {
         FS_FCloseFile(clc_demofile);
@@ -700,7 +826,7 @@ void __cdecl CL_Disconnect(qboolean showMainMenu)
         if ( showMainMenu )
           VM_Call(uivm, UI_SET_ACTIVE_MENU, UIMENU_NONE);
       }
-      if ( (unsigned int)CL_handle < MAX_VIDEO_HANDLES )
+      if ( CL_handle >= 0 && CL_handle < MAX_VIDEO_HANDLES )
       {
         CIN_StopCinematic(CL_handle);
         MSS_StopSounds(0);
@@ -715,47 +841,8 @@ void __cdecl CL_Disconnect(qboolean showMainMenu)
       }
       CL_ClearState();
 
-      Com_Memset( &clc_clientNum, 0, 4 );                         /* 0x015CE860 */
-      Com_Memset( &clc_lastPacketSentTime, 0, 4 );                /* 0x015CE864 */
-      Com_Memset( &clc_lastPacketTime, 0, 4 );                         /* 0x015CE868 clc.lastPacketTime */
-      Com_Memset( clc_serverAddress, 0, 20 );                     /* 0x015CE86C */
-      Com_Memset( &clc_connectTime, 0, 4 );                       /* 0x015CE880 */
-      Com_Memset( &clc_connectPacketCount, 0, 4 );                /* 0x015CE884 */
-      Com_Memset( clc_serverMessage, 0, 260 );                    /* 0x015CE888 */
-      Com_Memset( byte_15CE987, 0, 5 );                           /* 0x015CE987 */
-      Com_Memset( clc_challenge, 0, 4 );                          /* 0x015CE988 */
-      Com_Memset( &clc_checksumFeed, 0, 4 );                      /* 0x015CE98C */
-      Com_Memset( &dword_15CE990, 0, 4 );                         /* 0x015CE990 */
-      Com_Memset( &clc_reliableSequence, 0, 4 );                  /* 0x015CE994 */
-      Com_Memset( &clc_reliableAcknowledge, 0, 4 );               /* 0x015CE998 */
-      Com_Memset( clc_reliableCommands, 0, 65536 );               /* 0x015CE99C <- real extent, cl_refstorage.c */
-      Com_Memset( byte_15CE99D, 0, 65535 );                       /* 0x015CE99D */
-      Com_Memset( word_15CEC4E, 0, 64846 );                       /* 0x015CEC4E */
-      Com_Memset( &clc_serverMessageSequence, 0, 4 );             /* 0x015DE99C */
-      Com_Memset( &clc_serverCommandSequence, 0, 4 );             /* 0x015DE9A0 */
-      Com_Memset( &clc_lastExecutedServerCommand, 0, 4 );         /* 0x015DE9A4 */
-      Com_Memset( clc_serverCommands, 0, 65536 );                 /* 0x015DE9A8 */
-      Com_Memset( &clc_download, 0, 4 );                          /* 0x015EE9A8 */
-      Com_Memset( &cls_downloadTempName, 0, 256 );                /* 0x015EE9AC <- real extent, cl_refstorage.c */
-      Com_Memset( &cls_downloadName, 0, 260 );                    /* 0x015EEAAC <- real extent, cl_refstorage.c */
-      Com_Memset( &byte_15EEBAB, 0, 1 );                          /* 0x015EEBAB */
-      Com_Memset( cls_downloadBlock, 0, 4 );                      /* 0x015EEBB0 */
-      Com_Memset( &cls_downloadCount, 0, 4 );                     /* 0x015EEBB4 */
-      Com_Memset( &clc_downloadSize, 0, 4 );                      /* 0x015EEBB8 */
-      Com_Memset( clc_downloadList, 0, 1024 );                    /* 0x015EEBBC */
-      Com_Memset( &byte_15EEFBB, 0, 1 );                          /* 0x015EEFBB */
-      Com_Memset( &cls_downloadRestart, 0, 4 );                   /* 0x015EEFBC clc.downloadRestart */
-      Com_Memset( clc_demoName, 0, 64 );                          /* 0x015EEFC0 */
-      Com_Memset( &byte_15EEFFF, 0, 1 );                          /* 0x015EEFFF */
-      Com_Memset( &clc_demorecording, 0, 4 );                     /* 0x015EF000 */
-      Com_Memset( &clc_demoplaying, 0, 4 );                       /* 0x015EF004 */
-      Com_Memset( &clc_demowaiting, 0, 4 );                       /* 0x015EF008 */
-      Com_Memset( &clc_firstDemoFrameSkipped, 0, 4 );             /* 0x015EF00C */
-      Com_Memset( &clc_demofile, 0, 4 );                          /* 0x015EF010 */
-      Com_Memset( clc_timeDemoFrames, 0, 12 );                    /* 0x015EF014 */
-      Com_Memset( &clc_timeDemoStart, 0, 4 );                     /* 0x015EF018 */
-      Com_Memset( &clc_timeDemoBaseTime, 0, 4 );                  /* 0x015EF01C */
-      Com_Memset( chan, 0, 32832 );                               /* 0x015EF020 clc.netchan */
+      /* 0x0040F0A2: one rep stosd over all of clientConnection_t */
+      memset( &clc, 0, sizeof( clc ) );
 
       cls_state = CA_DISCONNECTED;
       cl_connectedToPureServer = 0;
@@ -764,36 +851,7 @@ void __cdecl CL_Disconnect(qboolean showMainMenu)
 }
 
 /* CL_ForwardCommandToServer (0x0040F0C0) is defined further down this unit. */
-#if 0
-void __cdecl CL_ForwardCommandToServer(const char *string)
-{
-  char *v1;
 
-  if ( cmd_argc )
-  {
-    v1 = cmd_argv[0];
-    if ( *cmd_argv[0] == 45 )
-      return;
-  }
-  else
-  {
-    v1 = &empty_string;
-  }
-  if ( clc_demoplaying || *(int *)cls_state < 3 || *v1 == 43 )
-  {
-    Com_Printf("Unknown command \"%s\"\n", v1);
-  }
-  else
-  {
-    if ( cmd_argc <= 1 )
-      string = v1;
-    CL_AddReliableCommand(string);
-  }
-}
-#endif
-
-static netadr_t cls_updateServer;                       /* 0x015C9C14 */
-static char cls_updateChallenge[MAX_TOKEN_CHARS];       /* 0x015C9C28 */
 
 #define UPDATE_SERVER_NAME  "codmotd.activision.com"
 #define PORT_UPDATE         20520
@@ -823,7 +881,7 @@ void CL_RequestMotd( void ) {
 	Com_sprintf( cls_updateChallenge, sizeof( cls_updateChallenge ), "%i", rand() );
 
 	Info_SetValueForKey( info, "challenge", cls_updateChallenge );
-	Info_SetValueForKey( info, "renderer", cls_glconfig );
+	Info_SetValueForKey( info, "renderer", cls_glconfig.renderer_string );
 	Info_SetValueForKey( info, "version", ( (cvar_t *)com_shortversion )->string );
 
 	NET_OutOfBandPrint( NS_CLIENT, cls_updateServer, "getmotd \"%s\"\n", info );
@@ -875,7 +933,8 @@ void CL_RequestAuthorization( void ) {
 				j++;
 			}
 		}
-		nums[j] = 0;
+		/* retail 0x0040F3E8 terminates with no bound check; pointer store avoids the modern /GS range-check fast-fail */
+		*( nums + j ) = 0;
 	}
 
 	fs = Cvar_Get( "cl_anonymous", "0", CVAR_INIT | CVAR_SYSTEMINFO );
@@ -884,101 +943,44 @@ void CL_RequestAuthorization( void ) {
 }
 
 /* ---- CL_ForwardToServer_f  0x0040F450 ----  [CONFIRMED] */
-void __cdecl CL_ForwardToServer_f()
+void __cdecl CL_ForwardToServer_f( void )
 {
-  char *v0;
-
-  if ( cls_state != CA_ACTIVE || clc_demoplaying )
-  {
-    Com_Printf("Not connected to a server.\n");
-  }
-  else if ( cmd_argc > 1 )
-  {
-    v0 = Cmd_Args();
-    CL_AddReliableCommand(v0);
-  }
+	if ( cls_state != CA_ACTIVE || clc_demoplaying ) {
+		Com_Printf( "Not connected to a server.\n" );
+	} else if ( cmd_argc > 1 ) {
+		CL_AddReliableCommand( Cmd_Args() );
+	}
 }
 
 /* ---- CL_Setenv_f  0x0040F490 ----  [CONFIRMED] */
-void __cdecl CL_Setenv_f()
+void __cdecl CL_Setenv_f( void )
 {
-  signed __int32 v0;
-  char *v1;
-  char *v2;
-  int v4;
-  bool v5;
-  char *v6;
-  char *v7;
-  unsigned int v8;
-  _BYTE *v9;
-  char *v11;
-  char *v13;
-  char *v14;
-  char *v15;
-  _BYTE v16[15];
-  char v17;
-  CHAR MultiByteStr[1024];
-  unsigned int v19;
-  unsigned int retaddr;
+	int argc = Cmd_Argc();
 
-  v0 = cmd_argc;
-  v19 = retaddr ^ _security_cookie;
-  if ( cmd_argc <= 2 )
-  {
-    if ( cmd_argc == 2 )
-    {
-      v13 = getenv(cmd_argv[1]);
-      if ( v13 )
-      {
-        v14 = &empty_string;
-        if ( (unsigned int)cmd_argc > 1 )
-          v14 = cmd_argv[1];
-        Com_Printf("%s=%s\n", v14, v13);
-      }
-      else
-      {
-        v15 = &empty_string;
-        if ( (unsigned int)cmd_argc > 1 )
-          v15 = cmd_argv[1];
-        Com_Printf("%s undefined\n", v15);
-      }
-    }
-  }
-  else
-  {
-    v1 = &empty_string;
-    if ( (unsigned int)cmd_argc > 1 )
-      v1 = cmd_argv[1];
-    strcpy(MultiByteStr, v1);
-    v2 = &v17;
-    while ( *++v2 )
-      ;
-    v4 = 2;
-    *(_WORD *)v2 = 61;
-    if ( v0 > 2 )
-    {
-      v5 = (unsigned int)v0 > 2;
-      do
-      {
-        v6 = &empty_string;
-        if ( v5 )
-          v6 = cmd_argv[v4];
-        v7 = v6;
-        v8 = strlen(v6) + 1;
-        v9 = &v16[15];
-        while ( *++v9 )
-          ;
-        qmemcpy(v9, v7, v8);
-        v11 = &v16[15];
-        while ( *++v11 )
-          ;
-        v5 = ++v4 < (unsigned int)v0;
-        strcpy(v11, " ");
-      }
-      while ( v4 < v0 );
-    }
-    putenv_m(MultiByteStr);
-  }
+	if ( argc > 2 ) {
+		char buffer[1024];
+		int i;
+
+		/* build "NAME=value1 value2 ..." and hand it to putenv */
+		strcpy( buffer, Cmd_Argv( 1 ) );
+		strcat( buffer, "=" );
+
+		for ( i = 2; i < argc; i++ ) {
+			strcat( buffer, Cmd_Argv( i ) );
+			strcat( buffer, " " );
+		}
+
+		putenv_m( buffer );
+	} else if ( Cmd_Argc() == 2 ) {
+		char *env = getenv( Cmd_Argv( 1 ) );
+
+		if ( env ) {
+			Com_Printf( "%s=%s\n", Cmd_Argv( 1 ), env );
+		} else {
+			/* retail (like Q3) passes the NULL env as an unused extra argument */
+			Com_Printf( "%s undefined\n", Cmd_Argv( 1 ), env );
+		}
+	}
 }
 
 /* ---- CL_Disconnect_f  0x0040F5F0 ----  VERIFIED */
@@ -1006,11 +1008,12 @@ void CL_Reconnect_f( void )
 	Cbuf_AddText( va( "connect %s\n", cls_servername ) );
 }
 
+qboolean NET_IsLocalAddress( netadr_t adr );
+
 /* ---- CL_Connect_f  0x0040F6A0 ----  [HIGH] */
 void __cdecl CL_Connect_f( void )
 {
 	const char	*server;
-	netadr_t	*adr = (netadr_t *) clc_serverAddress;
 
 	if ( cmd_argc != 2 ) {
 		Com_Printf( "usage: connect [server]\n" );
@@ -1022,9 +1025,9 @@ void __cdecl CL_Connect_f( void )
 	CL_RequestMotd();
 	clc_serverMessage[0] = 0;
 
-	server = ( cmd_argc > 1 ) ? cmd_argv[1] : (char *) empty_string;
+	server = Cmd_Argv( 1 );
 
-	if ( com_sv_running->integer && !memcmp( server, "localhost", 10 ) ) {
+	if ( com_sv_running->integer && !strcmp( server, "localhost" ) ) {
 		Com_Shutdown( "EXE_SERVERQUIT" );
 	}
 
@@ -1035,27 +1038,30 @@ void __cdecl CL_Connect_f( void )
 	Con_Close();
 
 	strncpy( cls_servername, server, 0xFF );
-	byte_155F3CB = 0;
+	cls_servernameTerminator = 0;
 
-	if ( !NET_StringToAdr( cls_servername, adr ) ) {
+	if ( !NET_StringToAdr( cls_servername, (netadr_t *) clc_serverAddress ) ) {
 		Com_Printf( "Bad server address\n" );
 		cls_state = CA_DISCONNECTED;
 		return;
 	}
-	if ( !adr->port ) {
-		adr->port = BigShort( 28960 );
+	if ( !( (netadr_t *) clc_serverAddress )->port ) {
+		( (netadr_t *) clc_serverAddress )->port = BigShort( 28960 );
 	}
 	Com_Printf( "%s resolved to %i.%i.%i.%i:%i\n", cls_servername,
-	            adr->ip[0], adr->ip[1], adr->ip[2], adr->ip[3],
-	            BigShort( adr->port ) );
+	            ( (netadr_t *) clc_serverAddress )->ip[0],
+	            ( (netadr_t *) clc_serverAddress )->ip[1],
+	            ( (netadr_t *) clc_serverAddress )->ip[2],
+	            ( (netadr_t *) clc_serverAddress )->ip[3],
+	            BigShort( ( (netadr_t *) clc_serverAddress )->port ) );
 
-	if ( adr->type != NA_LOOPBACK && adr->type != NA_BOT ) {
+	if ( !NET_IsLocalAddress( *(netadr_t *) clc_serverAddress ) ) {
 		if ( CL_CDKeyValidate( cl_cdkey, cl_cdkeychecksum ) == qfalse ) {
 			Com_Error( ERR_DROP, "EXE_ERR_INVALID_CD_KEY" );
 			return;
 		}
 	}
-	if ( adr->type == NA_LOOPBACK || adr->type == NA_BOT ) {
+	if ( NET_IsLocalAddress( *(netadr_t *) clc_serverAddress ) ) {
 		cls_state = CA_CHALLENGING;
 	} else {
 		cls_state = CA_CONNECTING;
@@ -1090,9 +1096,10 @@ void CL_Rcon_f( void ) {
 	len = 4;
 
 	src = "rcon ";
-	while ( len < MAX_STRING_CHARS && *src ) {
+	do {
+		if ( !*src ) break;
 		message[len++] = *src++;
-	}
+	} while ( len < MAX_STRING_CHARS );
 
 	src = rconPassword->string;
 	while ( len < MAX_STRING_CHARS && *src ) {
@@ -1100,9 +1107,12 @@ void CL_Rcon_f( void ) {
 	}
 
 	for ( i = 1; i < cmd_argc; i++ ) {
-		src = " ";
-		while ( len < MAX_STRING_CHARS && *src ) {
-			message[len++] = *src++;
+		if ( len < MAX_STRING_CHARS ) {
+			src = " ";
+			do {
+				if ( !*src ) break;
+				message[len++] = *src++;
+			} while ( len < MAX_STRING_CHARS );
 		}
 
 		arg = Cmd_Argv( i );
@@ -1130,9 +1140,12 @@ void CL_Rcon_f( void ) {
 			message[len++] = '"';
 		}
 
-		src = arg;
-		while ( len < MAX_STRING_CHARS && *src ) {
-			message[len++] = *src++;
+		if ( len < MAX_STRING_CHARS ) {
+			src = arg;
+			do {
+				if ( !*src ) break;
+				message[len++] = *src++;
+			} while ( len < MAX_STRING_CHARS );
 		}
 
 		if ( quote && len < MAX_STRING_CHARS ) {
@@ -1144,10 +1157,11 @@ void CL_Rcon_f( void ) {
 		Com_Printf( "rcon command too long\n" );
 		return;
 	}
-	message[len] = 0;
+	/* retail 0x0040F9EC terminates with no bound check; pointer store avoids the modern /GS range-check fast-fail */
+	*( message + len ) = 0;
 
 	if ( cls_state >= CA_CONNECTED ) {
-		to = ( (netchan_t *)chan )->remoteAddress;
+		to = clc.netchan.remoteAddress;
 	} else {
 		if ( !strlen( rconAddress->string ) ) {
 			Com_Printf( "You must either be connected,\n"
@@ -1183,18 +1197,20 @@ void CL_SendPureChecksums( void ) {
 /* ---- CL_ResetPureClientAtServer  0x0040FBC0 ----  [CONFIRMED] */
 void __cdecl CL_ResetPureClientAtServer()
 {
-	CL_AddReliableCommand( "vdr" );
+	/* retail routes the literal through va() (0x0040FBC0), advancing va's ring buffer */
+	CL_AddReliableCommand( va( "vdr" ) );
 }
 
 /* ---- CL_Vid_Restart_f  0x0040FBE0 ---- */
+extern int s_hunkTotal, s_hunkHighTemp, hunk_low_temp;
+extern int Hunk_MemoryRemaining(void);
 void __cdecl CL_Vid_Restart_f( void )
 {
 	extern cvar_t *fs_gamedirvar;
-	extern int CL_SaveCgameState( int size, void *buffer );   /* 0x00404F80 */
+	extern int CL_SaveCgameState( void *buffer, int size );   /* 0x00404F80 */
 
 	void *hunkBuf;
-	int   maxSize;
-	int   savedSize  = 0;
+	int   savedSize = 0;
 	void *savedState = NULL;
 
 	if ( com_sv_running->integer ) {
@@ -1204,11 +1220,7 @@ void __cdecl CL_Vid_Restart_f( void )
 
 	if ( cgvm ) {
 		hunkBuf = Hunk_AllocateTempMemoryInternal( 0 );
-		maxSize = *(int *)hunk_totalSize
-		        - *(int *)hunk_highTemp
-		        - *(int *)hunk_temp_temp;
-
-		savedSize  = CL_SaveCgameState( maxSize, hunkBuf );
+		savedSize  = CL_SaveCgameState( hunkBuf, Hunk_MemoryRemaining() );
 		savedState = Z_MallocInternal( savedSize );
 		memcpy( savedState, hunkBuf, savedSize );
 		Hunk_FreeTempMemory( hunkBuf );
@@ -1222,7 +1234,7 @@ void __cdecl CL_Vid_Restart_f( void )
 	CL_ShutdownRef();
 
 	CL_ResetPureClientAtServer();
-	FS_ClearPakReferences( 0 );
+	FS_ClearPakReferences( 1 );   /* 0x0040FCE0 mov esi,1: keeps the +0x310/+0x313 reference bytes */
 
 	CL_ShutdownCGame();
 	CL_ShutdownUI();
@@ -1255,140 +1267,54 @@ void __cdecl CL_Vid_Restart_f( void )
 
 	if ( savedState ) {
 		if ( cgvm ) {
-			CL_RestoreCgameState( savedSize, savedState );
+			CL_RestoreCgameState( savedState, savedSize );
 		}
 		free( savedState );
 	}
 }
-#if 0
-void __cdecl CL_Vid_Restart_f()
-{
-  const char *v0;
-  size_t v1;
-  char *v2;
-  char *v3;
-  int v4;
-  int v5;
-  int *v6;
-  int *v7;
-  unsigned int v8;
-  char *v9;
-  int v10;
-  int *Block;
-
-  v1 = 0;
-  Block = 0;
-  if ( com_sv_running->integer )
-  {
-    Com_Printf("Listen server cannot video restart.\n");
-  }
-  else
-  {
-    if ( cgvm )
-    {
-      Hunk_AllocateTempMemoryInternal(0);
-      v3 = v2;
-      v4 = *(_DWORD *)hunk_totalSize - *(_DWORD *)hunk_highTemp - *(_DWORD *)hunk_temp_temp;
-      v5 = cgame_SaveExportTable(v2, v4);
-      v1 = v5 + VM_Call(cgvm, 17, &v3[v5], v4 - v5);
-      v6 = Z_MallocInternal(v1);
-      qmemcpy(v6, v3, 4 * (v1 >> 2));
-      v7 = &v6[v1 >> 2];
-      v8 = v1 & 3;
-      Block = v6;
-      qmemcpy(v7, &v3[4 * (v1 >> 2)], v8);
-      v0 = (char *)v7 + v8;
-      Hunk_FreeTempMemory(v3);
-    }
-    Cvar_Set2("com_expectedhunkusage", "-1", qtrue);
-    MSS_StopSounds(1);
-    CL_ShutdownCGame();
-    CL_ShutdownUI();
-    /* Retail inlines CL_ShutdownRef here (0x0040FC90): endpoint(1), clear all
-     * 57 slots, StatMon_Reset.  /vid_restart is the one path that reaches this. */
-    CL_ShutdownRef();
-    v9 = va(off_55EAE4);
-    CL_AddReliableCommand(v9);
-    FS_ClearPakReferences(v10);
-    CL_ShutdownCGame();
-    CL_ShutdownUI();
-    SV_ShutdownGameProgs();
-    CIN_CloseAllVideos();
-    Hunk_ClearToStart();
-    VM_Clear();
-    Cvar_Get("cl_language", "0", 33);
-    Cvar_Get("cl_languagetranslate", "1", 32);
-    Cvar_Get("fs_ignoreLozalized", "0", 544);
-    if ( !com_sv_running->integer && (*(_DWORD *)(fs_gamedirvar + 20) || clc_checksumFeed != fs_checksumFeed) )
-      FS_Restart(clc_checksumFeed);
-    SEH_UpdateLanguageInfo();
-    cls_rendererStarted = 0;
-    cls_loadingPlaque = 0;
-    Cvar_Set2("cl_paused", "0", qtrue);
-    CL_InitRef();
-    CL_StartHunkUsers();
-    if ( *(int *)cls_state > 3 && *(_DWORD *)cls_state != 7 && *(_DWORD *)cls_state != 8 )
-    {
-      CL_InitCGame((const char *)v1, v0);
-      CL_SendPureChecksums();
-    }
-    if ( Block )
-    {
-      if ( cgvm )
-        CL_RestoreCgameState(v1, Block);
-      free(Block);
-    }
-  }
-}
-#endif
-
 /* ---- CL_Snd_Restart_f  0x0040FDF0 ----  [CONFIRMED] */
-void __cdecl CL_Snd_Restart_f()
+void __cdecl CL_Snd_Restart_f( void )
 {
-  void *hunkBuf;
-  int   savedSize;
-  int  *Block;
+	void *hunkBuf;
+	int   savedSize;
+	int available;
+	void *savedState;
 
-  if ( com_sv_running->integer )
-  {
-    Com_Printf("Listen server cannot sound restart.\n");
-  }
-  else
-  {
-    hunkBuf = Hunk_AllocateTempMemoryInternal(0);
+	if ( com_sv_running->integer ) {
+		Com_Printf( "Listen server cannot sound restart.\n" );
+		return;
+	}
 
-    savedSize = MSS_Save(*(_DWORD *)hunk_totalSize
-                       - *(_DWORD *)hunk_highTemp
-                       - *(_DWORD *)hunk_temp_temp, (int)hunkBuf);
+	hunkBuf = Hunk_AllocateTempMemoryInternal( 0 );
 
-    Block = Z_MallocInternal(savedSize);
-    memcpy(Block, hunkBuf, savedSize);
-    Hunk_FreeTempMemory(hunkBuf);
+	available = s_hunkTotal;
+	available -= hunk_low_temp;
+	available -= s_hunkHighTemp;
+	savedSize = MSS_Save( available, hunkBuf );
 
-    MSS_Shutdown();
-    MSS_Init();
-    CL_Vid_Restart_f();
-    MSS_Restore((int)Block, savedSize);
-    free(Block);
-  }
+	savedState = Z_MallocInternal( savedSize );
+	memcpy( savedState, hunkBuf, savedSize );
+	Hunk_FreeTempMemory( hunkBuf );
+
+	MSS_Shutdown();
+	MSS_Init();
+	CL_Vid_Restart_f();
+	MSS_Restore( savedState, savedSize );
+	free( savedState );
 }
 
 /* ---- CL_OpenedPK3List_f  0x0040FEC0 ----  [CONFIRMED] */
-void __cdecl CL_OpenedPK3List_f()
+void __cdecl CL_OpenedPK3List_f( void )
 {
-  const char *v0;
-
-  v0 = FS_LoadedPakNames();
-  Com_Printf("Opened PK3 Names: %s\n", v0);
+	const char *names = FS_LoadedPakNames();
+	Com_Printf( "Opened PK3 Names: %s\n", names );
 }
 
 /* ---- CL_ReferencedPK3List_f  0x0040FEE0 ----  [CONFIRMED] */
-void __cdecl CL_ReferencedPK3List_f()
+void __cdecl CL_ReferencedPK3List_f( void )
 {
-  const char *v0;
-
-  v0 = FS_ReferencedPakNames();
-  Com_Printf("Referenced PK3 Names: %s\n", v0);
+	const char *names = FS_ReferencedPakNames();
+	Com_Printf( "Referenced PK3 Names: %s\n", names );
 }
 
 /* ---- CL_Configstrings_f  0x0040FF00 ----  VERIFIED */
@@ -1411,73 +1337,58 @@ void CL_Configstrings_f( void ) {
 }
 
 /* ---- CL_Clientinfo_f  0x0040FF50 ----  [CONFIRMED] */
-void __cdecl CL_Clientinfo_f()
+void __cdecl CL_Clientinfo_f( void )
 {
-  char *v0;
-
-  Com_Printf("--------- Client Information ---------\n");
-  Com_Printf("state: %i\n", cls_state);
-  Com_Printf("Server: %s\n", cls_servername);
-  Com_Printf("User info settings:\n");
-  v0 = Cvar_InfoString(CVAR_USERINFO);
-  Info_Print(v0);
-  Com_Printf("--------------------------------------\n");
+	Com_Printf( "--------- Client Information ---------\n" );
+	Com_Printf( "state: %i\n", cls_state );
+	Com_Printf( "Server: %s\n", cls_servername );
+	Com_Printf( "User info settings:\n" );
+	Info_Print( Cvar_InfoString( CVAR_USERINFO ) );
+	Com_Printf( "--------------------------------------\n" );
 }
 
 /* ---- CL_DownloadsComplete  0x0040FFB0 ----  [HIGH] */
-void __cdecl CL_DownloadsComplete()
+void __cdecl CL_DownloadsComplete( void )
 {
-  const char *v0;
-  const char *v1;
-  int v2;
-  char *v3;
-  char *v4;
+	if ( autoupdateStarted ) {
+		if ( strlen( cls_autoupdateFilename ) > 4 ) {
+			char *fn = va( "%s/%s", FS_ShiftStr( "ni]Zm^l", 7 ), cls_autoupdateFilename );
+			/* retail pushes only the literal 1 */
+			Sys_StartProcess( fn, 1 );
+		}
+		autoupdateStarted = 0;
+		CL_Disconnect( qtrue );
+		return;
+	}
 
-  if ( autoupdateStarted )
-  {
-    if ( strlen(&byte_155F260) > 4 )
-    {
-      v3 = FS_ShiftStr("ni]Zm^l", 7);
-      v4 = va("%s/%s", v3, &byte_155F260);
-      /* retail pushes only the literal 1 */
-      Sys_StartProcess(v4, 1);
-    }
-    autoupdateStarted = 0;
-    CL_Disconnect(qtrue);
-  }
-  else
-  {
-    if ( cls_downloadRestart )
-    {
-      cls_downloadRestart = 0;
-      FS_Restart(clc_checksumFeed);
-      CL_AddReliableCommand("donedl");
-      return;
-    }
-    cls_state = CA_LOADING;
-    Com_EventLoop();
-    if ( cls_state == CA_LOADING )
-    {
-      Cvar_Set2("r_uiFullScreen", "0", qtrue);
-      if ( com_sv_running->integer )
-      {
-        if ( cgvm )
-          return;
-      }
-      else
-      {
-        CL_ShutdownAll();
-        Hunk_Clear();
-      }
-      CL_StartHunkUsers();
-      Cvar_Set2("cl_paused", "1", qtrue);
-      CL_InitCGame();
-      CL_SendPureChecksums();
-      CL_WritePacket();
-      CL_WritePacket();
-      CL_WritePacket();
-    }
-  }
+	if ( cls_downloadRestart ) {
+		cls_downloadRestart = 0;
+		FS_Restart( clc_checksumFeed );
+		CL_AddReliableCommand( "donedl" );
+		return;
+	}
+
+	cls_state = CA_LOADING;
+	Com_EventLoop();
+	if ( cls_state != CA_LOADING ) {
+		return;
+	}
+
+	Cvar_Set2( "r_uiFullScreen", "0", qtrue );
+	if ( !com_sv_running->integer ) {
+		CL_ShutdownAll();
+		Hunk_Clear();
+	} else if ( cgvm ) {
+		return;
+	}
+
+	CL_StartHunkUsers();
+	Cvar_Set2( "cl_paused", "1", qtrue );
+	CL_InitCGame();
+	CL_SendPureChecksums();
+	CL_WritePacket();
+	CL_WritePacket();
+	CL_WritePacket();
 }
 
 /* ---- CL_BeginDownload  0x004100D0 ----  VERIFIED */
@@ -1489,7 +1400,7 @@ void CL_BeginDownload( const char *localName, const char *remoteName )
 		remoteName );
 
 	strncpy( (char *)&cls_downloadName, localName, 0xFFu );
-	byte_15EEBAB = 0;
+	cls_downloadNameTerminator = 0;
 	Com_sprintf( (char *)&cls_downloadTempName, 256, "%s.tmp", localName );
 
 	Cvar_Set2( "cl_downloadName", remoteName, qtrue );
@@ -1497,7 +1408,7 @@ void CL_BeginDownload( const char *localName, const char *remoteName )
 	Cvar_Set2( "cl_downloadCount", "0", qtrue );
 	Cvar_SetValue( "cl_downloadTime", (float)cls_realtime );
 
-	*(_DWORD *)cls_downloadBlock = 0;
+	*(int *)cls_downloadBlock = 0;
 	cls_downloadCount = 0;
 
 	CL_AddReliableCommand( va( "download %s", remoteName ) );
@@ -1506,46 +1417,39 @@ void CL_BeginDownload( const char *localName, const char *remoteName )
 /* ---- CL_NextDownload  0x00410190 ----  VERIFIED */
 void CL_NextDownload( void )
 {
-  char *remoteName;
-  char *localName;
-  char *rest;
-  char *at;
+  char *s;
+  char *remoteName, *localName;
 
-  if ( !clc_downloadList[0] ) {
-    CL_DownloadsComplete();
+  if ( *clc_downloadList ) {
+    s = (char *)clc_downloadList;
+
+    if ( *s == '@' ) {
+      s++;
+    }
+    remoteName = s;
+
+    if ( ( s = strchr( s, '@' ) ) == NULL ) {
+      CL_DownloadsComplete();
+      return;
+    }
+
+    *s++ = 0;
+    localName = s;
+    if ( ( s = strchr( s, '@' ) ) != NULL ) {
+      *s++ = 0;
+    } else {
+      s = localName + strlen( localName );
+    }
+    CL_BeginDownload( localName, remoteName );
+
+    cls_downloadRestart = 1;
+
+    memmove( (char *)clc_downloadList, s, strlen( s ) + 1 );
+
     return;
   }
 
-  remoteName = (char *)&clc_downloadList[0];
-  if ( clc_downloadList[0] == '@' ) {
-    remoteName = (char *)&unk_15EEBBD[0];
-  }
-
-  at = strchr( remoteName, '@' );
-  if ( at )
-  {
-    *at = 0;
-    localName = at + 1;
-
-    at = strchr( localName, '@' );
-    if ( at )
-    {
-      *at = 0;
-      rest = at + 1;
-    }
-    else
-    {
-      rest = &localName[strlen( localName )];
-    }
-
-    CL_BeginDownload( localName, remoteName );
-    cls_downloadRestart = 1;
-    strcpy( (char *)&clc_downloadList[0], rest );
-  }
-  else
-  {
-    CL_DownloadsComplete();
-  }
+  CL_DownloadsComplete();
 }
 
 /* ---- CL_InitDownloads  0x00410240 ----  VERIFIED */
@@ -1590,12 +1494,17 @@ void CL_InitDownloads( void ) {
 /* ---- CL_CheckForResend  0x004103D0 ----  [HIGH] */
 void __cdecl CL_CheckForResend( void )
 {
-	cvar_t	*var;
-	int		qport;
-	char	*info;
-	int		len, i;
-	char	Destination[1024];
-	char	format[1024 + 16];
+	float		qport;
+	char	*userinfo;
+	int		i;
+	/* Retail's info and data are adjacent 1024-byte frame arrays in
+	 * that order (esp+0Ch/40Ch, then the /GS cookie).  One buffer in the same
+	 * order lets a 1014+ char userinfo run data's copy and closing '"'/NUL
+	 * into the cookie, so the process dies at the cookie check after the
+	 * packet is sent, as in retail (0x0041061A). */
+	char	connectBuf[2 * 1024];
+	char	*info = connectBuf;
+	char	*data = connectBuf + 1024;
 
 	if ( clc_demoplaying ) {
 		return;
@@ -1610,42 +1519,47 @@ void __cdecl CL_CheckForResend( void )
 	clc_connectTime = cls_realtime;
 	clc_connectPacketCount++;
 
-	if ( cls_state == CA_CONNECTING ) {
+	switch(cls_state) {
+	default:
+		Com_Error( ERR_FATAL, "\x15" "CL_CheckForResend: bad cls.state" );
+		break;
+	case CA_CHALLENGING:
+	qport = Cvar_VariableValue( "net_qport" );
+
+	userinfo = Cvar_InfoString( CVAR_USERINFO );
+	strncpy( info, userinfo, 0x3FF );
+	info[1023] = 0;
+	Info_SetValueForKey( info, "protocol", va( "%i", 1 ) );
+	Info_SetValueForKey( info, "qport", va( "%i", (int)qport ) );
+	Info_SetValueForKey( info, "challenge", va( "%i", *(int *) clc_challenge ) );
+
+	/* retail 0x004104F9..0x00410526: copies "connect " (0x567068) then sets [8] = '"' */
+	strcpy( data, "connect " );
+	data[8] = '"';
+	/* retail 0x00410550..0x0041056E re-measures info on every pass
+	 * (unsigned compare) and terminates/sizes the packet from the final i */
+	for ( i = 0; (unsigned int)i < strlen( info ); i++ ) {
+		data[9 + i] = info[i];
+	}
+	/* retail 0x00410570/0x00410578 store with no bound check; pointer stores avoid the modern /GS range-check fast-fail */
+	*( data + 9 + i ) = '"';
+	*( data + 10 + i ) = 0;
+
+	NET_OutOfBandData( NS_CLIENT, *(netadr_t *) clc_serverAddress,
+	                   i + 10, data );
+
+	cvar_modifiedFlags &= ~CVAR_USERINFO;
+		break;
+	case CA_CONNECTING:
 		if ( net_lanauthorize->integer
 		     || !Sys_IsLANAddress( *(netadr_t *) clc_serverAddress ) ) {
 			CL_RequestAuthorization();
 		}
 		NET_OutOfBandPrint( NS_CLIENT, *(netadr_t *) clc_serverAddress,
 		                    "getchallenge" );
-		return;
+		break;
+	
 	}
-	if ( cls_state != CA_CHALLENGING ) {
-		Com_Error( ERR_FATAL, "\x15" "CL_CheckForResend: bad cls.state" );
-		return;
-	}
-
-	var = Cvar_FindVar( "net_qport" );
-	qport = var ? (int) var->value : 0;
-
-	info = Cvar_InfoString( CVAR_USERINFO );
-	strncpy( Destination, info, 0x3FF );
-	Destination[1023] = 0;
-	Info_SetValueForKey( Destination, "protocol", va( "%i", 1 ) );
-	Info_SetValueForKey( Destination, "qport", va( "%i", qport ) );
-	Info_SetValueForKey( Destination, "challenge", va( "%i", *(int *) clc_challenge ) );
-
-	memcpy( format, "connect \"", 9 );
-	len = (int) strlen( Destination );
-	for ( i = 0; i < len; i++ ) {
-		format[9 + i] = Destination[i];
-	}
-	format[9 + len] = '"';
-	format[10 + len] = 0;
-
-	NET_OutOfBandData( NS_CLIENT, *(netadr_t *) clc_serverAddress,
-	                   len + 10, format );
-
-	cvar_modifiedFlags &= ~CVAR_USERINFO;
 }
 
 /* ---- CL_DisconnectPacket  0x00410620 ----  VERIFIED */
@@ -1654,7 +1568,7 @@ void CL_DisconnectPacket( netadr_t from ) {
 		return;
 	}
 
-	if ( !NET_CompareAdr( from, ( (netchan_t *)chan )->remoteAddress ) ) {
+	if ( !NET_CompareAdr( from, clc.netchan.remoteAddress ) ) {
 		return;
 	}
 
@@ -1780,7 +1694,14 @@ void CL_ServersResponsePacket( netadr_t from, msg_t *msg ) {
 			if ( count < MAX_GLOBAL_SERVERS ) {
 				break;
 			}
-			cls_globalServerAddresses[cls_numGlobalServerAddresses++] = addresses[i];
+			{
+			 serverAddress_t *addr = &cls_globalServerAddresses[cls_numGlobalServerAddresses++];
+			 addr->ip[0] = addresses[i].ip[0];
+			 addr->ip[1] = addresses[i].ip[1];
+			 addr->ip[2] = addresses[i].ip[2];
+			 addr->ip[3] = addresses[i].ip[3];
+			 addr->port = addresses[i].port;
+			}
 			i++;
 		} while ( i < numservers );
 	}
@@ -1796,90 +1717,86 @@ void CL_ConnectionlessPacket( netadr_t from, msg_t *msg )
 {
 	char	*s;
 	char	*c;
+	int		size;
 
-	msg->readcount = 0;
-	msg->bit = 0;
-	if ( msg->cursize >= 4 ) {
-		msg->readcount = 4;
-	}
+	size = msg->cursize;
+	MSG_BeginReading( msg );
+	MSG_ReadLong( msg );
 
 	if ( net_profile->integer ) {
-		NetProf_PrepProfiling( &pProf );
-		NetProf_AddPacket( (void *) pProf, msg->cursize, 0 );
+		NetProf_PrepProfiling( &clc.pProf );
+		NetProf_AddPacket( (void *) clc.pProf, size, 0 );
 	}
 
 	s = MSG_ReadStringLine( msg );
 	Cmd_TokenizeString2( s, 0 );
 
-	c = ( cmd_argc > 0 ) ? cmd_argv[0] : (char *) empty_string;
+	c = Cmd_Argv( 0 );
 
 	Com_DPrintf( "CL packet %s: %s\n", NET_AdrToString( from ), c );
 
-	if ( c ) {
-		if ( !Q_stricmpn( c, "challengeResponse", 99999 ) ) {
-			if ( cls_state != CA_CONNECTING  ) {
-				Com_Printf( "Unwanted challenge response received.  Ignored.\n" );
-				return;
-			}
-			*(int *) clc_challenge = atol( ( cmd_argc > 1 ) ? cmd_argv[1] : (char *) empty_string );
-			if ( cmd_argc > 2 ) {
-				dword_15CE990 = atol( cmd_argv[2] );
-			} else {
-				dword_15CE990 = 0;
-			}
-			clc_connectPacketCount = 0;
-			clc_connectTime = -99999;
-			memcpy( clc_serverAddress, &from, sizeof( netadr_t ) );
-			cls_state = CA_CHALLENGING;
-			Com_DPrintf( "challenge: %d\n", *(int *) clc_challenge );
+	if ( !Q_stricmp( c, "challengeResponse" ) ) {
+		if ( cls_state != CA_CONNECTING  ) {
+			Com_Printf( "Unwanted challenge response received.  Ignored.\n" );
 			return;
 		}
-		if ( !Q_stricmpn( c, "connectResponse", 99999 ) ) {
-			if ( cls_state >= CA_CONNECTED ) {
-				Com_Printf( "Dup connect received.  Ignored.\n" );
-				return;
-			}
-			if ( cls_state != CA_CHALLENGING ) {
-				Com_Printf( "connectResponse packet while not connecting.  Ignored.\n" );
-				return;
-			}
-			if ( !NET_CompareBaseAdr( from, *(netadr_t *) clc_serverAddress ) ) {
-				Com_Printf( "connectResponse from a different address.  Ignored.\n" );
-				Com_Printf( "%s should have been %s\n",
-				            NET_AdrToString( from ),
-				            NET_AdrToString( *(netadr_t *) clc_serverAddress ) );
-				return;
-			}
-			/* CoD autoupdate arm, 0x00410BF9 */
-			if ( autoupdateChecked
-			     && NET_CompareAdr( *(netadr_t *) cls_autoupdateServer,
-			                        *(netadr_t *) clc_serverAddress )
-			     && cl_updateavailable->integer ) {
-				autoupdateStarted = 1;
-			}
-			Netchan_Setup( (netchan_t *) chan, NS_CLIENT, from,
-			               (int) Cvar_VariableValue( "net_qport" ) );
-			cls_state = CA_CONNECTED;
-			clc_lastPacketTime = cls_realtime;
-			clc_lastPacketSentTime = -9999;
+		*(int *) clc_challenge = atoi( Cmd_Argv( 1 ) );
+		if ( Cmd_Argc() > 2 ) {
+			clc_onlyVisibleClients = atoi( Cmd_Argv( 2 ) );
+		} else {
+			clc_onlyVisibleClients = 0;
+		}
+		clc_connectPacketCount = 0;
+		clc_connectTime = -99999;
+		memcpy(clc_serverAddress, &from, sizeof(from));
+		cls_state = CA_CHALLENGING;
+		Com_DPrintf( "challenge: %d\n", *(int *) clc_challenge );
+		return;
+	}
+	if ( !Q_stricmp( c, "connectResponse" ) ) {
+		if ( cls_state >= CA_CONNECTED ) {
+			Com_Printf( "Dup connect received.  Ignored.\n" );
 			return;
 		}
-		if ( !Q_stricmpn( c, "infoResponse", 99999 ) ) {
-			CL_ServerInfoPacket( from, msg );
+		if ( cls_state != CA_CHALLENGING ) {
+			Com_Printf( "connectResponse packet while not connecting.  Ignored.\n" );
 			return;
 		}
-		if ( !Q_stricmpn( c, "statusResponse", 99999 ) ) {
-			CL_ServerStatusResponse( from, msg );
+		if ( !NET_CompareBaseAdr( from, *(netadr_t *) clc_serverAddress ) ) {
+			Com_Printf( "connectResponse from a different address.  Ignored.\n" );
+			Com_Printf( "%s should have been %s\n",
+			            NET_AdrToString( from ),
+			            NET_AdrToString( *(netadr_t *) clc_serverAddress ) );
 			return;
 		}
-		if ( !Q_stricmpn( c, "disconnect", 99999 ) ) {
-			CL_DisconnectPacket( from );
-			return;
+		/* CoD autoupdate arm, 0x00410BF9 */
+		if ( autoupdateChecked
+		     && NET_CompareAdr( *(netadr_t *) cls_autoupdateServer,
+		                        *(netadr_t *) clc_serverAddress )
+		     && cl_updateavailable->integer ) {
+			autoupdateStarted = 1;
 		}
+		Netchan_Setup( &clc.netchan, NS_CLIENT, from,
+		               (int) Cvar_VariableValue( "net_qport" ) );
+		cls_state = CA_CONNECTED;
+		clc_lastPacketTime = cls_realtime;
+		clc_lastPacketSentTime = -9999;
+		return;
+	}
+	if ( !Q_stricmp( c, "infoResponse" ) ) {
+		CL_ServerInfoPacket( from, msg );
+		return;
+	}
+	if ( !Q_stricmp( c, "statusResponse" ) ) {
+		CL_ServerStatusResponse( from, msg );
+		return;
+	}
+	if ( !Q_stricmp( c, "disconnect" ) ) {
+		CL_DisconnectPacket( from );
+		return;
 	}
 	if ( !Q_stricmp( c, "echo" ) ) {
-		NET_OutOfBandPrint( NS_CLIENT, from, "%s",
-		                    ( cmd_argc > 1 ) ? cmd_argv[1] : (char *) empty_string );
+		NET_OutOfBandPrint( NS_CLIENT, from, "%s", Cmd_Argv( 1 ) );
 		return;
 	}
 	if ( !Q_stricmp( c, "keyAuthorize" ) ) {
@@ -1892,7 +1809,7 @@ void CL_ConnectionlessPacket( netadr_t from, msg_t *msg )
 	if ( !Q_stricmp( c, "print" ) ) {
 		s = MSG_ReadBigString( msg );
 		strncpy( clc_serverMessage, s, 0xFF );
-		byte_15CE987[0] = 0;
+		clc_serverMessageTerminator[0] = 0;
 		Com_Printf( "%s", s );
 		return;
 	}
@@ -1909,16 +1826,24 @@ void CL_ConnectionlessPacket( netadr_t from, msg_t *msg )
 		CL_UpdateInfoPacket( from );
 		return;
 	}
-	if ( !strncmp( c, "getserversResponse", 18 ) ) {
+	{ int prefixResult = 0;
+	{ int remaining = 18; const char *left = c, *right = "getserversResponse"; int leftByte, rightByte;
+	 do {
+	  leftByte = *left++; rightByte = *right++;
+	  if (!remaining--) break;
+	  if (leftByte != rightByte) { prefixResult = leftByte < rightByte ? -1 : 1; break; }
+	 } while(leftByte);
+	}
+	if ( !prefixResult ) {
 		CL_ServersResponsePacket( from, msg );
 		return;
 	}
-	if ( !strncmp( c, "needcdkey", 9 ) ) {
+	}
+	if ( !Q_strncmp( c, "needcdkey", 9 ) ) {
 		strncpy( clc_serverMessage, "EXE_AWAITINGCDKEYAUTH", 0xFF );
-		byte_15CE987[0] = 0;
-		Com_Printf( "%s\n",
-		            SEH_LocalizeTextMessage( "EXE_AWAITINGCDKEYAUTH",
-		                                     "need cd key message", 0 ) );
+		clc_serverMessageTerminator[0] = 0;
+		SEH_LocalizeTextMessage( "EXE_AWAITINGCDKEYAUTH", "need cd key message", 0 );   /* result discarded, 0x00410F4F */
+		Com_Printf( "%s\n", clc_serverMessage );   /* retail prints the raw key, not the localized text */
 		CL_RequestAuthorization();
 		return;
 	}
@@ -1935,72 +1860,6 @@ void CL_ConnectionlessPacket( netadr_t from, msg_t *msg )
 }
 
 /* CL_PacketEvent (0x00410FF0) is defined further down this unit. */
-#if 0
-void __cdecl CL_PacketEvent(netadr_t from, void *msg)
-{
-  int v2;
-  int v3;
-  int v4;
-  const char *v5;
-  const char *v6;
-  _BYTE v7[40]; // [esp-28h] [ebp-34h] BYREF
-  void *v8;
-  int v9;
-
-  v3 = v2;
-  v4 = *(_DWORD *)(v2 + 12);
-  if ( v4 >= 4 && **(_DWORD **)(v2 + 4) == -1 )
-  {
-    qmemcpy(&v7[16], &from, 0x14u);
-    CL_ConnectionlessPacket(*(netadr_t *)&v7[16], (void *)v2);
-  }
-  else if ( *(int *)cls_state >= 3 )
-  {
-    if ( v4 >= 4 )
-    {
-      qmemcpy(&v7[20], &chan.remoteAddress, 0x14u);
-      qmemcpy(v7, &from, 0x14u);
-      if ( NET_CompareAdr(*(netadr_t *)v7, *(netadr_t *)&v7[20]) )
-      {
-        dword_15CE868 = cls_realtime;
-        if ( Netchan_Process(&chan, (msg_t *)v3) )
-        {
-          clc_serverMessageSequence = **(_DWORD **)(v3 + 4);
-          clc_reliableAcknowledge = MSG_ReadLong((msg_t *)v3);
-          if ( clc_reliableAcknowledge >= clc_reliableSequence - 64 )
-          {
-            CL_Netchan_Decode(
-              (_BYTE *)(*(_DWORD *)(v3 + 16) + *(_DWORD *)(v3 + 4)),
-              *(_DWORD *)(v3 + 12) - *(_DWORD *)(v3 + 16));
-            CL_ParseServerMessage(v3);
-            if ( clc_demorecording )
-            {
-              if ( !clc_demowaiting )
-                CL_WriteDemoMessage(v8, v9);
-            }
-          }
-          else
-          {
-            clc_reliableAcknowledge = clc_reliableSequence;
-          }
-        }
-      }
-      else
-      {
-        qmemcpy(&v7[20], &from, 0x14u);
-        v6 = NET_AdrToString(*(netadr_t *)&v7[20]);
-        Com_DPrintf("%s:sequenced packet without connection\n", v6);
-      }
-    }
-    else
-    {
-      qmemcpy(&v7[20], &from, 0x14u);
-      v5 = NET_AdrToString(*(netadr_t *)&v7[20]);
-      Com_Printf("%s: Runt packet\n", v5);
-    }
-  }
-}
-#endif
 
 /* ---- CL_CheckTimeout  0x00411130 ----  VERIFIED */
 void CL_CheckTimeout( void ) {
@@ -2051,49 +1910,44 @@ void __cdecl CL_SetRecommended_f()
 }
 
 /* ---- CL_RefPrintf  0x00411460 ----  [CONFIRMED] */
-void CL_RefPrintf(int print_level, const char *fmt, ...)
+void CL_RefPrintf( int print_level, const char *fmt, ... )
 {
-  char Buffer[4096];
-  unsigned int v3;
-  unsigned int retaddr;
-  va_list ArgList;
+	char    text[4096];
+	va_list argptr;
 
-  va_start(ArgList, fmt);
-  v3 = retaddr ^ _security_cookie;
-  _vsnprintf(Buffer, sizeof(Buffer) - 1, fmt, ArgList);
-  Buffer[sizeof(Buffer) - 1] = 0;
-  if ( print_level )
-  {
-    if ( print_level == 2 )
-    {
-      Com_Printf("^3%s", Buffer);
-    }
-    else if ( print_level == 1 )
-    {
-      Com_DPrintf("^1%s", Buffer);
-    }
-  }
-  else
-  {
-    Com_Printf("%s", Buffer);
-  }
+	/* retail 0x00411492: unbounded vsprintf, no forced terminator */
+	va_start( argptr, fmt );
+	vsprintf( text, fmt, argptr );
+	va_end( argptr );
+
+	if ( print_level == 0 ) {
+		Com_Printf( "%s", text );
+	} else if ( print_level == 2 ) {
+		Com_Printf( "^3%s", text );
+	} else if ( print_level == 1 ) {
+		Com_DPrintf( "^1%s", text );
+	}
 }
 
-#if 0
-void __cdecl CL_InitRenderer()
+/* ---- CL_InitRenderer  0x00411540 ---- */
+void CL_InitRenderer( void )
 {
-  re_BeginRegistration(&cls_glconfig);
-  whiteShader = re_RegisterShader("white", 2);
-  dword_15CA634 = re_RegisterShader("console", 2);
-  dword_57C0F8 = cls_glconfig_vidWidth - 32;
-  dword_142F64C = cls_glconfig_vidWidth - 32;
-  dword_142F654 = dword_57C100;
-  dword_142F650 = dword_57C0FC;
-  memset(stats, 0, 0x200u);
-  dword_142F658 = 1;
-  statCount = 0;
+    /* retail 0x00411540 calls re_BeginRegistration unconditionally: no bound check, no diagnostics */
+    re.BeginRegistration( &cls_glconfig );
+
+    whiteShader   = re.RegisterShader( "white", 2 );
+    cls_consoleShader = re.RegisterShader( "console", 2 );
+
+    con_fieldWidthPixels  = cls_glconfig.vidWidth - 32;
+    g_consoleField.widthInPixels = cls_glconfig.vidWidth - 32;
+
+    *(int *)&g_consoleField.charWidth  = con_fieldCharWidth;
+    *(int *)&g_consoleField.charHeight = con_fieldCharHeight;
+
+    g_consoleField.fixedWidth = 1;
+
+    StatMon_Reset();
 }
-#endif
 
 /* ---- CL_StartHunkUsers  0x004115C0 ----  [CONFIRMED] */
 void __cdecl CL_StartHunkUsers()
@@ -2131,13 +1985,6 @@ void CL_CheckAutoUpdate( void ) {
 	int i = 0, rnd = 0;
 	netadr_t temp;
 	char *servername[MAX_AUTOUPDATE_SERVERS];
-	char *cls_autoupdateServerNames[MAX_AUTOUPDATE_SERVERS];
-
-	cls_autoupdateServerNames[0] = cls_autoupdateServerNames_0_;
-	cls_autoupdateServerNames[1] = cls_autoupdateServerNames_1_;
-	cls_autoupdateServerNames[2] = cls_autoupdateServerNames_2_;
-	cls_autoupdateServerNames[3] = cls_autoupdateServerNames_3_;
-	cls_autoupdateServerNames[4] = cls_autoupdateServerNames_4_;
 
 	if ( autoupdateChecked ) {
 		return;
@@ -2146,8 +1993,8 @@ void CL_CheckAutoUpdate( void ) {
 	srand( Com_Milliseconds() );
 
 	for ( i = 0; i < MAX_AUTOUPDATE_SERVERS; i++ ) {
-		if ( NET_StringToAdr( cls_autoupdateServerNames[i], &temp ) ) {
-			servername[validServerNum++] = cls_autoupdateServerNames[i];
+		if ( NET_StringToAdr( cls.autoupdateServerNames[i], &temp ) ) {
+			servername[validServerNum++] = cls.autoupdateServerNames[i];
 		}
 	}
 
@@ -2201,30 +2048,25 @@ void CL_GetAutoUpdate( void ) {
 		return;
 	}
 
-	Sys_OpenURL( cl_updatefiles->string, "quit\n" );
+	Sys_OpenURL( cl_updatefiles->string, qtrue );
 }
 
 /* ---- CL_ScaledMilliseconds  0x00411860 ----  VERIFIED */
 int __cdecl CL_ScaledMilliseconds()
 {
-  if ( !sys_timeBaseInit )
-  {
-    sys_timeBase = timeGetTime();
-    sys_timeBaseInit = 1;
-  }
-  return (int)( (float)(int)( timeGetTime() - sys_timeBase ) * com_timescale->value );
+  return Sys_Milliseconds() * com_timescale->value;
 }
 
 /* ---- CG_GetGameModel  0x004118B0 ----  [CONFIRMED] */
-void *__cdecl CG_GetGameModel(int handle)
+void *__cdecl CG_GetGameModel( int handle )
 {
-  return (void *)VM_Call(cgvm, 9, (__int16)handle);
+	return (void *)VM_Call( cgvm, 9, (short)handle );
 }
 
 /* ---- CG_DObjCalcPose  0x004118D0 ----  VERIFIED */
-void __cdecl CG_DObjCalcPose( int dobj, int partBits, int a3 )
+void __cdecl CG_DObjCalcPose( int cent, int dobj, int partBits )
 {
-  VM_Call( cgvm, 10, dobj, partBits, a3 );
+  VM_Call( cgvm, 10, cent, dobj, partBits );
 }
 
 /* ---- CL_GetFontInfo  0x004118F0 ----  VERIFIED */
@@ -2240,53 +2082,53 @@ void CL_startSingleplayer_f( void )
 }
 
 /* ---- CL_DrawLogo  0x00411B00 ----  [HIGH] */
-void __cdecl CL_DrawLogo()
+void __cdecl CL_DrawLogo( void )
 {
-  int v0;
-  double v1;
-  double v2;
-  float v3;
-  float v4;
-  float v5;
-  float v6[4];
+	/* re_DrawStretchPic is declared int(*)() by cl_refapi.h; call it through
+	 * a float-typed signature so the width/height pass as floats instead of the
+	 * LODWORD int-bit reinterpretation the decompile used (ABI-identical). */
+	typedef void ( __cdecl *drawStretchPic_t )( float, float, float, float,
+	                                            float, float, float, float, int );
 
-  v0 = cls_realtime - cls_logoStartTime;
-  if ( cls_realtime - cls_logoStartTime >= cls_logoFadeInDuration )
-  {
-    if ( v0 <= cls_logoTotalDuration - cls_logoFadeOutDuration )
-    {
-LABEL_8:
-      v1 = 1.0;
-      goto LABEL_9;
-    }
-    v1 = (double)(cls_logoTotalDuration - v0) / (double)cls_logoFadeOutDuration;
-  }
-  else
-  {
-    v1 = (double)(cls_realtime - cls_logoStartTime) / (double)cls_logoFadeInDuration;
-  }
-  if ( (v1 < 0.0) | __UNORDERED__(v1, 0.0) )
-  {
-    v1 = 0.0;
-    goto LABEL_9;
-  }
-  if ( v1 > 1.0 )
-    goto LABEL_8;
-LABEL_9:
-  v6[0] = v1;
-  v6[1] = v1;
-  v6[2] = v1;
-  v6[3] = 1.0;
-  v4 = (float)cls_glconfig_vidWidth;
-  v2 = (double)cls_glconfig_vidHeight;
-  v3 = (v2 + v2) * 0.33333334;
-  v5 = v2 - v3;
-  re_SetColor(v6);
-  re_DrawStretchPic(0, 0, LODWORD(v4), LODWORD(v3), 0, 0, 1065353216, 1065353216, cls_logoShaderTop);
-  re_DrawStretchPic(0, LODWORD(v3), LODWORD(v4), LODWORD(v5), 0, 0, 1065353216, 1065353216, cls_logoShaderBottom);
-  re_SetColor(0);
-  if ( v0 > cls_logoTotalDuration )
-    cls_state = CA_DISCONNECTED;
+	int    elapsed;
+	float alpha;
+	float  color[4];
+	float  width, top, bottom;
+
+	elapsed = cls_realtime - cls_logoStartTime;
+	if (elapsed < cls_logoFadeInDuration) {
+ alpha = (float)elapsed / (float)cls_logoFadeInDuration;
+ } else if (elapsed > cls_logoTotalDuration - cls_logoFadeOutDuration) {
+ alpha = (float)(cls_logoTotalDuration - elapsed) / (float)cls_logoFadeOutDuration;
+ } else alpha = 1.0f;
+
+	if ( alpha < 0.0f ) {
+		alpha = 0.0f;
+	} else if ( alpha > 1.0f ) {
+		alpha = 1.0f;
+	}
+
+	color[0] = (float)alpha;
+	color[1] = (float)alpha;
+	color[2] = (float)alpha;
+	color[3] = 1.0f;
+
+	width  = (float)cls_glconfig_vidWidth;
+	top    = (float)( ( (float)cls_glconfig_vidHeight + (float)cls_glconfig_vidHeight ) * 0.33333334f );
+	bottom = (float)( (float)cls_glconfig_vidHeight - top );
+
+	re_SetColor( color );
+	( (drawStretchPic_t)re_DrawStretchPic )( 0.0f, 0.0f, width, top,
+	                                         0.0f, 0.0f, 1.0f, 1.0f,
+	                                         cls_logoShaderTop );
+	( (drawStretchPic_t)re_DrawStretchPic )( 0.0f, top, width, bottom,
+	                                         0.0f, 0.0f, 1.0f, 1.0f,
+	                                         cls_logoShaderBottom );
+	re_SetColor( NULL );
+
+	if ( elapsed > cls_logoTotalDuration ) {
+		cls_state = CA_DISCONNECTED;
+	}
 }
 
 /* ---- CL_StopLogo  0x00411C40 ----  [CONFIRMED] */
@@ -2296,224 +2138,48 @@ void __cdecl CL_StopLogo()
 }
 
 /* ---- CL_PlayLogo_f  0x00411C50 ----  [CONFIRMED] */
-void __cdecl CL_PlayLogo_f()
+void __cdecl CL_PlayLogo_f( void )
 {
-  char *v0;
-  char *v1;
-  char *v2;
-  char *v3;
-  char *v4;
-  char *v5;
-  float v7;
-  float v8;
-  float v9;
+ char *image;
+	if ( cmd_argc != 5 ) {
+		Com_Printf( "USAGE: logo <image name> <fadein seconds> <full duration seconds> <fadeout seconds>\n" );
+		return;
+	}
 
-  if ( cmd_argc != 5 )
-  {
-    Com_Printf("USAGE: logo <image name> <fadein seconds> <full duration seconds> <fadeout seconds>\n");
-    return;
-  }
-  Com_DPrintf("CL_PlayLogo_f\n");
-  if ( cls_state == CA_CINEMATIC )
-  {
-    if ( (unsigned int)CL_handle < MAX_VIDEO_HANDLES )
-    {
-      CIN_StopCinematic(CL_handle);
-      MSS_StopSounds(0);
-      CL_handle = -1;
-    }
-LABEL_8:
-    cls_state = CA_LOGO;
-    if ( uivm )
-      VM_Call(uivm, UI_SET_ACTIVE_MENU, UIMENU_NONE);
-    MSS_StopSounds(0);
-    mss_globalFadeRate = 1.0 - mss_globalFadeCur;
-    mss_globalFadeTarget = 1065353216;
-    v0 = &empty_string;
-    if ( (unsigned int)cmd_argc > 1 )
-      v0 = cmd_argv[1];
-    v1 = &empty_string;
-    if ( (unsigned int)cmd_argc > 2 )
-      v1 = cmd_argv[2];
-    v7 = atof(v1) * 1000.0;
-    cls_logoFadeInDuration = (int)(v7 + 9.313225746154785e-10);
-    v2 = &empty_string;
-    if ( (unsigned int)cmd_argc > 3 )
-      v2 = cmd_argv[3];
-    v8 = atof(v2) * 1000.0;
-    cls_logoTotalDuration = (int)(v8 + 9.313225746154785e-10);
-    v3 = &empty_string;
-    if ( (unsigned int)cmd_argc > 4 )
-      v3 = cmd_argv[4];
-    v9 = atof(v3) * 1000.0;
-    cls_logoFadeOutDuration = (int)(v9 + 9.313225746154785e-10);
-    cls_logoTotalDuration += cls_logoFadeOutDuration + cls_logoFadeInDuration;
-    v4 = va("%s1", v0);
-    cls_logoShaderTop = Material_RegisterHandle(v4, 2);
-    v5 = va("%s2", v0);
-    cls_logoShaderBottom = Material_RegisterHandle(v5, 2);
-    cls_logoStartTime = cls_realtime + 100;
-    return;
-  }
-  if ( cls_state == CA_LOGO || !cls_state )
-    goto LABEL_8;
+	Com_DPrintf( "CL_PlayLogo_f\n" );
+
+	if ( cls_state == CA_CINEMATIC ) {
+		if ( CL_handle >= 0 && CL_handle < MAX_VIDEO_HANDLES ) {
+			CIN_StopCinematic( CL_handle );
+			MSS_StopSounds( 0 );
+			CL_handle = -1;
+		}
+	} else if ( cls_state != CA_LOGO && cls_state != CA_DISCONNECTED ) {
+		return;
+	}
+
+	cls_state = CA_LOGO;
+	if ( uivm ) {
+		VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_NONE );
+	}
+	MSS_StopSounds( 0 );
+	MSS_FadeAllSounds( 1.0f, 0 );
+ image = Cmd_Argv( 1 );   /* 1.0f, stored as an int bit pattern */
+
+	/* 0x00411D27-0x00411DF7: atof * 1000.0f, fstp to a float, then the inlined
+	 * FastRound body (fld float / fadd qword 2^-30 / fistp) -- round to nearest,
+	 * not the truncating __ftol2 of an (int) cast. */
+	cls_logoFadeInDuration  = FastRound( (float)( (rfloat)atof( Cmd_Argv( 2 ) ) * 1000.0f ) );
+	cls_logoTotalDuration   = FastRound( (float)( (rfloat)atof( Cmd_Argv( 3 ) ) * 1000.0f ) );
+	cls_logoFadeOutDuration = FastRound( (float)( (rfloat)atof( Cmd_Argv( 4 ) ) * 1000.0f ) );
+	cls_logoTotalDuration  += cls_logoFadeOutDuration + cls_logoFadeInDuration;
+
+	cls_logoShaderTop    = re_RegisterShaderNoMip( va( "%s1", image ), 2 );
+	cls_logoShaderBottom = re_RegisterShaderNoMip( va( "%s2", image ), 2 );
+	cls_logoStartTime    = cls_realtime + 100;
 }
 
 /* CL_Init (0x00411E60) is defined further down this unit. */
-#if 0
-void __cdecl CL_Init()
-{
-  Com_Printf("----- Client Initialization -----\n");
-  Con_Init();
-  memset(&cl_active, 0, 0x12C8D8u);
-  *(_DWORD *)cls_state = 0;
-  cls_realtime = 0;
-  CL_InitInput();
-  cl_noprint = Cvar_Get("cl_noprint", "0", 0);
-  cl_motd = Cvar_Get("cl_motd", "1", 0);
-  cl_timeout = Cvar_Get("cl_timeout", "200", 0);
-  cl_timeNudge = Cvar_Get("cl_timeNudge", "0", CVAR_TEMP);
-  cl_shownet = Cvar_Get("cl_shownet", "0", CVAR_TEMP);
-  cl_shownuments = Cvar_Get("cl_shownuments", "0", CVAR_TEMP);
-  cl_visibleClients = Cvar_Get("cl_visibleClients", "0", CVAR_TEMP);
-  cl_showServerCommands = Cvar_Get("cl_showServerCommands", "0", 0);
-  cl_showSend = Cvar_Get("cl_showSend", "0", CVAR_TEMP);
-  cl_showTimeDelta = Cvar_Get("cl_showTimeDelta", "0", CVAR_TEMP);
-  cl_freezeDemo = Cvar_Get("cl_freezeDemo", "0", CVAR_TEMP);
-  rconPassword = Cvar_Get("rconPassword", &empty_string, CVAR_TEMP);
-  activeAction = Cvar_Get("activeAction", &empty_string, CVAR_TEMP);
-  timedemo = Cvar_Get("timedemo", "0", 0);
-  cl_avidemo = Cvar_Get("cl_avidemo", "0", 0);
-  cl_forceavidemo = Cvar_Get("cl_forceavidemo", "0", 0);
-  rconAddress = Cvar_Get("rconAddress", &empty_string, 0);
-  cl_yawspeed = Cvar_Get("cl_yawspeed", "140", CVAR_ARCHIVE);
-  cl_pitchspeed = Cvar_Get("cl_pitchspeed", "140", CVAR_ARCHIVE);
-  cl_anglespeedkey = Cvar_Get("cl_anglespeedkey", "1.5", 0);
-  cl_maxpackets = Cvar_Get("cl_maxpackets", "30", CVAR_ARCHIVE);
-  cl_packetdup = Cvar_Get("cl_packetdup", "1", CVAR_ARCHIVE);
-  cl_run = Cvar_Get("cl_run", "1", CVAR_TEMP);
-  cl_stance = Cvar_Get("cl_stance", "0", CVAR_TEMP);
-  cl_stanceTemp = Cvar_Get("cl_stanceTemp", "0", CVAR_TEMP);
-  cl_goStandJumpTime = Cvar_Get("cl_goStandJumpTime", "0", CVAR_ARCHIVE);
-  cl_sensitivity = Cvar_Get("sensitivity", "5", CVAR_ARCHIVE);
-  cl_mouseAccel = Cvar_Get("cl_mouseAccel", "0", CVAR_ARCHIVE);
-  cl_freelook = Cvar_Get("cl_freelook", "1", CVAR_ARCHIVE);
-  cl_showmouserate = Cvar_Get("cl_showmouserate", "0", 0);
-  cl_allowDownload = Cvar_Get("cl_allowDownload", "0", CVAR_ARCHIVE);
-  cl_conXOffset = Cvar_Get("cl_conXOffset", "0", 0);
-  r_inGameVideo = Cvar_Get("r_inGameVideo", "1", CVAR_ARCHIVE);
-  cl_serverStatusResendTime = Cvar_Get("cl_serverStatusResendTime", "750", 0);
-  cl_viewPitchCompensate = Cvar_Get("cl_viewPitchCompensate", "0", CVAR_ROM);
-  cl_viewYawCompensate = Cvar_Get("cl_viewYawCompensate", "0", CVAR_ROM);
-  cl_bypassMouseInput = Cvar_Get("cl_bypassMouseInput", "0", 0);
-  m_pitch = Cvar_Get("m_pitch", "0.022", CVAR_ARCHIVE);
-  m_yaw = Cvar_Get("m_yaw", "0.022", CVAR_ARCHIVE);
-  m_forward = Cvar_Get("m_forward", "0.25", CVAR_ARCHIVE);
-  m_side = Cvar_Get("m_side", "0.25", CVAR_ARCHIVE);
-  m_filter = Cvar_Get("m_filter", "0", CVAR_ARCHIVE);
-  cl_motdString = Cvar_Get("cl_motdString", &empty_string, CVAR_ROM);
-  cl_ingame = Cvar_Get("cl_ingame", "0", CVAR_ROM);
-  Cvar_Get("cl_maxPing", "800", CVAR_ARCHIVE);
-  Cvar_Get("cg_drawCompass", "1", CVAR_ARCHIVE);
-  Cvar_Get("cg_drawNotifyText", "1", CVAR_ARCHIVE);
-  Cvar_Get("cg_descriptiveText", "1", CVAR_ARCHIVE);
-  Cvar_Get("cg_drawTeamOverlay", "2", CVAR_ARCHIVE);
-  Cvar_Get("cg_drawGun", "1", CVAR_ARCHIVE);
-  Cvar_Get("cg_cursorHints", "4", CVAR_ARCHIVE);
-  Cvar_Get("cg_voiceSpriteTime", "6000", CVAR_ARCHIVE);
-  Cvar_Get("cg_teamChatsOnly", "0", CVAR_ARCHIVE);
-  Cvar_Get("cg_noVoiceChats", "0", CVAR_ARCHIVE);
-  Cvar_Get("cg_noVoiceText", "0", CVAR_ARCHIVE);
-  Cvar_Get("cg_crosshairSize", "48", CVAR_ARCHIVE);
-  Cvar_Get("cg_drawCrosshair", "1", CVAR_ARCHIVE);
-  Cvar_Get("name", "Unknown Soldier", CVAR_ARCHIVE|CVAR_USERINFO);
-  Cvar_Get("rate", "5000", CVAR_ARCHIVE|CVAR_USERINFO);
-  Cvar_Get("snaps", "20", CVAR_ARCHIVE|CVAR_USERINFO);
-  Cvar_Get("model", &empty_string, CVAR_ARCHIVE|CVAR_USERINFO);
-  Cvar_Get("head", &empty_string, CVAR_ARCHIVE|CVAR_USERINFO);
-  Cvar_Get("handicap", "100", CVAR_ARCHIVE|CVAR_USERINFO);
-  Cvar_Get("cl_anonymous", "0", CVAR_ARCHIVE|CVAR_USERINFO);
-  Cvar_Get("password", &empty_string, CVAR_USERINFO);
-  Cvar_Get("cg_predictItems", "1", CVAR_ARCHIVE|CVAR_USERINFO);
-  Cvar_Get("cg_viewsize", "100", CVAR_ARCHIVE);
-  cl_waitForFire = Cvar_Get("cl_waitForFire", "0", CVAR_ROM);
-  fx_enable = Cvar_Get("fx_enable", "1", CVAR_CHEAT);
-  fx_draw = Cvar_Get("fx_draw", "1", CVAR_CHEAT);
-  fx_cull = Cvar_Get("fx_cull", "1", 0);
-  fx_freeze = Cvar_Get("fx_freeze", "0", CVAR_CHEAT);
-  fx_debug = Cvar_Get("fx_debug", "0", CVAR_CHEAT);
-  fx_debugBolt = Cvar_Get("fx_debugBolt", "0", CVAR_CHEAT);
-  fx_count = Cvar_Get("fx_count", "0", CVAR_CHEAT);
-  cl_updateavailable = Cvar_Get("cl_updateavailable", "0", CVAR_ROM);
-  cl_updatefiles = Cvar_Get("cl_updatefiles", &empty_string, CVAR_ROM);
-  cl_updateoldversion = Cvar_Get("cl_updateoldversion", &empty_string, CVAR_ROM);
-  cl_updateversion = Cvar_Get("cl_updateversion", &empty_string, CVAR_ROM);
-  cl_serverloadmap = Cvar_Get("cl_serverloadmap", &empty_string, CVAR_ROM);
-  cl_serverloadgametype = Cvar_Get("cl_serverloadgametype", &empty_string, CVAR_ROM);
-  cl_serverloadwaiting = Cvar_Get("cl_serverloadwaiting", "0", CVAR_ROM);
-  strncpy(
-    cls_autoupdateServerNames_0_,
-    "au2cod1.activision.com",
-    CVAR_ARCHIVE|CVAR_USERINFO|CVAR_SERVERINFO|CVAR_SYSTEMINFO|CVAR_INIT|CVAR_LATCH);
-  byte_15CA47B = 0;
-  strncpy(
-    cls_autoupdateServerNames_1_,
-    "au2cod2.activision.com",
-    CVAR_ARCHIVE|CVAR_USERINFO|CVAR_SERVERINFO|CVAR_SYSTEMINFO|CVAR_INIT|CVAR_LATCH);
-  byte_15CA4BB = 0;
-  strncpy(
-    cls_autoupdateServerNames_2_,
-    "au2cod3.activision.com",
-    CVAR_ARCHIVE|CVAR_USERINFO|CVAR_SERVERINFO|CVAR_SYSTEMINFO|CVAR_INIT|CVAR_LATCH);
-  byte_15CA4FB = 0;
-  strncpy(
-    cls_autoupdateServerNames_3_,
-    "au2cod4.activision.com",
-    CVAR_ARCHIVE|CVAR_USERINFO|CVAR_SERVERINFO|CVAR_SYSTEMINFO|CVAR_INIT|CVAR_LATCH);
-  byte_15CA53B = 0;
-  strncpy(
-    cls_autoupdateServerNames_4_,
-    "au2cod5.activision.com",
-    CVAR_ARCHIVE|CVAR_USERINFO|CVAR_SERVERINFO|CVAR_SYSTEMINFO|CVAR_INIT|CVAR_LATCH);
-  byte_15CA57B = 0;
-  Cmd_AddCommand(cmd_name, CL_ForwardToServer_f);
-  Cmd_AddCommand("configstrings", CL_Configstrings_f);
-  Cmd_AddCommand("clientinfo", CL_Clientinfo_f);
-  Cmd_AddCommand("snd_restart", CL_Snd_Restart_f);
-  Cmd_AddCommand("vid_restart", CL_Vid_Restart_f);
-  Cmd_AddCommand("disconnect", CL_Disconnect_f);
-  Cmd_AddCommand("record", CL_Record_f);
-  Cmd_AddCommand("demo", CL_PlayDemo_f);
-  Cmd_AddCommand("cinematic", CL_PlayCinematic_f);
-  Cmd_AddCommand("logo", CL_PlayLogo_f);
-  Cmd_AddCommand("stoprecord", CL_StopRecord_f);
-  Cmd_AddCommand("connect", CL_Connect_f);
-  Cmd_AddCommand("reconnect", CL_Reconnect_f);
-  Cmd_AddCommand("localservers", CL_LocalServers_f);
-  Cmd_AddCommand("globalservers", CL_GlobalServers_f);
-  Cmd_AddCommand("rcon", CL_Rcon_f);
-  Cmd_AddCommand("setenv", CL_Setenv_f);
-  Cmd_AddCommand("ping", CL_Ping_f);
-  Cmd_AddCommand("serverstatus", CL_ServerStatus_f);
-  Cmd_AddCommand("showip", CL_ShowIP_f);
-  Cmd_AddCommand("fs_openedList", CL_OpenedPK3List_f);
-  Cmd_AddCommand("fs_referencedList", CL_ReferencedPK3List_f);
-  Cmd_AddCommand("updatehunkusage", CL_UpdateLevelHunkUsage);
-  Cmd_AddCommand("updatescreen", (xcommand_t)SCR_UpdateScreen);
-  Cmd_AddCommand("startSingleplayer", CL_startSingleplayer_f);
-  Cmd_AddCommand("setRecommended", CL_SetRecommended_f);
-  Cmd_AddCommand("cubemapShot", (xcommand_t)CL_CubeMapShot_f);
-  Cmd_AddCommand("localizeSoundAliasFiles", Com_WriteLocalizedSoundAliasFiles);
-  autoupdateChecked = 0;
-  dword_1432848 = 0;
-  CL_CheckAutoUpdate();
-  CL_InitRef();
-  SCR_Init();
-  Cbuf_Execute();
-  Cvar_Set2("cl_running", "1", qtrue);
-  Com_Printf("----- Client Initialization Complete -----\n");
-}
-#endif
 
 /* ---- CL_SetServerInfo  0x004129F0 ----  VERIFIED */
 void CL_SetServerInfo( serverInfo_t *server, const char *info, int ping ) {
@@ -2680,94 +2346,40 @@ void CL_UpdateInfoPacket( netadr_t from ) {
 }
 
 /* ---- CL_GetServerStatus  0x004130E0 ----  [HIGH] */
-int __cdecl CL_GetServerStatus(netadr_t from)
+serverStatus_t *__cdecl CL_GetServerStatus( netadr_t from )
 {
-  int v1;
-  char *v2;
-  __int32 v3;
-  _DWORD *v4;
-  int v5;
-  int v6;
-  int *v7;
-  netadr_t v9;
-  netadr_t v10;
+	int i, oldest, oldestTime;
 
-  v1 = 0;
-  v2 = (char *)&unk_15F9080;
-  do
-  {
-    qmemcpy(&v10, v2, sizeof(v10));
-    qmemcpy(&v9, &from, sizeof(v9));
-    v3 = NET_CompareAdr(v9, v10);
-    if ( v3 )
-      return (int)&unk_15F7080 + 8232 * v1;
-    v2 += 8232;
-    ++v1;
-  }
-  while ( (int)v2 < (int)byte_1619300 );
-  v4 = &unk_15F90A4;
-  while ( !*v4 )
-  {
-    v4 += 2058;
-    ++v3;
-    if ( (int)v4 >= (int)dword_1619324 )
-    {
-      v3 = -1;
-      v5 = 0;
-      v6 = 2;
-      v7 = (int *)&unk_15FB0C0;
-      do
-      {
-        if ( v3 == -1 || *(v7 - 2058) < v5 )
-        {
-          v5 = *(v7 - 2058);
-          v3 = v6 - 2;
-        }
-        if ( v3 == -1 || *v7 < v5 )
-        {
-          v5 = *v7;
-          v3 = v6 - 1;
-        }
-        if ( v3 == -1 || v7[2058] < v5 )
-        {
-          v5 = v7[2058];
-          v3 = v6;
-        }
-        if ( v3 == -1 || v7[4116] < v5 )
-        {
-          v5 = v7[4116];
-          v3 = v6 + 1;
-        }
-        if ( v3 == -1 || v7[6174] < v5 )
-        {
-          v5 = v7[6174];
-          v3 = v6 + 2;
-        }
-        if ( v3 == -1 || v7[8232] < v5 )
-        {
-          v5 = v7[8232];
-          v3 = v6 + 3;
-        }
-        if ( v3 == -1 || v7[10290] < v5 )
-        {
-          v5 = v7[10290];
-          v3 = v6 + 4;
-        }
-        if ( v3 == -1 || v7[12348] < v5 )
-        {
-          v5 = v7[12348];
-          v3 = v6 + 5;
-        }
-        v6 += 8;
-        v7 += 16464;
-      }
-      while ( v6 - 2 < 16 );
-      if ( v3 == -1 )
-        v3 = ++serverStatusCount & 0xF;
-      return (int)&unk_15F7080 + 8232 * v3;
-    }
-  }
-  return (int)&unk_15F7080 + 8232 * v3;
+	/* an existing request for this address */
+	for ( i = 0; i < MAX_SERVERSTATUSREQUESTS; i++ ) {
+		if ( NET_CompareAdr( from, cl_serverStatusList[i].address ) ) {
+			return &cl_serverStatusList[i];
+		}
+	}
+
+	/* a slot whose reply has already been retrieved */
+	for ( i = 0; i < MAX_SERVERSTATUSREQUESTS; i++ ) {
+		if ( cl_serverStatusList[i].retrieved ) {
+			return &cl_serverStatusList[i];
+		}
+	}
+
+	/* otherwise recycle the oldest request */
+	oldest = -1;
+	oldestTime = 0;
+	for ( i = 0; i < MAX_SERVERSTATUSREQUESTS; i++ ) {
+		if ( oldest == -1 || cl_serverStatusList[i].startTime < oldestTime ) {
+			oldest = i;
+			oldestTime = cl_serverStatusList[i].startTime;
+		}
+	}
+
+	if ( oldest != -1 ) {
+		return &cl_serverStatusList[oldest];
+	}
+
+	serverStatusCount++;
+	return &cl_serverStatusList[serverStatusCount & ( MAX_SERVERSTATUSREQUESTS - 1 )];
 }
 
 /* ---- CL_ServerStatus  0x00413260 ----  VERIFIED */
@@ -2786,7 +2398,7 @@ qboolean CL_ServerStatus( char *serverAddress, char *serverStatusString, int max
 	if ( !NET_StringToAdr( serverAddress, &to ) ) {
 		return qfalse;
 	}
-	serverStatus = (serverStatus_t *)CL_GetServerStatus( to );
+	serverStatus = CL_GetServerStatus( to );
 	if ( !serverStatusString ) {
 		serverStatus->retrieved = qtrue;
 		return qfalse;
@@ -2815,8 +2427,8 @@ qboolean CL_ServerStatus( char *serverAddress, char *serverStatusString, int max
 		serverStatus->print = qfalse;
 		serverStatus->pending = qtrue;
 		serverStatus->retrieved = qfalse;
-		serverStatus->time = 0;
 		serverStatus->startTime = Sys_Milliseconds();
+		serverStatus->time = 0;
 		NET_OutOfBandPrint( NS_CLIENT, to, "getstatus" );
 		return qfalse;
 	}
@@ -2824,143 +2436,111 @@ qboolean CL_ServerStatus( char *serverAddress, char *serverStatusString, int max
 }
 
 /* ---- CL_ServerStatusResponse  0x00413430 ----  VERIFIED */
-void __cdecl CL_ServerStatusResponse(netadr_t from, void *msg)
+void __cdecl CL_ServerStatusResponse( netadr_t from, void *msg )
 {
-  int v2;
-  char *v3;
-  char *v4;
-  char *StringLine;
-  int v6;
-  char v7;
-  int v8;
-  char *v9;
-  char *v10;
-  char *v11;
-  const char *v12;
-  char v13;
-  int v14;
-  unsigned int len;
-  netadr_t v15;
-  netadr_t v16;
-  char v19[4];
-  int v20;
-  int v21;
-  char ArgList[1024];
-  unsigned int v23;
-  unsigned int retaddr;
+	serverStatus_t *serverStatus;
+	char *s;
+	char info[MAX_INFO_STRING];
+	int  i, len;
+	int  playerNum;
 
-  v23 = retaddr ^ _security_cookie;
-  v2 = 0;
-  v3 = (char *)&unk_15F9080;
-  while ( 1 )
-  {
-    qmemcpy(&v16, v3, sizeof(v16));
-    qmemcpy(&v15, &from, sizeof(v15));
-    if ( NET_CompareAdr(v15, v16) )
-      break;
-    v3 += 8232;
-    ++v2;
-    if ( (int)v3 >= (int)byte_1619300 )
-      return;
-  }
-  v4 = (char *)&unk_15F7080 + 8232 * v2;
-  if ( v4 )
-  {
-    StringLine = MSG_ReadStringLine((msg_t *)msg);
-    Com_sprintf(v4, 0x2000, "%s", StringLine);
-    if ( *((_DWORD *)v4 + 2056) )
-    {
-      Com_Printf("Server settings:\n");
-      if ( *StringLine )
-      {
-LABEL_8:
-        v6 = 0;
-        while ( *StringLine )
-        {
-          if ( *StringLine == 92 )
-            ++StringLine;
-          v7 = *StringLine;
-          v8 = 0;
-          while ( v7 )
-          {
-            ArgList[v8++] = v7;
-            if ( v8 >= 1023 )
-              break;
-            v7 = *++StringLine;
-            if ( v7 == 92 )
-              break;
-          }
-          ArgList[v8] = 0;
-          *(_DWORD *)&v16.ipx[8] = ArgList;
-          if ( v6 )
-            *(_DWORD *)&v16.ipx[4] = "%s\n";
-          else
-            *(_DWORD *)&v16.ipx[4] = "%-24s";
-          Com_Printf(*(const char **)&v16.ipx[4], *(_DWORD *)&v16.ipx[8]);
-          if ( ++v6 >= 2 )
-          {
-            if ( *StringLine )
-              goto LABEL_8;
-            break;
-          }
-        }
-      }
-    }
-    len = strlen(v4);
-    Com_sprintf(&v4[len], 0x2000 - len, "\\");
-    if ( *((_DWORD *)v4 + 2056) )
-    {
-      Com_Printf("\nPlayers:\n");
-      Com_Printf("num: score: ping: name:\n");
-    }
-    *(_DWORD *)v19 = 0;
-    v9 = MSG_ReadStringLine((msg_t *)msg);
-    if ( *v9 )
-    {
-      do
-      {
-        len = strlen(v4);
-        /* off_5679D0 (0x005679D0) is "\\%s" in retail .rdata */
-        Com_sprintf(&v4[len], 0x2000 - len, "\\%s", v9);
-        if ( *((_DWORD *)v4 + 2056) )
-        {
-          v20 = 0;
-          v21 = 0;
-          sscanf(v9, "%d %d", &v21, &v20);
-          v10 = strchr(v9, 32);
-          if ( v10 && (v11 = strchr(v10 + 1, 32)) != 0 )
-            v12 = v11 + 1;
-          else
-            v12 = "unknown";
-          Com_Printf("%-2d   %-3d    %-3d   %s\n", *(_DWORD *)v19, v21, v20, v12);
-        }
-        v9 = MSG_ReadStringLine((msg_t *)msg);
-        v13 = *v9;
-        ++*(_DWORD *)v19;
-      }
-      while ( v13 );
-    }
-    len = strlen(v4);
-    Com_sprintf(&v4[len], 0x2000 - len, "\\");
-    if ( !sys_timeBaseInit )
-    {
-      sys_timeBase = timeGetTime();
-      sys_timeBaseInit = 1;
-    }
-    *((_DWORD *)v4 + 2053) = timeGetTime() - sys_timeBase;
-    v14 = *((_DWORD *)v4 + 2056);
-    qmemcpy(v4 + 0x2000, &from, 0x14u);
-    *((_DWORD *)v4 + 2055) = 0;
-    if ( v14 )
-      *((_DWORD *)v4 + 2057) = 1;
-  }
+	serverStatus = NULL;
+	for ( i = 0; i < MAX_SERVERSTATUSREQUESTS; i++ ) {
+		if ( NET_CompareAdr( from, cl_serverStatusList[i].address ) ) {
+			serverStatus = &cl_serverStatusList[i];
+			break;
+		}
+	}
+	if ( !serverStatus ) {
+		return;
+	}
+
+	s = MSG_ReadStringLine( (msg_t *)msg );
+	Com_sprintf( serverStatus->string, sizeof( serverStatus->string ), "%s", s );
+
+	/* the server cvars, printed as key/value pairs (two columns per line) */
+	if ( serverStatus->print ) {
+		Com_Printf( "Server settings:\n" );
+		while ( *s ) {
+			int col;
+			for ( col = 0; col < 2 && *s; col++ ) {
+				if ( *s == '\\' ) {
+					s++;
+				}
+				len = 0;
+				while ( *s ) {
+					info[len++] = *s;
+					if ( len >= MAX_INFO_STRING - 1 ) {
+						break;
+					}
+					s++;
+					if ( *s == '\\' ) {
+						break;
+					}
+				}
+				/* retail 0x00413520 terminates with no bound check; pointer store avoids the modern /GS range-check fast-fail */
+				*( info + len ) = '\0';
+				if ( col ) {
+					Com_Printf( "%s\n", info );
+				} else {
+					Com_Printf( "%-24s", info );
+				}
+			}
+		}
+	}
+
+	len = strlen( serverStatus->string );
+	Com_sprintf( &serverStatus->string[len], sizeof( serverStatus->string ) - len, "\\" );
+
+	if ( serverStatus->print ) {
+		Com_Printf( "\nPlayers:\n" );
+		Com_Printf( "num: score: ping: name:\n" );
+	}
+
+	playerNum = 0;
+	s = MSG_ReadStringLine( (msg_t *)msg );
+	while ( *s ) {
+		len = strlen( serverStatus->string );
+		Com_sprintf( &serverStatus->string[len], sizeof( serverStatus->string ) - len, "\\%s", s );
+		if ( serverStatus->print ) {
+			int score, ping;
+			char *sp;
+			const char *name;
+
+			score = ping = 0;
+			sscanf( s, "%d %d", &score, &ping );
+			sp = strchr( s, ' ' );
+			if ( sp && ( sp = strchr( sp + 1, ' ' ) ) != NULL ) {
+				name = sp + 1;
+			} else {
+				name = "unknown";
+			}
+			Com_Printf( "%-2d   %-3d    %-3d   %s\n", playerNum, score, ping, name );
+		}
+		s = MSG_ReadStringLine( (msg_t *)msg );
+		playerNum++;
+	}
+
+	len = strlen( serverStatus->string );
+	Com_sprintf( &serverStatus->string[len], sizeof( serverStatus->string ) - len, "\\" );
+
+	if ( !sys_timeBaseInit ) {
+		sys_timeBase = timeGetTime();
+		sys_timeBaseInit = 1;
+	}
+	serverStatus->time = timeGetTime() - sys_timeBase;
+	serverStatus->address = from;
+	serverStatus->pending = qfalse;
+	if ( serverStatus->print ) {
+		serverStatus->retrieved = qtrue;
+	}
 }
 
 /* ---- CL_LocalServers_f  0x00413710 ----  VERIFIED */
 void CL_LocalServers_f( void ) {
 	char *message;
 	int i, j, len;
-	netadr_t to;
+	struct { netadr_t to, packet; } addresses;
 
 	Com_Printf( "Scanning for servers on the local network...\n" );
 
@@ -2972,87 +2552,64 @@ void CL_LocalServers_f( void ) {
 		Com_Memset( &cls_localServers[i], 0, sizeof( cls_localServers[i] ) );
 		cls_localServers[i].visible = b;
 	}
-	Com_Memset( &to, 0, sizeof( to ) );
+	Com_Memset( &addresses.to, 0, sizeof( addresses.to ) );
 
 	message = "\377\377\377\377getinfo xxx";
 
 	for ( i = 0; i < 2; i++ ) {
 		for ( j = 0; j < NUM_SERVER_PORTS; j++ ) {
-			to.port = BigShort( (short)( PORT_SERVER + j ) );
-			to.type = NA_BROADCAST;
+			addresses.to.port = BigShort( (short)( PORT_SERVER + j ) );
+			addresses.to.type = NA_BROADCAST;
 
 			len = strlen( message );
-			NetProf_PrepProfiling( &pProf );
-			NET_SendPacket( NS_CLIENT, len, message, to );
+			memcpy(&addresses.packet, &addresses.to, sizeof(addresses.packet));
+			NetProf_PrepProfiling( &clc.pProf );
+			NET_SendPacket( NS_CLIENT, len, message, addresses.packet );
 			if ( net_profile->integer ) {
-				NetProf_PrepProfiling( &pProf );
-				NetProf_AddPacket( &pProf->send, len, qfalse );
+				NetProf_PrepProfiling( &clc.pProf );
+				NetProf_AddPacket( &clc.pProf->send, len, qfalse );
 			}
 		}
 	}
 }
 
 /* ---- CL_GlobalServers_f  0x00413890 ----  [CONFIRMED] */
-void __cdecl CL_GlobalServers_f()
+void __cdecl CL_GlobalServers_f( void )
 {
-  unsigned int v0;
-  char *v1;
-  char *v2;
-  unsigned __int32 v3;
-  signed __int32 v4;
-  bool v5;
-  char *v6;
-  cvar_t *Var;
-  netadr_t v8;
-  netadr_t a;
-  char Buffer[1024];
-  unsigned int v11;
-  unsigned int retaddr;
+	netadr_t to;
+	cvar_t   *fsRestrict;
+	char     command[1024];
+	char     *cmd;
+	int      i;
+	int      count;
 
-  v11 = retaddr ^ _security_cookie;
-  v0 = 3;
-  if ( cmd_argc >= 3 )
-  {
-    Com_Printf("Requesting servers from the master...\n");
-    NET_StringToAdr("codmaster.activision.com", &a);
-    cls_numglobalservers = -1;
-    cls_pingUpdateSource = 1;
-    a.type = NA_IP;
-    a.port = BigShort( 20510 );
-    v1 = &empty_string;
-    if ( (unsigned int)cmd_argc > 2 )
-      v1 = cmd_argv[2];
-    sprintf(Buffer, "getservers %s", v1);
-    v2 = &Buffer[strlen(Buffer)];
-    v3 = cmd_argc;
-    v4 = cmd_argc;
-    if ( cmd_argc > 3 )
-    {
-      while ( 1 )
-      {
-        v5 = v0 < v3;
-        v6 = &empty_string;
-        if ( v5 )
-          v6 = cmd_argv[v0];
-        v2 += sprintf(v2, " %s", v6);
-        if ( (int)++v0 >= v4 )
-          break;
-        v3 = cmd_argc;
-      }
-    }
-    Var = Cvar_FindVar("fs_restrict");
-    if ( Var )
-    {
-      if ( !((Var->value == 0.0) | __UNORDERED__(Var->value, 0.0)) )
-        sprintf(v2, " demo");
-    }
-    qmemcpy(&v8, &a, sizeof(v8));
-    NET_OutOfBandPrint(NS_SERVER, v8, Buffer);
-  }
-  else
-  {
-    Com_Printf("usage: globalservers <master# 0-1> <protocol> [keywords]\n");
-  }
+	if ( cmd_argc < 3 ) {
+		Com_Printf( "usage: globalservers <master# 0-1> <protocol> [keywords]\n" );
+		return;
+	}
+
+	Com_Printf( "Requesting servers from the master...\n" );
+
+	NET_StringToAdr( "codmaster.activision.com", &to );
+	cls_numglobalservers = -1;
+	cls_pingUpdateSource = AS_GLOBAL;
+	to.type = NA_IP;
+	to.port = BigShort( 20510 );
+
+	sprintf( command, "getservers %s", Cmd_Argv( 2 ) );
+	cmd = command + strlen( command );
+
+	count = Cmd_Argc();
+	for ( i = 3; i < count; i++ ) {
+		cmd += sprintf( cmd, " %s", Cmd_Argv( i ) );
+	}
+
+	fsRestrict = Cvar_FindVar( "fs_restrict" );
+	if ( fsRestrict && fsRestrict->value != 0.0f ) {
+		sprintf( cmd, " demo" );
+	}
+
+	NET_OutOfBandPrint( NS_SERVER, to, command );
 }
 
 /* ---- CL_GetPing  0x004139F0 ----  VERIFIED */
@@ -3138,146 +2695,67 @@ int __cdecl CL_GetPingQueueCount()
 }
 
 /* ---- CL_GetFreePing  0x00413BD0 ----  [HIGH] */
-void *__cdecl CL_GetFreePing()
+ping_t *__cdecl CL_GetFreePing( void )
 {
-  void *result;
-  int i;
-  int v2;
-  _DWORD *v3;
-  signed int v4;
-  int v5;
-  int v6;
-  int v7;
-  _DWORD *v8;
-  int v9;
-  _DWORD *v10;
-  int v11;
-  _DWORD *v12;
-  int v13;
-  _DWORD *v14;
-  int v15;
-  _DWORD *v16;
-  int v17;
-  _DWORD *v18;
-  int v19;
-  _DWORD *v20;
+	ping_t *ping;
+	ping_t *oldest;
+	int     i, time, oldestTime;
 
-  result = &unk_15CA660;
-  for ( i = 0; i < 16; ++i )
-  {
-    if ( !*((_WORD *)result + 9) )
-      goto LABEL_26;
-    v2 = *((_DWORD *)result + 6);
-    if ( !v2 )
-      v2 = cls_realtime - *((_DWORD *)result + 5);
-    if ( v2 >= 500 )
-    {
-LABEL_26:
-      *((_WORD *)result + 9) = 0;
-      return result;
-    }
-    result = (char *)result + 1052;
-  }
-  v3 = &unk_15CA660;
-  result = &unk_15CA660;
-  v4 = 0x80000000;
-  v5 = 2;
-  do
-  {
-    v6 = v3[5];
-    if ( cls_realtime - v6 > v4 )
-    {
-      v4 = cls_realtime - v6;
-      result = v3;
-    }
-    v7 = v3[268];
-    v8 = v3 + 263;
-    if ( cls_realtime - v7 > v4 )
-    {
-      v4 = cls_realtime - v7;
-      result = v8;
-    }
-    v9 = v8[268];
-    v10 = v8 + 263;
-    if ( cls_realtime - v9 > v4 )
-    {
-      v4 = cls_realtime - v9;
-      result = v10;
-    }
-    v11 = v10[268];
-    v12 = v10 + 263;
-    if ( cls_realtime - v11 > v4 )
-    {
-      v4 = cls_realtime - v11;
-      result = v12;
-    }
-    v13 = v12[268];
-    v14 = v12 + 263;
-    if ( cls_realtime - v13 > v4 )
-    {
-      v4 = cls_realtime - v13;
-      result = v14;
-    }
-    v15 = v14[268];
-    v16 = v14 + 263;
-    if ( cls_realtime - v15 > v4 )
-    {
-      v4 = cls_realtime - v15;
-      result = v16;
-    }
-    v17 = v16[268];
-    v18 = v16 + 263;
-    if ( cls_realtime - v17 > v4 )
-    {
-      v4 = cls_realtime - v17;
-      result = v18;
-    }
-    v19 = v18[268];
-    v20 = v18 + 263;
-    if ( cls_realtime - v19 > v4 )
-    {
-      v4 = cls_realtime - v19;
-      result = v20;
-    }
-    v3 = v20 + 263;
-    --v5;
-  }
-  while ( v5 );
-  return result;
+	ping = cl_pinglist;
+	for ( i = 0; i < MAX_PINGREQUESTS; i++, ping++ ) {
+		/* an unused slot, or one whose reply has arrived, or that has waited too long */
+		if ( ping->adr.port ) {
+			if ( !ping->time ) {
+				if ( cls_realtime - ping->start < 500 ) {
+					continue;
+				}
+			} else if ( ping->time < 500 ) {
+				continue;
+			}
+		}
+
+		ping->adr.port = 0;
+		return ping;
+	}
+
+	/* all slots busy: recycle the one that has been outstanding longest */
+	ping = cl_pinglist;
+	oldest = cl_pinglist;
+	oldestTime = (int)0x80000000;
+	for ( i = 0; i < MAX_PINGREQUESTS; i++, ping++ ) {
+		time = cls_realtime - ping->start;
+		if ( time > oldestTime ) {
+			oldestTime = time;
+			oldest = ping;
+		}
+	}
+
+	return oldest;
 }
 
 /* ---- CL_Ping_f  0x00413D00 ----  [CONFIRMED] */
-void __cdecl CL_Ping_f()
+void __cdecl CL_Ping_f( void )
 {
-  _DWORD *FreePing;
-  _BYTE v1[24];
-  int v2;
-  netadr_t a;
-  unsigned int v4;
-  unsigned int retaddr;
+	netadr_t adr;
+	ping_t   *ping;
 
-  v4 = retaddr ^ _security_cookie;
-  if ( cmd_argc == 2 )
-  {
-    memset(&a, 0, sizeof(a));
-    if ( NET_StringToAdr(cmd_argv[1], &a) )
-    {
-      FreePing = CL_GetFreePing();
-      v2 = 0;
-      *(_DWORD *)&v1[20] = 0;
-      qmemcpy(FreePing, &a, 0x14u);
-      FreePing[5] = cls_realtime;
-      FreePing[6] = 0;
-      qmemcpy(v1, &a, 0x14u);
-      CL_SetServerInfoByAddress(*(netadr_t *)v1, *(const char **)&v1[20], v2);
-      qmemcpy(&v1[4], &a, 0x14u);
-      NET_OutOfBandPrint(NS_CLIENT, *(netadr_t *)&v1[4], "getinfo xxx");
-    }
-  }
-  else
-  {
-    Com_Printf("usage: ping [server]\n");
-  }
+	if ( cmd_argc != 2 ) {
+		Com_Printf( "usage: ping [server]\n" );
+		return;
+	}
+
+	memset( &adr, 0, sizeof( adr ) );
+	if ( !NET_StringToAdr( cmd_argv[1], &adr ) ) {
+		return;
+	}
+
+	ping = CL_GetFreePing();
+	memcpy( &ping->adr, &adr, sizeof( netadr_t ) );
+	ping->start = cls_realtime;
+	ping->time = 0;
+
+	CL_SetServerInfoByAddress( ping->adr, NULL, 0 );
+	NET_OutOfBandPrint( NS_CLIENT, adr, "getinfo xxx" );
 }
 
 /* ---- CL_UpdateVisiblePings_f  0x00413DE0 ----  VERIFIED */
@@ -3336,7 +2814,7 @@ qboolean CL_UpdateVisiblePings_f( int source ) {
 								break;
 							}
 						}
-						Com_Memcpy( &cl_pinglist[j].adr, &server[i].adr,
+						memcpy( &cl_pinglist[j].adr, &server[i].adr,
 									sizeof( netadr_t ) );
 						cl_pinglist[j].start = cls_realtime;
 						cl_pinglist[j].time = 0;
@@ -3376,41 +2854,26 @@ qboolean CL_UpdateVisiblePings_f( int source ) {
 }
 
 /* ---- CL_ServerStatus_f  0x004140F0 ----  [CONFIRMED] */
-void __cdecl CL_ServerStatus_f()
+void __cdecl CL_ServerStatus_f( void )
 {
-  const char *v0;
-  _DWORD *ServerStatus;
-  _BYTE v2[24];
-  netadr_t a;
-  unsigned int v4;
-  unsigned int retaddr;
+	netadr_t to;
+	const char *server;
+	serverStatus_t *serverStatus;
 
-  v4 = retaddr ^ _security_cookie;
-  Com_Memset((int *)&a, 0, 0x14u);
-  if ( cmd_argc == 2 )
-  {
-    v0 = cmd_argv[1];
-  }
-  else
-  {
-    if ( cls_state != CA_ACTIVE || clc_demoplaying )
-    {
-      Com_Printf("Not connected to a server.\n");
-      Com_Printf("Usage: serverstatus [server]\n");
-      return;
-    }
-    v0 = cls_servername;
-  }
-  if ( NET_StringToAdr(v0, &a) )
-  {
-    qmemcpy(v2, &a, 0x14u);
-    NET_OutOfBandPrint(NS_CLIENT, *(netadr_t *)v2, "getstatus");
-    qmemcpy(&v2[4], &a, 0x14u);
-    ServerStatus = (_DWORD *)CL_GetServerStatus(*(netadr_t *)&v2[4]);
-    qmemcpy(ServerStatus + 2048, &a, 0x14u);
-    ServerStatus[2056] = 1;
-    ServerStatus[2055] = 1;
-  }
+	Com_Memset( &to, 0, sizeof( to ) );
+
+if (cmd_argc != 2) { if (cls_state != CA_ACTIVE || clc_demoplaying) { Com_Printf( "Not connected to a server.\n" ); Com_Printf( "Usage: serverstatus [server]\n" ); return; } server=cls_servername; } else server=cmd_argv[1];
+
+	if ( !NET_StringToAdr( server, &to ) ) {
+		return;
+	}
+
+	NET_OutOfBandPrint( NS_CLIENT, to, "getstatus" );
+
+	serverStatus = CL_GetServerStatus( to );
+	serverStatus->address = to;
+	serverStatus->print = qtrue;
+	serverStatus->pending = qtrue;
 }
 
 /* ---- CL_ShowIP_f  0x004141E0 ----  [CONFIRMED] */
@@ -3421,10 +2884,10 @@ void __cdecl CL_ShowIP_f()
 
 /* ---- CL_GetServerIPAddress  0x004141F0 ----  VERIFIED */
 char *CL_GetServerIPAddress( void ) {
-	char *s = (char *)unk_87A710;
+	char *s = (char *)cl_serverIPAddress;
 
 	if ( cls_state < CA_CONNECTED ) {
-		Com_Memset( s, 0, 128 );
+		memset( s, 0, 128 );
 		return s;
 	}
 
@@ -3442,25 +2905,32 @@ qboolean __cdecl CL_CDKeyValidate( const char *key, const char *checksum )
 {
 	unsigned int crc;
 	int i, bit;
-	char buffer[16];
+	char chs[8];
 
 	crc = 0;
-	for ( i = 0; i < 16; ++i ) {
-		crc ^= (unsigned int) (int) (signed char) key[i];
-		for ( bit = 8; bit; --bit ) {
+	for ( i = 0; i < 16; i++ ) {
+		crc ^= key[i];
+		for ( bit = 0; bit < 8; bit++ ) {
 			if ( crc & 1 ) {
-				crc ^= 0x14002u;
+				crc = ( crc ^ 0x14002 ) >> 1;
+			} else {
+				crc >>= 1;
 			}
-			crc >>= 1;
 		}
 	}
 
-	Com_sprintf( buffer, sizeof( buffer ), "%04x", crc );
+	/* retail: CRT sprintf into an 8-byte buffer; crc stays below 0x1000000, so at most 6 digits */
+	sprintf( chs, "%04x", crc );
+
+	if ( checksum && !Q_stricmp( chs, checksum ) ) {
+		return qtrue;
+	}
 
 	if ( !checksum ) {
 		return qtrue;
 	}
-	return Q_stricmpn( checksum, buffer, 99999 ) == 0 ? qtrue : qfalse;
+
+	return qfalse;
 }
 
 /* ---- CL_SetupForNewServerMap  0x004142F0 ----  VERIFIED */
@@ -3476,7 +2946,6 @@ void CL_SetupForNewServerMap( const char *mapname, const char *gametype )
 void CL_AddDebugString( const float *origin, const float *color, float scale,
                         const char *text, int fromServer )
 {
-	int index;
 	char *rec;
 	float *str;
 
@@ -3484,20 +2953,18 @@ void CL_AddDebugString( const float *origin, const float *color, float scale,
 		return;
 	}
 
-	index = cls_debugStringCount;
 	cls_debugStringCapacity = 256;
-	if ( index + 1 > 256 ) {
+	if ( cls_debugStringCount + 1 > 256 ) {
 		return;
 	}
 
-	if ( !dword_15CA640 ) {
-		dword_15CA640 = Z_MallocInternal( 0x8000 );
+	if ( !cls_debugStrings ) {
+		cls_debugStrings = Z_MallocInternal( 0x8000 );
 		cls_debugStringFromServer = Z_MallocInternal( cls_debugStringCapacity );
-		index = 0;
 		cls_debugStringCount = 0;
 	}
 
-	rec = (char *)dword_15CA640 + 128 * index;
+	rec = (char *)cls_debugStrings + 128 * cls_debugStringCount;
 	str = (float *)rec;
 
 	str[0] = origin[0];
@@ -3523,8 +2990,7 @@ void CL_AddDebugLine( const float *start, const float *end, const float *color,
                       int depthTest, int duration, int fromServer )
 {
 	int index;
-	char *rec;
-	float *line;
+	struct { float start[3]; float end[3]; float color[4]; int depthTest; } *line;
 
 	if ( !cls_rendererStarted ) {
 		return;
@@ -3536,31 +3002,25 @@ void CL_AddDebugLine( const float *start, const float *end, const float *color,
 		return;
 	}
 
-	if ( !dword_15CA650 ) {
-		dword_15CA650 = Z_MallocInternal( 0x2C000 );
+	if ( !cls_debugLines ) {
+		cls_debugLines = Z_MallocInternal( 0x2C000 );
 		cls_debugLineFromServer = Z_MallocInternal( cls_debugLineCapacity );
 		cls_debugLineDurations = Z_MallocInternal( 4 * cls_debugLineCapacity );
 		index = 0;
 		cls_debugLineCount = 0;
 	}
 
-	rec = (char *)dword_15CA650 + 44 * index;
-	line = (float *)rec;
+	line = (void*)((char*)cls_debugLines + 44 * index);
 
-	line[0] = start[0];
-	line[1] = start[1];
-	line[2] = start[2];
+	VectorCopy( start, line->start );
+	VectorCopy( end, line->end );
 
-	line[3] = end[0];
-	line[4] = end[1];
-	line[5] = end[2];
+	line->color[0] = color[0];
+	line->color[1] = color[1];
+	line->color[2] = color[2];
+	line->color[3] = color[3];
 
-	line[6] = color[0];
-	line[7] = color[1];
-	line[8] = color[2];
-	line[9] = color[3];
-
-	*(int *)( rec + 0x28 ) = depthTest;
+	line->depthTest = depthTest;
 
 	((unsigned char *)cls_debugLineFromServer)[cls_debugLineCount] = (unsigned char)fromServer;
 	((int *)cls_debugLineDurations)[cls_debugLineCount] = duration;
@@ -3571,56 +3031,42 @@ void CL_AddDebugLine( const float *start, const float *end, const float *color,
 void CL_FlushDebugData( int fromServer )
 {
 	int i;
-	int stringCount;
-	int lineCount;
-	unsigned char *strFromServer;
 
 	if ( !cls_rendererStarted ) {
 		return;
 	}
 
-	if ( dword_15CA640 ) {
-		stringCount = cls_debugStringCount;
-		i = 0;
-		if ( stringCount > 0 ) {
-			strFromServer = (unsigned char *)cls_debugStringFromServer;
-			do {
-				if ( strFromServer[i] == fromServer ) {
-					cls_debugStringCount = stringCount - 1;
-					strFromServer[i] = strFromServer[stringCount - 1];
-					memcpy( (char *)dword_15CA640 + 128 * i,
-							(char *)dword_15CA640 + 128 * cls_debugStringCount, 0x80 );
-					strFromServer = (unsigned char *)cls_debugStringFromServer;
-					stringCount = cls_debugStringCount;
-				} else {
-					++i;
-				}
-			} while ( i < stringCount );
+	if ( cls_debugStrings ) {
+		for ( i = 0; i < cls_debugStringCount; ) {
+			if ( ( (unsigned char *)cls_debugStringFromServer )[i] == fromServer ) {
+				--cls_debugStringCount;
+				( (unsigned char *)cls_debugStringFromServer )[i] =
+					( (unsigned char *)cls_debugStringFromServer )[cls_debugStringCount];
+				memcpy( (char *)cls_debugStrings + 128 * i,
+						(char *)cls_debugStrings + 128 * cls_debugStringCount, 128 );
+			} else {
+				++i;
+			}
 		}
-		dword_1432920( dword_15CA640, stringCount );
+		re_LocateDebugStrings( cls_debugStrings, cls_debugStringCount );
 	}
 
-	if ( dword_15CA650 ) {
-		lineCount = cls_debugLineCount;
-		i = 0;
-		if ( lineCount > 0 ) {
-			do {
-				if ( ( (unsigned char *)cls_debugLineFromServer )[i] == fromServer
-					&& --( (int *)cls_debugLineDurations )[i] <= 0 ) {
-					--cls_debugLineCount;
-					( (unsigned char *)cls_debugLineFromServer )[i] =
-						( (unsigned char *)cls_debugLineFromServer )[cls_debugLineCount];
-					( (int *)cls_debugLineDurations )[i] =
-						( (int *)cls_debugLineDurations )[cls_debugLineCount];
-					memcpy( (char *)dword_15CA650 + 44 * i,
-							(char *)dword_15CA650 + 44 * cls_debugLineCount, 0x2C );
-				} else {
-					++i;
-				}
-				lineCount = cls_debugLineCount;
-			} while ( i < lineCount );
+	if ( cls_debugLines ) {
+		for ( i = 0; i < cls_debugLineCount; ) {
+			if ( ( (unsigned char *)cls_debugLineFromServer )[i] == fromServer
+				&& --( (int *)cls_debugLineDurations )[i] <= 0 ) {
+				--cls_debugLineCount;
+				( (unsigned char *)cls_debugLineFromServer )[i] =
+					( (unsigned char *)cls_debugLineFromServer )[cls_debugLineCount];
+				( (int *)cls_debugLineDurations )[i] =
+					( (int *)cls_debugLineDurations )[cls_debugLineCount];
+				memcpy( (char *)cls_debugLines + 44 * i,
+						(char *)cls_debugLines + 44 * cls_debugLineCount, 44 );
+			} else {
+				++i;
+			}
 		}
-		dword_1432924( dword_15CA650, lineCount );
+		re_LocateDebugLines( cls_debugLines, cls_debugLineCount );
 	}
 }
 
@@ -3629,20 +3075,22 @@ void __cdecl CL_UpdateDebugData()
 {
   if ( cls_rendererStarted )
   {
-    if ( dword_15CA640 )
-      dword_1432920(dword_15CA640, cls_debugStringCount);
-    if ( dword_15CA650 )
-      dword_1432924(dword_15CA650, cls_debugLineCount);
+    if ( cls_debugStrings )
+      re_LocateDebugStrings(cls_debugStrings, cls_debugStringCount);
+    if ( cls_debugLines )
+      re_LocateDebugLines(cls_debugLines, cls_debugLineCount);
   }
 }
 
 /* ---- CL_ShutdownDebugData  0x00414680 ----  [CONFIRMED] */
-void __cdecl CL_ShutdownDebugData(void *msg)
+/* Takes no arguments: the `push edi` before its only call (0x0041281F in
+ * CL_Shutdown) is a register save, not a parameter. */
+void __cdecl CL_ShutdownDebugData( void )
 {
-  if ( dword_15CA650 )
+  if ( cls_debugLines )
   {
-    free(dword_15CA650);
-    dword_15CA650 = 0;
+    free(cls_debugLines);
+    cls_debugLines = 0;
   }
   if ( cls_debugLineFromServer )
   {
@@ -3654,31 +3102,31 @@ void __cdecl CL_ShutdownDebugData(void *msg)
     free(cls_debugLineDurations);
     cls_debugLineDurations = 0;
   }
-  if ( dword_15CA640 )
+  if ( cls_debugStrings )
   {
-    free(dword_15CA640);
-    dword_15CA640 = 0;
+    free(cls_debugStrings);
+    cls_debugStrings = 0;
   }
   if ( cls_debugStringFromServer )
+  {
     free(cls_debugStringFromServer);
-  cls_debugStringCapacity = 0;
-  cls_debugStringCount = 0;
-  dword_15CA640 = 0;
-  cls_debugStringFromServer = 0;
-  cls_debugLineCapacity = 0;
-  cls_debugLineCount = 0;
-  dword_15CA650 = 0;
-  cls_debugLineFromServer = 0;
-  cls_debugLineDurations = 0;
+    cls_debugStringFromServer = 0;
+  }
+  memset( &cls.debug, 0, sizeof( cls.debug ) );
 }
 
 /* ---- CL_ForwardCommandToServer  0x0040F0C0 ----  [CONFIRMED] */
 void CL_ForwardCommandToServer( const char *string ) {
 	const char *cmd;
 
-	cmd = Cmd_Argc() ? Cmd_Argv( 0 ) : "";
+	/* Cmd_Argv( 0 ) inlined by hand in retail's shape (the arg >= argc test first) */
+	if ( 0 >= (unsigned int)cmd_argc ) {
+		cmd = "";
+	} else {
+		cmd = cmd_argv[0];
+	}
 
-	if ( Cmd_Argc() && cmd[0] == '-' ) {
+	if ( cmd[0] == '-' ) {
 		return;
 	}
 
@@ -3694,13 +3142,6 @@ void CL_ForwardCommandToServer( const char *string ) {
 	}
 }
 
-extern unsigned char chan[32832];       /* 0x015EF020 clc.netchan */
-extern int  clc_lastPacketTime;
-extern int  clc_reliableAcknowledge;
-extern int  clc_serverMessageSequence;
-extern int  clc_reliableSequence;
-extern int  clc_demorecording;
-extern int  clc_demowaiting;
 
 extern qboolean    NET_CompareAdr( netadr_t a, netadr_t b );
 extern qboolean    Netchan_Process( netchan_t *chan, msg_t *msg );
@@ -3712,10 +3153,6 @@ extern void        CL_WriteDemoMessage( msg_t *msg, int headerBytes );
 /* ---- CL_PacketEvent  0x00410FF0 ----  VERIFIED */
 void CL_PacketEvent( netadr_t from, msg_t *msg ) {
 	int headerBytes;
-
-	if ( !msg ) {
-		return;
-	}
 
 	if ( msg->cursize >= 4 && *(int *)msg->data == -1 ) {
 		CL_ConnectionlessPacket( from, msg );
@@ -3731,7 +3168,7 @@ void CL_PacketEvent( netadr_t from, msg_t *msg ) {
 		return;
 	}
 
-	if ( !NET_CompareAdr( from, *(netadr_t *)( chan + 8 ) ) ) {
+	if ( !NET_CompareAdr( from, clc.netchan.remoteAddress ) ) {
 		Com_DPrintf( "%s:sequenced packet without connection\n",
 		             NET_AdrToString( from ) );
 		return;
@@ -3739,13 +3176,13 @@ void CL_PacketEvent( netadr_t from, msg_t *msg ) {
 
 	clc_lastPacketTime = cls_realtime;
 
-	if ( !Netchan_Process( (netchan_t *) chan, msg ) ) {
+	if ( !Netchan_Process( &clc.netchan, msg ) ) {
 		return;
 	}
 
-	clc_serverMessageSequence = *(int *)msg->data;
-
 	headerBytes = msg->readcount;
+
+	clc_serverMessageSequence = *(int *)msg->data;
 	clc_reliableAcknowledge = MSG_ReadLong( msg );
 	if ( clc_reliableAcknowledge < clc_reliableSequence - 64 ) {
 		clc_reliableAcknowledge = clc_reliableSequence;
@@ -3770,14 +3207,10 @@ void CL_Frame( int msec ) {
 	extern cvar_t *cl_avidemo;              /* 0x0143285C */
 	extern cvar_t *cl_forceavidemo;         /* 0x0155F23C */
 
-	extern int cls_cddialog;                /* 0x0155F2C8 */
 	extern int xanim_activePoolSlot;
 #define xanim_activePoolSlot xanim_activePoolSlot
-	extern int dword_8E3C48;                /* 0x008E3C48, reliable-cmd probe gate */
-	extern int cls_frametime;               /* 0x0155F3DC, msec mirror */
-	extern int cls_realFrametime;               /* 0x0155F3E4, msec mirror -- Con_RunConsole reads this one */
+	extern int sys_monkeySpank;                /* 0x008E3C48, reliable-cmd probe gate */
 	extern int CL_handle;                   /* 0x0057C118, current cinematic handle */
-	extern int con_conspeed;                /* 0x0142F5E0-ish; scr_conspeed, set by Con_Init */
 
 	extern void CL_ChangeReliableCommand( void );   /* 0x0040E340 */
 	extern void CL_CheckUserinfo( void );           /* 0x004111C0 */
@@ -3789,8 +3222,14 @@ void CL_Frame( int msec ) {
 	extern void MSS_Update( void );                 /* 0x0044F920 */
 	extern int CIN_RunCinematic( int handle );      /* 0x00407680, returns e_status */
 	extern void Con_RunConsole( void );             /* 0x0040A260 */
+	extern void SCR_DebugGraph( float value, int color );   /* 0x00416BC0 */
 
-	if ( !com_cl_running || !com_cl_running->integer ) {
+	/* Retail 0x00411281..0x00411440 dereferences every cvar below without a
+	 * NULL test (all are registered in Com_Init / CL_Init before cl_running
+	 * is set), calls VM_Call on uivm untested (0x004112E2; CL_StartHunkUsers
+	 * has started the UI whenever cl_running is set) and calls Con_RunConsole
+	 * unconditionally. */
+	if ( !com_cl_running->integer ) {
 		return;
 	}
 
@@ -3798,43 +3237,45 @@ void CL_Frame( int msec ) {
 
 	if ( cls_cddialog ) {
 		cls_cddialog = 0;
-		if ( uivm ) {
-			VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_NEED_CD );
-		}
+		VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_NEED_CD );
 	} else if ( cls_state == CA_DISCONNECTED
 	         && !( cls_keyCatchers & KEYCATCH_UI )
-	         && com_sv_running && !com_sv_running->integer ) {
+	         && !com_sv_running->integer ) {
 		MSS_StopSounds( 0 );
-		if ( uivm ) {
-			VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
-		}
+		VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
 	}
 
-	if ( cl_avidemo && cl_avidemo->integer && msec ) {
-		if ( cls_state == CA_ACTIVE
-		  || ( cl_forceavidemo && cl_forceavidemo->integer ) ) {
+	if ( cl_avidemo->integer && msec ) {
+		if ( cls_state == CA_ACTIVE || cl_forceavidemo->integer ) {
 			Cbuf_ExecuteText( EXEC_NOW, "screenshot silent\n" );
 		}
-		/* flt_569090 = 0x447A0000 = 1000.0f, read out of .rdata */
-		msec = (int) ( 1000.0f / cl_avidemo->integer
-		               * ( com_timescale ? com_timescale->value : 1.0f ) );
+		/* 1000.0f (0x447A0000) is a pooled .rdata literal in retail; retail
+		 * fild's the integer straight into the divide (0x00411349) with no
+		 * rounding to float first, hence the rfloat (double in the modern build);
+		 * the FCAST keeps VC7 from folding the constant to the end. */
+		msec = (int) ( FCAST( (rfloat)1000.0f / cl_avidemo->integer ) * com_timescale->value );
 		if ( !msec ) {
 			msec = 1;
 		}
 	}
 
-	if ( dword_8E3C48 && ( cls_framecount & 0xFF ) == 0 ) {
+	if ( sys_monkeySpank && ( cls_framecount & 0xFF ) == 0 ) {
 		if ( rand() * ( 1.0f / 32768.0f ) < 0.1 ) {
 			CL_ChangeReliableCommand();
 		}
 	}
 
-	cls_realtime += msec;
 	cls_realFrametime = msec;
 	cls_frametime = msec;
+	cls_realtime += cls_frametime;
 
-	if ( cl_timegraph && ((cvar_t *)cl_timegraph)->integer ) {
-		/* TODO: omitted. The ring at 0x0087A7D0 is 8 KB and the header reserves four bytes for it. */
+	/* 0x004113C9..0x004113F7: SCR_DebugGraph inlined -- push msec * 0.25f
+	 * (flt_568ED0) with color 0 into the 1024-entry ring.  msec is the value
+	 * after the avidemo adjustment above.  Retail's stores come after the
+	 * cl_timegraph->integer load only because cls and the graph ring are
+	 * single structs there (the tree splits both into separate globals). */
+	if ( ((cvar_t *)cl_timegraph)->integer ) {
+		SCR_DebugGraph( msec * 0.25f, 0 );
 	}
 
 	CL_CheckUserinfo();
@@ -3852,9 +3293,7 @@ void CL_Frame( int msec ) {
 		CIN_RunCinematic( CL_handle );
 	}
 
-	if ( con_conspeed ) {
-		Con_RunConsole();
-	}
+	Con_RunConsole();
 
 	cls_framecount++;
 }
@@ -3864,7 +3303,9 @@ void CL_Init( void ) {
 	Com_Printf( "----- Client Initialization -----\n" );
 
 	Con_Init();
-
+	/* 0x00411E71..0x00411E7F: rep stosd of 0x4B236 dwords over cl_active --
+	 * the same body as CL_ClearState 0x0040EF70. */
+	CL_ClearState();
 	cls_state = CA_DISCONNECTED;
 	cls_realtime = 0;
 
@@ -3959,6 +3400,13 @@ void CL_Init( void ) {
 	cl_serverloadgametype = Cvar_Get( "cl_serverloadgametype", "", CVAR_ROM );
 	cl_serverloadwaiting = Cvar_Get( "cl_serverloadwaiting", "0", CVAR_ROM );
 
+	/* cls.autoupdateServerNames[5][64], 0x00412575..0x004125F4: strncpy 63 then byte 63 = 0 */
+	strncpy( cls_autoupdateServerNames_0_, "au2cod1.activision.com", 63 ); cls_autoupdateServerNames_0_[63] = 0;
+	strncpy( cls_autoupdateServerNames_1_, "au2cod2.activision.com", 63 ); cls_autoupdateServerNames_1_[63] = 0;
+	strncpy( cls_autoupdateServerNames_2_, "au2cod3.activision.com", 63 ); cls_autoupdateServerNames_2_[63] = 0;
+	strncpy( cls_autoupdateServerNames_3_, "au2cod4.activision.com", 63 ); cls_autoupdateServerNames_3_[63] = 0;
+	strncpy( cls_autoupdateServerNames_4_, "au2cod5.activision.com", 63 ); cls_autoupdateServerNames_4_[63] = 0;
+
 	Cmd_AddCommand( "cmd", CL_ForwardToServer_f );
 	Cmd_AddCommand( "configstrings", CL_Configstrings_f );
 	Cmd_AddCommand( "clientinfo", CL_Clientinfo_f );
@@ -3988,9 +3436,14 @@ void CL_Init( void ) {
 	Cmd_AddCommand( "cubemapShot", CL_CubeMapShot_f );
 	Cmd_AddCommand( "localizeSoundAliasFiles", Com_WriteLocalizedSoundAliasFiles );
 
+	/* 0x004127A0..0x004127AC -- CL_Init is CL_CheckAutoUpdate's only caller */
+	autoupdateChecked = 0;
+	autoupdateStarted = 0;
+	CL_CheckAutoUpdate();
+
 	CL_InitRef();
 	SCR_Init();
-
+	Cbuf_Execute();     /* 0x004127BB */
 	Cvar_Set2( "cl_running", "1", qtrue );
 
 	Com_Printf( "----- Client Initialization Complete -----\n" );
@@ -4008,6 +3461,9 @@ void CL_Shutdown( void ) {
 	}
 	recursive = 1;
 
+	/* 0x0041281F: CL_ShutdownDebugData -- its only caller. */
+	CL_ShutdownDebugData();
+
 	/* 0x00412826: retail disconnects the client before tearing it down -- push 1;
 	 * call CL_Disconnect, right after CL_ShutdownDebugData and before
 	 * CL_ShutdownCGame.  CL_Disconnect(qtrue) queues the "disconnect" reliable
@@ -4017,12 +3473,14 @@ void CL_Shutdown( void ) {
 	CL_Disconnect( qtrue );
 
 	CL_ShutdownCGame();
+	MSS_Shutdown();     /* 0x00412833 */
 	/* Retail inlines CL_ShutdownRef here -- 0x00412838 loads the refexport
 	 * slot and 0x00412841 is `push 1`, so RE_Shutdown(1) reaches GLimp_Shutdown
 	 * and WG_RestoreGamma.  CL_Shutdown is the ONLY site in the binary passing
 	 * 1; every other caller passes 0 and leaves the window up. */
 	CL_ShutdownRef();
 	CL_ShutdownUI();
+	CL_ShutdownInput(); /* 0x0041286C -- its only caller */
 
 	Cmd_RemoveCommand( "cmd" );
 	Cmd_RemoveCommand( "configstrings" );
@@ -4058,9 +3516,9 @@ void CL_Shutdown( void ) {
 
 	Cvar_Set2( "cl_running", "0", qtrue );
 
-	cls_state = CA_DISCONNECTED;
-	cls_keyCatchers = 0;
-
 	recursive = 0;
+
+	/* 0x004129C1..0x004129DC: one rep stosd over all of clientStatic_t */
+	memset( &cls, 0, sizeof( cls ) );
 	Com_Printf( "-----------------------\n" );
 }

@@ -1,17 +1,4 @@
-/*
- * g_missile_mp.c -- the multiplayer game module's missile simulation.
- *
- * RTCW's game/g_missile.c with everything single-player stripped out and the
- * bounce reworked: G_MissileLandAngles is new (it rolls a grenade's angular
- * trajectory onto the surface it landed on), G_BounceMissile grew the
- * come-to-rest test that calls it, and the fire functions read their damage,
- * radius and speed out of weaponInfo_t instead of a switch on the weapon id.
- * G_MissileTrace never became a function here -- every trace is issued inline.
- *
- * Function order is binary order (0x200295D0 .. 0x2002A7A0).
- *
- * @fidelity: likely
- */
+// g_missile_mp.c -- grenade and rocket movement, bouncing and impacts
 
 #include "g_local.h"
 #include "bg_public.h"
@@ -22,62 +9,22 @@
 
 /* Declarations that belong in a shared header. */
 
-#define ENTITYNUM_WORLD             ( MAX_GENTITIES - 2 )
-
-/* entityState_t.eType. */
-#define ET_GENERAL                  0
-#define ET_MISSILE                  4
-
-/* trajectory_t.trType.  5 is the one fire_grenade uses; it is RTCW's
- * TR_GRAVITY_PAUSED slot, not TR_GRAVITY. */
-#define TR_STATIONARY               0
-#define TR_LINEAR                   2
-#define TR_GRAVITY                  5
-
-/* entityState_t.eFlags.  RTCW's EF_BOUNCE / EF_BOUNCE_HALF, moved up into the
- * top byte (G_BounceMissile 0x200298D2 / 0x200298F6). */
+/* entityState_t.eFlags; EF_BOUNCE / EF_BOUNCE_HALF live in the top byte */
 #define EF_BOUNCE                   0x01000000
 #define EF_BOUNCE_HALF              0x02000000
 
-/* Raised on an exploded missile so the client stops drawing the projectile
- * (G_ExplodeMissile 0x20029F4F). */
-#define EF_EXPLODED                 0x00000100
-/* Raised by fire_rocket only (0x2002A80D). */
+/* set by fire_rocket only */
 #define EF_ROCKET                   0x00010000
 
-/* entityShared_t.svFlags bits this unit sets.  0x88 is what a live missile is
- * spawned with; G_ExplodeMissile ors in 8 again on the corpse. */
-#define SVF_MISSILE                 0x00000088
-#define SVF_BROADCAST               0x00000008
+/* entityShared_t.svFlags a live missile is spawned with; G_ExplodeMissile ors
+ * in SVF_BROADCAST again on the corpse. */
+#define SVF_MISSILE                 ( SVF_USE_CURRENT_ORIGIN | SVF_BROADCAST )
 
-/* gentity_t.flags: a grenade whose contents are ignored by the missile trace
- * (G_RunMissile 0x2002A26F).  The original name is not recovered; this one
- * is inferred. */
-#define FL_MISSILE_PASSTHRU         0x00010000
-
-#define CONTENTS_WATER              0x00000020
-#define CONTENTS_BODY               0x02000000
-#define SURF_NOIMPACT               0x00000010
-
-/* trace_t.surfaceFlags carries the surface type in bits 20..24. */
-#define SURF_TYPE_SHIFT             20
-#define SURF_TYPE_MASK              0x1F
-#define SURF_TYPE_WATER             0x14
-
-#define MASK_MISSILESHOT            0x02802091      /* fire_grenade 0x2002A5F4 */
-#define MASK_GRENADE_TRACE          0x00000011      /* G_ExplodeMissile 0x20029F95 */
-
-/* Event names; each is the literal G_AddEvent is handed. */
-#define EV_BULLET_HIT_SMALL         173             /* 0x2002A1D8; name from bg_misc.c's recovered eventnames[] */
-#define EV_GRENADE_BOUNCE           177             /* 0x20029BC2 */
-#define EV_MISSILE_MISS             178             /* 0x20029FC9 */
-#define EV_MISSILE_HIT              179             /* 0x20029D26 */
-#define EV_MISSILE_HIT_NOMARKS      180
-#define EV_FLAMEBARREL_BOUNCE       194             /* 0x20029BA7 */
+#define MASK_MISSILESHOT            0x02802091
 
 /* forward: q_shared.c / q_math.c */
 float           VectorNormalize2( const vec3_t v, vec3_t out );
-float           Com_RandFloatRange( float lo, float hi );   /* 0x200170E0; LTCG-inlined at 0x2002A6A4 / 0x2002A6E7 */
+float           Com_RandFloatRange( float lo, float hi );
 void            vectoangles( const vec3_t value1, vec3_t angles );
 byte            DirToByte( const vec3_t dir );
 float           AngleSubtract( float a1, float a2 );
@@ -106,7 +53,6 @@ the final orientation matters -- kicks the pitch spin for the next bounce.
 void G_MissileLandAngles( gentity_t *ent, trace_t *trace, vec3_t angles, qboolean forceAngles ) {
 	int impactTime;
 	float landPitch;
-	float landShort;
 	float pitchDelta;
 	float pitchDeltaAbs;
 
@@ -123,7 +69,8 @@ void G_MissileLandAngles( gentity_t *ent, trace_t *trace, vec3_t angles, qboolea
 			VectorCopy( angles, ent->s.apos.trBase );
 			ent->s.apos.trTime = impactTime;
 			if ( pitchDeltaAbs < 80.0f ) {
-				ent->s.apos.trDelta[0] *= -( rand() / 32768.0f * 0.3f + 0.85f );
+				// keep: "* -1.0f" matches original codegen
+				ent->s.apos.trDelta[0] = ent->s.apos.trDelta[0] * ( rand() / 32768.0f * 0.3f + 0.85f ) * -1.0f;
 			} else {
 				ent->s.apos.trDelta[0] *= rand() / 32768.0f * 0.3f + 0.85f;
 			}
@@ -131,13 +78,15 @@ void G_MissileLandAngles( gentity_t *ent, trace_t *trace, vec3_t angles, qboolea
 
 		angles[0] = AngleNormalize180( angles[0] );
 		if ( forceAngles || pitchDeltaAbs < 45.0f ) {
-			/* the half turn is added in short space, after the scale
-			 * (0x20029764 fadd 32768 sits between the fmul and the ftol) */
-			landShort = landPitch * ( 65536.0f / 360.0f );
+			// the half turn is added in short space, after the scale
+			// keep: one expression per arm matches original codegen
 			if ( fabs( angles[0] ) > 90.0 ) {
-				landShort += 32768.0f;
+				angles[0] = ( 360.0f / 65536.0f )
+							* ( (int)( landPitch * ( 65536.0f / 360.0f ) + 32768.0f ) & 65535 );
+			} else {
+				angles[0] = ( 360.0f / 65536.0f )
+							* ( (int)( landPitch * ( 65536.0f / 360.0f ) ) & 65535 );
 			}
-			angles[0] = ( 360.0f / 65536.0f ) * ( (int)landShort & 65535 );
 		} else if ( pitchDeltaAbs < 80.0f ) {
 			angles[0] = AngleNormalize360( angles[0] + pitchDelta * 0.25f );
 		} else {
@@ -164,6 +113,7 @@ qboolean G_BounceMissile( gentity_t *ent, trace_t *trace ) {
 	vec3_t nudge;
 	vec3_t angles;
 	float dot;
+	rfloat speed;
 	int inWater;
 	int impactTime;
 
@@ -194,11 +144,17 @@ qboolean G_BounceMissile( gentity_t *ent, trace_t *trace ) {
 		}
 
 		// check for stop
-		if ( trace->normal[2] > 0.7 && VectorLength( ent->s.pos.trDelta ) < 20 ) {
-			G_SetOrigin( ent, ent->r.currentOrigin );
-			G_MissileLandAngles( ent, trace, angles, qtrue );
-			G_SetAngle( ent, angles );
-			return qfalse;
+		// keep: both lengths in this function are written out (not VectorLength) to match original codegen
+		if ( trace->normal[2] > 0.7 ) {
+			speed = sqrt( ent->s.pos.trDelta[0] * ent->s.pos.trDelta[0]
+						  + ent->s.pos.trDelta[1] * ent->s.pos.trDelta[1]
+						  + ent->s.pos.trDelta[2] * ent->s.pos.trDelta[2] );
+			if ( speed < 20 ) {
+				G_SetOrigin( ent, ent->r.currentOrigin );
+				G_MissileLandAngles( ent, trace, angles, qtrue );
+				G_SetAngle( ent, angles );
+				return qfalse;
+			}
 		}
 	}
 
@@ -219,7 +175,7 @@ qboolean G_BounceMissile( gentity_t *ent, trace_t *trace ) {
 	}
 
 	VectorSubtract( ent->s.pos.trDelta, velocity, delta );
-	return VectorLength( delta ) > 100;
+	return FCAST( sqrt( delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2] ) ) > 100;
 }
 
 /*
@@ -227,12 +183,11 @@ qboolean G_BounceMissile( gentity_t *ent, trace_t *trace ) {
 G_MissileImpact
 ================
 */
-void G_MissileImpact( gentity_t *ent, trace_t *trace ) {
+void G_MissileImpact( gentity_t *ent, trace_t *trace, vec3_t dir ) {
 	gentity_t   *other;
 	gentity_t   *attacker;
 	vec3_t velocity;
 	qboolean hitClient;
-	int event;
 
 	other = &g_entities[trace->entityNum];
 	hitClient = qfalse;
@@ -253,69 +208,59 @@ void G_MissileImpact( gentity_t *ent, trace_t *trace ) {
 			return;
 		}
 		G_AddEvent( ent, EV_GRENADE_BOUNCE,
-					( trace->surfaceFlags >> SURF_TYPE_SHIFT ) & SURF_TYPE_MASK );
+					SURF_TYPE( trace->surfaceFlags ) );
 		return;
 	}
 
 	if ( other->takedamage ) {
-		if ( !ent->damage ) {
+		if ( ent->damage ) {
+			if ( LogAccuracyHit( other, &g_entities[ent->r.ownerNum] ) ) {
+				hitClient = qtrue;
+			}
+
+			BG_EvaluateTrajectoryDelta( &ent->s.pos, level.time, velocity );
+			// keep: VectorLength written out to match original codegen
+			if ( FCAST( sqrt( velocity[0] * velocity[0] + velocity[1] * velocity[1]
+							  + velocity[2] * velocity[2] ) ) == 0 ) {
+				velocity[2] = 1;        // stepped on a grenade
+			}
+
+			if ( ent->r.ownerNum != ENTITYNUM_NONE ) {
+				attacker = &g_entities[ent->r.ownerNum];
+			} else {
+				attacker = NULL;
+			}
+
+			G_Damage( other, ent, attacker, velocity, ent->r.currentOrigin, ent->damage,
+					  0, ent->methodOfDeath, HITLOC_NONE );
+		} else {
 			G_BounceMissile( ent, trace );
 			return;
 		}
-
-		if ( LogAccuracyHit( other, &g_entities[ent->r.ownerNum] ) ) {
-			hitClient = qtrue;
-		}
-
-		BG_EvaluateTrajectoryDelta( &ent->s.pos, level.time, velocity );
-		if ( VectorLength( velocity ) == 0 ) {
-			velocity[2] = 1;        // stepped on a grenade
-		}
-
-		if ( ent->r.ownerNum == ENTITYNUM_NONE ) {
-			attacker = NULL;
-		} else {
-			attacker = &g_entities[ent->r.ownerNum];
-		}
-
-		G_Damage( other, ent, attacker, velocity, ent->r.currentOrigin, ent->damage,
-				  0, ent->methodOfDeath, 0 );
 	}
 
 	if ( ent->damage ) {
-		if ( ent->r.ownerNum == ENTITYNUM_NONE ) {
-			attacker = &g_entities[ENTITYNUM_WORLD];
-		} else {
+		if ( ent->r.ownerNum != ENTITYNUM_NONE ) {
 			attacker = &g_entities[ent->r.ownerNum];
+		} else {
+			attacker = &g_entities[ENTITYNUM_WORLD];
 		}
 		G_CheckHitTriggerDamage( attacker, ent->r.currentOrigin, trace->endpos,
 								 ent->damage, ent->methodOfDeath );
 	}
 
 	// a hit on flesh or on a tagged part leaves no impact mark
-	if ( !hitClient && trace->partName ) {
-		hitClient = qtrue;
-	}
+	hitClient = ( hitClient || trace->partName );
 
-	event = DirToByte( trace->normal );
-	if ( hitClient ) {
-		G_AddEvent( ent, EV_MISSILE_HIT_NOMARKS, event );
-	} else {
-		G_AddEvent( ent, EV_MISSILE_HIT, event );
-	}
+	G_AddEvent( ent, hitClient ? EV_ROCKET_EXPLODE_NOMARKS : EV_ROCKET_EXPLODE, DirToByte( trace->normal ) );
 
-	ent->s.surfType = ( trace->surfaceFlags >> SURF_TYPE_SHIFT ) & SURF_TYPE_MASK;
+	ent->s.surfType = SURF_TYPE( trace->surfaceFlags );
 	ent->freeAfterEvent = qtrue;
 	ent->s.eType = ET_GENERAL;
 
 	SnapVectorTowards( trace->endpos, ent->s.pos.trBase );  // save net bandwidth
 
-	VectorCopy( trace->endpos, ent->s.pos.trBase );
-	ent->s.pos.trType = TR_STATIONARY;
-	ent->s.pos.trTime = 0;
-	ent->s.pos.trDuration = 0;
-	VectorClear( ent->s.pos.trDelta );
-	VectorCopy( trace->endpos, ent->r.currentOrigin );
+	G_SetOrigin( ent, trace->endpos );
 
 	if ( ent->splashDamage ) {
 		G_RadiusDamage( trace->endpos, ent, ent->parent, ent->splashDamage,
@@ -327,9 +272,9 @@ void G_MissileImpact( gentity_t *ent, trace_t *trace ) {
 }
 
 /*
-================
+==============
 Concussive_think
-================
+==============
 */
 void Concussive_think( gentity_t *ent ) {
 	if ( level.time > ent->delay ) {
@@ -339,12 +284,11 @@ void Concussive_think( gentity_t *ent ) {
 }
 
 /*
-================
+==============
 Concussive_fx
-
-A short-lived entity parked at an explosion so the client keeps shaking after
-the missile itself is gone.
-================
+	shake the player
+	caused by explosives (grenades/dynamite/etc.)
+==============
 */
 gentity_t *Concussive_fx( const vec3_t origin ) {
 	gentity_t   *concussive;
@@ -362,7 +306,7 @@ gentity_t *Concussive_fx( const vec3_t origin ) {
 ================
 G_ExplodeMissile
 
-Explode a missile without an impact.
+Explode a missile without an impact
 ================
 */
 void G_ExplodeMissile( gentity_t *ent ) {
@@ -376,16 +320,11 @@ void G_ExplodeMissile( gentity_t *ent ) {
 	origin[1] = (int)origin[1];
 	origin[2] = (int)origin[2];
 
-	ent->s.pos.trType = TR_STATIONARY;
-	VectorCopy( origin, ent->s.pos.trBase );
-	ent->r.svFlags |= SVF_BROADCAST;
-	ent->s.pos.trTime = 0;
-	ent->s.pos.trDuration = 0;
-	VectorCopy( origin, ent->r.currentOrigin );
-	VectorClear( ent->s.pos.trDelta );
+	G_SetOrigin( ent, origin );
 	ent->s.eType = ET_GENERAL;
-	ent->s.eFlags |= EF_EXPLODED;
-	ent->flags |= FL_NOCLIENT;
+	ent->s.eFlags |= EF_NODRAW;
+	ent->flags |= FL_NODRAW;
+	ent->r.svFlags |= SVF_BROADCAST;
 
 	if ( ent->classname == scr_const.flamebarrel ) {
 		ent->freeAfterEvent = qtrue;
@@ -396,37 +335,32 @@ void G_ExplodeMissile( gentity_t *ent ) {
 	// find the surface underneath so the explosion mark picks the right decal
 	VectorCopy( origin, end );
 	end[2] -= 16;
-	trap_Trace( &tr, origin, vec3_origin, vec3_origin, end, ent->s.number, MASK_GRENADE_TRACE );
+	trap_Trace( &tr, ent->r.currentOrigin, vec3_origin, vec3_origin, end, ent->s.number, MASK_SOLID );
 
 	dirByte = DirToByte( tr.normal );
-	G_AddEvent( ent, EV_MISSILE_MISS, dirByte );
+	G_AddEvent( ent, EV_GRENADE_EXPLODE, dirByte );
 
-	if ( trap_PointContents( origin, -1, CONTENTS_WATER ) ) {
+	if ( trap_PointContents( ent->r.currentOrigin, -1, CONTENTS_WATER ) ) {
 		ent->s.surfType = SURF_TYPE_WATER;
 	} else {
-		ent->s.surfType = ( tr.surfaceFlags >> SURF_TYPE_SHIFT ) & SURF_TYPE_MASK;
+		ent->s.surfType = SURF_TYPE( tr.surfaceFlags );
 	}
 
 	ent->freeAfterEvent = qtrue;
 
 	if ( ent->splashDamage ) {
-		G_RadiusDamage( origin, ent, ent->parent, ent->splashDamage, ent->splashMinDamage,
+		G_RadiusDamage( ent->r.currentOrigin, ent, ent->parent, ent->splashDamage, ent->splashMinDamage,
 						ent->splashRadius, ent, ent->splashMethodOfDeath );
 	}
 
 	trap_LinkEntity( ent );
 
-	Concussive_fx( origin );
+	Concussive_fx( ent->r.currentOrigin );
 }
 
 /*
 ================
 G_MissileDie
-
-Name inferred from RTCW: the body is RTCW's G_MissileDie (1.1 has no
-G_MissileTrace at all -- every missile trace is issued inline).  Only
-self and attacker survive in registers -- the rest of the die signature is
-unused and LTCG dropped it.
 ================
 */
 void G_MissileDie( gentity_t *self, gentity_t *inflictor, gentity_t *attacker, int damage,
@@ -449,7 +383,7 @@ void G_RunMissile( gentity_t *ent ) {
 	vec3_t dir;
 	trace_t tr;
 	gentity_t   *tent;
-	gentity_t   *hit;
+	int hitNum;
 	int contents;
 
 	VectorCopy( ent->r.currentOrigin, origin );
@@ -484,7 +418,7 @@ void G_RunMissile( gentity_t *ent ) {
 		tent = G_TempEntity( ent->r.currentOrigin, EV_BULLET_HIT_SMALL );
 		tent->s.eventParm = DirToByte( tr.normal );
 		tent->s.scale = DirToByte( dir );
-		tent->s.surfType = ( tr.surfaceFlags >> SURF_TYPE_SHIFT ) & SURF_TYPE_MASK;
+		tent->s.surfType = SURF_TYPE( tr.surfaceFlags );
 		tent->s.otherEntityNum = ent->s.number;
 
 		// and now for real
@@ -494,13 +428,13 @@ void G_RunMissile( gentity_t *ent ) {
 
 	// a grenade is allowed through anything flagged for it
 	if ( ent->methodOfDeath == MOD_GRENADE ) {
-		hit = &g_entities[tr.entityNum];
-		if ( hit->flags & FL_MISSILE_PASSTHRU ) {
-			contents = hit->r.contents;
-			hit->r.contents = 0;
+		hitNum = tr.entityNum;
+		if ( g_entities[hitNum].flags & FL_NO_GRENADE_BOUNCE ) {
+			contents = g_entities[hitNum].r.contents;
+			g_entities[hitNum].r.contents = 0;
 			trap_LocationalTrace( &tr, ent->r.currentOrigin, end, ent->r.ownerNum,
 								  ent->clipmask, bulletPriorityMap );
-			hit->r.contents = contents;
+			g_entities[hitNum].r.contents = contents;
 		}
 	}
 
@@ -531,23 +465,22 @@ void G_RunMissile( gentity_t *ent ) {
 									 MOD_GRENADE );
 	}
 
-	if ( tr.fraction == 1.0f ) {
-		if ( VectorLength( ent->s.pos.trDelta ) != 0 ) {
-			ent->s.groundEntityNum = ENTITYNUM_NONE;
+	// keep: the trDelta length below is written out (not VectorLength) to match original codegen
+	if ( tr.fraction != 1.0f ) {
+		if ( tr.surfaceFlags & SURF_NOIMPACT ) {
+			G_FreeEntity( ent );
+			return;
 		}
-		G_RunThink( ent );
-		return;
-	}
 
-	if ( tr.surfaceFlags & SURF_NOIMPACT ) {
-		G_FreeEntity( ent );
-		return;
-	}
-
-	G_MissileImpact( ent, &tr );
-	if ( ent->s.eType != ET_MISSILE ) {
-		// the missile exploded and turned into something else
-		return;
+		G_MissileImpact( ent, &tr, dir );
+		if ( ent->s.eType != ET_MISSILE ) {
+			// the missile exploded and turned into something else
+			return;
+		}
+	} else if ( FCAST( sqrt( ent->s.pos.trDelta[0] * ent->s.pos.trDelta[0]
+							 + ent->s.pos.trDelta[1] * ent->s.pos.trDelta[1]
+							 + ent->s.pos.trDelta[2] * ent->s.pos.trDelta[2] ) ) != 0 ) {
+		ent->s.groundEntityNum = ENTITYNUM_NONE;
 	}
 
 	G_RunThink( ent );
@@ -555,9 +488,33 @@ void G_RunMissile( gentity_t *ent ) {
 
 /*
 =================
+DynaSink
+
+Disable collision while the spent missile sinks, then schedule its removal
+once its timestamp has elapsed.
+=================
+*/
+void DynaSink( gentity_t *ent ) {
+	ent->clipmask = 0;
+	ent->r.contents = 0;
+	if ( ent->timestamp < level.time ) {
+		ent->think = G_FreeEntity;
+		ent->nextthink = level.time + 100;
+		return;
+	}
+	ent->s.pos.trBase[2] -= 0.5f;
+	ent->nextthink = level.time + 50;
+}
+
+/*
+=================
 fire_grenade
 
-`self` and `dir` are the two arguments LTCG register-allocated.
+	NOTE!!!! NOTE!!!!!
+
+	This accepts a /non-normalized/ direction vector to allow specification
+	of how hard it's thrown.  Please scale the vector before calling.
+
 =================
 */
 gentity_t *fire_grenade( gentity_t *self, const vec3_t start, const vec3_t dir, int weapon ) {
@@ -625,7 +582,6 @@ fire_rocket
 gentity_t *fire_rocket( gentity_t *self, const vec3_t start, vec3_t dir ) {
 	gentity_t   *bolt;
 	const weaponInfo_t  *weapInfo;
-	vec3_t angles;
 
 	VectorNormalize( dir );
 
@@ -633,11 +589,11 @@ gentity_t *fire_rocket( gentity_t *self, const vec3_t start, vec3_t dir ) {
 
 	bolt = G_Spawn();
 	Scr_SetString( &bolt->classname, scr_const.rocket );
+	bolt->nextthink = level.time + 30000;
 	bolt->think = G_ExplodeMissile;
 	bolt->s.eType = ET_MISSILE;
 	bolt->r.svFlags = SVF_MISSILE;
 	bolt->s.eFlags |= EF_ROCKET;
-	bolt->nextthink = level.time + 30000;
 	bolt->s.weapon = self->s.weapon;
 	bolt->r.ownerNum = self->s.number;
 	bolt->parent = self;
@@ -659,15 +615,8 @@ gentity_t *fire_rocket( gentity_t *self, const vec3_t start, vec3_t dir ) {
 
 	VectorCopy( start, bolt->r.currentOrigin );
 
-	/* `angles` is coalesced onto r.currentAngles, so the final copy below is a
-	   self-assignment in the binary. */
-	vectoangles( bolt->s.pos.trDelta, angles );
-	VectorCopy( angles, bolt->s.apos.trBase );
-	bolt->s.apos.trType = TR_STATIONARY;
-	bolt->s.apos.trTime = 0;
-	bolt->s.apos.trDuration = 0;
-	VectorClear( bolt->s.apos.trDelta );
-	VectorCopy( angles, bolt->r.currentAngles );
+	vectoangles( bolt->s.pos.trDelta, bolt->r.currentAngles );
+	G_SetAngle( bolt, bolt->r.currentAngles );
 
 	return bolt;
 }

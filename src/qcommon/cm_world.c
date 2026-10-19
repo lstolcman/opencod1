@@ -8,25 +8,7 @@
  *
  * @fidelity: verified
  */
-#define sv                  cm_world_sv_placeholder
-#define server_public_t     cm_world_server_public_t
 #include "cm_local.h"
-#undef server_public_t
-#undef sv
-
-typedef struct worldSector_t
-{
-	int axis;                               /* +0x00  0 = x, 1 = y     */
-	int staticModelContents;                /* +0x04 */
-	int sightStaticModelContents;           /* +0x08  big models only  */
-	int entityContents;                     /* +0x0C */
-	float dist;                             /* +0x10  split plane      */
-	struct cmEntityLink_t   *entities;      /* +0x14 */
-	struct cmStaticModelLink_t *staticModels; /* +0x18 */
-	struct worldSector_t    *parent;        /* +0x1C  also the free list link */
-	struct worldSector_t    *children[2];   /* +0x20  [0] above, [1] below */
-} worldSector_t;
-COD1_ASSERT_SIZE( worldSector_t, 40 );
 
 typedef struct cmEntityLink_t
 {
@@ -51,16 +33,12 @@ typedef struct cmStaticModelLink_t
 } cmStaticModelLink_t;
 COD1_ASSERT_SIZE( cmStaticModelLink_t, 84 );
 
-float sv_worldMinsX, sv_worldMinsY, sv_worldMinsZ;
-float sv_worldMaxsX, sv_worldMaxsY, sv_worldMaxsZ;
 
-worldSector_t sv_worldSectors = { 0 };      /* 0x016175A8  the ROOT, not an array */
-worldSector_t *sv_freeWorldEntities = NULL; /* 0x016175D0  free-sector list head  */
-worldSector_t sv_listHeadNull = { 0 };      /* 0x016175D4  the "no child" sentinel */
-
-#define CM_MAX_WORLD_SECTORS    1024
-worldSector_t sv_worldSectorPool[CM_MAX_WORLD_SECTORS];
-#define sv_worldSectorPool      sv_worldSectorPool
+/* The world sectors are the tail of clipMap_t cm (cm_local.h). */
+#define sv_worldSectors         cm.sectors
+#define sv_freeWorldEntities    cm.freeSectors
+#define sv_listHeadNull         cm.listHeadNull
+#define sv_worldSectorPool      cm.pool
 
 #define CM_SV_HEAD_BYTES        ( 20 + 1028 + 4 * 0x800 )
 
@@ -75,6 +53,10 @@ typedef struct cmServerView_t
 } cmServerView_t;
 COD1_ASSERT_SIZE( cmServerView_t, 398572 );
 
+/* sv is server_mp/server.h's server_t (sv_main_mp.c); this unit reads it through the view
+ * above.  Including server.h and reading server_t directly (svEntities as cmEntityLink_t)
+ * compiles to the same code but changes the /GL object cm_world.obj, and that alone flips
+ * the LTCG scheduling tie in Netchan_Process (measured 2026-10-17). */
 extern cmServerView_t sv;
 
 #define CM_GENTITY_CONTENTS     ( 240 + 40 )
@@ -157,21 +139,10 @@ void CM_ClearWorldSectors( void ) {
 
 /* ---- CM_ClearWorld  0x00426B30 ---- VERIFIED */
 void CM_ClearWorld( void ) {
-	cmodel_t *cmod;
-	vec3_t mins, maxs;
-	int i;
-	int axis;
+	
+	unsigned int i;
 
-	cmod = CM_ClipHandleToModel( CM_InlineModel( 0 ) );
-	VectorCopy( cmod->mins, mins );
-	VectorCopy( cmod->maxs, maxs );
-
-	sv_worldMinsX = mins[0];
-	sv_worldMinsY = mins[1];
-	sv_worldMinsZ = mins[2];
-	sv_worldMaxsX = maxs[0];
-	sv_worldMaxsY = maxs[1];
-	sv_worldMaxsZ = maxs[2];
+	CM_ModelBounds( CM_InlineModel( 0 ), cm.worldMins, cm.worldMaxs );
 
 	sv_freeWorldEntities = &sv_worldSectorPool[0];
 	for ( i = 0; i < CM_MAX_WORLD_SECTORS - 1; i++ ) {
@@ -179,11 +150,15 @@ void CM_ClearWorld( void ) {
 	}
 	sv_worldSectorPool[CM_MAX_WORLD_SECTORS - 1].parent = NULL;
 
-	axis = ( ( maxs[0] - mins[0] ) <= ( maxs[1] - mins[1] ) );
-	sv_worldSectors.axis = axis;
+	{
+		vec3_t size;
+
+		VectorSubtract( cm.worldMaxs, cm.worldMins, size );
+		sv_worldSectors.axis = size[0] <= size[1];
+	}
+	sv_worldSectors.dist = ( cm.worldMins[sv_worldSectors.axis] + cm.worldMaxs[sv_worldSectors.axis] ) * 0.5f;
 	sv_worldSectors.children[0] = &sv_listHeadNull;
 	sv_worldSectors.children[1] = &sv_listHeadNull;
-	sv_worldSectors.dist = ( mins[axis] + maxs[axis] ) * 0.5f;
 }
 
 /* ---- CM_UnlinkEntity  0x00426C10 ---- VERIFIED */
@@ -203,8 +178,9 @@ void CM_UnlinkEntity( cmEntityLink_t *ent ) {
 	if ( sector->entities == ent ) {
 		sector->entities = ent->next;
 	} else {
-		for ( scan = sector->entities; scan->next != ent; scan = scan->next ) {
-			;
+		scan = sector->entities;
+		while ( scan->next != ent ) {
+			scan = scan->next;
 		}
 		scan->next = ent->next;
 	}
@@ -252,7 +228,6 @@ static void CM_SortNode( worldSector_t *node, const float mins[2],
 	cmEntityLink_t *prevEnt, *ent, *nextEnt;
 	cmStaticModelLink_t *prevLink, *link, *nextLink;
 	worldSector_t *child;
-	int contents;
 
 	axis = node->axis;
 	dist = node->dist;
@@ -260,7 +235,7 @@ static void CM_SortNode( worldSector_t *node, const float mins[2],
 	prevEnt = NULL;
 	ent = node->entities;
 	while ( ent ) {
-		if ( dist < ent->linkMins[axis] ) {
+		if ( ent->linkMins[axis] > dist ) {
 			child = node->children[0];
 			if ( child == &sv_listHeadNull ) {
 				child = CM_AllocWorldSector( mins, maxs );
@@ -292,10 +267,10 @@ static void CM_SortNode( worldSector_t *node, const float mins[2],
 		child->entities = ent;
 		child->entityContents |= CM_EntityLinkContents( ent );
 
-		if ( prevEnt ) {
-			prevEnt->next = nextEnt;
-		} else {
+		if ( !prevEnt ) {
 			node->entities = nextEnt;
+		} else {
+			prevEnt->next = nextEnt;
 		}
 		ent = nextEnt;
 	}
@@ -303,7 +278,7 @@ static void CM_SortNode( worldSector_t *node, const float mins[2],
 	prevLink = NULL;
 	link = node->staticModels;
 	while ( link ) {
-		if ( dist < link->linkMins[axis] ) {
+		if ( link->linkMins[axis] > dist ) {
 			child = node->children[0];
 			if ( child == &sv_listHeadNull ) {
 				child = CM_AllocWorldSector( mins, maxs );
@@ -330,18 +305,17 @@ static void CM_SortNode( worldSector_t *node, const float mins[2],
 		}
 
 		nextLink = link->next;
-		contents = CM_StaticModelContents( link->model );
 		link->next = child->staticModels;
 		child->staticModels = link;
-		child->staticModelContents |= contents;
+		child->staticModelContents |= CM_StaticModelContents( link->model );
 		if ( link->isBig ) {
-			child->sightStaticModelContents |= contents;
+			child->sightStaticModelContents |= CM_StaticModelContents( link->model );
 		}
 
-		if ( prevLink ) {
-			prevLink->next = nextLink;
-		} else {
+		if ( !prevLink ) {
 			node->staticModels = nextLink;
+		} else {
+			prevLink->next = nextLink;
 		}
 		link = nextLink;
 	}
@@ -434,10 +408,25 @@ void CM_LinkStaticModel( cmStaticModelLink_t *link ) {
 	int axis;
 	float dist;
 	float sectorMins[2], sectorMaxs[2];
+	int isBig;
 
-	link->isBig = ( link->linkMaxs[2] - link->linkMins[2] >= 64.0f &&
-					link->linkMaxs[1] - link->linkMins[1] >= 32.0f &&
-					link->linkMaxs[0] - link->linkMins[0] >= 32.0f );
+	/* CM_IsBigStaticModel (Mac 1.3), inlined: retail has no out-of-line copy */
+	do {
+		if ( link->linkMaxs[2] - link->linkMins[2] < 64.0f ) {
+			isBig = 0;
+			break;
+		}
+		if ( link->linkMaxs[1] - link->linkMins[1] < 32.0f ) {
+			isBig = 0;
+			break;
+		}
+		if ( link->linkMaxs[0] - link->linkMins[0] < 32.0f ) {
+			isBig = 0;
+			break;
+		}
+		isBig = 1;
+	} while ( 0 );
+	link->isBig = isBig;
 
 	contents = CM_StaticModelContents( link->model );
 
@@ -463,7 +452,7 @@ void CM_LinkStaticModel( cmStaticModelLink_t *link ) {
 			}
 			sector = sector->children[0];
 		} else {
-			if ( dist <= link->linkMaxs[axis] ) {
+			if ( !( dist > link->linkMaxs[axis] ) ) {
 				break;
 			}
 			sectorMaxs[axis] = dist;
@@ -481,13 +470,14 @@ void CM_LinkStaticModel( cmStaticModelLink_t *link ) {
 
 typedef struct areaParms_t
 {
-	int unused;                     /* +0x00  never read */
+	int unused;                     /* +0x00  never read or written */
 	const float     *mins;          /* +0x04 */
 	const float     *maxs;          /* +0x08 */
 	int             *entityList;    /* +0x0C */
 	int count;                      /* +0x10 */
 	int maxcount;                   /* +0x14 */
 	int contentmask;                /* +0x18 */
+	int unused2;                    /* +0x1C  never read or written */
 } areaParms_t;
 
 /* ---- CM_AreaEntities_r  0x00427150 ---- VERIFIED */
@@ -512,9 +502,9 @@ static void CM_AreaEntities_r( worldSector_t *node, areaParms_t *ap ) {
 		absmin = ( const float * )( gent + CM_GENTITY_ABSMIN );
 		absmax = ( const float * )( gent + CM_GENTITY_ABSMAX );
 
-		if ( absmin[0] > ap->maxs[0] || ap->mins[0] > absmax[0] ||
-			 absmin[1] > ap->maxs[1] || ap->mins[1] > absmax[1] ||
-			 absmin[2] > ap->maxs[2] || ap->mins[2] > absmax[2] ) {
+		if ( absmin[0] > ap->maxs[0] || absmax[0] < ap->mins[0] ||
+			 absmin[1] > ap->maxs[1] || absmax[1] < ap->mins[1] ||
+			 absmin[2] > ap->maxs[2] || absmax[2] < ap->mins[2] ) {
 			continue;
 		}
 
@@ -527,7 +517,7 @@ static void CM_AreaEntities_r( worldSector_t *node, areaParms_t *ap ) {
 		ap->count++;
 	}
 
-	if ( node->dist < ap->maxs[node->axis] ) {
+	if ( ap->maxs[node->axis] > node->dist ) {
 		CM_AreaEntities_r( node->children[0], ap );
 	}
 	if ( ap->mins[node->axis] < node->dist ) {
@@ -540,7 +530,6 @@ int CM_AreaEntities( const vec3_t mins, const vec3_t maxs, int *entityList,
 					 int maxcount, int contentmask ) {
 	areaParms_t ap;
 
-	ap.unused = 0;
 	ap.mins = mins;
 	ap.maxs = maxs;
 	ap.entityList = entityList;
@@ -556,7 +545,7 @@ int CM_AreaEntities( const vec3_t mins, const vec3_t maxs, int *entityList,
 /* ---- CM_TraceBox  0x004272E0 ---- VERIFIED */
 qboolean CM_TraceBox( const vec3_t start, const vec3_t end, const vec3_t mins,
 					  const vec3_t maxs, float fraction ) {
-	float enterFrac, leaveFrac, sign;
+	float leaveFrac, enterFrac, sign;
 	const float *bounds;
 	float d1, d2, denom;
 	int axis;
@@ -578,7 +567,7 @@ qboolean CM_TraceBox( const vec3_t start, const vec3_t end, const vec3_t mins,
 				denom = d1 - d2;
 				if ( enterFrac * denom < d1 ) {
 					enterFrac = d1 / denom;
-					if ( leaveFrac <= enterFrac ) {
+					if ( enterFrac >= leaveFrac ) {
 						return qtrue;
 					}
 				}
@@ -586,7 +575,7 @@ qboolean CM_TraceBox( const vec3_t start, const vec3_t end, const vec3_t mins,
 				denom = d1 - d2;
 				if ( leaveFrac * denom < d1 ) {
 					leaveFrac = d1 / denom;
-					if ( leaveFrac <= enterFrac ) {
+					if ( enterFrac >= leaveFrac ) {
 						return qtrue;
 					}
 				}
@@ -615,8 +604,8 @@ static void CM_PointTraceStaticModels_r( pointStaticModelWork_t *work,
 										 worldSector_t *node, float p1f,
 										 float p2f, const vec3_t p1,
 										 const vec3_t p2 ) {
-	int axis;
-	float d1, d2, frac, midf;
+	rfloat d1, frac;
+	float d2, midf;
 	vec3_t mid;
 	int side;
 	cmStaticModelLink_t *link;
@@ -628,9 +617,11 @@ static void CM_PointTraceStaticModels_r( pointStaticModelWork_t *work,
 		return;
 	}
 
-	axis = node->axis;
-	d1 = p1[axis] - node->dist;
-	d2 = p2[axis] - node->dist;
+	/* retail 0x0042741B keeps d1 on the x87 stack through the split and
+	   frac = d1 / (d1 - d2) (0x004274AD) stays there too (rfloat, so the
+	   modern build subtracts in double); only d2 is stored as a float */
+	d1 = ( rfloat )p1[node->axis] - node->dist;
+	d2 = p2[node->axis] - node->dist;
 
 	if ( d1 >= 0.0f && d2 >= 0.0f ) {
 		CM_PointTraceStaticModels_r( work, node->children[0], p1f, p2f,
@@ -669,9 +660,9 @@ static void CM_PointTraceStaticModels_r( pointStaticModelWork_t *work,
 /* ---- CM_PointTraceStaticModels  0x004275A0 ---- VERIFIED */
 void CM_PointTraceStaticModels( trace_t *results, const vec3_t start,
 								const vec3_t end, int contentmask ) {
-	pointStaticModelWork_t work;
+	vec3_t delta; pointStaticModelWork_t work; unsigned int *clear; int i;
 
-	Com_Memset( &work.trace, 0, sizeof( work.trace ) );
+	clear=(unsigned int *)&work.trace; for(i=0;i<sizeof(work.trace)/sizeof(*clear);i++)clear[i]=0;
 	work.trace.fraction = results->fraction;
 	work.contentmask = contentmask;
 	VectorCopy( start, work.start );
@@ -681,12 +672,15 @@ void CM_PointTraceStaticModels( trace_t *results, const vec3_t start,
 								 work.trace.fraction, work.start, work.end );
 
 	if ( work.trace.fraction < results->fraction ) {
+		delta[0]=end[0]-start[0]; delta[1]=end[1]-start[1]; delta[2]=end[2]-start[2]; /* retail 0x00427638 spills end[2] - start[2] to a float; the x and
+		   y deltas stay in x87 registers */
 		work.trace.endpos[0] = start[0] +
-							   ( end[0] - start[0] ) * work.trace.fraction;
+							   delta[0] * work.trace.fraction;
 		work.trace.endpos[1] = start[1] +
-							   ( end[1] - start[1] ) * work.trace.fraction;
+							   delta[1] * work.trace.fraction;
 		work.trace.endpos[2] = start[2] +
-							   ( end[2] - start[2] ) * work.trace.fraction;
+							   delta[2] *
+							   work.trace.fraction;
 		*results = work.trace;
 	}
 }
@@ -696,7 +690,7 @@ static void CM_ClipMoveToEntities_r( moveclip_t *clip, worldSector_t *node,
 									 float p1f, float p2f, const vec3_t p1,
 									 const vec3_t p2 ) {
 	int axis;
-	float d1, d2, offset, frac, midf;
+	float d1, d2, offset, midf;
 	vec3_t mid;
 	int side;
 	cmEntityLink_t *touch;
@@ -718,27 +712,54 @@ static void CM_ClipMoveToEntities_r( moveclip_t *clip, worldSector_t *node,
 	} else if ( d1 <= -offset && d2 <= -offset ) {
 		CM_ClipMoveToEntities_r( clip, node->children[1], p1f, p2f, p1, p2 );
 	} else {
+		/*
+		 * Straddle split (0x0042772F..0x004278CA).  Retail works out two
+		 * fractions from one reciprocal idist = 1 / (d1 - d2): frac bounds
+		 * the near-side segment [p1, mid(frac)] and frac2 starts the far-side
+		 * segment [mid(frac2), p2].  frac is capped at 1 (no lower clamp)
+		 * before the near call; frac2 is clamped at 0 only after it.  With
+		 * d1 == d2 (or NaN) frac = 1 and frac2 = 0.  idist and frac stay in
+		 * x87 registers in retail, hence rfloat; frac2 is spilled as a float
+		 * across the first call.  Both midf values use p2f - p1f rounded to
+		 * a float (0x004277CA spills it as a dword and reloads it).
+		 */
+		rfloat idist, frac;
+		float frac2;
+
 		if ( d1 < d2 ) {
 			side = 1;
-			frac = ( d1 + offset ) / ( d1 - d2 );
+			idist = 1.0f / ( d1 - d2 );
+			frac2 = ( d1 + offset ) * idist;
+			frac = ( d1 - offset ) * idist;
 		} else if ( d1 > d2 ) {
 			side = 0;
-			frac = ( d1 - offset ) / ( d1 - d2 );
+			idist = 1.0f / ( d1 - d2 );
+			frac2 = ( d1 - offset ) * idist;
+			frac = ( d1 + offset ) * idist;
 		} else {
 			side = 0;
-			frac = 0.0f;
+			frac = 1.0f;
+			frac2 = 0.0f;
 		}
 
-		CM_ClipMoveToEntities_r( clip, node->children[side], p1f, p2f,
-								 p1, p2 );
-
-		if ( frac < 0.0f ) {
-			frac = 0.0f;
+		if ( frac > 1.0f ) {
+			frac = 1.0f;
 		}
-		midf = p1f + ( p2f - p1f ) * frac;
+		midf = p1f + ( float )( p2f - p1f ) * frac;
 		mid[0] = p1[0] + ( p2[0] - p1[0] ) * frac;
 		mid[1] = p1[1] + ( p2[1] - p1[1] ) * frac;
 		mid[2] = p1[2] + ( p2[2] - p1[2] ) * frac;
+
+		CM_ClipMoveToEntities_r( clip, node->children[side], p1f, midf,
+								 p1, mid );
+
+		if ( frac2 < 0.0f ) {
+			frac2 = 0.0f;
+		}
+		midf = p1f + ( float )( p2f - p1f ) * frac2;
+		mid[0] = p1[0] + ( p2[0] - p1[0] ) * frac2;
+		mid[1] = p1[1] + ( p2[1] - p1[1] ) * frac2;
+		mid[2] = p1[2] + ( p2[2] - p1[2] ) * frac2;
 
 		CM_ClipMoveToEntities_r( clip, node->children[1 - side], midf, p2f,
 								 mid, p2 );
@@ -758,10 +779,11 @@ void CM_ClipMoveToEntities( moveclip_t *clip ) {
 /* ---- CM_ClipSightTraceToEntities_r  0x004278F0 ---- VERIFIED */
 static qboolean CM_ClipSightTraceToEntities_r( sightclip_t *clip,
 											   worldSector_t *node,
+											   float p1f, float p2f,
 											   const vec3_t p1,
 											   const vec3_t p2 ) {
 	int axis;
-	float d1, d2, offset;
+	float d1, d2, offset, midf;
 	int side;
 	qboolean result;
 	cmEntityLink_t *touch;
@@ -777,26 +799,71 @@ static qboolean CM_ClipSightTraceToEntities_r( sightclip_t *clip,
 
 	if ( d1 >= offset && d2 >= offset ) {
 		result = CM_ClipSightTraceToEntities_r( clip, node->children[0],
-											   p1, p2 );
+											   p1f, p2f, p1, p2 );
 		if ( result ) {
 			return result;
 		}
 	} else if ( d1 <= -offset && d2 <= -offset ) {
 		result = CM_ClipSightTraceToEntities_r( clip, node->children[1],
-											   p1, p2 );
+											   p1f, p2f, p1, p2 );
 		if ( result ) {
 			return result;
 		}
 	} else {
-		side = ( d1 < d2 );
+		/*
+		 * Straddle split (0x004279A8..0x00427B51), the same arithmetic as
+		 * CM_ClipMoveToEntities_r: the near child gets [p1, mid(frac)] with
+		 * frac capped at 1, the far child gets [mid(frac2), p2] with frac2
+		 * clamped at 0 after the near call; d1 == d2 (or NaN) gives frac = 1,
+		 * frac2 = 0.  p1f/p2f/midf are never tested here, but retail
+		 * passes them like CM_ClipMoveToEntities_r.  idist and frac stay in
+		 * x87 registers in retail, hence rfloat; frac2 is spilled as a float
+		 * over the node slot.
+		 */
+		rfloat idist, frac;
+		float frac2;
+		vec3_t mid;
+
+		if ( d1 < d2 ) {
+			side = 1;
+			idist = 1.0f / ( d1 - d2 );
+			frac2 = ( d1 + offset ) * idist;
+			frac = ( d1 - offset ) * idist;
+		} else if ( d1 > d2 ) {
+			side = 0;
+			idist = 1.0f / ( d1 - d2 );
+			frac2 = ( d1 - offset ) * idist;
+			frac = ( d1 + offset ) * idist;
+		} else {
+			side = 0;
+			frac = 1.0f;
+			frac2 = 0.0f;
+		}
+
+		if ( frac > 1.0f ) {
+			frac = 1.0f;
+		}
+		midf = p1f + ( float )( p2f - p1f ) * frac;
+		mid[0] = p1[0] + ( p2[0] - p1[0] ) * frac;
+		mid[1] = p1[1] + ( p2[1] - p1[1] ) * frac;
+		mid[2] = p1[2] + ( p2[2] - p1[2] ) * frac;
 
 		result = CM_ClipSightTraceToEntities_r( clip, node->children[side],
-											   p1, p2 );
+											   p1f, midf, p1, mid );
 		if ( result ) {
 			return result;
 		}
+
+		if ( frac2 < 0.0f ) {
+			frac2 = 0.0f;
+		}
+		midf = p1f + ( float )( p2f - p1f ) * frac2;
+		mid[0] = p1[0] + ( p2[0] - p1[0] ) * frac2;
+		mid[1] = p1[1] + ( p2[1] - p1[1] ) * frac2;
+		mid[2] = p1[2] + ( p2[2] - p1[2] ) * frac2;
+
 		result = CM_ClipSightTraceToEntities_r( clip, node->children[1 - side],
-											   p1, p2 );
+											   midf, p2f, mid, p2 );
 		if ( result ) {
 			return result;
 		}
@@ -814,7 +881,7 @@ static qboolean CM_ClipSightTraceToEntities_r( sightclip_t *clip,
 
 /* ---- CM_ClipSightTraceToEntities  0x00427B60 ---- VERIFIED */
 qboolean CM_ClipSightTraceToEntities( sightclip_t *clip ) {
-	return CM_ClipSightTraceToEntities_r( clip, &sv_worldSectors,
+	return CM_ClipSightTraceToEntities_r( clip, &sv_worldSectors, 0.0f, 1.0f,
 										  clip->start, clip->end );
 }
 
@@ -822,8 +889,8 @@ qboolean CM_ClipSightTraceToEntities( sightclip_t *clip ) {
 static void CM_PointTraceToEntities_r( pointtrace_t *clip, worldSector_t *node,
 									   float p1f, float p2f, const vec3_t p1,
 									   const vec3_t p2 ) {
-	int axis;
-	float d1, d2, frac, midf;
+	rfloat d1, frac;
+	float d2, midf;
 	vec3_t mid;
 	int side;
 	cmEntityLink_t *touch;
@@ -835,9 +902,11 @@ static void CM_PointTraceToEntities_r( pointtrace_t *clip, worldSector_t *node,
 		return;
 	}
 
-	axis = node->axis;
-	d1 = p1[axis] - node->dist;
-	d2 = p2[axis] - node->dist;
+	/* retail 0x00427BB4 keeps d1 on the x87 stack through the split and
+	   frac = d1 / (d1 - d2) (0x00427C4C) stays there too (rfloat, so the
+	   modern build subtracts in double); only d2 is stored as a float */
+	d1 = ( rfloat )p1[node->axis] - node->dist;
+	d2 = p2[node->axis] - node->dist;
 
 	if ( d1 >= 0.0f && d2 >= 0.0f ) {
 		CM_PointTraceToEntities_r( clip, node->children[0], p1f, p2f, p1, p2 );
@@ -871,10 +940,12 @@ void CM_PointTraceToEntities( pointtrace_t *clip ) {
 /* ---- CM_PointSightTraceToEntities_r  0x00427D30 ---- VERIFIED */
 static qboolean CM_PointSightTraceToEntities_r( sightpointtrace_t *clip,
 												worldSector_t *node,
+												float p1f, float p2f,
 												const vec3_t p1,
 												const vec3_t p2 ) {
-	int axis;
-	float d1, d2;
+	rfloat d1, frac;
+	float d2, midf;
+	vec3_t mid;
 	int side;
 	qboolean result;
 	cmEntityLink_t *touch;
@@ -883,33 +954,47 @@ static qboolean CM_PointSightTraceToEntities_r( sightpointtrace_t *clip,
 		return qfalse;
 	}
 
-	axis = node->axis;
-	d1 = p1[axis] - node->dist;
-	d2 = p2[axis] - node->dist;
+	/* retail 0x00427D58 keeps d1 on the x87 stack through the split and
+	   frac = d1 / (d1 - d2) stays there too (rfloat, so the modern build
+	   subtracts in double); only d2 is stored as a float */
+	d1 = ( rfloat )p1[node->axis] - node->dist;
+	d2 = p2[node->axis] - node->dist;
 
 	if ( d1 >= 0.0f && d2 >= 0.0f ) {
 		result = CM_PointSightTraceToEntities_r( clip, node->children[0],
-												 p1, p2 );
+												 p1f, p2f, p1, p2 );
 		if ( result ) {
 			return result;
 		}
 	} else if ( d1 <= 0.0f && d2 <= 0.0f ) {
 		result = CM_PointSightTraceToEntities_r( clip, node->children[1],
-												 p1, p2 );
+												 p1f, p2f, p1, p2 );
 		if ( result ) {
 			return result;
 		}
 	} else {
-		side = ( d1 < 0.0f );
+		/*
+		 * Straddle split (0x00427DDA..0x00427E74): mid = p1 + (p2 - p1) * frac
+		 * with frac = d1 / (d1 - d2); the near child gets [p1, mid] and the
+		 * far child [mid, p2], the same mid for both calls.  p1f/p2f/midf are
+		 * never tested here, but retail passes them like
+		 * CM_PointTraceToEntities_r.
+		 */
+		frac = d1 / ( d1 - d2 );
+		midf = p1f + ( p2f - p1f ) * frac;
+		mid[0] = p1[0] + ( p2[0] - p1[0] ) * frac;
+		mid[1] = p1[1] + ( p2[1] - p1[1] ) * frac;
+		mid[2] = p1[2] + ( p2[2] - p1[2] ) * frac;
 
+		side = ( d1 < 0.0f );
 		result = CM_PointSightTraceToEntities_r( clip, node->children[side],
-												 p1, p2 );
+												 p1f, midf, p1, mid );
 		if ( result ) {
 			return result;
 		}
 		result = CM_PointSightTraceToEntities_r( clip,
 												 node->children[1 - side],
-												 p1, p2 );
+												 midf, p2f, mid, p2 );
 		if ( result ) {
 			return result;
 		}
@@ -927,7 +1012,7 @@ static qboolean CM_PointSightTraceToEntities_r( sightpointtrace_t *clip,
 
 /* ---- CM_PointSightTraceToEntities  0x00427EB0 ---- VERIFIED */
 qboolean CM_PointSightTraceToEntities( sightpointtrace_t *clip ) {
-	return CM_PointSightTraceToEntities_r( clip, &sv_worldSectors,
+	return CM_PointSightTraceToEntities_r( clip, &sv_worldSectors, 0.0f, 1.0f,
 										   clip->start, clip->end );
 }
 
@@ -944,8 +1029,8 @@ static qboolean CM_SightTraceStaticModels_r( sightStaticModelWork_t *work,
 											 worldSector_t *node, float p1f,
 											 float p2f, const vec3_t p1,
 											 const vec3_t p2 ) {
-	int axis;
-	float d1, d2, frac, midf;
+	rfloat d1, frac;
+	float d2, midf;
 	vec3_t mid;
 	int side;
 	cmStaticModelLink_t *link;
@@ -955,9 +1040,11 @@ static qboolean CM_SightTraceStaticModels_r( sightStaticModelWork_t *work,
 		return qtrue;
 	}
 
-	axis = node->axis;
-	d1 = p1[axis] - node->dist;
-	d2 = p2[axis] - node->dist;
+	/* retail 0x00427EF8 keeps d1 on the x87 stack through the split and
+	   frac = d1 / (d1 - d2) (0x00427FA8) stays there too (rfloat, so the
+	   modern build subtracts in double); only d2 is stored as a float */
+	d1 = ( rfloat )p1[node->axis] - node->dist;
+	d2 = p2[node->axis] - node->dist;
 
 	if ( d1 >= 0.0f && d2 >= 0.0f ) {
 		if ( !CM_SightTraceStaticModels_r( work, node->children[0], p1f, p2f,
@@ -987,6 +1074,7 @@ static qboolean CM_SightTraceStaticModels_r( sightStaticModelWork_t *work,
 		}
 	}
 
+	trace.fraction = 1.0f;
 	for ( link = node->staticModels; link; link = link->next ) {
 		if ( !link->isBig ) {
 			continue;
@@ -1000,7 +1088,6 @@ static qboolean CM_SightTraceStaticModels_r( sightStaticModelWork_t *work,
 			continue;
 		}
 
-		trace.fraction = 1.0f;
 		CM_TraceStaticModel( link, &trace, work->start, work->end,
 							 work->contentmask );
 		if ( trace.fraction != 1.0f ) {
@@ -1021,7 +1108,7 @@ qboolean CM_SightTraceStaticModels( const vec3_t start, const vec3_t end,
 	VectorCopy( end, work.end );
 
 	return CM_SightTraceStaticModels_r( &work, &sv_worldSectors, 0.0f, 1.0f,
-										work.start, work.end );
+										work.start, work.end ) != 0;
 }
 
 /* ---- CM_GetPlaneNum  0x00428130 ---- VERIFIED */

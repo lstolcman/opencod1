@@ -10,7 +10,7 @@ typedef struct {
 typedef struct {
     unsigned short usedVertexCount; /* +0x00 */
     unsigned char  allocated;       /* +0x02 */
-    unsigned char  pad03;           /* +0x03  never read or written */
+    unsigned char  reserved_0x03;   /* +0x03  alignment; never read or written */
 } smcNode_t;
 
 typedef union {
@@ -47,22 +47,6 @@ typedef char smc_assert_cache_sz[(sizeof(smcCache_t)    == 58424) ? 1 : -1];
 /* Storage is in renderer/tr_staticmodelcache.c.  Retail 0x011CC230. */
 extern smcCache_t r_smcCache;
 
-#define unk_11CC230   (*(unsigned char *)&r_smcCache)
-#define unk_11CC2B8   (*(unsigned char *)&r_smcCache.pages[0].surfaces[0])
 
-#define dword_11DA630 r_smcCache.freeLists[0].next
-#define dword_11DA634 r_smcCache.freeLists[0].prev
-#define dword_11DA638 r_smcCache.freeLists[1].next
-#define dword_11DA63C r_smcCache.freeLists[1].prev
-#define dword_11DA640 r_smcCache.freeLists[2].next
-#define dword_11DA644 r_smcCache.freeLists[2].prev
-#define dword_11DA648 r_smcCache.freeLists[3].next
-#define dword_11DA64C r_smcCache.freeLists[3].prev
-#define dword_11DA650 r_smcCache.freeLists[4].next
-#define dword_11DA654 r_smcCache.freeLists[4].prev
-#define dword_11DA658 r_smcCache.lruList.next
-#define dword_11DA65C r_smcCache.lruList.prev
-#define dword_11DA660 r_smcCache.allocatedVertexCount
-#define dword_11DA664 r_smcCache.usedVertexCount
 
 #endif

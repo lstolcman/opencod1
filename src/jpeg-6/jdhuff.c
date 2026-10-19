@@ -153,7 +153,9 @@ jpeg_make_d_derived_tbl( j_decompress_ptr cinfo, JHUFF_TBL * htbl,
 		for ( i = 1; i <= (int) htbl->bits[l]; i++ )
 			huffsize[p++] = (char) l;
 	}
-	huffsize[p] = 0;
+	/* retail 0x005214D6 terminates with no bound check; written as a pointer store because
+	   huffsize[p] = 0 makes modern /GS add a range-check fast-fail for p >= 257 */
+	*( huffsize + p ) = 0;
 
 	/* Figure C.2: generate the codes themselves */
 	/* Note that this is in code-length order. */

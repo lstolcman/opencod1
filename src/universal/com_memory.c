@@ -7,27 +7,46 @@
  */
 
 #include "../qcommon/qcommon.h"
-#include "../qcommon/hexrays_shim.h"
-#include "../qcommon/cod1_globals.h"
+
+/* Canonical hunk counters owned by com_memory_core.c. */
+extern int s_hunkTotal;
+extern int s_zoneTotal;
+extern int s_hunkHighMark;
+extern int s_hunkHighPermanent;
+extern int s_hunkHighTemp;
+
+
+/* Globals owned by this unit.  hunkblocks heads
+ * the debug hunk-block list (cast to hunkblock_t* at use); hunk_logfile is the
+ * memory-log file handle. */
+int hunkblocks;      /* 0x008931B4 */
+int hunk_logfile;    /* 0x008931B8 */
 
 extern void FS_ClearDataForFiles( void *lowEnd, void *highEnd );
 extern int  XModelClearData();
-extern int  timeGetTime( void );
+__declspec( dllimport ) unsigned long __stdcall timeGetTime( void );
 
 extern void *fs_searchpaths;
 extern void *Hunk_AllocAlignInternal( int size, int align );
 extern void *Hunk_AllocLowAlignInternal( int size, int align );
 
-#define HUNK_TOTAL          ( *(int *) hunk_totalSize )   /* 0x0089319C */
-#define ZONE_TOTAL          ( *(int *) hunk_totalZoneSize )   /* 0x008931A0 */
-#define HUNK_HIGH_MARK      ( *(int *) hunk_highMark )   /* 0x008931A4 */
+#define HUNK_TOTAL          ( s_hunkTotal )   /* 0x0089319C */
+#define ZONE_TOTAL          ( s_zoneTotal )   /* 0x008931A0 */
+#define HUNK_HIGH_MARK      ( s_hunkHighMark )   /* 0x008931A4 */
 #define HUNK_HIGH_TEMPMARK  ( hunk_highTempMark )            /* 0x008931A8, plain */
-#define HUNK_HIGH_PERM      ( *(int *) hunk_highUsed )   /* 0x008931AC */
-#define HUNK_HIGH_TEMP      ( *(int *) hunk_highTemp )   /* 0x008931B0 */
-#define HUNK_LOW_MARK       ( *(int *) hunk_lowMark )   /* 0x008931BC */
+#define HUNK_HIGH_PERM      ( s_hunkHighPermanent )   /* 0x008931AC */
+#define HUNK_HIGH_TEMP      ( s_hunkHighTemp )   /* 0x008931B0 */
+/* the low counters are read directly, as retail does (com_memory_core.c owns
+   them; hunk_lowMark/hunk_temp_* only hold pointers to them) */
+extern int hunk_low_mark;
+extern int hunk_low_permanent;
+extern int hunk_low_temp;
+#define HUNK_LOW_MARK       ( hunk_low_mark )               /* 0x008931BC */
 #define HUNK_LOW_TEMPMARK   ( hunk_lowTempMark )            /* 0x008931C0, plain */
-#define HUNK_LOW_PERM       ( *(int *) hunk_temp_permanent )  /* 0x008931C4 */
-#define HUNK_LOW_TEMP       ( *(int *) hunk_temp_temp )       /* 0x008931C8 */
+#define HUNK_LOW_PERM       ( hunk_low_permanent )          /* 0x008931C4 */
+#define HUNK_LOW_TEMP       ( hunk_low_temp )               /* 0x008931C8 */
+
+int com_randSeed_m;   /* 0x0057B4B0 */
 
 /* ---- Com_SRand_m  0x00431430 ---- VERIFIED */
 int __cdecl Com_SRand_m( int seed ) {
@@ -36,18 +55,27 @@ int __cdecl Com_SRand_m( int seed ) {
 }
 
 /* ---- Com_RandFloatRange_m  0x00431440 ---- VERIFIED */
+/* Improve-float-consistency (/Op) code in retail: r and the result go through
+   4-byte slots and the divide by 32768 stays an fdiv. */
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", on )
+#endif
 double __cdecl Com_RandFloatRange_m( float lo, float hi ) {
 	float r;
 
 	com_randSeed_m = 214013 * com_randSeed_m + 2531011;
 	r = (float) ( (unsigned int) com_randSeed_m >> 17 );
-	return (float) ( ( hi - lo ) * r / 32768.0 + lo );
+	r = ( hi - lo ) * r / 32768.0f + lo;
+	return r;
 }
+#if defined( _MSC_VER ) && _MSC_VER < 1310
+#pragma optimize( "p", off )
+#endif
 
 /* ---- Com_RandIntRange_m  0x00431490 ---- VERIFIED */
-int __fastcall Com_RandIntRange_m( int a1, int a2 ) {
+int __fastcall Com_RandIntRange_m( int maxValue, int minValue ) {
 	com_randSeed_m = 214013 * com_randSeed_m + 2531011;
-	return a2 + ( (int) ( ( a1 - a2 ) * ( (unsigned int) com_randSeed_m >> 17 ) ) >> 15 );
+	return minValue + ( (int) ( ( maxValue - minValue ) * ( (unsigned int) com_randSeed_m >> 17 ) ) >> 15 );
 }
 
 /* ---- Z_FreeInternal  0x004318F0 ---- VERIFIED */
@@ -89,21 +117,14 @@ void Com_Meminfo_f( void ) {
 }
 
 /* ---- Com_TouchMemory  0x00431A80 ---- VERIFIED */
-static int Com_TouchMilliseconds( void ) {
-	if ( !sys_timeBaseInit ) {
-		sys_timeBase = timeGetTime();
-		sys_timeBaseInit = 1;
-	}
-	return timeGetTime() - sys_timeBase;
-}
-
+/* both Sys_Milliseconds calls are inlined in retail (0x00431B02) */
 void Com_TouchMemory( void ) {
 	int         *hunkWords;
 	int         sum;
 	int         start, stop;
 	int         startTime;
 
-	startTime = Com_TouchMilliseconds();
+	startTime = Sys_Milliseconds();
 	sum = 0;
 	hunkWords = (int *) s_hunkData;
 
@@ -119,7 +140,7 @@ void Com_TouchMemory( void ) {
 	}
 
 	Com_Printf( "Com_TouchMemory: %i msec. Using sum: %d\n",
-				Com_TouchMilliseconds() - startTime, sum );
+				Sys_Milliseconds() - startTime, sum );
 }
 
 /* ---- Com_InitZoneMemory  0x00431B30 ---- VERIFIED */
@@ -128,9 +149,9 @@ void Com_InitZoneMemory( void ) {
 
 typedef struct hunkblock_s {
 	int                 size;
-	int                 printed;
+	byte                printed;
 	struct hunkblock_s  *next;
-	int                 unused_0C;
+	const char          *label;
 	const char          *sourceFile;
 	int                 sourceLine;
 } hunkblock_t;
@@ -192,12 +213,14 @@ void Hunk_SmallLog( void ) {
 			continue;
 		}
 		for ( other = block->next ; other ; other = other->next ) {
-			if ( block->sourceLine == other->sourceLine
-				 && block->sourceFile && other->sourceFile
-				 && !Q_stricmp( block->sourceFile, other->sourceFile ) ) {
-				size += other->size;
-				other->printed = 1;
+			if ( block->sourceLine != other->sourceLine ) {
+				continue;
 			}
+			if ( Q_stricmp( block->sourceFile, other->sourceFile ) ) {
+				continue;
+			}
+			size += other->size;
+			other->printed = qtrue;
 		}
 		size += block->size;
 		numBlocks++;
@@ -212,15 +235,17 @@ void Hunk_SmallLog( void ) {
 
 /* ---- Hunk_MemoryRemaining  0x00431F10 ---- VERIFIED */
 int Hunk_MemoryRemaining( void ) {
-	return HUNK_TOTAL - HUNK_HIGH_TEMP - HUNK_LOW_TEMP;
+	return HUNK_TOTAL - HUNK_LOW_TEMP - HUNK_HIGH_TEMP;
 }
 
 /* ---- Hunk_RetouchMemory  0x00431F30 ---- VERIFIED */
 void Hunk_RetouchMemory( void ) {
-	XModelClearData( (char *) s_hunkData + HUNK_TOTAL - HUNK_HIGH_PERM,
-					 (char *) s_hunkData + HUNK_LOW_PERM );
-	FS_ClearDataForFiles( (char *) s_hunkData + HUNK_LOW_PERM,
-						  (char *) s_hunkData + HUNK_TOTAL - HUNK_HIGH_PERM );
+	char *low, *high;
+
+	low  = (char *) s_hunkData + HUNK_LOW_PERM;
+	high = (char *) s_hunkData + HUNK_TOTAL - HUNK_HIGH_PERM;
+	XModelClearData( high, low );
+	FS_ClearDataForFiles( low, high );
 }
 
 /* ---- Hunk_SetHighMark  0x00431F70 ---- VERIFIED */
@@ -243,16 +268,26 @@ qboolean __cdecl Hunk_CheckHighMark( const void *ptr ) {
 
 /* ---- Hunk_ClearToHighMark  0x00431FB0 ---- VERIFIED */
 void Hunk_ClearToHighMark( void ) {
+	char *low, *high;
+
 	HUNK_HIGH_TEMP = HUNK_HIGH_MARK;
 	HUNK_HIGH_PERM = HUNK_HIGH_MARK;
-	Hunk_RetouchMemory();
+	low  = (char *) s_hunkData + HUNK_LOW_PERM;
+	high = (char *) s_hunkData + HUNK_TOTAL - HUNK_HIGH_PERM;
+	XModelClearData( high, low );
+	FS_ClearDataForFiles( low, high );
 }
 
 /* ---- Hunk_ClearToHighTempMark  0x00431FF0 ---- VERIFIED */
 void Hunk_ClearToHighTempMark( void ) {
+	char *low, *high;
+
 	HUNK_HIGH_TEMP = HUNK_HIGH_TEMPMARK;
 	HUNK_HIGH_PERM = HUNK_HIGH_TEMPMARK;
-	Hunk_RetouchMemory();
+	low  = (char *) s_hunkData + HUNK_LOW_PERM;
+	high = (char *) s_hunkData + HUNK_TOTAL - HUNK_HIGH_PERM;
+	XModelClearData( high, low );
+	FS_ClearDataForFiles( low, high );
 }
 
 /* ---- Hunk_HighMarkIsSet  0x00432030 ---- VERIFIED */
@@ -268,12 +303,14 @@ int Hunk_SetLowMark( void ) {
 
 /* ---- Hunk_ClearToLowMark  0x00432050 ---- VERIFIED */
 void Hunk_ClearToLowMark( void ) {
+	char *low, *high;
+
 	HUNK_LOW_TEMP = HUNK_LOW_MARK;
 	HUNK_LOW_PERM = HUNK_LOW_MARK;
-	XModelClearData( (char *) s_hunkData + HUNK_TOTAL - HUNK_HIGH_PERM,
-					 (char *) s_hunkData + HUNK_LOW_MARK );
-	FS_ClearDataForFiles( (char *) s_hunkData + HUNK_LOW_MARK,
-						  (char *) s_hunkData + HUNK_TOTAL - HUNK_HIGH_PERM );
+	low  = (char *) s_hunkData + HUNK_LOW_PERM;
+	high = (char *) s_hunkData + HUNK_TOTAL - HUNK_HIGH_PERM;
+	XModelClearData( high, low );
+	FS_ClearDataForFiles( low, high );
 }
 
 /* ---- Hunk_Clear  0x00432140 ---- VERIFIED */
@@ -322,19 +359,19 @@ int Hunk_SetLowTempMark( void ) {
 
 /* ---- Hunk_FreeTempMemory  0x00432410 ---- VERIFIED */
 void Hunk_FreeTempMemory( void *buf ) {
-	int delta;
+	int *hdr;
 
 	if ( !s_hunkData ) {
 		free( buf );
 		return;
 	}
 
-	if ( *( (int *) buf - 4 ) != (int) 0x89537892 ) {
+	hdr = (int *) buf - 4;
+	if ( hdr[0] != (int) 0x89537892 ) {
 		Com_Error( ERR_FATAL, "\x15Hunk_FreeTempMemory: bad magic" );
 	}
-	delta = *( (int *) buf - 3 );
-	*( (int *) buf - 4 ) = (int) 0x89537893;
-	HUNK_LOW_TEMP -= delta;
+	hdr[0] = (int) 0x89537893;
+	HUNK_LOW_TEMP -= hdr[1];
 }
 
 /* ---- Hunk_ClearTempMemory  0x00432450 ---- VERIFIED */
@@ -359,11 +396,65 @@ int __cdecl Hunk_SetLowUsedInternal( int lowUsed ) {
 	return lowUsed;
 }
 
-/* ---- nullsub_12  0x004324A0 ---- VERIFIED */
-void nullsub_12( void ) {
+/* ---- Hunk_Trash  0x004324A0 ---- VERIFIED */
+void Hunk_Trash( void ) {
 }
 
 /* ---- memset32  0x004324B0 ---- VERIFIED */
+/* Q3's _copyDWord (qcommon/common.c), renamed.  Retail keeps the inline-asm
+   body, so callers pass all three arguments on the stack. */
+#if defined( _MSC_VER ) && defined( _M_IX86 )
+void memset32( unsigned int *dest, unsigned int constant, unsigned int count ) {
+	__asm
+	{
+			mov		edx,dest
+			mov		eax,constant
+			mov		ecx,count
+			and		ecx,~7
+			jz		padding
+			sub		ecx,8
+			jmp		loopu
+			align	16
+loopu:
+			test	[edx+ecx*4 + 28],ebx		// fetch next block destination to L1 cache
+			mov		[edx+ecx*4 + 0],eax
+			mov		[edx+ecx*4 + 4],eax
+			mov		[edx+ecx*4 + 8],eax
+			mov		[edx+ecx*4 + 12],eax
+			mov		[edx+ecx*4 + 16],eax
+			mov		[edx+ecx*4 + 20],eax
+			mov		[edx+ecx*4 + 24],eax
+			mov		[edx+ecx*4 + 28],eax
+			sub		ecx,8
+			jge		loopu
+padding:	mov		ecx,count
+			mov		ebx,ecx
+			and		ecx,7
+			jz		outtta
+			and		ebx,~7
+			lea		edx,[edx+ebx*4]				// advance dest pointer
+			test	[edx+0],eax					// fetch destination to L1 cache
+			cmp		ecx,4
+			jl		skip4
+			mov		[edx+0],eax
+			mov		[edx+4],eax
+			mov		[edx+8],eax
+			mov		[edx+12],eax
+			add		edx,16
+			sub		ecx,4
+skip4:		cmp		ecx,2
+			jl		skip2
+			mov		[edx+0],eax
+			mov		[edx+4],eax
+			add		edx,8
+			sub		ecx,2
+skip2:		cmp		ecx,1
+			jl		outtta
+			mov		[edx+0],eax
+outtta:
+	}
+}
+#else
 void memset32( unsigned int *dest, unsigned int constant, unsigned int count ) {
 	unsigned int i;
 
@@ -371,28 +462,79 @@ void memset32( unsigned int *dest, unsigned int constant, unsigned int count ) {
 		dest[i] = constant;
 	}
 }
+#endif
 
 /* ---- Com_Memcmp_m  0x00432720 ---- VERIFIED */
-int __cdecl Com_Memcmp_m( const void *a, const void *b, unsigned int n ) {
-	return memcmp( a, b, n ) == 0;
+/*
+ * Retail equality test (returns 1 if equal, 0 otherwise), not a full memcmp.
+ * Retail bug kept: the 16-byte block loop advances its counter by 4 per block
+ * (add edx,4) but bounds it by the block count n>>4 (cmp edx,esi), so only the
+ * first ceil((n>>4)/4) blocks are compared.  The byte tail then starts at
+ * n&~15, so the bytes between the last compared block and n&~15 are never
+ * checked (n=32 compares only bytes 0..15).  No retail callers.
+ * Written as Wolf:ET's Com_Memcmp (dw[i + k] indexing, tmp, d/s tail): that
+ * text gives retail's strength-reduced pointers and tail registers.
+ */
+int __cdecl Com_Memcmp_m( const void *src0, const void *src1, const unsigned int count ) {
+	unsigned int i;
+
+	if ( count >= 16 ) {
+		unsigned int *dw = (unsigned int *) src0;
+		unsigned int *sw = (unsigned int *) src1;
+
+		unsigned int nm2 = count / 16;
+		for ( i = 0 ; i < nm2 ; i += 4 ) {	/* retail bug: +4 per 16-byte block, bound is count/16 */
+			unsigned int tmp = ( dw[i + 0] - sw[i + 0] ) | ( dw[i + 1] - sw[i + 1] ) |
+							   ( dw[i + 2] - sw[i + 2] ) | ( dw[i + 3] - sw[i + 3] );
+			if ( tmp ) {
+				return qfalse;
+			}
+		}
+	}
+	if ( count & 15 ) {
+		byte *d = (byte *) src0;
+		byte *s = (byte *) src1;
+		for ( i = count & 0xfffffff0 ; i < count ; i++ ) {	/* tail starts at count&~15 */
+			if ( d[i] != s[i] ) {
+				return qfalse;
+			}
+		}
+	}
+
+	return qtrue;
 }
 
 /* ---- Com_TouchMemoryBlock_m  0x004327C0 ---- VERIFIED */
-int __cdecl Com_TouchMemoryBlock_m( int selector, const char *block, int size ) {
-	unsigned int i;
-	int          n;
-	volatile int sink;
+/* Retail's Com_Prefetch (the tree's copy lives in com_memory_core.c); type is
+   e_prefetch (0 PRE_READ, 1 PRE_WRITE, 2 PRE_READ_WRITE) and arrives in eax (LTCG). */
+void Com_TouchMemoryBlock_m( const void *s, const unsigned int bytes, int type ) {
+	switch ( type )
+	{
+	case 1: break;
+	case 0:
+	case 2:
 
-	if ( !selector || ( selector -= 2 ) == 0 ) {
-		n = size;
-		if ( n > 4096 ) {
-			n = 4096;
+		__asm
+		{
+			mov ebx,s
+			mov ecx,bytes
+			cmp ecx,4096                    // clamp to 4kB
+			jle skipClamp
+			mov ecx,4096
+skipClamp:
+			add ecx,0x1f
+			shr ecx,5                       // number of cache lines
+			jz skip
+			jmp loopie
+
+			align 16
+loopie: test byte ptr [ebx],al
+			add ebx,32
+			dec ecx
+			jnz loopie
+skip:
 		}
-		for ( i = (unsigned int) ( n + 31 ) >> 5 ; i ; --i ) {
-			sink = *block;
-			block += 32;
-		}
-		(void) sink;
+
+		break;
 	}
-	return selector;
 }
